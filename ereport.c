@@ -785,7 +785,95 @@ static int aggregate_bucket_for_page(path_row_map_t *level1,
     return 0;
 }
 
-static void emit_path_summary_table(FILE *out, const char *title, path_row_map_t *map) {
+static void contribution_cell_color(double pct, char *buf, size_t sz) {
+    const int low_r = 248, low_g = 244, low_b = 238;
+    const int high_r = 245, high_g = 214, high_b = 214;
+    double t = pct / 100.0;
+    int r, g, b;
+
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+
+    r = (int)(low_r + (high_r - low_r) * t + 0.5);
+    g = (int)(low_g + (high_g - low_g) * t + 0.5);
+    b = (int)(low_b + (high_b - low_b) * t + 0.5);
+    snprintf(buf, sz, "rgb(%d,%d,%d)", r, g, b);
+}
+
+static const char *path_tail_component(const char *path) {
+    const char *slash = strrchr(path, '/');
+    if (slash && slash[1] != '\0') return slash + 1;
+    return path;
+}
+
+static void compact_path_prefix(const char *path, char *buf, size_t sz) {
+    const char *slash = strrchr(path, '/');
+    size_t prefix_len;
+    const size_t keep = 28;
+
+    if (!slash) {
+        buf[0] = '\0';
+        return;
+    }
+
+    prefix_len = (size_t)(slash - path + 1);
+    if (prefix_len < sz && prefix_len <= keep) {
+        memcpy(buf, path, prefix_len);
+        buf[prefix_len] = '\0';
+        return;
+    }
+
+    if (prefix_len <= 1) {
+        snprintf(buf, sz, "/");
+        return;
+    }
+
+    if (prefix_len > keep) {
+        const char *start = path + (prefix_len - keep);
+        while (start > path && *(start - 1) != '/') start--;
+        snprintf(buf, sz, ".../%s", start);
+        return;
+    }
+
+    snprintf(buf, sz, "%.*s", (int)prefix_len, path);
+}
+
+static void emit_compact_path_cell(FILE *out, const char *path) {
+    char prefix[96];
+    const char *tail = path_tail_component(path);
+
+    compact_path_prefix(path, prefix, sizeof(prefix));
+
+    fprintf(out, "<td class=\"path-cell\" title=\"");
+    html_escape(out, path);
+    fprintf(out, "\">");
+    fprintf(out, "<div class=\"path-line\">");
+    fprintf(out, "<button type=\"button\" class=\"path-toggle\" aria-expanded=\"false\" title=\"");
+    html_escape(out, path);
+    fprintf(out, "\">");
+    if (prefix[0] != '\0') {
+        fprintf(out, "<span class=\"path-prefix\">");
+        html_escape(out, prefix);
+        fprintf(out, "</span>");
+    }
+    fprintf(out, "<span class=\"path-tail\">");
+    html_escape(out, tail);
+    fprintf(out, "</span></button>");
+    fprintf(out, "<button type=\"button\" class=\"copy-path\" data-copy=\"");
+    html_escape(out, path);
+    fprintf(out, "\" title=\"Copy full path\">Copy</button>");
+    fprintf(out, "</div><div class=\"path-full\" hidden>");
+    html_escape(out, path);
+    fprintf(out, "</div></td>");
+}
+
+static void emit_path_summary_table(FILE *out,
+                                    const char *title,
+                                    path_row_map_t *map,
+                                    uint64_t total_bucket_files,
+                                    uint64_t total_bucket_bytes,
+                                    uint64_t total_user_files,
+                                    uint64_t total_user_bytes) {
     path_row_t **rows = NULL;
     size_t count = 0;
     size_t i;
@@ -807,26 +895,38 @@ static void emit_path_summary_table(FILE *out, const char *title, path_row_map_t
 
     qsort(rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
 
-    fprintf(out, "<table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Bucket %% of Bytes</th><th class=\"r\">Bucket %% of Files</th></tr></thead>\n<tbody>\n");
+    fprintf(out, "<table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Share of Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Share of Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Share of User Bytes</th><th class=\"r\">Share of User Files</th></tr></thead>\n<tbody>\n");
     for (i = 0; i < count; i++) {
         char bb[32];
         char tb[32];
-        double bp = rows[i]->total_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)rows[i]->total_bytes) : 0.0;
-        double fp = rows[i]->total_files ? (100.0 * (double)rows[i]->bucket_files / (double)rows[i]->total_files) : 0.0;
+        char file_bg[32];
+        char byte_bg[32];
+        double share_bytes = total_bucket_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_bucket_bytes) : 0.0;
+        double share_files = total_bucket_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_bucket_files) : 0.0;
+        double user_bytes_pct = total_user_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_user_bytes) : 0.0;
+        double user_files_pct = total_user_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_user_files) : 0.0;
+
         human_bytes(rows[i]->bucket_bytes, bb, sizeof(bb));
         human_bytes(rows[i]->total_bytes, tb, sizeof(tb));
-        fprintf(out, "<tr><td class=\"path\" title=\"");
-        html_escape(out, rows[i]->path);
-        fprintf(out, "\">");
-        html_escape(out, rows[i]->path);
-        fprintf(out, "</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%s</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%s</td><td class=\"r\">%.1f</td><td class=\"r\">%.1f</td></tr>\n",
+        contribution_cell_color(share_files, file_bg, sizeof(file_bg));
+        contribution_cell_color(share_bytes, byte_bg, sizeof(byte_bg));
+
+        fprintf(out, "<tr>");
+        emit_compact_path_cell(out, rows[i]->path);
+        fprintf(out, "<td class=\"r\" style=\"background:%s\">%" PRIu64 "</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\" style=\"background:%s\">%s</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%s</td><td class=\"r\">%.1f</td><td class=\"r\">%.1f</td></tr>\n",
+                file_bg,
                 rows[i]->bucket_files,
+                file_bg,
+                share_files,
+                byte_bg,
                 bb,
+                byte_bg,
+                share_bytes,
                 rows[i]->total_files,
                 rows[i]->total_dirs,
                 tb,
-                bp,
-                fp);
+                user_bytes_pct,
+                user_files_pct);
     }
     fprintf(out, "</tbody></table>\n");
     free(rows);
@@ -846,6 +946,8 @@ static int emit_bucket_detail_page(const char *filename,
     size_t i;
     uint64_t bucket_files = 0;
     uint64_t bucket_bytes = 0;
+    uint64_t total_user_files = 0;
+    uint64_t total_user_bytes = 0;
 
     if (!out) return -1;
 
@@ -866,7 +968,17 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "th{background:#ece6da;position:sticky;top:0;z-index:2}\n");
     fprintf(out, "th:first-child,td:first-child{position:sticky;left:0;background:#f8f5ee;z-index:1}\n");
     fprintf(out, "td.r,th.r{text-align:right}\n");
-    fprintf(out, ".path{max-width:720px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}\n");
+    fprintf(out, ".path-cell{width:320px;max-width:320px;min-width:320px}\n");
+    fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px}\n");
+    fprintf(out, ".path-toggle{min-width:0;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n");
+    fprintf(out, ".path-prefix{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;font-size:10px;line-height:1.1;margin-bottom:1px}\n");
+    fprintf(out, ".path-tail{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:#1f2328;line-height:1.15}\n");
+    fprintf(out, ".copy-path{opacity:0;pointer-events:none;align-self:start;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n");
+    fprintf(out, ".path-cell:hover .copy-path,.path-cell:focus-within .copy-path,.path-cell.expanded .copy-path{opacity:1;pointer-events:auto}\n");
+    fprintf(out, ".copy-path:hover{background:#eadfc9}\n");
+    fprintf(out, ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n");
+    fprintf(out, ".path-full{margin-top:4px;padding:4px 6px;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;font-size:10px;color:#4e4538;user-select:all}\n");
+    fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:visible;text-overflow:clip}\n");
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
 
@@ -901,6 +1013,13 @@ static int emit_bucket_detail_page(const char *filename,
         bucket_bytes += details->items[i].size;
     }
 
+    for (i = 0; i < matched_records->count; i++) {
+        if (matched_records->items[i].type == 'f') {
+            total_user_files++;
+            total_user_bytes += matched_records->items[i].size;
+        }
+    }
+
     if (aggregate_bucket_for_page(&level1, &level2, details, base_prefix) != 0 ||
         aggregate_totals_for_page(&level1, &level2, matched_records, base_prefix) != 0) {
         free(base_prefix);
@@ -919,11 +1038,18 @@ static int emit_bucket_detail_page(const char *filename,
                 bucket_files,
                 bb);
     }
-    fputs("<div class=\"note\">Rows are sorted by bucket bytes descending. Bucket Files and Bucket Bytes describe the files that match the clicked bucket. Total Files, Total Dirs, and Total Bytes describe everything below that path. Bucket % of Bytes shows how much of the path's total bytes come from this bucket, and Bucket % of Files shows the same share for file counts.</div>\n", out);
+    fputs("<div class=\"note\">Rows are sorted by bucket bytes descending. Bucket Files and Bucket Bytes describe the files that match the clicked bucket. Share of Bucket Files and Share of Bucket Bytes show how much of the selected bucket lives under that path. Share of User Bytes and Share of User Files use the user's total files across all buckets as the denominator, so they show how much this path contributes to the user's overall footprint. Total Files, Total Dirs, and Total Bytes describe everything below that path. Redder bucket-share cells contribute more of the selected bucket.</div>\n", out);
 
-    emit_path_summary_table(out, "Level 1 Directories", &level1);
-    emit_path_summary_table(out, "Level 2 Directories", &level2);
+    emit_path_summary_table(out, "Level 1 Directories", &level1, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
+    emit_path_summary_table(out, "Level 2 Directories", &level2, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
 
+    fputs("<script>\n"
+          "(function(){\n"
+          "function copyText(text){if(navigator.clipboard&&window.isSecureContext){return navigator.clipboard.writeText(text);}return new Promise(function(resolve,reject){var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');resolve();}catch(err){reject(err);}document.body.removeChild(ta);});}\n"
+          "document.querySelectorAll('.copy-path').forEach(function(btn){btn.addEventListener('click',function(ev){var text=btn.getAttribute('data-copy');var old=btn.textContent;ev.preventDefault();ev.stopPropagation();copyText(text).then(function(){btn.textContent='Copied';setTimeout(function(){btn.textContent=old;},900);}).catch(function(){btn.textContent='Copy?';setTimeout(function(){btn.textContent=old;},1200);});});});\n"
+          "document.querySelectorAll('.path-toggle').forEach(function(btn){btn.addEventListener('click',function(ev){var cell=btn.closest('.path-cell');var full=cell.querySelector('.path-full');var expanded=cell.classList.toggle('expanded');full.hidden=!expanded;btn.setAttribute('aria-expanded',expanded?'true':'false');ev.preventDefault();});});\n"
+          "})();\n"
+          "</script>\n", out);
     fprintf(out, "</body>\n</html>\n");
 
     free(base_prefix);
@@ -1272,15 +1398,33 @@ static void emit_html(const char *username,
     printf("<title>Storage Report</title>\n");
     printf("<style>\n");
     printf("body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
+    printf("body.drawer-open{overflow:hidden}\n");
     printf("h1{margin-bottom:8px}\n");
     printf(".meta{margin-bottom:20px;color:#555}\n");
     printf("table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
-    printf("th,td{border:1px solid #ccc;padding:8px 10px;text-align:right}\n");
+    printf("th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     printf("th:first-child,td:first-child{text-align:left}\n");
     printf("th{background:#f4f4f4}\n");
-    printf(".tot{font-weight:bold;background:#fafafa}\n");
-    printf(".cell{transition:background-color 0.2s ease}\n");
-    printf(".cell a{display:block;color:inherit;text-decoration:none}\n");
+    printf(".tot{font-weight:600;background:#fafafa}\n");
+    printf(".cell,.tot-cell{transition:background-color 0.2s ease}\n");
+    printf(".cell a,.tot-block{display:block;color:inherit;text-decoration:none;text-align:center;min-height:42px;padding:1px 0}\n");
+    printf(".cell-main{display:flex;align-items:center;justify-content:center;gap:4px;flex-wrap:wrap;line-height:1}\n");
+    printf(".cell-bytes{font-size:14px;font-weight:600}\n");
+    printf(".cell-pct{font-size:10px;font-weight:700;color:#6a4d1a;background:rgba(255,255,255,0.78);padding:1px 4px;border-radius:999px;line-height:1}\n");
+    printf(".cell-sub{color:#666;font-size:10px;margin-top:2px;line-height:1.05}\n");
+    printf(".cell.active{outline:3px solid #8a6a2a;outline-offset:-3px}\n");
+    printf(".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
+    printf(".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
+    printf(".drawer{position:fixed;top:0;right:0;width:min(980px,92vw);height:100vh;background:#fff;box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;z-index:21;display:flex;flex-direction:column}\n");
+    printf(".drawer.open{transform:translateX(0)}\n");
+    printf(".drawer-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border-bottom:1px solid #ddd;background:#faf7ef}\n");
+    printf(".drawer-title{font-size:18px;font-weight:600;color:#222}\n");
+    printf(".drawer-sub{font-size:12px;color:#666;margin-top:4px}\n");
+    printf(".drawer-actions{display:flex;align-items:center;gap:10px}\n");
+    printf(".drawer-actions a,.drawer-actions button{font:inherit;font-size:13px;border:1px solid #c9b991;background:#fff8e8;color:#5a4214;padding:7px 10px;border-radius:6px;text-decoration:none;cursor:pointer}\n");
+    printf(".drawer-actions button{background:#fff}\n");
+    printf(".drawer-frame{border:0;width:100%%;flex:1;background:#fff}\n");
+    printf("@media (max-width:900px){body{margin:14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
     printf("</style>\n");
     printf("</head>\n<body>\n");
 
@@ -1337,19 +1481,25 @@ static void emit_html(const char *username,
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
             char hb[32];
             char bg[32];
+            double pct = 0.0;
             uint64_t b = sum->bytes[ab][sb];
             uint64_t f = sum->files[ab][sb];
             row_total += b;
 
+            if (sum->total_bytes) pct = 100.0 * (double)b / (double)sum->total_bytes;
             human_bytes(b, hb, sizeof(hb));
             heatmap_color(b, ab, max_cell_bytes, bg, sizeof(bg));
-            printf("<td class=\"cell\" style=\"background:%s\"><a href=\"" BUCKET_OUTPUT_DIR "/bucket_a%d_s%d.html\">%s<br><span style=\"color:#666;font-size:12px\">%" PRIu64 " files</span></a></td>", bg, ab, sb, hb, f);
+            printf("<td class=\"cell\" style=\"background:%s\"><a class=\"bucket-link\" data-age=\"%d\" data-size=\"%d\" href=\"" BUCKET_OUTPUT_DIR "/bucket_a%d_s%d.html\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div><div class=\"cell-sub\">%" PRIu64 " files</div></a></td>", bg, ab, sb, ab, sb, hb, pct, f);
         }
 
         {
             char hr[32];
+            char bg[32];
+            double pct = 0.0;
+            if (sum->total_bytes) pct = 100.0 * (double)row_total / (double)sum->total_bytes;
             human_bytes(row_total, hr, sizeof(hr));
-            printf("<td class=\"tot\">%s</td>", hr);
+            contribution_cell_color(pct, bg, sizeof(bg));
+            printf("<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hr, pct);
         }
 
         printf("</tr>\n");
@@ -1359,18 +1509,44 @@ static void emit_html(const char *username,
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         uint64_t col_total = 0;
         char hc[32];
+        char bg[32];
+        double pct = 0.0;
         for (ab = 0; ab < AGE_BUCKETS; ab++) col_total += sum->bytes[ab][sb];
+        if (sum->total_bytes) pct = 100.0 * (double)col_total / (double)sum->total_bytes;
         human_bytes(col_total, hc, sizeof(hc));
-        printf("<td>%s</td>", hc);
+        contribution_cell_color(pct, bg, sizeof(bg));
+        printf("<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hc, pct);
     }
     {
         char ht[32];
         human_bytes(sum->total_bytes, ht, sizeof(ht));
-        printf("<td>%s</td>", ht);
+        printf("<td class=\"tot tot-cell\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">100%%</span></div></div></td>", ht);
     }
     printf("</tr>\n");
 
     printf("</table>\n");
+    printf("<div id='bucket-backdrop' class='drawer-backdrop'></div>\n");
+    printf("<aside id='bucket-drawer' class='drawer' aria-hidden='true'>\n");
+    printf("<div class='drawer-head'><div><div id='bucket-title' class='drawer-title'>Bucket Details</div><div class='drawer-sub'>Click a heatmap cell to inspect that bucket without leaving the report.</div></div><div class='drawer-actions'><a id='bucket-open' href='#' target='_blank' rel='noopener'>Open page</a><button type='button' id='bucket-close'>Close</button></div></div>\n");
+    printf("<iframe id='bucket-frame' class='drawer-frame' title='Bucket details' loading='lazy'></iframe>\n");
+    printf("</aside>\n");
+    printf("<script>\n");
+    printf("(function(){\n");
+    printf("var ageNames=['<30d','30-90d','90-180d','180-365d','1-3y','3y+'];\n");
+    printf("var sizeNames=['<4K','4K-1M','1M-100M','100M-1G','1G-10G','10G+'];\n");
+    printf("var drawer=document.getElementById('bucket-drawer');\n");
+    printf("var backdrop=document.getElementById('bucket-backdrop');\n");
+    printf("var frame=document.getElementById('bucket-frame');\n");
+    printf("var titleEl=document.getElementById('bucket-title');\n");
+    printf("var openEl=document.getElementById('bucket-open');\n");
+    printf("var closeEl=document.getElementById('bucket-close');\n");
+    printf("var activeCell=null;\n");
+    printf("function closeDrawer(){drawer.classList.remove('open');drawer.setAttribute('aria-hidden','true');backdrop.classList.remove('open');document.body.classList.remove('drawer-open');if(activeCell){activeCell.classList.remove('active');activeCell=null;}}\n");
+    printf("function openDrawer(link){var age=Number(link.dataset.age);var size=Number(link.dataset.size);titleEl.textContent='Bucket Details: '+ageNames[age]+' / '+sizeNames[size];frame.src=link.href;openEl.href=link.href;drawer.classList.add('open');drawer.setAttribute('aria-hidden','false');backdrop.classList.add('open');document.body.classList.add('drawer-open');if(activeCell){activeCell.classList.remove('active');}activeCell=link.closest('.cell');if(activeCell){activeCell.classList.add('active');}}\n");
+    printf("document.querySelectorAll('.bucket-link').forEach(function(link){link.addEventListener('click',function(ev){if(ev.defaultPrevented||ev.button!==0||ev.metaKey||ev.ctrlKey||ev.shiftKey||ev.altKey){return;}ev.preventDefault();openDrawer(link);});});\n");
+    printf("closeEl.addEventListener('click',closeDrawer);backdrop.addEventListener('click',closeDrawer);document.addEventListener('keydown',function(ev){if(ev.key==='Escape'){closeDrawer();}});\n");
+    printf("})();\n");
+    printf("</script>\n");
     printf("</body>\n</html>\n");
 }
 
