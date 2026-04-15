@@ -1,10 +1,10 @@
 /*
  * ereport_simple.c
  *
- * Parallel reader for thread_*.bin files produced by ecrawl_nfs.
+ * Parallel reader for crawl bin files produced by ecrawl.
  *
  * What it does:
- *   - Scans a directory for thread_*.bin files
+ *   - Scans a directory for supported crawl .bin files
  *   - Uses N reader threads (default 32)
  *   - Resolves the requested username once to a numeric uid
  *   - Reads .bin files in parallel
@@ -16,11 +16,11 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport_simple ereport_simple.c
  *
  * Usage:
- *   ./ereport_simple <username> <atime|mtime|ctime> [bin_dir] [threads] > report.html
+ *   ./ereport_simple <username|uid> <atime|mtime|ctime> [bin_dir] [threads] > report.html
  *
  * Examples:
  *   ./ereport_simple erbmi1 mtime > report.html
- *   ./ereport_simple erbmi1 atime /data/crawl_bins 32 > report.html
+ *   ./ereport_simple 82831 atime /data/crawl_bins 32 > report.html
  */
 
 #define _XOPEN_SOURCE 700
@@ -268,6 +268,105 @@ static int has_bin_suffix(const char *name) {
 
 static int starts_with_thread(const char *name) {
     return strncmp(name, "thread_", 7) == 0;
+}
+
+static int starts_with_uid_shard(const char *name) {
+    return strncmp(name, "uid_shard_", 10) == 0;
+}
+
+static int is_power_of_two_u32(uint32_t v) {
+    return v && ((v & (v - 1U)) == 0U);
+}
+
+static int parse_uid_shard_number(const char *name, uint32_t *out) {
+    const char *p = name + 10;
+    char *end = NULL;
+    unsigned long v;
+
+    if (!starts_with_uid_shard(name) || !has_bin_suffix(name)) return -1;
+
+    errno = 0;
+    v = strtoul(p, &end, 10);
+    if (errno != 0 || end == p || strcmp(end, ".bin") != 0 || v > UINT32_MAX) return -1;
+
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int read_uid_shard_layout(const char *dirpath, uint32_t *uid_shards_out) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[256];
+    int saw_layout = 0;
+    uint32_t uid_shards = 0;
+
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", dirpath) >= (int)sizeof(manifest_path)) return -1;
+
+    fp = fopen(manifest_path, "r");
+    if (!fp) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        if (strcmp(line, "layout=uid_shards") == 0) {
+            saw_layout = 1;
+        } else if (strncmp(line, "uid_shards=", 11) == 0) {
+            unsigned long v = strtoul(line + 11, NULL, 10);
+            if (v > 0 && v <= UINT32_MAX) uid_shards = (uint32_t)v;
+        }
+    }
+
+    fclose(fp);
+    if (!saw_layout) return 0;
+    if (uid_shards == 0 || !is_power_of_two_u32(uid_shards)) {
+        fprintf(stderr, "invalid uid_shards value in %s\n", manifest_path);
+        return -1;
+    }
+
+    *uid_shards_out = uid_shards;
+    return 1;
+}
+
+static int parse_uid_arg(const char *s, uid_t *out) {
+    unsigned long long v;
+    char *end = NULL;
+
+    if (!s || *s == '\0') return -1;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return -1;
+    if ((unsigned long long)((uid_t)v) != v) return -1;
+
+    *out = (uid_t)v;
+    return 0;
+}
+
+static int resolve_target_user(const char *spec, uid_t *out_uid, char *display_name, size_t display_name_sz) {
+    struct passwd *pw;
+    uid_t parsed_uid;
+
+    if (parse_uid_arg(spec, &parsed_uid) == 0) {
+        *out_uid = parsed_uid;
+        pw = getpwuid(parsed_uid);
+        if (pw && pw->pw_name && pw->pw_name[0] != '\0') {
+            snprintf(display_name, display_name_sz, "%s", pw->pw_name);
+        } else {
+            snprintf(display_name, display_name_sz, "%s", spec);
+        }
+        return 0;
+    }
+
+    pw = getpwnam(spec);
+    if (!pw) return -1;
+
+    *out_uid = pw->pw_uid;
+    snprintf(display_name, display_name_sz, "%s", (pw->pw_name && pw->pw_name[0] != '\0') ? pw->pw_name : spec);
+    return 0;
 }
 
 static int parse_time_basis(const char *s, time_basis_t *out) {
@@ -555,12 +654,29 @@ static void *worker_main(void *arg_void) {
     return NULL;
 }
 
-static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t *out_count) {
+static int scan_dir_collect_files(const char *dirpath,
+                                  uid_t target_uid,
+                                  char ***out_paths,
+                                  size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
     size_t count = 0;
     size_t cap = 0;
+    uint32_t uid_shards = 0;
+    int layout_rc;
+    int use_uid_shards = 0;
+    uint32_t wanted_shard = 0;
+
+    layout_rc = read_uid_shard_layout(dirpath, &uid_shards);
+    if (layout_rc < 0) {
+        fprintf(stderr, "cannot read crawl manifest in %s\n", dirpath);
+        return -1;
+    }
+    if (layout_rc > 0) {
+        use_uid_shards = 1;
+        wanted_shard = ((uint32_t)target_uid) & (uid_shards - 1U);
+    }
 
     dir = opendir(dirpath);
     if (!dir) {
@@ -572,11 +688,15 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
         char full[PATH_MAX];
         char *copy;
 
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
-            continue;
-        }
-        if (!starts_with_thread(de->d_name) || !has_bin_suffix(de->d_name)) {
-            continue;
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+        if (!has_bin_suffix(de->d_name)) continue;
+
+        if (use_uid_shards) {
+            uint32_t shard = 0;
+            if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
+            if (shard != wanted_shard) continue;
+        } else {
+            if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
         }
 
         if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
@@ -588,10 +708,9 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
             size_t new_cap = (cap == 0) ? 64 : cap * 2;
             char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
             if (!tmp) {
+                size_t i;
                 closedir(dir);
-                for (size_t i = 0; i < count; i++) {
-                    free(paths[i]);
-                }
+                for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
                 return -1;
             }
@@ -601,10 +720,9 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
 
         copy = strdup(full);
         if (!copy) {
+            size_t i;
             closedir(dir);
-            for (size_t i = 0; i < count; i++) {
-                free(paths[i]);
-            }
+            for (i = 0; i < count; i++) free(paths[i]);
             free(paths);
             return -1;
         }
@@ -739,12 +857,12 @@ static void emit_html(const char *username,
 }
 
 int main(int argc, char **argv) {
-    const char *username;
+    const char *user_spec;
     const char *basis_str;
     const char *dirpath = ".";
     time_basis_t basis;
-    struct passwd *pw;
     uid_t target_uid;
+    char display_name[256];
     char **paths = NULL;
     size_t path_count = 0;
     int threads = DEFAULT_THREADS;
@@ -758,11 +876,11 @@ int main(int argc, char **argv) {
     int i;
 
     if (argc < 3 || argc > 5) {
-        fprintf(stderr, "Usage: %s <username> <atime|mtime|ctime> [bin_dir] [threads]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <username|uid> <atime|mtime|ctime> [bin_dir] [threads]\n", argv[0]);
         return 2;
     }
 
-    username = argv[1];
+    user_spec = argv[1];
     basis_str = argv[2];
     if (argc >= 4) {
         dirpath = argv[3];
@@ -778,19 +896,17 @@ int main(int argc, char **argv) {
         die("time basis must be one of: atime, mtime, ctime");
     }
 
-    pw = getpwnam(username);
-    if (!pw) {
-        fprintf(stderr, "unknown user: %s\n", username);
+    if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
+        fprintf(stderr, "unknown user or uid: %s\n", user_spec);
         return 1;
     }
-    target_uid = pw->pw_uid;
 
-    if (scan_dir_collect_files(dirpath, &paths, &path_count) != 0) {
+    if (scan_dir_collect_files(dirpath, target_uid, &paths, &path_count) != 0) {
         return 1;
     }
 
     if (path_count == 0) {
-        fprintf(stderr, "no thread_*.bin files found in %s\n", dirpath);
+        fprintf(stderr, "no matching input .bin files found in %s\n", dirpath);
         free(paths);
         return 1;
     }
@@ -854,7 +970,7 @@ int main(int argc, char **argv) {
         summary_merge(&final_sum, &args[i].summary);
     }
 
-    emit_html(username, target_uid, basis_str, &final_sum, path_count, threads_used);
+    emit_html(display_name, target_uid, basis_str, &final_sum, path_count, threads_used);
 
     free(tids);
     free(args);

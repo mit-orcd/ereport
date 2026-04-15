@@ -1,7 +1,7 @@
 /*
  * ereport.c
  *
- * Parallel reader for thread_*.bin files produced by ecrawl/ecrawl_nfs.
+ * Parallel reader for crawl bin files produced by ecrawl.
  * Emits the original HTML summary plus per-bucket drilldown pages with
  * dense level-1/level-2 directory summaries.
  *
@@ -9,7 +9,7 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport <username> <atime|mtime|ctime> [bin_dir] [threads] > report.html
+ *   ./ereport <username|uid> <atime|mtime|ctime> [bin_dir] [threads]
  */
 
 #define _XOPEN_SOURCE 700
@@ -28,6 +28,8 @@
 #include <time.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sys/time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -36,7 +38,7 @@
 #define FILE_MAGIC_LEN 8
 #define FORMAT_VERSION 2
 #define DEFAULT_THREADS 32
-#define BUCKET_OUTPUT_DIR "tmp"
+
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -162,6 +164,17 @@ typedef struct {
     bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS];
     matched_records_t matched_records;
 } worker_arg_t;
+
+static atomic_ullong g_io_opendir_calls = 0;
+static atomic_ullong g_io_readdir_calls = 0;
+static atomic_ullong g_io_closedir_calls = 0;
+static atomic_ullong g_io_fopen_calls = 0;
+static atomic_ullong g_io_fclose_calls = 0;
+static atomic_ullong g_io_fread_calls = 0;
+
+static const char *g_input_layout = "legacy";
+static uint32_t g_input_uid_shards = 0;
+static char g_bucket_output_dir[PATH_MAX] = "tmp";
 
 typedef struct {
     char *path;
@@ -388,6 +401,42 @@ static void matched_records_free(matched_records_t *m) {
     m->cap = 0;
 }
 
+static double now_sec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static FILE *counted_fopen(const char *path, const char *mode) {
+    atomic_fetch_add(&g_io_fopen_calls, 1);
+    return fopen(path, mode);
+}
+
+static int counted_fclose(FILE *fp) {
+    atomic_fetch_add(&g_io_fclose_calls, 1);
+    return fclose(fp);
+}
+
+static size_t counted_fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
+    atomic_fetch_add(&g_io_fread_calls, 1);
+    return fread(ptr, size, nmemb, fp);
+}
+
+static DIR *counted_opendir(const char *path) {
+    atomic_fetch_add(&g_io_opendir_calls, 1);
+    return opendir(path);
+}
+
+static struct dirent *counted_readdir(DIR *dir) {
+    atomic_fetch_add(&g_io_readdir_calls, 1);
+    return readdir(dir);
+}
+
+static int counted_closedir(DIR *dir) {
+    atomic_fetch_add(&g_io_closedir_calls, 1);
+    return closedir(dir);
+}
+
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
     exit(1);
@@ -400,6 +449,125 @@ static int has_bin_suffix(const char *name) {
 
 static int starts_with_thread(const char *name) {
     return strncmp(name, "thread_", 7) == 0;
+}
+
+static int starts_with_uid_shard(const char *name) {
+    return strncmp(name, "uid_shard_", 10) == 0;
+}
+
+static int is_power_of_two_u32(uint32_t v) {
+    return v && ((v & (v - 1U)) == 0U);
+}
+
+static int parse_uid_shard_number(const char *name, uint32_t *out) {
+    const char *p = name + 10;
+    char *end = NULL;
+    unsigned long v;
+
+    if (!starts_with_uid_shard(name) || !has_bin_suffix(name)) return -1;
+
+    errno = 0;
+    v = strtoul(p, &end, 10);
+    if (errno != 0 || end == p || strcmp(end, ".bin") != 0 || v > UINT32_MAX) return -1;
+
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int read_uid_shard_layout(const char *dirpath, uint32_t *uid_shards_out) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[256];
+    int saw_layout = 0;
+    uint32_t uid_shards = 0;
+
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", dirpath) >= (int)sizeof(manifest_path)) return -1;
+
+    fp = counted_fopen(manifest_path, "r");
+    if (!fp) {
+        if (errno == ENOENT) return 0;
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        if (strcmp(line, "layout=uid_shards") == 0) {
+            saw_layout = 1;
+        } else if (strncmp(line, "uid_shards=", 11) == 0) {
+            unsigned long v = strtoul(line + 11, NULL, 10);
+            if (v > 0 && v <= UINT32_MAX) uid_shards = (uint32_t)v;
+        }
+    }
+
+    counted_fclose(fp);
+    if (!saw_layout) return 0;
+    if (uid_shards == 0 || !is_power_of_two_u32(uid_shards)) {
+        fprintf(stderr, "invalid uid_shards value in %s\n", manifest_path);
+        return -1;
+    }
+
+    *uid_shards_out = uid_shards;
+    return 1;
+}
+
+static void set_bucket_output_dir(const char *username) {
+    size_t i;
+    int n;
+
+    if (!username || username[0] == '\0') username = "tmp";
+
+    n = snprintf(g_bucket_output_dir, sizeof(g_bucket_output_dir), "%s", username);
+    if (n < 0 || (size_t)n >= sizeof(g_bucket_output_dir)) {
+        snprintf(g_bucket_output_dir, sizeof(g_bucket_output_dir), "%s", "tmp");
+        return;
+    }
+
+    for (i = 0; g_bucket_output_dir[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)g_bucket_output_dir[i];
+        if (c == '/' || c == '\\' || c == ':' || c == '\t' || c == '\n' || c == '\r') {
+            g_bucket_output_dir[i] = '_';
+        }
+    }
+}
+
+static int parse_uid_arg(const char *s, uid_t *out) {
+    unsigned long long v;
+    char *end = NULL;
+
+    if (!s || *s == '\0') return -1;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || !end || *end != '\0') return -1;
+    if ((unsigned long long)((uid_t)v) != v) return -1;
+
+    *out = (uid_t)v;
+    return 0;
+}
+
+static int resolve_target_user(const char *spec, uid_t *out_uid, char *display_name, size_t display_name_sz) {
+    struct passwd *pw;
+    uid_t parsed_uid;
+
+    if (parse_uid_arg(spec, &parsed_uid) == 0) {
+        *out_uid = parsed_uid;
+        pw = getpwuid(parsed_uid);
+        if (pw && pw->pw_name && pw->pw_name[0] != '\0') {
+            snprintf(display_name, display_name_sz, "%s", pw->pw_name);
+        } else {
+            snprintf(display_name, display_name_sz, "%s", spec);
+        }
+        return 0;
+    }
+
+    pw = getpwnam(spec);
+    if (!pw) return -1;
+
+    *out_uid = pw->pw_uid;
+    snprintf(display_name, display_name_sz, "%s", (pw->pw_name && pw->pw_name[0] != '\0') ? pw->pw_name : spec);
+    return 0;
 }
 
 static int parse_time_basis(const char *s, time_basis_t *out) {
@@ -939,7 +1107,7 @@ static int emit_bucket_detail_page(const char *filename,
                                    int sb,
                                    const bucket_details_t *details,
                                    const matched_records_t *matched_records) {
-    FILE *out = fopen(filename, "w");
+    FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
     path_row_map_t level1;
     path_row_map_t level2;
@@ -952,7 +1120,7 @@ static int emit_bucket_detail_page(const char *filename,
     if (!out) return -1;
 
     if (path_row_map_init(&level1, 1024) != 0 || path_row_map_init(&level2, 2048) != 0) {
-        fclose(out);
+        counted_fclose(out);
         return -1;
     }
 
@@ -996,7 +1164,7 @@ static int emit_bucket_detail_page(const char *filename,
         fprintf(out, "<div class=\"note\">This bucket has no matching files.</div>\n</body>\n</html>\n");
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
-        fclose(out);
+        counted_fclose(out);
         return 0;
     }
 
@@ -1004,7 +1172,7 @@ static int emit_bucket_detail_page(const char *filename,
     if (!base_prefix) {
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
-        fclose(out);
+        counted_fclose(out);
         return -1;
     }
 
@@ -1025,7 +1193,7 @@ static int emit_bucket_detail_page(const char *filename,
         free(base_prefix);
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
-        fclose(out);
+        counted_fclose(out);
         return -1;
     }
 
@@ -1055,7 +1223,40 @@ static int emit_bucket_detail_page(const char *filename,
     free(base_prefix);
     path_row_map_destroy(&level1);
     path_row_map_destroy(&level2);
-    fclose(out);
+    counted_fclose(out);
+    return 0;
+}
+
+static int build_bucket_page_path(char *out, size_t out_sz, int ab, int sb) {
+    char suffix[32];
+    size_t dir_len = strlen(g_bucket_output_dir);
+    int suffix_len;
+
+    suffix_len = snprintf(suffix, sizeof(suffix), "/bucket_a%d_s%d.html", ab, sb);
+    if (suffix_len < 0 || (size_t)suffix_len >= sizeof(suffix)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (dir_len + (size_t)suffix_len >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memcpy(out, g_bucket_output_dir, dir_len);
+    memcpy(out + dir_len, suffix, (size_t)suffix_len + 1);
+    return 0;
+}
+
+static int ensure_bucket_output_dir_exists(void) {
+    struct stat st;
+
+    if (stat(g_bucket_output_dir, &st) != 0) {
+        if (mkdir(g_bucket_output_dir, 0777) != 0) return -1;
+    } else if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1064,20 +1265,13 @@ static int emit_all_bucket_detail_pages(const char *username,
                                         bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
                                         const matched_records_t *matched_records) {
     int ab, sb;
-    struct stat st;
 
-    if (stat(BUCKET_OUTPUT_DIR, &st) != 0) {
-        if (mkdir(BUCKET_OUTPUT_DIR, 0777) != 0) {
-            return -1;
-        }
-    } else if (!S_ISDIR(st.st_mode)) {
-        return -1;
-    }
+    if (ensure_bucket_output_dir_exists() != 0) return -1;
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-            char fn[128];
-            snprintf(fn, sizeof(fn), BUCKET_OUTPUT_DIR "/bucket_a%d_s%d.html", ab, sb);
+            char fn[PATH_MAX];
+            if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) return -1;
             if (emit_bucket_detail_page(fn, username, basis_str, ab, sb, &details[ab][sb], matched_records) != 0) {
                 return -1;
             }
@@ -1172,7 +1366,7 @@ static int read_one_file(const char *filepath,
     bin_file_header_t fh;
     int rc = -1;
 
-    fp = fopen(filepath, "rb");
+    fp = counted_fopen(filepath, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", filepath, strerror(errno));
         sum->bad_input_files++;
@@ -1181,7 +1375,7 @@ static int read_one_file(const char *filepath,
 
     sum->scanned_input_files++;
 
-    if (fread(&fh, sizeof(fh), 1, fp) != 1) {
+    if (counted_fread(&fh, sizeof(fh), 1, fp) != 1) {
         fprintf(stderr, "warn: short read on header: %s\n", filepath);
         sum->bad_input_files++;
         goto out;
@@ -1201,7 +1395,7 @@ static int read_one_file(const char *filepath,
 
         memset(&r, 0, sizeof(r));
 
-        n = fread(&r, sizeof(r), 1, fp);
+        n = counted_fread(&r, sizeof(r), 1, fp);
         if (n != 1) {
             if (feof(fp)) rc = 0;
             else {
@@ -1220,7 +1414,7 @@ static int read_one_file(const char *filepath,
                 sum->bad_input_files++;
                 break;
             }
-            if (fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
+            if (counted_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
                 fprintf(stderr, "warn: path read failed in %s\n", filepath);
                 sum->bad_input_files++;
                 free(pathbuf);
@@ -1302,7 +1496,7 @@ static int read_one_file(const char *filepath,
     }
 
 out:
-    fclose(fp);
+    counted_fclose(fp);
     return rc;
 }
 
@@ -1326,25 +1520,55 @@ static void *worker_main(void *arg_void) {
     return NULL;
 }
 
-static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t *out_count) {
+static int scan_dir_collect_files(const char *dirpath,
+                                  uid_t target_uid,
+                                  char ***out_paths,
+                                  size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
     size_t count = 0;
     size_t cap = 0;
+    uint32_t uid_shards = 0;
+    int layout_rc;
+    int use_uid_shards = 0;
+    uint32_t wanted_shard = 0;
 
-    dir = opendir(dirpath);
+    layout_rc = read_uid_shard_layout(dirpath, &uid_shards);
+    if (layout_rc < 0) {
+        fprintf(stderr, "cannot read crawl manifest in %s\n", dirpath);
+        return -1;
+    }
+    if (layout_rc > 0) {
+        use_uid_shards = 1;
+        wanted_shard = ((uint32_t)target_uid) & (uid_shards - 1U);
+        g_input_layout = "uid_shards";
+        g_input_uid_shards = uid_shards;
+    } else {
+        g_input_layout = "legacy";
+        g_input_uid_shards = 0;
+    }
+
+    dir = counted_opendir(dirpath);
     if (!dir) {
         fprintf(stderr, "cannot open directory %s: %s\n", dirpath, strerror(errno));
         return -1;
     }
 
-    while ((de = readdir(dir)) != NULL) {
+    while ((de = counted_readdir(dir)) != NULL) {
         char full[PATH_MAX];
         char *copy;
 
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!starts_with_thread(de->d_name) || !has_bin_suffix(de->d_name)) continue;
+        if (!has_bin_suffix(de->d_name)) continue;
+
+        if (use_uid_shards) {
+            uint32_t shard = 0;
+            if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
+            if (shard != wanted_shard) continue;
+        } else {
+            if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
+        }
 
         if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
             fprintf(stderr, "warn: path too long: %s/%s\n", dirpath, de->d_name);
@@ -1356,7 +1580,7 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
             char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
             if (!tmp) {
                 size_t i;
-                closedir(dir);
+                counted_closedir(dir);
                 for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
                 return -1;
@@ -1368,7 +1592,7 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
         copy = strdup(full);
         if (!copy) {
             size_t i;
-            closedir(dir);
+            counted_closedir(dir);
             for (i = 0; i < count; i++) free(paths[i]);
             free(paths);
             return -1;
@@ -1377,63 +1601,66 @@ static int scan_dir_collect_files(const char *dirpath, char ***out_paths, size_t
         paths[count++] = copy;
     }
 
-    closedir(dir);
+    counted_closedir(dir);
     *out_paths = paths;
     *out_count = count;
     return 0;
 }
 
-static void emit_html(const char *username,
-                      uid_t uid,
-                      const char *basis_str,
-                      const summary_t *sum,
-                      size_t input_files,
-                      int threads_used) {
+static int emit_html(const char *report_path,
+                     const char *username,
+                     uid_t uid,
+                     const char *basis_str,
+                     const summary_t *sum,
+                     size_t input_files,
+                     int threads_used) {
+    FILE *out = counted_fopen(report_path, "w");
+    if (!out) return -1;
     int ab, sb;
     uint64_t max_cell_bytes = 0;
 
-    printf("<!DOCTYPE html>\n");
-    printf("<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    printf("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    printf("<title>Storage Report</title>\n");
-    printf("<style>\n");
-    printf("body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
-    printf("body.drawer-open{overflow:hidden}\n");
-    printf("h1{margin-bottom:8px}\n");
-    printf(".meta{margin-bottom:20px;color:#555}\n");
-    printf("table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
-    printf("th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
-    printf("th:first-child,td:first-child{text-align:left}\n");
-    printf("th{background:#f4f4f4}\n");
-    printf(".tot{font-weight:600;background:#fafafa}\n");
-    printf(".cell,.tot-cell{transition:background-color 0.2s ease}\n");
-    printf(".cell a,.tot-block{display:block;color:inherit;text-decoration:none;text-align:center;min-height:42px;padding:1px 0}\n");
-    printf(".cell-main{display:flex;align-items:center;justify-content:center;gap:4px;flex-wrap:wrap;line-height:1}\n");
-    printf(".cell-bytes{font-size:14px;font-weight:600}\n");
-    printf(".cell-pct{font-size:10px;font-weight:700;color:#6a4d1a;background:rgba(255,255,255,0.78);padding:1px 4px;border-radius:999px;line-height:1}\n");
-    printf(".cell-sub{color:#666;font-size:10px;margin-top:2px;line-height:1.05}\n");
-    printf(".cell.active{outline:3px solid #8a6a2a;outline-offset:-3px}\n");
-    printf(".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
-    printf(".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
-    printf(".drawer{position:fixed;top:0;right:0;width:min(980px,92vw);height:100vh;background:#fff;box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;z-index:21;display:flex;flex-direction:column}\n");
-    printf(".drawer.open{transform:translateX(0)}\n");
-    printf(".drawer-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border-bottom:1px solid #ddd;background:#faf7ef}\n");
-    printf(".drawer-title{font-size:18px;font-weight:600;color:#222}\n");
-    printf(".drawer-sub{font-size:12px;color:#666;margin-top:4px}\n");
-    printf(".drawer-actions{display:flex;align-items:center;gap:10px}\n");
-    printf(".drawer-actions a,.drawer-actions button{font:inherit;font-size:13px;border:1px solid #c9b991;background:#fff8e8;color:#5a4214;padding:7px 10px;border-radius:6px;text-decoration:none;cursor:pointer}\n");
-    printf(".drawer-actions button{background:#fff}\n");
-    printf(".drawer-frame{border:0;width:100%%;flex:1;background:#fff}\n");
-    printf("@media (max-width:900px){body{margin:14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
-    printf("</style>\n");
-    printf("</head>\n<body>\n");
+    fprintf(out, "<!DOCTYPE html>\n");
+    fprintf(out, "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    fprintf(out, "<title>Storage Report</title>\n");
+    fprintf(out, "<style>\n");
+    fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
+    fprintf(out, "body.drawer-open{overflow:hidden}\n");
+    fprintf(out, "h1{margin-bottom:8px}\n");
+    fprintf(out, ".meta{margin-bottom:20px;color:#555}\n");
+    fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
+    fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
+    fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
+    fprintf(out, "th{background:#f4f4f4}\n");
+    fprintf(out, ".tot{font-weight:600;background:#fafafa}\n");
+    fprintf(out, ".cell,.tot-cell{transition:background-color 0.2s ease}\n");
+    fprintf(out, ".cell a,.tot-block{display:block;color:inherit;text-decoration:none;text-align:center;min-height:42px;padding:1px 0}\n");
+    fprintf(out, ".cell-main{display:flex;align-items:center;justify-content:center;gap:4px;flex-wrap:wrap;line-height:1}\n");
+    fprintf(out, ".cell-bytes{font-size:14px;font-weight:600}\n");
+    fprintf(out, ".cell-pct{font-size:10px;font-weight:700;color:#6a4d1a;background:rgba(255,255,255,0.78);padding:1px 4px;border-radius:999px;line-height:1}\n");
+    fprintf(out, ".cell-sub{color:#666;font-size:10px;margin-top:2px;line-height:1.05}\n");
+    fprintf(out, ".cell.active{outline:3px solid #8a6a2a;outline-offset:-3px}\n");
+    fprintf(out, ".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
+    fprintf(out, ".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
+    fprintf(out, ".drawer{position:fixed;top:0;right:0;width:min(980px,92vw);height:100vh;background:#fff;box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;z-index:21;display:flex;flex-direction:column}\n");
+    fprintf(out, ".drawer.open{transform:translateX(0)}\n");
+    fprintf(out, ".drawer-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border-bottom:1px solid #ddd;background:#faf7ef}\n");
+    fprintf(out, ".drawer-title{font-size:18px;font-weight:600;color:#222}\n");
+    fprintf(out, ".drawer-sub{font-size:12px;color:#666;margin-top:4px}\n");
+    fprintf(out, ".drawer-actions{display:flex;align-items:center;gap:10px}\n");
+    fprintf(out, ".drawer-actions a,.drawer-actions button{font:inherit;font-size:13px;border:1px solid #c9b991;background:#fff8e8;color:#5a4214;padding:7px 10px;border-radius:6px;text-decoration:none;cursor:pointer}\n");
+    fprintf(out, ".drawer-actions button{background:#fff}\n");
+    fprintf(out, ".drawer-frame{border:0;width:100%%;flex:1;background:#fff}\n");
+    fprintf(out, "@media (max-width:900px){body{margin:14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
+    fprintf(out, "</style>\n");
+    fprintf(out, "</head>\n<body>\n");
 
-    printf("<h1>Storage Report</h1>\n");
-    printf("<div class=\"meta\">User: <strong>");
-    html_escape(stdout, username);
-    printf("</strong> (uid=%lu) &nbsp; | &nbsp; Time basis: <strong>", (unsigned long)uid);
-    html_escape(stdout, basis_str);
-    printf("</strong> &nbsp; | &nbsp; Input files: <strong>%zu</strong> &nbsp; | &nbsp; Threads: <strong>%d</strong></div>\n",
+    fprintf(out, "<h1>Storage Report</h1>\n");
+    fprintf(out, "<div class=\"meta\">User: <strong>");
+    html_escape(out, username);
+    fprintf(out, "</strong> (uid=%lu) &nbsp; | &nbsp; Time basis: <strong>", (unsigned long)uid);
+    html_escape(out, basis_str);
+    fprintf(out, "</strong> &nbsp; | &nbsp; Input files: <strong>%zu</strong> &nbsp; | &nbsp; Threads: <strong>%d</strong></div>\n",
            input_files, threads_used);
 
     {
@@ -1444,17 +1671,17 @@ static void emit_html(const char *username,
         human_bytes(sum->total_bytes, totalb, sizeof(totalb));
         human_bytes(non_file_bytes, total_other_b, sizeof(total_other_b));
 
-        printf("<p>");
-        printf("Scanned records: %" PRIu64 "<br>\n", sum->scanned_records);
-        printf("Matched records: %" PRIu64 "<br>\n", sum->matched_records);
-        printf("Files: %" PRIu64 "<br>\n", sum->total_files);
-        printf("Directories: %" PRIu64 "<br>\n", sum->total_dirs);
-        printf("Links: %" PRIu64 "<br>\n", sum->total_links);
-        printf("Others: %" PRIu64 "<br>\n", non_file_count);
-        printf("Total capacity in files: %s (%" PRIu64 " bytes)<br>\n", totalb, sum->total_bytes);
-        printf("Total capacity in others: %s (%" PRIu64 " bytes)<br>\n", total_other_b, non_file_bytes);
-        printf("Bad input files: %" PRIu64, sum->bad_input_files);
-        printf("</p>\n");
+        fprintf(out, "<p>");
+        fprintf(out, "Scanned records: %" PRIu64 "<br>\n", sum->scanned_records);
+        fprintf(out, "Matched records: %" PRIu64 "<br>\n", sum->matched_records);
+        fprintf(out, "Files: %" PRIu64 "<br>\n", sum->total_files);
+        fprintf(out, "Directories: %" PRIu64 "<br>\n", sum->total_dirs);
+        fprintf(out, "Links: %" PRIu64 "<br>\n", sum->total_links);
+        fprintf(out, "Others: %" PRIu64 "<br>\n", non_file_count);
+        fprintf(out, "Total capacity in files: %s (%" PRIu64 " bytes)<br>\n", totalb, sum->total_bytes);
+        fprintf(out, "Total capacity in others: %s (%" PRIu64 " bytes)<br>\n", total_other_b, non_file_bytes);
+        fprintf(out, "Bad input files: %" PRIu64, sum->bad_input_files);
+        fprintf(out, "</p>\n");
     }
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
@@ -1463,20 +1690,20 @@ static void emit_html(const char *username,
         }
     }
 
-    printf("<table>\n");
-    printf("<tr><th>Age \\ Size</th>");
+    fprintf(out, "<table>\n");
+    fprintf(out, "<tr><th>Age \\ Size</th>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-        printf("<th>");
-        html_escape(stdout, size_bucket_names[sb]);
-        printf("</th>");
+        fprintf(out, "<th>");
+        html_escape(out, size_bucket_names[sb]);
+        fprintf(out, "</th>");
     }
-    printf("<th>Total</th></tr>\n");
+    fprintf(out, "<th>Total</th></tr>\n");
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         uint64_t row_total = 0;
-        printf("<tr><td>");
-        html_escape(stdout, age_bucket_names[ab]);
-        printf("</td>");
+        fprintf(out, "<tr><td>");
+        html_escape(out, age_bucket_names[ab]);
+        fprintf(out, "</td>");
 
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
             char hb[32];
@@ -1489,7 +1716,7 @@ static void emit_html(const char *username,
             if (sum->total_bytes) pct = 100.0 * (double)b / (double)sum->total_bytes;
             human_bytes(b, hb, sizeof(hb));
             heatmap_color(b, ab, max_cell_bytes, bg, sizeof(bg));
-            printf("<td class=\"cell\" style=\"background:%s\"><a class=\"bucket-link\" data-age=\"%d\" data-size=\"%d\" href=\"" BUCKET_OUTPUT_DIR "/bucket_a%d_s%d.html\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div><div class=\"cell-sub\">%" PRIu64 " files</div></a></td>", bg, ab, sb, ab, sb, hb, pct, f);
+            fprintf(out, "<td class=\"cell\" style=\"background:%s\"><a class=\"bucket-link\" data-age=\"%d\" data-size=\"%d\" href=\"%s/bucket_a%d_s%d.html\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div><div class=\"cell-sub\">%" PRIu64 " files</div></a></td>", bg, ab, sb, g_bucket_output_dir, ab, sb, hb, pct, f);
         }
 
         {
@@ -1499,13 +1726,13 @@ static void emit_html(const char *username,
             if (sum->total_bytes) pct = 100.0 * (double)row_total / (double)sum->total_bytes;
             human_bytes(row_total, hr, sizeof(hr));
             contribution_cell_color(pct, bg, sizeof(bg));
-            printf("<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hr, pct);
+            fprintf(out, "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hr, pct);
         }
 
-        printf("</tr>\n");
+        fprintf(out, "</tr>\n");
     }
 
-    printf("<tr class=\"tot\"><td>Total</td>");
+    fprintf(out, "<tr class=\"tot\"><td>Total</td>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         uint64_t col_total = 0;
         char hc[32];
@@ -1515,48 +1742,93 @@ static void emit_html(const char *username,
         if (sum->total_bytes) pct = 100.0 * (double)col_total / (double)sum->total_bytes;
         human_bytes(col_total, hc, sizeof(hc));
         contribution_cell_color(pct, bg, sizeof(bg));
-        printf("<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hc, pct);
+        fprintf(out, "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div></div></td>", bg, hc, pct);
     }
     {
         char ht[32];
         human_bytes(sum->total_bytes, ht, sizeof(ht));
-        printf("<td class=\"tot tot-cell\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">100%%</span></div></div></td>", ht);
+        fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">100%%</span></div></div></td>", ht);
     }
-    printf("</tr>\n");
+    fprintf(out, "</tr>\n");
 
-    printf("</table>\n");
-    printf("<div id='bucket-backdrop' class='drawer-backdrop'></div>\n");
-    printf("<aside id='bucket-drawer' class='drawer' aria-hidden='true'>\n");
-    printf("<div class='drawer-head'><div><div id='bucket-title' class='drawer-title'>Bucket Details</div><div class='drawer-sub'>Click a heatmap cell to inspect that bucket without leaving the report.</div></div><div class='drawer-actions'><a id='bucket-open' href='#' target='_blank' rel='noopener'>Open page</a><button type='button' id='bucket-close'>Close</button></div></div>\n");
-    printf("<iframe id='bucket-frame' class='drawer-frame' title='Bucket details' loading='lazy'></iframe>\n");
-    printf("</aside>\n");
-    printf("<script>\n");
-    printf("(function(){\n");
-    printf("var ageNames=['<30d','30-90d','90-180d','180-365d','1-3y','3y+'];\n");
-    printf("var sizeNames=['<4K','4K-1M','1M-100M','100M-1G','1G-10G','10G+'];\n");
-    printf("var drawer=document.getElementById('bucket-drawer');\n");
-    printf("var backdrop=document.getElementById('bucket-backdrop');\n");
-    printf("var frame=document.getElementById('bucket-frame');\n");
-    printf("var titleEl=document.getElementById('bucket-title');\n");
-    printf("var openEl=document.getElementById('bucket-open');\n");
-    printf("var closeEl=document.getElementById('bucket-close');\n");
-    printf("var activeCell=null;\n");
-    printf("function closeDrawer(){drawer.classList.remove('open');drawer.setAttribute('aria-hidden','true');backdrop.classList.remove('open');document.body.classList.remove('drawer-open');if(activeCell){activeCell.classList.remove('active');activeCell=null;}}\n");
-    printf("function openDrawer(link){var age=Number(link.dataset.age);var size=Number(link.dataset.size);titleEl.textContent='Bucket Details: '+ageNames[age]+' / '+sizeNames[size];frame.src=link.href;openEl.href=link.href;drawer.classList.add('open');drawer.setAttribute('aria-hidden','false');backdrop.classList.add('open');document.body.classList.add('drawer-open');if(activeCell){activeCell.classList.remove('active');}activeCell=link.closest('.cell');if(activeCell){activeCell.classList.add('active');}}\n");
-    printf("document.querySelectorAll('.bucket-link').forEach(function(link){link.addEventListener('click',function(ev){if(ev.defaultPrevented||ev.button!==0||ev.metaKey||ev.ctrlKey||ev.shiftKey||ev.altKey){return;}ev.preventDefault();openDrawer(link);});});\n");
-    printf("closeEl.addEventListener('click',closeDrawer);backdrop.addEventListener('click',closeDrawer);document.addEventListener('keydown',function(ev){if(ev.key==='Escape'){closeDrawer();}});\n");
-    printf("})();\n");
-    printf("</script>\n");
-    printf("</body>\n</html>\n");
+    fprintf(out, "</table>\n");
+    fprintf(out, "<div id='bucket-backdrop' class='drawer-backdrop'></div>\n");
+    fprintf(out, "<aside id='bucket-drawer' class='drawer' aria-hidden='true'>\n");
+    fprintf(out, "<div class='drawer-head'><div><div id='bucket-title' class='drawer-title'>Bucket Details</div><div class='drawer-sub'>Click a heatmap cell to inspect that bucket without leaving the report.</div></div><div class='drawer-actions'><a id='bucket-open' href='#' target='_blank' rel='noopener'>Open page</a><button type='button' id='bucket-close'>Close</button></div></div>\n");
+    fprintf(out, "<iframe id='bucket-frame' class='drawer-frame' title='Bucket details' loading='lazy'></iframe>\n");
+    fprintf(out, "</aside>\n");
+    fprintf(out, "<script>\n");
+    fprintf(out, "(function(){\n");
+    fprintf(out, "var ageNames=['<30d','30-90d','90-180d','180-365d','1-3y','3y+'];\n");
+    fprintf(out, "var sizeNames=['<4K','4K-1M','1M-100M','100M-1G','1G-10G','10G+'];\n");
+    fprintf(out, "var drawer=document.getElementById('bucket-drawer');\n");
+    fprintf(out, "var backdrop=document.getElementById('bucket-backdrop');\n");
+    fprintf(out, "var frame=document.getElementById('bucket-frame');\n");
+    fprintf(out, "var titleEl=document.getElementById('bucket-title');\n");
+    fprintf(out, "var openEl=document.getElementById('bucket-open');\n");
+    fprintf(out, "var closeEl=document.getElementById('bucket-close');\n");
+    fprintf(out, "var activeCell=null;\n");
+    fprintf(out, "function closeDrawer(){drawer.classList.remove('open');drawer.setAttribute('aria-hidden','true');backdrop.classList.remove('open');document.body.classList.remove('drawer-open');if(activeCell){activeCell.classList.remove('active');activeCell=null;}}\n");
+    fprintf(out, "function openDrawer(link){var age=Number(link.dataset.age);var size=Number(link.dataset.size);titleEl.textContent='Bucket Details: '+ageNames[age]+' / '+sizeNames[size];frame.src=link.href;openEl.href=link.href;drawer.classList.add('open');drawer.setAttribute('aria-hidden','false');backdrop.classList.add('open');document.body.classList.add('drawer-open');if(activeCell){activeCell.classList.remove('active');}activeCell=link.closest('.cell');if(activeCell){activeCell.classList.add('active');}}\n");
+    fprintf(out, "document.querySelectorAll('.bucket-link').forEach(function(link){link.addEventListener('click',function(ev){if(ev.defaultPrevented||ev.button!==0||ev.metaKey||ev.ctrlKey||ev.shiftKey||ev.altKey){return;}ev.preventDefault();openDrawer(link);});});\n");
+    fprintf(out, "closeEl.addEventListener('click',closeDrawer);backdrop.addEventListener('click',closeDrawer);document.addEventListener('keydown',function(ev){if(ev.key==='Escape'){closeDrawer();}});\n");
+    fprintf(out, "})();\n");
+    fprintf(out, "</script>\n");
+    fprintf(out, "</body>\n</html>\n");
+    if (counted_fclose(out) != 0) return -1;
+    return 0;
+}
+
+static void emit_run_stats(const char *username,
+                           uid_t uid,
+                           const char *basis_str,
+                           const char *dirpath,
+                           const char *report_path,
+                           size_t input_files,
+                           int threads_requested,
+                           int threads_used,
+                           const summary_t *sum,
+                           int bucket_pages_written,
+                           double elapsed_sec) {
+    fprintf(stderr, "report_type=ereport\n");
+    fprintf(stderr, "user=%s\n", username);
+    fprintf(stderr, "uid=%lu\n", (unsigned long)uid);
+    fprintf(stderr, "time_basis=%s\n", basis_str);
+    fprintf(stderr, "input_dir=%s\n", dirpath);
+    fprintf(stderr, "input_layout=%s\n", g_input_layout);
+    if (g_input_uid_shards) fprintf(stderr, "input_uid_shards=%u\n", g_input_uid_shards);
+    fprintf(stderr, "input_files=%zu\n", input_files);
+    fprintf(stderr, "threads_requested=%d\n", threads_requested);
+    fprintf(stderr, "threads_used=%d\n", threads_used);
+    fprintf(stderr, "report_path=%s\n", report_path);
+    fprintf(stderr, "bucket_pages_dir=%s\n", g_bucket_output_dir);
+    fprintf(stderr, "bucket_pages_written=%d\n", bucket_pages_written);
+    fprintf(stderr, "scanned_input_files=%" PRIu64 "\n", sum->scanned_input_files);
+    fprintf(stderr, "scanned_records=%" PRIu64 "\n", sum->scanned_records);
+    fprintf(stderr, "matched_records=%" PRIu64 "\n", sum->matched_records);
+    fprintf(stderr, "files=%" PRIu64 "\n", sum->total_files);
+    fprintf(stderr, "directories=%" PRIu64 "\n", sum->total_dirs);
+    fprintf(stderr, "links=%" PRIu64 "\n", sum->total_links);
+    fprintf(stderr, "others=%" PRIu64 "\n", (sum->matched_records - sum->matched_files));
+    fprintf(stderr, "total_capacity_in_files=%" PRIu64 "\n", sum->total_bytes);
+    fprintf(stderr, "total_capacity_in_others=%" PRIu64 "\n", (sum->total_capacity_bytes - sum->total_bytes));
+    fprintf(stderr, "bad_input_files=%" PRIu64 "\n", sum->bad_input_files);
+    fprintf(stderr, "io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
+    fprintf(stderr, "io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
+    fprintf(stderr, "io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
+    fprintf(stderr, "io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
+    fprintf(stderr, "io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
+    fprintf(stderr, "io_fread_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fread_calls));
+    fprintf(stderr, "elapsed_sec=%.3f\n", elapsed_sec);
 }
 
 int main(int argc, char **argv) {
-    const char *username;
+    const char *user_spec;
     const char *basis_str;
     const char *dirpath = ".";
     time_basis_t basis;
-    struct passwd *pw;
     uid_t target_uid;
+    char display_name[256];
     char **paths = NULL;
     size_t path_count = 0;
     int threads = DEFAULT_THREADS;
@@ -1569,14 +1841,25 @@ int main(int argc, char **argv) {
     matched_records_t final_matched_records;
     inode_set_t seen_inodes;
     time_t now;
+    char report_path[PATH_MAX];
     int i, ab, sb;
+    int bucket_pages_written = 0;
+    double t0, t1;
+
+    atomic_store(&g_io_opendir_calls, 0);
+    atomic_store(&g_io_readdir_calls, 0);
+    atomic_store(&g_io_closedir_calls, 0);
+    atomic_store(&g_io_fopen_calls, 0);
+    atomic_store(&g_io_fclose_calls, 0);
+    atomic_store(&g_io_fread_calls, 0);
+    t0 = now_sec();
 
     if (argc < 3 || argc > 5) {
-        fprintf(stderr, "Usage: %s <username> <atime|mtime|ctime> [bin_dir] [threads]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <username|uid> <atime|mtime|ctime> [bin_dir] [threads]\n", argv[0]);
         return 2;
     }
 
-    username = argv[1];
+    user_spec = argv[1];
     basis_str = argv[2];
     if (argc >= 4) dirpath = argv[3];
     if (argc == 5) {
@@ -1586,16 +1869,20 @@ int main(int argc, char **argv) {
 
     if (parse_time_basis(basis_str, &basis) != 0) die("time basis must be one of: atime, mtime, ctime");
 
-    pw = getpwnam(username);
-    if (!pw) {
-        fprintf(stderr, "unknown user: %s\n", username);
+    if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
+        fprintf(stderr, "unknown user or uid: %s\n", user_spec);
         return 1;
     }
-    target_uid = pw->pw_uid;
 
-    if (scan_dir_collect_files(dirpath, &paths, &path_count) != 0) return 1;
+    set_bucket_output_dir(display_name);
+    if (snprintf(report_path, sizeof(report_path), "%s/index.html", g_bucket_output_dir) >= (int)sizeof(report_path)) {
+        fprintf(stderr, "report path too long for %s\n", g_bucket_output_dir);
+        return 1;
+    }
+
+    if (scan_dir_collect_files(dirpath, target_uid, &paths, &path_count) != 0) return 1;
     if (path_count == 0) {
-        fprintf(stderr, "no thread_*.bin files found in %s\n", dirpath);
+        fprintf(stderr, "no matching input .bin files found in %s\n", dirpath);
         free(paths);
         return 1;
     }
@@ -1689,11 +1976,32 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (emit_all_bucket_detail_pages(username, basis_str, final_details, &final_matched_records) != 0) {
-        fprintf(stderr, "failed to write bucket detail pages\n");
+    if (ensure_bucket_output_dir_exists() != 0) {
+        fprintf(stderr, "failed to create report output directory %s: %s\n", g_bucket_output_dir, strerror(errno));
+        free(tids);
+        free(args);
+        for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+        free(paths);
+        pthread_mutex_destroy(&queue.mutex);
+        inode_set_destroy(&seen_inodes);
+        matched_records_free(&final_matched_records);
+        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+            for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+        }
+        return 1;
     }
 
-    emit_html(username, target_uid, basis_str, &final_sum, path_count, threads_used);
+    if (emit_all_bucket_detail_pages(display_name, basis_str, final_details, &final_matched_records) != 0) {
+        fprintf(stderr, "failed to write bucket detail pages\n");
+    } else {
+        bucket_pages_written = AGE_BUCKETS * SIZE_BUCKETS;
+    }
+
+    if (emit_html(report_path, display_name, target_uid, basis_str, &final_sum, path_count, threads_used) != 0) {
+        fprintf(stderr, "failed to write main report %s\n", report_path);
+    }
+    t1 = now_sec();
+    emit_run_stats(display_name, target_uid, basis_str, dirpath, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written, t1 - t0);
 
     free(tids);
     free(args);
