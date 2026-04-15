@@ -63,7 +63,7 @@
 #define FORMAT_VERSION 2
 
 #define LOCAL_STACK_DONATE_FLOOR 16
-#define DONATE_LIMIT_PER_DIR 2
+#define DONATE_LIMIT_PER_DIR 8
 
 typedef struct task_node {
     char *path;
@@ -248,6 +248,9 @@ static int g_active_workers_max = 0;
 static uint64_t g_active_workers_samples = 0;
 static uint64_t g_seconds_single_worker = 0;
 static uint64_t g_seconds_queue_empty_single_worker = 0;
+static double g_run_start_sec = 0.0;
+
+static double now_sec(void);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -382,6 +385,20 @@ static void human_decimal(double v, char *buf, size_t sz) {
     if (v >= 100.0) snprintf(buf, sz, "%.0f%s", v, units[i]);
     else if (v >= 10.0) snprintf(buf, sz, "%.1f%s", v, units[i]);
     else snprintf(buf, sz, "%.2f%s", v, units[i]);
+}
+
+static void format_duration(double sec, char *out, size_t out_sz) {
+    uint64_t total, hours, minutes, seconds;
+
+    if (!out || out_sz == 0) return;
+    if (sec < 0.0) sec = 0.0;
+
+    total = (uint64_t)(sec + 0.5);
+    hours = total / 3600;
+    minutes = (total % 3600) / 60;
+    seconds = total % 60;
+
+    snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, hours, minutes, seconds);
 }
 
 static void clear_status_line(void) {
@@ -1182,7 +1199,8 @@ static void *stats_thread_main(void *arg) {
             int active = atomic_load(&g_active_workers);
             unsigned int divisor = atomic_load(&g_seconds_seen);
             double ops_rate;
-            char te[32], tf[32], td[32], ts[32], re[32], pp[32];
+            double elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
+            char te[32], tf[32], td[32], ts[32], re[32], pp[32], elapsed_buf[32];
 
             if (divisor == 0) divisor = 1;
             ops_rate = (double)window_entries / (double)divisor;
@@ -1202,9 +1220,10 @@ static void *stats_thread_main(void *arg) {
             human_decimal((double)total_bytes, ts, sizeof(ts));
             human_decimal(ops_rate, re, sizeof(re));
             human_decimal((double)popped, pp, sizeof(pp));
+            format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
-            printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s            ",
-                   re, te, tf, td, ts, qdepth, writer_qdepth, active, pp);
+            printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s | el:%s            ",
+                   re, te, tf, td, ts, qdepth, writer_qdepth, active, pp, elapsed_buf);
             fflush(stdout);
         }
     }
@@ -1681,6 +1700,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_io_fflush_calls, 0);
 
     t0 = now_sec();
+    g_run_start_sec = t0;
 
     if (!g_no_write) {
         writer_threads_used = 0;
