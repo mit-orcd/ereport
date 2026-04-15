@@ -160,6 +160,17 @@ typedef struct {
 } dir_stack_t;
 
 typedef struct {
+    char *path;
+    int depth;
+} seed_work_t;
+
+typedef struct {
+    seed_work_t *items;
+    size_t count;
+    size_t cap;
+} seed_stack_t;
+
+typedef struct {
     uint32_t *items;
     size_t count;
     size_t cap;
@@ -1036,6 +1047,53 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
     return 0;
 }
 
+static int seed_stack_init(seed_stack_t *s) {
+    s->items = NULL;
+    s->count = 0;
+    s->cap = 0;
+    return 0;
+}
+
+static void seed_stack_destroy(seed_stack_t *s) {
+    size_t i;
+    for (i = 0; i < s->count; i++) free(s->items[i].path);
+    free(s->items);
+    s->items = NULL;
+    s->count = 0;
+    s->cap = 0;
+}
+
+static int seed_stack_push_take(seed_stack_t *s, char *path_owned, int depth) {
+    if (s->count == s->cap) {
+        size_t new_cap = (s->cap == 0) ? 64 : (s->cap * 2);
+        seed_work_t *new_items = (seed_work_t *)realloc(s->items, new_cap * sizeof(*new_items));
+        if (!new_items) return -1;
+        s->items = new_items;
+        s->cap = new_cap;
+    }
+
+    s->items[s->count].path = path_owned;
+    s->items[s->count].depth = depth;
+    s->count++;
+    return 0;
+}
+
+static int seed_stack_push_dup(seed_stack_t *s, const char *path, int depth) {
+    char *dup = strdup(path);
+    if (!dup) return -1;
+    if (seed_stack_push_take(s, dup, depth) != 0) {
+        free(dup);
+        return -1;
+    }
+    return 0;
+}
+
+static int seed_stack_pop(seed_stack_t *s, seed_work_t *work) {
+    if (s->count == 0) return -1;
+    *work = s->items[--s->count];
+    return 0;
+}
+
 
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
     uint64_t qdepth = atomic_load(&g_queue_depth);
@@ -1391,68 +1449,99 @@ static void *writer_thread_main(void *arg_void) {
 }
 
 static int walk_and_seed(const char *path,
-                         int depth,
                          shared_state_t *shared,
                          crawl_stats_t *stats,
                          perf_local_t *perf,
                          emit_context_t *emit,
                          task_queue_t *queue) {
-    struct stat st;
-    DIR *dir = NULL;
-    struct dirent *ent;
+    seed_stack_t stack;
 
-    memset(&st, 0, sizeof(st));
-    if (counted_lstat(path, &st) != 0) {
-        fprintf(stderr, "ERROR main lstat %s: %s\n", path, strerror(errno));
+    seed_stack_init(&stack);
+    if (seed_stack_push_dup(&stack, path, 0) != 0) {
+        fprintf(stderr, "ERROR main stack push %s: %s\n", path, strerror(errno));
         stats_add_error(shared);
         return -1;
     }
 
-    if (!S_ISDIR(st.st_mode) || depth < g_split_depth) {
-        record_ids_from_stat(&st);
-        stats_add_entry_local(stats, st.st_mode, (uint64_t)st.st_size);
-        perf_account_local(perf, st.st_mode, (uint64_t)st.st_size);
-    }
+    while (stack.count > 0) {
+        seed_work_t work;
+        char *cur_path;
+        int depth;
+        struct stat st;
+        DIR *dir = NULL;
+        struct dirent *ent;
 
-    if (depth < g_split_depth || !S_ISDIR(st.st_mode)) {
-        if (emit_record(emit, path, &st) != 0) {
-            fprintf(stderr, "ERROR main emit_record %s: %s\n", path, strerror(errno));
+        if (seed_stack_pop(&stack, &work) != 0) break;
+        cur_path = work.path;
+        depth = work.depth;
+
+        memset(&st, 0, sizeof(st));
+        if (counted_lstat(cur_path, &st) != 0) {
+            fprintf(stderr, "ERROR main lstat %s: %s\n", cur_path, strerror(errno));
             stats_add_error(shared);
-            return -1;
-        }
-    }
-
-    if (!S_ISDIR(st.st_mode)) return 0;
-
-    if (depth == g_split_depth) {
-        if (queue_push(queue, path, &st) != 0) {
-            fprintf(stderr, "ERROR main failed to enqueue split-depth dir: %s\n", path);
-            stats_add_error(shared);
-            return -1;
-        }
-        stats_add_split_dir(shared);
-        return 0;
-    }
-
-    dir = counted_opendir(path);
-    if (!dir) {
-        fprintf(stderr, "ERROR main opendir %s: %s\n", path, strerror(errno));
-        stats_add_error(shared);
-        return -1;
-    }
-
-    while ((ent = counted_readdir(dir)) != NULL) {
-        char child[PATH_MAX];
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-        if (join_path(path, ent->d_name, child, sizeof(child)) != 0) {
-            fprintf(stderr, "ERROR main path too long: %s/%s\n", path, ent->d_name);
-            stats_add_error(shared);
+            free(cur_path);
             continue;
         }
-        walk_and_seed(child, depth + 1, shared, stats, perf, emit, queue);
+
+        if (!S_ISDIR(st.st_mode) || depth < g_split_depth) {
+            record_ids_from_stat(&st);
+            stats_add_entry_local(stats, st.st_mode, (uint64_t)st.st_size);
+            perf_account_local(perf, st.st_mode, (uint64_t)st.st_size);
+        }
+
+        if (depth < g_split_depth || !S_ISDIR(st.st_mode)) {
+            if (emit_record(emit, cur_path, &st) != 0) {
+                fprintf(stderr, "ERROR main emit_record %s: %s\n", cur_path, strerror(errno));
+                stats_add_error(shared);
+                free(cur_path);
+                continue;
+            }
+        }
+
+        if (!S_ISDIR(st.st_mode)) {
+            free(cur_path);
+            continue;
+        }
+
+        if (depth == g_split_depth) {
+            if (queue_push(queue, cur_path, &st) != 0) {
+                fprintf(stderr, "ERROR main failed to enqueue split-depth dir: %s\n", cur_path);
+                stats_add_error(shared);
+                free(cur_path);
+                continue;
+            }
+            stats_add_split_dir(shared);
+            free(cur_path);
+            continue;
+        }
+
+        dir = counted_opendir(cur_path);
+        if (!dir) {
+            fprintf(stderr, "ERROR main opendir %s: %s\n", cur_path, strerror(errno));
+            stats_add_error(shared);
+            free(cur_path);
+            continue;
+        }
+
+        while ((ent = counted_readdir(dir)) != NULL) {
+            char child[PATH_MAX];
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+            if (join_path(cur_path, ent->d_name, child, sizeof(child)) != 0) {
+                fprintf(stderr, "ERROR main path too long: %s/%s\n", cur_path, ent->d_name);
+                stats_add_error(shared);
+                continue;
+            }
+            if (seed_stack_push_dup(&stack, child, depth + 1) != 0) {
+                fprintf(stderr, "ERROR main stack push %s: %s\n", child, strerror(errno));
+                stats_add_error(shared);
+            }
+        }
+
+        counted_closedir(dir);
+        free(cur_path);
     }
 
-    counted_closedir(dir);
+    seed_stack_destroy(&stack);
     return 0;
 }
 
@@ -1768,7 +1857,7 @@ int main(int argc, char **argv) {
         stats_add_worker_started(&shared);
     }
 
-    walk_and_seed(start_path, 0, &shared, &main_stats, &main_perf, &main_emit, &queue);
+    walk_and_seed(start_path, &shared, &main_stats, &main_perf, &main_emit, &queue);
     perf_flush_local(&main_perf);
     if (emit_context_flush_all(&main_emit) != 0) stats_add_error(&shared);
 
