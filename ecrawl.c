@@ -62,8 +62,8 @@
 #define FILE_MAGIC_LEN 8
 #define FORMAT_VERSION 2
 
-#define LOCAL_STACK_DONATE_FLOOR 64
-#define DONATE_LIMIT_PER_DIR 1
+#define LOCAL_STACK_DONATE_FLOOR 16
+#define DONATE_LIMIT_PER_DIR 2
 
 typedef struct task_node {
     char *path;
@@ -96,6 +96,12 @@ typedef struct {
     uint64_t dirs;
     uint64_t bytes;
 } perf_local_t;
+
+typedef struct {
+    uint64_t donated_dirs;
+    uint64_t donation_attempts;
+    uint64_t donation_successes;
+} worker_aux_stats_t;
 
 typedef struct {
     pthread_mutex_t stats_mutex;
@@ -199,6 +205,7 @@ typedef struct {
     uint64_t worker_index;
     crawl_stats_t stats;
     perf_local_t perf;
+    worker_aux_stats_t aux;
 } worker_arg_t;
 
 typedef struct {
@@ -235,6 +242,12 @@ static double g_ops_rate_sum = 0.0;
 static double g_ops_rate_min = 0.0;
 static double g_ops_rate_max = 0.0;
 static uint64_t g_ops_rate_samples = 0;
+static uint64_t g_active_workers_sum = 0;
+static int g_active_workers_min = 0;
+static int g_active_workers_max = 0;
+static uint64_t g_active_workers_samples = 0;
+static uint64_t g_seconds_single_worker = 0;
+static uint64_t g_seconds_queue_empty_single_worker = 0;
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -369,6 +382,12 @@ static void human_decimal(double v, char *buf, size_t sz) {
     if (v >= 100.0) snprintf(buf, sz, "%.0f%s", v, units[i]);
     else if (v >= 10.0) snprintf(buf, sz, "%.1f%s", v, units[i]);
     else snprintf(buf, sz, "%.2f%s", v, units[i]);
+}
+
+static void clear_status_line(void) {
+    if (isatty(STDOUT_FILENO)) printf("\r\033[2K\r");
+    else printf("\r%160s\r", "");
+    fflush(stdout);
 }
 
 static int id_registry_contains_locked(const id_registry_t *r, uint32_t id) {
@@ -515,17 +534,19 @@ static void stats_add_split_dir(shared_state_t *s) {
     pthread_mutex_unlock(&s->stats_mutex);
 }
 
-static void stats_add_donated_dir(shared_state_t *s) {
-    pthread_mutex_lock(&s->stats_mutex);
-    s->donated_dirs++;
-    s->donation_successes++;
-    pthread_mutex_unlock(&s->stats_mutex);
+static void stats_merge_aux(shared_state_t *shared, const worker_aux_stats_t *local) {
+    shared->donated_dirs += local->donated_dirs;
+    shared->donation_attempts += local->donation_attempts;
+    shared->donation_successes += local->donation_successes;
 }
 
-static void stats_add_donation_attempt(shared_state_t *s) {
-    pthread_mutex_lock(&s->stats_mutex);
+static void stats_add_donated_dir_local(worker_aux_stats_t *s) {
+    s->donated_dirs++;
+    s->donation_successes++;
+}
+
+static void stats_add_donation_attempt_local(worker_aux_stats_t *s) {
     s->donation_attempts++;
-    pthread_mutex_unlock(&s->stats_mutex);
 }
 
 static void perf_flush_local(perf_local_t *perf) {
@@ -1015,6 +1036,7 @@ static int process_directory_iterative(dir_work_t *root_work,
                                        shared_state_t *shared,
                                        crawl_stats_t *stats,
                                        perf_local_t *perf,
+                                       worker_aux_stats_t *aux,
                                        emit_context_t *emit,
                                        task_queue_t *queue) {
     dir_stack_t stack;
@@ -1093,9 +1115,9 @@ static int process_directory_iterative(dir_work_t *root_work,
 
                 if (S_ISDIR(child_st.st_mode)) {
                     if (donated_this_dir < DONATE_LIMIT_PER_DIR && should_donate_work(shared, &stack)) {
-                        stats_add_donation_attempt(shared);
+                        stats_add_donation_attempt_local(aux);
                         if (queue_push(queue, child, &child_st) == 0) {
-                            stats_add_donated_dir(shared);
+                            stats_add_donated_dir_local(aux);
                             donated_this_dir++;
                         } else if (dir_stack_push_dup(&stack, child, &child_st) != 0) {
                             fprintf(stderr, "ERROR worker stack push %s: %s\n", child, strerror(errno));
@@ -1168,6 +1190,12 @@ static void *stats_thread_main(void *arg) {
             if (g_ops_rate_samples == 0 || ops_rate < g_ops_rate_min) g_ops_rate_min = ops_rate;
             if (g_ops_rate_samples == 0 || ops_rate > g_ops_rate_max) g_ops_rate_max = ops_rate;
             g_ops_rate_samples++;
+            g_active_workers_sum += (uint64_t)active;
+            if (g_active_workers_samples == 0 || active < g_active_workers_min) g_active_workers_min = active;
+            if (g_active_workers_samples == 0 || active > g_active_workers_max) g_active_workers_max = active;
+            g_active_workers_samples++;
+            if (active <= 1) g_seconds_single_worker++;
+            if (qdepth == 0 && active == 1) g_seconds_queue_empty_single_worker++;
             human_decimal((double)total_entries, te, sizeof(te));
             human_decimal((double)total_files, tf, sizeof(tf));
             human_decimal((double)total_dirs, td, sizeof(td));
@@ -1200,7 +1228,7 @@ static void *worker_thread_main(void *arg_void) {
         if (queue_pop_wait(arg->queue, &task) != 0) break;
 
         atomic_fetch_add(&g_active_workers, 1);
-        process_directory_iterative(&task, arg->shared, &arg->stats, &arg->perf, &emit, arg->queue);
+        process_directory_iterative(&task, arg->shared, &arg->stats, &arg->perf, &arg->aux, &emit, arg->queue);
         atomic_fetch_sub(&g_active_workers, 1);
 
         if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
@@ -1628,6 +1656,12 @@ int main(int argc, char **argv) {
     g_ops_rate_min = 0.0;
     g_ops_rate_max = 0.0;
     g_ops_rate_samples = 0;
+    g_active_workers_sum = 0;
+    g_active_workers_min = 0;
+    g_active_workers_max = 0;
+    g_active_workers_samples = 0;
+    g_seconds_single_worker = 0;
+    g_seconds_queue_empty_single_worker = 0;
     atomic_store(&g_queue_depth, 0);
     atomic_store(&g_active_workers, 0);
     atomic_store(&g_main_done, 0);
@@ -1703,6 +1737,7 @@ int main(int argc, char **argv) {
         worker_args[i].worker_index = (uint64_t)(i + 1);
         memset(&worker_args[i].stats, 0, sizeof(worker_args[i].stats));
         memset(&worker_args[i].perf, 0, sizeof(worker_args[i].perf));
+        memset(&worker_args[i].aux, 0, sizeof(worker_args[i].aux));
 
         if (pthread_create(&workers[i], NULL, worker_thread_main, &worker_args[i]) != 0) {
             fprintf(stderr, "ERROR failed to create worker %d\n", i + 1);
@@ -1730,7 +1765,10 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&queue.mutex);
 
     stats_merge(&shared, &main_stats);
-    for (i = 0; i < worker_count_started; i++) stats_merge(&shared, &worker_args[i].stats);
+    for (i = 0; i < worker_count_started; i++) {
+        stats_merge(&shared, &worker_args[i].stats);
+        stats_merge_aux(&shared, &worker_args[i].aux);
+    }
 
     if (!g_no_write) {
         for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
@@ -1740,7 +1778,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_stop_stats, 1);
     pthread_join(stats_thread, NULL);
 
-    printf("\n");
+    clear_status_line();
     t1 = now_sec();
 
     if (!g_no_write && write_crawl_manifest(start_path, worker_count_started) != 0) {
@@ -1800,12 +1838,24 @@ int main(int argc, char **argv) {
         double mean_ops = g_ops_rate_samples ? g_ops_rate_sum / (double)g_ops_rate_samples : avg_ops;
         double max_ops = g_ops_rate_samples ? g_ops_rate_max : avg_ops;
         double min_ops = g_ops_rate_samples ? g_ops_rate_min : avg_ops;
+        char avg_ops_buf[32], mean_ops_buf[32], max_ops_buf[32], min_ops_buf[32];
 
-        printf("avg_ops_per_sec=%.2f\n", avg_ops);
-        printf("mean_ops_per_sec=%.2f\n", mean_ops);
-        printf("max_ops_per_sec=%.2f\n", max_ops);
-        printf("min_ops_per_sec=%.2f\n", min_ops);
+        human_decimal(avg_ops, avg_ops_buf, sizeof(avg_ops_buf));
+        human_decimal(mean_ops, mean_ops_buf, sizeof(mean_ops_buf));
+        human_decimal(max_ops, max_ops_buf, sizeof(max_ops_buf));
+        human_decimal(min_ops, min_ops_buf, sizeof(min_ops_buf));
+
+        printf("avg_ops_per_sec=%s\n", avg_ops_buf);
+        printf("mean_ops_per_sec=%s\n", mean_ops_buf);
+        printf("max_ops_per_sec=%s\n", max_ops_buf);
+        printf("min_ops_per_sec=%s\n", min_ops_buf);
     }
+    printf("donate_floor=%d\n", LOCAL_STACK_DONATE_FLOOR);
+    printf("avg_active_workers=%.2f\n", g_active_workers_samples ? (double)g_active_workers_sum / (double)g_active_workers_samples : 0.0);
+    printf("min_active_workers=%d\n", g_active_workers_min);
+    printf("max_active_workers=%d\n", g_active_workers_max);
+    printf("seconds_single_worker=%" PRIu64 "\n", g_seconds_single_worker);
+    printf("seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
     printf("elapsed_sec=%.3f\n", t1 - t0);
 
     emit_context_destroy(&main_emit);
