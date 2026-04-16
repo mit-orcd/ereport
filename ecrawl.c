@@ -4,11 +4,10 @@
  * Compact binary-output local filesystem metadata crawler.
  *
  * Features:
- *   - Main thread walks to a configurable split depth.
- *   - Directories found at split depth are queued as initial work.
- *   - Worker threads consume queued directories.
+ *   - Main thread seeds the crawl with the root path only.
+ *   - Worker threads consume queued batches of directory work.
  *   - Workers traverse directories iteratively with a local stack.
- *   - Workers may donate deeper subdirectories back to the global queue.
+ *   - Workers may donate batches of accumulated subdirectories back to the global queue.
  *   - Crawl workers only crawl and enqueue record batches.
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output.
  *   - Existing shard files are appended to, never truncated.
@@ -36,6 +35,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdatomic.h>
 #include <dirent.h>
@@ -62,15 +62,13 @@
 #define FILE_MAGIC_LEN 8
 #define FORMAT_VERSION 2
 
-#define LOCAL_STACK_DONATE_FLOOR 16
-#define DONATE_LIMIT_PER_DIR 8
+#define LOCAL_STACK_DONATE_FLOOR 8
+#define DONATE_CHUNK_MIN 4
+#define DONATE_CHUNK_MAX 128
+#define DONATE_QUEUE_TARGET_PER_IDLE 4
+#define HARDLINK_REGISTRY_SHARDS 256U
 
-typedef struct task_node {
-    char *path;
-    struct stat st;
-    int have_stat;
-    struct task_node *next;
-} task_node_t;
+typedef struct task_node task_node_t;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -85,6 +83,7 @@ typedef struct {
     uint64_t total_entries;
     uint64_t total_dirs;
     uint64_t total_files;
+    uint64_t total_hardlink_files;
     uint64_t total_symlinks;
     uint64_t total_other;
     uint64_t total_bytes;
@@ -108,6 +107,7 @@ typedef struct {
     uint64_t total_entries;
     uint64_t total_dirs;
     uint64_t total_files;
+    uint64_t total_hardlink_files;
     uint64_t total_symlinks;
     uint64_t total_other;
     uint64_t total_errors;
@@ -149,6 +149,7 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     char *path;
+    size_t path_len;
     struct stat st;
     int have_stat;
 } dir_work_t;
@@ -160,17 +161,6 @@ typedef struct {
 } dir_stack_t;
 
 typedef struct {
-    char *path;
-    int depth;
-} seed_work_t;
-
-typedef struct {
-    seed_work_t *items;
-    size_t count;
-    size_t cap;
-} seed_stack_t;
-
-typedef struct {
     uint32_t *items;
     size_t count;
     size_t cap;
@@ -178,6 +168,23 @@ typedef struct {
     FILE *fp;
     char path[PATH_MAX];
 } id_registry_t;
+
+typedef struct {
+    uint64_t dev;
+    uint64_t ino;
+    unsigned char used;
+} inode_entry_t;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    inode_entry_t *items;
+    size_t count;
+    size_t cap;
+} inode_registry_shard_t;
+
+typedef struct {
+    inode_registry_shard_t shards[HARDLINK_REGISTRY_SHARDS];
+} inode_registry_t;
 
 typedef struct record_batch {
     unsigned char *data;
@@ -218,6 +225,13 @@ typedef struct {
     perf_local_t perf;
     worker_aux_stats_t aux;
 } worker_arg_t;
+
+struct task_node {
+    dir_work_t *items;
+    size_t count;
+    size_t cap;
+    struct task_node *next;
+};
 
 typedef struct {
     writer_queue_t *queue;
@@ -262,6 +276,9 @@ static uint64_t g_seconds_queue_empty_single_worker = 0;
 static double g_run_start_sec = 0.0;
 
 static double now_sec(void);
+static void dir_stack_destroy(dir_stack_t *s);
+static void stats_add_error(shared_state_t *s);
+static void perf_flush_local(perf_local_t *perf);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -283,6 +300,10 @@ static atomic_ullong g_io_fclose_calls     = 0;
 static atomic_ullong g_io_fwrite_calls     = 0;
 static atomic_ullong g_io_fflush_calls     = 0;
 
+#define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
+#define ATOMIC_SUB_RELAXED(obj, value) atomic_fetch_sub_explicit((obj), (value), memory_order_relaxed)
+#define ATOMIC_LOAD_RELAXED(obj) atomic_load_explicit((obj), memory_order_relaxed)
+
 static int g_split_depth = 2;
 static int g_writer_threads = DEFAULT_WRITER_THREADS;
 static uint32_t g_uid_shards = DEFAULT_UID_SHARDS;
@@ -293,54 +314,60 @@ static int g_no_write = 0;
 static char g_output_dir[PATH_MAX] = ".";
 static id_registry_t g_uid_registry;
 static id_registry_t g_gid_registry;
+static inode_registry_t g_hardlink_registry;
 
 static FILE *counted_fopen(const char *path, const char *mode) {
-    atomic_fetch_add(&g_io_fopen_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_fopen_calls, 1);
     return fopen(path, mode);
 }
 
 static int counted_fclose(FILE *fp) {
-    atomic_fetch_add(&g_io_fclose_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_fclose_calls, 1);
     return fclose(fp);
 }
 
 static size_t counted_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp) {
-    atomic_fetch_add(&g_io_fwrite_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_fwrite_calls, 1);
     return fwrite(ptr, size, nmemb, fp);
 }
 
 static int counted_fflush(FILE *fp) {
-    atomic_fetch_add(&g_io_fflush_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_fflush_calls, 1);
     return fflush(fp);
 }
 
 static int counted_stat(const char *path, struct stat *st) {
-    atomic_fetch_add(&g_io_stat_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_stat_calls, 1);
     return stat(path, st);
 }
 
 static int counted_lstat(const char *path, struct stat *st) {
-    atomic_fetch_add(&g_io_lstat_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
     return lstat(path, st);
 }
 
+static int counted_fstatat_nofollow(int dirfd_value, const char *name, struct stat *st) {
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
+    return fstatat(dirfd_value, name, st, AT_SYMLINK_NOFOLLOW);
+}
+
 static int counted_mkdir(const char *path, mode_t mode) {
-    atomic_fetch_add(&g_io_mkdir_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_mkdir_calls, 1);
     return mkdir(path, mode);
 }
 
 static DIR *counted_opendir(const char *path) {
-    atomic_fetch_add(&g_io_opendir_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_opendir_calls, 1);
     return opendir(path);
 }
 
 static struct dirent *counted_readdir(DIR *dir) {
-    atomic_fetch_add(&g_io_readdir_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_readdir_calls, 1);
     return readdir(dir);
 }
 
 static int counted_closedir(DIR *dir) {
-    atomic_fetch_add(&g_io_closedir_calls, 1);
+    ATOMIC_ADD_RELAXED(&g_io_closedir_calls, 1);
     return closedir(dir);
 }
 
@@ -373,15 +400,56 @@ static int shard_digits_for(uint32_t shards) {
     return digits;
 }
 
-static int join_path(const char *base, const char *name, char *out, size_t out_sz) {
-    int n;
+static int join_path_fast(const char *base, size_t base_len,
+                          const char *name, size_t name_len,
+                          char *out, size_t out_sz) {
+    size_t need;
 
     if (!base || !name || !out || out_sz == 0) return -1;
 
-    if (strcmp(base, "/") == 0) n = snprintf(out, out_sz, "/%s", name);
-    else n = snprintf(out, out_sz, "%s/%s", base, name);
+    if (base_len == 1 && base[0] == '/') {
+        need = 1 + name_len + 1;
+        if (need > out_sz) return -1;
+        out[0] = '/';
+        if (name_len > 0) memcpy(out + 1, name, name_len);
+        out[1 + name_len] = '\0';
+        return 0;
+    }
 
-    return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
+    need = base_len + 1 + name_len + 1;
+    if (need > out_sz) return -1;
+    memcpy(out, base, base_len);
+    out[base_len] = '/';
+    if (name_len > 0) memcpy(out + base_len + 1, name, name_len);
+    out[base_len + 1 + name_len] = '\0';
+    return 0;
+}
+
+static int join_path_alloc(const char *base, size_t base_len,
+                           const char *name, size_t name_len,
+                           char **out_path, size_t *out_len) {
+    char *path;
+    size_t need;
+
+    if (!base || !name || !out_path || !out_len) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (base_len == 1 && base[0] == '/') need = 1 + name_len + 1;
+    else need = base_len + 1 + name_len + 1;
+
+    path = (char *)malloc(need);
+    if (!path) return -1;
+    if (join_path_fast(base, base_len, name, name_len, path, need) != 0) {
+        free(path);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    *out_path = path;
+    *out_len = need - 1;
+    return 0;
 }
 
 static void human_decimal(double v, char *buf, size_t sz) {
@@ -525,20 +593,156 @@ static void record_ids_from_stat(const struct stat *st) {
     write_gid_if_new(st->st_gid);
 }
 
-static void stats_add_entry_local(crawl_stats_t *s, mode_t mode, uint64_t size) {
-    s->total_entries++;
-    if (S_ISDIR(mode)) s->total_dirs++;
-    else if (S_ISREG(mode)) {
-        s->total_files++;
-        s->total_bytes += size;
-    } else if (S_ISLNK(mode)) s->total_symlinks++;
-    else s->total_other++;
+static uint64_t inode_hash_u64(uint64_t dev, uint64_t ino) {
+    uint64_t x = dev + UINT64_C(0x9e3779b97f4a7c15);
+    x ^= ino + UINT64_C(0x9e3779b97f4a7c15) + (x << 6) + (x >> 2);
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static int inode_registry_resize_locked(inode_registry_shard_t *r, size_t new_cap) {
+    inode_entry_t *new_items;
+    size_t i;
+
+    new_items = (inode_entry_t *)calloc(new_cap, sizeof(*new_items));
+    if (!new_items) return -1;
+
+    for (i = 0; i < r->cap; i++) {
+        inode_entry_t entry;
+        size_t idx;
+
+        if (!r->items[i].used) continue;
+        entry = r->items[i];
+        idx = (size_t)(inode_hash_u64(entry.dev, entry.ino) & (uint64_t)(new_cap - 1));
+        while (new_items[idx].used) idx = (idx + 1) & (new_cap - 1);
+        new_items[idx] = entry;
+    }
+
+    free(r->items);
+    r->items = new_items;
+    r->cap = new_cap;
+    return 0;
+}
+
+static int inode_registry_mark_seen(inode_registry_t *r, uint64_t dev, uint64_t ino) {
+    int result = 0;
+    uint64_t hash = inode_hash_u64(dev, ino);
+    inode_registry_shard_t *shard = &r->shards[hash & (HARDLINK_REGISTRY_SHARDS - 1U)];
+
+    pthread_mutex_lock(&shard->mutex);
+
+    if (shard->cap == 0) {
+        if (inode_registry_resize_locked(shard, 1U << 12) != 0) {
+            pthread_mutex_unlock(&shard->mutex);
+            return -1;
+        }
+    } else if ((shard->count + 1) * 10 >= shard->cap * 7) {
+        if (inode_registry_resize_locked(shard, shard->cap << 1) != 0) {
+            pthread_mutex_unlock(&shard->mutex);
+            return -1;
+        }
+    }
+
+    {
+        size_t idx = (size_t)(hash & (uint64_t)(shard->cap - 1));
+        while (shard->items[idx].used) {
+            if (shard->items[idx].dev == dev && shard->items[idx].ino == ino) {
+                result = 0;
+                pthread_mutex_unlock(&shard->mutex);
+                return result;
+            }
+            idx = (idx + 1) & (shard->cap - 1);
+        }
+
+        shard->items[idx].used = 1;
+        shard->items[idx].dev = dev;
+        shard->items[idx].ino = ino;
+        shard->count++;
+        result = 1;
+    }
+
+    pthread_mutex_unlock(&shard->mutex);
+    return result;
+}
+
+static int inode_registry_init(inode_registry_t *r) {
+    size_t i;
+
+    memset(r, 0, sizeof(*r));
+    for (i = 0; i < HARDLINK_REGISTRY_SHARDS; i++) {
+        if (pthread_mutex_init(&r->shards[i].mutex, NULL) != 0) {
+            while (i > 0) {
+                i--;
+                pthread_mutex_destroy(&r->shards[i].mutex);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void inode_registry_destroy(inode_registry_t *r) {
+    size_t i;
+
+    for (i = 0; i < HARDLINK_REGISTRY_SHARDS; i++) {
+        free(r->shards[i].items);
+        r->shards[i].items = NULL;
+        r->shards[i].count = 0;
+        r->shards[i].cap = 0;
+        pthread_mutex_destroy(&r->shards[i].mutex);
+    }
+}
+
+static uint64_t regular_file_byte_credit(shared_state_t *shared, crawl_stats_t *stats, const struct stat *st) {
+    int seen_result;
+
+    if (!S_ISREG(st->st_mode)) return 0;
+    if (st->st_nlink <= 1) return (uint64_t)st->st_size;
+
+    stats->total_hardlink_files++;
+    seen_result = inode_registry_mark_seen(&g_hardlink_registry, (uint64_t)st->st_dev, (uint64_t)st->st_ino);
+    if (seen_result < 0) {
+        stats_add_error(shared);
+        return (uint64_t)st->st_size;
+    }
+    return seen_result ? (uint64_t)st->st_size : 0;
+}
+
+static void account_entry_local(shared_state_t *shared, crawl_stats_t *stats, perf_local_t *perf, const struct stat *st) {
+    uint64_t byte_credit = 0;
+
+    if (!shared || !stats || !perf || !st) return;
+
+    stats->total_entries++;
+    perf->entries++;
+
+    if (S_ISDIR(st->st_mode)) {
+        stats->total_dirs++;
+        perf->dirs++;
+    } else if (S_ISREG(st->st_mode)) {
+        stats->total_files++;
+        perf->files++;
+        byte_credit = regular_file_byte_credit(shared, stats, st);
+        stats->total_bytes += byte_credit;
+        perf->bytes += byte_credit;
+    } else if (S_ISLNK(st->st_mode)) {
+        stats->total_symlinks++;
+    } else {
+        stats->total_other++;
+    }
+
+    if (perf->entries >= PERF_FLUSH_INTERVAL) perf_flush_local(perf);
 }
 
 static void stats_merge(shared_state_t *shared, const crawl_stats_t *local) {
     shared->total_entries += local->total_entries;
     shared->total_dirs += local->total_dirs;
     shared->total_files += local->total_files;
+    shared->total_hardlink_files += local->total_hardlink_files;
     shared->total_symlinks += local->total_symlinks;
     shared->total_other += local->total_other;
     shared->total_bytes += local->total_bytes;
@@ -556,25 +760,19 @@ static void stats_add_worker_started(shared_state_t *s) {
     pthread_mutex_unlock(&s->stats_mutex);
 }
 
-static void stats_add_split_dir(shared_state_t *s) {
-    pthread_mutex_lock(&s->stats_mutex);
-    s->split_dirs_enqueued++;
-    pthread_mutex_unlock(&s->stats_mutex);
-}
-
 static void stats_merge_aux(shared_state_t *shared, const worker_aux_stats_t *local) {
     shared->donated_dirs += local->donated_dirs;
     shared->donation_attempts += local->donation_attempts;
     shared->donation_successes += local->donation_successes;
 }
 
-static void stats_add_donated_dir_local(worker_aux_stats_t *s) {
-    s->donated_dirs++;
-    s->donation_successes++;
+static void stats_add_donated_dirs_local(worker_aux_stats_t *s, uint64_t count) {
+    s->donated_dirs += count;
+    s->donation_successes += count;
 }
 
-static void stats_add_donation_attempt_local(worker_aux_stats_t *s) {
-    s->donation_attempts++;
+static void stats_add_donation_attempt_local(worker_aux_stats_t *s, uint64_t count) {
+    s->donation_attempts += count;
 }
 
 static void perf_flush_local(perf_local_t *perf) {
@@ -582,37 +780,24 @@ static void perf_flush_local(perf_local_t *perf) {
 
     if (!perf || perf->entries == 0) return;
 
-    idx = atomic_load(&g_bucket_index);
-    atomic_fetch_add(&g_total_entries, perf->entries);
-    atomic_fetch_add(&g_window_entries, perf->entries);
-    atomic_fetch_add(&g_bucket_entries[idx], perf->entries);
+    idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
+    ATOMIC_ADD_RELAXED(&g_total_entries, perf->entries);
+    ATOMIC_ADD_RELAXED(&g_window_entries, perf->entries);
+    ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], perf->entries);
 
     if (perf->dirs > 0) {
-        atomic_fetch_add(&g_total_dirs, perf->dirs);
-        atomic_fetch_add(&g_window_dirs, perf->dirs);
-        atomic_fetch_add(&g_bucket_dirs[idx], perf->dirs);
+        ATOMIC_ADD_RELAXED(&g_total_dirs, perf->dirs);
+        ATOMIC_ADD_RELAXED(&g_window_dirs, perf->dirs);
+        ATOMIC_ADD_RELAXED(&g_bucket_dirs[idx], perf->dirs);
     }
     if (perf->files > 0) {
-        atomic_fetch_add(&g_total_files, perf->files);
-        atomic_fetch_add(&g_window_files, perf->files);
-        atomic_fetch_add(&g_bucket_files[idx], perf->files);
-        atomic_fetch_add(&g_total_bytes, perf->bytes);
+        ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
+        ATOMIC_ADD_RELAXED(&g_window_files, perf->files);
+        ATOMIC_ADD_RELAXED(&g_bucket_files[idx], perf->files);
+        ATOMIC_ADD_RELAXED(&g_total_bytes, perf->bytes);
     }
 
     memset(perf, 0, sizeof(*perf));
-}
-
-static void perf_account_local(perf_local_t *perf, mode_t mode, uint64_t size) {
-    if (!perf) return;
-
-    perf->entries++;
-    if (S_ISDIR(mode)) perf->dirs++;
-    else if (S_ISREG(mode)) {
-        perf->files++;
-        perf->bytes += size;
-    }
-
-    if (perf->entries >= PERF_FLUSH_INTERVAL) perf_flush_local(perf);
 }
 
 static int write_bin_header(FILE *fp) {
@@ -631,6 +816,7 @@ static void print_usage(const char *prog) {
             prog);
     fprintf(stderr, "Example: %s /data1 3 /scratch/crawl_out 8192 8\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1 3\n", prog);
+    fprintf(stderr, "Note: split-depth is accepted for compatibility; scheduling now seeds from the root path only.\n");
 }
 
 static int ensure_output_dir_exists(const char *path) {
@@ -698,8 +884,9 @@ static void queue_destroy(task_queue_t *q) {
     pthread_mutex_lock(&q->mutex);
     cur = q->head;
     while (cur) {
+        dir_stack_t task = {cur->items, cur->count, cur->cap};
         next = cur->next;
-        free(cur->path);
+        dir_stack_destroy(&task);
         free(cur);
         cur = next;
     }
@@ -709,24 +896,22 @@ static void queue_destroy(task_queue_t *q) {
     pthread_cond_destroy(&q->cond);
 }
 
-static int queue_push(task_queue_t *q, const char *path, const struct stat *st) {
-    task_node_t *node = (task_node_t *)malloc(sizeof(*node));
+static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
+    task_node_t *node;
+
+    if (!task || task->count == 0) return 0;
+
+    node = (task_node_t *)malloc(sizeof(*node));
     if (!node) return -1;
 
-    node->path = strdup(path);
-    if (!node->path) {
-        free(node);
-        return -1;
-    }
-    if (st) node->st = *st;
-    else memset(&node->st, 0, sizeof(node->st));
-    node->have_stat = st ? 1 : 0;
+    node->items = task->items;
+    node->count = task->count;
+    node->cap = task->cap;
     node->next = NULL;
 
     pthread_mutex_lock(&q->mutex);
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
-        free(node->path);
         free(node);
         return -1;
     }
@@ -734,13 +919,17 @@ static int queue_push(task_queue_t *q, const char *path, const struct stat *st) 
     else q->head = node;
     q->tail = node;
     q->queued_tasks++;
-    atomic_fetch_add(&g_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_queue_depth, 1);
     pthread_cond_signal(&q->cond);
     pthread_mutex_unlock(&q->mutex);
+
+    task->items = NULL;
+    task->count = 0;
+    task->cap = 0;
     return 0;
 }
 
-static int queue_pop_wait(task_queue_t *q, dir_work_t *work) {
+static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
     task_node_t *node;
 
     pthread_mutex_lock(&q->mutex);
@@ -762,14 +951,15 @@ static int queue_pop_wait(task_queue_t *q, dir_work_t *work) {
     node = q->head;
     q->head = node->next;
     if (!q->head) q->tail = NULL;
+    atomic_fetch_add(&g_active_workers, 1);
     pthread_mutex_unlock(&q->mutex);
 
-    atomic_fetch_sub(&g_queue_depth, 1);
-    atomic_fetch_add(&g_tasks_popped, 1);
+    ATOMIC_SUB_RELAXED(&g_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_tasks_popped, 1);
 
-    work->path = node->path;
-    work->st = node->st;
-    work->have_stat = node->have_stat;
+    task->items = node->items;
+    task->count = node->count;
+    task->cap = node->cap;
     free(node);
     return 0;
 }
@@ -833,8 +1023,8 @@ static int writer_queue_push(writer_queue_t *q, record_batch_t *batch) {
     q->tail = batch;
     q->count++;
 
-    atomic_fetch_add(&g_writer_queue_depth, 1);
-    atomic_fetch_add(&g_batches_enqueued, 1);
+    ATOMIC_ADD_RELAXED(&g_writer_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_batches_enqueued, 1);
 
     pthread_cond_signal(&q->cond_nonempty);
     pthread_mutex_unlock(&q->mutex);
@@ -861,8 +1051,8 @@ static record_batch_t *writer_queue_pop(writer_queue_t *q) {
     pthread_cond_signal(&q->cond_nonfull);
     pthread_mutex_unlock(&q->mutex);
 
-    atomic_fetch_sub(&g_writer_queue_depth, 1);
-    atomic_fetch_add(&g_batches_dequeued, 1);
+    ATOMIC_SUB_RELAXED(&g_writer_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_batches_dequeued, 1);
     return batch;
 }
 
@@ -926,20 +1116,18 @@ static int ensure_pending_capacity(pending_batch_t *p, size_t need) {
     return 0;
 }
 
-static int emit_record(emit_context_t *ctx, const char *path, const struct stat *st) {
+static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, const struct stat *st) {
     bin_record_hdr_t hdr;
     batch_frame_hdr_t frame;
     pending_batch_t *pending;
     uint32_t shard;
     int writer_index;
-    size_t path_len;
     size_t record_len;
     size_t frame_len;
 
     if (!ctx || !path || !st) return -1;
     if (g_no_write) return 0;
 
-    path_len = strlen(path);
     if (path_len > UINT16_MAX) return -1;
 
     memset(&hdr, 0, sizeof(hdr));
@@ -1014,7 +1202,7 @@ static void dir_stack_destroy(dir_stack_t *s) {
     s->cap = 0;
 }
 
-static int dir_stack_push_take(dir_stack_t *s, char *path_owned, const struct stat *st) {
+static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len, const struct stat *st) {
     if (s->count == s->cap) {
         size_t new_cap = (s->cap == 0) ? 64 : (s->cap * 2);
         dir_work_t *new_items = (dir_work_t *)realloc(s->items, new_cap * sizeof(*new_items));
@@ -1024,20 +1212,11 @@ static int dir_stack_push_take(dir_stack_t *s, char *path_owned, const struct st
     }
 
     s->items[s->count].path = path_owned;
+    s->items[s->count].path_len = path_len;
     if (st) s->items[s->count].st = *st;
     else memset(&s->items[s->count].st, 0, sizeof(s->items[s->count].st));
     s->items[s->count].have_stat = st ? 1 : 0;
     s->count++;
-    return 0;
-}
-
-static int dir_stack_push_dup(dir_stack_t *s, const char *path, const struct stat *st) {
-    char *dup = strdup(path);
-    if (!dup) return -1;
-    if (dir_stack_push_take(s, dup, st) != 0) {
-        free(dup);
-        return -1;
-    }
     return 0;
 }
 
@@ -1047,91 +1226,68 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
     return 0;
 }
 
-static int seed_stack_init(seed_stack_t *s) {
-    s->items = NULL;
-    s->count = 0;
-    s->cap = 0;
-    return 0;
-}
-
-static void seed_stack_destroy(seed_stack_t *s) {
-    size_t i;
-    for (i = 0; i < s->count; i++) free(s->items[i].path);
-    free(s->items);
-    s->items = NULL;
-    s->count = 0;
-    s->cap = 0;
-}
-
-static int seed_stack_push_take(seed_stack_t *s, char *path_owned, int depth) {
-    if (s->count == s->cap) {
-        size_t new_cap = (s->cap == 0) ? 64 : (s->cap * 2);
-        seed_work_t *new_items = (seed_work_t *)realloc(s->items, new_cap * sizeof(*new_items));
-        if (!new_items) return -1;
-        s->items = new_items;
-        s->cap = new_cap;
-    }
-
-    s->items[s->count].path = path_owned;
-    s->items[s->count].depth = depth;
-    s->count++;
-    return 0;
-}
-
-static int seed_stack_push_dup(seed_stack_t *s, const char *path, int depth) {
-    char *dup = strdup(path);
-    if (!dup) return -1;
-    if (seed_stack_push_take(s, dup, depth) != 0) {
-        free(dup);
-        return -1;
-    }
-    return 0;
-}
-
-static int seed_stack_pop(seed_stack_t *s, seed_work_t *work) {
-    if (s->count == 0) return -1;
-    *work = s->items[--s->count];
-    return 0;
-}
-
-
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
-    uint64_t qdepth = atomic_load(&g_queue_depth);
+    uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
     int active = atomic_load(&g_active_workers);
     int started = (int)shared->worker_threads_started;
+    int idle = started - active;
 
     if (started <= 1) return 0;
     if (active >= started) return 0;
     if (local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
-    if (qdepth >= (uint64_t)((started - active) * 2)) return 0;
+    if (qdepth >= (uint64_t)(idle * DONATE_QUEUE_TARGET_PER_IDLE)) return 0;
     return 1;
 }
 
-static int process_directory_iterative(dir_work_t *root_work,
+static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, worker_aux_stats_t *aux) {
+    dir_stack_t donated;
+    size_t count, start;
+
+    if (!local_stack || local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
+
+    count = local_stack->count / 2;
+    if (count < DONATE_CHUNK_MIN) count = DONATE_CHUNK_MIN;
+    if (count > DONATE_CHUNK_MAX) count = DONATE_CHUNK_MAX;
+    if (count >= local_stack->count) count = local_stack->count - 1;
+    if (count == 0) return 0;
+
+    dir_stack_init(&donated);
+    donated.items = (dir_work_t *)malloc(count * sizeof(*donated.items));
+    if (!donated.items) return -1;
+
+    donated.count = count;
+    donated.cap = count;
+    start = local_stack->count - count;
+    memcpy(donated.items, local_stack->items + start, count * sizeof(*donated.items));
+    local_stack->count = start;
+
+    stats_add_donation_attempt_local(aux, count);
+    if (queue_push_stack_take(queue, &donated) != 0) {
+        local_stack->count += count;
+        free(donated.items);
+        return -1;
+    }
+
+    stats_add_donated_dirs_local(aux, count);
+    return 0;
+}
+
+static int process_directory_iterative(dir_stack_t *stack,
                                        shared_state_t *shared,
                                        crawl_stats_t *stats,
                                        perf_local_t *perf,
                                        worker_aux_stats_t *aux,
                                        emit_context_t *emit,
                                        task_queue_t *queue) {
-    dir_stack_t stack;
-
-    dir_stack_init(&stack);
-    if (dir_stack_push_take(&stack, root_work->path, root_work->have_stat ? &root_work->st : NULL) != 0) {
-        fprintf(stderr, "ERROR worker stack push %s: %s\n", root_work->path, strerror(errno));
-        stats_add_error(shared);
-        return -1;
-    }
-    root_work->path = NULL;
-
-    while (stack.count > 0) {
+    while (stack->count > 0) {
         dir_work_t work;
         char *dir_path;
+        size_t dir_path_len;
         struct stat st;
         DIR *dir = NULL;
         struct dirent *ent;
 
-        if (dir_stack_pop(&stack, &work) != 0) break;
+        if (dir_stack_pop(stack, &work) != 0) break;
         dir_path = work.path;
 
         if (work.have_stat) st = work.st;
@@ -1146,9 +1302,9 @@ static int process_directory_iterative(dir_work_t *root_work,
         }
 
         record_ids_from_stat(&st);
-        stats_add_entry_local(stats, st.st_mode, (uint64_t)st.st_size);
-        perf_account_local(perf, st.st_mode, (uint64_t)st.st_size);
-        if (emit_record(emit, dir_path, &st) != 0) {
+        account_entry_local(shared, stats, perf, &st);
+        dir_path_len = work.path_len;
+        if (emit_record(emit, dir_path, dir_path_len, &st) != 0) {
             fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
             stats_add_error(shared);
             free(dir_path);
@@ -1169,44 +1325,62 @@ static int process_directory_iterative(dir_work_t *root_work,
         }
 
         {
-            int donated_this_dir = 0;
+            int dir_fd = dirfd(dir);
+            if (dir_fd < 0) {
+                fprintf(stderr, "ERROR worker dirfd %s: %s\n", dir_path, strerror(errno));
+                stats_add_error(shared);
+                counted_closedir(dir);
+                free(dir_path);
+                continue;
+            }
+
             while ((ent = counted_readdir(dir)) != NULL) {
                 char child[PATH_MAX];
+                size_t child_name_len;
                 struct stat child_st;
 
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-                if (join_path(dir_path, ent->d_name, child, sizeof(child)) != 0) {
+
+                if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                    fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
+                    stats_add_error(shared);
+                    continue;
+                }
+
+                child_name_len = strlen(ent->d_name);
+                if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
                     fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
                     stats_add_error(shared);
                     continue;
                 }
 
-                memset(&child_st, 0, sizeof(child_st));
-                if (counted_lstat(child, &child_st) != 0) {
-                    fprintf(stderr, "ERROR worker lstat %s: %s\n", child, strerror(errno));
-                    stats_add_error(shared);
-                    continue;
-                }
-
                 if (S_ISDIR(child_st.st_mode)) {
-                    if (donated_this_dir < DONATE_LIMIT_PER_DIR && should_donate_work(shared, &stack)) {
-                        stats_add_donation_attempt_local(aux);
-                        if (queue_push(queue, child, &child_st) == 0) {
-                            stats_add_donated_dir_local(aux);
-                            donated_this_dir++;
-                        } else if (dir_stack_push_dup(&stack, child, &child_st) != 0) {
-                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child, strerror(errno));
-                            stats_add_error(shared);
-                        }
-                    } else if (dir_stack_push_dup(&stack, child, &child_st) != 0) {
-                        fprintf(stderr, "ERROR worker stack push %s: %s\n", child, strerror(errno));
+                    char *child_path_owned;
+                    size_t child_path_len;
+
+                    if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                        &child_path_owned, &child_path_len) != 0) {
+                        fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
                         stats_add_error(shared);
+                        continue;
+                    }
+                    if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                        fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                        free(child_path_owned);
+                        stats_add_error(shared);
+                        continue;
+                    }
+                    while (should_donate_work(shared, stack)) {
+                        if (donate_stack_chunk(stack, queue, aux) != 0) {
+                            fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
+                            stats_add_error(shared);
+                            break;
+                        }
                     }
                 } else {
                     record_ids_from_stat(&child_st);
-                    stats_add_entry_local(stats, child_st.st_mode, (uint64_t)child_st.st_size);
-                    perf_account_local(perf, child_st.st_mode, (uint64_t)child_st.st_size);
-                    if (emit_record(emit, child, &child_st) != 0) {
+                    account_entry_local(shared, stats, perf, &child_st);
+                    if (emit_record(emit, child, dir_path_len + child_name_len + (dir_path_len == 1 && dir_path[0] == '/' ? 0 : 1), &child_st) != 0) {
                         fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                         stats_add_error(shared);
                     }
@@ -1218,7 +1392,6 @@ static int process_directory_iterative(dir_work_t *root_work,
         free(dir_path);
     }
 
-    dir_stack_destroy(&stack);
     return 0;
 }
 
@@ -1300,11 +1473,10 @@ static void *worker_thread_main(void *arg_void) {
     }
 
     for (;;) {
-        dir_work_t task;
+        dir_stack_t task;
 
         if (queue_pop_wait(arg->queue, &task) != 0) break;
 
-        atomic_fetch_add(&g_active_workers, 1);
         process_directory_iterative(&task, arg->shared, &arg->stats, &arg->perf, &arg->aux, &emit, arg->queue);
         atomic_fetch_sub(&g_active_workers, 1);
 
@@ -1314,7 +1486,7 @@ static void *worker_thread_main(void *arg_void) {
             pthread_mutex_unlock(&arg->queue->mutex);
         }
 
-        free(task.path);
+        dir_stack_destroy(&task);
     }
 
     perf_flush_local(&arg->perf);
@@ -1448,100 +1620,42 @@ static void *writer_thread_main(void *arg_void) {
     return NULL;
 }
 
-static int walk_and_seed(const char *path,
-                         shared_state_t *shared,
-                         crawl_stats_t *stats,
-                         perf_local_t *perf,
-                         emit_context_t *emit,
-                         task_queue_t *queue) {
-    seed_stack_t stack;
+static int enqueue_root_task(const char *path, shared_state_t *shared, task_queue_t *queue) {
+    dir_stack_t task;
+    struct stat st;
+    char *dup;
+    size_t path_len;
 
-    seed_stack_init(&stack);
-    if (seed_stack_push_dup(&stack, path, 0) != 0) {
+    dir_stack_init(&task);
+    memset(&st, 0, sizeof(st));
+    if (counted_lstat(path, &st) != 0) {
+        fprintf(stderr, "ERROR main lstat %s: %s\n", path, strerror(errno));
+        stats_add_error(shared);
+        return -1;
+    }
+
+    dup = strdup(path);
+    if (!dup) {
         fprintf(stderr, "ERROR main stack push %s: %s\n", path, strerror(errno));
         stats_add_error(shared);
         return -1;
     }
 
-    while (stack.count > 0) {
-        seed_work_t work;
-        char *cur_path;
-        int depth;
-        struct stat st;
-        DIR *dir = NULL;
-        struct dirent *ent;
-
-        if (seed_stack_pop(&stack, &work) != 0) break;
-        cur_path = work.path;
-        depth = work.depth;
-
-        memset(&st, 0, sizeof(st));
-        if (counted_lstat(cur_path, &st) != 0) {
-            fprintf(stderr, "ERROR main lstat %s: %s\n", cur_path, strerror(errno));
-            stats_add_error(shared);
-            free(cur_path);
-            continue;
-        }
-
-        if (!S_ISDIR(st.st_mode) || depth < g_split_depth) {
-            record_ids_from_stat(&st);
-            stats_add_entry_local(stats, st.st_mode, (uint64_t)st.st_size);
-            perf_account_local(perf, st.st_mode, (uint64_t)st.st_size);
-        }
-
-        if (depth < g_split_depth || !S_ISDIR(st.st_mode)) {
-            if (emit_record(emit, cur_path, &st) != 0) {
-                fprintf(stderr, "ERROR main emit_record %s: %s\n", cur_path, strerror(errno));
-                stats_add_error(shared);
-                free(cur_path);
-                continue;
-            }
-        }
-
-        if (!S_ISDIR(st.st_mode)) {
-            free(cur_path);
-            continue;
-        }
-
-        if (depth == g_split_depth) {
-            if (queue_push(queue, cur_path, &st) != 0) {
-                fprintf(stderr, "ERROR main failed to enqueue split-depth dir: %s\n", cur_path);
-                stats_add_error(shared);
-                free(cur_path);
-                continue;
-            }
-            stats_add_split_dir(shared);
-            free(cur_path);
-            continue;
-        }
-
-        dir = counted_opendir(cur_path);
-        if (!dir) {
-            fprintf(stderr, "ERROR main opendir %s: %s\n", cur_path, strerror(errno));
-            stats_add_error(shared);
-            free(cur_path);
-            continue;
-        }
-
-        while ((ent = counted_readdir(dir)) != NULL) {
-            char child[PATH_MAX];
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-            if (join_path(cur_path, ent->d_name, child, sizeof(child)) != 0) {
-                fprintf(stderr, "ERROR main path too long: %s/%s\n", cur_path, ent->d_name);
-                stats_add_error(shared);
-                continue;
-            }
-            if (seed_stack_push_dup(&stack, child, depth + 1) != 0) {
-                fprintf(stderr, "ERROR main stack push %s: %s\n", child, strerror(errno));
-                stats_add_error(shared);
-            }
-        }
-
-        counted_closedir(dir);
-        free(cur_path);
+    path_len = strlen(path);
+    if (dir_stack_push_take(&task, dup, path_len, &st) != 0) {
+        fprintf(stderr, "ERROR main stack push %s: %s\n", path, strerror(errno));
+        free(dup);
+        stats_add_error(shared);
+        return -1;
     }
 
-    seed_stack_destroy(&stack);
+    if (queue_push_stack_take(queue, &task) != 0) {
+        fprintf(stderr, "ERROR main failed to enqueue root task: %s\n", path);
+        dir_stack_destroy(&task);
+        stats_add_error(shared);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1561,8 +1675,10 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
 
     fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
     fprintf(fp, "layout=uid_shards\n");
+    fprintf(fp, "seed_mode=root_only\n");
     fprintf(fp, "start_path=%s\n", start_path);
     fprintf(fp, "split_depth=%d\n", g_split_depth);
+    fprintf(fp, "byte_accounting=unique_regular_files\n");
     fprintf(fp, "crawl_workers=%d\n", worker_count_started);
     fprintf(fp, "writer_threads=%d\n", g_writer_threads);
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
@@ -1584,9 +1700,6 @@ int main(int argc, char **argv) {
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
-    emit_context_t main_emit;
-    crawl_stats_t main_stats;
-    perf_local_t main_perf;
     double t0, t1;
     int worker_count_started = 0;
     int positional_count = 0;
@@ -1594,6 +1707,7 @@ int main(int argc, char **argv) {
     int writer_threads_used = 0;
     int uid_registry_ready = 0;
     int gid_registry_ready = 0;
+    int hardlink_registry_ready = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -1693,9 +1807,15 @@ int main(int argc, char **argv) {
     }
 
     memset(&shared, 0, sizeof(shared));
-    memset(&main_stats, 0, sizeof(main_stats));
-    memset(&main_perf, 0, sizeof(main_perf));
     pthread_mutex_init(&shared.stats_mutex, NULL);
+    if (inode_registry_init(&g_hardlink_registry) != 0) {
+        fprintf(stderr, "ERROR failed to initialize hardlink registry\n");
+        pthread_mutex_destroy(&shared.stats_mutex);
+        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+        return 1;
+    }
+    hardlink_registry_ready = 1;
     queue_init(&queue);
 
     if (!g_no_write) {
@@ -1709,6 +1829,7 @@ int main(int argc, char **argv) {
             free(writer_args);
             queue_destroy(&queue);
             pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
             if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
             if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
             return 1;
@@ -1723,26 +1844,12 @@ int main(int argc, char **argv) {
                 free(writer_args);
                 queue_destroy(&queue);
                 pthread_mutex_destroy(&shared.stats_mutex);
+                if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
                 if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
                 if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
                 return 1;
             }
         }
-    }
-
-    if (emit_context_init(&main_emit, writer_queues, writer_threads_used) != 0) {
-        fprintf(stderr, "ERROR failed to initialize main emit context\n");
-        if (!g_no_write) {
-            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
-            free(writer_queues);
-            free(writer_threads);
-            free(writer_args);
-        }
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
-        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
-        return 1;
     }
 
     for (i = 0; i < WINDOW_SECONDS; i++) {
@@ -1804,13 +1911,13 @@ int main(int argc, char **argv) {
         }
         if (writer_threads_used == 0) {
             fprintf(stderr, "ERROR no writer threads started\n");
-            emit_context_destroy(&main_emit);
             for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
             free(writer_queues);
             free(writer_threads);
             free(writer_args);
             queue_destroy(&queue);
             pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
             if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
             if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
             return 1;
@@ -1824,7 +1931,6 @@ int main(int argc, char **argv) {
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
             for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
         }
-        emit_context_destroy(&main_emit);
         if (!g_no_write) {
             for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
             free(writer_queues);
@@ -1833,6 +1939,7 @@ int main(int argc, char **argv) {
         }
         queue_destroy(&queue);
         pthread_mutex_destroy(&shared.stats_mutex);
+        if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
         if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
         if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
         return 1;
@@ -1857,9 +1964,7 @@ int main(int argc, char **argv) {
         stats_add_worker_started(&shared);
     }
 
-    walk_and_seed(start_path, &shared, &main_stats, &main_perf, &main_emit, &queue);
-    perf_flush_local(&main_perf);
-    if (emit_context_flush_all(&main_emit) != 0) stats_add_error(&shared);
+    enqueue_root_task(start_path, &shared, &queue);
 
     atomic_store(&g_main_done, 1);
     pthread_mutex_lock(&queue.mutex);
@@ -1873,7 +1978,6 @@ int main(int argc, char **argv) {
     pthread_cond_broadcast(&queue.cond);
     pthread_mutex_unlock(&queue.mutex);
 
-    stats_merge(&shared, &main_stats);
     for (i = 0; i < worker_count_started; i++) {
         stats_merge(&shared, &worker_args[i].stats);
         stats_merge_aux(&shared, &worker_args[i].aux);
@@ -1899,6 +2003,7 @@ int main(int argc, char **argv) {
     printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
     printf("output_layout=%s\n", g_no_write ? "none" : "uid_shards");
     printf("format_version=%u\n", FORMAT_VERSION);
+    printf("seed_mode=%s\n", "root_only");
     printf("split_depth=%d\n", g_split_depth);
     printf("uid_shards=%u\n", g_uid_shards);
     printf("uid_shard_digits=%d\n", g_shard_digits);
@@ -1908,6 +2013,7 @@ int main(int argc, char **argv) {
     printf("writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
     printf("record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
     printf("write_buffer_size=%u\n", g_no_write ? 0U : (unsigned)WRITE_BUFFER_SIZE);
+    printf("byte_accounting=%s\n", "unique_regular_files");
     printf("worker_threads_started=%" PRIu64 "\n", shared.worker_threads_started);
     printf("split_dirs_enqueued=%" PRIu64 "\n", shared.split_dirs_enqueued);
     printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
@@ -1923,6 +2029,7 @@ int main(int argc, char **argv) {
     printf("entries=%" PRIu64 "\n", shared.total_entries);
     printf("dirs=%" PRIu64 "\n", shared.total_dirs);
     printf("files=%" PRIu64 "\n", shared.total_files);
+    printf("hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
     printf("symlinks=%" PRIu64 "\n", shared.total_symlinks);
     printf("other=%" PRIu64 "\n", shared.total_other);
     printf("total_bytes=%" PRIu64 "\n", shared.total_bytes);
@@ -1967,7 +2074,6 @@ int main(int argc, char **argv) {
     printf("seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
     printf("elapsed_sec=%.3f\n", t1 - t0);
 
-    emit_context_destroy(&main_emit);
     if (!g_no_write) {
         for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
         free(writer_queues);
@@ -1978,5 +2084,6 @@ int main(int argc, char **argv) {
     pthread_mutex_destroy(&shared.stats_mutex);
     if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
     if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+    if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
     return 0;
 }
