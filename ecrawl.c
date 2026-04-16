@@ -1355,17 +1355,16 @@ static int process_directory_iterative(dir_stack_t *stack,
             while ((ent = counted_readdir(dir)) != NULL) {
                 size_t child_name_len;
                 struct stat child_st;
+#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
+                unsigned char child_d_type = ent->d_type;
+#else
+                unsigned char child_d_type = DT_UNKNOWN;
+#endif
 
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
 
-                if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
-                    fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
-                    stats_add_error(shared);
-                    continue;
-                }
-
                 child_name_len = strlen(ent->d_name);
-                if (S_ISDIR(child_st.st_mode)) {
+                if (child_d_type == DT_DIR) {
                     char *child_path_owned;
                     size_t child_path_len;
 
@@ -1375,7 +1374,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                         stats_add_error(shared);
                         continue;
                     }
-                    if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                    if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
                         fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
                         free(child_path_owned);
                         stats_add_error(shared);
@@ -1389,21 +1388,51 @@ static int process_directory_iterative(dir_stack_t *stack,
                         }
                     }
                 } else {
-                    record_ids_from_stat(&child_st);
-                    account_entry_local(shared, stats, perf, &child_st);
-                    if (!g_no_write) {
-                        char child[PATH_MAX];
-                        size_t child_path_len = dir_path_len + child_name_len +
-                                                ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+                    if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                        fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
+                        stats_add_error(shared);
+                        continue;
+                    }
+                    if (S_ISDIR(child_st.st_mode)) {
+                        char *child_path_owned;
+                        size_t child_path_len;
 
-                        if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
-                            fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                        if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                            &child_path_owned, &child_path_len) != 0) {
+                            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
                             stats_add_error(shared);
                             continue;
                         }
-                        if (emit_record(emit, child, child_path_len, &child_st) != 0) {
-                            fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                            free(child_path_owned);
                             stats_add_error(shared);
+                            continue;
+                        }
+                        while (should_donate_work(shared, stack)) {
+                            if (donate_stack_chunk(stack, queue, aux) != 0) {
+                                fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
+                                stats_add_error(shared);
+                                break;
+                            }
+                        }
+                    } else {
+                        record_ids_from_stat(&child_st);
+                        account_entry_local(shared, stats, perf, &child_st);
+                        if (!g_no_write) {
+                            char child[PATH_MAX];
+                            size_t child_path_len = dir_path_len + child_name_len +
+                                                    ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+
+                            if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
+                                fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                                stats_add_error(shared);
+                                continue;
+                            }
+                            if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                                fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                                stats_add_error(shared);
+                            }
                         }
                     }
                 }
