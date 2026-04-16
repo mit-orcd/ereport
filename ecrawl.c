@@ -1353,7 +1353,6 @@ static int process_directory_iterative(dir_stack_t *stack,
             }
 
             while ((ent = counted_readdir(dir)) != NULL) {
-                char child[PATH_MAX];
                 size_t child_name_len;
                 struct stat child_st;
 
@@ -1366,12 +1365,6 @@ static int process_directory_iterative(dir_stack_t *stack,
                 }
 
                 child_name_len = strlen(ent->d_name);
-                if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
-                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
-                    stats_add_error(shared);
-                    continue;
-                }
-
                 if (S_ISDIR(child_st.st_mode)) {
                     char *child_path_owned;
                     size_t child_path_len;
@@ -1398,9 +1391,20 @@ static int process_directory_iterative(dir_stack_t *stack,
                 } else {
                     record_ids_from_stat(&child_st);
                     account_entry_local(shared, stats, perf, &child_st);
-                    if (emit_record(emit, child, dir_path_len + child_name_len + (dir_path_len == 1 && dir_path[0] == '/' ? 0 : 1), &child_st) != 0) {
-                        fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
-                        stats_add_error(shared);
+                    if (!g_no_write) {
+                        char child[PATH_MAX];
+                        size_t child_path_len = dir_path_len + child_name_len +
+                                                ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+
+                        if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
+                            fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                            fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                            stats_add_error(shared);
+                        }
                     }
                 }
             }

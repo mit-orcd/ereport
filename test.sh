@@ -10,7 +10,7 @@ run_check() {
   local cmd=$2
 
   printf '\n[%s]\n' "$label"
-  time bash -lc "$cmd"
+  time bash -o pipefail -lc "$cmd"
 }
 
 run_check "files_count" \
