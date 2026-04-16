@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 
 import argparse
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import socket
+from functools import partial
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from socketserver import ThreadingMixIn
+
+try:
+    from http.server import ThreadingHTTPServer as BaseThreadingHTTPServer
+except ImportError:
+    class BaseThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        pass
+
+
+class ReusableThreadingHTTPServer(BaseThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def parse_args():
@@ -19,11 +33,19 @@ def main():
     if not root.is_dir():
         raise SystemExit(f'error: not a directory: {root}')
 
-    handler = lambda *a, **kw: SimpleHTTPRequestHandler(*a, directory=str(root), **kw)
-    server = ThreadingHTTPServer((args.bind, args.port), handler)
+    handler = partial(SimpleHTTPRequestHandler, directory=str(root))
+    try:
+        server = ReusableThreadingHTTPServer((args.bind, args.port), handler)
+    except OSError as exc:
+        raise SystemExit(f'error: cannot bind {args.bind}:{args.port}: {exc.strerror}') from exc
 
     print(f'Serving {root}')
-    print(f'URL: http://{args.bind}:{args.port}/')
+    if args.bind == '0.0.0.0':
+        hostname = socket.gethostname()
+        print(f'URL: http://127.0.0.1:{args.port}/')
+        print(f'URL: http://{hostname}:{args.port}/')
+    else:
+        print(f'URL: http://{args.bind}:{args.port}/')
     print('Press Ctrl-C to stop.')
 
     try:

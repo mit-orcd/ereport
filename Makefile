@@ -1,8 +1,12 @@
 # Compiler
 CC = gcc
+PYTHON3 ?= python3
 
 # Flags
 CFLAGS = -O2 -Wall -Wextra -pthread
+SERVE_ROOT ?= .
+SERVE_PORT ?= 8000
+SERVE_BIND ?= 127.0.0.1
 
 # Targets
 TARGETS = ereport_simple ereport ecrawl
@@ -29,9 +33,9 @@ clean:
 	rm -rf __pycache__
 
 serve:
-	./eserve.py .
+	$(PYTHON3) eserve.py --bind $(SERVE_BIND) --port $(SERVE_PORT) $(SERVE_ROOT)
 
 serve-public:
-	./eserve.py --bind 0.0.0.0 .
+	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(SERVE_ROOT)
 
 .PHONY: all clean debug serve serve-public
