@@ -40,6 +40,7 @@
 #include <stdatomic.h>
 #include <dirent.h>
 #include <limits.h>
+#include <time.h>
 #include <pwd.h>
 #include <grp.h>
 #include <stdarg.h>
@@ -285,6 +286,7 @@ static double now_sec(void);
 static void dir_stack_destroy(dir_stack_t *s);
 static void stats_add_error(shared_state_t *s);
 static void perf_flush_local(perf_local_t *perf);
+static int build_default_output_dir(char *out, size_t out_sz);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -856,6 +858,50 @@ static int ensure_output_dir_exists(const char *path) {
     }
     if (errno != ENOENT) return -1;
     return counted_mkdir(path, 0775) == 0 ? 0 : -1;
+}
+
+static int build_default_output_dir(char *out, size_t out_sz) {
+    static const char *months[] = {
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec"
+    };
+    char hostname_buf[256];
+    time_t now;
+    struct tm tm_now;
+    const char *month = "unk";
+    int n;
+
+    if (!out || out_sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(hostname_buf, 0, sizeof(hostname_buf));
+    if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) != 0) return -1;
+    hostname_buf[sizeof(hostname_buf) - 1] = '\0';
+    {
+        char *dot = strchr(hostname_buf, '.');
+        if (dot) *dot = '\0';
+    }
+
+    now = time(NULL);
+    if (now == (time_t)-1) return -1;
+    if (!localtime_r(&now, &tm_now)) return -1;
+    if (tm_now.tm_mon >= 0 && tm_now.tm_mon < 12) month = months[tm_now.tm_mon];
+
+    n = snprintf(out, out_sz, "%s_%s-%02d-%04d_%02d-%02d-%02d",
+                 hostname_buf,
+                 month,
+                 tm_now.tm_mday,
+                 tm_now.tm_year + 1900,
+                 tm_now.tm_hour,
+                 tm_now.tm_min,
+                 tm_now.tm_sec);
+    if (n < 0 || (size_t)n >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
 }
 
 static int build_shard_path(uint32_t shard, char *out, size_t out_sz) {
@@ -1768,6 +1814,7 @@ int main(int argc, char **argv) {
     double t0, t1;
     int worker_count_started = 0;
     int positional_count = 0;
+    int output_dir_explicit = 0;
     int writer_slots;
     int writer_threads_used = 0;
     int uid_registry_ready = 0;
@@ -1839,6 +1886,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "output-dir is too long\n");
             return 2;
         }
+        output_dir_explicit = 1;
     }
     if (positional_count >= 4) {
         unsigned long shards = strtoul(positionals[3], NULL, 10);
@@ -1859,6 +1907,13 @@ int main(int argc, char **argv) {
     g_shard_digits = shard_digits_for(g_uid_shards);
     writer_slots = g_writer_threads;
     writer_threads_used = g_no_write ? 0 : g_writer_threads;
+
+    if (!g_no_write && !output_dir_explicit) {
+        if (build_default_output_dir(g_output_dir, sizeof(g_output_dir)) != 0) {
+            fprintf(stderr, "ERROR failed to build default output directory name: %s\n", strerror(errno));
+            return 1;
+        }
+    }
 
     if (!g_no_write) {
         if (ensure_output_dir_exists(g_output_dir) != 0) {
