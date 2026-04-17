@@ -18,7 +18,7 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--verbose] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
+ *   ./ecrawl [--no-write] [--verbose] [--workers N] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
  */
 
 #define _XOPEN_SOURCE 700
@@ -320,6 +320,7 @@ static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
+static int g_worker_threads_limit = MAX_WORKERS;
 static char g_output_dir[PATH_MAX] = ".";
 static id_registry_t g_uid_registry;
 static id_registry_t g_gid_registry;
@@ -829,10 +830,11 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--verbose] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]\n",
+            "Usage: %s [--no-write] [--verbose] [--workers N] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]\n",
             prog);
     fprintf(stderr, "Example: %s /data1 3 /scratch/crawl_out 8192 8\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1 3\n", prog);
+    fprintf(stderr, "Workers: use --workers N to choose 1..%d crawl threads.\n", MAX_WORKERS);
     fprintf(stderr, "Default output shows a concise human-oriented summary; use --verbose for the full metrics dump.\n");
     fprintf(stderr, "Note: split-depth is accepted for compatibility; scheduling now seeds from the root path only.\n");
 }
@@ -1783,6 +1785,21 @@ int main(int argc, char **argv) {
             g_verbose = 1;
             continue;
         }
+        if (strcmp(argv[i], "--workers") == 0) {
+            long workers;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--workers requires a value\n");
+                print_usage(argv[0]);
+                return 2;
+            }
+            workers = strtol(argv[++i], NULL, 10);
+            if (workers < 1 || workers > MAX_WORKERS) {
+                fprintf(stderr, "workers must be between 1 and %d\n", MAX_WORKERS);
+                return 2;
+            }
+            g_worker_threads_limit = (int)workers;
+            continue;
+        }
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -2014,7 +2031,7 @@ int main(int argc, char **argv) {
     }
     stats_thread_started = 1;
 
-    for (i = 0; i < MAX_WORKERS; i++) {
+    for (i = 0; i < g_worker_threads_limit; i++) {
         worker_args[i].shared = &shared;
         worker_args[i].queue = &queue;
         worker_args[i].writer_queues = writer_queues;
@@ -2088,6 +2105,7 @@ int main(int argc, char **argv) {
             printf("start_path=%s\n", start_path);
             printf("no_write=%d\n", g_no_write);
             printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
+            printf("workers=%" PRIu64 "\n", shared.worker_threads_started);
             printf("writer_threads=%d\n", writer_threads_used);
             printf("byte_accounting=%s\n", "unique_regular_files");
             printf("entries=%" PRIu64 "\n", shared.total_entries);
@@ -2116,7 +2134,7 @@ int main(int argc, char **argv) {
             printf("uid_shards=%u\n", g_uid_shards);
             printf("uid_shard_digits=%d\n", g_shard_digits);
             printf("writer_threads=%d\n", writer_threads_used);
-            printf("max_worker_threads=%d\n", MAX_WORKERS);
+            printf("max_worker_threads=%d\n", g_worker_threads_limit);
             printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
             printf("writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
             printf("record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
