@@ -297,6 +297,11 @@ static atomic_ullong g_writer_queue_depth  = 0;
 static atomic_ullong g_batches_enqueued    = 0;
 static atomic_ullong g_batches_dequeued    = 0;
 
+/* pthread_cond_wait wakeups (cheap relaxed atomics); high counts suggest queue starvation. */
+static atomic_ullong g_wait_crawl_tasks = 0;
+static atomic_ullong g_wait_writer_push = 0;
+static atomic_ullong g_wait_writer_pop  = 0;
+
 static atomic_ullong g_io_lstat_calls      = 0;
 static atomic_ullong g_io_stat_calls       = 0;
 static atomic_ullong g_io_mkdir_calls      = 0;
@@ -1012,6 +1017,7 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
             return -1;
         }
         pthread_cond_wait(&q->cond, &q->mutex);
+        atomic_fetch_add_explicit(&g_wait_crawl_tasks, 1ULL, memory_order_relaxed);
     }
 
     node = q->head;
@@ -1077,6 +1083,7 @@ static int writer_queue_push(writer_queue_t *q, record_batch_t *batch) {
     pthread_mutex_lock(&q->mutex);
     while (!q->closed && q->count >= q->max_batches) {
         pthread_cond_wait(&q->cond_nonfull, &q->mutex);
+        atomic_fetch_add_explicit(&g_wait_writer_push, 1ULL, memory_order_relaxed);
     }
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
@@ -1108,6 +1115,7 @@ static record_batch_t *writer_queue_pop(writer_queue_t *q) {
             return NULL;
         }
         pthread_cond_wait(&q->cond_nonempty, &q->mutex);
+        atomic_fetch_add_explicit(&g_wait_writer_pop, 1ULL, memory_order_relaxed);
     }
 
     batch = q->head;
@@ -1800,6 +1808,12 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     return 0;
 }
 
+static void print_queue_wait_metrics(void) {
+    printf("wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
+    printf("wait_writer_push=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_push));
+    printf("wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
+}
+
 int main(int argc, char **argv) {
     const char *start_path;
     const char *positionals[5];
@@ -2024,6 +2038,9 @@ int main(int argc, char **argv) {
     atomic_store(&g_writer_queue_depth, 0);
     atomic_store(&g_batches_enqueued, 0);
     atomic_store(&g_batches_dequeued, 0);
+    atomic_store(&g_wait_crawl_tasks, 0);
+    atomic_store(&g_wait_writer_push, 0);
+    atomic_store(&g_wait_writer_pop, 0);
     atomic_store(&g_io_lstat_calls, 0);
     atomic_store(&g_io_stat_calls, 0);
     atomic_store(&g_io_mkdir_calls, 0);
@@ -2177,6 +2194,7 @@ int main(int argc, char **argv) {
             printf("avg_ops_per_sec=%s\n", avg_ops_buf);
             printf("elapsed_sec=%.3f\n", elapsed);
             printf("errors=%" PRIu64 "\n", shared.total_errors);
+            print_queue_wait_metrics();
         } else {
             tasks_popped = (uint64_t)atomic_load(&g_tasks_popped);
             printf("start_path=%s\n", start_path);
@@ -2244,6 +2262,7 @@ int main(int argc, char **argv) {
             printf("seconds_single_worker=%" PRIu64 "\n", g_seconds_single_worker);
             printf("seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
             printf("elapsed_sec=%.3f\n", elapsed);
+            print_queue_wait_metrics();
         }
     }
 

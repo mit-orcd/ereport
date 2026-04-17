@@ -9,7 +9,7 @@ SERVE_PORT ?= 8000
 SERVE_BIND ?= 127.0.0.1
 
 # Targets
-TARGETS = ereport_simple ereport ecrawl
+TARGETS = ereport_simple ereport ereport_index ecrawl
 
 # Default target
 all: $(TARGETS)
@@ -21,6 +21,9 @@ ereport_simple: ereport_simple.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 ereport: ereport.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+ereport_index: ereport_index.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 # Debug build
