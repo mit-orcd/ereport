@@ -56,24 +56,35 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--verbose] [--workers N] [--record-root <abs-path>] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
+./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
 ```
+
+Positional arguments are only **`start-path`** (required, absolute) and optionally **`output-dir`**. If **`output-dir`** is omitted, a timestamped directory name is created in the current working directory.
+
+Optional environment variables (no CLI flags for these):
+
+| Variable | Meaning |
+|----------|---------|
+| **`ECRAWL_WORKERS`** | Crawl worker threads (**1…16**, default **16**). |
+| **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
+| **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
 
 Examples:
 
 ```bash
 ./ecrawl /data1
 ./ecrawl --no-write /data1
-./ecrawl --no-write --verbose --workers 8 /data1
-./ecrawl /data1 2 fstor004_apr-17-2026_15-03-01
-./ecrawl --record-root /storage/srv07 /mnt/server07 3 crawl_srv07
+./ecrawl --no-write --verbose /data1
+ECRAWL_WORKERS=8 ./ecrawl /data1
+./ecrawl /data1 fstor004_apr-17-2026_15-03-01
+./ecrawl --record-root /storage/srv07 /mnt/server07 crawl_srv07
+ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /data1 /tmp/out
 ```
 
 Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
 - `--verbose` enables the full end-of-run diagnostics.
-- `--workers N` sets crawl worker count at runtime, up to the compiled maximum.
 - **`--record-root <abs-path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv07/...` vs `/storage/srv08/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. Requires `--record-root` to be an absolute path.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
@@ -102,9 +113,11 @@ Usage:
 ./ereport <username|uid> <atime|mtime|ctime> [bin_dir ...]
 ```
 
+If you **omit every `bin_dir`**, `ereport` reads crawl `.bin` files from the **current working directory** (`./`).
+
 Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** thread):
 
-- Set **`EREPORT_THREADS`** (default **32**). There is no `-t` / `--threads` CLI flag.
+- Set **`EREPORT_THREADS`** (default **32**). Thread count is **not** set on the command line.
 
 **Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (legacy vs `uid_shards`) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file (uid-sharded layout) or all matching bins (legacy)—so twenty servers mean twenty directories and twenty shard files merged into one report.
 
@@ -167,8 +180,9 @@ Examples:
 Default behavior:
 
 - **`--make`** writes under **`./<username>/index/`** (`paths.bin`, `tri_keys.bin`, etc.).
+- **`--make`** with only **`<username|uid>`** and no **`bin_dir`** arguments reads crawl input from **`./`** (same idea as `ereport`).
 - **`--search`** defaults **`index_dir`** to **`./index`** when omitted (relative to current working directory).
-- **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, overrides the default worker count for **`--make`** (otherwise compiled defaults apply).
+- **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallel **scan/index** workers for **`--make`** (default **32** when unset or invalid). The merge phase uses a **separate** parallelism model (CPU-based, capped), not this variable.
 
 JSON search output is one UTF-8 JSON object per line:
 
@@ -275,6 +289,8 @@ python3 eserve.py --bind 0.0.0.0 --port 8080 ./milechin
 ```
 
 ## Typical Workflow
+
+For **multiple crawl outputs** (e.g. several servers), run **`ecrawl`** once per output directory (often with distinct **`--record-root`** values), then pass **all** of those directories to one **`ereport`** and **`ereport_index --make`** command so the report and search index stay unified.
 
 ### 1. Crawl a filesystem
 
@@ -384,9 +400,21 @@ This means:
 
 where `total_capacity_in_files` is based on matched file records and hard-link-aware byte accounting from the crawl input.
 
+## Environment variables (quick reference)
+
+| Variable | Tool / context | Role |
+|----------|----------------|------|
+| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (1…16, default 16). |
+| **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default 8). |
+| **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
+| **`EREPORT_THREADS`** | `ereport` | Parallel bin chunk readers (default 32). |
+| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` | Parallel scan/index workers (default 32). |
+| **`EREPORT_INDEX_BIN`** | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
+
 ## Notes
 
 - The code assumes local filesystem crawl data written by `ecrawl` format version `2`.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - `ereport` and `ereport_index` both read only the shard files relevant to the requested user when uid-sharded input is available.
+- **`ECRAWL_UID_SHARDS`** for a crawl run should match across every output directory you later pass together to **`ereport`** / **`ereport_index --make`** (merged reports assume consistent shard layout).
 - The **`Makefile`** targets **`serve`** and **`serve-public`** wrap **`eserve.py`** and forward **`SERVE_ROOT`**, **`SERVE_PORT`**, and **`SERVE_BIND`**.

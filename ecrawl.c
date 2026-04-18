@@ -18,7 +18,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--verbose] [--workers N] [--record-root <abs-path>] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
+ *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ * Threading / shard layout (optional env): ECRAWL_WORKERS, ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
  */
 
 #define _XOPEN_SOURCE 700
@@ -406,6 +407,46 @@ static char file_type_char(mode_t mode) {
 
 static int is_power_of_two_u32(uint32_t v) {
     return v && ((v & (v - 1U)) == 0U);
+}
+
+/* Crawl worker thread count (1..MAX_WORKERS). Default: MAX_WORKERS. */
+static int parse_ecrawl_workers(void) {
+    const char *e = getenv("ECRAWL_WORKERS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return MAX_WORKERS;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > MAX_WORKERS) return MAX_WORKERS;
+    return (int)t;
+}
+
+/* Writer thread count for uid-sharded output. Default: DEFAULT_WRITER_THREADS. */
+static int parse_ecrawl_writer_threads_env(void) {
+    const char *e = getenv("ECRAWL_WRITER_THREADS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_WRITER_THREADS;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > 4096) return DEFAULT_WRITER_THREADS;
+    return (int)t;
+}
+
+/* Must be a power of two. Default: DEFAULT_UID_SHARDS. */
+static uint32_t parse_ecrawl_uid_shards_env(void) {
+    const char *e = getenv("ECRAWL_UID_SHARDS");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_UID_SHARDS;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v == 0UL || v > (unsigned long)UINT32_MAX || !is_power_of_two_u32((uint32_t)v))
+        return DEFAULT_UID_SHARDS;
+    return (uint32_t)v;
 }
 
 static uint32_t shard_for_uid(uid_t uid) {
@@ -842,16 +883,22 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--verbose] [--workers N] [--record-root <abs-path>] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]\n",
+            "Usage: %s [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
-    fprintf(stderr, "Example: %s /data1 3 /scratch/crawl_out 8192 8\n", prog);
-    fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 3 out_srv07\n", prog);
-    fprintf(stderr, "Benchmark: %s --no-write /data1 3\n", prog);
-    fprintf(stderr, "Workers: use --workers N to choose 1..%d crawl threads.\n", MAX_WORKERS);
+    fprintf(stderr, "Example: %s /data1\n", prog);
+    fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
+    fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
+    fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
-            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (absolute path; makes multi-server reports searchable by prefix).\n");
+            "Optional env: ECRAWL_WORKERS (1..%d crawl workers, default %d), "
+            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u).\n",
+            MAX_WORKERS,
+            MAX_WORKERS,
+            DEFAULT_WRITER_THREADS,
+            (unsigned)DEFAULT_UID_SHARDS);
+    fprintf(stderr,
+            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (absolute path).\n");
     fprintf(stderr, "Default output shows a concise human-oriented summary; use --verbose for the full metrics dump.\n");
-    fprintf(stderr, "Note: split-depth is accepted for compatibility; scheduling now seeds from the root path only.\n");
 }
 
 static int ensure_output_dir_exists(const char *path) {
@@ -1888,7 +1935,7 @@ static void print_queue_wait_metrics(void) {
 
 int main(int argc, char **argv) {
     const char *start_path;
-    const char *positionals[5];
+    const char *positionals[2];
     shared_state_t shared;
     task_queue_t queue;
     writer_queue_t *writer_queues = NULL;
@@ -1941,21 +1988,6 @@ int main(int argc, char **argv) {
             g_record_root = g_record_root_buf;
             continue;
         }
-        if (strcmp(argv[i], "--workers") == 0) {
-            long workers;
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--workers requires a value\n");
-                print_usage(argv[0]);
-                return 2;
-            }
-            workers = strtol(argv[++i], NULL, 10);
-            if (workers < 1 || workers > MAX_WORKERS) {
-                fprintf(stderr, "workers must be between 1 and %d\n", MAX_WORKERS);
-                return 2;
-            }
-            g_worker_threads_limit = (int)workers;
-            continue;
-        }
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -1987,35 +2019,17 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (positional_count >= 2) {
-        g_split_depth = atoi(positionals[1]);
-        if (g_split_depth < 1) {
-            fprintf(stderr, "split-depth must be >= 1\n");
-            return 2;
-        }
-    }
-    if (positional_count >= 3) {
-        int n = snprintf(g_output_dir, sizeof(g_output_dir), "%s", positionals[2]);
+        int n = snprintf(g_output_dir, sizeof(g_output_dir), "%s", positionals[1]);
         if (n < 0 || (size_t)n >= sizeof(g_output_dir)) {
             fprintf(stderr, "output-dir is too long\n");
             return 2;
         }
         output_dir_explicit = 1;
     }
-    if (positional_count >= 4) {
-        unsigned long shards = strtoul(positionals[3], NULL, 10);
-        if (shards == 0 || shards > UINT32_MAX || !is_power_of_two_u32((uint32_t)shards)) {
-            fprintf(stderr, "uid-shards must be a power of two > 0\n");
-            return 2;
-        }
-        g_uid_shards = (uint32_t)shards;
-    }
-    if (positional_count >= 5) {
-        g_writer_threads = atoi(positionals[4]);
-        if (g_writer_threads <= 0) {
-            fprintf(stderr, "writer-threads must be > 0\n");
-            return 2;
-        }
-    }
+
+    g_worker_threads_limit = parse_ecrawl_workers();
+    g_uid_shards = parse_ecrawl_uid_shards_env();
+    g_writer_threads = parse_ecrawl_writer_threads_env();
     if ((uint32_t)g_writer_threads > g_uid_shards) g_writer_threads = (int)g_uid_shards;
     g_shard_digits = shard_digits_for(g_uid_shards);
     writer_slots = g_writer_threads;
@@ -2304,7 +2318,6 @@ int main(int argc, char **argv) {
             printf("output_layout=%s\n", g_no_write ? "none" : "uid_shards");
             printf("format_version=%u\n", FORMAT_VERSION);
             printf("seed_mode=%s\n", "root_only");
-            printf("split_depth=%d\n", g_split_depth);
             printf("uid_shards=%u\n", g_uid_shards);
             printf("uid_shard_digits=%d\n", g_shard_digits);
             printf("writer_threads=%d\n", writer_threads_used);

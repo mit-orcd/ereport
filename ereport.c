@@ -1170,7 +1170,7 @@ static void emit_path_summary_table(FILE *out,
 
     qsort(rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
 
-    fprintf(out, "<table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Share of Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Share of Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Share of User Bytes</th><th class=\"r\">Share of User Files</th></tr></thead>\n<tbody>\n");
+    fprintf(out, "<div class=\"bucket-table-wrap\"><table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Share of Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Share of Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Share of User Bytes</th><th class=\"r\">Share of User Files</th></tr></thead>\n<tbody>\n");
     for (i = 0; i < count; i++) {
         char bb[32];
         char tb[32];
@@ -1203,7 +1203,7 @@ static void emit_path_summary_table(FILE *out,
                 user_bytes_pct,
                 user_files_pct);
     }
-    fprintf(out, "</tbody></table>\n");
+    fprintf(out, "</tbody></table></div>\n");
     free(rows);
 }
 
@@ -1235,25 +1235,27 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     fprintf(out, "<title>Bucket Details</title>\n<style>\n");
     fprintf(out, "body{font-family:\"DejaVu Sans Mono\",\"Consolas\",monospace;margin:18px;color:#1f2328;background:#fcfcf8}\n");
+    fprintf(out, ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;margin-bottom:18px}\n");
     fprintf(out, "h1,h2{margin:0 0 10px 0;font-weight:600}\n");
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:12px}\n");
     fprintf(out, ".note{font-size:11px;color:#666;margin-bottom:14px;max-width:1200px}\n");
-    fprintf(out, "table{border-collapse:collapse;width:100%%;font-size:11px;table-layout:fixed;margin-bottom:18px}\n");
+    fprintf(out, "table{border-collapse:collapse;width:100%%;font-size:11px;table-layout:fixed}\n");
     fprintf(out, "th,td{border:1px solid #d5d0c5;padding:3px 6px;vertical-align:top}\n");
     fprintf(out, "th{background:#ece6da;position:sticky;top:0;z-index:2}\n");
     fprintf(out, "th:first-child,td:first-child{position:sticky;left:0;background:#f8f5ee;z-index:1}\n");
     fprintf(out, "td.r,th.r{text-align:right}\n");
-    fprintf(out, ".path-cell{width:320px;max-width:320px;min-width:320px}\n");
-    fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px}\n");
-    fprintf(out, ".path-toggle{min-width:0;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n");
-    fprintf(out, ".path-prefix{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;font-size:10px;line-height:1.1;margin-bottom:1px}\n");
-    fprintf(out, ".path-tail{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:#1f2328;line-height:1.15}\n");
-    fprintf(out, ".copy-path{opacity:0;pointer-events:none;align-self:start;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n");
+    fprintf(out, "th:first-child{width:40%%;min-width:min(560px,78vw);max-width:720px;box-sizing:border-box}\n");
+    fprintf(out, ".path-cell{width:40%%;min-width:min(560px,78vw);max-width:720px;overflow-x:hidden;overflow-y:visible;box-sizing:border-box}\n");
+    fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;min-width:0}\n");
+    fprintf(out, ".path-toggle{min-width:0;max-width:100%%;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n");
+    fprintf(out, ".path-prefix{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;font-size:10px;line-height:1.15;margin-bottom:1px}\n");
+    fprintf(out, ".path-tail{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:#1f2328;line-height:1.15}\n");
+    fprintf(out, ".copy-path{opacity:0;pointer-events:none;align-self:start;flex-shrink:0;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n");
     fprintf(out, ".path-cell:hover .copy-path,.path-cell:focus-within .copy-path,.path-cell.expanded .copy-path{opacity:1;pointer-events:auto}\n");
     fprintf(out, ".copy-path:hover{background:#eadfc9}\n");
     fprintf(out, ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n");
-    fprintf(out, ".path-full{margin-top:4px;padding:4px 6px;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;font-size:10px;color:#4e4538;user-select:all}\n");
-    fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:visible;text-overflow:clip}\n");
+    fprintf(out, ".path-full{margin-top:6px;padding:6px 8px;max-width:100%%;box-sizing:border-box;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;overflow-wrap:anywhere;font-size:10px;line-height:1.35;color:#4e4538;user-select:all;overflow-x:auto}\n");
+    fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}\n");
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
 
