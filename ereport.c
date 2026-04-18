@@ -10,8 +10,9 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport <username|uid> <atime|mtime|ctime> [bin_dir] [threads]
- * Optional thread count: last arg overrides EREPORT_THREADS (else default 32).
+ *   ./ereport <username|uid> <atime|mtime|ctime> [bin_dir ...]
+ * Parallel worker count: EREPORT_THREADS (default 32); see worker_main / stats_thread.
+ * Multiple bin_dir values merge one user's shard files from each crawl output directory.
  *
  * Writes outputs under ./<resolved_username>/ (cwd). Falls back to ./tmp/ only if
  * the username is empty or unusably long after sanitization.
@@ -1721,91 +1722,130 @@ static void *stats_thread_main(void *arg) {
     return NULL;
 }
 
-static int scan_dir_collect_files(const char *dirpath,
-                                  uid_t target_uid,
-                                  char ***out_paths,
-                                  size_t *out_count) {
+static int scan_dirs_collect_files(const char **dirpaths,
+                                   size_t dir_count,
+                                   uid_t target_uid,
+                                   char ***out_paths,
+                                   size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
     size_t count = 0;
     size_t cap = 0;
-    uint32_t uid_shards = 0;
-    int layout_rc;
+    size_t di;
+    uint32_t first_shards = 0;
+    int first_layout = -2;
     int use_uid_shards = 0;
     uint32_t wanted_shard = 0;
 
-    layout_rc = read_uid_shard_layout(dirpath, &uid_shards);
-    if (layout_rc < 0) {
-        fprintf(stderr, "cannot read crawl manifest in %s\n", dirpath);
+    if (dir_count == 0) {
+        fprintf(stderr, "no crawl bin directories specified\n");
         return -1;
     }
-    if (layout_rc > 0) {
+
+    for (di = 0; di < dir_count; di++) {
+        uint32_t shards = 0;
+        int layout_rc = read_uid_shard_layout(dirpaths[di], &shards);
+        if (layout_rc < 0) {
+            fprintf(stderr, "cannot read crawl manifest in %s\n", dirpaths[di]);
+            return -1;
+        }
+        if (di == 0) {
+            first_layout = layout_rc;
+            first_shards = shards;
+        } else {
+            if (layout_rc != first_layout) {
+                fprintf(stderr, "incompatible crawl layouts between %s and %s\n", dirpaths[0], dirpaths[di]);
+                return -1;
+            }
+            if (layout_rc > 0 && shards != first_shards) {
+                fprintf(stderr, "uid_shards mismatch: %s has %u, expected %u (from %s)\n",
+                        dirpaths[di], shards, first_shards, dirpaths[0]);
+                return -1;
+            }
+        }
+    }
+
+    if (first_layout > 0) {
         use_uid_shards = 1;
-        wanted_shard = ((uint32_t)target_uid) & (uid_shards - 1U);
+        wanted_shard = ((uint32_t)target_uid) & (first_shards - 1U);
         g_input_layout = "uid_shards";
-        g_input_uid_shards = uid_shards;
+        g_input_uid_shards = first_shards;
     } else {
         g_input_layout = "legacy";
         g_input_uid_shards = 0;
     }
 
-    dir = counted_opendir(dirpath);
-    if (!dir) {
-        fprintf(stderr, "cannot open directory %s: %s\n", dirpath, strerror(errno));
-        return -1;
-    }
+    for (di = 0; di < dir_count; di++) {
+        const char *dirpath = dirpaths[di];
 
-    while ((de = counted_readdir(dir)) != NULL) {
-        char full[PATH_MAX];
-        char *copy;
-
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!has_bin_suffix(de->d_name)) continue;
-
-        if (use_uid_shards) {
-            uint32_t shard = 0;
-            if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
-            if (shard != wanted_shard) continue;
-        } else {
-            if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
+        dir = counted_opendir(dirpath);
+        if (!dir) {
+            fprintf(stderr, "cannot open directory %s: %s\n", dirpath, strerror(errno));
+            goto fail_partial;
         }
 
-        if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
-            fprintf(stderr, "warn: path too long: %s/%s\n", dirpath, de->d_name);
-            continue;
-        }
+        while ((de = counted_readdir(dir)) != NULL) {
+            char full[PATH_MAX];
+            char *copy;
 
-        if (count == cap) {
-            size_t new_cap = (cap == 0) ? 64 : cap * 2;
-            char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
-            if (!tmp) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            if (!has_bin_suffix(de->d_name)) continue;
+
+            if (use_uid_shards) {
+                uint32_t shard = 0;
+                if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
+                if (shard != wanted_shard) continue;
+            } else {
+                if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
+            }
+
+            if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
+                fprintf(stderr, "warn: path too long: %s/%s\n", dirpath, de->d_name);
+                continue;
+            }
+
+            if (count == cap) {
+                size_t new_cap = (cap == 0) ? 64 : cap * 2;
+                char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
+                if (!tmp) {
+                    size_t i;
+                    counted_closedir(dir);
+                    for (i = 0; i < count; i++) free(paths[i]);
+                    free(paths);
+                    return -1;
+                }
+                paths = tmp;
+                cap = new_cap;
+            }
+
+            copy = strdup(full);
+            if (!copy) {
                 size_t i;
                 counted_closedir(dir);
                 for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
                 return -1;
             }
-            paths = tmp;
-            cap = new_cap;
+
+            paths[count++] = copy;
         }
 
-        copy = strdup(full);
-        if (!copy) {
-            size_t i;
-            counted_closedir(dir);
-            for (i = 0; i < count; i++) free(paths[i]);
-            free(paths);
-            return -1;
-        }
-
-        paths[count++] = copy;
+        counted_closedir(dir);
+        dir = NULL;
     }
 
-    counted_closedir(dir);
     *out_paths = paths;
     *out_count = count;
     return 0;
+
+fail_partial:
+    {
+        size_t i;
+        for (i = 0; i < count; i++) free(paths[i]);
+        free(paths);
+    }
+    return -1;
 }
 
 static int append_chunk(file_chunk_t **chunks,
@@ -2226,6 +2266,27 @@ static int emit_html(const char *report_path,
     return 0;
 }
 
+static void format_input_dirs_label(const char **dirs, size_t n, char *buf, size_t buf_sz) {
+    size_t pos = 0;
+    size_t i;
+
+    if (!buf || buf_sz == 0) return;
+    buf[0] = '\0';
+    if (n == 0 || !dirs) return;
+    if (n == 1) {
+        snprintf(buf, buf_sz, "%s", dirs[0]);
+        return;
+    }
+    for (i = 0; i < n && pos + 1 < buf_sz; i++) {
+        int w = snprintf(buf + pos, buf_sz - pos, "%s%s", i ? ";" : "", dirs[i]);
+        if (w < 0 || (size_t)w >= buf_sz - pos) {
+            snprintf(buf, buf_sz, "%s;… (%zu directories)", dirs[0], n);
+            return;
+        }
+        pos += (size_t)w;
+    }
+}
+
 static void emit_run_stats(const char *username,
                            uid_t uid,
                            const char *basis_str,
@@ -2289,7 +2350,9 @@ static void emit_run_stats(const char *username,
 int main(int argc, char **argv) {
     const char *user_spec;
     const char *basis_str;
-    const char *dirpath = ".";
+    const char **bin_dirs = NULL;
+    size_t bin_dir_count = 0;
+    char input_dirs_label[4096];
     time_basis_t basis;
     uid_t target_uid;
     char display_name[256];
@@ -2339,37 +2402,66 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     g_run_start_sec = t0;
 
-    if (argc < 3 || argc > 5) {
-        fprintf(stderr, "Usage: %s <username|uid> <atime|mtime|ctime> [bin_dir] [threads]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
+        fprintf(stderr, "Thread count: EREPORT_THREADS (default %d).\n", DEFAULT_THREADS);
         return 2;
     }
 
     user_spec = argv[1];
     basis_str = argv[2];
-    if (argc >= 4) dirpath = argv[3];
-    if (argc == 5) {
-        threads = atoi(argv[4]);
-        if (threads <= 0) die("threads must be > 0");
-    } else {
-        threads = parse_ereport_thread_count();
+    threads = parse_ereport_thread_count();
+
+    {
+        int ai = 3;
+        bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
+        if (!bin_dirs) die("allocation failed");
+        while (ai < argc) {
+            if (argv[ai][0] == '-') {
+                fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                free((void *)bin_dirs);
+                return 2;
+            }
+            bin_dirs[bin_dir_count++] = argv[ai];
+            ai++;
+        }
+        if (bin_dir_count == 0) {
+            free((void *)bin_dirs);
+            bin_dirs = (const char **)malloc(sizeof(char *));
+            if (!bin_dirs) die("allocation failed");
+            bin_dirs[0] = ".";
+            bin_dir_count = 1;
+        }
     }
 
-    if (parse_time_basis(basis_str, &basis) != 0) die("time basis must be one of: atime, mtime, ctime");
+    format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
+
+    if (parse_time_basis(basis_str, &basis) != 0) {
+        free((void *)bin_dirs);
+        die("time basis must be one of: atime, mtime, ctime");
+    }
 
     if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
         fprintf(stderr, "unknown user or uid: %s\n", user_spec);
+        free((void *)bin_dirs);
         return 1;
     }
 
     set_bucket_output_dir(display_name);
     if (snprintf(report_path, sizeof(report_path), "%s/index.html", g_bucket_output_dir) >= (int)sizeof(report_path)) {
         fprintf(stderr, "report path too long for %s\n", g_bucket_output_dir);
+        free((void *)bin_dirs);
         return 1;
     }
 
-    if (scan_dir_collect_files(dirpath, target_uid, &paths, &path_count) != 0) return 1;
+    if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, &paths, &path_count) != 0) {
+        free((void *)bin_dirs);
+        return 1;
+    }
+    free((void *)bin_dirs);
+    bin_dirs = NULL;
     if (path_count == 0) {
-        fprintf(stderr, "no matching input .bin files found in %s\n", dirpath);
+        fprintf(stderr, "no matching input .bin files in %s\n", input_dirs_label);
         free(paths);
         return 1;
     }
@@ -2398,7 +2490,7 @@ int main(int argc, char **argv) {
     }
 
     if (chunk_count == 0) {
-        fprintf(stderr, "no readable chunk work found in %s\n", dirpath);
+        fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
         for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
         free(paths);
         free(file_states);
@@ -2562,7 +2654,7 @@ int main(int argc, char **argv) {
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
-    emit_run_stats(display_name, target_uid, basis_str, dirpath, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written, t1 - t0);
+    emit_run_stats(display_name, target_uid, basis_str, input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written, t1 - t0);
 
     free(tids);
     free(args);

@@ -403,7 +403,7 @@ static void *stats_thread_main(void *arg) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make <username|uid> [bin_dir]\n"
+            "  %s --make <username|uid> [bin_dir ...]\n"
             "  %s --search <term> [index_dir] [--json] [--skip N] [--limit M]\n",
             argv0,
             argv0);
@@ -559,91 +559,130 @@ static int build_path(char *out, size_t out_sz, const char *dir, const char *nam
     return 0;
 }
 
-static int scan_dir_collect_files(const char *dirpath,
-                                  uid_t target_uid,
-                                  char ***out_paths,
-                                  size_t *out_count) {
+static int scan_dirs_collect_files(const char **dirpaths,
+                                   size_t dir_count,
+                                   uid_t target_uid,
+                                   char ***out_paths,
+                                   size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
     size_t count = 0;
     size_t cap = 0;
-    uint32_t uid_shards = 0;
-    int layout_rc;
+    size_t di;
+    uint32_t first_shards = 0;
+    int first_layout = -2;
     int use_uid_shards = 0;
     uint32_t wanted_shard = 0;
 
-    layout_rc = read_uid_shard_layout(dirpath, &uid_shards);
-    if (layout_rc < 0) {
-        fprintf(stderr, "cannot read crawl manifest in %s\n", dirpath);
+    if (dir_count == 0) {
+        fprintf(stderr, "no crawl bin directories specified\n");
         return -1;
     }
-    if (layout_rc > 0) {
+
+    for (di = 0; di < dir_count; di++) {
+        uint32_t shards = 0;
+        int layout_rc = read_uid_shard_layout(dirpaths[di], &shards);
+        if (layout_rc < 0) {
+            fprintf(stderr, "cannot read crawl manifest in %s\n", dirpaths[di]);
+            return -1;
+        }
+        if (di == 0) {
+            first_layout = layout_rc;
+            first_shards = shards;
+        } else {
+            if (layout_rc != first_layout) {
+                fprintf(stderr, "incompatible crawl layouts between %s and %s\n", dirpaths[0], dirpaths[di]);
+                return -1;
+            }
+            if (layout_rc > 0 && shards != first_shards) {
+                fprintf(stderr, "uid_shards mismatch: %s has %u, expected %u (from %s)\n",
+                        dirpaths[di], shards, first_shards, dirpaths[0]);
+                return -1;
+            }
+        }
+    }
+
+    if (first_layout > 0) {
         use_uid_shards = 1;
-        wanted_shard = ((uint32_t)target_uid) & (uid_shards - 1U);
+        wanted_shard = ((uint32_t)target_uid) & (first_shards - 1U);
         g_input_layout = "uid_shards";
-        g_input_uid_shards = uid_shards;
+        g_input_uid_shards = first_shards;
     } else {
         g_input_layout = "legacy";
         g_input_uid_shards = 0;
     }
 
-    dir = opendir(dirpath);
-    if (!dir) {
-        fprintf(stderr, "cannot open directory %s: %s\n", dirpath, strerror(errno));
-        return -1;
-    }
+    for (di = 0; di < dir_count; di++) {
+        const char *dirpath = dirpaths[di];
 
-    while ((de = readdir(dir)) != NULL) {
-        char full[PATH_MAX];
-        char *copy;
-
-        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-        if (!has_bin_suffix(de->d_name)) continue;
-
-        if (use_uid_shards) {
-            uint32_t shard = 0;
-            if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
-            if (shard != wanted_shard) continue;
-        } else {
-            if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
+        dir = opendir(dirpath);
+        if (!dir) {
+            fprintf(stderr, "cannot open directory %s: %s\n", dirpath, strerror(errno));
+            goto fail_partial;
         }
 
-        if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
-            fprintf(stderr, "warn: path too long: %s/%s\n", dirpath, de->d_name);
-            continue;
-        }
+        while ((de = readdir(dir)) != NULL) {
+            char full[PATH_MAX];
+            char *copy;
 
-        if (count == cap) {
-            size_t new_cap = (cap == 0) ? 64 : cap * 2;
-            char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
-            if (!tmp) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            if (!has_bin_suffix(de->d_name)) continue;
+
+            if (use_uid_shards) {
+                uint32_t shard = 0;
+                if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
+                if (shard != wanted_shard) continue;
+            } else {
+                if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
+            }
+
+            if (snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name) >= (int)sizeof(full)) {
+                fprintf(stderr, "warn: path too long: %s/%s\n", dirpath, de->d_name);
+                continue;
+            }
+
+            if (count == cap) {
+                size_t new_cap = (cap == 0) ? 64 : cap * 2;
+                char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
+                if (!tmp) {
+                    size_t i;
+                    closedir(dir);
+                    for (i = 0; i < count; i++) free(paths[i]);
+                    free(paths);
+                    return -1;
+                }
+                paths = tmp;
+                cap = new_cap;
+            }
+
+            copy = strdup(full);
+            if (!copy) {
                 size_t i;
                 closedir(dir);
                 for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
                 return -1;
             }
-            paths = tmp;
-            cap = new_cap;
+
+            paths[count++] = copy;
         }
 
-        copy = strdup(full);
-        if (!copy) {
-            size_t i;
-            closedir(dir);
-            for (i = 0; i < count; i++) free(paths[i]);
-            free(paths);
-            return -1;
-        }
-
-        paths[count++] = copy;
+        closedir(dir);
+        dir = NULL;
     }
 
-    closedir(dir);
     *out_paths = paths;
     *out_count = count;
     return 0;
+
+fail_partial:
+    {
+        size_t i;
+        for (i = 0; i < count; i++) free(paths[i]);
+        free(paths);
+    }
+    return -1;
 }
 
 static int append_chunk(file_chunk_t **chunks,
@@ -1791,10 +1830,11 @@ out:
     return -1;
 }
 
-static int build_index_dir(const char *user_spec, const char *dirpath) {
+static int build_index_dir(const char *user_spec, const char **dirpaths, size_t dirpath_count) {
     uid_t target_uid;
     char display_name[256];
     char sanitized_name[256];
+    char dirs_label[4096];
     char paths_path[PATH_MAX], offsets_path[PATH_MAX];
     char **paths = NULL;
     size_t path_count = 0;
@@ -1850,9 +1890,25 @@ static int build_index_dir(const char *user_spec, const char *dirpath) {
     atomic_store(&g_writeq_writer_waits, 0);
     g_run_start_sec = t0;
 
-    if (scan_dir_collect_files(dirpath, target_uid, &paths, &path_count) != 0) return 1;
+    if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, &paths, &path_count) != 0) return 1;
+
+    dirs_label[0] = '\0';
+    if (dirpath_count == 1) {
+        snprintf(dirs_label, sizeof(dirs_label), "%s", dirpaths[0]);
+    } else {
+        size_t k, pos = 0;
+        for (k = 0; k < dirpath_count && pos + 1 < sizeof(dirs_label); k++) {
+            int w = snprintf(dirs_label + pos, sizeof(dirs_label) - pos, "%s%s", k ? ";" : "", dirpaths[k]);
+            if (w < 0 || (size_t)w >= sizeof(dirs_label) - pos) {
+                snprintf(dirs_label, sizeof(dirs_label), "%s;… (%zu dirs)", dirpaths[0], dirpath_count);
+                break;
+            }
+            pos += (size_t)w;
+        }
+    }
+
     if (path_count == 0) {
-        fprintf(stderr, "no matching input .bin files found in %s\n", dirpath);
+        fprintf(stderr, "no matching input .bin files under %s\n", dirs_label);
         free(paths);
         return 1;
     }
@@ -1883,7 +1939,7 @@ static int build_index_dir(const char *user_spec, const char *dirpath) {
     g_progress_input_files_total = ctx.input_files;
 
     if (chunk_count == 0) {
-        fprintf(stderr, "no readable chunk work found in %s\n", dirpath);
+        fprintf(stderr, "no readable chunk work found in %s\n", dirs_label);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         free(file_states);
@@ -2085,7 +2141,7 @@ static int build_index_dir(const char *user_spec, const char *dirpath) {
     printf("mode=make\n");
     printf("user=%s\n", ctx.display_name);
     printf("uid=%lu\n", (unsigned long)ctx.target_uid);
-    printf("input_dir=%s\n", dirpath);
+    printf("input_dir=%s\n", dirs_label);
     printf("input_layout=%s\n", g_input_layout);
     if (g_input_uid_shards) printf("input_uid_shards=%u\n", g_input_uid_shards);
     printf("input_files=%" PRIu64 "\n", ctx.input_files);
@@ -2504,10 +2560,18 @@ int main(int argc, char **argv) {
     if (argc < 2) die_usage(argv[0]);
 
     if (strcmp(argv[1], "--make") == 0) {
-        const char *dirpath = ".";
-        if (argc < 3 || argc > 4) die_usage(argv[0]);
-        if (argc == 4) dirpath = argv[3];
-        return build_index_dir(argv[2], dirpath);
+        const char **dirpaths;
+        size_t dirpath_count;
+        if (argc < 3) die_usage(argv[0]);
+        if (argc == 3) {
+            static const char *dot = ".";
+            dirpaths = &dot;
+            dirpath_count = 1;
+        } else {
+            dirpaths = (const char **)(argv + 3);
+            dirpath_count = (size_t)(argc - 3);
+        }
+        return build_index_dir(argv[2], dirpaths, dirpath_count);
     }
 
     if (strcmp(argv[1], "--search") == 0) {

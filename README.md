@@ -56,7 +56,7 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--verbose] [--workers N] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
+./ecrawl [--no-write] [--verbose] [--workers N] [--record-root <abs-path>] <start-path> [split-depth] [output-dir] [uid-shards] [writer-threads]
 ```
 
 Examples:
@@ -66,6 +66,7 @@ Examples:
 ./ecrawl --no-write /data1
 ./ecrawl --no-write --verbose --workers 8 /data1
 ./ecrawl /data1 2 fstor004_apr-17-2026_15-03-01
+./ecrawl --record-root /storage/srv07 /mnt/server07 3 crawl_srv07
 ```
 
 Notes:
@@ -73,6 +74,7 @@ Notes:
 - `--no-write` crawls and reports metrics without writing shard files.
 - `--verbose` enables the full end-of-run diagnostics.
 - `--workers N` sets crawl worker count at runtime, up to the compiled maximum.
+- **`--record-root <abs-path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv07/...` vs `/storage/srv08/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. Requires `--record-root` to be an absolute path.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
@@ -97,19 +99,23 @@ Outputs:
 Usage:
 
 ```bash
-./ereport <username|uid> <atime|mtime|ctime> [bin_dir] [threads]
+./ereport <username|uid> <atime|mtime|ctime> [bin_dir ...]
 ```
 
-Thread count:
+Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** thread):
 
-- Optional **`threads`** as last argument overrides **`EREPORT_THREADS`** (otherwise default **32**).
+- Set **`EREPORT_THREADS`** (default **32**). There is no `-t` / `--threads` CLI flag.
+
+**Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (legacy vs `uid_shards`) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file (uid-sharded layout) or all matching bins (legacy)—so twenty servers mean twenty directories and twenty shard files merged into one report.
 
 Examples:
 
 ```bash
 ./ereport milechin atime fstor005-mgmt_apr-17-2026_15-07-17
 EREPORT_THREADS=16 ./ereport milechin atime /tmp/crawl_out
-./ereport 82831 mtime /tmp/crawl_out 8
+EREPORT_THREADS=8 ./ereport 82831 mtime /tmp/crawl_out
+EREPORT_THREADS=16 ./ereport milechin atime crawl_srv01 crawl_srv02 crawl_srv03
+./ereport milechin atime crawl_a crawl_b crawl_c
 ```
 
 Parse chunks scale with input `.bin` size so parallel workers are not capped by a tiny chunk count.
@@ -146,7 +152,7 @@ Queries must be **at least three characters** (trigram filtering).
 Usage:
 
 ```bash
-./ereport_index --make <username|uid> [bin_dir]
+./ereport_index --make <username|uid> [bin_dir ...]
 ./ereport_index --search <term> [index_dir] [--json] [--skip N] [--limit M]
 ```
 
@@ -294,9 +300,19 @@ milechin/bucket_a0_s0.html
 
 ### 3. Optionally build a search index
 
+One crawl output directory (default index location is **`./<username>/index/`**):
+
 ```bash
 ./ereport_index --make milechin fstor004_apr-17-2026_15-03-01
 ```
+
+Several crawl output directories (merged index for the same user):
+
+```bash
+./ereport_index --make milechin crawl_srv01 crawl_srv02 crawl_srv03
+```
+
+Omit directories to use **`./`** as the only input path: `./ereport_index --make milechin`.
 
 This writes:
 
