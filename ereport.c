@@ -472,6 +472,14 @@ static void human_decimal(double v, char *buf, size_t sz) {
     else snprintf(buf, sz, "%.2f%s", v, units[i]);
 }
 
+/* SI-style shortened count (K/M/G…) plus exact integer for HTML stats cards */
+static void emit_stats_count_dd(FILE *out, const char *dt_label, uint64_t v) {
+    char hb[32];
+    human_decimal((double)v, hb, sizeof(hb));
+    fprintf(out, "<dt>%s</dt><dd><span class=\"stats-friendly\">%s</span> <span class=\"stats-abs\">(%" PRIu64 ")</span></dd>\n", dt_label, hb,
+            v);
+}
+
 static void format_duration(double sec, char *buf, size_t sz) {
     long total = sec > 0.0 ? (long)(sec + 0.5) : 0;
     long h = total / 3600;
@@ -618,6 +626,83 @@ static int read_uid_shard_layout(const char *dirpath, uint32_t *uid_shards_out) 
     return 1;
 }
 
+/*
+ * Prefer record_root (logical storage id) when present in crawl_manifest.txt,
+ * else start_path (filesystem crawl root). Returns 0 when a path was filled.
+ */
+static int read_manifest_storage_display_path(const char *bin_dir, char *out, size_t out_sz) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[4096];
+    char record_root[4096];
+    char start_path[4096];
+
+    if (!out || out_sz == 0) return -1;
+    record_root[0] = '\0';
+    start_path[0] = '\0';
+
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", bin_dir) >= (int)sizeof(manifest_path)) return -1;
+
+    fp = counted_fopen(manifest_path, "r");
+    if (!fp) return -1;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        if (strncmp(line, "record_root=", 12) == 0) {
+            if (snprintf(record_root, sizeof(record_root), "%s", line + 12) >= (int)sizeof(record_root)) record_root[0] = '\0';
+        } else if (strncmp(line, "start_path=", 11) == 0) {
+            if (snprintf(start_path, sizeof(start_path), "%s", line + 11) >= (int)sizeof(start_path)) start_path[0] = '\0';
+        }
+    }
+
+    counted_fclose(fp);
+
+    if (record_root[0] != '\0') {
+        int r = snprintf(out, out_sz, "%s", record_root);
+        if (r >= 0 && (size_t)r < out_sz) return 0;
+        return -1;
+    }
+    if (start_path[0] != '\0') {
+        int r = snprintf(out, out_sz, "%s", start_path);
+        if (r >= 0 && (size_t)r < out_sz) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+static void format_storage_base_paths_label(const char **dirs, size_t n, char *buf, size_t buf_sz) {
+    size_t pos = 0;
+    size_t i;
+    char one[4096];
+
+    if (!buf || buf_sz == 0) return;
+    buf[0] = '\0';
+    if (n == 0 || !dirs) return;
+
+    if (n == 1) {
+        if (read_manifest_storage_display_path(dirs[0], one, sizeof(one)) == 0)
+            snprintf(buf, buf_sz, "%s", one);
+        else
+            snprintf(buf, buf_sz, "%s", dirs[0]);
+        return;
+    }
+
+    for (i = 0; i < n && pos + 1 < buf_sz; i++) {
+        const char *show = dirs[i];
+        if (read_manifest_storage_display_path(dirs[i], one, sizeof(one)) == 0) show = one;
+        {
+            int w = snprintf(buf + pos, buf_sz - pos, "%s%s", i ? ";" : "", show);
+            if (w < 0 || (size_t)w >= buf_sz - pos) {
+                snprintf(buf, buf_sz, "%s;… (%zu locations)", dirs[0], n);
+                return;
+            }
+            pos += (size_t)w;
+        }
+    }
+}
+
 static void set_bucket_output_dir(const char *username) {
     size_t i;
     int n;
@@ -751,6 +836,19 @@ static void html_escape(FILE *out, const char *s) {
             case '>': fputs("&gt;", out); break;
             case '"': fputs("&quot;", out); break;
             default: fputc(*s, out); break;
+        }
+    }
+}
+
+static void html_escape_segment(FILE *out, const char *s, size_t len) {
+    size_t i;
+    for (i = 0; i < len; i++) {
+        switch (s[i]) {
+            case '&': fputs("&amp;", out); break;
+            case '<': fputs("&lt;", out); break;
+            case '>': fputs("&gt;", out); break;
+            case '"': fputs("&quot;", out); break;
+            default: fputc(s[i], out); break;
         }
     }
 }
@@ -954,15 +1052,21 @@ static int extract_row_paths(const char *path,
                              size_t row1_sz,
                              char *row2,
                              size_t row2_sz,
-                             int *has_row2) {
+                             char *row3,
+                             size_t row3_sz,
+                             int *has_row2,
+                             int *has_row3) {
     const char *p = path;
     const char *c1;
     const char *c2;
+    const char *c3;
     size_t comp1_len;
     size_t comp2_len;
+    size_t comp3_len;
     size_t plen = base_prefix ? strlen(base_prefix) : 0;
 
     *has_row2 = 0;
+    *has_row3 = 0;
     if (!starts_with_dir_prefix(path, base_prefix)) return 0;
 
     if (base_prefix && base_prefix[0] != '\0' && strcmp(base_prefix, "/") != 0) {
@@ -991,11 +1095,23 @@ static int extract_row_paths(const char *path,
 
     if (!join_path_component(row2, row2_sz, row1, c2, comp2_len)) return 1;
     *has_row2 = 1;
+
+    p++;
+    if (*p == '\0') return 1;
+
+    c3 = p;
+    while (*p && *p != '/') p++;
+    if (*p != '/') return 1;
+    comp3_len = (size_t)(p - c3);
+
+    if (!join_path_component(row3, row3_sz, row2, c3, comp3_len)) return 1;
+    *has_row3 = 1;
     return 1;
 }
 
 static int aggregate_totals_for_page(path_row_map_t *level1,
                                      path_row_map_t *level2,
+                                     path_row_map_t *level3,
                                      const matched_records_t *records,
                                      const char *base_prefix) {
     size_t i;
@@ -1003,11 +1119,15 @@ static int aggregate_totals_for_page(path_row_map_t *level1,
     for (i = 0; i < records->count; i++) {
         char row1[PATH_MAX];
         char row2[PATH_MAX];
+        char row3[PATH_MAX];
         int has_row2;
+        int has_row3;
         const matched_record_t *r = &records->items[i];
         path_row_t *row;
 
-        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), &has_row2)) continue;
+        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), row3, sizeof(row3), &has_row2,
+                              &has_row3))
+            continue;
 
         row = path_row_map_find(level1, row1);
         if (row) {
@@ -1024,6 +1144,15 @@ static int aggregate_totals_for_page(path_row_map_t *level1,
                 row->total_bytes += r->size;
             }
         }
+
+        if (has_row3) {
+            row = path_row_map_find(level3, row3);
+            if (row) {
+                if (r->type == 'f') row->total_files++;
+                else if (r->type == 'd') row->total_dirs++;
+                row->total_bytes += r->size;
+            }
+        }
     }
 
     return 0;
@@ -1031,6 +1160,7 @@ static int aggregate_totals_for_page(path_row_map_t *level1,
 
 static int aggregate_bucket_for_page(path_row_map_t *level1,
                                      path_row_map_t *level2,
+                                     path_row_map_t *level3,
                                      const bucket_details_t *details,
                                      const char *base_prefix) {
     size_t i;
@@ -1038,11 +1168,15 @@ static int aggregate_bucket_for_page(path_row_map_t *level1,
     for (i = 0; i < details->count; i++) {
         char row1[PATH_MAX];
         char row2[PATH_MAX];
+        char row3[PATH_MAX];
         int has_row2;
+        int has_row3;
         const detail_record_t *r = &details->items[i];
         path_row_t *row;
 
-        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), &has_row2)) continue;
+        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), row3, sizeof(row3), &has_row2,
+                              &has_row3))
+            continue;
 
         row = path_row_map_get_or_insert(level1, row1);
         if (!row) return -1;
@@ -1051,6 +1185,13 @@ static int aggregate_bucket_for_page(path_row_map_t *level1,
 
         if (has_row2) {
             row = path_row_map_get_or_insert(level2, row2);
+            if (!row) return -1;
+            row->bucket_files++;
+            row->bucket_bytes += r->size;
+        }
+
+        if (has_row3) {
+            row = path_row_map_get_or_insert(level3, row3);
             if (!row) return -1;
             row->bucket_files++;
             row->bucket_bytes += r->size;
@@ -1218,6 +1359,7 @@ static int emit_bucket_detail_page(const char *filename,
     char *base_prefix = NULL;
     path_row_map_t level1;
     path_row_map_t level2;
+    path_row_map_t level3;
     size_t i;
     uint64_t bucket_files = 0;
     uint64_t bucket_bytes = 0;
@@ -1226,7 +1368,7 @@ static int emit_bucket_detail_page(const char *filename,
 
     if (!out) return -1;
 
-    if (path_row_map_init(&level1, 1024) != 0 || path_row_map_init(&level2, 2048) != 0) {
+    if (path_row_map_init(&level1, 1024) != 0 || path_row_map_init(&level2, 2048) != 0 || path_row_map_init(&level3, 4096) != 0) {
         counted_fclose(out);
         return -1;
     }
@@ -1239,6 +1381,12 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "h1,h2{margin:0 0 10px 0;font-weight:600}\n");
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:12px}\n");
     fprintf(out, ".note{font-size:11px;color:#666;margin-bottom:14px;max-width:1200px}\n");
+    fprintf(out, ".bucket-help{margin:0 0 16px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:1200px;font-size:12px;line-height:1.55;color:#555}\n");
+    fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
+    fprintf(out, ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n");
+    fprintf(out, ".bucket-help .bucket-help-body{padding:0 12px 12px}\n");
+    fprintf(out, ".bucket-help .bucket-help-body p{margin:0 0 10px}\n");
+    fprintf(out, ".bucket-help .bucket-help-body p:last-child{margin-bottom:0}\n");
     fprintf(out, "table{border-collapse:collapse;width:100%%;font-size:11px;table-layout:fixed}\n");
     fprintf(out, "th,td{border:1px solid #d5d0c5;padding:3px 6px;vertical-align:top}\n");
     fprintf(out, "th{background:#ece6da;position:sticky;top:0;z-index:2}\n");
@@ -1273,6 +1421,7 @@ static int emit_bucket_detail_page(const char *filename,
         fprintf(out, "<div class=\"note\">This bucket has no matching files.</div>\n</body>\n</html>\n");
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
+        path_row_map_destroy(&level3);
         counted_fclose(out);
         return 0;
     }
@@ -1281,6 +1430,7 @@ static int emit_bucket_detail_page(const char *filename,
     if (!base_prefix) {
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
+        path_row_map_destroy(&level3);
         counted_fclose(out);
         return -1;
     }
@@ -1297,11 +1447,12 @@ static int emit_bucket_detail_page(const char *filename,
         }
     }
 
-    if (aggregate_bucket_for_page(&level1, &level2, details, base_prefix) != 0 ||
-        aggregate_totals_for_page(&level1, &level2, matched_records, base_prefix) != 0) {
+    if (aggregate_bucket_for_page(&level1, &level2, &level3, details, base_prefix) != 0 ||
+        aggregate_totals_for_page(&level1, &level2, &level3, matched_records, base_prefix) != 0) {
         free(base_prefix);
         path_row_map_destroy(&level1);
         path_row_map_destroy(&level2);
+        path_row_map_destroy(&level3);
         counted_fclose(out);
         return -1;
     }
@@ -1315,10 +1466,22 @@ static int emit_bucket_detail_page(const char *filename,
                 bucket_files,
                 bb);
     }
-    fputs("<div class=\"note\">Rows are sorted by bucket bytes descending. Bucket Files and Bucket Bytes describe the files that match the clicked bucket. Share of Bucket Files and Share of Bucket Bytes show how much of the selected bucket lives under that path. Share of User Bytes and Share of User Files use the user's total files across all buckets as the denominator, so they show how much this path contributes to the user's overall footprint. Total Files, Total Dirs, and Total Bytes describe everything below that path. Redder bucket-share cells contribute more of the selected bucket.</div>\n", out);
+    fputs("<details class=\"bucket-help\"><summary>How to read these tables</summary>\n"
+          "<div class=\"bucket-help-body\">\n"
+          "<p><strong>Sorting.</strong> Rows are ordered by bucket bytes (largest first).</p>\n"
+          "<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
+          "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path.</p>\n"
+          "<p><strong>User share columns.</strong> &ldquo;Share of user bytes/files&rdquo; compares this path to <em>all</em> of the user&rsquo;s files across every bucket (overall footprint).</p>\n"
+          "<p><strong>Totals under each path.</strong> Total files, dirs, and bytes include everything recorded below that directory prefix.</p>\n"
+          "<p><strong>Levels 1&ndash;3.</strong> Each table groups paths one, two, or three directory segments below the shared base path. "
+          "A row appears at level <em>n</em> only when there is at least one more path segment below that prefix.</p>\n"
+          "<p><strong>Heat colors.</strong> Stronger red in the bucket-share cells means a larger share of this bucket&rsquo;s bytes or files.</p>\n"
+          "</div></details>\n",
+          out);
 
     emit_path_summary_table(out, "Level 1 Directories", &level1, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
     emit_path_summary_table(out, "Level 2 Directories", &level2, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
+    emit_path_summary_table(out, "Level 3 Directories", &level3, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
 
     fputs("<script>\n"
           "(function(){\n"
@@ -1332,6 +1495,7 @@ static int emit_bucket_detail_page(const char *filename,
     free(base_prefix);
     path_row_map_destroy(&level1);
     path_row_map_destroy(&level2);
+    path_row_map_destroy(&level3);
     counted_fclose(out);
     return 0;
 }
@@ -1971,13 +2135,43 @@ out:
     return rc;
 }
 
+static void emit_storage_sources_html(FILE *out, size_t crawl_source_count, const char *label) {
+    fprintf(out, "<div class=\"report-sources-section\"><h3>Crawl sources</h3>\n");
+    fprintf(out, "<p class=\"lead\">Data merged from <strong>%zu</strong> crawl location%s.</p>\n", crawl_source_count,
+            crawl_source_count == 1U ? "" : "s");
+    fprintf(out, "<ul class=\"report-sources-list\">\n");
+    if (!label || label[0] == '\0') {
+        fprintf(out, "<li><em>Not listed</em></li>\n");
+    } else {
+        const char *p = label;
+        while (*p) {
+            const char *semi = strchr(p, ';');
+            if (!semi) {
+                fprintf(out, "<li>");
+                html_escape(out, p);
+                fprintf(out, "</li>\n");
+                break;
+            }
+            if (semi > p) {
+                fprintf(out, "<li>");
+                html_escape_segment(out, p, (size_t)(semi - p));
+                fprintf(out, "</li>\n");
+            }
+            p = semi + 1;
+        }
+    }
+    fprintf(out, "</ul></div>\n");
+}
+
 static int emit_html(const char *report_path,
                      const char *username,
                      uid_t uid,
                      const char *basis_str,
                      const summary_t *sum,
                      size_t input_files,
-                     int threads_used) {
+                     int threads_used,
+                     size_t crawl_source_count,
+                     const char *crawl_sources_label) {
     FILE *out = counted_fopen(report_path, "w");
     int ab, sb;
 
@@ -1987,14 +2181,29 @@ static int emit_html(const char *report_path,
     fprintf(out, "<!DOCTYPE html>\n");
     fprintf(out, "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    fprintf(out, "<title>Storage Report</title>\n");
+    fprintf(out, "<title>Data storage report — ");
+    html_escape(out, username);
+    fprintf(out, "</title>\n");
     fprintf(out, "<style>\n");
     fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
     fprintf(out, "body.drawer-open{overflow:hidden}\n");
     fprintf(out, "h1{margin-bottom:8px}\n");
     fprintf(out, ".report-title{font-size:1.35rem;margin:0 0 18px}\n");
-    fprintf(out, ".report-stats{margin-top:28px;padding-top:18px;border-top:1px solid #ddd}\n");
-    fprintf(out, ".report-stats h2{font-size:1.1rem;margin:0 0 10px}\n");
+    fprintf(out, ".report-stats{margin-top:28px;padding-top:22px;border-top:1px solid #ddd}\n");
+    fprintf(out, ".report-stats>h2{font-size:1.15rem;margin:0 0 14px}\n");
+    fprintf(out, ".report-sources-section{margin-bottom:20px;padding:14px 16px;background:#f9f9f7;border:1px solid #e8e4dc;border-radius:8px}\n");
+    fprintf(out, ".report-sources-section h3{font-size:0.95rem;margin:0 0 8px;color:#444;font-weight:600}\n");
+    fprintf(out, ".report-sources-section .lead{margin:0 0 10px;font-size:13px;color:#555;line-height:1.45}\n");
+    fprintf(out, ".report-sources-list{margin:8px 0 0;padding-left:22px;line-height:1.55;color:#333;font-size:13px}\n");
+    fprintf(out, ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:4px}\n");
+    fprintf(out, ".stats-card{margin:0;padding:14px 16px;background:#fafafa;border:1px solid #e5e5e5;border-radius:8px}\n");
+    fprintf(out, ".stats-card h3{font-size:0.92rem;margin:0 0 12px;color:#333;font-weight:600}\n");
+    fprintf(out, ".stats-dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 14px;font-size:13px;align-items:baseline}\n");
+    fprintf(out, ".stats-dl dt{margin:0;color:#666;font-weight:500}\n");
+    fprintf(out, ".stats-dl dd{margin:0;color:#222;text-align:right;word-break:break-word}\n");
+    fprintf(out, ".stats-num{font-variant-numeric:tabular-nums}\n");
+    fprintf(out, ".stats-friendly{font-weight:600;color:#1a1a1a}\n");
+    fprintf(out, ".stats-abs{color:#666;font-size:12px;font-weight:400}\n");
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
     fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
@@ -2036,18 +2245,20 @@ static int emit_html(const char *report_path,
     fprintf(out, ".path-search-pager{display:flex;gap:12px;margin-top:12px;align-items:center;flex-wrap:wrap}\n");
     fprintf(out, ".path-search-pager button{padding:6px 14px;font-size:14px;cursor:pointer;border:1px solid #bbb;border-radius:4px;background:#f8f8f8}\n");
     fprintf(out, ".path-search-pager button:disabled{opacity:0.45;cursor:not-allowed}\n");
+    fprintf(out, ".path-search-hint{font-size:12px;color:#666;margin:6px 0 12px;line-height:1.4;max-width:min(720px,100%%)}\n");
     fprintf(out, "</style>\n");
     fprintf(out, "</head>\n<body>\n");
 
-    fprintf(out, "<h1 class=\"report-title\">Report for <strong>");
+    fprintf(out, "<h1 class=\"report-title\">Data storage report for <strong>");
     html_escape(out, username);
     fprintf(out, "</strong></h1>\n");
 
     fprintf(out, "<section class=\"path-search\" aria-label=\"Path search\">\n");
     fprintf(out, "<label for=\"path-search-input\">Search paths</label>\n");
+    fprintf(out, "<p class=\"path-search-hint\">Type at least three characters. Results appear below as you type; press Enter for full pages of matches. Use Hide to close the results panel.</p>\n");
     fprintf(out,
             "<input type=\"text\" id=\"path-search-input\" autocomplete=\"off\" "
-            "placeholder=\"At least 3 characters — uses ereport_index via server (./index/ + eserve)\" />\n");
+            "placeholder=\"Example: project name or folder\" />\n");
     fprintf(out, "<div id=\"path-search-panel\" class=\"path-search-panel\" hidden aria-live=\"polite\">\n");
     fprintf(out, "<div class=\"path-search-panel-head\"><strong id=\"path-search-panel-title\">Search results</strong>\n");
     fprintf(out, "<button type=\"button\" id=\"path-search-panel-hide\" aria-label=\"Hide results\">Hide</button></div>\n");
@@ -2143,24 +2354,44 @@ static int emit_html(const char *report_path,
         human_bytes(sum->total_other_bytes, total_other_b, sizeof(total_other_b));
 
         fprintf(out, "<section class=\"report-stats\" aria-label=\"Summary statistics\">\n");
-        fprintf(out, "<h2>Statistics</h2>\n");
-        fprintf(out, "<p>");
-        fprintf(out, "<strong>Uid:</strong> %lu &nbsp;|&nbsp; <strong>Time basis:</strong> ", (unsigned long)uid);
+        fprintf(out, "<h2>Report summary</h2>\n");
+        emit_storage_sources_html(out, crawl_source_count, crawl_sources_label);
+
+        fprintf(out, "<div class=\"stats-grid\">\n");
+
+        fprintf(out, "<article class=\"stats-card\"><h3>Run</h3><dl class=\"stats-dl\">\n");
+        fprintf(out, "<dt>Unix UID</dt><dd class=\"stats-num\">%lu</dd>\n", (unsigned long)uid);
+        fprintf(out, "<dt>Time basis</dt><dd>");
         html_escape(out, basis_str);
-        fprintf(out, " &nbsp;|&nbsp; <strong>Input files:</strong> %zu &nbsp;|&nbsp; <strong>Threads:</strong> %d<br>\n",
-               input_files, threads_used);
-        fprintf(out, "Scanned records: %" PRIu64 "<br>\n", sum->scanned_records);
-        fprintf(out, "Matched records: %" PRIu64 "<br>\n", sum->matched_records);
-        fprintf(out, "Files: %" PRIu64 "<br>\n", sum->total_files);
-        fprintf(out, "Directories: %" PRIu64 "<br>\n", sum->total_dirs);
-        fprintf(out, "Links: %" PRIu64 "<br>\n", sum->total_links);
-        fprintf(out, "Other file types: %" PRIu64 "<br>\n", other_count);
-        fprintf(out, "Non-files: %" PRIu64 "<br>\n", non_file_count);
-        fprintf(out, "Total capacity in files: %s (%" PRIu64 " bytes)<br>\n", totalb, sum->total_bytes);
-        fprintf(out, "Total capacity in non-files: %s (%" PRIu64 " bytes)<br>\n", total_non_file_b, non_file_bytes);
-        fprintf(out, "Total capacity in other file types: %s (%" PRIu64 " bytes)<br>\n", total_other_b, sum->total_other_bytes);
-        fprintf(out, "Bad input files: %" PRIu64, sum->bad_input_files);
-        fprintf(out, "</p>\n");
+        fprintf(out, "</dd>\n");
+        emit_stats_count_dd(out, "Input .bin files", (uint64_t)input_files);
+        emit_stats_count_dd(out, "Threads used", (uint64_t)threads_used);
+        fprintf(out, "</dl></article>\n");
+
+        fprintf(out, "<article class=\"stats-card\"><h3>Records processed</h3><dl class=\"stats-dl\">\n");
+        emit_stats_count_dd(out, "Scanned records", sum->scanned_records);
+        emit_stats_count_dd(out, "Matched records", sum->matched_records);
+        emit_stats_count_dd(out, "Bad input files", sum->bad_input_files);
+        fprintf(out, "</dl></article>\n");
+
+        fprintf(out, "<article class=\"stats-card\"><h3>Filesystem snapshot</h3><dl class=\"stats-dl\">\n");
+        emit_stats_count_dd(out, "Regular files", sum->total_files);
+        emit_stats_count_dd(out, "Directories", sum->total_dirs);
+        emit_stats_count_dd(out, "Symbolic links", sum->total_links);
+        emit_stats_count_dd(out, "Other types", other_count);
+        emit_stats_count_dd(out, "Non-regular entries", non_file_count);
+        fprintf(out, "</dl></article>\n");
+
+        fprintf(out, "<article class=\"stats-card\"><h3>Capacity</h3><dl class=\"stats-dl\">\n");
+        fprintf(out, "<dt>In regular files</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
+                totalb, sum->total_bytes);
+        fprintf(out, "<dt>In symlinks / non-files</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
+                total_non_file_b, non_file_bytes);
+        fprintf(out, "<dt>Other file types</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
+                total_other_b, sum->total_other_bytes);
+        fprintf(out, "</dl></article>\n");
+
+        fprintf(out, "</div>\n");
         fprintf(out, "</section>\n");
     }
 
@@ -2355,6 +2586,7 @@ int main(int argc, char **argv) {
     const char **bin_dirs = NULL;
     size_t bin_dir_count = 0;
     char input_dirs_label[4096];
+    char storage_base_paths_label[4096];
     time_basis_t basis;
     uid_t target_uid;
     char display_name[256];
@@ -2437,6 +2669,7 @@ int main(int argc, char **argv) {
     }
 
     format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
+    format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
 
     if (parse_time_basis(basis_str, &basis) != 0) {
         free((void *)bin_dirs);
@@ -2646,7 +2879,8 @@ int main(int argc, char **argv) {
         bucket_pages_written = AGE_BUCKETS * SIZE_BUCKETS;
     }
 
-    if (emit_html(report_path, display_name, target_uid, basis_str, &final_sum, path_count, threads_used) != 0) {
+    if (emit_html(report_path, display_name, target_uid, basis_str, &final_sum, path_count, threads_used,
+                  bin_dir_count, storage_base_paths_label) != 0) {
         fprintf(stderr, "failed to write main report %s\n", report_path);
     }
     final_sum.scanned_input_files = (uint64_t)path_count;

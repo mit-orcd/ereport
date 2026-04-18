@@ -175,7 +175,15 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         out = (proc.stdout or '').strip()
         if not out:
-            self.send_error(HTTPStatus.BAD_GATEWAY, 'empty response from ereport_index')
+            # Older ereport_index could exit 0 with no stdout on no-match; return empty JSON.
+            empty = json.dumps(
+                {'total': 0, 'skip': skip, 'limit': limit, 'paths': []}
+            ).encode('utf-8')
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(empty)))
+            self.end_headers()
+            self.wfile.write(empty)
             return True
         try:
             json.loads(out)

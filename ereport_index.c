@@ -2363,6 +2363,11 @@ static int cmp_vec_count_asc(const void *a, const void *b) {
     return 0;
 }
 
+static void json_print_empty_search(uint64_t skip_req, uint64_t limit_req) {
+    fprintf(stdout, "{\"total\":0,\"skip\":%" PRIu64 ",\"limit\":%" PRIu64 ",\"paths\":[]}\n", skip_req, limit_req);
+    fflush(stdout);
+}
+
 static void json_escape_stdout(FILE *out, const char *s) {
     fputc('"', out);
     for (; *s; s++) {
@@ -2413,6 +2418,9 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     char *lower_term = NULL;
     int rc = 1;
 
+    /* Avoid full buffering when stdout is a pipe (eserve subprocess): empty reads → 502 */
+    if (json_output) setvbuf(stdout, NULL, _IONBF, 0);
+
     if (build_path(keys_path, sizeof(keys_path), index_dir, "tri_keys.bin") != 0 ||
         build_path(postings_path, sizeof(postings_path), index_dir, "tri_postings.bin") != 0 ||
         build_path(paths_path, sizeof(paths_path), index_dir, "paths.bin") != 0 ||
@@ -2446,7 +2454,14 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         trigram_key_t key;
         int found = find_trigram_key(keys_fp, key_count, query_trigrams[i], &key);
         if (found != 0) {
-            rc = found < 0 ? 1 : 0;
+            if (found < 0) {
+                rc = 1;
+            } else if (json_output) {
+                json_print_empty_search(skip_req, limit_req);
+                rc = 0;
+            } else {
+                rc = 0;
+            }
             goto out;
         }
         if (load_postings_list(postings_fp, &key, &lists[i]) != 0) goto out;
@@ -2457,6 +2472,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     memset(&next, 0, sizeof(next));
 
     if (query_trigram_count == 0) {
+        if (json_output) json_print_empty_search(skip_req, limit_req);
         rc = 0;
         goto out;
     }
@@ -2534,6 +2550,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                 free(json_paths[ki]);
             }
             fputs("]}\n", stdout);
+            fflush(stdout);
             free(json_paths);
         }
     }
