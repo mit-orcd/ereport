@@ -33,6 +33,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -55,6 +56,11 @@
 #define DEFAULT_UID_SHARDS 8192U
 #define DEFAULT_MAX_OPEN_SHARDS 256U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
+#define FD_RESERVE_BASE 128U
+#define FD_RESERVE_PER_WORKER 4U
+#define FD_RESERVE_PER_WRITER 4U
+#define EMFILE_RETRY_LIMIT 8U
+#define EMFILE_RETRY_USEC 50000U
 #define RECORD_BATCH_BYTES (1U << 20)
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
@@ -324,11 +330,14 @@ static int g_split_depth = 2;
 static int g_writer_threads = DEFAULT_WRITER_THREADS;
 static uint32_t g_uid_shards = DEFAULT_UID_SHARDS;
 static unsigned g_max_open_shards = DEFAULT_MAX_OPEN_SHARDS;
+static unsigned g_requested_max_open_shards = DEFAULT_MAX_OPEN_SHARDS;
 static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
 static int g_worker_threads_limit = MAX_WORKERS;
+static atomic_uint g_fd_pressure = 0;
+static atomic_uint g_writer_failed = 0;
 static char g_output_dir[PATH_MAX] = ".";
 /* When set, bin records store paths under this root instead of the physical crawl start-path. */
 static char g_record_root_buf[PATH_MAX];
@@ -394,6 +403,13 @@ static int counted_closedir(DIR *dir) {
     return closedir(dir);
 }
 
+static void emfile_retry_pause(unsigned attempt) {
+    useconds_t delay = EMFILE_RETRY_USEC;
+
+    if (attempt < 4U) delay *= (useconds_t)(attempt + 1U);
+    usleep(delay);
+}
+
 static char file_type_char(mode_t mode) {
     if (S_ISREG(mode))  return 'f';
     if (S_ISDIR(mode))  return 'd';
@@ -433,6 +449,52 @@ static int parse_ecrawl_writer_threads_env(void) {
     t = strtol(e, &end, 10);
     if (errno || end == e || *end || t < 1 || t > 4096) return DEFAULT_WRITER_THREADS;
     return (int)t;
+}
+
+/* Per-writer shard cache target. Auto-capped against RLIMIT_NOFILE later. */
+static unsigned parse_ecrawl_max_open_shards_env(void) {
+    const char *e = getenv("ECRAWL_MAX_OPEN_SHARDS");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_MAX_OPEN_SHARDS;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 1UL || v > (unsigned long)UINT_MAX)
+        return DEFAULT_MAX_OPEN_SHARDS;
+    return (unsigned)v;
+}
+
+static void configure_max_open_shards(void) {
+    struct rlimit lim;
+    rlim_t soft;
+    rlim_t reserve;
+    rlim_t available;
+    rlim_t per_writer_fd_cap;
+    rlim_t per_writer_shard_count;
+
+    g_max_open_shards = g_requested_max_open_shards;
+    if (g_no_write || g_writer_threads <= 0) return;
+    if (getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY) return;
+
+    soft = lim.rlim_cur;
+    reserve = FD_RESERVE_BASE +
+              (rlim_t)g_worker_threads_limit * FD_RESERVE_PER_WORKER +
+              (rlim_t)g_writer_threads * FD_RESERVE_PER_WRITER;
+    if (soft <= reserve + (rlim_t)g_writer_threads) {
+        g_max_open_shards = 1U;
+        return;
+    }
+
+    available = soft - reserve;
+    per_writer_fd_cap = available / (rlim_t)g_writer_threads;
+    per_writer_shard_count = ((rlim_t)g_uid_shards + (rlim_t)g_writer_threads - 1U) /
+                             (rlim_t)g_writer_threads;
+
+    if (per_writer_fd_cap < 1U) per_writer_fd_cap = 1U;
+    if (per_writer_fd_cap < (rlim_t)g_max_open_shards) g_max_open_shards = (unsigned)per_writer_fd_cap;
+    if (per_writer_shard_count < (rlim_t)g_max_open_shards) g_max_open_shards = (unsigned)per_writer_shard_count;
+    if (g_max_open_shards < 1U) g_max_open_shards = 1U;
 }
 
 /* Must be a power of two. Default: DEFAULT_UID_SHARDS. */
@@ -891,11 +953,13 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
             "Optional env: ECRAWL_WORKERS (1..%d crawl workers, default %d), "
-            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u).\n",
+            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u), "
+            "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE).\n",
             MAX_WORKERS,
             MAX_WORKERS,
             DEFAULT_WRITER_THREADS,
-            (unsigned)DEFAULT_UID_SHARDS);
+            (unsigned)DEFAULT_UID_SHARDS,
+            DEFAULT_MAX_OPEN_SHARDS);
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (absolute path).\n");
     fprintf(stderr, "Default output shows a concise human-oriented summary; use --verbose for the full metrics dump.\n");
@@ -1508,7 +1572,15 @@ static int process_directory_iterative(dir_stack_t *stack,
             continue;
         }
 
-        dir = counted_opendir(dir_path);
+        {
+            unsigned retry;
+            for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
+                dir = counted_opendir(dir_path);
+                if (dir || errno != EMFILE || retry == EMFILE_RETRY_LIMIT) break;
+                atomic_store(&g_fd_pressure, 1U);
+                emfile_retry_pause(retry);
+            }
+        }
         if (!dir) {
             fprintf(stderr, "ERROR worker opendir %s: %s\n", dir_path, strerror(errno));
             stats_add_error(shared);
@@ -1732,12 +1804,59 @@ static void *worker_thread_main(void *arg_void) {
     return NULL;
 }
 
+static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_index,
+                                  uint32_t uid_shards, unsigned *open_count) {
+    uint32_t i;
+    shard_file_state_t *victim = NULL;
+
+    for (i = writer_index; i < uid_shards; i += (uint32_t)g_writer_threads) {
+        if (shards[i].fp) {
+            if (!victim || shards[i].last_used < victim->last_used) victim = &shards[i];
+        }
+    }
+    if (!victim) return 0;
+
+    counted_fclose(victim->fp);
+    victim->fp = NULL;
+    if (*open_count > 0) (*open_count)--;
+    return 1;
+}
+
+static void writer_trim_shards(shard_file_state_t *shards, uint32_t writer_index,
+                               uint32_t uid_shards, unsigned *open_count, unsigned target) {
+    while (*open_count > target) {
+        if (!writer_close_lru_shard(shards, writer_index, uid_shards, open_count)) break;
+    }
+}
+
+static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
+    if (state->bytes_written == 0) {
+        state->fp = counted_fopen(path, "ab+");
+        if (!state->fp) return -1;
+        setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
+        if (write_bin_header(state->fp) != 0 || counted_fflush(state->fp) != 0) {
+            int saved_errno = errno ? errno : EIO;
+            counted_fclose(state->fp);
+            state->fp = NULL;
+            errno = saved_errno;
+            return -1;
+        }
+        state->bytes_written = sizeof(bin_file_header_t);
+    } else {
+        state->fp = counted_fopen(path, "ab");
+        if (!state->fp) return -1;
+        setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
+    }
+    return 0;
+}
+
 static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_index, uint32_t shard,
                                 uint32_t uid_shards, unsigned max_open_shards,
                                 unsigned *open_count, uint64_t *tick, FILE **fp_out) {
     shard_file_state_t *state = &shards[shard];
     char path[PATH_MAX];
     struct stat st;
+    unsigned retry;
 
     if (state->fp) {
         state->last_used = ++(*tick);
@@ -1745,26 +1864,17 @@ static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_inde
         return 0;
     }
 
-    if (*open_count >= max_open_shards) {
-        uint32_t i;
-        shard_file_state_t *victim = NULL;
-        for (i = writer_index; i < uid_shards; i += (uint32_t)g_writer_threads) {
-            if (shards[i].fp) {
-                if (!victim || shards[i].last_used < victim->last_used) victim = &shards[i];
-            }
-        }
-        if (victim) {
-            counted_fclose(victim->fp);
-            victim->fp = NULL;
-            (*open_count)--;
-        }
-    }
-
     if (!state->initialized) {
         uint64_t sz = 0;
         int valid = 0;
         if (build_shard_path(shard, path, sizeof(path)) != 0) return -1;
-        if (inspect_existing_shard(path, &sz, &valid) != 0) return -1;
+        for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
+            if (inspect_existing_shard(path, &sz, &valid) == 0) break;
+            if (errno != EMFILE || retry == EMFILE_RETRY_LIMIT) return -1;
+            atomic_store(&g_fd_pressure, 1U);
+            writer_close_lru_shard(shards, writer_index, uid_shards, open_count);
+            emfile_retry_pause(retry);
+        }
         if (sz != 0 && !valid) {
             errno = EINVAL;
             return -1;
@@ -1775,18 +1885,17 @@ static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_inde
 
     if (build_shard_path(shard, path, sizeof(path)) != 0) return -1;
 
-    if (state->bytes_written == 0) {
-        state->fp = counted_fopen(path, "ab+");
-        if (!state->fp) return -1;
-        setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
-        if (write_bin_header(state->fp) != 0) return -1;
-        counted_fflush(state->fp);
-        state->bytes_written = sizeof(bin_file_header_t);
-    } else {
-        if (counted_stat(path, &st) != 0) return -1;
-        state->fp = counted_fopen(path, "ab");
-        if (!state->fp) return -1;
-        setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
+    if (state->bytes_written != 0 && counted_stat(path, &st) != 0) return -1;
+
+    if (*open_count >= max_open_shards)
+        writer_close_lru_shard(shards, writer_index, uid_shards, open_count);
+
+    for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
+        if (writer_open_shard_file(state, path) == 0) break;
+        if (errno != EMFILE || retry == EMFILE_RETRY_LIMIT) return -1;
+        atomic_store(&g_fd_pressure, 1U);
+        writer_close_lru_shard(shards, writer_index, uid_shards, open_count);
+        emfile_retry_pause(retry);
     }
 
     (*open_count)++;
@@ -1801,6 +1910,11 @@ static int writer_process_batch(uint32_t writer_index,
                                 uint64_t *tick,
                                 record_batch_t *batch) {
     size_t off = 0;
+
+    if (atomic_load(&g_fd_pressure) && *open_count > 1U) {
+        writer_trim_shards(shards, writer_index, g_uid_shards, open_count, *open_count / 2U);
+        atomic_store(&g_fd_pressure, 0U);
+    }
 
     while (off + sizeof(batch_frame_hdr_t) <= batch->len) {
         batch_frame_hdr_t frame;
@@ -1842,6 +1956,7 @@ static void *writer_thread_main(void *arg_void) {
         if (!batch) break;
         if (writer_process_batch(arg->writer_index, shards, &open_count, &tick, batch) != 0) {
             fprintf(stderr, "ERROR writer %u failed processing batch: %s\n", arg->writer_index, strerror(errno));
+            atomic_store(&g_writer_failed, 1U);
         }
         free(batch->data);
         free(batch);
@@ -1921,6 +2036,7 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     fprintf(fp, "writer_threads=%d\n", g_writer_threads);
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
     fprintf(fp, "uid_shard_digits=%d\n", g_shard_digits);
+    fprintf(fp, "max_open_shards=%u\n", g_max_open_shards);
     fprintf(fp, "uid_output=uid.txt\n");
     fprintf(fp, "gid_output=gid.txt\n");
     counted_fclose(fp);
@@ -2031,6 +2147,8 @@ int main(int argc, char **argv) {
     g_uid_shards = parse_ecrawl_uid_shards_env();
     g_writer_threads = parse_ecrawl_writer_threads_env();
     if ((uint32_t)g_writer_threads > g_uid_shards) g_writer_threads = (int)g_uid_shards;
+    g_requested_max_open_shards = parse_ecrawl_max_open_shards_env();
+    configure_max_open_shards();
     g_shard_digits = shard_digits_for(g_uid_shards);
     writer_slots = g_writer_threads;
     writer_threads_used = g_no_write ? 0 : g_writer_threads;
@@ -2147,6 +2265,8 @@ int main(int argc, char **argv) {
     atomic_store(&g_queue_depth, 0);
     atomic_store(&g_active_workers, 0);
     atomic_store(&g_main_done, 0);
+    atomic_store(&g_fd_pressure, 0);
+    atomic_store(&g_writer_failed, 0);
     atomic_store(&g_tasks_popped, 0);
     atomic_store(&g_writer_queue_depth, 0);
     atomic_store(&g_batches_enqueued, 0);
@@ -2293,6 +2413,8 @@ int main(int argc, char **argv) {
             printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
             printf("workers=%" PRIu64 "\n", shared.worker_threads_started);
             printf("writer_threads=%d\n", writer_threads_used);
+            printf("uid_shards=%u\n", g_uid_shards);
+            printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
             printf("byte_accounting=%s\n", "unique_regular_files");
             printf("entries=%" PRIu64 "\n", shared.total_entries);
             printf("dirs=%" PRIu64 "\n", shared.total_dirs);
@@ -2308,6 +2430,7 @@ int main(int argc, char **argv) {
             printf("avg_ops_per_sec=%s\n", avg_ops_buf);
             printf("elapsed_sec=%.3f\n", elapsed);
             printf("errors=%" PRIu64 "\n", shared.total_errors);
+            printf("writer_failed=%u\n", atomic_load(&g_writer_failed));
             print_queue_wait_metrics();
         } else {
             tasks_popped = (uint64_t)atomic_load(&g_tasks_popped);
@@ -2351,6 +2474,7 @@ int main(int argc, char **argv) {
             printf("other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
             printf("apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
             printf("errors=%" PRIu64 "\n", shared.total_errors);
+            printf("writer_failed=%u\n", atomic_load(&g_writer_failed));
             printf("io_lstat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_lstat_calls));
             printf("io_stat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_stat_calls));
             printf("io_mkdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_mkdir_calls));
@@ -2391,5 +2515,5 @@ int main(int argc, char **argv) {
     if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
     if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
     if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
-    return 0;
+    return atomic_load(&g_writer_failed) ? 1 : 0;
 }

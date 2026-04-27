@@ -68,6 +68,7 @@ Optional environment variables (no CLI flags for these):
 | **`ECRAWL_WORKERS`** | Crawl worker threads (**1…16**, default **16**). |
 | **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
+| **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
 
 Examples:
 
@@ -79,6 +80,7 @@ ECRAWL_WORKERS=8 ./ecrawl /data1
 ./ecrawl /data1 fstor004_apr-17-2026_15-03-01
 ./ecrawl --record-root /storage/srv07 /mnt/server07 crawl_srv07
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /data1 /tmp/out
+ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /data1 /tmp/out
 ```
 
 Notes:
@@ -89,6 +91,9 @@ Notes:
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
+- `uid_shards`: uid shard count used for the output layout.
+- `max_open_shards`: effective per-writer shard file cache after any open-file-limit auto-cap.
+- `writer_failed`: `1` means at least one writer batch failed; the process exits nonzero in this case.
 - `wait_crawl_tasks`: worker wakeups waiting on the crawl task queue (idle workers).
 - `wait_writer_push`: worker wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (workers not feeding writers fast enough).
@@ -407,6 +412,7 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 | **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (1…16, default 16). |
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default 8). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
+| **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel bin chunk readers (default 32). |
 | **`EREPORT_INDEX_THREADS`** | `ereport_index --make` | Parallel scan/index workers (default 32). |
 | **`EREPORT_INDEX_BIN`** | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
