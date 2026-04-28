@@ -31,6 +31,16 @@ expect_eq() {
     [[ "$got" == "$want" ]] || die "${label}: want '${want}' got '${got}'"
 }
 
+# Like expect_eq but records failure and continues (for fs correlation so every check is printed).
+expect_eq_continue() {
+    local label=$1 want=$2 got=$3
+    if [[ "$got" != "$want" ]]; then
+        printf '  FAIL: %s: want %s got %s\n' "$label" "$want" "$got" >&2
+        return 1
+    fi
+    return 0
+}
+
 need_exe() {
     [[ -x "$1" ]] || die "missing or not executable: $1 (run 'make' in ${SCRIPT_DIR})"
 }
@@ -71,9 +81,11 @@ sum_unique_regular_bytes() {
 
 run_fs_correlation() {
     local root=$1
+    local fs_fail=0
     [[ -d "$root" ]] || die "not a directory: $root"
 
     log "filesystem correlation (may be slow on large trees): $root"
+    log "note: live trees can drift between fd/find passes and ecrawl; expect exact match only on quiescent data."
 
     local fc dc lc crawl_files crawl_dirs crawl_symlinks crawl_bytes ere_files ere_dirs ere_links ere_cap fs_files fs_dirs fs_symlinks fs_u_bytes
 
@@ -114,10 +126,10 @@ run_fs_correlation() {
     printf '  ecrawl:  files=%s dirs=%s symlinks=%s total_bytes=%s\n' \
         "$crawl_files" "$crawl_dirs" "$crawl_symlinks" "$crawl_bytes"
 
-    expect_eq "ecrawl.files vs fs file count" "$fc" "$crawl_files"
-    expect_eq "ecrawl.dirs vs fs dir count" "$dc" "$crawl_dirs"
-    expect_eq "ecrawl.symlinks vs fs symlink count" "$lc" "$crawl_symlinks"
-    expect_eq "ecrawl.total_bytes vs sum unique regular bytes" "$fs_u_bytes" "$crawl_bytes"
+    expect_eq_continue "ecrawl.files vs fs file count" "$fc" "$crawl_files" || fs_fail=1
+    expect_eq_continue "ecrawl.dirs vs fs dir count" "$dc" "$crawl_dirs" || fs_fail=1
+    expect_eq_continue "ecrawl.symlinks vs fs symlink count" "$lc" "$crawl_symlinks" || fs_fail=1
+    expect_eq_continue "ecrawl.total_bytes vs sum unique regular bytes" "$fs_u_bytes" "$crawl_bytes" || fs_fail=1
 
     log "ereport (single user) cwd=${td}"
     (
@@ -138,21 +150,22 @@ run_fs_correlation() {
     printf '  ereport: files=%s dirs=%s links=%s total_capacity_in_files=%s\n' \
         "$ere_files" "$ere_dirs" "$ere_links" "$ere_cap"
 
-    expect_eq "ereport.files vs ecrawl.files" "$crawl_files" "$ere_files"
-    expect_eq "ereport.directories vs ecrawl.dirs" "$crawl_dirs" "$ere_dirs"
-    expect_eq "ereport.links vs ecrawl.symlinks" "$crawl_symlinks" "$ere_links"
-    expect_eq "ereport.total_capacity_in_files vs ecrawl.total_bytes" "$crawl_bytes" "$ere_cap"
+    expect_eq_continue "ereport.files vs ecrawl.files" "$crawl_files" "$ere_files" || fs_fail=1
+    expect_eq_continue "ereport.directories vs ecrawl.dirs" "$crawl_dirs" "$ere_dirs" || fs_fail=1
+    expect_eq_continue "ereport.links vs ecrawl.symlinks" "$crawl_symlinks" "$ere_links" || fs_fail=1
+    expect_eq_continue "ereport.total_capacity_in_files vs ecrawl.total_bytes" "$crawl_bytes" "$ere_cap" || fs_fail=1
 
     local scanned matched entries
     scanned=$(kv_last scanned_records "$ere_out")
     matched=$(kv_last matched_records "$ere_out")
     entries=$(kv_last entries "$crawl_log")
     printf '  records: ecrawl entries=%s ereport scanned=%s matched=%s\n' "$entries" "$scanned" "$matched"
-    expect_eq "ereport.scanned_records vs ecrawl.entries" "$entries" "$scanned"
-    expect_eq "ereport.matched_records vs scanned (single-user tree)" "$scanned" "$matched"
+    expect_eq_continue "ereport.scanned_records vs ecrawl.entries" "$entries" "$scanned" || fs_fail=1
+    expect_eq_continue "ereport.matched_records vs scanned (single-user tree)" "$scanned" "$matched" || fs_fail=1
 
     trap - EXIT
     cleanup_fs
+    [[ "$fs_fail" -eq 0 ]] || die "filesystem correlation had mismatches for $root (see FAIL lines above)"
     pass "filesystem correlation for $root"
 }
 

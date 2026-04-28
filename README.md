@@ -36,7 +36,7 @@ make check              # tiny in-memory fixture only (fast)
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs ecrawl/ereport built)
 ```
 
-- **`test.sh`** — Parses **`key=value`** stats from **`ecrawl`** and **`ereport`** and checks **`entries` ↔ `scanned_records`**, file/dir/link counts, and byte totals. With **no arguments** it uses a tiny tree under `/tmp`. With a **directory** (e.g. **`./test`** after **`test_setup.sh`**), it also correlates **`find`/`fd`** counts on that tree before crawling it. Use **`SKIP_FS=1`** to skip that filesystem pass when a path is given.
+- **`test.sh`** — Parses **`key=value`** stats from **`ecrawl`** and **`ereport`** and checks **`entries` ↔ `scanned_records`**, file/dir/link counts, and byte totals. With **no arguments** it uses a tiny tree under `/tmp`. With a **directory** (e.g. **`./test`** after **`test_setup.sh`**), it also correlates **`find`/`fd`** counts on that tree before crawling it; **all** ecrawl/ereport checks are printed, then the script fails if any mismatch. On **busy live trees**, counts can drift between the baseline **`fd`/`find`** passes and **`ecrawl`** (minutes apart), so treat strict equality as best on **quiescent** data. Use **`SKIP_FS=1`** to skip that filesystem pass when a path is given.
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
