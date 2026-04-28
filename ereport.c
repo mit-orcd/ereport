@@ -3120,9 +3120,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fputs("ereport: scanning crawl directories for .bin shard files...\n", stderr);
-    fflush(stderr);
-
     if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, all_users_mode, &paths, &path_count) != 0) {
         free((void *)bin_dirs);
         return 1;
@@ -3130,7 +3127,15 @@ int main(int argc, char **argv) {
     free((void *)bin_dirs);
     bin_dirs = NULL;
     if (path_count == 0) {
-        fprintf(stderr, "no matching input .bin files in %s\n", input_dirs_label);
+        if (!all_users_mode && strcmp(g_input_layout, "uid_shards") == 0 && g_input_uid_shards > 0U) {
+            uint32_t shard = ((uint32_t)target_uid) & (g_input_uid_shards - 1U);
+            fprintf(stderr,
+                    "ereport: no uid-shard .bin for this user (uid %" PRIuMAX " → shard %u of %u); "
+                    "ecrawl only writes non-empty shards. Crawl dir: %s\n",
+                    (uintmax_t)(unsigned)target_uid, shard, g_input_uid_shards, input_dirs_label);
+        } else {
+            fprintf(stderr, "ereport: no matching input .bin files in %s\n", input_dirs_label);
+        }
         free(paths);
         return 1;
     }

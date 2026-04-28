@@ -36,7 +36,7 @@ make check              # ./test.sh integration only (tiny /tmp tree; fast)
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs ecrawl/ereport built)
 ```
 
-- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**). With a **directory argument**, it then runs **filesystem correlation** on that root: baseline **`find`/`fd`** file/dir/symlink counts and **unique regular-file bytes** (via **`find`** `%D:%i`, not **`du`**) vs **`ecrawl`**; **`ecrawl`** tree-wide totals vs **`ereport` all-users** only (files, dirs, links, bytes, **`entries` ↔ `scanned_records`**); **single-user** checks are **consistency and subset** (e.g. matched = scanned; scanned and per-type totals ≤ **`ecrawl.entries`** / all-users). **All** checks are printed; any failure fails the step. On **busy live trees**, **`find`/`fd`** can drift from **`ecrawl`** between passes—expect strict equality mainly on **quiescent** data. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_WORKERS`**, **`EREPORT_THREADS`** override defaults.
+- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_WORKERS`**, **`EREPORT_THREADS`** override defaults.
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
@@ -226,6 +226,32 @@ Default behavior:
 - **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallelism for **`--make`** (default **32** when unset or invalid): **chunk-boundary mapping** runs with up to this many scanners across distinct input `.bin` files (capped by file count), and **parse/index** uses the same count for parallel chunk workers (including parallel trigram writers). The trigram **merge** phase uses a **separate** parallelism model (CPU-based, capped), not this variable. Raising thread count increases peak RAM mostly by having more workers fill **bounded** queues (paths writer depth is **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`**); the trigram job queue has a fixed depth (**4096** paths) inside the binary; very high values are rarely useful if storage is the bottleneck.
 - **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** — optional override (**4…4096**) for how many **write batches** may wait on the single writer thread during **`--make`**. Default scales with **`EREPORT_INDEX_THREADS`** (about **threads/4**, clamped **6…48**). Raising this raises peak memory if workers outpace the writer; lowering it adds backpressure (workers block until the writer drains).
 
+#### Raising open-file limits (`ulimit`)
+
+Large **`--make`** runs may keep **many** **`tmp_trigrams_*.bin`** files open at once (one per active trigram bucket, up to **4096**). Indexing also opens crawl shards and pipes—raise **`RLIMIT_NOFILE`** if you hit **`Too many open files`** (**`EMFILE`**).
+
+**Inspect limits in the current shell** (Linux **`bash`**):
+
+```bash
+ulimit -Sn    # soft limit (what the process actually gets)
+ulimit -Hn    # hard limit (ceiling for raising soft without extra privileges)
+```
+
+**Raise the soft limit for this shell session** before running **`--make`** (value must be **≤ hard limit** unless you change the hard limit as root):
+
+```bash
+ulimit -n 65536
+EREPORT_INDEX_THREADS=160 ./ereport_index --make --index-dir /path/to/index/ /path/to/crawl/
+```
+
+Or one line:
+
+```bash
+ulimit -n 65536 && ./ereport_index --make ...
+```
+
+If **`ulimit -n …`** fails with “cannot modify limit”, the hard limit is too low—increase it (requires **root** or local policy): e.g. **`/etc/security/limits.conf`** (`nofile` soft/hard for your user), **systemd** unit **`LimitNOFILE=`** for a service, or session **`pam_limits`**. After changing system limits, **log in again** or start a new session so **`ulimit -Hn`** reflects the new ceiling.
+
 JSON search output is one UTF-8 JSON object per line:
 
 ```json
@@ -238,7 +264,7 @@ If **`--json`** is given without **`--limit`**, **limit defaults to 50**.
 
 Roughly two phases:
 
-1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, while **multiple trigram writer threads** append **`tmp_trigrams_*.bin`** records in parallel (per-bucket mutexes and lazy `FILE*` handles). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** (how many parsed paths may wait for trigram writers) has fixed depth **4096** (not configurable by environment variable).
+1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, while **multiple trigram writer threads** append **`tmp_trigrams_*.bin`** records in parallel (per-bucket mutexes and lazy **`FILE*`** handles—many buckets can be open at once; **`ulimit -n`** may be required). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** (how many parsed paths may wait for trigram writers) has fixed depth **4096** (not configurable by environment variable).
 
 2. **Merge** — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs **multiple worker threads** that write per-bucket segment files, then a single thread **stitches** postings offsets and concatenates blobs. Reads prefer **`mmap`** with `malloc`+`read` fallback; sorting uses **LSD radix** on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers.
 
@@ -413,7 +439,7 @@ Ensure **`ereport_index`** is built (`make ereport_index`) or set **`EREPORT_IND
 
 ## Validation Helpers
 
-`test.sh` behavior is summarized under **Testing** above (integration vs optional filesystem correlation; **`ecrawl`** vs **`find`/`fd`**; **all-users** vs tree-wide **`ecrawl`**; **single-user** subset checks).
+`test.sh` behavior is summarized under **Testing** above (integration vs optional filesystem correlation; **`find`/`fd`** vs **`ecrawl`** and vs **`ereport` all-users**; **`ecrawl`** vs **`ereport`**; **single-user** subset checks).
 
 Example:
 
