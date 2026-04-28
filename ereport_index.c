@@ -35,11 +35,11 @@
 #define INDEX_VERSION 1
 #define TRIGRAM_BUCKET_BITS 12
 #define TRIGRAM_BUCKET_COUNT (1U << TRIGRAM_BUCKET_BITS)
-#define BUCKET_CACHE_SLOTS 64
 #define DEFAULT_THREADS 32
 #define PARSE_CHUNK_BYTES (32ULL << 20)
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define WRITE_BATCH_PATHS 4096
+#define TRIGRAM_JOB_QUEUE_DEPTH 4096 /* pending paths between paths writer and trigram workers */
 #define MERGE_IO_BUFSIZE (1U << 20)
 #define MERGE_MAX_WORKERS 16
 #define MERGE_PARALLEL_MIN 4
@@ -80,18 +80,6 @@ typedef struct __attribute__((packed)) {
 } trigram_key_t;
 
 typedef struct {
-    int bucket;
-    FILE *fp;
-    uint64_t tick;
-} bucket_cache_slot_t;
-
-typedef struct {
-    char dir[PATH_MAX];
-    bucket_cache_slot_t slots[BUCKET_CACHE_SLOTS];
-    uint64_t tick;
-} bucket_cache_t;
-
-typedef struct {
     char *path;
     uint64_t start_offset;
     uint64_t end_offset;
@@ -118,6 +106,45 @@ typedef struct write_batch {
     struct write_batch *next;
 } write_batch_t;
 
+/* Per-`--make` run: live on the stack in `build_index_dir`, passed by pointer (no file-scope atomics). */
+typedef struct index_run_stats {
+    atomic_ullong scanned_input_files;
+    atomic_ullong scanned_records;
+    atomic_ullong indexed_paths;
+    atomic_ullong trigram_records;
+    atomic_ullong bad_input_files;
+    atomic_int stop_stats;
+    atomic_int writer_failed;
+    uint64_t input_files_total;
+    uint64_t chunk_prep_files_total;
+    atomic_ullong chunk_prep_files_done;
+    atomic_ullong writeq_writer_waits;
+    atomic_ullong writeq_parse_waits;
+    atomic_ullong trigramq_paths_waits;
+    atomic_ullong trigramq_worker_waits;
+    double run_start_sec;
+    uint64_t stats_prev_indexed_paths; /* paths/s line in status thread only */
+} index_run_stats_t;
+
+static void index_run_stats_reset(index_run_stats_t *s) {
+    atomic_store(&s->scanned_input_files, 0);
+    atomic_store(&s->scanned_records, 0);
+    atomic_store(&s->indexed_paths, 0);
+    atomic_store(&s->trigram_records, 0);
+    atomic_store(&s->bad_input_files, 0);
+    atomic_store(&s->stop_stats, 0);
+    atomic_store(&s->writer_failed, 0);
+    s->input_files_total = 0;
+    s->chunk_prep_files_total = 0;
+    atomic_store(&s->chunk_prep_files_done, 0);
+    atomic_store(&s->writeq_writer_waits, 0);
+    atomic_store(&s->writeq_parse_waits, 0);
+    atomic_store(&s->trigramq_paths_waits, 0);
+    atomic_store(&s->trigramq_worker_waits, 0);
+    s->run_start_sec = 0.0;
+    s->stats_prev_indexed_paths = 0;
+}
+
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t has_batch; /* writer waits for work */
@@ -127,7 +154,27 @@ typedef struct {
     size_t depth;
     size_t max_depth;
     int closed;
+    index_run_stats_t *run_stats;
 } write_queue_t;
+
+typedef struct trigram_job {
+    uint64_t path_id;
+    uint32_t *codes;
+    size_t code_count;
+    struct trigram_job *next;
+} trigram_job_t;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t has_job;
+    pthread_cond_t has_space;
+    trigram_job_t *head;
+    trigram_job_t *tail;
+    size_t depth;
+    size_t max_depth;
+    int closed;
+    index_run_stats_t *run_stats;
+} trigram_job_queue_t;
 
 typedef struct {
     atomic_uint remaining_chunks;
@@ -140,7 +187,6 @@ typedef struct {
     char index_dir[PATH_MAX];
     FILE *paths_fp;
     FILE *path_offsets_fp;
-    bucket_cache_t bucket_cache;
     uint64_t input_files;
     uint64_t scanned_records;
     uint64_t indexed_paths;
@@ -161,9 +207,13 @@ typedef struct {
     uint64_t merge_bytes_tri_keys_written;
     uint64_t merge_bytes_tri_postings_written;
     uint8_t bucket_nonempty[TRIGRAM_BUCKET_COUNT];
+    pthread_mutex_t *bucket_parallel_mutex; /* [TRIGRAM_BUCKET_COUNT] indexing phase */
+    FILE **bucket_parallel_fp;             /* lazy-open tmp_trigrams; parallel trigram writers */
+    index_run_stats_t *run_stats;
     int merge_workers_used;
     double index_phase_sec;
     int index_workers_used;
+    int trigram_writer_workers_used;
 } build_ctx_t;
 
 typedef struct {
@@ -177,6 +227,17 @@ typedef struct {
 } worker_arg_t;
 
 typedef struct {
+    write_queue_t *write_queue;
+    trigram_job_queue_t *trigram_queue;
+    build_ctx_t *ctx;
+} paths_writer_arg_t;
+
+typedef struct {
+    trigram_job_queue_t *trigram_queue;
+    build_ctx_t *ctx;
+} trigram_worker_arg_t;
+
+typedef struct {
     uint64_t *ids;
     size_t count;
     size_t cap;
@@ -184,20 +245,6 @@ typedef struct {
 
 static const char *g_input_layout = "legacy";
 static uint32_t g_input_uid_shards = 0;
-static atomic_ullong g_progress_scanned_input_files = 0;
-static atomic_ullong g_progress_scanned_records = 0;
-static atomic_ullong g_progress_indexed_paths = 0;
-static atomic_ullong g_progress_trigram_records = 0;
-static atomic_ullong g_progress_bad_input_files = 0;
-static atomic_int g_stop_stats = 0;
-static atomic_int g_writer_failed = 0;
-static uint64_t g_progress_input_files_total = 0;
-static atomic_ullong g_chunk_prep_files_done = 0;
-static uint64_t g_chunk_prep_files_total = 0;
-static double g_run_start_sec = 0.0;
-
-/* Relaxed counter: pthread_cond_wait wakeups while write queue empty (writer idle vs producers). */
-static atomic_ullong g_writeq_writer_waits = 0;
 
 static double now_sec(void) {
     struct timeval tv;
@@ -371,7 +418,10 @@ static int write_queue_push(write_queue_t *q, write_batch_t *batch) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
     }
-    while (q->depth >= q->max_depth && !q->closed) pthread_cond_wait(&q->has_space, &q->mutex);
+    while (q->depth >= q->max_depth && !q->closed) {
+        atomic_fetch_add_explicit(&q->run_stats->writeq_parse_waits, 1ULL, memory_order_relaxed);
+        pthread_cond_wait(&q->has_space, &q->mutex);
+    }
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
@@ -392,7 +442,7 @@ static write_batch_t *write_queue_pop_wait(write_queue_t *q) {
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->closed) {
         pthread_cond_wait(&q->has_batch, &q->mutex);
-        atomic_fetch_add_explicit(&g_writeq_writer_waits, 1ULL, memory_order_relaxed);
+        atomic_fetch_add_explicit(&q->run_stats->writeq_writer_waits, 1ULL, memory_order_relaxed);
     }
     batch = q->head;
     if (batch) {
@@ -413,10 +463,61 @@ static void write_queue_close(write_queue_t *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
-static void *stats_thread_main(void *arg) {
-    (void)arg;
+static int trigram_job_queue_push(trigram_job_queue_t *q, trigram_job_t *job) {
+    pthread_mutex_lock(&q->mutex);
+    if (q->closed) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    while (q->depth >= q->max_depth && !q->closed) {
+        atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
+        pthread_cond_wait(&q->has_space, &q->mutex);
+    }
+    if (q->closed) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    job->next = NULL;
+    if (q->tail) q->tail->next = job;
+    else q->head = job;
+    q->tail = job;
+    q->depth++;
+    pthread_cond_signal(&q->has_job);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
 
-    while (!atomic_load(&g_stop_stats)) {
+static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
+    trigram_job_t *job;
+
+    pthread_mutex_lock(&q->mutex);
+    while (!q->head && !q->closed) {
+        atomic_fetch_add_explicit(&q->run_stats->trigramq_worker_waits, 1ULL, memory_order_relaxed);
+        pthread_cond_wait(&q->has_job, &q->mutex);
+    }
+    job = q->head;
+    if (job) {
+        q->head = job->next;
+        if (!q->head) q->tail = NULL;
+        q->depth--;
+        pthread_cond_broadcast(&q->has_space);
+    }
+    pthread_mutex_unlock(&q->mutex);
+    return job;
+}
+
+static void trigram_job_queue_close(trigram_job_queue_t *q) {
+    pthread_mutex_lock(&q->mutex);
+    q->closed = 1;
+    pthread_cond_broadcast(&q->has_job);
+    pthread_cond_broadcast(&q->has_space);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+static void *stats_thread_main(void *arg) {
+    index_run_stats_t *rs = (index_run_stats_t *)arg;
+
+    while (!atomic_load(&rs->stop_stats)) {
         unsigned long long scanned_files;
         unsigned long long scanned_records;
         unsigned long long indexed_paths;
@@ -424,22 +525,21 @@ static void *stats_thread_main(void *arg) {
         unsigned long long bad_input_files;
         double elapsed_sec;
         char sf[32], tf[32], sr[32], ip[32], tr[32], rate_buf[32], elapsed_buf[32];
-        static unsigned long long prev_indexed_paths = 0;
         double rate;
 
         sleep(1);
 
-        scanned_files = atomic_load(&g_progress_scanned_input_files);
-        scanned_records = atomic_load(&g_progress_scanned_records);
-        indexed_paths = atomic_load(&g_progress_indexed_paths);
-        trigram_records = atomic_load(&g_progress_trigram_records);
-        bad_input_files = atomic_load(&g_progress_bad_input_files);
-        elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
-        rate = (double)(indexed_paths - prev_indexed_paths);
-        prev_indexed_paths = indexed_paths;
+        scanned_files = atomic_load(&rs->scanned_input_files);
+        scanned_records = atomic_load(&rs->scanned_records);
+        indexed_paths = atomic_load(&rs->indexed_paths);
+        trigram_records = atomic_load(&rs->trigram_records);
+        bad_input_files = atomic_load(&rs->bad_input_files);
+        elapsed_sec = rs->run_start_sec > 0.0 ? now_sec() - rs->run_start_sec : 0.0;
+        rate = (double)(indexed_paths - rs->stats_prev_indexed_paths);
+        rs->stats_prev_indexed_paths = indexed_paths;
 
         human_decimal((double)scanned_files, sf, sizeof(sf));
-        human_decimal((double)g_progress_input_files_total, tf, sizeof(tf));
+        human_decimal((double)rs->input_files_total, tf, sizeof(tf));
         human_decimal((double)scanned_records, sr, sizeof(sr));
         human_decimal((double)indexed_paths, ip, sizeof(ip));
         human_decimal((double)trigram_records, tr, sizeof(tr));
@@ -447,8 +547,8 @@ static void *stats_thread_main(void *arg) {
         format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
         {
-            uint64_t prep_tot_u = g_chunk_prep_files_total;
-            unsigned long long prep_done_u = atomic_load(&g_chunk_prep_files_done);
+            uint64_t prep_tot_u = rs->chunk_prep_files_total;
+            unsigned long long prep_done_u = atomic_load(&rs->chunk_prep_files_done);
 
             if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
                 char pdone[32], ptot[32];
@@ -911,6 +1011,7 @@ typedef struct {
     file_chunk_t **prep_chunks;
     size_t *prep_chunk_counts;
     atomic_size_t next_path_index;
+    index_run_stats_t *run_stats;
 } chunk_prep_pool_t;
 
 static void *chunk_prep_worker_main(void *arg) {
@@ -930,7 +1031,7 @@ static void *chunk_prep_worker_main(void *arg) {
         pool->prep_chunks[(int)i] = local_chunks;
         pool->prep_chunk_counts[(int)i] = local_count;
         (void)fc;
-        atomic_fetch_add_explicit(&g_chunk_prep_files_done, 1ULL, memory_order_relaxed);
+        atomic_fetch_add_explicit(&pool->run_stats->chunk_prep_files_done, 1ULL, memory_order_relaxed);
     }
 
     return NULL;
@@ -1186,61 +1287,78 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
     return 0;
 }
 
-static int bucket_cache_init(bucket_cache_t *cache, const char *dir) {
-    memset(cache, 0, sizeof(*cache));
-    if (snprintf(cache->dir, sizeof(cache->dir), "%s", dir) >= (int)sizeof(cache->dir)) return -1;
-    for (size_t i = 0; i < BUCKET_CACHE_SLOTS; i++) cache->slots[i].bucket = -1;
+static int parallel_bucket_io_init(build_ctx_t *ctx) {
+    uint32_t b;
+
+    ctx->bucket_parallel_mutex = (pthread_mutex_t *)calloc(TRIGRAM_BUCKET_COUNT, sizeof(pthread_mutex_t));
+    ctx->bucket_parallel_fp = (FILE **)calloc(TRIGRAM_BUCKET_COUNT, sizeof(FILE *));
+    if (!ctx->bucket_parallel_mutex || !ctx->bucket_parallel_fp) {
+        free(ctx->bucket_parallel_mutex);
+        free(ctx->bucket_parallel_fp);
+        ctx->bucket_parallel_mutex = NULL;
+        ctx->bucket_parallel_fp = NULL;
+        return -1;
+    }
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (pthread_mutex_init(&ctx->bucket_parallel_mutex[b], NULL) != 0) {
+            uint32_t k;
+            for (k = 0; k < b; k++) pthread_mutex_destroy(&ctx->bucket_parallel_mutex[k]);
+            free(ctx->bucket_parallel_mutex);
+            free(ctx->bucket_parallel_fp);
+            ctx->bucket_parallel_mutex = NULL;
+            ctx->bucket_parallel_fp = NULL;
+            return -1;
+        }
+    }
     return 0;
 }
 
-static void bucket_cache_close_all(bucket_cache_t *cache) {
-    for (size_t i = 0; i < BUCKET_CACHE_SLOTS; i++) {
-        if (cache->slots[i].fp) fclose(cache->slots[i].fp);
-        cache->slots[i].fp = NULL;
-        cache->slots[i].bucket = -1;
-        cache->slots[i].tick = 0;
+static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
+    uint32_t b;
+
+    if (!ctx->bucket_parallel_fp) return;
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (ctx->bucket_parallel_fp[b]) {
+            fclose(ctx->bucket_parallel_fp[b]);
+            ctx->bucket_parallel_fp[b] = NULL;
+        }
     }
+    if (ctx->bucket_parallel_mutex) {
+        for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) pthread_mutex_destroy(&ctx->bucket_parallel_mutex[b]);
+        free(ctx->bucket_parallel_mutex);
+        ctx->bucket_parallel_mutex = NULL;
+    }
+    free(ctx->bucket_parallel_fp);
+    ctx->bucket_parallel_fp = NULL;
 }
 
-static FILE *bucket_cache_get_fp(bucket_cache_t *cache, uint32_t bucket, build_ctx_t *ctx) {
-    size_t i;
-    size_t victim = 0;
-    uint64_t victim_tick = UINT64_MAX;
-    char path[PATH_MAX];
+static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, const trigram_record_t *rec) {
     FILE *fp;
+    char path[PATH_MAX];
 
-    for (i = 0; i < BUCKET_CACHE_SLOTS; i++) {
-        if (cache->slots[i].bucket == (int)bucket && cache->slots[i].fp) {
-            cache->slots[i].tick = ++cache->tick;
-            return cache->slots[i].fp;
+    pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
+    fp = ctx->bucket_parallel_fp[bucket];
+    if (!fp) {
+        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(path)) {
+            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+            return -1;
         }
-    }
-
-    for (i = 0; i < BUCKET_CACHE_SLOTS; i++) {
-        if (!cache->slots[i].fp) {
-            victim = i;
-            victim_tick = 0;
-            break;
+        fp = fopen(path, "ab");
+        if (!fp) {
+            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+            return -1;
         }
-        if (cache->slots[i].tick < victim_tick) {
-            victim_tick = cache->slots[i].tick;
-            victim = i;
+        if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
         }
+        ctx->bucket_nonempty[bucket] = 1;
+        ctx->bucket_parallel_fp[bucket] = fp;
     }
-
-    if (cache->slots[victim].fp) fclose(cache->slots[victim].fp);
-
-    if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", cache->dir, bucket) >= (int)sizeof(path)) return NULL;
-    fp = fopen(path, "ab");
-    if (!fp) return NULL;
-    if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+    if (fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        return -1;
     }
-    if (ctx) ctx->bucket_nonempty[bucket] = 1;
-
-    cache->slots[victim].bucket = (int)bucket;
-    cache->slots[victim].fp = fp;
-    cache->slots[victim].tick = ++cache->tick;
-    return fp;
+    pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+    return 0;
 }
 
 static int write_varint_u64(FILE *fp, uint64_t value) {
@@ -1273,52 +1391,56 @@ static int decode_varint_u64_buf(const unsigned char *buf, size_t len, size_t *p
     return -1;
 }
 
-static int append_path_and_trigrams_locked(build_ctx_t *ctx,
-                                           const char *path,
-                                           const uint32_t *codes,
-                                           size_t code_count) {
-    uint64_t path_id = ctx->indexed_paths;
+static int append_paths_only(build_ctx_t *ctx, const char *path) {
     uint64_t offset;
 
     offset = (uint64_t)ftello(ctx->paths_fp);
     if (fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) return -1;
     if (fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) return -1;
-
-    for (size_t i = 0; i < code_count; i++) {
-        trigram_record_t rec;
-        uint32_t bucket = codes[i] >> (24 - TRIGRAM_BUCKET_BITS);
-        FILE *bucket_fp = bucket_cache_get_fp(&ctx->bucket_cache, bucket, ctx);
-        if (!bucket_fp) {
-            return -1;
-        }
-        rec.trigram = codes[i];
-        rec.path_id = path_id;
-        if (fwrite(&rec, sizeof(rec), 1, bucket_fp) != 1) {
-            return -1;
-        }
-    }
-
-    ctx->trigram_records += (uint64_t)code_count;
-    ctx->indexed_paths++;
     return 0;
 }
 
-static void *writer_main(void *arg_void) {
-    worker_arg_t *arg = (worker_arg_t *)arg_void;
+static void *paths_writer_main(void *arg_void) {
+    paths_writer_arg_t *pa = (paths_writer_arg_t *)arg_void;
+    index_run_stats_t *rs = pa->ctx->run_stats;
 
     for (;;) {
-        write_batch_t *batch = write_queue_pop_wait(arg->write_queue);
+        write_batch_t *batch = write_queue_pop_wait(pa->write_queue);
         if (!batch) break;
 
         for (size_t i = 0; i < batch->count; i++) {
             parsed_path_t *item = &batch->items[i];
-            if (append_path_and_trigrams_locked(arg->ctx, item->path, item->codes, item->code_count) != 0) {
-                atomic_store(&g_writer_failed, 1);
+            uint64_t path_id = pa->ctx->indexed_paths;
+            trigram_job_t *job;
+
+            if (append_paths_only(pa->ctx, item->path) != 0) {
+                atomic_store(&rs->writer_failed, 1);
                 write_batch_destroy(batch);
                 return NULL;
             }
-            atomic_fetch_add(&g_progress_indexed_paths, 1U);
-            atomic_fetch_add(&g_progress_trigram_records, (unsigned long long)item->code_count);
+
+            job = (trigram_job_t *)malloc(sizeof(*job));
+            if (!job) {
+                atomic_store(&rs->writer_failed, 1);
+                write_batch_destroy(batch);
+                return NULL;
+            }
+            job->path_id = path_id;
+            job->codes = item->codes;
+            job->code_count = item->code_count;
+            job->next = NULL;
+            item->codes = NULL;
+
+            if (trigram_job_queue_push(pa->trigram_queue, job) != 0) {
+                free(job->codes);
+                free(job);
+                atomic_store(&rs->writer_failed, 1);
+                write_batch_destroy(batch);
+                return NULL;
+            }
+
+            pa->ctx->indexed_paths++;
+            atomic_fetch_add(&rs->indexed_paths, 1U);
         }
 
         write_batch_destroy(batch);
@@ -1327,15 +1449,52 @@ static void *writer_main(void *arg_void) {
     return NULL;
 }
 
-static void finalize_chunk_file_progress(file_state_t *file_states, size_t file_index) {
+static void *trigram_worker_main(void *arg_void) {
+    trigram_worker_arg_t *tw = (trigram_worker_arg_t *)arg_void;
+    index_run_stats_t *rs = tw->ctx->run_stats;
+
+    for (;;) {
+        trigram_job_t *job = trigram_job_queue_pop_wait(tw->trigram_queue);
+        if (!job) break;
+
+        if (atomic_load(&rs->writer_failed)) {
+            free(job->codes);
+            free(job);
+            continue;
+        }
+
+        for (size_t i = 0; i < job->code_count; i++) {
+            trigram_record_t rec;
+            uint32_t bucket = job->codes[i] >> (24 - TRIGRAM_BUCKET_BITS);
+
+            rec.trigram = job->codes[i];
+            rec.path_id = job->path_id;
+            if (append_trigram_record_parallel(tw->ctx, bucket, &rec) != 0) {
+                atomic_store(&rs->writer_failed, 1);
+                free(job->codes);
+                free(job);
+                return NULL;
+            }
+        }
+
+        atomic_fetch_add(&rs->trigram_records, (unsigned long long)job->code_count);
+        free(job->codes);
+        free(job);
+    }
+
+    return NULL;
+}
+
+static void finalize_chunk_file_progress(index_run_stats_t *rs, file_state_t *file_states, size_t file_index) {
     unsigned int old_remaining;
-    if (!file_states) return;
+    if (!file_states || !rs) return;
     old_remaining = atomic_fetch_sub(&file_states[file_index].remaining_chunks, 1U);
-    if (old_remaining == 1U) atomic_fetch_add(&g_progress_scanned_input_files, 1U);
+    if (old_remaining == 1U) atomic_fetch_add(&rs->scanned_input_files, 1U);
 }
 
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     build_ctx_t *ctx = worker->ctx;
+    index_run_stats_t *rs = ctx->run_stats;
     write_queue_t *write_queue = worker->write_queue;
     file_state_t *file_states = worker->file_states;
     FILE *fp = NULL;
@@ -1345,7 +1504,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     fp = fopen(chunk->path, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", chunk->path, strerror(errno));
-        atomic_fetch_add(&g_progress_bad_input_files, 1U);
+        atomic_fetch_add(&rs->bad_input_files, 1U);
         return -1;
     }
 
@@ -1354,7 +1513,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
 
     if (fseeko(fp, (off_t)chunk->start_offset, SEEK_SET) != 0) {
         fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
-        atomic_fetch_add(&g_progress_bad_input_files, 1U);
+        atomic_fetch_add(&rs->bad_input_files, 1U);
         goto out;
     }
 
@@ -1376,24 +1535,24 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             if (feof(fp)) rc = 0;
             else {
                 fprintf(stderr, "warn: read error in %s\n", chunk->path);
-                atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
             }
             break;
         }
 
-        atomic_fetch_add(&g_progress_scanned_records, 1U);
+        atomic_fetch_add(&rs->scanned_records, 1U);
 
         bytes_left_after_hdr = chunk->end_offset - (uint64_t)ftello(fp);
         if ((uint64_t)r.path_len > bytes_left_after_hdr) {
             fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
-            atomic_fetch_add(&g_progress_bad_input_files, 1U);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
 
         if (!ctx->aggregate_all_users && (uid_t)r.uid != ctx->target_uid) {
             if (r.path_len > 0 && fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
                 fprintf(stderr, "warn: seek failed skipping path in %s\n", chunk->path);
-                atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
                 break;
             }
             continue;
@@ -1402,12 +1561,12 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         pathbuf = (char *)malloc((size_t)r.path_len + 1);
         if (!pathbuf) {
             fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-            atomic_fetch_add(&g_progress_bad_input_files, 1U);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
         if (r.path_len > 0 && fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
             fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
-            atomic_fetch_add(&g_progress_bad_input_files, 1U);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
             free(pathbuf);
             break;
         }
@@ -1418,7 +1577,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             size_t code_count = 0;
             if (extract_path_trigrams(pathbuf, &codes, &code_count, worker) != 0) {
                 fprintf(stderr, "warn: failed to extract trigrams from %s\n", chunk->path);
-                atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
                 free(pathbuf);
                 break;
             }
@@ -1427,7 +1586,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
                 batch = (write_batch_t *)calloc(1, sizeof(*batch));
                 if (!batch) {
                     fprintf(stderr, "warn: failed to allocate write batch for %s\n", chunk->path);
-                    atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                    atomic_fetch_add(&rs->bad_input_files, 1U);
                     free(codes);
                     free(pathbuf);
                     break;
@@ -1435,7 +1594,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             }
             if (write_batch_append(batch, pathbuf, codes, code_count) != 0) {
                 fprintf(stderr, "warn: failed to append write batch for %s\n", chunk->path);
-                atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
                 free(codes);
                 free(pathbuf);
                 break;
@@ -1446,7 +1605,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             if (batch->count >= worker->write_batch_flush_at) {
                 if (write_queue_push(write_queue, batch) != 0) {
                     fprintf(stderr, "warn: failed to queue write batch for %s\n", chunk->path);
-                    atomic_fetch_add(&g_progress_bad_input_files, 1U);
+                    atomic_fetch_add(&rs->bad_input_files, 1U);
                     write_batch_destroy(batch);
                     batch = NULL;
                     break;
@@ -1462,11 +1621,11 @@ out:
     fclose(fp);
     if (batch) {
         if (write_queue_push(write_queue, batch) != 0) {
-            atomic_fetch_add(&g_progress_bad_input_files, 1U);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
             write_batch_destroy(batch);
         }
     }
-    finalize_chunk_file_progress(file_states, chunk->file_index);
+    finalize_chunk_file_progress(rs, file_states, chunk->file_index);
     return rc;
 }
 
@@ -1476,7 +1635,7 @@ static void *worker_main(void *arg_void) {
     for (;;) {
         file_chunk_t *chunk = queue_pop(arg->queue);
         if (!chunk) break;
-        if (atomic_load(&g_writer_failed)) break;
+        if (atomic_load(&arg->ctx->run_stats->writer_failed)) break;
         process_chunk_make(arg, chunk);
     }
 
@@ -1978,23 +2137,33 @@ static int build_index_dir(const char *user_spec,
     file_state_t *file_states = NULL;
     work_queue_t queue;
     write_queue_t write_queue;
+    trigram_job_queue_t trigram_queue;
     pthread_t *tids = NULL;
     worker_arg_t *args = NULL;
-    worker_arg_t writer_arg;
+    paths_writer_arg_t paths_writer_arg;
+    trigram_worker_arg_t trigram_worker_arg;
     pthread_t stats_thread;
-    pthread_t writer_thread;
+    pthread_t paths_writer_thread;
+    pthread_t *trigram_tids = NULL;
     build_ctx_t ctx;
+    index_run_stats_t run_stats;
     double t0 = now_sec();
     double t1;
+    double chunk_prep_sec = 0.0;
     int stats_thread_started = 0;
     int threads = parse_index_thread_count();
     int threads_used = 0;
+    int trigram_threads = threads;
+    int trigram_threads_used = 0;
     size_t i;
 
     memset(&ctx, 0, sizeof(ctx));
     memset(&queue, 0, sizeof(queue));
     memset(&write_queue, 0, sizeof(write_queue));
-    memset(&writer_arg, 0, sizeof(writer_arg));
+    memset(&trigram_queue, 0, sizeof(trigram_queue));
+    write_queue.run_stats = &run_stats;
+    trigram_queue.run_stats = &run_stats;
+    memset(&paths_writer_arg, 0, sizeof(paths_writer_arg));
 
     if (!all_users_mode) {
         if (!user_spec) {
@@ -2032,15 +2201,9 @@ static int build_index_dir(const char *user_spec,
     ctx.last_rate_sec = t0;
     ctx.last_rate_indexed_paths = 0;
     ctx.last_rate_merge_units = 0;
-    atomic_store(&g_progress_scanned_input_files, 0);
-    atomic_store(&g_progress_scanned_records, 0);
-    atomic_store(&g_progress_indexed_paths, 0);
-    atomic_store(&g_progress_trigram_records, 0);
-    atomic_store(&g_progress_bad_input_files, 0);
-    atomic_store(&g_stop_stats, 0);
-    atomic_store(&g_writer_failed, 0);
-    atomic_store(&g_writeq_writer_waits, 0);
-    g_run_start_sec = t0;
+    index_run_stats_reset(&run_stats);
+    run_stats.run_start_sec = t0;
+    ctx.run_stats = &run_stats;
 
     if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, all_users_mode, &paths, &path_count) != 0)
         return 1;
@@ -2075,6 +2238,7 @@ static int build_index_dir(const char *user_spec,
     }
 
     {
+        double t_chunk_prep0 = now_sec();
         uint64_t *chunk_targets = (uint64_t *)calloc(path_count, sizeof(uint64_t));
         int *prep_rc = (int *)calloc(path_count, sizeof(int));
         file_chunk_t **prep_chunks = (file_chunk_t **)calloc(path_count, sizeof(*prep_chunks));
@@ -2104,11 +2268,11 @@ static int build_index_dir(const char *user_spec,
                 chunk_targets[i] = compute_parse_chunk_target((uint64_t)st.st_size, threads);
         }
 
-        g_progress_input_files_total = (uint64_t)path_count;
-        g_chunk_prep_files_total = (uint64_t)path_count;
-        atomic_store(&g_chunk_prep_files_done, 0ULL);
+        run_stats.input_files_total = (uint64_t)path_count;
+        run_stats.chunk_prep_files_total = (uint64_t)path_count;
+        atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
 
-        if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
+        if (pthread_create(&stats_thread, NULL, stats_thread_main, &run_stats) != 0) {
             fprintf(stderr, "failed to create stats thread\n");
             free(chunk_targets);
             free(prep_rc);
@@ -2134,12 +2298,13 @@ static int build_index_dir(const char *user_spec,
         pool.prep_rc = prep_rc;
         pool.prep_chunks = prep_chunks;
         pool.prep_chunk_counts = prep_chunk_counts;
+        pool.run_stats = &run_stats;
         atomic_store(&pool.next_path_index, 0);
 
         prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
         if (!prep_tids) {
             fprintf(stderr, "allocation failed\n");
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -2157,7 +2322,7 @@ static int build_index_dir(const char *user_spec,
             if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
                 size_t j;
                 fprintf(stderr, "failed to create chunk-prep thread\n");
-                atomic_store(&g_stop_stats, 1);
+                atomic_store(&run_stats.stop_stats, 1);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -2203,7 +2368,7 @@ static int build_index_dir(const char *user_spec,
             merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
             if (!merged) {
                 fprintf(stderr, "allocation failed\n");
-                atomic_store(&g_stop_stats, 1);
+                atomic_store(&run_stats.stop_stats, 1);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -2238,16 +2403,17 @@ static int build_index_dir(const char *user_spec,
         free(prep_chunks);
         free(prep_chunk_counts);
 
-        g_chunk_prep_files_total = 0;
-        atomic_store(&g_chunk_prep_files_done, 0ULL);
+        run_stats.chunk_prep_files_total = 0;
+        atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
+        chunk_prep_sec = now_sec() - t_chunk_prep0;
     }
 
-    atomic_store(&g_progress_bad_input_files, ctx.bad_input_files);
+    atomic_store(&run_stats.bad_input_files, (unsigned long long)ctx.bad_input_files);
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", dirs_label);
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -2262,7 +2428,7 @@ static int build_index_dir(const char *user_spec,
     if ((!index_dir_override || index_dir_override[0] == '\0') && ensure_dir_recursive(sanitized_name) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", sanitized_name, strerror(errno));
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -2277,7 +2443,7 @@ static int build_index_dir(const char *user_spec,
     if (ensure_dir_recursive(ctx.index_dir) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", ctx.index_dir, strerror(errno));
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -2293,7 +2459,7 @@ static int build_index_dir(const char *user_spec,
     if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
         build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0) {
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -2312,16 +2478,34 @@ static int build_index_dir(const char *user_spec,
     }
     if (ctx.path_offsets_fp && setvbuf(ctx.path_offsets_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
-    if (!ctx.paths_fp || !ctx.path_offsets_fp || bucket_cache_init(&ctx.bucket_cache, ctx.index_dir) != 0) {
+    if (!ctx.paths_fp || !ctx.path_offsets_fp) {
         fprintf(stderr, "failed to initialize index outputs in %s\n", ctx.index_dir);
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
         }
         if (ctx.paths_fp) fclose(ctx.paths_fp);
         if (ctx.path_offsets_fp) fclose(ctx.path_offsets_fp);
+        for (i = 0; i < path_count; i++) free(paths[i]);
+        free(paths);
+        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+        free(chunks);
+        free(file_states);
+        return 1;
+    }
+
+    if (parallel_bucket_io_init(&ctx) != 0) {
+        fprintf(stderr, "ereport_index: failed to allocate per-bucket locks\n");
+        if (stats_thread_started) {
+            atomic_store(&run_stats.stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
+        fclose(ctx.paths_fp);
+        fclose(ctx.path_offsets_fp);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2339,6 +2523,11 @@ static int build_index_dir(const char *user_spec,
     pthread_cond_init(&write_queue.has_batch, NULL);
     pthread_cond_init(&write_queue.has_space, NULL);
 
+    trigram_queue.max_depth = TRIGRAM_JOB_QUEUE_DEPTH;
+    pthread_mutex_init(&trigram_queue.mutex, NULL);
+    pthread_cond_init(&trigram_queue.has_job, NULL);
+    pthread_cond_init(&trigram_queue.has_space, NULL);
+
     threads_used = threads;
     tids = (pthread_t *)calloc((size_t)threads, sizeof(*tids));
     args = (worker_arg_t *)calloc((size_t)threads, sizeof(*args));
@@ -2347,18 +2536,21 @@ static int build_index_dir(const char *user_spec,
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
         }
-        bucket_cache_close_all(&ctx.bucket_cache);
+        parallel_bucket_io_shutdown(&ctx);
         fclose(ctx.paths_fp);
         fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
         pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2367,25 +2559,103 @@ static int build_index_dir(const char *user_spec,
         return 1;
     }
 
-    writer_arg.write_queue = &write_queue;
-    writer_arg.ctx = &ctx;
-    if (pthread_create(&writer_thread, NULL, writer_main, &writer_arg) != 0) {
-        fprintf(stderr, "failed to create writer thread\n");
+    trigram_tids = (pthread_t *)calloc((size_t)trigram_threads, sizeof(*trigram_tids));
+    if (!trigram_tids) {
+        fprintf(stderr, "allocation failed\n");
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
         }
-        bucket_cache_close_all(&ctx.bucket_cache);
+        parallel_bucket_io_shutdown(&ctx);
         fclose(ctx.paths_fp);
         fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
         pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
+        for (i = 0; i < path_count; i++) free(paths[i]);
+        free(paths);
+        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+        free(chunks);
+        free(file_states);
+        return 1;
+    }
+
+    trigram_worker_arg.trigram_queue = &trigram_queue;
+    trigram_worker_arg.ctx = &ctx;
+
+    for (i = 0; i < (size_t)trigram_threads; i++) {
+        if (pthread_create(&trigram_tids[i], NULL, trigram_worker_main, &trigram_worker_arg) != 0) {
+            size_t j;
+            fprintf(stderr, "failed to create trigram worker\n");
+            atomic_store(&run_stats.writer_failed, 1);
+            trigram_job_queue_close(&trigram_queue);
+            for (j = 0; j < i; j++) pthread_join(trigram_tids[j], NULL);
+            free(trigram_tids);
+            trigram_tids = NULL;
+            free(tids);
+            free(args);
+            if (stats_thread_started) {
+                atomic_store(&run_stats.stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+            }
+            parallel_bucket_io_shutdown(&ctx);
+            fclose(ctx.paths_fp);
+            fclose(ctx.path_offsets_fp);
+            pthread_mutex_destroy(&queue.mutex);
+            pthread_mutex_destroy(&write_queue.mutex);
+            pthread_cond_destroy(&write_queue.has_batch);
+            pthread_cond_destroy(&write_queue.has_space);
+            pthread_mutex_destroy(&trigram_queue.mutex);
+            pthread_cond_destroy(&trigram_queue.has_job);
+            pthread_cond_destroy(&trigram_queue.has_space);
+            for (j = 0; j < path_count; j++) free(paths[j]);
+            free(paths);
+            for (j = 0; j < chunk_count; j++) free(chunks[j].path);
+            free(chunks);
+            free(file_states);
+            return 1;
+        }
+    }
+    trigram_threads_used = trigram_threads;
+
+    paths_writer_arg.write_queue = &write_queue;
+    paths_writer_arg.trigram_queue = &trigram_queue;
+    paths_writer_arg.ctx = &ctx;
+    if (pthread_create(&paths_writer_thread, NULL, paths_writer_main, &paths_writer_arg) != 0) {
+        fprintf(stderr, "failed to create paths writer thread\n");
+        atomic_store(&run_stats.writer_failed, 1);
+        trigram_job_queue_close(&trigram_queue);
+        for (i = 0; i < (size_t)trigram_threads; i++) pthread_join(trigram_tids[i], NULL);
+        free(trigram_tids);
+        trigram_tids = NULL;
+        free(tids);
+        free(args);
+        if (stats_thread_started) {
+            atomic_store(&run_stats.stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
+        parallel_bucket_io_shutdown(&ctx);
+        fclose(ctx.paths_fp);
+        fclose(ctx.path_offsets_fp);
+        pthread_mutex_destroy(&queue.mutex);
+        pthread_mutex_destroy(&write_queue.mutex);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2412,38 +2682,45 @@ static int build_index_dir(const char *user_spec,
         pthread_join(tids[i], NULL);
     }
     write_queue_close(&write_queue);
-    pthread_join(writer_thread, NULL);
+    pthread_join(paths_writer_thread, NULL);
+    trigram_job_queue_close(&trigram_queue);
+    for (i = 0; i < (size_t)trigram_threads_used; i++) {
+        pthread_join(trigram_tids[i], NULL);
+    }
 
     if (stats_thread_started) {
-        atomic_store(&g_stop_stats, 1);
+        atomic_store(&run_stats.stop_stats, 1);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
 
-    ctx.scanned_records = atomic_load(&g_progress_scanned_records);
-    ctx.indexed_paths = atomic_load(&g_progress_indexed_paths);
-    ctx.trigram_records = atomic_load(&g_progress_trigram_records);
-    ctx.bad_input_files = atomic_load(&g_progress_bad_input_files);
-    if (atomic_load(&g_writer_failed)) {
-        fprintf(stderr, "writer thread failed while building %s\n", ctx.index_dir);
+    ctx.scanned_records = atomic_load(&run_stats.scanned_records);
+    ctx.indexed_paths = atomic_load(&run_stats.indexed_paths);
+    ctx.trigram_records = atomic_load(&run_stats.trigram_records);
+    ctx.bad_input_files = atomic_load(&run_stats.bad_input_files);
+    if (atomic_load(&run_stats.writer_failed)) {
+        fprintf(stderr, "ereport_index: indexing writer failed while building %s\n", ctx.index_dir);
         free(tids);
         free(args);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
         pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
+        free(trigram_tids);
+        trigram_tids = NULL;
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
         free(file_states);
-        bucket_cache_close_all(&ctx.bucket_cache);
+        parallel_bucket_io_shutdown(&ctx);
         fclose(ctx.paths_fp);
         fclose(ctx.path_offsets_fp);
         return 1;
     }
-
-    bucket_cache_close_all(&ctx.bucket_cache);
 
     if (write_final_path_offset(&ctx) != 0 || fclose(ctx.paths_fp) != 0 || fclose(ctx.path_offsets_fp) != 0) {
         fprintf(stderr, "failed to finalize paths in %s\n", ctx.index_dir);
@@ -2453,16 +2730,25 @@ static int build_index_dir(const char *user_spec,
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
         pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
+        free(trigram_tids);
+        trigram_tids = NULL;
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
         free(file_states);
+        parallel_bucket_io_shutdown(&ctx);
         return 1;
     }
 
     ctx.index_phase_sec = now_sec() - t0;
     ctx.index_workers_used = threads_used;
+    ctx.trigram_writer_workers_used = trigram_threads_used;
+
+    parallel_bucket_io_shutdown(&ctx);
 
     if (process_trigram_buckets(&ctx) != 0 || write_meta_file(&ctx) != 0) {
         fprintf(stderr, "failed to finalize index in %s\n", ctx.index_dir);
@@ -2472,6 +2758,11 @@ static int build_index_dir(const char *user_spec,
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
         pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
+        free(trigram_tids);
+        trigram_tids = NULL;
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2496,8 +2787,10 @@ static int build_index_dir(const char *user_spec,
     printf("trigram_records=%" PRIu64 "\n", ctx.trigram_records);
     printf("unique_trigrams=%" PRIu64 "\n", ctx.unique_trigrams);
     printf("bad_input_files=%" PRIu64 "\n", ctx.bad_input_files);
+    printf("chunk_prep_sec=%.3f\n", chunk_prep_sec);
     printf("index_phase_sec=%.3f\n", ctx.index_phase_sec);
     printf("index_workers=%d\n", ctx.index_workers_used);
+    printf("index_trigram_workers=%d\n", ctx.trigram_writer_workers_used);
     {
         char ips_buf[32];
         double ips = ctx.index_phase_sec > 0.0 ? (double)ctx.indexed_paths / ctx.index_phase_sec : 0.0;
@@ -2533,16 +2826,24 @@ static int build_index_dir(const char *user_spec,
     }
     printf("writeq_max_batches=%zu\n", write_queue.max_depth);
     printf("write_batch_flush_at=%zu\n", batch_paths_flush_limit(threads));
-    printf("writeq_writer_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&g_writeq_writer_waits));
+    printf("writeq_writer_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_writer_waits));
+    printf("writeq_parse_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_parse_waits));
+    printf("trigramq_paths_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_paths_waits));
+    printf("trigramq_worker_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_worker_waits));
     printf("wall_after_index_sec=%.3f\n", (t1 - t0) - ctx.index_phase_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
 
     free(tids);
     free(args);
+    free(trigram_tids);
+    trigram_tids = NULL;
     pthread_mutex_destroy(&queue.mutex);
     pthread_mutex_destroy(&write_queue.mutex);
     pthread_cond_destroy(&write_queue.has_batch);
     pthread_cond_destroy(&write_queue.has_space);
+    pthread_mutex_destroy(&trigram_queue.mutex);
+    pthread_cond_destroy(&trigram_queue.has_job);
+    pthread_cond_destroy(&trigram_queue.has_space);
     for (i = 0; i < path_count; i++) free(paths[i]);
     free(paths);
     for (i = 0; i < chunk_count; i++) free(chunks[i].path);

@@ -3,7 +3,7 @@ CC = gcc
 PYTHON3 ?= python3
 
 # Flags
-CFLAGS = -O2 -Wall -Wextra -pthread
+CFLAGS = -O2 -Wall -Wextra -Wunused-parameter -pthread
 SERVE_ROOT ?= .
 SERVE_PORT ?= 8000
 SERVE_BIND ?= 127.0.0.1

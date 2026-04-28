@@ -191,6 +191,46 @@ typedef struct {
 } uid_accum_t;
 
 typedef struct {
+    uint64_t scanned_input_files;
+    uint64_t scanned_records;
+    uint64_t matched_records;
+    uint64_t bad_input_files;
+} progress_local_t;
+
+/* Per-run stats for HTML report generation (stack in `main`; no file-scope progress atomics). */
+typedef struct ereport_run_stats {
+    atomic_ullong scanned_input_files;
+    atomic_ullong scanned_records;
+    atomic_ullong matched_records;
+    atomic_ullong bad_input_files;
+    atomic_int stop_stats;
+    uint64_t input_files_total;
+    atomic_ullong chunk_prep_files_done;
+    uint64_t chunk_prep_files_total;
+    double run_start_sec;
+    double records_rate_sum;
+    double records_rate_min;
+    double records_rate_max;
+    uint64_t records_rate_samples;
+} ereport_run_stats_t;
+
+static void ereport_run_stats_reset(ereport_run_stats_t *s) {
+    atomic_store(&s->scanned_input_files, 0);
+    atomic_store(&s->scanned_records, 0);
+    atomic_store(&s->matched_records, 0);
+    atomic_store(&s->bad_input_files, 0);
+    atomic_store(&s->stop_stats, 0);
+    s->input_files_total = 0;
+    atomic_store(&s->chunk_prep_files_done, 0);
+    s->chunk_prep_files_total = 0;
+    s->run_start_sec = 0.0;
+    s->records_rate_sum = 0.0;
+    s->records_rate_min = 0.0;
+    s->records_rate_max = 0.0;
+    s->records_rate_samples = 0;
+}
+
+typedef struct {
     work_queue_t *queue;
     file_state_t *file_states;
     uid_t target_uid;
@@ -203,14 +243,8 @@ typedef struct {
     summary_t summary;
     bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS];
     matched_records_t matched_records;
+    ereport_run_stats_t *run_stats;
 } worker_arg_t;
-
-typedef struct {
-    uint64_t scanned_input_files;
-    uint64_t scanned_records;
-    uint64_t matched_records;
-    uint64_t bad_input_files;
-} progress_local_t;
 
 static atomic_ullong g_io_opendir_calls = 0;
 static atomic_ullong g_io_readdir_calls = 0;
@@ -218,24 +252,10 @@ static atomic_ullong g_io_closedir_calls = 0;
 static atomic_ullong g_io_fopen_calls = 0;
 static atomic_ullong g_io_fclose_calls = 0;
 static atomic_ullong g_io_fread_calls = 0;
-static atomic_ullong g_progress_scanned_input_files = 0;
-static atomic_ullong g_progress_scanned_records = 0;
-static atomic_ullong g_progress_matched_records = 0;
-static atomic_ullong g_progress_bad_input_files = 0;
 static atomic_ullong g_bucket_records[WINDOW_SECONDS];
 static atomic_ullong g_window_records = 0;
 static atomic_int g_bucket_index = 0;
 static atomic_uint g_seconds_seen = 0;
-static atomic_int g_stop_stats = 0;
-
-static uint64_t g_progress_input_files_total = 0;
-static atomic_ullong g_chunk_prep_files_done = 0;
-static uint64_t g_chunk_prep_files_total = 0;
-static double g_run_start_sec = 0.0;
-static double g_records_rate_sum = 0.0;
-static double g_records_rate_min = 0.0;
-static double g_records_rate_max = 0.0;
-static uint64_t g_records_rate_samples = 0;
 
 static const char *g_input_layout = "legacy";
 static uint32_t g_input_uid_shards = 0;
@@ -614,10 +634,10 @@ static void format_duration(double sec, char *buf, size_t sz) {
     snprintf(buf, sz, "%02ld:%02ld:%02ld", h, m, s);
 }
 
-static void progress_flush_local(progress_local_t *progress) {
+static void progress_flush_local(progress_local_t *progress, ereport_run_stats_t *rs) {
     int idx;
 
-    if (!progress) return;
+    if (!progress || !rs) return;
     if (progress->scanned_input_files == 0 &&
         progress->scanned_records == 0 &&
         progress->matched_records == 0 &&
@@ -625,26 +645,26 @@ static void progress_flush_local(progress_local_t *progress) {
 
     idx = atomic_load(&g_bucket_index);
     if (progress->scanned_input_files > 0) {
-        atomic_fetch_add(&g_progress_scanned_input_files, progress->scanned_input_files);
+        atomic_fetch_add(&rs->scanned_input_files, progress->scanned_input_files);
     }
     if (progress->scanned_records > 0) {
-        atomic_fetch_add(&g_progress_scanned_records, progress->scanned_records);
+        atomic_fetch_add(&rs->scanned_records, progress->scanned_records);
         atomic_fetch_add(&g_window_records, progress->scanned_records);
         atomic_fetch_add(&g_bucket_records[idx], progress->scanned_records);
     }
     if (progress->matched_records > 0) {
-        atomic_fetch_add(&g_progress_matched_records, progress->matched_records);
+        atomic_fetch_add(&rs->matched_records, progress->matched_records);
     }
     if (progress->bad_input_files > 0) {
-        atomic_fetch_add(&g_progress_bad_input_files, progress->bad_input_files);
+        atomic_fetch_add(&rs->bad_input_files, progress->bad_input_files);
     }
 
     memset(progress, 0, sizeof(*progress));
 }
 
-static void progress_maybe_flush(progress_local_t *progress) {
-    if (!progress) return;
-    if (progress->scanned_records >= PROGRESS_FLUSH_INTERVAL) progress_flush_local(progress);
+static void progress_maybe_flush(progress_local_t *progress, ereport_run_stats_t *rs) {
+    if (!progress || !rs) return;
+    if (progress->scanned_records >= PROGRESS_FLUSH_INTERVAL) progress_flush_local(progress, rs);
 }
 
 static FILE *counted_fopen(const char *path, const char *mode) {
@@ -1833,7 +1853,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
                           progress_local_t *progress,
                           summary_t *sum,
                           bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
-                          matched_records_t *matched_records) {
+                          matched_records_t *matched_records,
+                          ereport_run_stats_t *run_stats) {
     FILE *fp = NULL;
     int rc = -1;
 
@@ -1882,7 +1903,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
         sum->scanned_records++;
         if (progress) {
             progress->scanned_records++;
-            progress_maybe_flush(progress);
+            progress_maybe_flush(progress, run_stats);
         }
 
         record_match = all_users || ((uid_t)r.uid == target_uid);
@@ -2020,7 +2041,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 out:
     counted_fclose(fp);
     finalize_chunk_file_progress(file_states, chunk->file_index, progress);
-    progress_flush_local(progress);
+    progress_flush_local(progress, run_stats);
     return rc;
 }
 
@@ -2046,18 +2067,19 @@ static void *worker_main(void *arg_void) {
                        &progress,
                        &arg->summary,
                        arg->details,
-                       &arg->matched_records);
+                       &arg->matched_records,
+                       arg->run_stats);
     }
 
-    progress_flush_local(&progress);
+    progress_flush_local(&progress, arg->run_stats);
 
     return NULL;
 }
 
 static void *stats_thread_main(void *arg) {
-    (void)arg;
+    ereport_run_stats_t *rs = (ereport_run_stats_t *)arg;
 
-    while (!atomic_load(&g_stop_stats)) {
+    while (!atomic_load(&rs->stop_stats)) {
         unsigned long long scanned_files;
         unsigned long long scanned_records;
         unsigned long long matched_records;
@@ -2081,12 +2103,12 @@ static void *stats_thread_main(void *arg) {
             if (seen < WINDOW_SECONDS) atomic_store(&g_seconds_seen, seen + 1U);
         }
 
-        scanned_files = atomic_load(&g_progress_scanned_input_files);
-        scanned_records = atomic_load(&g_progress_scanned_records);
-        matched_records = atomic_load(&g_progress_matched_records);
-        bad_input_files = atomic_load(&g_progress_bad_input_files);
+        scanned_files = atomic_load(&rs->scanned_input_files);
+        scanned_records = atomic_load(&rs->scanned_records);
+        matched_records = atomic_load(&rs->matched_records);
+        bad_input_files = atomic_load(&rs->bad_input_files);
         window_records = atomic_load(&g_window_records);
-        elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
+        elapsed_sec = rs->run_start_sec > 0.0 ? now_sec() - rs->run_start_sec : 0.0;
 
         {
             unsigned int divisor = atomic_load(&g_seconds_seen);
@@ -2094,21 +2116,21 @@ static void *stats_thread_main(void *arg) {
             records_rate = (double)window_records / (double)divisor;
         }
 
-        g_records_rate_sum += records_rate;
-        if (g_records_rate_samples == 0 || records_rate < g_records_rate_min) g_records_rate_min = records_rate;
-        if (g_records_rate_samples == 0 || records_rate > g_records_rate_max) g_records_rate_max = records_rate;
-        g_records_rate_samples++;
+        rs->records_rate_sum += records_rate;
+        if (rs->records_rate_samples == 0 || records_rate < rs->records_rate_min) rs->records_rate_min = records_rate;
+        if (rs->records_rate_samples == 0 || records_rate > rs->records_rate_max) rs->records_rate_max = records_rate;
+        rs->records_rate_samples++;
 
         human_decimal((double)scanned_files, sf, sizeof(sf));
-        human_decimal((double)g_progress_input_files_total, tf, sizeof(tf));
+        human_decimal((double)rs->input_files_total, tf, sizeof(tf));
         human_decimal((double)scanned_records, sr, sizeof(sr));
         human_decimal((double)matched_records, mr, sizeof(mr));
         human_decimal(records_rate, rr, sizeof(rr));
         format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
         {
-            uint64_t prep_tot_u = g_chunk_prep_files_total;
-            unsigned long long prep_done_u = atomic_load(&g_chunk_prep_files_done);
+            uint64_t prep_tot_u = rs->chunk_prep_files_total;
+            unsigned long long prep_done_u = atomic_load(&rs->chunk_prep_files_done);
 
             if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
                 char pdone[32], ptot[32];
@@ -2406,6 +2428,7 @@ typedef struct {
     file_chunk_t **prep_chunks;
     size_t *prep_chunk_counts;
     atomic_size_t next_path_index;
+    ereport_run_stats_t *run_stats;
 } chunk_prep_pool_t;
 
 static void *chunk_prep_worker_main(void *arg) {
@@ -2425,7 +2448,7 @@ static void *chunk_prep_worker_main(void *arg) {
         pool->prep_chunks[(int)i] = local_chunks;
         pool->prep_chunk_counts[(int)i] = local_count;
         (void)fc;
-        atomic_fetch_add_explicit(&g_chunk_prep_files_done, 1ULL, memory_order_relaxed);
+        atomic_fetch_add_explicit(&pool->run_stats->chunk_prep_files_done, 1ULL, memory_order_relaxed);
     }
 
     return NULL;
@@ -2859,13 +2882,15 @@ static void emit_run_stats(const char *username,
                            int threads_requested,
                            int threads_used,
                            const summary_t *sum,
+                           ereport_run_stats_t *run_rs,
                            int bucket_pages_written,
                            double elapsed_sec) {
     char avg_records_buf[32], mean_records_buf[32], max_records_buf[32], min_records_buf[32];
     double avg_records = elapsed_sec > 0.0 ? (double)sum->scanned_records / elapsed_sec : 0.0;
-    double mean_records = g_records_rate_samples ? g_records_rate_sum / (double)g_records_rate_samples : avg_records;
-    double max_records = g_records_rate_samples ? g_records_rate_max : avg_records;
-    double min_records = g_records_rate_samples ? g_records_rate_min : avg_records;
+    double mean_records =
+        run_rs && run_rs->records_rate_samples ? run_rs->records_rate_sum / (double)run_rs->records_rate_samples : avg_records;
+    double max_records = run_rs && run_rs->records_rate_samples ? run_rs->records_rate_max : avg_records;
+    double min_records = run_rs && run_rs->records_rate_samples ? run_rs->records_rate_min : avg_records;
 
     human_decimal(avg_records, avg_records_buf, sizeof(avg_records_buf));
     human_decimal(mean_records, mean_records_buf, sizeof(mean_records_buf));
@@ -2947,6 +2972,7 @@ int main(int argc, char **argv) {
     int bucket_detail_levels = 0;
     uint64_t distinct_uid_count = 0;
     double t0, t1;
+    ereport_run_stats_t run_stats;
 
     atomic_store(&g_io_opendir_calls, 0);
     atomic_store(&g_io_readdir_calls, 0);
@@ -2954,24 +2980,13 @@ int main(int argc, char **argv) {
     atomic_store(&g_io_fopen_calls, 0);
     atomic_store(&g_io_fclose_calls, 0);
     atomic_store(&g_io_fread_calls, 0);
-    atomic_store(&g_progress_scanned_input_files, 0);
-    atomic_store(&g_progress_scanned_records, 0);
-    atomic_store(&g_progress_matched_records, 0);
-    atomic_store(&g_progress_bad_input_files, 0);
+    ereport_run_stats_reset(&run_stats);
     atomic_store(&g_window_records, 0);
     atomic_store(&g_bucket_index, 0);
     atomic_store(&g_seconds_seen, 0);
-    atomic_store(&g_stop_stats, 0);
     for (i = 0; i < WINDOW_SECONDS; i++) atomic_store(&g_bucket_records[i], 0);
-    g_progress_input_files_total = 0;
-    g_chunk_prep_files_total = 0;
-    atomic_store(&g_chunk_prep_files_done, 0ULL);
-    g_records_rate_sum = 0.0;
-    g_records_rate_min = 0.0;
-    g_records_rate_max = 0.0;
-    g_records_rate_samples = 0;
     t0 = now_sec();
-    g_run_start_sec = t0;
+    run_stats.run_start_sec = t0;
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
@@ -3162,11 +3177,11 @@ int main(int argc, char **argv) {
                 chunk_targets[i] = compute_parse_chunk_target((uint64_t)st.st_size, threads);
         }
 
-        g_progress_input_files_total = (uint64_t)path_count;
-        g_chunk_prep_files_total = (uint64_t)path_count;
-        atomic_store(&g_chunk_prep_files_done, 0ULL);
+        run_stats.input_files_total = (uint64_t)path_count;
+        run_stats.chunk_prep_files_total = (uint64_t)path_count;
+        atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
 
-        if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
+        if (pthread_create(&stats_thread, NULL, stats_thread_main, &run_stats) != 0) {
             fprintf(stderr, "failed to create stats thread\n");
             free(chunk_targets);
             free(prep_rc);
@@ -3192,12 +3207,13 @@ int main(int argc, char **argv) {
         pool.prep_rc = prep_rc;
         pool.prep_chunks = prep_chunks;
         pool.prep_chunk_counts = prep_chunk_counts;
+        pool.run_stats = &run_stats;
         atomic_store(&pool.next_path_index, 0);
 
         prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
         if (!prep_tids) {
             fprintf(stderr, "allocation failed\n");
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -3215,7 +3231,7 @@ int main(int argc, char **argv) {
             if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
                 int j;
                 fprintf(stderr, "failed to create chunk-prep thread\n");
-                atomic_store(&g_stop_stats, 1);
+                atomic_store(&run_stats.stop_stats, 1);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -3255,7 +3271,7 @@ int main(int argc, char **argv) {
             merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
             if (!merged) {
                 fprintf(stderr, "allocation failed\n");
-                atomic_store(&g_stop_stats, 1);
+                atomic_store(&run_stats.stop_stats, 1);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -3290,14 +3306,14 @@ int main(int argc, char **argv) {
         free(prep_chunks);
         free(prep_chunk_counts);
 
-        g_chunk_prep_files_total = 0;
-        atomic_store(&g_chunk_prep_files_done, 0ULL);
+        run_stats.chunk_prep_files_total = 0;
+        atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
     }
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -3324,7 +3340,7 @@ int main(int argc, char **argv) {
         free(chunks);
         chunks = NULL;
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -3361,6 +3377,7 @@ int main(int argc, char **argv) {
         args[i].basis = basis;
         args[i].now = now;
         args[i].seen_inodes = &seen_inodes;
+        args[i].run_stats = &run_stats;
 
         if (all_users_mode) {
             if (uid_accum_init(&args[i].uid_distinct, 8192) != 0) {
@@ -3370,7 +3387,7 @@ int main(int argc, char **argv) {
                 for (j = 0; j < i; j++) pthread_join(tids[j], NULL);
                 for (j = 0; j < i; j++) uid_accum_destroy(&args[j].uid_distinct);
                 if (stats_thread_started) {
-                    atomic_store(&g_stop_stats, 1);
+                    atomic_store(&run_stats.stop_stats, 1);
                     pthread_join(stats_thread, NULL);
                     clear_status_line();
                 }
@@ -3405,7 +3422,7 @@ int main(int argc, char **argv) {
             if (matched_records_merge(&final_matched_records, &args[i].matched_records) != 0) {
                 fprintf(stderr, "allocation failed merging matched records\n");
                 if (stats_thread_started) {
-                    atomic_store(&g_stop_stats, 1);
+                    atomic_store(&run_stats.stop_stats, 1);
                     pthread_join(stats_thread, NULL);
                     clear_status_line();
                 }
@@ -3432,7 +3449,7 @@ int main(int argc, char **argv) {
                     if (bucket_details_merge(&final_details[ab][sb], &args[i].details[ab][sb]) != 0) {
                         fprintf(stderr, "allocation failed merging bucket details\n");
                         if (stats_thread_started) {
-                            atomic_store(&g_stop_stats, 1);
+                            atomic_store(&run_stats.stop_stats, 1);
                             pthread_join(stats_thread, NULL);
                             clear_status_line();
                         }
@@ -3510,7 +3527,7 @@ int main(int argc, char **argv) {
     if (ensure_bucket_output_dir_exists() != 0) {
         fprintf(stderr, "failed to create report output directory %s: %s\n", g_bucket_output_dir, strerror(errno));
         if (stats_thread_started) {
-            atomic_store(&g_stop_stats, 1);
+            atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
         }
@@ -3547,13 +3564,13 @@ int main(int argc, char **argv) {
     final_sum.scanned_input_files = (uint64_t)path_count;
     t1 = now_sec();
     if (stats_thread_started) {
-        atomic_store(&g_stop_stats, 1);
+        atomic_store(&run_stats.stop_stats, 1);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
     emit_run_stats(display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid, basis_str,
-                   input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written,
-                   t1 - t0);
+                   input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, &run_stats,
+                   bucket_pages_written, t1 - t0);
 
     free(tids);
     free(args);
