@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Michel Erb — see license.txt.
+# Copyright (c) 2026 Michel Erb — see LICENSE.
 
 """Serve generated report files over HTTP.
 

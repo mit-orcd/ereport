@@ -472,4 +472,4 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 
 ## License
 
-This project is licensed under the **MIT License**. See **[license.txt](license.txt)**. Copyright is held by **Michel Erb** (2026).
+This project is licensed under the **MIT License**. See **[LICENSE](LICENSE)**. Copyright is held by **Michel Erb** (2026).

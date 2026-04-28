@@ -2,7 +2,7 @@
  * ereport_index — trigram path index for ereport HTML search (eserve).
  *
  * SPDX-License-Identifier: MIT
- * Copyright (c) 2026 Michel Erb — see license.txt.
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
  */
 
 #define _XOPEN_SOURCE 700

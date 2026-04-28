@@ -2,7 +2,7 @@
  * ereport.c
  *
  * SPDX-License-Identifier: MIT
- * Copyright (c) 2026 Michel Erb — see license.txt.
+ * Copyright (c) 2026 Michel Erb — see LICENSE.
  *
  * Parallel reader for crawl bin files produced by ecrawl.
  * Emits the original HTML summary plus per-bucket drilldown pages with
