@@ -89,21 +89,21 @@ Optional environment variables (no CLI flags for these):
 Examples:
 
 ```bash
-./ecrawl /data1
-./ecrawl --no-write /data1
-./ecrawl --no-write --verbose /data1
-ECRAWL_WORKERS=8 ./ecrawl /data1
-./ecrawl /data1 fstor004_apr-17-2026_15-03-01
-./ecrawl --record-root /storage/srv07 /mnt/server07 crawl_srv07
-ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /data1 /tmp/out
-ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /data1 /tmp/out
+./ecrawl /path/to/filesystem-tree
+./ecrawl --no-write /path/to/filesystem-tree
+./ecrawl --no-write --verbose /path/to/filesystem-tree
+ECRAWL_WORKERS=8 ./ecrawl /path/to/filesystem-tree
+./ecrawl /path/to/filesystem-tree host-a_apr-17-2026_15-03-01
+./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
+ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
+ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ```
 
 Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
 - `--verbose` enables the full end-of-run diagnostics.
-- **`--record-root <abs-path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv07/...` vs `/storage/srv08/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. Requires `--record-root` to be an absolute path.
+- **`--record-root <abs-path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. Requires `--record-root` to be an absolute path.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
@@ -148,15 +148,15 @@ Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** 
 Examples:
 
 ```bash
-./ereport milechin atime fstor005-mgmt_apr-17-2026_15-07-17
-EREPORT_THREADS=16 ./ereport milechin atime /tmp/crawl_out
-EREPORT_THREADS=8 ./ereport 82831 mtime /tmp/crawl_out
-EREPORT_THREADS=16 ./ereport milechin atime crawl_srv01 crawl_srv02 crawl_srv03
-./ereport milechin atime crawl_a crawl_b crawl_c
-./ereport atime /tmp/crawl_out
+./ereport alice atime host-b-mgmt_apr-17-2026_15-07-17
+EREPORT_THREADS=16 ./ereport alice atime /tmp/crawl-out
+EREPORT_THREADS=8 ./ereport 82831 mtime /tmp/crawl-out
+EREPORT_THREADS=16 ./ereport alice atime crawl_srv01 crawl_srv02 crawl_srv03
+./ereport alice atime crawl_a crawl_b crawl_c
+./ereport atime /tmp/crawl-out
 EREPORT_THREADS=16 ./ereport mtime crawl_srv01 crawl_srv02
 EREPORT_THREADS=64 ./ereport ctime /path/to/crawl
-./ereport --bucket-details 3 milechin mtime crawl_out
+./ereport --bucket-details 3 alice mtime crawl_out
 ./ereport --bucket-details 3 mtime crawl_srv01 crawl_srv02
 ```
 
@@ -181,15 +181,15 @@ Interactive search in `index.html` requires **`ereport_index --make`** (see belo
 The search is a case-insensitive substring match on **individual path segments** (slashes separate segments; matches do not span `/`). For example:
 
 ```text
-erb
+doc
 ```
 
 matches paths such as:
 
 ```text
-/path/foo/erbmi1/...
-/path/foo/ferbm/...
-/path/foo/erb/...
+/path/foo/alice/...
+/path/foo/acme-docs/...
+/path/foo/doc/...
 ```
 
 Queries must be **at least three characters** (trigram filtering).
@@ -208,13 +208,13 @@ You can pass **multiple** **`bin_dir`** paths (same merged crawl directories as 
 Examples:
 
 ```bash
-./ereport_index --make milechin fstor005-mgmt_apr-17-2026_15-07-17
-./ereport_index --make /path/to/crawl_out
+./ereport_index --make alice host-b-mgmt_apr-17-2026_15-07-17
+./ereport_index --make /path/to/crawl-out
 ./ereport_index --make crawl_srv01 crawl_srv02
-./ereport_index --make --index-dir /var/lib/ereport-search milechin crawl_a crawl_b
-./ereport_index --search erb milechin/index
-./ereport_index --search erb all_users/index
-./ereport_index --search erb milechin/index --json --skip 0 --limit 20   # JSON body for APIs
+./ereport_index --make --index-dir /var/lib/example-search alice crawl_a crawl_b
+./ereport_index --search doc alice/index
+./ereport_index --search doc all_users/index
+./ereport_index --search doc alice/index --json --skip 0 --limit 20   # JSON body for APIs
 ```
 
 Default behavior:
@@ -301,19 +301,19 @@ Examples:
 
 ```bash
 # Serve one user’s report tree (contains index.html + index/ + bucket_*.html)
-make serve-public SERVE_ROOT=./milechin SERVE_PORT=8080
+make serve-public SERVE_ROOT=./alice SERVE_PORT=8080
 
 # Serve a parent directory that contains a user folder
 make serve-public SERVE_ROOT=. SERVE_PORT=8000
-# Then open http://<host>:8000/milechin/index.html
+# Then open http://<host>:8000/alice/index.html
 ```
 
 **Search HTTP API** (used by `index.html` via relative `fetch`):
 
 | URL pattern | When to use |
 |-------------|-------------|
-| **`GET /search?q=…&skip=…&limit=…`** | `SERVE_ROOT` **is** the report directory (e.g. `./milechin`) so `index.html` is at the root of the site. |
-| **`GET /<user>/search?q=…`** | `SERVE_ROOT` **contains** the user folder (e.g. SERVE_ROOT=. and files live under `./milechin/`). |
+| **`GET /search?q=…&skip=…&limit=…`** | `SERVE_ROOT` **is** the report directory (e.g. `./alice`) so `index.html` is at the root of the site. |
+| **`GET /<user>/search?q=…`** | `SERVE_ROOT` **contains** the user folder (e.g. SERVE_ROOT=. and files live under `./alice/`). |
 
 Parameters:
 
@@ -327,7 +327,7 @@ Direct **`python3`** invocation:
 
 ```bash
 python3 eserve.py --bind 127.0.0.1 --port 8000 /path/to/serve
-python3 eserve.py --bind 0.0.0.0 --port 8080 ./milechin
+python3 eserve.py --bind 0.0.0.0 --port 8080 ./alice
 ```
 
 ## Typical Workflow
@@ -337,7 +337,7 @@ For **multiple crawl outputs** (e.g. several servers), run **`ecrawl`** once per
 ### 1. Crawl a filesystem
 
 ```bash
-./ecrawl /data1
+./ecrawl /path/to/filesystem-tree
 ```
 
 This writes binary shard files into an auto-generated output directory unless you provide one explicitly.
@@ -345,14 +345,14 @@ This writes binary shard files into an auto-generated output directory unless yo
 ### 2. Build a per-user report
 
 ```bash
-./ereport milechin atime fstor004_apr-17-2026_15-03-01
+./ereport alice atime host-a_apr-17-2026_15-03-01
 ```
 
 This writes:
 
 ```text
-milechin/index.html
-milechin/bucket_a0_s0.html
+alice/index.html
+alice/bucket_a0_s0.html
 ...
 ```
 
@@ -361,16 +361,16 @@ milechin/bucket_a0_s0.html
 One crawl output directory (default index location is **`./<username>/index/`**):
 
 ```bash
-./ereport_index --make milechin fstor004_apr-17-2026_15-03-01
+./ereport_index --make alice host-a_apr-17-2026_15-03-01
 ```
 
 Several crawl output directories (merged index for the same user):
 
 ```bash
-./ereport_index --make milechin crawl_srv01 crawl_srv02 crawl_srv03
+./ereport_index --make alice crawl_srv01 crawl_srv02 crawl_srv03
 ```
 
-Omit directories to use **`./`** as the only input path: `./ereport_index --make milechin`.
+Omit directories to use **`./`** as the only input path: `./ereport_index --make alice`.
 
 **All-users** index (same crawl inputs as `./ereport ctime …`, output beside **`./all_users/`**). Omit a username: list crawl dirs first so the first token is **not** resolved as a login or uid:
 
@@ -382,11 +382,11 @@ Omit directories to use **`./`** as the only input path: `./ereport_index --make
 This writes:
 
 ```text
-milechin/index/meta.txt
-milechin/index/path_offsets.bin
-milechin/index/paths.bin
-milechin/index/tri_keys.bin
-milechin/index/tri_postings.bin
+alice/index/meta.txt
+alice/index/path_offsets.bin
+alice/index/paths.bin
+alice/index/tri_keys.bin
+alice/index/tri_postings.bin
 ```
 
 ### 4. Serve the results over HTTP
@@ -396,7 +396,7 @@ Pick **`SERVE_ROOT`** depending on how you want URLs to look:
 **Option A — Serve the user directory directly** (`index.html` at site root):
 
 ```bash
-make serve-public SERVE_ROOT=./milechin SERVE_PORT=8000
+make serve-public SERVE_ROOT=./alice SERVE_PORT=8000
 ```
 
 Open **`http://127.0.0.1:8000/index.html`**. Search requests go to **`http://127.0.0.1:8000/search?q=…`** (handled by `eserve.py`).
@@ -407,7 +407,7 @@ Open **`http://127.0.0.1:8000/index.html`**. Search requests go to **`http://127
 make serve-public SERVE_ROOT=. SERVE_PORT=8000
 ```
 
-Open **`http://127.0.0.1:8000/milechin/index.html`**. Search requests resolve to **`http://127.0.0.1:8000/milechin/search?q=…`**.
+Open **`http://127.0.0.1:8000/alice/index.html`**. Search requests resolve to **`http://127.0.0.1:8000/alice/search?q=…`**.
 
 Ensure **`ereport_index`** is built (`make ereport_index`) or set **`EREPORT_INDEX_BIN`** before starting the server.
 
@@ -418,7 +418,7 @@ Ensure **`ereport_index`** is built (`make ereport_index`) or set **`EREPORT_IND
 Example:
 
 ```bash
-./test.sh /data1/milechin
+./test.sh /path/to/test-correlation-root
 ```
 
 It is mainly for development and benchmarking, not part of the normal end-user workflow.
