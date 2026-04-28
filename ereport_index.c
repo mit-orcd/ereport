@@ -1340,11 +1340,13 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     fp = ctx->bucket_parallel_fp[bucket];
     if (!fp) {
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(path)) {
+            fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u)\n", bucket);
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             return -1;
         }
         fp = fopen(path, "ab");
         if (!fp) {
+            fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             return -1;
         }
@@ -1354,6 +1356,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
         ctx->bucket_parallel_fp[bucket] = fp;
     }
     if (fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+        fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
         pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
         return -1;
     }
@@ -1395,8 +1398,14 @@ static int append_paths_only(build_ctx_t *ctx, const char *path) {
     uint64_t offset;
 
     offset = (uint64_t)ftello(ctx->paths_fp);
-    if (fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) return -1;
-    if (fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) return -1;
+    if (fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) {
+        fprintf(stderr, "ereport_index: fwrite path_offsets.bin: %s\n", strerror(errno));
+        return -1;
+    }
+    if (fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) {
+        fprintf(stderr, "ereport_index: fwrite paths.bin: %s\n", strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -1421,6 +1430,7 @@ static void *paths_writer_main(void *arg_void) {
 
             job = (trigram_job_t *)malloc(sizeof(*job));
             if (!job) {
+                fprintf(stderr, "ereport_index: malloc(trigram_job): %s\n", strerror(errno));
                 atomic_store(&rs->writer_failed, 1);
                 write_batch_destroy(batch);
                 return NULL;
@@ -1432,6 +1442,7 @@ static void *paths_writer_main(void *arg_void) {
             item->codes = NULL;
 
             if (trigram_job_queue_push(pa->trigram_queue, job) != 0) {
+                fprintf(stderr, "ereport_index: trigram job queue push failed (queue closed)\n");
                 free(job->codes);
                 free(job);
                 atomic_store(&rs->writer_failed, 1);

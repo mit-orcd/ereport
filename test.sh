@@ -41,6 +41,16 @@ expect_eq_continue() {
     return 0
 }
 
+# Integer: got <= ceiling (for single-user ⊆ tree / ⊆ all-users checks).
+expect_le_continue() {
+    local label=$1 ceiling=$2 got=$3
+    if [[ "$got" -gt "$ceiling" ]]; then
+        printf '  FAIL: %s: want <= %s got %s\n' "$label" "$ceiling" "$got" >&2
+        return 1
+    fi
+    return 0
+}
+
 need_exe() {
     [[ -x "$1" ]] || die "missing or not executable: $1 (run 'make' in ${SCRIPT_DIR})"
 }
@@ -87,7 +97,9 @@ run_fs_correlation() {
     log "filesystem correlation (may be slow on large trees): $root"
     log "note: live trees can drift between fd/find passes and ecrawl; expect exact match only on quiescent data."
 
-    local fc dc lc crawl_files crawl_dirs crawl_symlinks crawl_bytes ere_files ere_dirs ere_links ere_cap fs_files fs_dirs fs_symlinks fs_u_bytes
+    local fc dc lc crawl_files crawl_dirs crawl_symlinks crawl_bytes entries
+    local su_files su_dirs su_links su_cap su_scanned su_matched
+    local au_files au_dirs au_links au_cap au_scanned au_matched au_distinct
 
     fc=$(count_files "$root")
     dc=$(count_dirs "$root")
@@ -96,12 +108,14 @@ run_fs_correlation() {
 
     printf '  find/fd: files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$fc" "$dc" "$lc" "$fs_u_bytes"
 
-    local td crawl_out crawl_log ere_log ere_out
+    local td crawl_out crawl_log ere_su_out ere_su_err ere_all_out ere_all_log
     td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_fs_test.XXXXXX")
     crawl_out="${td}/crawl_out"
     crawl_log="${td}/ecrawl.log"
-    ere_log="${td}/ereport.err"
-    ere_out="${td}/ereport.out"
+    ere_su_out="${td}/ereport_single.stdout"
+    ere_su_err="${td}/ereport_single.stderr"
+    ere_all_out="${td}/ereport_all.stdout"
+    ere_all_log="${td}/ereport_all.stderr"
 
     cleanup_fs() {
         rm -rf "$td"
@@ -112,7 +126,7 @@ run_fs_correlation() {
     root_abs=$(cd "$root" && pwd)
 
     log "ecrawl -> ${crawl_out}"
-    ECREAWL_WORKERS="${ECREAWL_WORKERS:-8}" \
+    ECRAWL_WORKERS="${ECRAWL_WORKERS:-8}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
         die "ecrawl failed"
@@ -131,37 +145,67 @@ run_fs_correlation() {
     expect_eq_continue "ecrawl.symlinks vs fs symlink count" "$lc" "$crawl_symlinks" || fs_fail=1
     expect_eq_continue "ecrawl.total_bytes vs sum unique regular bytes" "$fs_u_bytes" "$crawl_bytes" || fs_fail=1
 
-    log "ereport (single user) cwd=${td}"
+    entries=$(kv_last entries "$crawl_log")
+
+    # Single-user and all-users runs use the same crawl; ecrawl line totals are tree-wide → compare only to all-users.
+    log "ereport single-user ($(id -un)) cwd=${td}"
     (
         cd "$td" || exit 1
         EREPORT_THREADS="${EREPORT_THREADS:-8}" \
-            "$EREPORT" "$(id -un)" mtime "$crawl_out" >"$ere_out" 2>"$ere_log"
+            "$EREPORT" "$(id -un)" mtime "$crawl_out" >"$ere_su_out" 2>"$ere_su_err"
     ) || {
-        tail -n 60 "$ere_log" >&2 || true
-        tail -n 40 "$ere_out" >&2 || true
-        die "ereport failed"
+        tail -n 60 "$ere_su_err" >&2 || true
+        tail -n 40 "$ere_su_out" >&2 || true
+        die "ereport (single user) failed"
     }
 
-    ere_files=$(kv_last files "$ere_out")
-    ere_dirs=$(kv_last directories "$ere_out")
-    ere_links=$(kv_last links "$ere_out")
-    ere_cap=$(kv_last total_capacity_in_files "$ere_out")
+    log "ereport all-users aggregate cwd=${td}"
+    (
+        cd "$td" || exit 1
+        EREPORT_THREADS="${EREPORT_THREADS:-8}" \
+            "$EREPORT" mtime "$crawl_out" >"$ere_all_out" 2>"$ere_all_log"
+    ) || {
+        tail -n 60 "$ere_all_log" >&2 || true
+        tail -n 40 "$ere_all_out" >&2 || true
+        die "ereport (all users) failed"
+    }
 
-    printf '  ereport: files=%s dirs=%s links=%s total_capacity_in_files=%s\n' \
-        "$ere_files" "$ere_dirs" "$ere_links" "$ere_cap"
+    su_files=$(kv_last files "$ere_su_out")
+    su_dirs=$(kv_last directories "$ere_su_out")
+    su_links=$(kv_last links "$ere_su_out")
+    su_cap=$(kv_last total_capacity_in_files "$ere_su_out")
+    su_scanned=$(kv_last scanned_records "$ere_su_out")
+    su_matched=$(kv_last matched_records "$ere_su_out")
 
-    expect_eq_continue "ereport.files vs ecrawl.files" "$crawl_files" "$ere_files" || fs_fail=1
-    expect_eq_continue "ereport.directories vs ecrawl.dirs" "$crawl_dirs" "$ere_dirs" || fs_fail=1
-    expect_eq_continue "ereport.links vs ecrawl.symlinks" "$crawl_symlinks" "$ere_links" || fs_fail=1
-    expect_eq_continue "ereport.total_capacity_in_files vs ecrawl.total_bytes" "$crawl_bytes" "$ere_cap" || fs_fail=1
+    au_files=$(kv_last files "$ere_all_out")
+    au_dirs=$(kv_last directories "$ere_all_out")
+    au_links=$(kv_last links "$ere_all_out")
+    au_cap=$(kv_last total_capacity_in_files "$ere_all_out")
+    au_scanned=$(kv_last scanned_records "$ere_all_out")
+    au_matched=$(kv_last matched_records "$ere_all_out")
+    au_distinct=$(kv_last distinct_uids "$ere_all_out")
 
-    local scanned matched entries
-    scanned=$(kv_last scanned_records "$ere_out")
-    matched=$(kv_last matched_records "$ere_out")
-    entries=$(kv_last entries "$crawl_log")
-    printf '  records: ecrawl entries=%s ereport scanned=%s matched=%s\n' "$entries" "$scanned" "$matched"
-    expect_eq_continue "ereport.scanned_records vs ecrawl.entries" "$entries" "$scanned" || fs_fail=1
-    expect_eq_continue "ereport.matched_records vs scanned (single-user tree)" "$scanned" "$matched" || fs_fail=1
+    printf '  ereport single (%s): files=%s dirs=%s links=%s scanned=%s matched=%s total_capacity_in_files=%s\n' \
+        "$(id -un)" "$su_files" "$su_dirs" "$su_links" "$su_scanned" "$su_matched" "$su_cap"
+    printf '  ereport all_users: files=%s dirs=%s links=%s scanned=%s matched=%s total_capacity_in_files=%s distinct_uids=%s\n' \
+        "$au_files" "$au_dirs" "$au_links" "$au_scanned" "$au_matched" "$au_cap" "$au_distinct"
+    printf '  records: ecrawl entries=%s ereport single scanned=%s all-users scanned=%s\n' \
+        "$entries" "$su_scanned" "$au_scanned"
+
+    expect_eq_continue "all-users: ereport.files vs ecrawl.files" "$crawl_files" "$au_files" || fs_fail=1
+    expect_eq_continue "all-users: ereport.directories vs ecrawl.dirs" "$crawl_dirs" "$au_dirs" || fs_fail=1
+    expect_eq_continue "all-users: ereport.links vs ecrawl.symlinks" "$crawl_symlinks" "$au_links" || fs_fail=1
+    expect_eq_continue "all-users: ereport.total_capacity_in_files vs ecrawl.total_bytes" "$crawl_bytes" "$au_cap" || fs_fail=1
+    expect_eq_continue "all-users: ereport.scanned_records vs ecrawl.entries" "$entries" "$au_scanned" || fs_fail=1
+    expect_eq_continue "all-users: ereport.matched_records vs scanned" "$au_scanned" "$au_matched" || fs_fail=1
+
+    expect_eq_continue "single-user: matched_records vs scanned" "$su_scanned" "$su_matched" || fs_fail=1
+    expect_le_continue "single-user: scanned_records <= ecrawl.entries" "$entries" "$su_scanned" || fs_fail=1
+    expect_le_continue "single-user: scanned_records <= all-users scanned_records" "$au_scanned" "$su_scanned" || fs_fail=1
+    expect_le_continue "single-user: files <= all-users files" "$au_files" "$su_files" || fs_fail=1
+    expect_le_continue "single-user: directories <= all-users directories" "$au_dirs" "$su_dirs" || fs_fail=1
+    expect_le_continue "single-user: links <= all-users links" "$au_links" "$su_links" || fs_fail=1
+    expect_le_continue "single-user: total_capacity_in_files <= all-users total_capacity_in_files" "$au_cap" "$su_cap" || fs_fail=1
 
     trap - EXIT
     cleanup_fs
@@ -196,7 +240,7 @@ run_integration() {
     root_abs=$(cd "${td}/walk" && pwd)
 
     log "ecrawl ${root_abs} -> ${crawl_out}"
-    ECREAWL_WORKERS="${ECREAWL_WORKERS:-4}" \
+    ECRAWL_WORKERS="${ECRAWL_WORKERS:-4}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
         die "ecrawl failed on synthetic tree"

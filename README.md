@@ -32,11 +32,11 @@ make clean
 ## Testing
 
 ```bash
-make check              # tiny in-memory fixture only (fast)
+make check              # ./test.sh integration only (tiny /tmp tree; fast)
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs ecrawl/ereport built)
 ```
 
-- **`test.sh`** — Parses **`key=value`** stats from **`ecrawl`** and **`ereport`** and checks **`entries` ↔ `scanned_records`**, file/dir/link counts, and byte totals. With **no arguments** it uses a tiny tree under `/tmp`. With a **directory** (e.g. **`./test`** after **`test_setup.sh`**), it also correlates **`find`/`fd`** counts on that tree before crawling it; **all** ecrawl/ereport checks are printed, then the script fails if any mismatch. On **busy live trees**, counts can drift between the baseline **`fd`/`find`** passes and **`ecrawl`** (minutes apart), so treat strict equality as best on **quiescent** data. Use **`SKIP_FS=1`** to skip that filesystem pass when a path is given.
+- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**). With a **directory argument**, it then runs **filesystem correlation** on that root: baseline **`find`/`fd`** file/dir/symlink counts and **unique regular-file bytes** (via **`find`** `%D:%i`, not **`du`**) vs **`ecrawl`**; **`ecrawl`** tree-wide totals vs **`ereport` all-users** only (files, dirs, links, bytes, **`entries` ↔ `scanned_records`**); **single-user** checks are **consistency and subset** (e.g. matched = scanned; scanned and per-type totals ≤ **`ecrawl.entries`** / all-users). **All** checks are printed; any failure fails the step. On **busy live trees**, **`find`/`fd`** can drift from **`ecrawl`** between passes—expect strict equality mainly on **quiescent** data. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_WORKERS`**, **`EREPORT_THREADS`** override defaults.
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
@@ -413,7 +413,7 @@ Ensure **`ereport_index`** is built (`make ereport_index`) or set **`EREPORT_IND
 
 ## Validation Helpers
 
-`test.sh` is a validation script used during development to compare crawl/report counts and byte totals against `find`, `fd`, and `du` style checks.
+`test.sh` behavior is summarized under **Testing** above (integration vs optional filesystem correlation; **`ecrawl`** vs **`find`/`fd`**; **all-users** vs tree-wide **`ecrawl`**; **single-user** subset checks).
 
 Example:
 
@@ -421,7 +421,7 @@ Example:
 ./test.sh /path/to/test-correlation-root
 ```
 
-It is mainly for development and benchmarking, not part of the normal end-user workflow.
+Used during development and benchmarking; not part of the normal end-user workflow.
 
 ## Output Semantics
 
