@@ -1,6 +1,9 @@
 /*
  * ecrawl.c
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see license.txt.
+ *
  * Compact binary-output local filesystem metadata crawler.
  *
  * Features:

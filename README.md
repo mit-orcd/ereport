@@ -7,7 +7,6 @@ The current toolchain is:
 - `ecrawl`: parallel filesystem crawler that writes compact binary records
 - `ereport`: report generator that reads crawl output and writes `index.html`, bucket drilldown pages, and a search box that uses the trigram index when you serve the tree over HTTP
 - `ereport_index`: search-index helper for path-element substring search
-- `ereport_simple`: older/simple report variant
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
 
 ## Build
@@ -22,13 +21,30 @@ Build individual binaries:
 make ecrawl
 make ereport
 make ereport_index
-make ereport_simple
 ```
 
 Clean:
 
 ```bash
 make clean
+```
+
+## Testing
+
+```bash
+make check              # tiny in-memory fixture only (fast)
+make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs ecrawl/ereport built)
+```
+
+- **`test.sh`** — Parses **`key=value`** stats from **`ecrawl`** and **`ereport`** and checks **`entries` ↔ `scanned_records`**, file/dir/link counts, and byte totals. With **no arguments** it uses a tiny tree under `/tmp`. With a **directory** (e.g. **`./test`** after **`test_setup.sh`**), it also correlates **`find`/`fd`** counts on that tree before crawling it. Use **`SKIP_FS=1`** to skip that filesystem pass when a path is given.
+- **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
+- **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
+
+Manual sequence:
+
+```bash
+./test_setup.sh
+./test.sh "$(pwd)/test"
 ```
 
 ## What The Tools Do
@@ -102,29 +118,32 @@ Interpret these as **counts of blocking episodes**, not wall-clock time.
 
 ### `ereport`
 
-`ereport` reads crawl output and builds a per-user HTML report under **`./<username>/`** (resolved login name), unless that name is unusable—then it falls back to `./tmp/`.
+`ereport` reads crawl output and builds an HTML report under **`./<username>/`** (resolved login name), unless that name is unusable—then it falls back to `./tmp/`. If you **omit the username** and pass only the time basis (`./ereport atime …`), it aggregates **all UIDs** present in the crawl and writes under **`./all_users/`**.
 
 Outputs:
 
 - `./<username>/index.html` — heat map, **path search** box (uses server-side index when served via `eserve`), full statistics below the table
-- `./<username>/bucket_aX_sY.html` — bucket drilldown pages  
-  Bucket links open in a **right-hand drawer**. Search results appear in a **panel directly below** the search box (live preview after three characters; press **Enter** for full paging with **Prev/Next**).
+- `./<username>/bucket_aX_sY.html` — per age/size cell; **brief summary HTML** unless you pass **`--bucket-details N`** (see below). With **`--bucket-details`**, each page lists directory rollup tables for **N** path levels below the shared prefix inside that bucket.
+- `./all_users/` — same layout; **`./all_users/bucket_aX_sY.html`** is a brief summary unless **`--bucket-details`** is used (heat-map totals on `index.html` always match the crawl).
+
+Place **`--bucket-details N`** (`N` = **1…32**) **first**, before the username (if any) and time basis. Omit it for fast runs and small bucket HTML (no path reads for drill-down tables).
 
 **Search UI (important):** There is **only one** search field. Results stay **below that box**—not in a sliding drawer—so it stays obvious what you are editing. After three characters you get a preview list under the input; press **Enter** for paged results in the same panel. Use **Hide** to collapse the panel without clearing your query.
 
 Usage:
 
 ```bash
-./ereport <username|uid> <atime|mtime|ctime> [bin_dir ...]
+./ereport [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]
+./ereport [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]   # all users → ./all_users/
 ```
 
 If you **omit every `bin_dir`**, `ereport` reads crawl `.bin` files from the **current working directory** (`./`).
 
-Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** thread):
+The **first argument** is treated as a time basis (`atime`, `mtime`, or `ctime`) only when it matches exactly—otherwise it is interpreted as a username or numeric UID (so you cannot name an account literally `atime` without passing it as a UID).
 
-- Set **`EREPORT_THREADS`** (default **32**). Thread count is **not** set on the command line.
+Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** thread): set **`EREPORT_THREADS`** (default **32**). Thread count is **not** set on the command line.
 
-**Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (legacy vs `uid_shards`) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file (uid-sharded layout) or all matching bins (legacy)—so twenty servers mean twenty directories and twenty shard files merged into one report.
+**Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (legacy vs `uid_shards`) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file when you specify a user (uid-sharded layout), **or every shard file** when aggregating all users; legacy layouts still load all matching bins. So twenty servers mean twenty directories and twenty shard files merged into one report (per-user), or all shards from every directory (all-users mode).
 
 Examples:
 
@@ -134,12 +153,20 @@ EREPORT_THREADS=16 ./ereport milechin atime /tmp/crawl_out
 EREPORT_THREADS=8 ./ereport 82831 mtime /tmp/crawl_out
 EREPORT_THREADS=16 ./ereport milechin atime crawl_srv01 crawl_srv02 crawl_srv03
 ./ereport milechin atime crawl_a crawl_b crawl_c
+./ereport atime /tmp/crawl_out
+EREPORT_THREADS=16 ./ereport mtime crawl_srv01 crawl_srv02
+EREPORT_THREADS=64 ./ereport ctime /path/to/crawl
+./ereport --bucket-details 3 milechin mtime crawl_out
+./ereport --bucket-details 3 mtime crawl_srv01 crawl_srv02
 ```
 
 Parse chunks scale with input `.bin` size so parallel workers are not capped by a tiny chunk count.
 
+**Bucket drill-down:** By default, **`ereport` does not read path strings** into per-bucket tables—the parser seeks past path bytes and **`bucket_aX_sY.html`** files stay short summaries. Pass **`--bucket-details N`** so **`ereport` reads paths** and emits **N** directory-level rollup tables per bucket page (`N` between **1** and **32**). This applies to **single-user** and **all-users** runs; larger **`N`** and all-users crawls cost more I/O and memory.
+
 Runtime behavior:
 
+- **`ereport` scans crawl directories**, then **maps chunk boundaries** inside each `.bin` shard (reading record headers only). That mapping runs with **`EREPORT_THREADS` parallel scanners**; stdout shows **`chunk-map files:X/Y`** until every shard has been scanned, then the usual records/sec line appears while workers parse chunks.
 - prints a live progress line during processing
 - prints final run stats to `stdout`
 - writes warnings/errors to `stderr`
@@ -149,7 +176,7 @@ Interactive search in `index.html` requires **`ereport_index --make`** (see belo
 
 ### `ereport_index`
 
-`ereport_index` builds and searches an on-disk trigram index for one user’s crawl data.
+`ereport_index` builds and searches an on-disk trigram index over crawl path strings—either for **one resolved Unix user** or for **every UID** when **no user** is selected (see **`--make`** disambiguation below; same idea as `ereport` all-users mode: all uid-shard files, no UID filter on records).
 
 The search is a case-insensitive substring match on **individual path segments** (slashes separate segments; matches do not span `/`). For example:
 
@@ -170,24 +197,34 @@ Queries must be **at least three characters** (trigram filtering).
 Usage:
 
 ```bash
-./ereport_index --make <username|uid> [bin_dir ...]
+./ereport_index --make [--index-dir <path>] [username|uid] [bin_dir ...]
 ./ereport_index --search <term> [index_dir] [--json] [--skip N] [--limit M]
 ```
+
+**`--make` user vs all-users:** If the **first** argument after optional **`--index-dir`** is a valid login name or numeric uid on this system, it names the report user and any further arguments are crawl directories (default **`./`**). If that first token is **not** a known user (for example it is a crawl output directory name), **every** argument—including the first—is treated as a **`bin_dir`**, and the index is built for **all UIDs** under **`./all_users/index/`** unless **`--index-dir`** overrides the location (same merge semantics as **`ereport`** aggregate output). **`./ereport_index --make`** with nothing after **`--make`** indexes **`./`** for all users.
+
+You can pass **multiple** **`bin_dir`** paths (same merged crawl directories as for **`ereport`**); they are merged into one index.
 
 Examples:
 
 ```bash
 ./ereport_index --make milechin fstor005-mgmt_apr-17-2026_15-07-17
+./ereport_index --make /path/to/crawl_out
+./ereport_index --make crawl_srv01 crawl_srv02
+./ereport_index --make --index-dir /var/lib/ereport-search milechin crawl_a crawl_b
 ./ereport_index --search erb milechin/index
+./ereport_index --search erb all_users/index
 ./ereport_index --search erb milechin/index --json --skip 0 --limit 20   # JSON body for APIs
 ```
 
 Default behavior:
 
-- **`--make`** writes under **`./<username>/index/`** (`paths.bin`, `tri_keys.bin`, etc.).
+- **`--make [--index-dir <path>]`** — without **`--index-dir`**, **`--make <user> …`** writes under **`./<username>/index/`** (`paths.bin`, `tri_keys.bin`, etc.). With **`--index-dir`**, those files go directly under **`<path>`** (the directory is created if needed).
+- **`--make`** with only crawl directories (first token not a system user) writes under **`./all_users/index/`** unless **`--index-dir`** is set.
 - **`--make`** with only **`<username|uid>`** and no **`bin_dir`** arguments reads crawl input from **`./`** (same idea as `ereport`).
 - **`--search`** defaults **`index_dir`** to **`./index`** when omitted (relative to current working directory).
-- **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallel **scan/index** workers for **`--make`** (default **32** when unset or invalid). The merge phase uses a **separate** parallelism model (CPU-based, capped), not this variable.
+- **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallelism for **`--make`** (default **32** when unset or invalid): **chunk-boundary mapping** runs with up to this many scanners across distinct input `.bin` files (capped by file count), and **parse/index** uses the same count for parallel chunk workers. The trigram **merge** phase uses a **separate** parallelism model (CPU-based, capped), not this variable. Raising thread count increases peak RAM mostly by having more workers fill **bounded** writer queues (see **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`**); very high values are rarely useful if storage is the bottleneck.
+- **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** — optional override (**4…4096**) for how many **write batches** may wait on the single writer thread during **`--make`**. Default scales with **`EREPORT_INDEX_THREADS`** (about **threads/4**, clamped **6…48**). Raising this raises peak memory if workers outpace the writer; lowering it adds backpressure (workers block until the writer drains).
 
 JSON search output is one UTF-8 JSON object per line:
 
@@ -201,7 +238,7 @@ If **`--json`** is given without **`--limit`**, **limit defaults to 50**.
 
 Roughly two phases:
 
-1. **Scan / index** — Parallel workers read crawl `.bin` chunks (record headers first). Rows whose UID does not match the target user skip reading the path string entirely (`fseek` past it). Matching paths are trigram-extracted and batched to a dedicated writer thread that appends `paths.bin`, `path_offsets.bin`, and per-bucket temp trigram files. Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness.
+1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Paths are trigram-extracted and batched to a dedicated writer thread that appends `paths.bin`, `path_offsets.bin`, and per-bucket temp trigram files. Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness.
 
 2. **Merge** — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs **multiple worker threads** that write per-bucket segment files, then a single thread **stitches** postings offsets and concatenates blobs. Reads prefer **`mmap`** with `malloc`+`read` fallback; sorting uses **LSD radix** on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers.
 
@@ -210,7 +247,7 @@ Roughly two phases:
 Typical keys include:
 
 - **Where time goes:** `index_phase_sec` (everything up to closing `paths.bin` / `path_offsets.bin`, i.e. scan + parallel index + writer draining temp buckets) vs `merge_phase_sec` vs `wall_after_index_sec` (merge + `meta.txt` and similar; should be ≈ `merge_phase_sec` plus tiny overhead). `elapsed_sec` is end-to-end. **`avg_paths_per_sec` divides by `elapsed_sec`**, so it understates peak index throughput if merge is fast; use **`index_paths_per_sec`** (paths ÷ `index_phase_sec`) for scan/index rate.
-- Throughput and scale: `scanned_records`, `indexed_paths`, `trigram_records`, `unique_trigrams`, `index_workers`.
+- Throughput and scale: `scanned_records`, `indexed_paths`, `trigram_records`, `unique_trigrams`, `index_workers`, `writeq_max_batches`, `write_batch_flush_at` (queue backpressure and paths-per-batch flush tuning).
 - Merge: `merge_phase_sec`, `merge_workers`, `merge_buckets_nonempty`, `merge_buckets_skipped`, `merge_trigram_records_read`, byte counts for temp reads and final `tri_*` outputs, derived `*_per_sec` rates.
 - Pipeline: `writeq_writer_waits` — count of writer-thread waits on an empty write queue (low is good for the scan phase).
 
@@ -295,7 +332,7 @@ python3 eserve.py --bind 0.0.0.0 --port 8080 ./milechin
 
 ## Typical Workflow
 
-For **multiple crawl outputs** (e.g. several servers), run **`ecrawl`** once per output directory (often with distinct **`--record-root`** values), then pass **all** of those directories to one **`ereport`** and **`ereport_index --make`** command so the report and search index stay unified.
+For **multiple crawl outputs** (e.g. several servers), run **`ecrawl`** once per output directory (often with distinct **`--record-root`** values), then pass **all** of those directories to one **`ereport`** / **`ereport_index --make`** command so the report and search index stay unified. For an **all-users** aggregate report (`./ereport ctime …`), build the matching index with **`ereport_index --make dir1 dir2 …`** where the **first** argument is **not** a valid username/uid on this host—pass the same **`bin_dir`** list as for **`ereport`** (for example directory names only).
 
 ### 1. Crawl a filesystem
 
@@ -334,6 +371,13 @@ Several crawl output directories (merged index for the same user):
 ```
 
 Omit directories to use **`./`** as the only input path: `./ereport_index --make milechin`.
+
+**All-users** index (same crawl inputs as `./ereport ctime …`, output beside **`./all_users/`**). Omit a username: list crawl dirs first so the first token is **not** resolved as a login or uid:
+
+```bash
+./ereport_index --make crawl_srv01 crawl_srv02
+./ereport_index --search foo all_users/index
+```
 
 This writes:
 
@@ -414,13 +458,18 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel bin chunk readers (default 32). |
-| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` | Parallel scan/index workers (default 32). |
+| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` | Parallel chunk-boundary mapping (across bin files) and parallel scan/index workers (default 32). |
+| **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** | `ereport_index --make` | Max writer-queue depth (default scales with thread count; bounds RAM when many workers feed one writer). |
 | **`EREPORT_INDEX_BIN`** | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
 
 ## Notes
 
 - The code assumes local filesystem crawl data written by `ecrawl` format version `2`.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
-- `ereport` and `ereport_index` both read only the shard files relevant to the requested user when uid-sharded input is available.
+- For **per-user** runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. **All-users** runs load **every** shard file (same as merging full-cluster crawls).
 - **`ECRAWL_UID_SHARDS`** for a crawl run should match across every output directory you later pass together to **`ereport`** / **`ereport_index --make`** (merged reports assume consistent shard layout).
 - The **`Makefile`** targets **`serve`** and **`serve-public`** wrap **`eserve.py`** and forward **`SERVE_ROOT`**, **`SERVE_PORT`**, and **`SERVE_BIND`**.
+
+## License
+
+This project is licensed under the **MIT License**. See **[license.txt](license.txt)**. Copyright is held by **Michel Erb** (2026).

@@ -1,3 +1,10 @@
+/*
+ * ereport_index — trigram path index for ereport HTML search (eserve).
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see license.txt.
+ */
+
 #define _XOPEN_SOURCE 700
 
 #include <ctype.h>
@@ -113,9 +120,12 @@ typedef struct write_batch {
 
 typedef struct {
     pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    pthread_cond_t has_batch; /* writer waits for work */
+    pthread_cond_t has_space; /* producers wait when queue is full */
     write_batch_t *head;
     write_batch_t *tail;
+    size_t depth;
+    size_t max_depth;
     int closed;
 } write_queue_t;
 
@@ -125,6 +135,7 @@ typedef struct {
 
 typedef struct {
     uid_t target_uid;
+    int aggregate_all_users;
     char display_name[256];
     char index_dir[PATH_MAX];
     FILE *paths_fp;
@@ -160,6 +171,7 @@ typedef struct {
     write_queue_t *write_queue;
     file_state_t *file_states;
     build_ctx_t *ctx;
+    size_t write_batch_flush_at;
     char *lower_seg_buf;
     size_t lower_seg_cap;
 } worker_arg_t;
@@ -180,6 +192,8 @@ static atomic_ullong g_progress_bad_input_files = 0;
 static atomic_int g_stop_stats = 0;
 static atomic_int g_writer_failed = 0;
 static uint64_t g_progress_input_files_total = 0;
+static atomic_ullong g_chunk_prep_files_done = 0;
+static uint64_t g_chunk_prep_files_total = 0;
 static double g_run_start_sec = 0.0;
 
 /* Relaxed counter: pthread_cond_wait wakeups while write queue empty (writer idle vs producers). */
@@ -320,8 +334,44 @@ static void write_batch_destroy(write_batch_t *batch) {
     free(batch);
 }
 
+/* Cap batches waiting on the writer so N parallel workers cannot enqueue without bound (OOM). */
+static size_t compute_write_queue_max_batches(int threads) {
+    const char *e;
+    unsigned long v;
+    char *end;
+    size_t w;
+
+    if (threads < 1) threads = DEFAULT_THREADS;
+    e = getenv("EREPORT_INDEX_WRITEQ_MAX_BATCHES");
+    if (e && *e) {
+        errno = 0;
+        v = strtoul(e, &end, 10);
+        if (!errno && end != e && *end == '\0' && v >= 4UL && v <= 4096UL) return (size_t)v;
+    }
+    w = (size_t)((threads + 3) / 4);
+    if (w < 6U) w = 6U;
+    if (w > 48U) w = 48U;
+    return w;
+}
+
+/* Fewer paths per batch when index_workers is high (one writer drains the queue). */
+static size_t batch_paths_flush_limit(int threads) {
+    size_t t;
+
+    if (threads < 1) threads = DEFAULT_THREADS;
+    if (threads <= 32) return WRITE_BATCH_PATHS;
+    t = (size_t)(((unsigned long)WRITE_BATCH_PATHS * 32UL) / (unsigned long)threads);
+    if (t < 256U) t = 256U;
+    return t;
+}
+
 static int write_queue_push(write_queue_t *q, write_batch_t *batch) {
     pthread_mutex_lock(&q->mutex);
+    if (q->closed) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    while (q->depth >= q->max_depth && !q->closed) pthread_cond_wait(&q->has_space, &q->mutex);
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
@@ -330,7 +380,8 @@ static int write_queue_push(write_queue_t *q, write_batch_t *batch) {
     if (q->tail) q->tail->next = batch;
     else q->head = batch;
     q->tail = batch;
-    pthread_cond_signal(&q->cond);
+    q->depth++;
+    pthread_cond_signal(&q->has_batch);
     pthread_mutex_unlock(&q->mutex);
     return 0;
 }
@@ -340,13 +391,15 @@ static write_batch_t *write_queue_pop_wait(write_queue_t *q) {
 
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->closed) {
-        pthread_cond_wait(&q->cond, &q->mutex);
+        pthread_cond_wait(&q->has_batch, &q->mutex);
         atomic_fetch_add_explicit(&g_writeq_writer_waits, 1ULL, memory_order_relaxed);
     }
     batch = q->head;
     if (batch) {
         q->head = batch->next;
         if (!q->head) q->tail = NULL;
+        q->depth--;
+        pthread_cond_broadcast(&q->has_space);
     }
     pthread_mutex_unlock(&q->mutex);
     return batch;
@@ -355,7 +408,8 @@ static write_batch_t *write_queue_pop_wait(write_queue_t *q) {
 static void write_queue_close(write_queue_t *q) {
     pthread_mutex_lock(&q->mutex);
     q->closed = 1;
-    pthread_cond_broadcast(&q->cond);
+    pthread_cond_broadcast(&q->has_batch);
+    pthread_cond_broadcast(&q->has_space);
     pthread_mutex_unlock(&q->mutex);
 }
 
@@ -392,9 +446,23 @@ static void *stats_thread_main(void *arg) {
         human_decimal(rate, rate_buf, sizeof(rate_buf));
         format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
-        printf("\r%s paths/s | files:%s/%s rec:%s idx:%s tri:%s bad:%llu | el:%s            ",
-               rate_buf, sf, tf, sr, ip, tr, bad_input_files, elapsed_buf);
-        fflush(stdout);
+        {
+            uint64_t prep_tot_u = g_chunk_prep_files_total;
+            unsigned long long prep_done_u = atomic_load(&g_chunk_prep_files_done);
+
+            if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
+                char pdone[32], ptot[32];
+                human_decimal((double)prep_done_u, pdone, sizeof(pdone));
+                human_decimal((double)prep_tot_u, ptot, sizeof(ptot));
+                printf("\rchunk-map files:%s/%s | scanning bin boundaries for parallel parse | el:%s            ",
+                       pdone, ptot, elapsed_buf);
+                fflush(stdout);
+            } else {
+                printf("\r%s paths/s | files:%s/%s rec:%s idx:%s tri:%s bad:%llu | el:%s            ",
+                       rate_buf, sf, tf, sr, ip, tr, bad_input_files, elapsed_buf);
+                fflush(stdout);
+            }
+        }
     }
 
     return NULL;
@@ -403,12 +471,18 @@ static void *stats_thread_main(void *arg) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make <username|uid> [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [username|uid] [bin_dir ...]\n"
             "  %s --search <term> [index_dir] [--json] [--skip N] [--limit M]\n",
             argv0,
             argv0);
     fprintf(stderr,
-            "    Default index_dir is ./index (relative to cwd). Plain search prints paths.\n"
+            "  --make: Optional --index-dir <path> (must follow --make) writes index files directly under\n"
+            "    <path> (paths.bin, tri_keys.bin, …). Default is ./<username>/index/ or ./all_users/index/.\n"
+            "    Multiple bin_dir arguments are merged like ereport. If the first token after flags is a valid\n"
+            "    login or numeric uid, it selects that user; remaining arguments are crawl directories (default .).\n"
+            "    If that token is not a known user, every argument is a crawl directory (all-users index).\n"
+            "    With no user/bin arguments after flags, the index is all-users for ./\n"
+            "  --search: default index_dir is ./index (relative to cwd). Plain search prints paths.\n"
             "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"paths\":[...]}\n");
     exit(2);
 }
@@ -562,6 +636,7 @@ static int build_path(char *out, size_t out_sz, const char *dir, const char *nam
 static int scan_dirs_collect_files(const char **dirpaths,
                                    size_t dir_count,
                                    uid_t target_uid,
+                                   int all_users,
                                    char ***out_paths,
                                    size_t *out_count) {
     DIR *dir = NULL;
@@ -632,7 +707,7 @@ static int scan_dirs_collect_files(const char **dirpaths,
             if (use_uid_shards) {
                 uint32_t shard = 0;
                 if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
-                if (shard != wanted_shard) continue;
+                if (!all_users && shard != wanted_shard) continue;
             } else {
                 if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
             }
@@ -711,6 +786,13 @@ static int append_chunk(file_chunk_t **chunks,
     return 0;
 }
 
+static void free_chunk_array_rows(file_chunk_t *chunks, size_t count) {
+    size_t j;
+
+    for (j = 0; j < count; j++) free(chunks[j].path);
+    free(chunks);
+}
+
 static int parse_index_thread_count(void) {
     const char *e = getenv("EREPORT_INDEX_THREADS");
     long t;
@@ -739,15 +821,22 @@ static uint64_t compute_parse_chunk_target(uint64_t file_size_bytes, int threads
 static int build_chunks_for_file(const char *path,
                                  size_t file_index,
                                  uint64_t chunk_target_bytes,
-                                 file_chunk_t **chunks,
-                                 size_t *chunk_count,
-                                 size_t *chunk_cap,
-                                 unsigned int *file_chunk_counter) {
+                                 file_chunk_t **chunks_out,
+                                 size_t *chunk_count_out,
+                                 unsigned int *file_chunk_counter_out) {
     FILE *fp = NULL;
     bin_file_header_t fh;
     uint64_t chunk_start;
     uint64_t next_target;
+    file_chunk_t *chunks = NULL;
+    size_t chunk_count = 0;
+    size_t chunk_cap = 0;
+    unsigned int fc = 0;
     int rc = -1;
+
+    *chunks_out = NULL;
+    *chunk_count_out = 0;
+    *file_chunk_counter_out = 0;
 
     fp = fopen(path, "rb");
     if (!fp) {
@@ -779,8 +868,8 @@ static int build_chunks_for_file(const char *path,
             if (feof(fp)) {
                 uint64_t file_end = (uint64_t)record_start;
                 if (file_end > chunk_start) {
-                    if (append_chunk(chunks, chunk_count, chunk_cap, path, chunk_start, file_end, file_index) != 0) goto out;
-                    (*file_chunk_counter)++;
+                    if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, file_end, file_index) != 0) goto out;
+                    fc++;
                 }
                 rc = 0;
             }
@@ -793,8 +882,9 @@ static int build_chunks_for_file(const char *path,
 
         while ((uint64_t)record_end >= next_target) {
             if ((uint64_t)record_end > chunk_start) {
-                if (append_chunk(chunks, chunk_count, chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0) goto out;
-                (*file_chunk_counter)++;
+                if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0)
+                    goto out;
+                fc++;
             }
             chunk_start = (uint64_t)record_end;
             next_target = chunk_start + chunk_target_bytes;
@@ -803,7 +893,47 @@ static int build_chunks_for_file(const char *path,
 
 out:
     if (fp) fclose(fp);
-    return rc;
+    if (rc != 0) {
+        free_chunk_array_rows(chunks, chunk_count);
+        return -1;
+    }
+    *chunks_out = chunks;
+    *chunk_count_out = chunk_count;
+    *file_chunk_counter_out = fc;
+    return 0;
+}
+
+typedef struct {
+    char **paths;
+    uint64_t *chunk_targets;
+    size_t path_count;
+    int *prep_rc;
+    file_chunk_t **prep_chunks;
+    size_t *prep_chunk_counts;
+    atomic_size_t next_path_index;
+} chunk_prep_pool_t;
+
+static void *chunk_prep_worker_main(void *arg) {
+    chunk_prep_pool_t *pool = (chunk_prep_pool_t *)arg;
+
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&pool->next_path_index, 1, memory_order_relaxed);
+        file_chunk_t *local_chunks = NULL;
+        size_t local_count = 0;
+        unsigned int fc = 0;
+        int r;
+
+        if (i >= pool->path_count) break;
+
+        r = build_chunks_for_file(pool->paths[i], i, pool->chunk_targets[i], &local_chunks, &local_count, &fc);
+        pool->prep_rc[(int)i] = r;
+        pool->prep_chunks[(int)i] = local_chunks;
+        pool->prep_chunk_counts[(int)i] = local_count;
+        (void)fc;
+        atomic_fetch_add_explicit(&g_chunk_prep_files_done, 1ULL, memory_order_relaxed);
+    }
+
+    return NULL;
 }
 
 static int u64_vec_push(u64_vec_t *v, uint64_t id) {
@@ -1260,7 +1390,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             break;
         }
 
-        if ((uid_t)r.uid != ctx->target_uid) {
+        if (!ctx->aggregate_all_users && (uid_t)r.uid != ctx->target_uid) {
             if (r.path_len > 0 && fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
                 fprintf(stderr, "warn: seek failed skipping path in %s\n", chunk->path);
                 atomic_fetch_add(&g_progress_bad_input_files, 1U);
@@ -1313,7 +1443,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             pathbuf = NULL;
             codes = NULL;
 
-            if (batch->count >= WRITE_BATCH_PATHS) {
+            if (batch->count >= worker->write_batch_flush_at) {
                 if (write_queue_push(write_queue, batch) != 0) {
                     fprintf(stderr, "warn: failed to queue write batch for %s\n", chunk->path);
                     atomic_fetch_add(&g_progress_bad_input_files, 1U);
@@ -1372,6 +1502,7 @@ static int write_meta_file(const build_ctx_t *ctx) {
 
     fprintf(fp, "ereport_index_version=%d\n", INDEX_VERSION);
     fprintf(fp, "user=%s\n", ctx->display_name);
+    fprintf(fp, "aggregate_all_users=%d\n", ctx->aggregate_all_users ? 1 : 0);
     fprintf(fp, "uid=%lu\n", (unsigned long)ctx->target_uid);
     fprintf(fp, "input_layout=%s\n", g_input_layout);
     if (g_input_uid_shards) fprintf(fp, "input_uid_shards=%u\n", g_input_uid_shards);
@@ -1830,7 +1961,11 @@ out:
     return -1;
 }
 
-static int build_index_dir(const char *user_spec, const char **dirpaths, size_t dirpath_count) {
+static int build_index_dir(const char *user_spec,
+                           const char **dirpaths,
+                           size_t dirpath_count,
+                           int all_users_mode,
+                           const char *index_dir_override) {
     uid_t target_uid;
     char display_name[256];
     char sanitized_name[256];
@@ -1840,7 +1975,6 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     size_t path_count = 0;
     file_chunk_t *chunks = NULL;
     size_t chunk_count = 0;
-    size_t chunk_cap = 0;
     file_state_t *file_states = NULL;
     work_queue_t queue;
     write_queue_t write_queue;
@@ -1862,18 +1996,36 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     memset(&write_queue, 0, sizeof(write_queue));
     memset(&writer_arg, 0, sizeof(writer_arg));
 
-    if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
-        fprintf(stderr, "unknown user or uid: %s\n", user_spec);
-        return 1;
+    if (!all_users_mode) {
+        if (!user_spec) {
+            fprintf(stderr, "ereport_index: internal error: missing user_spec\n");
+            return 1;
+        }
+        if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
+            fprintf(stderr, "unknown user or uid: %s\n", user_spec);
+            return 1;
+        }
+    } else {
+        target_uid = (uid_t)0;
+        if (snprintf(display_name, sizeof(display_name), "all_users") >= (int)sizeof(display_name)) {
+            fprintf(stderr, "ereport_index: display name buffer\n");
+            return 1;
+        }
     }
 
     snprintf(sanitized_name, sizeof(sanitized_name), "%s", display_name);
     sanitize_name(sanitized_name);
-    if (snprintf(ctx.index_dir, sizeof(ctx.index_dir), "%s/index", sanitized_name) >= (int)sizeof(ctx.index_dir)) {
+    if (index_dir_override && index_dir_override[0] != '\0') {
+        if (snprintf(ctx.index_dir, sizeof(ctx.index_dir), "%s", index_dir_override) >= (int)sizeof(ctx.index_dir)) {
+            fprintf(stderr, "index directory path too long\n");
+            return 1;
+        }
+    } else if (snprintf(ctx.index_dir, sizeof(ctx.index_dir), "%s/index", sanitized_name) >= (int)sizeof(ctx.index_dir)) {
         fprintf(stderr, "index directory path too long\n");
         return 1;
     }
     ctx.target_uid = target_uid;
+    ctx.aggregate_all_users = all_users_mode ? 1 : 0;
     snprintf(ctx.display_name, sizeof(ctx.display_name), "%s", display_name);
     ctx.start_sec = t0;
     ctx.last_status_sec = 0.0;
@@ -1890,7 +2042,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     atomic_store(&g_writeq_writer_waits, 0);
     g_run_start_sec = t0;
 
-    if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, &paths, &path_count) != 0) return 1;
+    if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, all_users_mode, &paths, &path_count) != 0)
+        return 1;
 
     dirs_label[0] = '\0';
     if (dirpath_count == 1) {
@@ -1921,25 +2074,184 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         return 1;
     }
 
-    for (i = 0; i < path_count; i++) {
-        struct stat st;
-        unsigned int file_chunk_counter = 0;
-        uint64_t chunk_target = PARSE_CHUNK_BYTES;
-        if (stat(paths[i], &st) == 0 && S_ISREG(st.st_mode))
-            chunk_target = compute_parse_chunk_target((uint64_t)st.st_size, threads);
-        if (build_chunks_for_file(paths[i], i, chunk_target, &chunks, &chunk_count, &chunk_cap, &file_chunk_counter) == 0) {
-            atomic_store(&file_states[i].remaining_chunks, file_chunk_counter);
-            ctx.input_files++;
-        } else {
-            atomic_store(&file_states[i].remaining_chunks, 0);
-            ctx.bad_input_files++;
+    {
+        uint64_t *chunk_targets = (uint64_t *)calloc(path_count, sizeof(uint64_t));
+        int *prep_rc = (int *)calloc(path_count, sizeof(int));
+        file_chunk_t **prep_chunks = (file_chunk_t **)calloc(path_count, sizeof(*prep_chunks));
+        size_t *prep_chunk_counts = (size_t *)calloc(path_count, sizeof(size_t));
+        chunk_prep_pool_t pool;
+        pthread_t *prep_tids = NULL;
+        int prep_threads;
+        size_t merge_off;
+
+        if (!chunk_targets || !prep_rc || !prep_chunks || !prep_chunk_counts) {
+            fprintf(stderr, "allocation failed\n");
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
         }
+
+        for (i = 0; i < path_count; i++) {
+            struct stat st;
+
+            chunk_targets[i] = PARSE_CHUNK_BYTES;
+            if (stat(paths[i], &st) == 0 && S_ISREG(st.st_mode))
+                chunk_targets[i] = compute_parse_chunk_target((uint64_t)st.st_size, threads);
+        }
+
+        g_progress_input_files_total = (uint64_t)path_count;
+        g_chunk_prep_files_total = (uint64_t)path_count;
+        atomic_store(&g_chunk_prep_files_done, 0ULL);
+
+        if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
+            fprintf(stderr, "failed to create stats thread\n");
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
+        }
+        stats_thread_started = 1;
+
+        prep_threads = threads;
+        if ((size_t)prep_threads > path_count) prep_threads = (int)path_count;
+
+        fprintf(stderr, "ereport_index: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
+        fflush(stderr);
+
+        memset(&pool, 0, sizeof(pool));
+        pool.paths = paths;
+        pool.chunk_targets = chunk_targets;
+        pool.path_count = path_count;
+        pool.prep_rc = prep_rc;
+        pool.prep_chunks = prep_chunks;
+        pool.prep_chunk_counts = prep_chunk_counts;
+        atomic_store(&pool.next_path_index, 0);
+
+        prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
+        if (!prep_tids) {
+            fprintf(stderr, "allocation failed\n");
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
+        }
+
+        for (i = 0; i < (size_t)prep_threads; i++) {
+            if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
+                size_t j;
+                fprintf(stderr, "failed to create chunk-prep thread\n");
+                atomic_store(&g_stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+                for (j = 0; j < i; j++) pthread_join(prep_tids[j], NULL);
+                free(prep_tids);
+                free(chunk_targets);
+                free(prep_rc);
+                free(prep_chunks);
+                free(prep_chunk_counts);
+                for (j = 0; j < path_count; j++) free(paths[j]);
+                free(paths);
+                free(file_states);
+                return 1;
+            }
+        }
+
+        for (i = 0; i < (size_t)prep_threads; i++) pthread_join(prep_tids[i], NULL);
+        free(prep_tids);
+
+        ctx.input_files = 0;
+        ctx.bad_input_files = 0;
+        for (i = 0; i < path_count; i++) {
+            if (prep_rc[i] != 0) {
+                atomic_store(&file_states[i].remaining_chunks, 0);
+                ctx.bad_input_files++;
+                if (prep_chunks[i]) {
+                    free_chunk_array_rows(prep_chunks[i], prep_chunk_counts[i]);
+                    prep_chunks[i] = NULL;
+                }
+            } else {
+                ctx.input_files++;
+            }
+        }
+
+        chunk_count = 0;
+        for (i = 0; i < path_count; i++) {
+            if (prep_rc[i] == 0) chunk_count += prep_chunk_counts[i];
+        }
+
+        if (chunk_count > 0) {
+            file_chunk_t *merged;
+
+            merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
+            if (!merged) {
+                fprintf(stderr, "allocation failed\n");
+                atomic_store(&g_stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+                for (i = 0; i < path_count; i++) {
+                    if (prep_rc[i] == 0 && prep_chunks[i]) free_chunk_array_rows(prep_chunks[i], prep_chunk_counts[i]);
+                }
+                free(chunk_targets);
+                free(prep_rc);
+                free(prep_chunks);
+                free(prep_chunk_counts);
+                for (i = 0; i < path_count; i++) free(paths[i]);
+                free(paths);
+                free(file_states);
+                return 1;
+            }
+
+            merge_off = 0;
+            for (i = 0; i < path_count; i++) {
+                if (prep_rc[i] != 0) continue;
+                memcpy(merged + merge_off, prep_chunks[i], prep_chunk_counts[i] * sizeof(file_chunk_t));
+                merge_off += prep_chunk_counts[i];
+                free(prep_chunks[i]);
+                prep_chunks[i] = NULL;
+                atomic_store(&file_states[i].remaining_chunks,
+                             prep_chunk_counts[i] > (size_t)UINT_MAX ? UINT_MAX : (unsigned int)prep_chunk_counts[i]);
+            }
+            chunks = merged;
+        }
+
+        free(chunk_targets);
+        free(prep_rc);
+        free(prep_chunks);
+        free(prep_chunk_counts);
+
+        g_chunk_prep_files_total = 0;
+        atomic_store(&g_chunk_prep_files_done, 0ULL);
     }
+
     atomic_store(&g_progress_bad_input_files, ctx.bad_input_files);
-    g_progress_input_files_total = ctx.input_files;
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", dirs_label);
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         free(file_states);
@@ -1947,8 +2259,29 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         return 1;
     }
 
-    if (ensure_dir_recursive(sanitized_name) != 0 || ensure_dir_recursive(ctx.index_dir) != 0) {
+    if ((!index_dir_override || index_dir_override[0] == '\0') && ensure_dir_recursive(sanitized_name) != 0) {
+        fprintf(stderr, "failed to create %s: %s\n", sanitized_name, strerror(errno));
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
+        for (i = 0; i < path_count; i++) free(paths[i]);
+        free(paths);
+        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+        free(chunks);
+        free(file_states);
+        return 1;
+    }
+    if (ensure_dir_recursive(ctx.index_dir) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", ctx.index_dir, strerror(errno));
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -1959,6 +2292,12 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
 
     if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
         build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0) {
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -1975,6 +2314,12 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     }
     if (!ctx.paths_fp || !ctx.path_offsets_fp || bucket_cache_init(&ctx.bucket_cache, ctx.index_dir) != 0) {
         fprintf(stderr, "failed to initialize index outputs in %s\n", ctx.index_dir);
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         if (ctx.paths_fp) fclose(ctx.paths_fp);
         if (ctx.path_offsets_fp) fclose(ctx.path_offsets_fp);
         for (i = 0; i < path_count; i++) free(paths[i]);
@@ -1989,8 +2334,10 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     queue.count = chunk_count;
     queue.next_index = 0;
     pthread_mutex_init(&queue.mutex, NULL);
+    write_queue.max_depth = compute_write_queue_max_batches(threads);
     pthread_mutex_init(&write_queue.mutex, NULL);
-    pthread_cond_init(&write_queue.cond, NULL);
+    pthread_cond_init(&write_queue.has_batch, NULL);
+    pthread_cond_init(&write_queue.has_space, NULL);
 
     threads_used = threads;
     tids = (pthread_t *)calloc((size_t)threads, sizeof(*tids));
@@ -1999,12 +2346,19 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         fprintf(stderr, "allocation failed\n");
         free(tids);
         free(args);
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         bucket_cache_close_all(&ctx.bucket_cache);
         fclose(ctx.paths_fp);
         fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2019,12 +2373,19 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         fprintf(stderr, "failed to create writer thread\n");
         free(tids);
         free(args);
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         bucket_cache_close_all(&ctx.bucket_cache);
         fclose(ctx.paths_fp);
         fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2032,27 +2393,6 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         free(file_states);
         return 1;
     }
-
-    if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
-        fprintf(stderr, "failed to create stats thread\n");
-        write_queue_close(&write_queue);
-        pthread_join(writer_thread, NULL);
-        free(tids);
-        free(args);
-        bucket_cache_close_all(&ctx.bucket_cache);
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
-        pthread_mutex_destroy(&queue.mutex);
-        pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
-        for (i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
-        free(chunks);
-        free(file_states);
-        return 1;
-    }
-    stats_thread_started = 1;
 
     for (i = 0; i < (size_t)threads; i++) {
         memset(&args[i], 0, sizeof(args[i]));
@@ -2060,6 +2400,7 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         args[i].write_queue = &write_queue;
         args[i].file_states = file_states;
         args[i].ctx = &ctx;
+        args[i].write_batch_flush_at = batch_paths_flush_limit(threads);
         if (pthread_create(&tids[i], NULL, worker_main, &args[i]) != 0) {
             fprintf(stderr, "failed to create worker %zu\n", i);
             threads_used = (int)i;
@@ -2089,7 +2430,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         free(args);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2109,7 +2451,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         free(args);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2127,7 +2470,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         free(args);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.cond);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2140,6 +2484,7 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     clear_status_line();
     printf("mode=make\n");
     printf("user=%s\n", ctx.display_name);
+    printf("aggregate_all_users=%d\n", ctx.aggregate_all_users ? 1 : 0);
     printf("uid=%lu\n", (unsigned long)ctx.target_uid);
     printf("input_dir=%s\n", dirs_label);
     printf("input_layout=%s\n", g_input_layout);
@@ -2186,6 +2531,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
         human_decimal(avg_paths, avg_paths_buf, sizeof(avg_paths_buf));
     printf("avg_paths_per_sec=%s\n", avg_paths_buf);
     }
+    printf("writeq_max_batches=%zu\n", write_queue.max_depth);
+    printf("write_batch_flush_at=%zu\n", batch_paths_flush_limit(threads));
     printf("writeq_writer_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&g_writeq_writer_waits));
     printf("wall_after_index_sec=%.3f\n", (t1 - t0) - ctx.index_phase_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
@@ -2194,7 +2541,8 @@ static int build_index_dir(const char *user_spec, const char **dirpaths, size_t 
     free(args);
     pthread_mutex_destroy(&queue.mutex);
     pthread_mutex_destroy(&write_queue.mutex);
-    pthread_cond_destroy(&write_queue.cond);
+    pthread_cond_destroy(&write_queue.has_batch);
+    pthread_cond_destroy(&write_queue.has_space);
     for (i = 0; i < path_count; i++) free(paths[i]);
     free(paths);
     for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2579,16 +2927,48 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "--make") == 0) {
         const char **dirpaths;
         size_t dirpath_count;
-        if (argc < 3) die_usage(argv[0]);
-        if (argc == 3) {
+        int all_users_mode;
+        const char *user_spec = NULL;
+        const char *index_dir_override = NULL;
+        int ai = 2;
+        uid_t probe_uid;
+        char probe_disp[256];
+
+        if (ai < argc && strcmp(argv[ai], "--index-dir") == 0) {
+            if (ai + 2 > argc) {
+                fprintf(stderr, "ereport_index: --index-dir requires a path\n");
+                return 2;
+            }
+            index_dir_override = argv[ai + 1];
+            ai += 2;
+        }
+
+        if (argc == ai) {
             static const char *dot = ".";
+            all_users_mode = 1;
             dirpaths = &dot;
             dirpath_count = 1;
-        } else {
-            dirpaths = (const char **)(argv + 3);
-            dirpath_count = (size_t)(argc - 3);
+            return build_index_dir(NULL, dirpaths, dirpath_count, all_users_mode, index_dir_override);
         }
-        return build_index_dir(argv[2], dirpaths, dirpath_count);
+
+        if (resolve_target_user(argv[ai], &probe_uid, probe_disp, sizeof(probe_disp)) == 0) {
+            user_spec = argv[ai];
+            all_users_mode = 0;
+            ai++;
+            if (argc == ai) {
+                static const char *dot = ".";
+                dirpaths = &dot;
+                dirpath_count = 1;
+            } else {
+                dirpaths = (const char **)(argv + ai);
+                dirpath_count = (size_t)(argc - ai);
+            }
+        } else {
+            all_users_mode = 1;
+            dirpaths = (const char **)(argv + ai);
+            dirpath_count = (size_t)(argc - ai);
+        }
+        return build_index_dir(user_spec, dirpaths, dirpath_count, all_users_mode, index_dir_override);
     }
 
     if (strcmp(argv[1], "--search") == 0) {

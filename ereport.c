@@ -1,6 +1,9 @@
 /*
  * ereport.c
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Michel Erb — see license.txt.
+ *
  * Parallel reader for crawl bin files produced by ecrawl.
  * Emits the original HTML summary plus per-bucket drilldown pages with
  * dense level-1/level-2 directory summaries. Path search in index.html uses
@@ -10,12 +13,17 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport <username|uid> <atime|mtime|ctime> [bin_dir ...]
+ *   ./ereport [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]
+ *   ./ereport [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]
+ *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
+ *     bucket pages are brief summaries only. Flags must appear first, before username/time basis.
+ *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
  * Parallel worker count: EREPORT_THREADS (default 32); see worker_main / stats_thread.
- * Multiple bin_dir values merge one user's shard files from each crawl output directory.
+ * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
+ * or every shard when aggregating all users).
  *
- * Writes outputs under ./<resolved_username>/ (cwd). Falls back to ./tmp/ only if
- * the username is empty or unusably long after sanitization.
+ * Writes outputs under ./<resolved_username>/ or ./all_users/ for aggregate mode (cwd).
+ * Falls back to ./tmp/ only if the directory name is empty or unusably long after sanitization.
  */
 
 #define _XOPEN_SOURCE 700
@@ -48,7 +56,7 @@
 #define PROGRESS_FLUSH_INTERVAL 1024U
 #define PARSE_CHUNK_BYTES (32ULL << 20)
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
-
+#define BUCKET_DETAIL_LEVELS_MAX 32
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -176,12 +184,22 @@ typedef struct {
 } inode_set_t;
 
 typedef struct {
+    uint64_t *keys;
+    unsigned char *used;
+    size_t cap;
+    size_t count;
+} uid_accum_t;
+
+typedef struct {
     work_queue_t *queue;
     file_state_t *file_states;
     uid_t target_uid;
+    int all_users;
+    int bucket_detail_levels;
     time_basis_t basis;
     time_t now;
     inode_set_t *seen_inodes;
+    uid_accum_t uid_distinct;
     summary_t summary;
     bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS];
     matched_records_t matched_records;
@@ -211,6 +229,8 @@ static atomic_uint g_seconds_seen = 0;
 static atomic_int g_stop_stats = 0;
 
 static uint64_t g_progress_input_files_total = 0;
+static atomic_ullong g_chunk_prep_files_done = 0;
+static uint64_t g_chunk_prep_files_total = 0;
 static double g_run_start_sec = 0.0;
 static double g_records_rate_sum = 0.0;
 static double g_records_rate_min = 0.0;
@@ -342,6 +362,112 @@ static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t 
 
     pthread_mutex_unlock(&s->mutex);
     return 1;
+}
+
+static uint64_t uid_hash64(uint64_t uid) {
+    uint64_t x = uid;
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static int uid_accum_init(uid_accum_t *s, size_t initial_cap) {
+    size_t cap = 1;
+    while (cap < initial_cap) cap <<= 1;
+
+    s->keys = (uint64_t *)calloc(cap, sizeof(*s->keys));
+    s->used = (unsigned char *)calloc(cap, sizeof(*s->used));
+    if (!s->keys || !s->used) {
+        free(s->keys);
+        free(s->used);
+        s->keys = NULL;
+        s->used = NULL;
+        s->cap = 0;
+        s->count = 0;
+        return -1;
+    }
+
+    s->cap = cap;
+    s->count = 0;
+    return 0;
+}
+
+static void uid_accum_destroy(uid_accum_t *s) {
+    if (!s) return;
+    free(s->keys);
+    free(s->used);
+    s->keys = NULL;
+    s->used = NULL;
+    s->cap = 0;
+    s->count = 0;
+}
+
+static int uid_accum_rehash(uid_accum_t *s, size_t new_cap) {
+    uint64_t *new_keys = (uint64_t *)calloc(new_cap, sizeof(*new_keys));
+    unsigned char *new_used = (unsigned char *)calloc(new_cap, sizeof(*new_used));
+    size_t i;
+
+    if (!new_keys || !new_used) {
+        free(new_keys);
+        free(new_used);
+        return -1;
+    }
+
+    for (i = 0; i < s->cap; i++) {
+        if (s->used[i]) {
+            uint64_t key = s->keys[i];
+            size_t idx = (size_t)(uid_hash64(key) & (new_cap - 1));
+            while (new_used[idx]) idx = (idx + 1) & (new_cap - 1);
+            new_keys[idx] = key;
+            new_used[idx] = 1;
+        }
+    }
+
+    free(s->keys);
+    free(s->used);
+    s->keys = new_keys;
+    s->used = new_used;
+    s->cap = new_cap;
+    return 0;
+}
+
+/* Single-threaded only. Returns 1 if newly inserted, 0 if already present, -1 on error. */
+static int uid_accum_insert_if_new(uid_accum_t *s, uint64_t uid) {
+    size_t idx;
+
+    if ((s->count + 1) * 10 >= s->cap * 7) {
+        if (uid_accum_rehash(s, s->cap << 1) != 0) return -1;
+    }
+
+    idx = (size_t)(uid_hash64(uid) & (s->cap - 1));
+    while (s->used[idx]) {
+        if (s->keys[idx] == uid) return 0;
+        idx = (idx + 1) & (s->cap - 1);
+    }
+
+    s->used[idx] = 1;
+    s->keys[idx] = uid;
+    s->count++;
+    return 1;
+}
+
+static size_t uid_accum_size(const uid_accum_t *s) {
+    return s ? s->count : 0;
+}
+
+/* dst must be distinct from src; single-threaded; leaves src intact (caller frees src). */
+static int uid_accum_merge_into(uid_accum_t *dst, const uid_accum_t *src) {
+    size_t i;
+
+    for (i = 0; i < src->cap; i++) {
+        if (src->used[i]) {
+            if (uid_accum_insert_if_new(dst, src->keys[i]) < 0) return -1;
+        }
+    }
+    return 0;
 }
 
 static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t size) {
@@ -1046,29 +1172,13 @@ static int join_path_component(char *dst, size_t dst_sz, const char *base, const
     return n >= 0 && (size_t)n < dst_sz;
 }
 
-static int extract_row_paths(const char *path,
-                             const char *base_prefix,
-                             char *row1,
-                             size_t row1_sz,
-                             char *row2,
-                             size_t row2_sz,
-                             char *row3,
-                             size_t row3_sz,
-                             int *has_row2,
-                             int *has_row3) {
+static const char *path_after_base_prefix(const char *path, const char *base_prefix) {
     const char *p = path;
-    const char *c1;
-    const char *c2;
-    const char *c3;
-    size_t comp1_len;
-    size_t comp2_len;
-    size_t comp3_len;
-    size_t plen = base_prefix ? strlen(base_prefix) : 0;
+    size_t plen;
 
-    *has_row2 = 0;
-    *has_row3 = 0;
-    if (!starts_with_dir_prefix(path, base_prefix)) return 0;
+    if (!starts_with_dir_prefix(path, base_prefix)) return NULL;
 
+    plen = base_prefix ? strlen(base_prefix) : 0;
     if (base_prefix && base_prefix[0] != '\0' && strcmp(base_prefix, "/") != 0) {
         p += plen;
         if (*p == '/') p++;
@@ -1076,125 +1186,101 @@ static int extract_row_paths(const char *path,
         p++;
     }
 
-    if (*p == '\0') return 0;
-
-    c1 = p;
-    while (*p && *p != '/') p++;
-    if (*p != '/') return 0;
-    comp1_len = (size_t)(p - c1);
-
-    if (!join_path_component(row1, row1_sz, base_prefix ? base_prefix : "", c1, comp1_len)) return 0;
-
-    p++;
-    if (*p == '\0') return 1;
-
-    c2 = p;
-    while (*p && *p != '/') p++;
-    if (*p != '/') return 1;
-    comp2_len = (size_t)(p - c2);
-
-    if (!join_path_component(row2, row2_sz, row1, c2, comp2_len)) return 1;
-    *has_row2 = 1;
-
-    p++;
-    if (*p == '\0') return 1;
-
-    c3 = p;
-    while (*p && *p != '/') p++;
-    if (*p != '/') return 1;
-    comp3_len = (size_t)(p - c3);
-
-    if (!join_path_component(row3, row3_sz, row2, c3, comp3_len)) return 1;
-    *has_row3 = 1;
-    return 1;
+    return p;
 }
 
-static int aggregate_totals_for_page(path_row_map_t *level1,
-                                     path_row_map_t *level2,
-                                     path_row_map_t *level3,
-                                     const matched_records_t *records,
-                                     const char *base_prefix) {
+static int aggregate_bucket_for_page_n(path_row_map_t *maps,
+                                       int nlevels,
+                                       const bucket_details_t *details,
+                                       const char *base_prefix) {
     size_t i;
 
-    for (i = 0; i < records->count; i++) {
-        char row1[PATH_MAX];
-        char row2[PATH_MAX];
-        char row3[PATH_MAX];
-        int has_row2;
-        int has_row3;
-        const matched_record_t *r = &records->items[i];
-        path_row_t *row;
+    for (i = 0; i < details->count; i++) {
+        const detail_record_t *r = &details->items[i];
+        char prev[PATH_MAX];
+        char rowpath[PATH_MAX];
+        const char *p;
+        int depth;
 
-        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), row3, sizeof(row3), &has_row2,
-                              &has_row3))
-            continue;
+        p = path_after_base_prefix(r->path, base_prefix);
+        if (!p || *p == '\0') continue;
 
-        row = path_row_map_find(level1, row1);
-        if (row) {
-            if (r->type == 'f') row->total_files++;
-            else if (r->type == 'd') row->total_dirs++;
-            row->total_bytes += r->size;
+        prev[0] = '\0';
+        if (base_prefix) {
+            if (snprintf(prev, sizeof(prev), "%s", base_prefix) >= (int)sizeof(prev)) return -1;
         }
 
-        if (has_row2) {
-            row = path_row_map_find(level2, row2);
-            if (row) {
-                if (r->type == 'f') row->total_files++;
-                else if (r->type == 'd') row->total_dirs++;
-                row->total_bytes += r->size;
-            }
-        }
+        for (depth = 0; depth < nlevels; depth++) {
+            const char *start;
+            size_t comp_len;
+            path_row_t *row;
 
-        if (has_row3) {
-            row = path_row_map_find(level3, row3);
-            if (row) {
-                if (r->type == 'f') row->total_files++;
-                else if (r->type == 'd') row->total_dirs++;
-                row->total_bytes += r->size;
-            }
+            while (*p == '/') p++;
+            if (*p == '\0') break;
+
+            start = p;
+            while (*p && *p != '/') p++;
+            comp_len = (size_t)(p - start);
+            if (comp_len == 0) break;
+
+            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) return -1;
+
+            row = path_row_map_get_or_insert(&maps[depth], rowpath);
+            if (!row) return -1;
+            row->bucket_files++;
+            row->bucket_bytes += r->size;
+
+            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) return -1;
         }
     }
 
     return 0;
 }
 
-static int aggregate_bucket_for_page(path_row_map_t *level1,
-                                     path_row_map_t *level2,
-                                     path_row_map_t *level3,
-                                     const bucket_details_t *details,
-                                     const char *base_prefix) {
+static int aggregate_totals_for_page_n(path_row_map_t *maps,
+                                       int nlevels,
+                                       const matched_records_t *records,
+                                       const char *base_prefix) {
     size_t i;
 
-    for (i = 0; i < details->count; i++) {
-        char row1[PATH_MAX];
-        char row2[PATH_MAX];
-        char row3[PATH_MAX];
-        int has_row2;
-        int has_row3;
-        const detail_record_t *r = &details->items[i];
-        path_row_t *row;
+    for (i = 0; i < records->count; i++) {
+        const matched_record_t *r = &records->items[i];
+        char prev[PATH_MAX];
+        char rowpath[PATH_MAX];
+        const char *p;
+        int depth;
 
-        if (!extract_row_paths(r->path, base_prefix, row1, sizeof(row1), row2, sizeof(row2), row3, sizeof(row3), &has_row2,
-                              &has_row3))
-            continue;
+        p = path_after_base_prefix(r->path, base_prefix);
+        if (!p || *p == '\0') continue;
 
-        row = path_row_map_get_or_insert(level1, row1);
-        if (!row) return -1;
-        row->bucket_files++;
-        row->bucket_bytes += r->size;
-
-        if (has_row2) {
-            row = path_row_map_get_or_insert(level2, row2);
-            if (!row) return -1;
-            row->bucket_files++;
-            row->bucket_bytes += r->size;
+        prev[0] = '\0';
+        if (base_prefix) {
+            if (snprintf(prev, sizeof(prev), "%s", base_prefix) >= (int)sizeof(prev)) return -1;
         }
 
-        if (has_row3) {
-            row = path_row_map_get_or_insert(level3, row3);
-            if (!row) return -1;
-            row->bucket_files++;
-            row->bucket_bytes += r->size;
+        for (depth = 0; depth < nlevels; depth++) {
+            const char *start;
+            size_t comp_len;
+            path_row_t *row;
+
+            while (*p == '/') p++;
+            if (*p == '\0') break;
+
+            start = p;
+            while (*p && *p != '/') p++;
+            comp_len = (size_t)(p - start);
+            if (comp_len == 0) break;
+
+            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) return -1;
+
+            row = path_row_map_find(&maps[depth], rowpath);
+            if (row) {
+                if (r->type == 'f') row->total_files++;
+                else if (r->type == 'd') row->total_dirs++;
+                row->total_bytes += r->size;
+            }
+
+            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) return -1;
         }
     }
 
@@ -1350,25 +1436,40 @@ static void emit_path_summary_table(FILE *out,
 
 static int emit_bucket_detail_page(const char *filename,
                                    const char *username,
+                                   int all_users,
+                                   uint64_t distinct_uids,
                                    const char *basis_str,
                                    int ab,
                                    int sb,
+                                   int detail_levels,
                                    const bucket_details_t *details,
                                    const matched_records_t *matched_records) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
-    path_row_map_t level1;
-    path_row_map_t level2;
-    path_row_map_t level3;
+    path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
     size_t i;
     uint64_t bucket_files = 0;
     uint64_t bucket_bytes = 0;
     uint64_t total_user_files = 0;
     uint64_t total_user_bytes = 0;
+    int d;
+    int init_fail_at = -1;
 
     if (!out) return -1;
 
-    if (path_row_map_init(&level1, 1024) != 0 || path_row_map_init(&level2, 2048) != 0 || path_row_map_init(&level3, 4096) != 0) {
+    if (detail_levels < 1 || detail_levels > BUCKET_DETAIL_LEVELS_MAX) {
+        counted_fclose(out);
+        return -1;
+    }
+
+    for (d = 0; d < detail_levels; d++) {
+        if (path_row_map_init(&maps[d], 1024 + (size_t)d * 512) != 0) {
+            init_fail_at = d;
+            break;
+        }
+    }
+    if (init_fail_at >= 0) {
+        for (d = 0; d < init_fail_at; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return -1;
     }
@@ -1380,6 +1481,7 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;margin-bottom:18px}\n");
     fprintf(out, "h1,h2{margin:0 0 10px 0;font-weight:600}\n");
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:12px}\n");
+    fprintf(out, ".meta-sub{font-weight:400;color:#666}\n");
     fprintf(out, ".note{font-size:11px;color:#666;margin-bottom:14px;max-width:1200px}\n");
     fprintf(out, ".bucket-help{margin:0 0 16px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:1200px;font-size:12px;line-height:1.55;color:#555}\n");
     fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
@@ -1407,9 +1509,16 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
 
-    fprintf(out, "<h1>Bucket Details</h1>\n<div class=\"meta\">User: <strong>");
-    html_escape(out, username);
-    fprintf(out, "</strong> | Basis: <strong>");
+    fprintf(out, "<h1>Bucket Details</h1>\n<div class=\"meta\">");
+    if (all_users) {
+        fprintf(out, "Scope: <strong>all crawled users</strong> <span class=\"meta-sub\">(%" PRIu64 " distinct UIDs)</span> | ",
+                distinct_uids);
+    } else {
+        fprintf(out, "User: <strong>");
+        html_escape(out, username);
+        fprintf(out, "</strong> | ");
+    }
+    fprintf(out, "Basis: <strong>");
     html_escape(out, basis_str);
     fprintf(out, "</strong> | Age: <strong>");
     html_escape(out, age_bucket_names[ab]);
@@ -1419,18 +1528,14 @@ static int emit_bucket_detail_page(const char *filename,
 
     if (details->count == 0) {
         fprintf(out, "<div class=\"note\">This bucket has no matching files.</div>\n</body>\n</html>\n");
-        path_row_map_destroy(&level1);
-        path_row_map_destroy(&level2);
-        path_row_map_destroy(&level3);
+        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return 0;
     }
 
     base_prefix = dup_common_dir_prefix(details);
     if (!base_prefix) {
-        path_row_map_destroy(&level1);
-        path_row_map_destroy(&level2);
-        path_row_map_destroy(&level3);
+        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return -1;
     }
@@ -1447,12 +1552,10 @@ static int emit_bucket_detail_page(const char *filename,
         }
     }
 
-    if (aggregate_bucket_for_page(&level1, &level2, &level3, details, base_prefix) != 0 ||
-        aggregate_totals_for_page(&level1, &level2, &level3, matched_records, base_prefix) != 0) {
+    if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix) != 0 ||
+        aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix) != 0) {
         free(base_prefix);
-        path_row_map_destroy(&level1);
-        path_row_map_destroy(&level2);
-        path_row_map_destroy(&level3);
+        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return -1;
     }
@@ -1472,16 +1575,22 @@ static int emit_bucket_detail_page(const char *filename,
           "<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
           "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path.</p>\n"
           "<p><strong>User share columns.</strong> &ldquo;Share of user bytes/files&rdquo; compares this path to <em>all</em> of the user&rsquo;s files across every bucket (overall footprint).</p>\n"
-          "<p><strong>Totals under each path.</strong> Total files, dirs, and bytes include everything recorded below that directory prefix.</p>\n"
-          "<p><strong>Levels 1&ndash;3.</strong> Each table groups paths one, two, or three directory segments below the shared base path. "
-          "A row appears at level <em>n</em> only when there is at least one more path segment below that prefix.</p>\n"
+          "<p><strong>Totals under each path.</strong> Total files, dirs, and bytes include everything recorded below that directory prefix.</p>\n",
+          out);
+    fprintf(out,
+            "<p><strong>Levels 1&ndash;%d.</strong> Each table groups paths by cumulative directory depth below the shared base path "
+            "(one segment per level). A row appears at level <em>n</em> only when there is at least one path segment at that depth.</p>\n",
+            detail_levels);
+    fputs(
           "<p><strong>Heat colors.</strong> Stronger red in the bucket-share cells means a larger share of this bucket&rsquo;s bytes or files.</p>\n"
           "</div></details>\n",
           out);
 
-    emit_path_summary_table(out, "Level 1 Directories", &level1, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
-    emit_path_summary_table(out, "Level 2 Directories", &level2, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
-    emit_path_summary_table(out, "Level 3 Directories", &level3, bucket_files, bucket_bytes, total_user_files, total_user_bytes);
+    for (d = 0; d < detail_levels; d++) {
+        char title[64];
+        snprintf(title, sizeof(title), "Level %d Directories", d + 1);
+        emit_path_summary_table(out, title, &maps[d], bucket_files, bucket_bytes, total_user_files, total_user_bytes);
+    }
 
     fputs("<script>\n"
           "(function(){\n"
@@ -1493,9 +1602,7 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "</body>\n</html>\n");
 
     free(base_prefix);
-    path_row_map_destroy(&level1);
-    path_row_map_destroy(&level2);
-    path_row_map_destroy(&level3);
+    for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
     counted_fclose(out);
     return 0;
 }
@@ -1535,19 +1642,93 @@ static int ensure_bucket_output_dir_exists(void) {
     return 0;
 }
 
-static int emit_all_bucket_detail_pages(const char *username,
+static int emit_bucket_detail_stub_fast(const char *filename,
+                                        const char *username,
+                                        int all_users,
+                                        uint64_t distinct_uids,
                                         const char *basis_str,
+                                        int ab,
+                                        int sb,
+                                        const summary_t *sum) {
+    FILE *out = counted_fopen(filename, "w");
+    char hb[32], ht[32];
+
+    if (!out) return -1;
+    human_bytes(sum->bytes[ab][sb], hb, sizeof(hb));
+    human_bytes(sum->total_bytes, ht, sizeof(ht));
+
+    fprintf(out, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    fprintf(out, "<title>Bucket summary</title>\n<style>\n");
+    fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222;line-height:1.45}\n");
+    fprintf(out, ".meta{margin:0 0 14px 0;color:#555;font-size:13px}\n");
+    fprintf(out, ".note{margin:16px 0;padding:12px 14px;background:#faf8f0;border:1px solid #e8e4dc;border-radius:8px;font-size:13px}\n");
+    fprintf(out, "</style>\n</head>\n<body>\n<h1>Bucket summary</h1>\n");
+
+    fprintf(out, "<div class=\"meta\">");
+    if (all_users) {
+        fprintf(out, "Scope: <strong>all crawled users</strong> (%" PRIu64 " distinct UIDs) | ", distinct_uids);
+    } else {
+        fprintf(out, "User: <strong>");
+        html_escape(out, username);
+        fprintf(out, "</strong> | ");
+    }
+    fprintf(out, "Basis: <strong>");
+    html_escape(out, basis_str);
+    fprintf(out, "</strong> | Age: <strong>");
+    html_escape(out, age_bucket_names[ab]);
+    fprintf(out, "</strong> | Size: <strong>");
+    html_escape(out, size_bucket_names[sb]);
+    fprintf(out, "</strong></div>\n");
+
+    fprintf(out,
+            "<p class=\"note\">Per-path drill-down tables were omitted because <strong>--bucket-details N</strong> was "
+            "not used. The heat map on <code>index.html</code> uses full totals; only directory/path breakdowns inside "
+            "each bucket are skipped. Re-run with <strong>--bucket-details</strong> (before other arguments) for full "
+            "tables.</p>\n");
+
+    fprintf(out, "<p>This age/size cell: <strong>%s</strong> in <strong>%" PRIu64
+                 "</strong> regular files (after hard-link dedup rules).</p>\n",
+            hb, sum->files[ab][sb]);
+    fprintf(out, "<p>All matched regular files (entire report): <strong>%s</strong> in <strong>%" PRIu64
+                 "</strong> files.</p>\n",
+            ht, sum->total_files);
+
+    fprintf(out, "</body>\n</html>\n");
+    if (counted_fclose(out) != 0) return -1;
+    return 0;
+}
+
+static int emit_all_bucket_detail_pages(const char *username,
+                                        int all_users,
+                                        uint64_t distinct_uids,
+                                        const char *basis_str,
+                                        int bucket_detail_levels,
+                                        const summary_t *sum_ref,
                                         bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
                                         const matched_records_t *matched_records) {
     int ab, sb;
 
     if (ensure_bucket_output_dir_exists() != 0) return -1;
 
+    if (bucket_detail_levels == 0 && sum_ref) {
+        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+            for (sb = 0; sb < SIZE_BUCKETS; sb++) {
+                char fn[PATH_MAX];
+                if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) return -1;
+                if (emit_bucket_detail_stub_fast(fn, username, all_users, distinct_uids, basis_str, ab, sb, sum_ref) != 0)
+                    return -1;
+            }
+        }
+        return 0;
+    }
+
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
             char fn[PATH_MAX];
             if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) return -1;
-            if (emit_bucket_detail_page(fn, username, basis_str, ab, sb, &details[ab][sb], matched_records) != 0) {
+            if (emit_bucket_detail_page(fn, username, all_users, distinct_uids, basis_str, ab, sb, bucket_detail_levels,
+                                        &details[ab][sb], matched_records) != 0) {
                 return -1;
             }
         }
@@ -1643,9 +1824,12 @@ static int finalize_chunk_file_progress(file_state_t *file_states,
 static int read_one_chunk(const file_chunk_t *chunk,
                           file_state_t *file_states,
                           uid_t target_uid,
+                          int all_users,
+                          int bucket_detail_levels,
                           time_basis_t basis,
                           time_t now,
                           inode_set_t *seen_inodes,
+                          uid_accum_t *uid_distinct,
                           progress_local_t *progress,
                           summary_t *sum,
                           bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
@@ -1675,6 +1859,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
         char *pathbuf = NULL;
         uint64_t accounted_size = 0;
         off_t record_offset = ftello(fp);
+        int record_match;
+        int skip_paths;
 
         if (record_offset < 0 || (uint64_t)record_offset >= chunk->end_offset) {
             rc = 0;
@@ -1699,99 +1885,136 @@ static int read_one_chunk(const file_chunk_t *chunk,
             progress_maybe_flush(progress);
         }
 
-        if (r.path_len > 0) {
-            pathbuf = (char *)malloc((size_t)r.path_len + 1);
-            if (!pathbuf) {
-                fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
+        record_match = all_users || ((uid_t)r.uid == target_uid);
+        skip_paths = record_match && bucket_detail_levels == 0;
+
+        if (!record_match) {
+            if (r.path_len > 0) {
+                if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
+                    fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    break;
+                }
             }
-            if (counted_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
-                fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                free(pathbuf);
-                break;
-            }
-            pathbuf[r.path_len] = '\0';
-        } else {
-            pathbuf = strdup("");
-            if (!pathbuf) {
-                fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
-            }
+            continue;
         }
 
-        if ((uid_t)r.uid == target_uid) {
-            sum->matched_records++;
-            if (progress) progress->matched_records++;
-
-            if (r.type == 'f') {
-                int sb = size_bucket_for(r.size);
-                int ab = age_bucket_for(pick_time(&r, basis), now);
-                int count_bytes = 1;
-
-                if (r.nlink > 1) {
-                    int ins = inode_set_insert_if_new(seen_inodes, r.dev_major, r.dev_minor, r.inode);
-                    if (ins < 0) {
-                        fprintf(stderr, "warn: inode dedup set error in %s\n", chunk->path);
-                        sum->bad_input_files++;
-                        if (progress) progress->bad_input_files++;
-                        free(pathbuf);
-                        break;
-                    }
-                    if (ins == 0) count_bytes = 0;
+        if (skip_paths) {
+            if (r.path_len > 0) {
+                if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
+                    fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    break;
                 }
-
-                sum->matched_files++;
-                sum->total_files++;
-                sum->files[ab][sb] += 1;
-                accounted_size = count_bytes ? r.size : 0;
-
-                if (count_bytes) {
-                    sum->total_capacity_bytes += r.size;
-                    sum->total_bytes += r.size;
-                    sum->bytes[ab][sb] += r.size;
+            }
+            pathbuf = NULL;
+        } else {
+            if (r.path_len > 0) {
+                pathbuf = (char *)malloc((size_t)r.path_len + 1);
+                if (!pathbuf) {
+                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    break;
                 }
-
-                if (bucket_details_append(&details[ab][sb], pathbuf, accounted_size) != 0) {
-                    fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
+                if (counted_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
+                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
                     free(pathbuf);
                     break;
                 }
-            } else if (r.type == 'd') {
-                sum->matched_dirs++;
-                sum->total_dirs++;
-                sum->total_capacity_bytes += r.size;
-                accounted_size = r.size;
-            } else if (r.type == 'l') {
-                sum->matched_links++;
-                sum->total_links++;
-                sum->total_capacity_bytes += r.size;
-                accounted_size = r.size;
+                pathbuf[r.path_len] = '\0';
             } else {
-                sum->matched_others++;
-                sum->total_others++;
-                sum->total_other_bytes += r.size;
-                sum->total_capacity_bytes += r.size;
-                accounted_size = r.size;
+                pathbuf = strdup("");
+                if (!pathbuf) {
+                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    break;
+                }
+            }
+        }
+
+        if (all_users && uid_distinct && uid_accum_insert_if_new(uid_distinct, r.uid) < 0) {
+            fprintf(stderr, "warn: uid set error in %s\n", chunk->path);
+            sum->bad_input_files++;
+            if (progress) progress->bad_input_files++;
+            if (pathbuf) free(pathbuf);
+            break;
+        }
+
+        sum->matched_records++;
+        if (progress) progress->matched_records++;
+
+        if (r.type == 'f') {
+            int sb = size_bucket_for(r.size);
+            int ab = age_bucket_for(pick_time(&r, basis), now);
+            int count_bytes = 1;
+
+            if (r.nlink > 1) {
+                int ins = inode_set_insert_if_new(seen_inodes, r.dev_major, r.dev_minor, r.inode);
+                if (ins < 0) {
+                    fprintf(stderr, "warn: inode dedup set error in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    if (pathbuf) free(pathbuf);
+                    break;
+                }
+                if (ins == 0) count_bytes = 0;
             }
 
+            sum->matched_files++;
+            sum->total_files++;
+            sum->files[ab][sb] += 1;
+            accounted_size = count_bytes ? r.size : 0;
+
+            if (count_bytes) {
+                sum->total_capacity_bytes += r.size;
+                sum->total_bytes += r.size;
+                sum->bytes[ab][sb] += r.size;
+            }
+
+            if (!skip_paths) {
+                if (bucket_details_append(&details[ab][sb], pathbuf, accounted_size) != 0) {
+                    fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
+                    sum->bad_input_files++;
+                    if (progress) progress->bad_input_files++;
+                    if (pathbuf) free(pathbuf);
+                    break;
+                }
+            }
+        } else if (r.type == 'd') {
+            sum->matched_dirs++;
+            sum->total_dirs++;
+            sum->total_capacity_bytes += r.size;
+            accounted_size = r.size;
+        } else if (r.type == 'l') {
+            sum->matched_links++;
+            sum->total_links++;
+            sum->total_capacity_bytes += r.size;
+            accounted_size = r.size;
+        } else {
+            sum->matched_others++;
+            sum->total_others++;
+            sum->total_other_bytes += r.size;
+            sum->total_capacity_bytes += r.size;
+            accounted_size = r.size;
+        }
+
+        if (!skip_paths) {
             if (matched_records_append(matched_records, pathbuf, r.type, accounted_size) != 0) {
                 fprintf(stderr, "warn: matched record append failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
-                free(pathbuf);
+                if (pathbuf) free(pathbuf);
                 break;
             }
         }
 
-        free(pathbuf);
+        if (pathbuf) free(pathbuf);
     }
 
 out:
@@ -1814,9 +2037,12 @@ static void *worker_main(void *arg_void) {
         read_one_chunk(chunk,
                        arg->file_states,
                        arg->target_uid,
+                       arg->all_users,
+                       arg->bucket_detail_levels,
                        arg->basis,
                        arg->now,
                        arg->seen_inodes,
+                       arg->all_users ? &arg->uid_distinct : NULL,
                        &progress,
                        &arg->summary,
                        arg->details,
@@ -1880,9 +2106,23 @@ static void *stats_thread_main(void *arg) {
         human_decimal(records_rate, rr, sizeof(rr));
         format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
-        printf("\r%s rec/s(10s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
-               rr, sf, tf, sr, mr, bad_input_files, elapsed_buf);
-        fflush(stdout);
+        {
+            uint64_t prep_tot_u = g_chunk_prep_files_total;
+            unsigned long long prep_done_u = atomic_load(&g_chunk_prep_files_done);
+
+            if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
+                char pdone[32], ptot[32];
+                human_decimal((double)prep_done_u, pdone, sizeof(pdone));
+                human_decimal((double)prep_tot_u, ptot, sizeof(ptot));
+                printf("\rchunk-map files:%s/%s | scanning bin headers for parallel parse | el:%s            ", pdone, ptot,
+                       elapsed_buf);
+                fflush(stdout);
+            } else {
+                printf("\r%s rec/s(10s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                       rr, sf, tf, sr, mr, bad_input_files, elapsed_buf);
+                fflush(stdout);
+            }
+        }
     }
 
     return NULL;
@@ -1891,6 +2131,7 @@ static void *stats_thread_main(void *arg) {
 static int scan_dirs_collect_files(const char **dirpaths,
                                    size_t dir_count,
                                    uid_t target_uid,
+                                   int all_users,
                                    char ***out_paths,
                                    size_t *out_count) {
     DIR *dir = NULL;
@@ -1961,7 +2202,7 @@ static int scan_dirs_collect_files(const char **dirpaths,
             if (use_uid_shards) {
                 uint32_t shard = 0;
                 if (parse_uid_shard_number(de->d_name, &shard) != 0) continue;
-                if (shard != wanted_shard) continue;
+                if (!all_users && shard != wanted_shard) continue;
             } else {
                 if (!starts_with_thread(de->d_name) && !starts_with_uid_shard(de->d_name)) continue;
             }
@@ -2012,6 +2253,12 @@ fail_partial:
         free(paths);
     }
     return -1;
+}
+
+static void free_chunk_array_rows(file_chunk_t *chunks, size_t count) {
+    size_t j;
+    for (j = 0; j < count; j++) free(chunks[j].path);
+    free(chunks);
 }
 
 static int append_chunk(file_chunk_t **chunks,
@@ -2068,15 +2315,22 @@ static uint64_t compute_parse_chunk_target(uint64_t file_size_bytes, int threads
 static int build_chunks_for_file(const char *path,
                                  size_t file_index,
                                  uint64_t chunk_target_bytes,
-                                 file_chunk_t **chunks,
-                                 size_t *chunk_count,
-                                 size_t *chunk_cap,
-                                 unsigned int *file_chunk_counter) {
+                                 file_chunk_t **chunks_out,
+                                 size_t *chunk_count_out,
+                                 unsigned int *file_chunk_counter_out) {
     FILE *fp = NULL;
     bin_file_header_t fh;
     uint64_t chunk_start;
     uint64_t next_target;
+    file_chunk_t *chunks = NULL;
+    size_t chunk_count = 0;
+    size_t chunk_cap = 0;
+    unsigned int fc = 0;
     int rc = -1;
+
+    *chunks_out = NULL;
+    *chunk_count_out = 0;
+    *file_chunk_counter_out = 0;
 
     fp = counted_fopen(path, "rb");
     if (!fp) {
@@ -2108,8 +2362,9 @@ static int build_chunks_for_file(const char *path,
             if (feof(fp)) {
                 uint64_t file_end = (uint64_t)record_start;
                 if (file_end > chunk_start) {
-                    if (append_chunk(chunks, chunk_count, chunk_cap, path, chunk_start, file_end, file_index) != 0) goto out;
-                    (*file_chunk_counter)++;
+                    if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, file_end, file_index) != 0)
+                        goto out;
+                    fc++;
                 }
                 rc = 0;
             }
@@ -2122,8 +2377,9 @@ static int build_chunks_for_file(const char *path,
 
         while ((uint64_t)record_end >= next_target) {
             if ((uint64_t)record_end > chunk_start) {
-                if (append_chunk(chunks, chunk_count, chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0) goto out;
-                (*file_chunk_counter)++;
+                if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0)
+                    goto out;
+                fc++;
             }
             chunk_start = (uint64_t)record_end;
             next_target = chunk_start + chunk_target_bytes;
@@ -2132,7 +2388,47 @@ static int build_chunks_for_file(const char *path,
 
 out:
     if (fp) counted_fclose(fp);
-    return rc;
+    if (rc != 0) {
+        free_chunk_array_rows(chunks, chunk_count);
+        return -1;
+    }
+    *chunks_out = chunks;
+    *chunk_count_out = chunk_count;
+    *file_chunk_counter_out = fc;
+    return 0;
+}
+
+typedef struct {
+    char **paths;
+    uint64_t *chunk_targets;
+    size_t path_count;
+    int *prep_rc;
+    file_chunk_t **prep_chunks;
+    size_t *prep_chunk_counts;
+    atomic_size_t next_path_index;
+} chunk_prep_pool_t;
+
+static void *chunk_prep_worker_main(void *arg) {
+    chunk_prep_pool_t *pool = (chunk_prep_pool_t *)arg;
+
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&pool->next_path_index, 1, memory_order_relaxed);
+        file_chunk_t *local_chunks = NULL;
+        size_t local_count = 0;
+        unsigned int fc = 0;
+        int r;
+
+        if (i >= pool->path_count) break;
+
+        r = build_chunks_for_file(pool->paths[i], i, pool->chunk_targets[i], &local_chunks, &local_count, &fc);
+        pool->prep_rc[(int)i] = r;
+        pool->prep_chunks[(int)i] = local_chunks;
+        pool->prep_chunk_counts[(int)i] = local_count;
+        (void)fc;
+        atomic_fetch_add_explicit(&g_chunk_prep_files_done, 1ULL, memory_order_relaxed);
+    }
+
+    return NULL;
 }
 
 static void emit_storage_sources_html(FILE *out, size_t crawl_source_count, const char *label) {
@@ -2165,6 +2461,9 @@ static void emit_storage_sources_html(FILE *out, size_t crawl_source_count, cons
 
 static int emit_html(const char *report_path,
                      const char *username,
+                     int all_users,
+                     uint64_t distinct_uids,
+                     int bucket_detail_levels,
                      uid_t uid,
                      const char *basis_str,
                      const summary_t *sum,
@@ -2182,13 +2481,17 @@ static int emit_html(const char *report_path,
     fprintf(out, "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     fprintf(out, "<title>Data storage report — ");
-    html_escape(out, username);
+    if (all_users)
+        fputs("all users", out);
+    else
+        html_escape(out, username);
     fprintf(out, "</title>\n");
     fprintf(out, "<style>\n");
     fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
     fprintf(out, "body.drawer-open{overflow:hidden}\n");
     fprintf(out, "h1{margin-bottom:8px}\n");
     fprintf(out, ".report-title{font-size:1.35rem;margin:0 0 18px}\n");
+    fprintf(out, ".report-aggregate-note{margin:0 0 18px;font-size:13px;color:#444;line-height:1.45;max-width:720px}\n");
     fprintf(out, ".report-stats{margin-top:28px;padding-top:22px;border-top:1px solid #ddd}\n");
     fprintf(out, ".report-stats>h2{font-size:1.15rem;margin:0 0 14px}\n");
     fprintf(out, ".report-sources-section{margin-bottom:20px;padding:14px 16px;background:#f9f9f7;border:1px solid #e8e4dc;border-radius:8px}\n");
@@ -2250,8 +2553,28 @@ static int emit_html(const char *report_path,
     fprintf(out, "</head>\n<body>\n");
 
     fprintf(out, "<h1 class=\"report-title\">Data storage report for <strong>");
-    html_escape(out, username);
+    if (all_users) {
+        fputs("all crawled users", out);
+    } else {
+        html_escape(out, username);
+    }
     fprintf(out, "</strong></h1>\n");
+    if (all_users) {
+        fprintf(out, "<p class=\"report-aggregate-note\">Includes filesystem entries from <strong>%" PRIu64
+                     "</strong> distinct Unix users (UIDs); not filtered to a single account.",
+                distinct_uids);
+        if (bucket_detail_levels == 0)
+            fprintf(out,
+                    " Bucket drill-down pages list summary totals only; pass <strong>--bucket-details N</strong> "
+                    "(before other arguments) for directory tables. Heat-map totals are unchanged.");
+        fprintf(out, "</p>\n");
+    } else if (bucket_detail_levels == 0) {
+        fprintf(out,
+                "<p class=\"report-aggregate-note\">Bucket drill-down pages list summary totals only. Pass "
+                "<strong>--bucket-details N</strong> (before the username and time basis, 1&ndash;%d directory levels) "
+                "for full per-cell directory tables.</p>\n",
+                BUCKET_DETAIL_LEVELS_MAX);
+    }
 
     fprintf(out, "<section class=\"path-search\" aria-label=\"Path search\">\n");
     fprintf(out, "<label for=\"path-search-input\">Search paths</label>\n");
@@ -2360,7 +2683,11 @@ static int emit_html(const char *report_path,
         fprintf(out, "<div class=\"stats-grid\">\n");
 
         fprintf(out, "<article class=\"stats-card\"><h3>Run</h3><dl class=\"stats-dl\">\n");
-        fprintf(out, "<dt>Unix UID</dt><dd class=\"stats-num\">%lu</dd>\n", (unsigned long)uid);
+        if (all_users) {
+            emit_stats_count_dd(out, "Distinct UIDs (users)", distinct_uids);
+        } else {
+            fprintf(out, "<dt>Unix UID</dt><dd class=\"stats-num\">%lu</dd>\n", (unsigned long)uid);
+        }
         fprintf(out, "<dt>Time basis</dt><dd>");
         html_escape(out, basis_str);
         fprintf(out, "</dd>\n");
@@ -2521,6 +2848,9 @@ static void format_input_dirs_label(const char **dirs, size_t n, char *buf, size
 }
 
 static void emit_run_stats(const char *username,
+                           int all_users,
+                           uint64_t distinct_uids,
+                           int bucket_detail_levels,
                            uid_t uid,
                            const char *basis_str,
                            const char *dirpath,
@@ -2544,6 +2874,9 @@ static void emit_run_stats(const char *username,
 
     printf("report_type=ereport\n");
     printf("user=%s\n", username);
+    printf("aggregate_all_users=%d\n", all_users ? 1 : 0);
+    printf("bucket_detail_levels=%d\n", bucket_detail_levels);
+    if (all_users) printf("distinct_uids=%" PRIu64 "\n", distinct_uids);
     printf("uid=%lu\n", (unsigned long)uid);
     printf("time_basis=%s\n", basis_str);
     printf("input_dir=%s\n", dirpath);
@@ -2594,7 +2927,6 @@ int main(int argc, char **argv) {
     size_t path_count = 0;
     file_chunk_t *chunks = NULL;
     size_t chunk_count = 0;
-    size_t chunk_cap = 0;
     file_state_t *file_states = NULL;
     int threads = DEFAULT_THREADS;
     int threads_used;
@@ -2611,6 +2943,9 @@ int main(int argc, char **argv) {
     int i, ab, sb;
     int bucket_pages_written = 0;
     int stats_thread_started = 0;
+    int all_users_mode = 0;
+    int bucket_detail_levels = 0;
+    uint64_t distinct_uid_count = 0;
     double t0, t1;
 
     atomic_store(&g_io_opendir_calls, 0);
@@ -2629,6 +2964,8 @@ int main(int argc, char **argv) {
     atomic_store(&g_stop_stats, 0);
     for (i = 0; i < WINDOW_SECONDS; i++) atomic_store(&g_bucket_records[i], 0);
     g_progress_input_files_total = 0;
+    g_chunk_prep_files_total = 0;
+    atomic_store(&g_chunk_prep_files_done, 0ULL);
     g_records_rate_sum = 0.0;
     g_records_rate_min = 0.0;
     g_records_rate_max = 0.0;
@@ -2636,51 +2973,130 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     g_run_start_sec = t0;
 
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
-        fprintf(stderr, "Thread count: EREPORT_THREADS (default %d).\n", DEFAULT_THREADS);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
+        fprintf(stderr, "       %s [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]  (all users → ./all_users/)\n",
+                argv[0]);
+        fprintf(stderr, "Optional --bucket-details N (1…%d): full per-bucket directory tables; omit for brief buckets.\n",
+                BUCKET_DETAIL_LEVELS_MAX);
+        fprintf(stderr, "Flags must appear first. Thread count: EREPORT_THREADS (default %d).\n", DEFAULT_THREADS);
         return 2;
     }
 
-    user_spec = argv[1];
-    basis_str = argv[2];
-    threads = parse_ereport_thread_count();
-
     {
-        int ai = 3;
-        bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
-        if (!bin_dirs) die("allocation failed");
-        while (ai < argc) {
-            if (argv[ai][0] == '-') {
-                fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
-                free((void *)bin_dirs);
+        int ac = argc;
+        char **av = argv;
+        while (ac > 1 && strcmp(av[1], "--bucket-details") == 0) {
+            char *end;
+            long lv;
+            if (bucket_detail_levels != 0) {
+                fprintf(stderr, "ereport: duplicate --bucket-details\n");
                 return 2;
             }
-            bin_dirs[bin_dir_count++] = argv[ai];
-            ai++;
+            if (ac < 3) {
+                fprintf(stderr, "ereport: --bucket-details requires a number\n");
+                return 2;
+            }
+            errno = 0;
+            lv = strtol(av[2], &end, 10);
+            if (errno || end == av[2] || *end || lv < 1 || lv > BUCKET_DETAIL_LEVELS_MAX) {
+                fprintf(stderr, "ereport: --bucket-details must be between 1 and %d\n", BUCKET_DETAIL_LEVELS_MAX);
+                return 2;
+            }
+            bucket_detail_levels = (int)lv;
+            memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+            ac -= 2;
+            argc = ac;
         }
-        if (bin_dir_count == 0) {
-            free((void *)bin_dirs);
-            bin_dirs = (const char **)malloc(sizeof(char *));
+    }
+
+    if (argc < 2) {
+        fprintf(stderr, "ereport: missing arguments (need a time basis, or username and time basis)\n");
+        return 2;
+    }
+
+    threads = parse_ereport_thread_count();
+
+    if (parse_time_basis(argv[1], &basis) == 0) {
+        all_users_mode = 1;
+        basis_str = argv[1];
+        target_uid = (uid_t)0;
+        if (snprintf(display_name, sizeof(display_name), "all_users") >= (int)sizeof(display_name)) {
+            fprintf(stderr, "ereport: output name too long\n");
+            return 2;
+        }
+
+        {
+            int ai = 2;
+            bin_dirs = (const char **)calloc((size_t)(argc > 2 ? (size_t)(argc - 2) : 1), sizeof(char *));
             if (!bin_dirs) die("allocation failed");
-            bin_dirs[0] = ".";
-            bin_dir_count = 1;
+            while (ai < argc) {
+                if (argv[ai][0] == '-') {
+                    fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                    free((void *)bin_dirs);
+                    return 2;
+                }
+                bin_dirs[bin_dir_count++] = argv[ai];
+                ai++;
+            }
+            if (bin_dir_count == 0) {
+                free((void *)bin_dirs);
+                bin_dirs = (const char **)malloc(sizeof(char *));
+                if (!bin_dirs) die("allocation failed");
+                bin_dirs[0] = ".";
+                bin_dir_count = 1;
+            }
+        }
+    } else {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
+            fprintf(stderr, "       %s [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]  (all users → ./all_users/)\n",
+                    argv[0]);
+            fprintf(stderr, "Optional --bucket-details N (1…%d); omit for brief bucket pages. Thread count: EREPORT_THREADS "
+                           "(default %d).\n",
+                    BUCKET_DETAIL_LEVELS_MAX, DEFAULT_THREADS);
+            return 2;
+        }
+
+        user_spec = argv[1];
+        basis_str = argv[2];
+
+        {
+            int ai = 3;
+            bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
+            if (!bin_dirs) die("allocation failed");
+            while (ai < argc) {
+                if (argv[ai][0] == '-') {
+                    fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                    free((void *)bin_dirs);
+                    return 2;
+                }
+                bin_dirs[bin_dir_count++] = argv[ai];
+                ai++;
+            }
+            if (bin_dir_count == 0) {
+                free((void *)bin_dirs);
+                bin_dirs = (const char **)malloc(sizeof(char *));
+                if (!bin_dirs) die("allocation failed");
+                bin_dirs[0] = ".";
+                bin_dir_count = 1;
+            }
+        }
+
+        if (parse_time_basis(basis_str, &basis) != 0) {
+            free((void *)bin_dirs);
+            die("time basis must be one of: atime, mtime, ctime");
+        }
+
+        if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
+            fprintf(stderr, "unknown user or uid: %s\n", user_spec);
+            free((void *)bin_dirs);
+            return 1;
         }
     }
 
     format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
     format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
-
-    if (parse_time_basis(basis_str, &basis) != 0) {
-        free((void *)bin_dirs);
-        die("time basis must be one of: atime, mtime, ctime");
-    }
-
-    if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
-        fprintf(stderr, "unknown user or uid: %s\n", user_spec);
-        free((void *)bin_dirs);
-        return 1;
-    }
 
     set_bucket_output_dir(display_name);
     if (snprintf(report_path, sizeof(report_path), "%s/index.html", g_bucket_output_dir) >= (int)sizeof(report_path)) {
@@ -2689,7 +3105,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, &paths, &path_count) != 0) {
+    fputs("ereport: scanning crawl directories for .bin shard files...\n", stderr);
+    fflush(stderr);
+
+    if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, all_users_mode, &paths, &path_count) != 0) {
         free((void *)bin_dirs);
         return 1;
     }
@@ -2701,6 +3120,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    fprintf(stderr, "ereport: found %zu matching bin file(s).\n", path_count);
+    fflush(stderr);
+
     file_states = (file_state_t *)calloc(path_count, sizeof(*file_states));
     if (!file_states) {
         size_t k;
@@ -2710,22 +3132,176 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    for (i = 0; (size_t)i < path_count; i++) {
-        struct stat st;
-        unsigned int file_chunk_counter = 0;
-        uint64_t chunk_target = PARSE_CHUNK_BYTES;
-        if (stat(paths[i], &st) == 0 && S_ISREG(st.st_mode))
-            chunk_target = compute_parse_chunk_target((uint64_t)st.st_size, threads);
-        if (build_chunks_for_file(paths[i], (size_t)i, chunk_target, &chunks, &chunk_count, &chunk_cap,
-                                   &file_chunk_counter) != 0) {
-            atomic_store(&file_states[i].remaining_chunks, 0);
-        } else {
-            atomic_store(&file_states[i].remaining_chunks, file_chunk_counter);
+    {
+        uint64_t *chunk_targets = (uint64_t *)calloc(path_count, sizeof(uint64_t));
+        int *prep_rc = (int *)calloc(path_count, sizeof(int));
+        file_chunk_t **prep_chunks = (file_chunk_t **)calloc(path_count, sizeof(*prep_chunks));
+        size_t *prep_chunk_counts = (size_t *)calloc(path_count, sizeof(size_t));
+        chunk_prep_pool_t pool;
+        pthread_t *prep_tids = NULL;
+        int prep_threads;
+        size_t merge_off;
+
+        if (!chunk_targets || !prep_rc || !prep_chunks || !prep_chunk_counts) {
+            fprintf(stderr, "allocation failed\n");
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
         }
+
+        for (i = 0; (size_t)i < path_count; i++) {
+            struct stat st;
+
+            chunk_targets[i] = PARSE_CHUNK_BYTES;
+            if (stat(paths[i], &st) == 0 && S_ISREG(st.st_mode))
+                chunk_targets[i] = compute_parse_chunk_target((uint64_t)st.st_size, threads);
+        }
+
+        g_progress_input_files_total = (uint64_t)path_count;
+        g_chunk_prep_files_total = (uint64_t)path_count;
+        atomic_store(&g_chunk_prep_files_done, 0ULL);
+
+        if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
+            fprintf(stderr, "failed to create stats thread\n");
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
+        }
+        stats_thread_started = 1;
+
+        prep_threads = threads;
+        if ((size_t)prep_threads > path_count) prep_threads = (int)path_count;
+
+        fprintf(stderr, "ereport: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
+        fflush(stderr);
+
+        memset(&pool, 0, sizeof(pool));
+        pool.paths = paths;
+        pool.chunk_targets = chunk_targets;
+        pool.path_count = path_count;
+        pool.prep_rc = prep_rc;
+        pool.prep_chunks = prep_chunks;
+        pool.prep_chunk_counts = prep_chunk_counts;
+        atomic_store(&pool.next_path_index, 0);
+
+        prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
+        if (!prep_tids) {
+            fprintf(stderr, "allocation failed\n");
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
+        }
+
+        for (i = 0; i < prep_threads; i++) {
+            if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
+                int j;
+                fprintf(stderr, "failed to create chunk-prep thread\n");
+                atomic_store(&g_stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+                for (j = 0; j < i; j++) pthread_join(prep_tids[j], NULL);
+                free(prep_tids);
+                free(chunk_targets);
+                free(prep_rc);
+                free(prep_chunks);
+                free(prep_chunk_counts);
+                for (j = 0; (size_t)j < path_count; j++) free(paths[j]);
+                free(paths);
+                free(file_states);
+                return 1;
+            }
+        }
+
+        for (i = 0; i < prep_threads; i++) pthread_join(prep_tids[i], NULL);
+        free(prep_tids);
+        prep_tids = NULL;
+
+        chunk_count = 0;
+        for (i = 0; (size_t)i < path_count; i++) {
+            if (prep_rc[i] != 0) {
+                atomic_store(&file_states[i].remaining_chunks, 0U);
+                if (prep_chunks[i]) {
+                    free_chunk_array_rows(prep_chunks[i], prep_chunk_counts[i]);
+                    prep_chunks[i] = NULL;
+                }
+                continue;
+            }
+            chunk_count += prep_chunk_counts[i];
+        }
+
+        if (chunk_count > 0) {
+            file_chunk_t *merged;
+
+            merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
+            if (!merged) {
+                fprintf(stderr, "allocation failed\n");
+                atomic_store(&g_stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+                for (i = 0; (size_t)i < path_count; i++) {
+                    if (prep_rc[i] == 0 && prep_chunks[i]) free_chunk_array_rows(prep_chunks[i], prep_chunk_counts[i]);
+                }
+                free(chunk_targets);
+                free(prep_rc);
+                free(prep_chunks);
+                free(prep_chunk_counts);
+                for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+                free(paths);
+                free(file_states);
+                return 1;
+            }
+
+            merge_off = 0;
+            for (i = 0; (size_t)i < path_count; i++) {
+                if (prep_rc[i] != 0) continue;
+                memcpy(merged + merge_off, prep_chunks[i], prep_chunk_counts[i] * sizeof(file_chunk_t));
+                merge_off += prep_chunk_counts[i];
+                free(prep_chunks[i]);
+                prep_chunks[i] = NULL;
+                atomic_store(&file_states[i].remaining_chunks,
+                             prep_chunk_counts[i] > (size_t)UINT_MAX ? UINT_MAX : (unsigned int)prep_chunk_counts[i]);
+            }
+            chunks = merged;
+        }
+
+        free(chunk_targets);
+        free(prep_rc);
+        free(prep_chunks);
+        free(prep_chunk_counts);
+
+        g_chunk_prep_files_total = 0;
+        atomic_store(&g_chunk_prep_files_done, 0ULL);
     }
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
         free(paths);
         free(file_states);
@@ -2734,7 +3310,6 @@ int main(int argc, char **argv) {
 
     threads_used = threads;
     now = time(NULL);
-    g_progress_input_files_total = (uint64_t)path_count;
 
     memset(&queue, 0, sizeof(queue));
     queue.chunks = chunks;
@@ -2745,8 +3320,18 @@ int main(int argc, char **argv) {
     if (inode_set_init(&seen_inodes, 65536) != 0) {
         size_t k;
         fprintf(stderr, "allocation failed\n");
+        for (k = 0; k < chunk_count; k++) free(chunks[k].path);
+        free(chunks);
+        chunks = NULL;
+        if (stats_thread_started) {
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+        }
         for (k = 0; k < path_count; k++) free(paths[k]);
         free(paths);
+        free(file_states);
         pthread_mutex_destroy(&queue.mutex);
         return 1;
     }
@@ -2762,29 +3347,45 @@ int main(int argc, char **argv) {
         free(paths);
         pthread_mutex_destroy(&queue.mutex);
         inode_set_destroy(&seen_inodes);
+        free(file_states);
         return 1;
     }
-
-    if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
-        fprintf(stderr, "failed to create stats thread\n");
-        free(tids);
-        free(args);
-        for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
-        free(paths);
-        pthread_mutex_destroy(&queue.mutex);
-        inode_set_destroy(&seen_inodes);
-        return 1;
-    }
-    stats_thread_started = 1;
 
     for (i = 0; i < threads; i++) {
         memset(&args[i], 0, sizeof(args[i]));
         args[i].queue = &queue;
         args[i].file_states = file_states;
         args[i].target_uid = target_uid;
+        args[i].all_users = all_users_mode;
+        args[i].bucket_detail_levels = bucket_detail_levels;
         args[i].basis = basis;
         args[i].now = now;
         args[i].seen_inodes = &seen_inodes;
+
+        if (all_users_mode) {
+            if (uid_accum_init(&args[i].uid_distinct, 8192) != 0) {
+                int j;
+                fprintf(stderr, "allocation failed\n");
+                threads_used = i;
+                for (j = 0; j < i; j++) pthread_join(tids[j], NULL);
+                for (j = 0; j < i; j++) uid_accum_destroy(&args[j].uid_distinct);
+                if (stats_thread_started) {
+                    atomic_store(&g_stop_stats, 1);
+                    pthread_join(stats_thread, NULL);
+                    clear_status_line();
+                }
+                free(tids);
+                free(args);
+                for (j = 0; j < (int)chunk_count; j++) free(chunks[j].path);
+                free(chunks);
+                for (j = 0; (size_t)j < path_count; j++) free(paths[j]);
+                free(paths);
+                free(file_states);
+                pthread_mutex_destroy(&queue.mutex);
+                inode_set_destroy(&seen_inodes);
+                return 1;
+            }
+        }
 
         if (pthread_create(&tids[i], NULL, worker_main, &args[i]) != 0) {
             fprintf(stderr, "failed to create thread %d\n", i);
@@ -2800,17 +3401,69 @@ int main(int argc, char **argv) {
     for (i = 0; i < threads_used; i++) {
         pthread_join(tids[i], NULL);
         summary_merge(&final_sum, &args[i].summary);
-        if (matched_records_merge(&final_matched_records, &args[i].matched_records) != 0) {
-            fprintf(stderr, "allocation failed merging matched records\n");
-            if (stats_thread_started) {
-                atomic_store(&g_stop_stats, 1);
-                pthread_join(stats_thread, NULL);
-                clear_status_line();
+        if (bucket_detail_levels > 0) {
+            if (matched_records_merge(&final_matched_records, &args[i].matched_records) != 0) {
+                fprintf(stderr, "allocation failed merging matched records\n");
+                if (stats_thread_started) {
+                    atomic_store(&g_stop_stats, 1);
+                    pthread_join(stats_thread, NULL);
+                    clear_status_line();
+                }
+                matched_records_free(&final_matched_records);
+                for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                    for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+                }
+                free(tids);
+                if (all_users_mode) {
+                    for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
+                }
+                free(args);
+                for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
+                free(chunks);
+                for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+                free(paths);
+                free(file_states);
+                pthread_mutex_destroy(&queue.mutex);
+                inode_set_destroy(&seen_inodes);
+                return 1;
             }
-            matched_records_free(&final_matched_records);
             for (ab = 0; ab < AGE_BUCKETS; ab++) {
-                for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+                for (sb = 0; sb < SIZE_BUCKETS; sb++) {
+                    if (bucket_details_merge(&final_details[ab][sb], &args[i].details[ab][sb]) != 0) {
+                        fprintf(stderr, "allocation failed merging bucket details\n");
+                        if (stats_thread_started) {
+                            atomic_store(&g_stop_stats, 1);
+                            pthread_join(stats_thread, NULL);
+                            clear_status_line();
+                        }
+                        matched_records_free(&final_matched_records);
+                        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                            for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+                        }
+                        free(tids);
+                        if (all_users_mode) {
+                            for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
+                        }
+                        free(args);
+                        for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
+                        free(chunks);
+                        for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+                        free(paths);
+                        free(file_states);
+                        pthread_mutex_destroy(&queue.mutex);
+                        inode_set_destroy(&seen_inodes);
+                        return 1;
+                    }
+                }
             }
+        }
+    }
+
+    if (all_users_mode) {
+        uid_accum_t merged_uids;
+        if (uid_accum_init(&merged_uids, 65536) != 0) {
+            fprintf(stderr, "allocation failed merging uid tallies\n");
+            for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
             free(tids);
             free(args);
             for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
@@ -2820,34 +3473,38 @@ int main(int argc, char **argv) {
             free(file_states);
             pthread_mutex_destroy(&queue.mutex);
             inode_set_destroy(&seen_inodes);
+            matched_records_free(&final_matched_records);
+            for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+            }
             return 1;
         }
-        for (ab = 0; ab < AGE_BUCKETS; ab++) {
-            for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-                if (bucket_details_merge(&final_details[ab][sb], &args[i].details[ab][sb]) != 0) {
-                    fprintf(stderr, "allocation failed merging bucket details\n");
-                    if (stats_thread_started) {
-                        atomic_store(&g_stop_stats, 1);
-                        pthread_join(stats_thread, NULL);
-                        clear_status_line();
-                    }
-                    matched_records_free(&final_matched_records);
-                    for (ab = 0; ab < AGE_BUCKETS; ab++) {
-                        for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
-                    }
-                    free(tids);
-                    free(args);
-                    for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
-                    free(chunks);
-                    for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
-                    free(paths);
-                    free(file_states);
-                    pthread_mutex_destroy(&queue.mutex);
-                    inode_set_destroy(&seen_inodes);
-                    return 1;
+        for (i = 0; i < threads_used; i++) {
+            if (uid_accum_merge_into(&merged_uids, &args[i].uid_distinct) != 0) {
+                int j;
+                fprintf(stderr, "allocation failed merging uid tallies\n");
+                uid_accum_destroy(&merged_uids);
+                for (j = i; j < threads; j++) uid_accum_destroy(&args[j].uid_distinct);
+                free(tids);
+                free(args);
+                for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
+                free(chunks);
+                for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+                free(paths);
+                free(file_states);
+                pthread_mutex_destroy(&queue.mutex);
+                inode_set_destroy(&seen_inodes);
+                matched_records_free(&final_matched_records);
+                for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                    for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
                 }
+                return 1;
             }
+            uid_accum_destroy(&args[i].uid_distinct);
         }
+        for (; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
+        distinct_uid_count = (uint64_t)uid_accum_size(&merged_uids);
+        uid_accum_destroy(&merged_uids);
     }
 
     if (ensure_bucket_output_dir_exists() != 0) {
@@ -2873,14 +3530,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (emit_all_bucket_detail_pages(display_name, basis_str, final_details, &final_matched_records) != 0) {
+    if (emit_all_bucket_detail_pages(display_name, all_users_mode, distinct_uid_count, basis_str,
+                                     bucket_detail_levels,
+                                     bucket_detail_levels == 0 ? &final_sum : NULL, final_details,
+                                     &final_matched_records) != 0) {
         fprintf(stderr, "failed to write bucket detail pages\n");
     } else {
         bucket_pages_written = AGE_BUCKETS * SIZE_BUCKETS;
     }
 
-    if (emit_html(report_path, display_name, target_uid, basis_str, &final_sum, path_count, threads_used,
-                  bin_dir_count, storage_base_paths_label) != 0) {
+    if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
+                   basis_str, &final_sum, path_count, threads_used, bin_dir_count,
+                   storage_base_paths_label) != 0) {
         fprintf(stderr, "failed to write main report %s\n", report_path);
     }
     final_sum.scanned_input_files = (uint64_t)path_count;
@@ -2890,7 +3551,9 @@ int main(int argc, char **argv) {
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
-    emit_run_stats(display_name, target_uid, basis_str, input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written, t1 - t0);
+    emit_run_stats(display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid, basis_str,
+                   input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, bucket_pages_written,
+                   t1 - t0);
 
     free(tids);
     free(args);
