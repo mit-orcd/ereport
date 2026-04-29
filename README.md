@@ -9,6 +9,23 @@ The current toolchain is:
 - `ereport_index`: search-index helper for path-element substring search
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
 
+## Default thread counts (per binary)
+
+**Each program has its own defaults.** There is no single global “thread count” for the whole toolchain: `ecrawl`, `ereport`, and `ereport_index` read **different** environment variables and use **different** built-in numbers when those variables are unset.
+
+**Minimum CPUs / RAM** below are practical **floors** for running **with default thread counts** on a dedicated or mostly idle machine: enough logical CPUs that default parallelism is not absurdly oversubscribed, and enough RAM that typical modest workloads are unlikely to fail from memory pressure alone. They are **not** guarantees for huge trees or maximal queue depth—reduce env thread counts on smaller hosts, and expect **`ereport_index --make`** large merges to need **well above** the baseline RAM (merge budget follows host/cgroup **MemAvailable**; wide parallel index runs often use **tens to hundreds of GiB** peak).
+
+| Program | Parallelism role | Override (env) | Built-in default | Min logical CPUs | Min RAM |
+|---------|------------------|----------------|------------------|------------------|---------|
+| **`ecrawl`** | Walk / queue directory work | **`ECRAWL_WORKERS`** | **16** crawl workers (hard max **16**) | **4** | **4 GiB** |
+| **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
+| **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
+| **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
+
+**Not controlled by those knobs:** `ereport_index --make` **merge** workers (cap **16**, chosen from RAM budget), and **`--resume-merge`** merge workers—see **`EREPORT_INDEX_MERGE_`** vars in the table below.
+
+Details and ranges for each variable appear under each tool’s section and in **Environment variables (quick reference)** at the end of this file.
+
 ## Build
 
 ```bash
@@ -164,7 +181,7 @@ Outputs:
 
 Place **`--bucket-details N`** (`N` = **1…32**) **first**, before the username (if any) and time basis. Omit it for fast runs and small bucket HTML (no path reads for drill-down tables).
 
-**Search UI (important):** There is **only one** search field. Results stay **below that box**—not in a sliding drawer—so it stays obvious what you are editing. After three characters you get a preview list under the input; press **Enter** for paged results in the same panel. Use **Hide** to collapse the panel without clearing your query.
+**Search UI (important):** There is **only one** search field. Results stay **below that box**—not in a sliding drawer—so it stays obvious what you are editing. After three characters you get a preview list under the input; press **Enter** for paged results in the same panel. Use **Hide** to collapse the panel without clearing your query. The preview and paged-result lines include timing plus corpus scale: **`indexed_paths`** from the index’s **`meta.txt`** (shown as “~N paths indexed”) when that value is present; otherwise they fall back to **`index_keys`** (distinct trigrams in **`tri_keys.bin`**, shown as “~N trigrams”).
 
 Usage:
 
@@ -265,42 +282,30 @@ Default behavior:
 - **`--search [--index-dir <path>] <term>`** — optional **`--index-dir`** (same flag as **`--make`**). If omitted, the index directory defaults to **`./index`** relative to the current working directory.
 - **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallelism for **`--make`** (default **32** when unset or invalid): **chunk-boundary mapping** runs with up to this many scanners across distinct input `.bin` files (capped by file count), and **parse/index** uses the same count for **parallel chunk readers** (parse workers). **Trigram writers** default to the same count; override with **`EREPORT_INDEX_TRIGRAM_THREADS`** (below). **This does not set trigram merge worker count.** Merge uses up to **16** workers by default, capped by **available RAM** (each merge worker may hold about **2× the largest `tmp_trigrams_*.bin` bucket** in memory during sort). Tune merge parallelism with **`EREPORT_INDEX_MERGE_RAM_FRAC`** / **`EREPORT_INDEX_MERGE_MEMORY_MB`** (see below). Raising thread count increases peak RAM mostly by having more workers fill **bounded** queues (paths writer depth is **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`**).
 - **`EREPORT_INDEX_TRIGRAM_THREADS`** — optional; parallel writers appending to **`tmp_trigrams_*.bin`** during **`--make`**. Defaults to **`EREPORT_INDEX_THREADS`** (same integer range **1…4096**). Use when trigram temp I/O is the bottleneck and you can afford more concurrent bucket files (subject to **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** / **`ulimit -n`**).
-- **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** — optional; bounded queue of path jobs between the paths writer and trigram workers (default **4096**, range **512…262144**). Larger values reduce producer blocking when trigram workers fall behind; they use more RAM for queued work.
+- **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** — optional; bounded queue of path jobs between the paths writer and trigram workers (range **512…262144**). When unset, default depth scales with **`EREPORT_INDEX_TRIGRAM_THREADS`** (**64×** workers, minimum **4096**, capped at **16384**) so high parallelism does not starve workers as easily; override explicitly for more headroom (uses more RAM).
 - **`EREPORT_INDEX_WRITE_BATCH_PATHS`** — optional; target number of paths per batch handed to the paths writer (default **4096**, range **512…65536**). The effective flush size is also scaled down when **`EREPORT_INDEX_THREADS`** is high (see **`write_batch_flush_at`** in **`--make`** stats).
-- **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** — optional override (**4…4096**) for how many **write batches** may wait on the single writer thread during **`--make`**. Default scales with **`EREPORT_INDEX_THREADS`** (about **threads/4**, clamped **6…48**). Raising this raises peak memory if workers outpace the writer; lowering it adds backpressure (workers block until the writer drains).
-- **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** — optional cap (**32…4096**) on how many **`tmp_trigrams_*.bin`** bucket **`FILE*`** handles stay open during **`--make`**. If unset, **`ereport_index`** picks a limit from **`RLIMIT_NOFILE`** (roughly **`min(512, soft_limit − ~150)`**) or defaults to **384**; least-recently-used buckets are **`fclose`**d when over the cap and reopened with **`ab`** on the next write. Raise **`ulimit -n`** or set this lower if you still hit **`EMFILE`**.
+- **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** — optional override (**4…4096**) for how many **write batches** may wait on the single writer thread during **`--make`**. Default scales with **`EREPORT_INDEX_THREADS`** (about **threads/3**, clamped **6…96**). Raising this raises peak memory if workers outpace the writer; lowering it adds backpressure (workers block until the writer drains).
+- **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** — optional cap (**32…4096**) on how many **`tmp_trigrams_*`** bucket **`FILE*`** handles each trigram worker may keep open (LRU); unset defaults to **4096**, then split across workers using an assumed fd budget (see **`ulimit`** below). Lower this if you hit **`EMFILE`**.
 
-#### Raising open-file limits (`ulimit`)
+#### Open files (`ulimit`)
 
-Parallel indexing opens crawl shards, pipes, and up to **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** **`tmp_trigrams_*.bin`** files at a time (not all **4096** buckets at once). If **`Too many open files`** (**`EMFILE`**) persists, raise **`RLIMIT_NOFILE`** or reduce **`EREPORT_INDEX_THREADS`**.
-
-**Inspect limits in the current shell** (Linux **`bash`**):
+**`ereport_index --make`** uses many descriptors (parallel trigram shards, merge I/O, crawl inputs). Before large builds run:
 
 ```bash
-ulimit -Sn    # soft limit (what the process actually gets)
-ulimit -Hn    # hard limit (ceiling for raising soft without extra privileges)
+ulimit -n 65535
 ```
 
-**Raise the soft limit for this shell session** before running **`--make`** (value must be **≤ hard limit** unless you change the hard limit as root):
+(**65535** or higher.) If **`Too many open files`** persists, raise **`ulimit -n`** further, lower **`EREPORT_INDEX_THREADS`**, or set **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** lower. If **`ulimit -n`** cannot go high enough, raise the **hard** limit (often **`/etc/security/limits.conf`** or **`systemd`** **`LimitNOFILE=`**) and open a new shell.
 
-```bash
-ulimit -n 65536
-EREPORT_INDEX_THREADS=160 ./ereport_index --make --index-dir /path/to/index/ /path/to/crawl/
-```
-
-Or one line:
-
-```bash
-ulimit -n 65536 && ./ereport_index --make ...
-```
-
-If **`ulimit -n …`** fails with “cannot modify limit”, the hard limit is too low—increase it (requires **root** or local policy): e.g. **`/etc/security/limits.conf`** (`nofile` soft/hard for your user), **systemd** unit **`LimitNOFILE=`** for a service, or session **`pam_limits`**. After changing system limits, **log in again** or start a new session so **`ulimit -Hn`** reflects the new ceiling.
-
-JSON search output is one UTF-8 JSON object per line:
+JSON search output is one UTF-8 JSON object per line (fields mirror **`ereport_index --help`**):
 
 ```json
-{"total":123,"skip":0,"limit":50,"paths":["...","..."]}
+{"total":123,"skip":0,"limit":50,"search_ms":4,"index_keys":63000,"indexed_paths":2000000,"paths":["...","..."]}
 ```
+
+- **`index_keys`** — number of distinct trigram keys in **`tri_keys.bin`**.
+- **`indexed_paths`** — corpus size from **`meta.txt`** (**`indexed_paths=`**), aligned with **`paths.bin`** entry count (**`0`** if **`meta.txt`** is missing or unreadable).
+- **`search_ms`** — server-side search duration for that request.
 
 If **`--json`** is given without **`--limit`**, **limit defaults to 50**.
 
@@ -308,7 +313,7 @@ If **`--json`** is given without **`--limit`**, **limit defaults to 50**.
 
 Roughly two phases:
 
-1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, then enqueues **linked trigram jobs from each write batch** to the trigram queue in **slices** that fit current free depth (fewer mutex rounds than per-path enqueue, without stalling until an entire batch fits). **Multiple trigram writer threads** append **`tmp_trigrams_*.bin`** in parallel (per-bucket mutexes, lazy **`FILE*`** handles, and **LRU eviction** of idle bucket files against **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** / **`RLIMIT_NOFILE`**). For each path, trigram codes are **sorted by bucket** and written with **batched `fwrite`s** per bucket (fewer lock rounds and syscalls than one write per trigram). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** depth defaults to **4096** parsed paths between the paths writer and trigram workers; override with **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** (see above).
+1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, then enqueues **linked trigram jobs from each write batch** to the trigram queue in **slices** that fit current free depth (fewer mutex rounds than per-path enqueue, without stalling until an entire batch fits). **Multiple trigram writer threads** append **`tmp_trigrams_*.bin`** shard files in parallel (lazy **`FILE*`** handles and **LRU eviction** per **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`**; requires sufficient **`ulimit -n`**). For each path, trigram codes are **sorted by bucket** and written with **batched `fwrite`s** per bucket (fewer lock rounds and syscalls than one write per trigram). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** depth defaults to **4096** parsed paths between the paths writer and trigram workers; override with **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** (see above).
 
 2. **Merge** — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs **multiple worker threads** that write per-bucket segment files, then a single thread **stitches** postings offsets and concatenates blobs. Reads prefer **`mmap`** with `malloc`+`read` fallback; sorting uses **LSD radix** on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers.
 
@@ -340,7 +345,7 @@ Typical keys include:
 
 - **Where time goes:** `chunk_prep_sec` (parallel chunk-boundary mapping only) vs `index_phase_sec` (wall clock from run start through closing `paths.bin` / `path_offsets.bin`, including scan, prep, directory setup, parallel parse + writers + draining queues) vs `merge_phase_sec` vs `wall_after_index_sec` (merge + `meta.txt` and similar; should be ≈ `merge_phase_sec` plus tiny overhead). `elapsed_sec` is end-to-end. **`avg_paths_per_sec` divides by `elapsed_sec`**, so it understates peak index throughput if merge is fast; use **`index_paths_per_sec`** (paths ÷ `index_phase_sec`) for overall index-stage rate.
 - **CPU by phase (Linux `getrusage`, all threads summed):** on successful **`--make`**, lines prefixed `cpu_prep_`, `cpu_idx_`, `cpu_mrg_`, `cpu_make_` report user/sys CPU seconds, voluntary/involuntary context switches, and minor/major page faults between phase boundaries (`_cpu_user_sec`, `_cpu_sys_sec`, `_ctx_sw_vol`, etc.).
-- **Stdio/POSIX I/O counts for `--make`:** `make_fread_*`, `make_fwrite_*`, `make_fopen_calls`, `make_fclose_calls`, `make_open_calls`, `make_read_*`, `make_mmap_calls`, `make_munmap_calls`, `make_bucket_lock_acquires` (increments once per **batched** append to `tmp_trigrams` for a bucket—much smaller than `trigram_records`)—useful for tuning syscalls / lock contention.
+- **Stdio/POSIX I/O counts for `--make`:** `make_fread_*`, `make_fwrite_*`, `make_fopen_calls`, `make_fclose_calls`, `make_open_calls`, `make_read_*`, `make_mmap_calls`, `make_munmap_calls`, `make_trigram_append_batches` (once per **batched** append to `tmp_trigrams` for a bucket—much smaller than `trigram_records`)—useful for tuning syscalls / temp I/O behavior.
 - Throughput and scale: `scanned_records`, `indexed_paths`, `trigram_records`, `unique_trigrams`, `index_workers`, `index_trigram_workers`, `writeq_max_batches`, `write_batch_flush_at` (queue backpressure and paths-per-batch flush tuning).
 - Merge: `merge_phase_sec`, `merge_workers` (after RAM cap), `merge_workers_cpu` (CPU-based choice before cap), `merge_max_bucket_mib`, `merge_parallel_ram_budget_mib`, `merge_buckets_nonempty`, `merge_buckets_skipped`, `merge_trigram_records_read`, byte counts for temp reads and final `tri_*` outputs, derived `*_per_sec` rates.
 - **Queue wait counters** (each increment only when a thread blocks on `pthread_cond_wait`; **no overhead on the non-blocking fast path**): `writeq_writer_waits` (paths writer starved for parse batches), `writeq_parse_waits` (parse workers blocked because the paths writer queue is full), `trigramq_paths_waits` (paths writer blocked because the trigram job queue is full), `trigramq_worker_waits` (trigram workers idle waiting for jobs). High counts usually mean raising **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** or **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`**, tuning **`EREPORT_INDEX_THREADS`** / **`EREPORT_INDEX_TRIGRAM_THREADS`**, or faster trigram temp I/O (subject to RAM and disk).
@@ -358,7 +363,7 @@ Current index format:
 
 Current files under `<username>/index/`:
 
-- `meta.txt`
+- `meta.txt` — small key/value record written at end of **`--make`** / **`--resume-merge`** (includes **`indexed_paths=`** corpus size and format/version fields)
 - `path_offsets.bin`
 - `paths.bin`
 - `tri_keys.bin`
@@ -425,7 +430,7 @@ Parameters:
 - **`skip`** — offset into the ranked match list (default `0`).
 - **`limit`** — page size (default `50`; capped server-side).
 
-Successful responses are **`application/json`** from **`ereport_index`** (`total`, `skip`, `limit`, `paths`). Errors return JSON or plain HTTP errors depending on failure mode.
+Successful responses are **`application/json`** from **`ereport_index`**: **`total`**, **`skip`**, **`limit`**, **`search_ms`**, **`index_keys`**, **`indexed_paths`**, and **`paths`** (string array). Errors return JSON or plain HTTP errors depending on failure mode.
 
 Direct **`python3`** invocation:
 
@@ -557,19 +562,21 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 
 ## Environment variables (quick reference)
 
+Defaults below are the **built-in** values when the variable is **unset**—each tool uses **its own** defaults (see **Default thread counts (per binary)** above).
+
 | Variable | Tool / context | Role |
 |----------|----------------|------|
-| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (1…16, default 16). |
-| **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default 8). |
+| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (1…16, default **16**). |
+| **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
-| **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default 32). |
-| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` / **`--search`** | Parallel chunk-boundary mapping, index **parse** workers, and (for **`--search`**) parallel postings load + path filtering when the query and candidate set are large enough (default 32). Does **not** set merge worker count or (by default) trigram writer count. |
-| **`EREPORT_INDEX_TRIGRAM_THREADS`** | `ereport_index --make` | Parallel writers to **`tmp_trigrams_*.bin`** (default: same as **`EREPORT_INDEX_THREADS`**). |
-| **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** | `ereport_index --make` | Bounded queue between paths writer and trigram workers (default **4096**, range **512…262144**). |
+| **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default **32**). |
+| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` / **`--search`** | Parallel chunk-boundary mapping, index **parse** workers, and (for **`--search`**) parallel postings load + path filtering when the query and candidate set are large enough (default **32**). Does **not** set merge worker count. Trigram temp writers default to this count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. |
+| **`EREPORT_INDEX_TRIGRAM_THREADS`** | `ereport_index --make` | Parallel writers to **`tmp_trigrams_*.bin`** (default: **same as `EREPORT_INDEX_THREADS`** when unset). |
+| **`EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH`** | `ereport_index --make` | Bounded queue between paths writer and trigram workers (default scales with trigram thread count; range **512…262144**). |
 | **`EREPORT_INDEX_WRITE_BATCH_PATHS`** | `ereport_index --make` | Base paths-per-batch to the writer (default **4096**, range **512…65536**; scaled when thread count is high). |
 | **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** | `ereport_index --make` | Max depth of batches waiting on the **paths** writer (default scales with thread count). |
-| **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** | `ereport_index --make` | Cap on concurrently open **`tmp_trigrams_*.bin`** bucket **`FILE*`** handles (**32…4096**; default derives from **`RLIMIT_NOFILE`** or **384**). |
+| **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** | `ereport_index --make` | Per-worker LRU cap on **`tmp_trigrams_*`** shard **`FILE*`** handles (**32…4096**; default **4096**). Use a high **`ulimit -n`** for large **`--make`** (see README). |
 | **`EREPORT_INDEX_MERGE_MEMORY_MB`** | `ereport_index --make` / merge / **resume-merge** | Explicit merge RAM **budget** (MiB) for limiting parallel merge workers (optional). |
 | **`EREPORT_INDEX_MERGE_RAM_FRAC`** | `ereport_index --make` / merge / **resume-merge** | Fraction of `min(MemAvailable, cgroup memory.max)` used as that budget (default **0.55**). |
 | **`EREPORT_INDEX_BIN`** | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
