@@ -29,6 +29,42 @@ Clean:
 make clean
 ```
 
+## Why this is fast (design concepts)
+
+The tools are fast because they combine **compact binary I/O**, **parallelism along natural boundaries**, and **bounded pipelines** instead of naïvely scanning everything twice or holding giant locks over shared mutable state.
+
+### Shared ideas (`ecrawl`, `ereport`, `ereport_index`)
+
+- **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (`NFSCBIN` / format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
+- **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers).
+- **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
+
+### `ecrawl`: crawling and capture
+
+- **Parallel walkers** feed a **task queue**; multiple threads traverse the tree concurrently while respecting directory boundaries.
+- **Uid-sharded output** — Records hash to many **`uid_shard_*.bin`** files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
+- **Separate writer threads** — Crawl threads batch work to **bounded writer queues**; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record.
+- **Checkpoint rows during write** — Sidecars capture sparse offsets so **later tools** can parallel-read without rescanning from zero.
+
+### `ereport`: reports from crawl bins
+
+- **Parallel chunk mapping** — Uses **`*.ckpt`** to build **chunk lists** (byte ranges that align with record starts). Chunk count scales with file size, so **`EREPORT_THREADS`** has enough units of work.
+- **Parallel chunk parsing** — Workers consume disjoint chunks; summaries and bucket histograms merge after workers finish (merge step is **not** on the per-record hot path across all threads).
+- **Parallel bucket HTML** — The **36** heat-map cells map to **36** independent output files; emission fans out across threads up to that cap.
+- **Cheap mode by default** — Without **`--bucket-details`**, the parser **seeks past** path strings for histogram-only passes, keeping I/O and CPU down when you only need aggregates.
+
+### `ereport_index`: trigram index build (`--make`)
+
+- **Same chunk boundaries as `ereport`** — Parallel chunk readers; rows can skip path bytes when building for a single UID ( **`fseek`** past unmatched records).
+- **Ordered path stream** — A single **paths writer** thread appends **`paths.bin`** / **`path_offsets.bin`** in **strict path-id order** so the index remains coherent while **many** trigram workers run.
+- **Producer–consumer queues** — Parse workers → paths writer → **trigram job queue** (bounded) → trigram workers → **`tmp_trigrams_*.bin`**. Bounded queues apply **backpressure** instead of unbounded RAM; tuning env vars trades memory vs blocking (see metrics like **`writeq_parse_waits`** / **`trigramq_paths_waits`**).
+- **Sliced bulk enqueue** — Trigram jobs from a write batch are enqueued in **slices** that fit current queue depth, so partial capacity is used instead of waiting until an entire batch fits.
+- **Batched trigram writes** — For each path, trigram codes are **sorted by trigram bucket**, then **`fwrite`** runs **per contiguous bucket run** under one mutex acquisition per slice — far fewer lock rounds and syscalls than one write per trigram.
+- **Lazy open + LRU on bucket files** — Only up to **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** **`tmp_trigrams_*.bin`** handles stay open; cold buckets are closed and reopened on demand so you do not need thousands of `FILE*` simultaneously.
+- **Merge phase** — Temp bucket files are sorted (**radix** on packed records), optionally merged with **parallel workers** subject to a **RAM budget**, with large buffered I/O and **`mmap`** where helpful — separate from index-phase throughput but tuned for large disks.
+
+Together, these choices aim to keep **CPU**, **mutexes**, and **syscalls** off the critical path per byte of crawl data, and to use **disk bandwidth** (especially on NVMe) with large buffered writes instead of tiny random appends per logical record.
+
 ## Testing
 
 ```bash
