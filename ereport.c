@@ -59,6 +59,7 @@
 #define PARSE_CHUNK_BYTES (32ULL << 20)
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define BUCKET_DETAIL_LEVELS_MAX 32
+#define BUCKET_PATH_TABLE_MAX_ROWS 200
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -1551,8 +1552,30 @@ static void emit_path_summary_table(FILE *out,
 
     qsort(rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
 
+    {
+        size_t shown = count;
+        if (shown > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) shown = (size_t)BUCKET_PATH_TABLE_MAX_ROWS;
+
+        fprintf(out,
+                "<!-- bucket path table: %zu director%s at this level; %zu rows in HTML (cap %d; sort bucket bytes "
+                "desc) -->\n",
+                count,
+                count == 1 ? "y" : "ies",
+                shown,
+                BUCKET_PATH_TABLE_MAX_ROWS);
+
+        if (count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) {
+            fprintf(out,
+                    "<p class=\"table-trunc-note\">Showing the <strong>top %d</strong> of <strong>%zu</strong> "
+                    "directories at this depth (sorted by bucket bytes, largest first). Omitted rows are lower "
+                    "in that ranking; heat-map and bucket summary totals above still include the full bucket.</p>\n",
+                    BUCKET_PATH_TABLE_MAX_ROWS,
+                    count);
+        }
+    }
+
     fprintf(out, "<div class=\"bucket-table-wrap\"><table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Share of Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Share of Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Share of User Bytes</th><th class=\"r\">Share of User Files</th></tr></thead>\n<tbody>\n");
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < count && i < (size_t)BUCKET_PATH_TABLE_MAX_ROWS; i++) {
         char bb[32];
         char tb[32];
         char file_bg[32];
@@ -1643,6 +1666,7 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:12px}\n");
     fprintf(out, ".meta-sub{font-weight:400;color:#666}\n");
     fprintf(out, ".note{font-size:11px;color:#666;margin-bottom:14px;max-width:1200px}\n");
+    fprintf(out, ".table-trunc-note{font-size:11px;color:#555;margin:0 0 10px;max-width:1200px;line-height:1.45}\n");
     fprintf(out, ".bucket-help{margin:0 0 16px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:1200px;font-size:12px;line-height:1.55;color:#555}\n");
     fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
     fprintf(out, ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n");
