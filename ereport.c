@@ -93,21 +93,21 @@ enum { SIZE_BUCKETS = 6 };
 enum { AGE_BUCKETS = 6 };
 
 static const char *size_bucket_names[SIZE_BUCKETS] = {
-    "<4K",
-    "4K-1M",
-    "1M-100M",
-    "100M-1G",
-    "1G-10G",
+    "< 4K",
+    "4K – 1M",
+    "1M – 100M",
+    "100M – 1G",
+    "1G – 10G",
     "10G+"
 };
 
 static const char *age_bucket_names[AGE_BUCKETS] = {
-    "<30d",
-    "30-90d",
-    "90-180d",
-    "180-365d",
-    "1-3y",
-    "3y+"
+    "< 30 days",
+    "30–90 days",
+    "90–180 days",
+    "180 days – 1 yr",
+    "1–3 years",
+    "3+ years"
 };
 
 typedef struct {
@@ -646,60 +646,55 @@ static void format_uint_commas(uint64_t n, char *buf, size_t sz) {
     buf[j] = '\0';
 }
 
-/* Rounded integer suffix for scans (parentheses only): (111M), (2K), (5T). */
+/* Abbreviated count in parentheses only for 7+ digit totals (>= 1,000,000): (111M), (5T). */
 static void format_count_paren_round(uint64_t n, char *buf, size_t sz) {
     int v;
 
     if (sz == 0) return;
+    if (n < 1000000ULL) {
+        buf[0] = '\0';
+        return;
+    }
     if (n >= 1000000000000ULL) {
         v = (int)((n + 500000000000ULL) / 1000000000000ULL);
         snprintf(buf, sz, "(%dT)", v);
     } else if (n >= 1000000000ULL) {
         v = (int)((n + 500000000ULL) / 1000000000ULL);
         snprintf(buf, sz, "(%dB)", v);
-    } else if (n >= 1000000ULL) {
+    } else {
         v = (int)((n + 500000ULL) / 1000000ULL);
         snprintf(buf, sz, "(%dM)", v);
-    } else if (n >= 1000ULL) {
-        v = (int)((n + 500ULL) / 1000ULL);
-        snprintf(buf, sz, "(%dK)", v);
-    } else {
-        snprintf(buf, sz, "(%" PRIu64 ")", n);
     }
 }
 
-/* "111,243,648 (111M)" — comma-separated plus rounded helper in parentheses. */
+/* Comma-separated count; optional abbreviated suffix in parentheses only when >= 1e6. */
 static void format_count_pretty_inline(uint64_t n, char *buf, size_t sz) {
     char c[48];
     char p[16];
 
     format_uint_commas(n, c, sizeof(c));
     format_count_paren_round(n, p, sizeof(p));
-    snprintf(buf, sz, "%s %s", c, p);
+    if (p[0])
+        snprintf(buf, sz, "%s %s", c, p);
+    else
+        snprintf(buf, sz, "%s", c);
 }
 
-/* Heat-map / stub line: "... regular files". */
-static void format_regular_files_phrase(uint64_t n, char *buf, size_t sz) {
-    char c[48];
-    char p[16];
-
-    format_uint_commas(n, c, sizeof(c));
-    format_count_paren_round(n, p, sizeof(p));
-    snprintf(buf, sz, "%s %s regular files", c, p);
-}
-
-/* Stats cards: comma abs + (rounded) — replaces older SI + raw digits. */
+/* Stats cards: comma abs + optional (rounded) for large counts. */
 static void emit_stats_count_dd(FILE *out, const char *dt_label, uint64_t v) {
     char comma_buf[48];
     char paren_buf[16];
 
     format_uint_commas(v, comma_buf, sizeof(comma_buf));
     format_count_paren_round(v, paren_buf, sizeof(paren_buf));
-    fprintf(out,
-            "<dt>%s</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num-short\">%s</span></dd>\n",
-            dt_label,
-            comma_buf,
-            paren_buf);
+    if (paren_buf[0])
+        fprintf(out,
+                "<dt>%s</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num-short\">%s</span></dd>\n",
+                dt_label,
+                comma_buf,
+                paren_buf);
+    else
+        fprintf(out, "<dt>%s</dt><dd><span class=\"stats-num\">%s</span></dd>\n", dt_label, comma_buf);
 }
 
 static void format_duration(double sec, char *buf, size_t sz) {
@@ -1794,13 +1789,15 @@ static int emit_bucket_detail_stub_fast(const char *filename,
         char cell_files[128];
         char all_files[128];
 
-        format_regular_files_phrase(sum->files[ab][sb], cell_files, sizeof(cell_files));
-        format_regular_files_phrase(sum->total_files, all_files, sizeof(all_files));
+        format_count_pretty_inline(sum->files[ab][sb], cell_files, sizeof(cell_files));
+        format_count_pretty_inline(sum->total_files, all_files, sizeof(all_files));
         fprintf(out,
-                "<p>This age/size cell: <strong>%s</strong> in <strong>%s</strong> (after hard-link dedup rules).</p>\n",
+                "<p>This age/size cell: <strong>%s</strong> total bytes in <strong>%s</strong> regular files (hard-link "
+                "dedup).</p>\n",
                 hb,
                 cell_files);
-        fprintf(out, "<p>All matched regular files (entire report): <strong>%s</strong> in <strong>%s</strong>.</p>\n", ht,
+        fprintf(out, "<p>Entire report (all matched regular files): <strong>%s</strong> in <strong>%s</strong> files.</p>\n",
+                ht,
                 all_files);
     }
 
@@ -3036,6 +3033,8 @@ static int emit_html(const char *report_path,
     fprintf(out, ".stats-num{font-variant-numeric:tabular-nums;font-weight:600;color:#1a1a1a}\n");
     fprintf(out, ".stats-num-short{color:#555;font-size:12px;font-weight:500}\n");
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
+    fprintf(out, ".heatmap-caption{caption-side:top;text-align:left;font-size:12px;color:#555;line-height:1.45;max-width:720px;margin:10px 0 12px;padding:0}\n");
+    fprintf(out, ".heatmap-corner{font-weight:600}\n");
     fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
     fprintf(out, "th{background:#f4f4f4}\n");
@@ -3132,7 +3131,10 @@ static int emit_html(const char *report_path,
     }
 
     fprintf(out, "<table>\n");
-    fprintf(out, "<tr><th>Age \\ Size</th>");
+    fprintf(out,
+            "<caption class=\"heatmap-caption\">Rows: file age (relative to the crawl basis). Columns: file size. Second-line "
+            "values are file counts (regular files; device/inode dedup).</caption>\n");
+    fprintf(out, "<tr><th scope=\"col\" class=\"heatmap-corner\">Age \xc3\x97 Size</th>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         fprintf(out, "<th>");
         html_escape(out, size_bucket_names[sb]);
@@ -3162,7 +3164,7 @@ static int emit_html(const char *report_path,
             if (sum->total_bytes) pct = 100.0 * (double)b / (double)sum->total_bytes;
             human_bytes(b, hb, sizeof(hb));
             heatmap_color(b, ab, max_cell_bytes, bg, sizeof(bg));
-            format_regular_files_phrase(f, fline, sizeof(fline));
+            format_count_pretty_inline(f, fline, sizeof(fline));
             fprintf(out,
                     "<td class=\"cell\" style=\"background:%s\"><a class=\"bucket-link\" data-age=\"%d\" data-size=\"%d\" "
                     "href=\"bucket_a%d_s%d.html\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span "
@@ -3185,7 +3187,7 @@ static int emit_html(const char *report_path,
 
             if (sum->total_bytes) pct = 100.0 * (double)row_total / (double)sum->total_bytes;
             human_bytes(row_total, hr, sizeof(hr));
-            format_regular_files_phrase(row_files, rf, sizeof(rf));
+            format_count_pretty_inline(row_files, rf, sizeof(rf));
             contribution_cell_color(pct, bg, sizeof(bg));
             fprintf(out,
                     "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div "
@@ -3215,7 +3217,7 @@ static int emit_html(const char *report_path,
         }
         if (sum->total_bytes) pct = 100.0 * (double)col_total / (double)sum->total_bytes;
         human_bytes(col_total, hc, sizeof(hc));
-        format_regular_files_phrase(col_files, cf, sizeof(cf));
+        format_count_pretty_inline(col_files, cf, sizeof(cf));
         contribution_cell_color(pct, bg, sizeof(bg));
         fprintf(out,
                 "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div "
@@ -3231,7 +3233,7 @@ static int emit_html(const char *report_path,
         char tf[160];
 
         human_bytes(sum->total_bytes, ht, sizeof(ht));
-        format_regular_files_phrase(sum->total_files, tf, sizeof(tf));
+        format_count_pretty_inline(sum->total_files, tf, sizeof(tf));
         fprintf(out,
                 "<td class=\"tot tot-cell\"><div class=\"tot-block\"><div class=\"cell-main\"><span "
                 "class=\"cell-bytes\">%s</span><span class=\"cell-pct\">100%%</span></div><div class=\"cell-sub\">%s</div></div></td>",
