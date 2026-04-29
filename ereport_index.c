@@ -44,7 +44,9 @@
 #define PARSE_CHUNK_BYTES (32ULL << 20)
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define WRITE_BATCH_PATHS 4096
-#define TRIGRAM_JOB_QUEUE_DEPTH 4096 /* pending paths between paths writer and trigram workers */
+#define TRIGRAM_JOB_QUEUE_DEPTH 4096 /* default pending trigram jobs (paths); override: EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH */
+
+static size_t g_write_batch_paths_base = WRITE_BATCH_PATHS;
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
 #define MERGE_MAX_WORKERS 16
@@ -533,10 +535,11 @@ static size_t compute_write_queue_max_batches(int threads) {
 /* Fewer paths per batch when index_workers is high (one writer drains the queue). */
 static size_t batch_paths_flush_limit(int threads) {
     size_t t;
+    size_t base = g_write_batch_paths_base;
 
     if (threads < 1) threads = DEFAULT_THREADS;
-    if (threads <= 32) return WRITE_BATCH_PATHS;
-    t = (size_t)(((unsigned long)WRITE_BATCH_PATHS * 32UL) / (unsigned long)threads);
+    if (threads <= 32) return base;
+    t = (size_t)(((unsigned long)base * 32UL) / (unsigned long)threads);
     if (t < 256U) t = 256U;
     return t;
 }
@@ -843,7 +846,11 @@ static void die_usage(const char *argv0) {
             "    Plain search prints paths.\n"
             "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"paths\":[...]}\n"
             "    Parallelism: EREPORT_INDEX_THREADS (default 32) loads postings lists and filters paths in parallel\n"
-            "    when the query has multiple trigrams and the candidate set is large.\n");
+            "    when the query has multiple trigrams and the candidate set is large.\n"
+            "    --make tuning: EREPORT_INDEX_TRIGRAM_THREADS (default: same as EREPORT_INDEX_THREADS) parallel\n"
+            "    writers to tmp_trigram bucket files; EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH (default 4096, 512…262144)\n"
+            "    bounded queue from paths writer to trigram workers; EREPORT_INDEX_WRITE_BATCH_PATHS (default 4096,\n"
+            "    512…65536) paths per batch to the writer. Also EREPORT_INDEX_WRITEQ_MAX_BATCHES, EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS.\n");
     exit(2);
 }
 
@@ -1165,6 +1172,45 @@ static int parse_index_thread_count(void) {
     t = strtol(e, &end, 10);
     if (errno || end == e || *end || t < 1 || t > 4096) return DEFAULT_THREADS;
     return (int)t;
+}
+
+/* Trigram writers (default: same as EREPORT_INDEX_THREADS). */
+static int parse_trigram_thread_count(int index_threads) {
+    const char *e = getenv("EREPORT_INDEX_TRIGRAM_THREADS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return index_threads;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > 4096) return index_threads;
+    return (int)t;
+}
+
+/* Depth of bounded queue between paths writer and trigram workers (larger → less producer blocking, more RAM). */
+static size_t parse_trigram_queue_depth(void) {
+    const char *e = getenv("EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return TRIGRAM_JOB_QUEUE_DEPTH;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 512UL || v > 262144UL) return TRIGRAM_JOB_QUEUE_DEPTH;
+    return (size_t)v;
+}
+
+/* Target paths per write batch before flushing to the writer thread (scaled down when many parse workers). */
+static size_t parse_write_batch_paths(void) {
+    const char *e = getenv("EREPORT_INDEX_WRITE_BATCH_PATHS");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return WRITE_BATCH_PATHS;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 512UL || v > 65536UL) return WRITE_BATCH_PATHS;
+    return (size_t)v;
 }
 
 /* Aim for ~(4 * threads) chunks per input .bin so work units are not capped by PARSE_CHUNK_BYTES alone. */
@@ -1752,12 +1798,38 @@ static int append_unique_trigram(uint32_t **codes, size_t *count, size_t *cap, u
     return 0;
 }
 
+/* Count sliding 3-byte windows (one trigram each) across path segments (length >= 3). */
+static size_t count_path_trigram_windows(const char *path) {
+    const char *seg = path;
+    size_t total = 0;
+
+    while (*seg != '\0') {
+        const char *next = strchr(seg, '/');
+        size_t seg_len = next ? (size_t)(next - seg) : strlen(seg);
+
+        if (seg_len >= 3) total += seg_len - 2;
+        if (!next) break;
+        seg = next + 1;
+    }
+    return total;
+}
+
 static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t *out_count, worker_arg_t *scratch) {
     const char *seg = path;
-    uint32_t *codes = NULL;
-    size_t count = 0;
-    size_t cap = 0;
+    size_t nraw = count_path_trigram_windows(path);
+    uint32_t *codes;
+    size_t pos = 0;
 
+    if (nraw == 0) {
+        *out_codes = NULL;
+        *out_count = 0;
+        return 0;
+    }
+
+    codes = (uint32_t *)malloc(nraw * sizeof(uint32_t));
+    if (!codes) return -1;
+
+    seg = path;
     while (*seg != '\0') {
         const char *next = strchr(seg, '/');
         size_t seg_len = next ? (size_t)(next - seg) : strlen(seg);
@@ -1780,18 +1852,17 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
                 }
             }
 
-            for (i = 0; i < seg_len; i++) lower_seg[i] = (char)tolower((unsigned char)seg[i]);
+            for (i = 0; i < seg_len; i++) {
+                unsigned char b = (unsigned char)seg[i];
+                lower_seg[i] = (char)((b >= (unsigned char)'A' && b <= (unsigned char)'Z') ? (b + 32U) : b);
+            }
             lower_seg[seg_len] = '\0';
 
             for (i = 0; i + 3 <= seg_len; i++) {
                 uint32_t trigram = ((uint32_t)(unsigned char)lower_seg[i] << 16) |
                                    ((uint32_t)(unsigned char)lower_seg[i + 1] << 8) |
                                    (uint32_t)(unsigned char)lower_seg[i + 2];
-                if (append_unique_trigram(&codes, &count, &cap, trigram) != 0) {
-                    if (!scratch) free(lower_seg);
-                    free(codes);
-                    return -1;
-                }
+                codes[pos++] = trigram;
             }
             if (!scratch) free(lower_seg);
         }
@@ -1800,10 +1871,14 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
         seg = next + 1;
     }
 
-    if (count > 1) sort_codes_unique(codes, &count);
+    if (pos != nraw) {
+        free(codes);
+        return -1;
+    }
 
+    sort_codes_unique(codes, &nraw);
     *out_codes = codes;
-    *out_count = count;
+    *out_count = nraw;
     return 0;
 }
 
@@ -3372,8 +3447,9 @@ static int build_index_dir(const char *user_spec,
     double chunk_prep_sec = 0.0;
     int stats_thread_started = 0;
     int threads = parse_index_thread_count();
+    size_t trigram_queue_depth_cfg = parse_trigram_queue_depth();
     int threads_used = 0;
-    int trigram_threads = threads;
+    int trigram_threads = parse_trigram_thread_count(threads);
     int trigram_threads_used = 0;
     size_t i;
     struct rusage ru_make_start, ru_after_prep, ru_after_index, ru_after_merge;
@@ -3387,6 +3463,8 @@ static int build_index_dir(const char *user_spec,
     write_queue.run_stats = &run_stats;
     trigram_queue.run_stats = &run_stats;
     memset(&paths_writer_arg, 0, sizeof(paths_writer_arg));
+
+    g_write_batch_paths_base = parse_write_batch_paths();
 
     if (!all_users_mode) {
         if (!user_spec) {
@@ -3748,6 +3826,13 @@ static int build_index_dir(const char *user_spec,
         return 1;
     }
 
+    fprintf(stderr,
+            "ereport_index: make: parse_workers=%d trigram_workers=%d trigram_job_queue_depth=%zu write_batch_paths=%zu\n",
+            threads,
+            trigram_threads,
+            trigram_queue_depth_cfg,
+            g_write_batch_paths_base);
+
     queue.chunks = chunks;
     queue.count = chunk_count;
     queue.next_index = 0;
@@ -3757,7 +3842,7 @@ static int build_index_dir(const char *user_spec,
     pthread_cond_init(&write_queue.has_batch, NULL);
     pthread_cond_init(&write_queue.has_space, NULL);
 
-    trigram_queue.max_depth = TRIGRAM_JOB_QUEUE_DEPTH;
+    trigram_queue.max_depth = trigram_queue_depth_cfg;
     pthread_mutex_init(&trigram_queue.mutex, NULL);
     pthread_cond_init(&trigram_queue.has_job, NULL);
     pthread_cond_init(&trigram_queue.has_space, NULL);
@@ -4058,6 +4143,8 @@ static int build_index_dir(const char *user_spec,
     printf("index_phase_sec=%.3f\n", ctx.index_phase_sec);
     printf("index_workers=%d\n", ctx.index_workers_used);
     printf("index_trigram_workers=%d\n", ctx.trigram_writer_workers_used);
+    printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
+    printf("write_batch_paths=%zu\n", g_write_batch_paths_base);
     {
         char ips_buf[32];
         double ips = ctx.index_phase_sec > 0.0 ? (double)ctx.indexed_paths / ctx.index_phase_sec : 0.0;
