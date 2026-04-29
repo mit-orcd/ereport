@@ -597,41 +597,6 @@ static void write_queue_close(write_queue_t *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
-/*
- * Enqueue a chain of n_jobs jobs (head … tail linked by job->next; tail->next ignored).
- * Waits until depth + n_jobs fits — one wait loop per batch instead of per path from paths_writer.
- */
-static int trigram_job_queue_push_chain(trigram_job_queue_t *q,
-                                        trigram_job_t *head,
-                                        trigram_job_t *tail,
-                                        size_t n_jobs,
-                                        uint64_t total_approx_body_bytes) {
-    if (!head || !tail || n_jobs == 0) return 0;
-
-    pthread_mutex_lock(&q->mutex);
-    if (q->closed) {
-        pthread_mutex_unlock(&q->mutex);
-        return -1;
-    }
-    while (q->depth + n_jobs > q->max_depth && !q->closed) {
-        atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
-        pthread_cond_wait(&q->has_space, &q->mutex);
-    }
-    if (q->closed) {
-        pthread_mutex_unlock(&q->mutex);
-        return -1;
-    }
-    tail->next = NULL;
-    if (q->tail) q->tail->next = head;
-    else q->head = head;
-    q->tail = tail;
-    q->depth += n_jobs;
-    q->queued_body_bytes += total_approx_body_bytes;
-    pthread_cond_broadcast(&q->has_job);
-    pthread_mutex_unlock(&q->mutex);
-    return 0;
-}
-
 static void trigram_job_chain_free(trigram_job_t *head) {
     while (head) {
         trigram_job_t *next = head->next;
@@ -639,6 +604,78 @@ static void trigram_job_chain_free(trigram_job_t *head) {
         free(head);
         head = next;
     }
+}
+
+/* Move up to `space` jobs from the front of *remaining to a detached chain; *remaining is the rest (or NULL). */
+static trigram_job_t *trigram_chain_peel_front(trigram_job_t **remaining, size_t space, size_t *n_jobs_out, uint64_t *body_out) {
+    trigram_job_t *seg_h = *remaining;
+    trigram_job_t *seg_t;
+    size_t n;
+    uint64_t b;
+
+    if (!seg_h || space == 0) {
+        *n_jobs_out = 0;
+        *body_out = 0;
+        return NULL;
+    }
+    seg_t = seg_h;
+    b = (uint64_t)seg_t->approx_body_bytes;
+    n = 1;
+    while (n < space && seg_t->next) {
+        seg_t = seg_t->next;
+        b += (uint64_t)seg_t->approx_body_bytes;
+        n++;
+    }
+    *remaining = seg_t->next;
+    seg_t->next = NULL;
+    *n_jobs_out = n;
+    *body_out = b;
+    return seg_h;
+}
+
+/*
+ * Enqueue a full paths-writer batch chain in slices of up to (max_depth - depth) jobs.
+ * Unlike an atomic batch enqueue, uses partial queue capacity — avoids stalling when e.g. depth 3500
+ * and the batch has 1024 jobs but only 596 slots would suffice for partial progress.
+ */
+static int trigram_job_queue_push_chain_slices(trigram_job_queue_t *q, trigram_job_t *head) {
+    trigram_job_t *rem = head;
+
+    while (rem) {
+        pthread_mutex_lock(&q->mutex);
+        if (q->closed) {
+            pthread_mutex_unlock(&q->mutex);
+            trigram_job_chain_free(rem);
+            return -1;
+        }
+        while (q->depth >= q->max_depth && !q->closed) {
+            atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
+            pthread_cond_wait(&q->has_space, &q->mutex);
+        }
+        if (q->closed) {
+            pthread_mutex_unlock(&q->mutex);
+            trigram_job_chain_free(rem);
+            return -1;
+        }
+        {
+            size_t space = q->max_depth - q->depth;
+            size_t take_n;
+            uint64_t seg_body;
+            trigram_job_t *seg_h = trigram_chain_peel_front(&rem, space, &take_n, &seg_body);
+            trigram_job_t *seg_t;
+
+            for (seg_t = seg_h; seg_t->next; seg_t = seg_t->next) {
+            }
+            if (q->tail) q->tail->next = seg_h;
+            else q->head = seg_h;
+            q->tail = seg_t;
+            q->depth += take_n;
+            q->queued_body_bytes += seg_body;
+            pthread_cond_broadcast(&q->has_job);
+        }
+        pthread_mutex_unlock(&q->mutex);
+    }
+    return 0;
 }
 
 static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
@@ -2235,7 +2272,6 @@ static void *paths_writer_main(void *arg_void) {
             trigram_job_t *tj_head = NULL;
             trigram_job_t *tj_tail = NULL;
             size_t tj_n = 0;
-            uint64_t tj_body = 0;
 
             for (size_t i = 0; i < batch->count; i++) {
                 parsed_path_t *item = &batch->items[i];
@@ -2264,7 +2300,6 @@ static void *paths_writer_main(void *arg_void) {
                 job->next = NULL;
                 item->codes = NULL;
 
-                tj_body += (uint64_t)job->approx_body_bytes;
                 if (!tj_head) {
                     tj_head = tj_tail = job;
                 } else {
@@ -2277,7 +2312,7 @@ static void *paths_writer_main(void *arg_void) {
                 atomic_fetch_add(&rs->indexed_paths, 1U);
             }
 
-            if (tj_n != 0 && trigram_job_queue_push_chain(pa->trigram_queue, tj_head, tj_tail, tj_n, tj_body) != 0) {
+            if (tj_n != 0 && trigram_job_queue_push_chain_slices(pa->trigram_queue, tj_head) != 0) {
                 fprintf(stderr, "ereport_index: trigram job queue push failed (queue closed)\n");
                 trigram_job_chain_free(tj_head);
                 atomic_store(&rs->writer_failed, 1);
