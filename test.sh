@@ -65,6 +65,37 @@ kv_last() {
     grep "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-
 }
 
+# For two non-negative integer strings: absolute delta and percent of baseline (want).
+# Percent rounds to integer; if that is 0 but pct > 0, use decimals until the first
+# non-zero digit after the point (same significant-digit intent as "first digit after comma").
+fs_fail_delta() {
+    local want=$1 got=$2
+    LC_ALL=C awk -v w="$want" -v g="$got" '
+    function abs(x) { return x < 0 ? -x : x }
+    BEGIN {
+        w = int(w + 0)
+        g = int(g + 0)
+        d = abs(g - w)
+        printf "delta_abs=%d", d
+        if (w == 0) {
+            if (g == 0) print " delta_pct=0%"
+            else print " delta_pct=n/a"
+            exit
+        }
+        pct = 100.0 * d / w
+        ri = int(pct + 0.5)
+        if (ri >= 1) printf " delta_pct=%d%%\n", ri
+        else if (pct <= 0) print " delta_pct=0%"
+        else {
+            order = log(pct) / log(10)
+            nd = int(-order) + 1
+            if (nd < 1) nd = 1
+            if (nd > 15) nd = 15
+            printf " delta_pct=%.*f%%\n", nd, pct
+        }
+    }'
+}
+
 # Optional 4th arg: on success, print "OK: label — reason" (why the match matters).
 expect_eq() {
     local label=$1 want=$2 got=$3
@@ -80,7 +111,11 @@ expect_eq_continue() {
     local label=$1 want=$2 got=$3
     local ok_note=${4:-}
     if [[ "$got" != "$want" ]]; then
-        printf '  %sFAIL:%s %s: want %s got %s%s\n' "$R" "$Z" "$label" "$want" "$got" "$Z" >&2
+        if [[ "$want" =~ ^[0-9]+$ ]] && [[ "$got" =~ ^[0-9]+$ ]]; then
+            printf '  %sFAIL:%s %s: want %s got %s (%s)%s\n' "$R" "$Z" "$label" "$want" "$got" "$(fs_fail_delta "$want" "$got")" "$Z" >&2
+        else
+            printf '  %sFAIL:%s %s: want %s got %s%s\n' "$R" "$Z" "$label" "$want" "$got" "$Z" >&2
+        fi
         return 1
     fi
     if [[ -n "$ok_note" ]]; then

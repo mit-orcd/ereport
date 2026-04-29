@@ -2793,7 +2793,16 @@ static int emit_html(const char *report_path,
     fputs("function fetchSearch(term,skip,lim){\n", out);
     fputs("var u='search?q='+encodeURIComponent(term)+'&skip='+String(skip)+'&limit='+String(lim);\n", out);
     fputs("return fetch(u).then(function(r){\n", out);
-    fputs("if(!r.ok)return r.text().then(function(t){throw new Error(t||String(r.status));});return r.json();\n", out);
+    fputs("if(!r.ok){\n", out);
+    fputs("var ct=(r.headers.get('Content-Type')||'').toLowerCase();\n", out);
+    fputs("if(ct.indexOf('application/json')>=0){\n", out);
+    fputs("return r.json().then(function(j){\n", out);
+    fputs("var m=(j&&j.error)?String(j.error):('HTTP '+r.status);\n", out);
+    fputs("if(j&&j.hint)m=m+' '+String(j.hint);\n", out);
+    fputs("throw new Error(m);\n", out);
+    fputs("});}\n", out);
+    fputs("return r.text().then(function(t){throw new Error(t||String(r.status));});}\n", out);
+    fputs("return r.json();\n", out);
     fputs("});}\n", out);
     fputs("function renderPreview(raw){\n", out);
     fputs("var box=document.getElementById('path-search-preview');\n", out);
@@ -2809,7 +2818,7 @@ static int emit_html(const char *report_path,
     fputs("if(paths.length===0){box.innerHTML='<span class=\"path-search-muted\">No matches.</span>';return;}\n", out);
     fputs("var h='<ul>';for(var i=0;i<paths.length;i++){h+='<li>'+escHtml(paths[i])+'</li>';}h+='</ul>';\n", out);
     fputs("if((j.total||0)>paths.length){h+='<div class=\"path-search-muted\">Showing '+paths.length+' of '+j.total+' — press Enter for full paging.</div>';}\n", out);
-    fputs("box.innerHTML=h;\n}).catch(function(e){box.innerHTML='<span class=\"path-search-muted\">'+escHtml(e.message)+'</span>';});\n}\n", out);
+    fputs("box.innerHTML=h;\n}).catch(function(e){var caperr=document.getElementById('path-search-caption');if(caperr)caperr.textContent='';box.innerHTML='<span class=\"path-search-muted\">'+escHtml(e.message)+'</span>';});\n}\n", out);
     fputs("function renderFullPage(){\n", out);
     fputs("var meta=document.getElementById('path-search-results-meta');\n", out);
     fputs("var list=document.getElementById('path-search-results-list');\n", out);
@@ -2826,7 +2835,7 @@ static int emit_html(const char *report_path,
     fputs("meta.textContent=total+' match'+(total===1?'':'es')+' — page '+pageNum+' of '+pages;\n", out);
     fputs("var paths=j.paths||[];var h='';for(var i=0;i<paths.length;i++){h+='<li>'+escHtml(paths[i])+'</li>';}list.innerHTML=h;\n", out);
     fputs("prev.disabled=pageNum<=1;next.disabled=pageNum>=pages;\n", out);
-    fputs("}).catch(function(e){meta.textContent='';list.innerHTML='<li class=\"path-search-muted\">'+escHtml(e.message)+'</li>';prev.disabled=true;next.disabled=true;});\n}\n", out);
+    fputs("}).catch(function(e){var capfp=document.getElementById('path-search-caption');if(capfp)capfp.textContent='';meta.textContent='';list.innerHTML='<li class=\"path-search-muted\">'+escHtml(e.message)+'</li>';prev.disabled=true;next.disabled=true;});\n}\n", out);
     fputs("function runFullSearch(term){\n", out);
     fputs("fullTerm=term.trim();if(fullTerm.length<3)return;\n", out);
     fputs("pageNum=1;showSearchPanel();\n", out);

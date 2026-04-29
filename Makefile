@@ -7,6 +7,8 @@ CFLAGS = -O2 -Wall -Wextra -Wunused-parameter -pthread
 SERVE_ROOT ?= .
 SERVE_PORT ?= 8000
 SERVE_BIND ?= 127.0.0.1
+# Optional: directory with trigram index (tri_keys.bin); forwarded as eserve.py --index-dir
+SERVE_INDEX_DIR ?=
 
 # Targets
 TARGETS = ereport ereport_index ecrawl
@@ -32,11 +34,12 @@ clean:
 	rm -f $(TARGETS) *.o
 	rm -rf __pycache__
 
+# SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
 serve:
-	$(PYTHON3) eserve.py --bind $(SERVE_BIND) --port $(SERVE_PORT) $(SERVE_ROOT)
+	$(PYTHON3) eserve.py --bind $(SERVE_BIND) --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 serve-public:
-	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(SERVE_ROOT)
+	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
 check: $(TARGETS)

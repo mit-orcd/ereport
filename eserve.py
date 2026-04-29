@@ -16,6 +16,10 @@ also accept:
   GET /search?q=...
 
 Requires ereport_index on PATH or set EREPORT_INDEX_BIN to its absolute path.
+
+Search index directory defaults to ./index under each report path (see URL patterns below).
+Override with --index-dir DIR or EREPORT_SEARCH_INDEX_DIR (CLI wins over env): one directory
+containing tri_keys.bin used for every …/search request (may be outside SERVE_ROOT).
 """
 
 import argparse
@@ -64,13 +68,29 @@ def parse_args():
     parser.add_argument('root', nargs='?', default='.', help='Directory to serve. Defaults to the current directory.')
     parser.add_argument('--bind', default='127.0.0.1', help='Address to bind to. Defaults to 127.0.0.1.')
     parser.add_argument('--port', type=int, default=8000, help='Port to listen on. Defaults to 8000.')
+    parser.add_argument(
+        '--index-dir',
+        metavar='DIR',
+        default=None,
+        help='Trigram index directory (tri_keys.bin). Overrides default …/index layout; '
+        'may be outside SERVE_ROOT. Env: EREPORT_SEARCH_INDEX_DIR.',
+    )
     return parser.parse_args()
 
 
+def resolve_search_index_dir_override(cli_path: Optional[str]) -> Optional[Path]:
+    """CLI --index-dir overrides EREPORT_SEARCH_INDEX_DIR."""
+    raw = cli_path if cli_path else os.environ.get('EREPORT_SEARCH_INDEX_DIR')
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
 class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
-    """Class attribute _ereport_index_override may be set before serve_forever."""
+    """Class attributes may be set before serve_forever."""
 
     _ereport_index_override = None  # type: Optional[str]
+    _search_index_dir_override = None  # type: Optional[Path]
 
     def __init__(self, *args, **kwargs):
         self._ereport_index_bin = type(self)._ereport_index_override or resolve_ereport_index_bin()
@@ -87,21 +107,39 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
     def _handle_path_search(self, parsed, parts):
         root = Path(self.directory).resolve()
         report_rel = parts[:-1]
-        if report_rel:
+        idx_ov = type(self)._search_index_dir_override
+        if idx_ov is not None:
+            index_dir = idx_ov
+        elif report_rel:
             index_dir = root.joinpath(*report_rel, 'index')
         else:
             # GET /search — serve root is already the report folder (./index/ beside index.html)
             index_dir = root / 'index'
 
-        try:
-            index_dir.resolve().relative_to(root)
-        except ValueError:
-            self.send_error(HTTPStatus.FORBIDDEN, 'path escapes serve root')
-            return True
+        if idx_ov is None:
+            try:
+                index_dir.resolve().relative_to(root)
+            except ValueError:
+                self.send_error(HTTPStatus.FORBIDDEN, 'path escapes serve root')
+                return True
 
         if not (index_dir / 'tri_keys.bin').is_file():
-            label = '/'.join(report_rel + ['index']) if report_rel else 'index'
-            self.send_error(HTTPStatus.NOT_FOUND, 'no index under ' + label)
+            hint = (
+                'Check --index-dir / EREPORT_SEARCH_INDEX_DIR, or build with: ereport_index --make'
+                if idx_ov is not None
+                else 'Build one in this report directory with: ereport_index --make'
+            )
+            body = json.dumps(
+                {
+                    'error': 'No search index found.',
+                    'hint': hint,
+                }
+            ).encode('utf-8')
+            self.send_response(HTTPStatus.NOT_FOUND)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return True
 
         qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -211,6 +249,8 @@ def main():
 
     index_bin = resolve_ereport_index_bin()
     ReportHTTPRequestHandler._ereport_index_override = index_bin
+    idx_dir = resolve_search_index_dir_override(args.index_dir)
+    ReportHTTPRequestHandler._search_index_dir_override = idx_dir
     handler = partial(ReportHTTPRequestHandler, directory=str(root))
     try:
         server = ReusableThreadingHTTPServer((args.bind, args.port), handler)
@@ -219,6 +259,8 @@ def main():
 
     print(f'Serving {root}')
     print(f'ereport_index: {index_bin}')
+    if idx_dir is not None:
+        print(f'search index dir: {idx_dir}')
     if args.bind == '0.0.0.0':
         hostname = socket.gethostname()
         print(f'URL: http://127.0.0.1:{args.port}/')
