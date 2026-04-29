@@ -1203,6 +1203,8 @@ static int cmp_row_bucket_bytes_desc(const void *a, const void *b) {
     return strcmp(ra->path, rb->path);
 }
 
+static int starts_with_dir_prefix(const char *path, const char *prefix);
+
 static char *dup_common_dir_prefix(const bucket_details_t *details) {
     char *prefix;
     size_t i;
@@ -1225,17 +1227,36 @@ static char *dup_common_dir_prefix(const bucket_details_t *details) {
 
     while (len > 1 && prefix[len - 1] == '/') prefix[--len] = '\0';
 
+    /*
+     * If every path is exactly this prefix or continues as prefix/..., the prefix is already a
+     * directory boundary (e.g. shared crawl root /a/b/001). Do not strip the last segment — that
+     * incorrectly turns /orcd/.../001 into /orcd/... and shifts all level tables by one.
+     * Strip one component only when the character-wise LCP ends inside a filename segment
+     * (e.g. /a/b/file1 vs /a/b/file2 → /a/b/fi → parent /a/b).
+     */
     {
-        char *slash = strrchr(prefix, '/');
-        if (slash) {
-            if (slash == prefix) prefix[1] = '\0';
-            else *slash = '\0';
-        } else if (details->items[0].path && details->items[0].path[0] == '/') {
-            free(prefix);
-            prefix = strdup("/");
-            if (!prefix) return NULL;
-        } else {
-            prefix[0] = '\0';
+        int all_dir_boundary = 1;
+
+        for (i = 0; i < details->count; i++) {
+            const char *pth = details->items[i].path ? details->items[i].path : "";
+            if (!starts_with_dir_prefix(pth, prefix)) {
+                all_dir_boundary = 0;
+                break;
+            }
+        }
+
+        if (!all_dir_boundary) {
+            char *slash = strrchr(prefix, '/');
+            if (slash) {
+                if (slash == prefix) prefix[1] = '\0';
+                else *slash = '\0';
+            } else if (details->items[0].path && details->items[0].path[0] == '/') {
+                free(prefix);
+                prefix = strdup("/");
+                if (!prefix) return NULL;
+            } else {
+                prefix[0] = '\0';
+            }
         }
     }
 
