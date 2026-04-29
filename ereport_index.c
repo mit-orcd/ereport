@@ -597,13 +597,23 @@ static void write_queue_close(write_queue_t *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
-static int trigram_job_queue_push(trigram_job_queue_t *q, trigram_job_t *job) {
+/*
+ * Enqueue a chain of n_jobs jobs (head … tail linked by job->next; tail->next ignored).
+ * Waits until depth + n_jobs fits — one wait loop per batch instead of per path from paths_writer.
+ */
+static int trigram_job_queue_push_chain(trigram_job_queue_t *q,
+                                        trigram_job_t *head,
+                                        trigram_job_t *tail,
+                                        size_t n_jobs,
+                                        uint64_t total_approx_body_bytes) {
+    if (!head || !tail || n_jobs == 0) return 0;
+
     pthread_mutex_lock(&q->mutex);
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
     }
-    while (q->depth >= q->max_depth && !q->closed) {
+    while (q->depth + n_jobs > q->max_depth && !q->closed) {
         atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
         pthread_cond_wait(&q->has_space, &q->mutex);
     }
@@ -611,15 +621,24 @@ static int trigram_job_queue_push(trigram_job_queue_t *q, trigram_job_t *job) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
     }
-    job->next = NULL;
-    if (q->tail) q->tail->next = job;
-    else q->head = job;
-    q->tail = job;
-    q->depth++;
-    q->queued_body_bytes += (uint64_t)job->approx_body_bytes;
-    pthread_cond_signal(&q->has_job);
+    tail->next = NULL;
+    if (q->tail) q->tail->next = head;
+    else q->head = head;
+    q->tail = tail;
+    q->depth += n_jobs;
+    q->queued_body_bytes += total_approx_body_bytes;
+    pthread_cond_broadcast(&q->has_job);
     pthread_mutex_unlock(&q->mutex);
     return 0;
+}
+
+static void trigram_job_chain_free(trigram_job_t *head) {
+    while (head) {
+        trigram_job_t *next = head->next;
+        free(head->codes);
+        free(head);
+        head = next;
+    }
 }
 
 static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
@@ -2212,42 +2231,59 @@ static void *paths_writer_main(void *arg_void) {
         write_batch_t *batch = write_queue_pop_wait(pa->write_queue);
         if (!batch) break;
 
-        for (size_t i = 0; i < batch->count; i++) {
-            parsed_path_t *item = &batch->items[i];
-            uint64_t path_id = pa->ctx->indexed_paths;
-            trigram_job_t *job;
+        {
+            trigram_job_t *tj_head = NULL;
+            trigram_job_t *tj_tail = NULL;
+            size_t tj_n = 0;
+            uint64_t tj_body = 0;
 
-            if (append_paths_only(pa->ctx, item->path) != 0) {
-                atomic_store(&rs->writer_failed, 1);
-                write_batch_destroy(batch);
-                return NULL;
+            for (size_t i = 0; i < batch->count; i++) {
+                parsed_path_t *item = &batch->items[i];
+                uint64_t path_id = pa->ctx->indexed_paths;
+                trigram_job_t *job;
+
+                if (append_paths_only(pa->ctx, item->path) != 0) {
+                    atomic_store(&rs->writer_failed, 1);
+                    trigram_job_chain_free(tj_head);
+                    write_batch_destroy(batch);
+                    return NULL;
+                }
+
+                job = (trigram_job_t *)malloc(sizeof(*job));
+                if (!job) {
+                    fprintf(stderr, "ereport_index: malloc(trigram_job): %s\n", strerror(errno));
+                    atomic_store(&rs->writer_failed, 1);
+                    trigram_job_chain_free(tj_head);
+                    write_batch_destroy(batch);
+                    return NULL;
+                }
+                job->path_id = path_id;
+                job->codes = item->codes;
+                job->code_count = item->code_count;
+                job->approx_body_bytes = sizeof(trigram_job_t) + item->code_count * sizeof(uint32_t);
+                job->next = NULL;
+                item->codes = NULL;
+
+                tj_body += (uint64_t)job->approx_body_bytes;
+                if (!tj_head) {
+                    tj_head = tj_tail = job;
+                } else {
+                    tj_tail->next = job;
+                    tj_tail = job;
+                }
+                tj_n++;
+
+                pa->ctx->indexed_paths++;
+                atomic_fetch_add(&rs->indexed_paths, 1U);
             }
 
-            job = (trigram_job_t *)malloc(sizeof(*job));
-            if (!job) {
-                fprintf(stderr, "ereport_index: malloc(trigram_job): %s\n", strerror(errno));
-                atomic_store(&rs->writer_failed, 1);
-                write_batch_destroy(batch);
-                return NULL;
-            }
-            job->path_id = path_id;
-            job->codes = item->codes;
-            job->code_count = item->code_count;
-            job->approx_body_bytes = sizeof(trigram_job_t) + item->code_count * sizeof(uint32_t);
-            job->next = NULL;
-            item->codes = NULL;
-
-            if (trigram_job_queue_push(pa->trigram_queue, job) != 0) {
+            if (tj_n != 0 && trigram_job_queue_push_chain(pa->trigram_queue, tj_head, tj_tail, tj_n, tj_body) != 0) {
                 fprintf(stderr, "ereport_index: trigram job queue push failed (queue closed)\n");
-                free(job->codes);
-                free(job);
+                trigram_job_chain_free(tj_head);
                 atomic_store(&rs->writer_failed, 1);
                 write_batch_destroy(batch);
                 return NULL;
             }
-
-            pa->ctx->indexed_paths++;
-            atomic_fetch_add(&rs->indexed_paths, 1U);
         }
 
         write_batch_destroy(batch);
