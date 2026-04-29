@@ -28,16 +28,19 @@
 #include <sys/resource.h>
 #include <time.h>
 
+#include "crawl_ckpt.h"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 #define FILE_MAGIC_LEN 8
-#define FORMAT_VERSION 2
+#define FORMAT_VERSION 3
 #define INDEX_VERSION 1
 #define TRIGRAM_BUCKET_BITS 12
 #define TRIGRAM_BUCKET_COUNT (1U << TRIGRAM_BUCKET_BITS)
 #define DEFAULT_THREADS 32
+#define DEFAULT_MAX_OPEN_TRIGRAM_BUCKET_FP 384
 #define PARSE_CHUNK_BYTES (32ULL << 20)
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define WRITE_BATCH_PATHS 4096
@@ -222,6 +225,11 @@ typedef struct {
     uint8_t bucket_nonempty[TRIGRAM_BUCKET_COUNT];
     pthread_mutex_t *bucket_parallel_mutex; /* [TRIGRAM_BUCKET_COUNT] indexing phase */
     FILE **bucket_parallel_fp;             /* lazy-open tmp_trigrams; parallel trigram writers */
+    pthread_mutex_t bucket_parallel_evict_mutex;
+    atomic_uint_fast64_t bucket_parallel_lru_clock;
+    uint64_t *bucket_parallel_lru_age; /* [TRIGRAM_BUCKET_COUNT]; larger = more recently written */
+    uint32_t bucket_parallel_open_count;
+    uint32_t bucket_parallel_max_open;
     index_run_stats_t *run_stats;
     int merge_workers_used;
     int merge_workers_cpu; /* before memory cap */
@@ -262,7 +270,8 @@ typedef struct {
     size_t cap;
 } u64_vec_t;
 
-static const char *g_input_layout = "legacy";
+/* Manifest-driven crawl directory layout: "uid_shards" or "unsharded" (no uid-shard manifest). */
+static const char *g_input_layout = "unsharded";
 static uint32_t g_input_uid_shards = 0;
 
 static double rusage_timeval_sec(const struct timeval *tv) {
@@ -816,7 +825,7 @@ static void die_usage(const char *argv0) {
             "Usage:\n"
             "  %s --make [--index-dir <path>] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
-            "  %s --search <term> [index_dir] [--json] [--skip N] [--limit M]\n",
+            "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n",
             argv0,
             argv0,
             argv0);
@@ -830,8 +839,11 @@ static void die_usage(const char *argv0) {
             "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
             "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
             "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
-            "  --search: default index_dir is ./index (relative to cwd). Plain search prints paths.\n"
-            "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"paths\":[...]}\n");
+            "  --search: Optional --index-dir <path> (same flag as --make); default index dir is ./index.\n"
+            "    Plain search prints paths.\n"
+            "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"paths\":[...]}\n"
+            "    Parallelism: EREPORT_INDEX_THREADS (default 32) loads postings lists and filters paths in parallel\n"
+            "    when the query has multiple trigrams and the candidate set is large.\n");
     exit(2);
 }
 
@@ -1015,7 +1027,9 @@ static int scan_dirs_collect_files(const char **dirpaths,
             first_shards = shards;
         } else {
             if (layout_rc != first_layout) {
-                fprintf(stderr, "incompatible crawl layouts between %s and %s\n", dirpaths[0], dirpaths[di]);
+                fprintf(stderr,
+                        "incompatible crawl directory layouts between %s and %s (uid-sharded vs unsharded)\n",
+                        dirpaths[0], dirpaths[di]);
                 return -1;
             }
             if (layout_rc > 0 && shards != first_shards) {
@@ -1032,7 +1046,7 @@ static int scan_dirs_collect_files(const char **dirpaths,
         g_input_layout = "uid_shards";
         g_input_uid_shards = first_shards;
     } else {
-        g_input_layout = "legacy";
+        g_input_layout = "unsharded";
         g_input_uid_shards = 0;
     }
 
@@ -1166,14 +1180,70 @@ static uint64_t compute_parse_chunk_target(uint64_t file_size_bytes, int threads
     return target;
 }
 
-static int build_chunks_for_file(const char *path,
-                                 size_t file_index,
-                                 uint64_t chunk_target_bytes,
-                                 file_chunk_t **chunks_out,
-                                 size_t *chunk_count_out,
-                                 unsigned int *file_chunk_counter_out) {
+static int bin_ckpt_sidecar_path(const char *bin_path, char *out, size_t out_sz) {
+    int n = snprintf(out, out_sz, "%s.ckpt", bin_path);
+    return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
+}
+
+static int load_bin_ckpt(const char *bin_path, uint64_t file_sz, uint64_t **offs_out, size_t *n_out) {
+    char ckpath[PATH_MAX];
+    crawl_ckpt_file_hdr_t ch;
+    uint64_t *buf = NULL;
+    size_t i;
+    FILE *fp;
+
+    *offs_out = NULL;
+    *n_out = 0;
+    if (bin_ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
+    fp = mk_fopen(ckpath, "rb");
+    if (!fp) return -1;
+    if (mk_fread(&ch, sizeof(ch), 1, fp) != 1) {
+        mk_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+    if (memcmp(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN) != 0 || ch.version != CRAWL_CKPT_ONDISK_VERSION ||
+        ch.stride_bytes != CRAWL_CKPT_STRIDE_BYTES || ch.num_offsets == 0 || ch.num_offsets > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
+        mk_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+    buf = (uint64_t *)malloc((size_t)ch.num_offsets * sizeof(*buf));
+    if (!buf) {
+        mk_fclose(fp);
+        return -1;
+    }
+    if (mk_fread(buf, sizeof(uint64_t), (size_t)ch.num_offsets, fp) != (size_t)ch.num_offsets || mk_fclose(fp) != 0) {
+        free(buf);
+        errno = EINVAL;
+        return -1;
+    }
+    if (buf[0] != sizeof(bin_file_header_t)) {
+        free(buf);
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 1; i < (size_t)ch.num_offsets; i++) {
+        if (buf[i] <= buf[i - 1] || buf[i] > file_sz) {
+            free(buf);
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    *offs_out = buf;
+    *n_out = (size_t)ch.num_offsets;
+    return 0;
+}
+
+static int build_chunks_for_segment(const char *path,
+                                    size_t file_index,
+                                    uint64_t chunk_target_bytes,
+                                    uint64_t seg_start,
+                                    uint64_t seg_end,
+                                    file_chunk_t **chunks_out,
+                                    size_t *chunk_count_out,
+                                    unsigned int *file_chunk_counter_out) {
     FILE *fp = NULL;
-    bin_file_header_t fh;
     uint64_t chunk_start;
     uint64_t next_target;
     file_chunk_t *chunks = NULL;
@@ -1186,23 +1256,18 @@ static int build_chunks_for_file(const char *path,
     *chunk_count_out = 0;
     *file_chunk_counter_out = 0;
 
+    if (seg_start > seg_end) return -1;
+
     fp = mk_fopen(path, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", path, strerror(errno));
         return -1;
     }
 
-    if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) {
-        fprintf(stderr, "warn: short read on header: %s\n", path);
-        goto out;
-    }
-    if (memcmp(fh.magic, "NFSCBIN", 7) != 0 || fh.version != FORMAT_VERSION) {
-        fprintf(stderr, "warn: bad format/version in %s\n", path);
-        goto out;
-    }
+    if (fseeko(fp, (off_t)seg_start, SEEK_SET) != 0) goto out;
 
     if (chunk_target_bytes == 0) chunk_target_bytes = PARSE_CHUNK_BYTES;
-    chunk_start = (uint64_t)sizeof(fh);
+    chunk_start = seg_start;
     next_target = chunk_start + chunk_target_bytes;
 
     for (;;) {
@@ -1212,26 +1277,29 @@ static int build_chunks_for_file(const char *path,
 
         if (record_start < 0) goto out;
 
-        if (mk_fread(&r, sizeof(r), 1, fp) != 1) {
-            if (feof(fp)) {
-                uint64_t file_end = (uint64_t)record_start;
-                if (file_end > chunk_start) {
-                    if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, file_end, file_index) != 0) goto out;
-                    fc++;
-                }
-                rc = 0;
+        if ((uint64_t)record_start >= seg_end) {
+            if ((uint64_t)record_start > seg_end) goto out;
+            if ((uint64_t)record_start > chunk_start) {
+                if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_start, file_index) != 0) goto out;
+                fc++;
             }
+            rc = 0;
+            goto out;
+        }
+
+        if (mk_fread(&r, sizeof(r), 1, fp) != 1) {
+            if (feof(fp)) fprintf(stderr, "warn: unexpected EOF in segment of %s\n", path);
             goto out;
         }
 
         if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) goto out;
         record_end = ftello(fp);
         if (record_end < 0) goto out;
+        if ((uint64_t)record_end > seg_end) goto out;
 
         while ((uint64_t)record_end >= next_target) {
             if ((uint64_t)record_end > chunk_start) {
-                if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0)
-                    goto out;
+                if (append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_end, file_index) != 0) goto out;
                 fc++;
             }
             chunk_start = (uint64_t)record_end;
@@ -1245,6 +1313,228 @@ out:
         free_chunk_array_rows(chunks, chunk_count);
         return -1;
     }
+    *chunks_out = chunks;
+    *chunk_count_out = chunk_count;
+    *file_chunk_counter_out = fc;
+    return 0;
+}
+
+typedef struct {
+    const char *path;
+    size_t file_index;
+    uint64_t chunk_target_bytes;
+    const uint64_t *offs;
+    size_t n_offs;
+    uint64_t file_size;
+    int seg_a;
+    int seg_b;
+    file_chunk_t *chunks;
+    size_t chunk_count;
+    size_t chunk_cap;
+    unsigned int fc;
+    int rc;
+} chunk_bundle_t;
+
+static int chunk_list_take_all(file_chunk_t **dst, size_t *dn, size_t *dcap, file_chunk_t *src, size_t sn) {
+    size_t j;
+
+    for (j = 0; j < sn; j++) {
+        if (append_chunk(dst, dn, dcap, src[j].path, src[j].start_offset, src[j].end_offset, src[j].file_index) != 0) {
+            for (; j < sn; j++) free(src[j].path);
+            free(src);
+            return -1;
+        }
+        free(src[j].path);
+    }
+    free(src);
+    return 0;
+}
+
+static void *chunk_bundle_worker_main(void *arg) {
+    chunk_bundle_t *b = (chunk_bundle_t *)arg;
+    int si;
+
+    b->rc = 0;
+    b->chunks = NULL;
+    b->chunk_count = 0;
+    b->chunk_cap = 0;
+    b->fc = 0;
+
+    for (si = b->seg_a; si < b->seg_b; si++) {
+        file_chunk_t *seg_chunks = NULL;
+        size_t seg_count = 0;
+        unsigned int seg_fc = 0;
+        uint64_t lo = b->offs[si];
+        uint64_t hi = ((size_t)si + 1U < b->n_offs) ? b->offs[(size_t)si + 1U] : b->file_size;
+
+        if (build_chunks_for_segment(b->path, b->file_index, b->chunk_target_bytes, lo, hi, &seg_chunks, &seg_count, &seg_fc) != 0) {
+            free_chunk_array_rows(b->chunks, b->chunk_count);
+            b->chunks = NULL;
+            b->chunk_count = 0;
+            b->rc = -1;
+            return NULL;
+        }
+        if (chunk_list_take_all(&b->chunks, &b->chunk_count, &b->chunk_cap, seg_chunks, seg_count) != 0) {
+            free_chunk_array_rows(b->chunks, b->chunk_count);
+            b->chunks = NULL;
+            b->chunk_count = 0;
+            b->rc = -1;
+            return NULL;
+        }
+        b->fc += seg_fc;
+    }
+    return NULL;
+}
+
+static int build_chunks_for_file(const char *path,
+                                 size_t file_index,
+                                 uint64_t chunk_target_bytes,
+                                 file_chunk_t **chunks_out,
+                                 size_t *chunk_count_out,
+                                 unsigned int *file_chunk_counter_out) {
+    struct stat st;
+    bin_file_header_t fh;
+    uint64_t *offs = NULL;
+    size_t n_off = 0;
+    uint64_t fsz;
+    FILE *fp = NULL;
+    int rc = -1;
+    file_chunk_t *chunks = NULL;
+    size_t chunk_count = 0;
+    unsigned int fc = 0;
+
+    *chunks_out = NULL;
+    *chunk_count_out = 0;
+    *file_chunk_counter_out = 0;
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "warn: cannot stat %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    fsz = (uint64_t)st.st_size;
+
+    fp = mk_fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "warn: cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) {
+        fprintf(stderr, "warn: short read on header: %s\n", path);
+        mk_fclose(fp);
+        return -1;
+    }
+    mk_fclose(fp);
+    fp = NULL;
+
+    if (memcmp(fh.magic, "NFSCBIN", 7) != 0 || fh.version != FORMAT_VERSION) {
+        fprintf(stderr, "warn: bad format/version in %s\n", path);
+        return -1;
+    }
+
+    if (load_bin_ckpt(path, fsz, &offs, &n_off) != 0) {
+        fprintf(stderr, "warn: missing or invalid checkpoint sidecar (.ckpt) for %s\n", path);
+        return -1;
+    }
+    if (n_off == 0 || offs[0] != (uint64_t)sizeof(fh)) {
+        fprintf(stderr, "warn: bad checkpoint offsets in %s\n", path);
+        free(offs);
+        return -1;
+    }
+
+    if (chunk_target_bytes == 0) chunk_target_bytes = PARSE_CHUNK_BYTES;
+
+    {
+        int nw = parse_index_thread_count();
+        size_t n_seg = n_off;
+
+        if (nw > (int)n_seg) nw = (int)n_seg;
+
+        if (n_seg <= 1 || nw <= 1) {
+            rc = build_chunks_for_segment(path, file_index, chunk_target_bytes, offs[0], fsz, &chunks, &chunk_count, &fc);
+            free(offs);
+            if (rc != 0) return -1;
+            *chunks_out = chunks;
+            *chunk_count_out = chunk_count;
+            *file_chunk_counter_out = fc;
+            return 0;
+        }
+
+        {
+            chunk_bundle_t *bundles = (chunk_bundle_t *)calloc((size_t)nw, sizeof(*bundles));
+            pthread_t *tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+            int w, lo, base, rem;
+
+            if (!bundles || !tids) {
+                free(bundles);
+                free(tids);
+                free(offs);
+                return -1;
+            }
+            lo = 0;
+            base = (int)n_seg / nw;
+            rem = (int)n_seg % nw;
+            for (w = 0; w < nw; w++) {
+                int cnt = base + (w < rem ? 1 : 0);
+                bundles[w].path = path;
+                bundles[w].file_index = file_index;
+                bundles[w].chunk_target_bytes = chunk_target_bytes;
+                bundles[w].offs = offs;
+                bundles[w].n_offs = n_off;
+                bundles[w].file_size = fsz;
+                bundles[w].seg_a = lo;
+                bundles[w].seg_b = lo + cnt;
+                lo += cnt;
+            }
+            for (w = 0; w < nw; w++) {
+                if (pthread_create(&tids[w], NULL, chunk_bundle_worker_main, &bundles[w]) != 0) {
+                    int j;
+                    for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
+                    for (j = w; j < nw; j++) {
+                        free_chunk_array_rows(bundles[j].chunks, bundles[j].chunk_count);
+                        bundles[j].chunks = NULL;
+                    }
+                    free(bundles);
+                    free(tids);
+                    free(offs);
+                    return -1;
+                }
+            }
+            for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+
+            chunks = NULL;
+            chunk_count = 0;
+            {
+                size_t cap = 0;
+                fc = 0;
+                rc = 0;
+                for (w = 0; w < nw; w++) {
+                    if (bundles[w].rc != 0) {
+                        rc = -1;
+                        break;
+                    }
+                    if (chunk_list_take_all(&chunks, &chunk_count, &cap, bundles[w].chunks, bundles[w].chunk_count) != 0) {
+                        rc = -1;
+                        break;
+                    }
+                    bundles[w].chunks = NULL;
+                    bundles[w].chunk_count = 0;
+                    fc += bundles[w].fc;
+                }
+                if (rc != 0) {
+                    free_chunk_array_rows(chunks, chunk_count);
+                    for (w = 0; w < nw; w++) free_chunk_array_rows(bundles[w].chunks, bundles[w].chunk_count);
+                    free(bundles);
+                    free(tids);
+                    free(offs);
+                    return -1;
+                }
+            }
+            free(bundles);
+            free(tids);
+        }
+    }
+
+    free(offs);
     *chunks_out = chunks;
     *chunk_count_out = chunk_count;
     *file_chunk_counter_out = fc;
@@ -1390,35 +1680,17 @@ static char *ascii_lower_dup(const char *s) {
     return out;
 }
 
-static int path_element_contains(const char *lower_path, const char *lower_term) {
-    const char *seg = lower_path;
-    size_t term_len = strlen(lower_term);
-
-    if (term_len == 0) return 1;
-
-    while (*seg != '\0') {
-        const char *next = strchr(seg, '/');
-        size_t seg_len = next ? (size_t)(next - seg) : strlen(seg);
-
-        if (seg_len > 0) {
-            size_t i;
-            for (i = 0; i + term_len <= seg_len; i++) {
-                if (memcmp(seg + i, lower_term, term_len) == 0) return 1;
-            }
-        }
-
-        if (!next) break;
-        seg = next + 1;
-    }
-
-    return 0;
-}
-
+/* After trigram intersection, require the full query substring to appear contiguously in the path.
+ * (Trigrams are extracted per path segment during --make, but the query term is contiguous; otherwise
+ * unrelated paths can match every trigram in different segments — e.g. …/micro/…/iche/…/hel… without "michel".) */
 static int path_matches_term(const char *path, const char *lower_term) {
-    char *lower = ascii_lower_dup(path);
+    char *lower;
     int matched;
+
+    if (!lower_term || !lower_term[0]) return 0;
+    lower = ascii_lower_dup(path);
     if (!lower) return 0;
-    matched = path_element_contains(lower, lower_term);
+    matched = strstr(lower, lower_term) != NULL;
     free(lower);
     return matched;
 }
@@ -1535,26 +1807,89 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
     return 0;
 }
 
+/*
+ * Cap parallel tmp_trigrams bucket FILE*s (lazy-open stays warm until close). Without a cap,
+ * workloads touching many distinct trigram buckets can open nearly TRIGRAM_BUCKET_COUNT files
+ * and hit EMFILE. Override with EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS (32…4096); unset uses
+ * min(512, RLIMIT_NOFILE − ~150) when available, else DEFAULT_MAX_OPEN_TRIGRAM_BUCKET_FP.
+ */
+static uint32_t compute_max_open_trigram_buckets(void) {
+    const char *e = getenv("EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS");
+    long v;
+    char *end;
+    struct rlimit rl;
+
+    if (e && *e) {
+        errno = 0;
+        v = strtol(e, &end, 10);
+        if (!errno && end != e && !*end && v >= 32 && v <= (long)TRIGRAM_BUCKET_COUNT) return (uint32_t)v;
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > 128UL) {
+        uint64_t cap = rl.rlim_cur > 150UL ? (uint64_t)rl.rlim_cur - 150UL : 64UL;
+        if (cap > 512U) cap = 512U;
+        if (cap < 64U) cap = 64U;
+        return (uint32_t)cap;
+    }
+    return (uint32_t)DEFAULT_MAX_OPEN_TRIGRAM_BUCKET_FP;
+}
+
+static uint32_t parallel_pick_lru_victim(const build_ctx_t *ctx, uint32_t exclude) {
+    uint32_t b, best = UINT32_MAX;
+    uint64_t best_age = 0;
+    int found = 0;
+
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (b == exclude) continue;
+        if (!ctx->bucket_parallel_fp[b]) continue;
+        if (!found || ctx->bucket_parallel_lru_age[b] < best_age ||
+            (ctx->bucket_parallel_lru_age[b] == best_age && b < best)) {
+            best_age = ctx->bucket_parallel_lru_age[b];
+            best = b;
+            found = 1;
+        }
+    }
+    return found ? best : UINT32_MAX;
+}
+
 static int parallel_bucket_io_init(build_ctx_t *ctx) {
     uint32_t b;
 
     ctx->bucket_parallel_mutex = (pthread_mutex_t *)calloc(TRIGRAM_BUCKET_COUNT, sizeof(pthread_mutex_t));
     ctx->bucket_parallel_fp = (FILE **)calloc(TRIGRAM_BUCKET_COUNT, sizeof(FILE *));
-    if (!ctx->bucket_parallel_mutex || !ctx->bucket_parallel_fp) {
+    ctx->bucket_parallel_lru_age = (uint64_t *)calloc(TRIGRAM_BUCKET_COUNT, sizeof(uint64_t));
+    if (!ctx->bucket_parallel_mutex || !ctx->bucket_parallel_fp || !ctx->bucket_parallel_lru_age) {
         free(ctx->bucket_parallel_mutex);
         free(ctx->bucket_parallel_fp);
+        free(ctx->bucket_parallel_lru_age);
         ctx->bucket_parallel_mutex = NULL;
         ctx->bucket_parallel_fp = NULL;
+        ctx->bucket_parallel_lru_age = NULL;
         return -1;
     }
+    ctx->bucket_parallel_max_open = compute_max_open_trigram_buckets();
+    ctx->bucket_parallel_open_count = 0;
+    atomic_init(&ctx->bucket_parallel_lru_clock, 1ULL);
+    if (pthread_mutex_init(&ctx->bucket_parallel_evict_mutex, NULL) != 0) {
+        free(ctx->bucket_parallel_mutex);
+        free(ctx->bucket_parallel_fp);
+        free(ctx->bucket_parallel_lru_age);
+        ctx->bucket_parallel_mutex = NULL;
+        ctx->bucket_parallel_fp = NULL;
+        ctx->bucket_parallel_lru_age = NULL;
+        return -1;
+    }
+    fprintf(stderr, "ereport_index: tmp_trigram bucket FILE cap: %u\n", ctx->bucket_parallel_max_open);
     for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
         if (pthread_mutex_init(&ctx->bucket_parallel_mutex[b], NULL) != 0) {
             uint32_t k;
+            pthread_mutex_destroy(&ctx->bucket_parallel_evict_mutex);
             for (k = 0; k < b; k++) pthread_mutex_destroy(&ctx->bucket_parallel_mutex[k]);
             free(ctx->bucket_parallel_mutex);
             free(ctx->bucket_parallel_fp);
+            free(ctx->bucket_parallel_lru_age);
             ctx->bucket_parallel_mutex = NULL;
             ctx->bucket_parallel_fp = NULL;
+            ctx->bucket_parallel_lru_age = NULL;
             return -1;
         }
     }
@@ -1571,45 +1906,149 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
             ctx->bucket_parallel_fp[b] = NULL;
         }
     }
+    ctx->bucket_parallel_open_count = 0;
     if (ctx->bucket_parallel_mutex) {
         for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) pthread_mutex_destroy(&ctx->bucket_parallel_mutex[b]);
         free(ctx->bucket_parallel_mutex);
         ctx->bucket_parallel_mutex = NULL;
     }
+    pthread_mutex_destroy(&ctx->bucket_parallel_evict_mutex);
     free(ctx->bucket_parallel_fp);
     ctx->bucket_parallel_fp = NULL;
+    free(ctx->bucket_parallel_lru_age);
+    ctx->bucket_parallel_lru_age = NULL;
 }
 
 static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, const trigram_record_t *rec) {
     FILE *fp;
     char path[PATH_MAX];
+    uint64_t tick;
 
     atomic_fetch_add_explicit(&g_mk_bucket_lock_acqs, 1ULL, memory_order_relaxed);
     pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
     fp = ctx->bucket_parallel_fp[bucket];
-    if (!fp) {
-        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(path)) {
-            fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u)\n", bucket);
+    if (fp) {
+        tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
+        ctx->bucket_parallel_lru_age[bucket] = tick;
+        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+            fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             return -1;
         }
-        fp = mk_fopen(path, "ab");
-        if (!fp) {
-            fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
-            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
-            return -1;
-        }
-        if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
-        }
-        ctx->bucket_nonempty[bucket] = 1;
-        ctx->bucket_parallel_fp[bucket] = fp;
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        return 0;
     }
+    pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+
+    pthread_mutex_lock(&ctx->bucket_parallel_evict_mutex);
+    pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
+    fp = ctx->bucket_parallel_fp[bucket];
+    if (fp) {
+        tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
+        ctx->bucket_parallel_lru_age[bucket] = tick;
+        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+            fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
+            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+            pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+            return -1;
+        }
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+
+    while (ctx->bucket_parallel_open_count >= ctx->bucket_parallel_max_open) {
+        uint32_t victim = parallel_pick_lru_victim(ctx, bucket);
+        uint32_t lo;
+        uint32_t hi;
+
+        if (victim == UINT32_MAX) {
+            fprintf(
+                stderr,
+                "ereport_index: internal: no LRU victim (open_count=%u max=%u)\n",
+                ctx->bucket_parallel_open_count,
+                ctx->bucket_parallel_max_open
+            );
+            pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+            return -1;
+        }
+        lo = victim < bucket ? victim : bucket;
+        hi = victim < bucket ? bucket : victim;
+        pthread_mutex_lock(&ctx->bucket_parallel_mutex[lo]);
+        pthread_mutex_lock(&ctx->bucket_parallel_mutex[hi]);
+        if (ctx->bucket_parallel_fp[victim]) {
+            if (mk_fclose(ctx->bucket_parallel_fp[victim]) != 0) {
+                fprintf(stderr, "ereport_index: fclose tmp_trigrams bucket %u: %s\n", victim, strerror(errno));
+            }
+            ctx->bucket_parallel_fp[victim] = NULL;
+            ctx->bucket_parallel_open_count--;
+        }
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[hi]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[lo]);
+
+        pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
+        fp = ctx->bucket_parallel_fp[bucket];
+        if (fp) {
+            tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
+            ctx->bucket_parallel_lru_age[bucket] = tick;
+            if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+                fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
+                pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+                pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+                return -1;
+            }
+            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+            pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+            return 0;
+        }
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+    }
+
+    pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
+    fp = ctx->bucket_parallel_fp[bucket];
+    if (fp) {
+        tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
+        ctx->bucket_parallel_lru_age[bucket] = tick;
+        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+            fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
+            pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+            pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+            return -1;
+        }
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+        return 0;
+    }
+
+    if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(path)) {
+        fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u)\n", bucket);
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+        return -1;
+    }
+    fp = mk_fopen(path, "ab");
+    if (!fp) {
+        fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
+        pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
+        return -1;
+    }
+    if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+    }
+    ctx->bucket_nonempty[bucket] = 1;
+    ctx->bucket_parallel_fp[bucket] = fp;
+    ctx->bucket_parallel_open_count++;
+    tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
+    ctx->bucket_parallel_lru_age[bucket] = tick;
     if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
         fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
         pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+        pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
         return -1;
     }
     pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
+    pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
     return 0;
 }
 
@@ -2018,7 +2457,8 @@ static size_t merge_collect_nonempty_from_bitset(build_ctx_t *ctx, uint32_t **ou
     return nb;
 }
 
-static size_t merge_collect_nonempty_legacy_scan(build_ctx_t *ctx, uint32_t **out_list) {
+/* When bucket_nonempty[] was not populated, discover non-empty merge buckets by stat()-ing tmp_trigrams_*.bin. */
+static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_t **out_list) {
     char path[PATH_MAX];
     struct stat st;
     size_t nb = 0;
@@ -2752,7 +3192,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     ctx->merge_workers_used = 1;
 
     nbuckets = merge_collect_nonempty_from_bitset(ctx, &bucket_list);
-    if (nbuckets == 0) nbuckets = merge_collect_nonempty_legacy_scan(ctx, &bucket_list);
+    if (nbuckets == 0) nbuckets = merge_collect_nonempty_buckets_stat_scan(ctx, &bucket_list);
     merge_skipped = (uint32_t)(TRIGRAM_BUCKET_COUNT - nbuckets);
 
     if (build_path(key_path, sizeof(key_path), ctx->index_dir, "tri_keys.bin") != 0 ||
@@ -3904,6 +4344,109 @@ static void json_escape_stdout(FILE *out, const char *s) {
     fputc('"', out);
 }
 
+enum {
+    SEARCH_TRIGRAM_PAR_MIN = 2,
+    SEARCH_PATH_PAR_MIN = 64
+};
+
+typedef struct {
+    const char *keys_path;
+    const char *postings_path;
+    uint64_t key_count;
+    const uint32_t *query_trigrams;
+    u64_vec_t *lists;
+    size_t lo;
+    size_t hi;
+    atomic_int *err;
+} search_trigram_load_arg_t;
+
+static void *search_trigram_load_worker(void *v) {
+    search_trigram_load_arg_t *a = (search_trigram_load_arg_t *)v;
+    FILE *kf;
+    FILE *pf;
+    size_t i;
+
+    if (a->lo >= a->hi) return NULL;
+    if (atomic_load_explicit(a->err, memory_order_relaxed)) return NULL;
+    kf = fopen(a->keys_path, "rb");
+    pf = fopen(a->postings_path, "rb");
+    if (!kf || !pf) {
+        atomic_store_explicit(a->err, 1, memory_order_relaxed);
+        if (kf) fclose(kf);
+        if (pf) fclose(pf);
+        return NULL;
+    }
+
+    for (i = a->lo; i < a->hi; i++) {
+        trigram_key_t key;
+        int found;
+
+        if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
+        found = find_trigram_key(kf, a->key_count, a->query_trigrams[i], &key);
+        if (found < 0) {
+            atomic_store_explicit(a->err, 1, memory_order_relaxed);
+            break;
+        }
+        if (found > 0) continue;
+        if (load_postings_list(pf, &key, &a->lists[i]) != 0) {
+            atomic_store_explicit(a->err, 1, memory_order_relaxed);
+            break;
+        }
+    }
+    fclose(kf);
+    fclose(pf);
+    return NULL;
+}
+
+typedef struct {
+    const char *paths_path;
+    const char *offsets_path;
+    const uint64_t *ids;
+    char **out_paths;
+    const char *lower_term;
+    size_t lo;
+    size_t hi;
+    atomic_int *err;
+} search_path_filter_arg_t;
+
+static void *search_path_filter_worker(void *v) {
+    search_path_filter_arg_t *a = (search_path_filter_arg_t *)v;
+    FILE *paths_fp;
+    FILE *offsets_fp;
+    size_t i;
+
+    if (a->lo >= a->hi) return NULL;
+    if (atomic_load_explicit(a->err, memory_order_relaxed)) return NULL;
+    paths_fp = fopen(a->paths_path, "rb");
+    offsets_fp = fopen(a->offsets_path, "rb");
+    if (!paths_fp || !offsets_fp) {
+        atomic_store_explicit(a->err, 1, memory_order_relaxed);
+        if (paths_fp) fclose(paths_fp);
+        if (offsets_fp) fclose(offsets_fp);
+        return NULL;
+    }
+
+    for (i = a->lo; i < a->hi; i++) {
+        char *p;
+
+        if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
+        p = read_path_by_id(paths_fp, offsets_fp, a->ids[i]);
+        if (!p) {
+            a->out_paths[i] = NULL;
+            continue;
+        }
+        if (!path_matches_term(p, a->lower_term)) {
+            free(p);
+            a->out_paths[i] = NULL;
+        } else {
+            a->out_paths[i] = p;
+        }
+    }
+    fclose(paths_fp);
+    fclose(offsets_fp);
+    return NULL;
+}
+
 static int search_index_dir(const char *term, const char *index_dir, uint64_t skip_req, uint64_t limit_req,
                             int json_output) {
     char keys_path[PATH_MAX], postings_path[PATH_MAX], paths_path[PATH_MAX], offsets_path[PATH_MAX];
@@ -3916,6 +4459,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     u64_vec_t current, next;
     char *lower_term = NULL;
     int rc = 1;
+    int search_threads = parse_index_thread_count();
 
     /* Avoid full buffering when stdout is a pipe (eserve subprocess): empty reads → 502 */
     if (json_output) setvbuf(stdout, NULL, _IONBF, 0);
@@ -3927,18 +4471,9 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         return 1;
     }
 
-    keys_fp = fopen(keys_path, "rb");
-    postings_fp = fopen(postings_path, "rb");
-    paths_fp = fopen(paths_path, "rb");
-    offsets_fp = fopen(offsets_path, "rb");
-    if (!keys_fp || !postings_fp || !paths_fp || !offsets_fp) {
-        fprintf(stderr, "cannot open index under %s\n", index_dir);
-        goto out;
-    }
-
     if (stat(keys_path, &st) != 0 || (st.st_size % (off_t)sizeof(trigram_key_t)) != 0) {
         fprintf(stderr, "invalid tri_keys.bin in %s\n", index_dir);
-        goto out;
+        return 1;
     }
     key_count = (uint64_t)(st.st_size / (off_t)sizeof(trigram_key_t));
 
@@ -3949,21 +4484,83 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     lists = (u64_vec_t *)calloc(query_trigram_count, sizeof(*lists));
     if (!lists) goto out;
 
-    for (size_t i = 0; i < query_trigram_count; i++) {
-        trigram_key_t key;
-        int found = find_trigram_key(keys_fp, key_count, query_trigrams[i], &key);
-        if (found != 0) {
-            if (found < 0) {
-                rc = 1;
-            } else if (json_output) {
-                json_print_empty_search(skip_req, limit_req);
-                rc = 0;
-            } else {
-                rc = 0;
+    if (query_trigram_count >= (size_t)SEARCH_TRIGRAM_PAR_MIN && search_threads > 1) {
+        int nw = search_threads;
+        int w;
+
+        if (nw > (int)query_trigram_count) nw = (int)query_trigram_count;
+
+        {
+            pthread_t *tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+            search_trigram_load_arg_t *args = (search_trigram_load_arg_t *)calloc((size_t)nw, sizeof(*args));
+            atomic_int load_err = 0;
+
+            if (!tids || !args) {
+                free(tids);
+                free(args);
+                goto out;
             }
+            for (w = 0; w < nw; w++) {
+                size_t span = (query_trigram_count + (size_t)nw - 1) / (size_t)nw;
+                size_t a_lo = (size_t)w * span;
+                size_t a_hi = a_lo + span;
+                if (a_hi > query_trigram_count) a_hi = query_trigram_count;
+                args[w].keys_path = keys_path;
+                args[w].postings_path = postings_path;
+                args[w].key_count = key_count;
+                args[w].query_trigrams = query_trigrams;
+                args[w].lists = lists;
+                args[w].lo = a_lo;
+                args[w].hi = a_hi;
+                args[w].err = &load_err;
+            }
+            for (w = 0; w < nw; w++) {
+                if (pthread_create(&tids[w], NULL, search_trigram_load_worker, &args[w]) != 0) {
+                    int j;
+                    atomic_store_explicit(&load_err, 1, memory_order_relaxed);
+                    for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
+                    free(tids);
+                    free(args);
+                    goto out;
+                }
+            }
+            for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+            free(tids);
+            free(args);
+            if (atomic_load_explicit(&load_err, memory_order_relaxed)) goto out;
+        }
+    } else {
+        keys_fp = fopen(keys_path, "rb");
+        postings_fp = fopen(postings_path, "rb");
+        if (!keys_fp || !postings_fp) {
+            fprintf(stderr, "cannot open index under %s\n", index_dir);
             goto out;
         }
-        if (load_postings_list(postings_fp, &key, &lists[i]) != 0) goto out;
+        for (size_t i = 0; i < query_trigram_count; i++) {
+            trigram_key_t key;
+            int found = find_trigram_key(keys_fp, key_count, query_trigrams[i], &key);
+            if (found != 0) {
+                if (found < 0) {
+                    rc = 1;
+                } else if (json_output) {
+                    json_print_empty_search(skip_req, limit_req);
+                    rc = 0;
+                } else {
+                    rc = 0;
+                }
+                goto out;
+            }
+            if (load_postings_list(postings_fp, &key, &lists[i]) != 0) goto out;
+        }
+    }
+
+    if (keys_fp) {
+        fclose(keys_fp);
+        keys_fp = NULL;
+    }
+    if (postings_fp) {
+        fclose(postings_fp);
+        postings_fp = NULL;
     }
 
     qsort(lists, query_trigram_count, sizeof(*lists), cmp_vec_count_asc);
@@ -4001,14 +4598,94 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         char **json_paths = NULL;
         size_t json_cap = 0;
         size_t ki;
+        char **pref_paths = NULL;
+
+        if (current.count >= (size_t)SEARCH_PATH_PAR_MIN && search_threads > 1) {
+            int pnw = search_threads;
+            int pw;
+            pthread_t *ptids = NULL;
+            search_path_filter_arg_t *pargs = NULL;
+            atomic_int path_err = 0;
+
+            if (pnw > (int)current.count) pnw = (int)current.count;
+            pref_paths = (char **)calloc(current.count, sizeof(char *));
+            ptids = (pthread_t *)calloc((size_t)pnw, sizeof(*ptids));
+            pargs = (search_path_filter_arg_t *)calloc((size_t)pnw, sizeof(*pargs));
+            if (!pref_paths || !ptids || !pargs) {
+                free(pref_paths);
+                free(ptids);
+                free(pargs);
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
+            }
+            for (pw = 0; pw < pnw; pw++) {
+                size_t span = (current.count + (size_t)pnw - 1) / (size_t)pnw;
+                size_t a_lo = (size_t)pw * span;
+                size_t a_hi = a_lo + span;
+                if (a_hi > current.count) a_hi = current.count;
+                pargs[pw].paths_path = paths_path;
+                pargs[pw].offsets_path = offsets_path;
+                pargs[pw].ids = current.ids;
+                pargs[pw].out_paths = pref_paths;
+                pargs[pw].lower_term = lower_term;
+                pargs[pw].lo = a_lo;
+                pargs[pw].hi = a_hi;
+                pargs[pw].err = &path_err;
+            }
+            for (pw = 0; pw < pnw; pw++) {
+                if (pthread_create(&ptids[pw], NULL, search_path_filter_worker, &pargs[pw]) != 0) {
+                    int j;
+                    atomic_store_explicit(&path_err, 1, memory_order_relaxed);
+                    for (j = 0; j < pw; j++) pthread_join(ptids[j], NULL);
+                    for (ki = 0; ki < current.count; ki++) free(pref_paths[ki]);
+                    free(pref_paths);
+                    free(ptids);
+                    free(pargs);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
+                }
+            }
+            for (pw = 0; pw < pnw; pw++) pthread_join(ptids[pw], NULL);
+            free(ptids);
+            free(pargs);
+            if (atomic_load_explicit(&path_err, memory_order_relaxed)) {
+                for (ki = 0; ki < current.count; ki++) free(pref_paths[ki]);
+                free(pref_paths);
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
+            }
+        } else if (current.count > 0) {
+            paths_fp = fopen(paths_path, "rb");
+            offsets_fp = fopen(offsets_path, "rb");
+            if (!paths_fp || !offsets_fp) {
+                fprintf(stderr, "cannot open paths.bin under %s\n", index_dir);
+                if (paths_fp) fclose(paths_fp);
+                if (offsets_fp) fclose(offsets_fp);
+                paths_fp = NULL;
+                offsets_fp = NULL;
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
+            }
+        }
 
         for (size_t i = 0; i < current.count; i++) {
-            char *path = read_path_by_id(paths_fp, offsets_fp, current.ids[i]);
-            if (!path) continue;
-            if (!path_matches_term(path, lower_term)) {
-                free(path);
-                continue;
+            char *path;
+
+            if (pref_paths) {
+                path = pref_paths[i];
+            } else {
+                path = read_path_by_id(paths_fp, offsets_fp, current.ids[i]);
+                if (!path) continue;
+                if (!path_matches_term(path, lower_term)) {
+                    free(path);
+                    continue;
+                }
             }
+            if (!path) continue;
             if (match_idx >= skip_req && page_emitted < max_emit) {
                 if (json_output) {
                     if (page_emitted >= json_cap) {
@@ -4036,6 +4713,16 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
             }
             match_idx++;
         }
+
+        if (paths_fp) {
+            fclose(paths_fp);
+            paths_fp = NULL;
+        }
+        if (offsets_fp) {
+            fclose(offsets_fp);
+            offsets_fp = NULL;
+        }
+        if (pref_paths) free(pref_paths);
 
         if (json_output) {
             fprintf(stdout,
@@ -4134,14 +4821,21 @@ int main(int argc, char **argv) {
         uint64_t limit_req = UINT64_MAX;
         int json_output = 0;
         int ai;
+        const char *term;
 
-        if (argc < 3) die_usage(argv[0]);
-
-        ai = 3;
-        if (argc > 3 && argv[3][0] != '-') {
-            index_dir = argv[3];
-            ai = 4;
+        ai = 2;
+        if (ai < argc && strcmp(argv[ai], "--index-dir") == 0) {
+            if (ai + 2 > argc || argv[ai + 1][0] == '\0') {
+                fprintf(stderr, "ereport_index: --search --index-dir requires a path\n");
+                return 2;
+            }
+            index_dir = argv[ai + 1];
+            ai += 2;
         }
+
+        if (argc <= ai) die_usage(argv[0]);
+        term = argv[ai];
+        ai++;
 
         while (ai < argc) {
             if (strcmp(argv[ai], "--json") == 0) {
@@ -4170,7 +4864,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        return search_index_dir(argv[2], index_dir, skip_req, limit_req, json_output);
+        return search_index_dir(term, index_dir, skip_req, limit_req, json_output);
     }
 
     die_usage(argv[0]);

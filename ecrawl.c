@@ -50,6 +50,8 @@
 #include <grp.h>
 #include <stdarg.h>
 
+#include "crawl_ckpt.h"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -71,7 +73,7 @@
 
 #define FILE_MAGIC "NFSCBIN"
 #define FILE_MAGIC_LEN 8
-#define FORMAT_VERSION 2
+#define FORMAT_VERSION 3
 
 #define LOCAL_STACK_DONATE_FLOOR 8
 #define DONATE_CHUNK_MIN 4
@@ -260,6 +262,10 @@ typedef struct {
     uint64_t bytes_written;
     uint64_t last_used;
     unsigned char initialized;
+    uint64_t *ckpt_offs;
+    size_t ckpt_n;
+    size_t ckpt_cap;
+    uint64_t seg_start_byte;
 } shard_file_state_t;
 
 /* Rolling 10-second stats */
@@ -1065,6 +1071,218 @@ static int inspect_existing_shard(const char *path, uint64_t *size_out, int *val
     return 0;
 }
 
+static int ckpt_sidecar_path(const char *bin_path, char *out, size_t out_sz) {
+    int n = snprintf(out, out_sz, "%s.ckpt", bin_path);
+    return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
+}
+
+static void shard_ckpt_free(shard_file_state_t *s) {
+    free(s->ckpt_offs);
+    s->ckpt_offs = NULL;
+    s->ckpt_n = 0;
+    s->ckpt_cap = 0;
+}
+
+static int shard_ckpt_push(shard_file_state_t *s, uint64_t off) {
+    if (s->ckpt_n == s->ckpt_cap) {
+        size_t ncap = s->ckpt_cap ? s->ckpt_cap * 2 : 16;
+        uint64_t *p = (uint64_t *)realloc(s->ckpt_offs, ncap * sizeof(*p));
+        if (!p) return -1;
+        s->ckpt_offs = p;
+        s->ckpt_cap = ncap;
+    }
+    s->ckpt_offs[s->ckpt_n++] = off;
+    return 0;
+}
+
+static int shard_ckpt_write_sidecar(const char *bin_path, const uint64_t *offs, size_t n) {
+    char ckpath[PATH_MAX];
+    crawl_ckpt_file_hdr_t ch;
+    FILE *fp;
+
+    if (!offs || n == 0) return -1;
+    if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
+    fp = counted_fopen(ckpath, "wb");
+    if (!fp) return -1;
+    memset(&ch, 0, sizeof(ch));
+    memcpy(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN);
+    ch.version = CRAWL_CKPT_ONDISK_VERSION;
+    ch.stride_bytes = CRAWL_CKPT_STRIDE_BYTES;
+    ch.num_offsets = (uint64_t)n;
+    if (fwrite(&ch, sizeof(ch), 1, fp) != 1 || fwrite(offs, sizeof(uint64_t), n, fp) != n) {
+        int e = errno ? errno : EIO;
+        counted_fclose(fp);
+        errno = e;
+        return -1;
+    }
+    if (counted_fflush(fp) != 0 || counted_fclose(fp) != 0) return -1;
+    return 0;
+}
+
+static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t file_sz, uint64_t **offs_out, size_t *n_out) {
+    char ckpath[PATH_MAX];
+    crawl_ckpt_file_hdr_t ch;
+    uint64_t *buf = NULL;
+    size_t i;
+    FILE *fp;
+
+    *offs_out = NULL;
+    *n_out = 0;
+    if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
+    fp = counted_fopen(ckpath, "rb");
+    if (!fp) return -1;
+    if (fread(&ch, sizeof(ch), 1, fp) != 1) {
+        counted_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+    if (memcmp(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN) != 0 || ch.version != CRAWL_CKPT_ONDISK_VERSION ||
+        ch.stride_bytes != CRAWL_CKPT_STRIDE_BYTES || ch.num_offsets == 0 || ch.num_offsets > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
+        counted_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+    buf = (uint64_t *)malloc((size_t)ch.num_offsets * sizeof(*buf));
+    if (!buf) {
+        counted_fclose(fp);
+        return -1;
+    }
+    if (fread(buf, sizeof(uint64_t), (size_t)ch.num_offsets, fp) != (size_t)ch.num_offsets || counted_fclose(fp) != 0) {
+        free(buf);
+        errno = EINVAL;
+        return -1;
+    }
+    if (buf[0] != sizeof(bin_file_header_t)) {
+        free(buf);
+        errno = EINVAL;
+        return -1;
+    }
+    for (i = 1; i < (size_t)ch.num_offsets; i++) {
+        if (buf[i] <= buf[i - 1] || buf[i] > file_sz) {
+            free(buf);
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    *offs_out = buf;
+    *n_out = (size_t)ch.num_offsets;
+    return 0;
+}
+
+static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint64_t **offs_out, size_t *n_out,
+                                   uint64_t *seg_start_out) {
+    FILE *fp;
+    uint64_t *buf = NULL;
+    size_t n, cap;
+    uint64_t seg0;
+    off_t pos;
+
+    *offs_out = NULL;
+    *n_out = 0;
+    fp = counted_fopen(bin_path, "rb");
+    if (!fp) return -1;
+    if (file_sz < sizeof(bin_file_header_t)) {
+        counted_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+
+    buf = (uint64_t *)malloc(16 * sizeof(*buf));
+    if (!buf) {
+        counted_fclose(fp);
+        return -1;
+    }
+    n = 1;
+    cap = 16;
+    buf[0] = sizeof(bin_file_header_t);
+    seg0 = sizeof(bin_file_header_t);
+
+    if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto fail;
+    pos = (off_t)sizeof(bin_file_header_t);
+
+    while ((uint64_t)pos < file_sz) {
+        uint64_t rec_start = (uint64_t)pos;
+        bin_record_hdr_t rh;
+
+        if (rec_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
+            if (n == cap) {
+                size_t ncap = cap * 2;
+                uint64_t *p = (uint64_t *)realloc(buf, ncap * sizeof(*p));
+                if (!p) goto fail;
+                buf = p;
+                cap = ncap;
+            }
+            buf[n++] = rec_start;
+            seg0 = rec_start;
+        }
+        if (fread(&rh, sizeof(rh), 1, fp) != 1) goto fail;
+        pos = ftello(fp);
+        if (pos < 0) goto fail;
+        if (rh.path_len) {
+            if ((uint64_t)pos + rh.path_len > file_sz) goto fail;
+            if (fseeko(fp, (off_t)rh.path_len, SEEK_CUR) != 0) goto fail;
+            pos = ftello(fp);
+            if (pos < 0) goto fail;
+        }
+    }
+    if ((uint64_t)pos != file_sz) {
+        errno = EINVAL;
+        goto fail;
+    }
+    counted_fclose(fp);
+    *offs_out = buf;
+    *n_out = n;
+    *seg_start_out = seg0;
+    return 0;
+fail:
+    counted_fclose(fp);
+    free(buf);
+    return -1;
+}
+
+static int shard_ckpt_load_for_append(shard_file_state_t *s, const char *bin_path, uint64_t file_sz) {
+    uint64_t *rd = NULL;
+    size_t rn = 0;
+
+    shard_ckpt_free(s);
+    if (shard_ckpt_read_sidecar(bin_path, file_sz, &rd, &rn) == 0) {
+        s->ckpt_offs = rd;
+        s->ckpt_n = rn;
+        s->ckpt_cap = rn;
+        s->seg_start_byte = rd[rn - 1];
+        return 0;
+    }
+    if (shard_ckpt_rebuild_scan(bin_path, file_sz, &rd, &rn, &s->seg_start_byte) == 0) {
+        s->ckpt_offs = rd;
+        s->ckpt_n = rn;
+        s->ckpt_cap = rn;
+        return 0;
+    }
+    return -1;
+}
+
+static int shard_ckpt_init_new(shard_file_state_t *s) {
+    shard_ckpt_free(s);
+    s->ckpt_offs = (uint64_t *)malloc(16 * sizeof(*s->ckpt_offs));
+    if (!s->ckpt_offs) return -1;
+    s->ckpt_cap = 16;
+    s->ckpt_offs[0] = sizeof(bin_file_header_t);
+    s->ckpt_n = 1;
+    s->seg_start_byte = sizeof(bin_file_header_t);
+    return 0;
+}
+
+static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_path) {
+    int r;
+
+    if (!s->fp) return 0;
+    if (!s->ckpt_offs || s->ckpt_n == 0) return -1;
+    r = shard_ckpt_write_sidecar(bin_path, s->ckpt_offs, s->ckpt_n);
+    shard_ckpt_free(s);
+    s->seg_start_byte = 0;
+    return r;
+}
+
 static void queue_init(task_queue_t *q) {
     memset(q, 0, sizeof(*q));
     pthread_mutex_init(&q->mutex, NULL);
@@ -1819,6 +2037,11 @@ static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_in
     }
     if (!victim) return 0;
 
+    {
+        uint32_t shard = (uint32_t)(victim - shards);
+        char path[PATH_MAX];
+        if (build_shard_path(shard, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(victim, path);
+    }
     counted_fclose(victim->fp);
     victim->fp = NULL;
     if (*open_count > 0) (*open_count)--;
@@ -1845,10 +2068,24 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
             return -1;
         }
         state->bytes_written = sizeof(bin_file_header_t);
+        if (shard_ckpt_init_new(state) != 0) {
+            int saved_errno = errno ? errno : ENOMEM;
+            counted_fclose(state->fp);
+            state->fp = NULL;
+            errno = saved_errno;
+            return -1;
+        }
     } else {
         state->fp = counted_fopen(path, "ab");
         if (!state->fp) return -1;
         setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
+        if (shard_ckpt_load_for_append(state, path, state->bytes_written) != 0) {
+            int saved_errno = errno ? errno : EINVAL;
+            counted_fclose(state->fp);
+            state->fp = NULL;
+            errno = saved_errno;
+            return -1;
+        }
     }
     return 0;
 }
@@ -1934,6 +2171,16 @@ static int writer_process_batch(uint32_t writer_index,
             return -1;
         }
 
+        {
+            shard_file_state_t *st = &shards[frame.shard];
+            uint64_t rec_start = st->bytes_written;
+
+            if (rec_start - st->seg_start_byte >= CRAWL_CKPT_STRIDE_BYTES) {
+                if (shard_ckpt_push(st, rec_start) != 0) return -1;
+                st->seg_start_byte = rec_start;
+            }
+        }
+
         if (counted_fwrite(batch->data + off, 1, frame.data_len, fp) != frame.data_len) return -1;
         shards[frame.shard].bytes_written += frame.data_len;
         shards[frame.shard].last_used = ++(*tick);
@@ -1968,7 +2215,12 @@ static void *writer_thread_main(void *arg_void) {
     {
         uint32_t i;
         for (i = arg->writer_index; i < g_uid_shards; i += (uint32_t)g_writer_threads) {
-            if (shards[i].fp) counted_fclose(shards[i].fp);
+            if (shards[i].fp) {
+                char path[PATH_MAX];
+                if (build_shard_path(i, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(&shards[i], path);
+                counted_fclose(shards[i].fp);
+                shards[i].fp = NULL;
+            }
         }
     }
     free(shards);

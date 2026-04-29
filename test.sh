@@ -170,8 +170,9 @@ count_symlinks() {
 
 sum_unique_regular_bytes() {
     local root=$1
-    # Same spirit as test.sh original: unique (dev,inode) sums size once per inode (regular files).
-    find "$root" -type f -printf '%D:%i %s\n' 2>/dev/null | sort -u | awk '{s += $2} END {printf "%.0f\n", s + 0}'
+    # Sum st_size once per (dev,inode) so hard links count once, matching ecrawl total_bytes spirit.
+    # One awk pass (no sort). RAM scales with unique (dev,inode) keys.
+    find "$root" -type f -printf '%D:%i %s\n' 2>/dev/null | awk '!seen[$1]++ { s += $2 } END { printf "%.0f\n", s + 0 }'
 }
 
 run_fs_correlation() {
@@ -183,6 +184,7 @@ run_fs_correlation() {
     log "note: live trees drift between the find/fd snapshot and ecrawl; expect exact match only on quiescent data."
     log "note: same find/fd snapshot is compared to ecrawl and (all-users) ereport — ecrawl vs ereport should match even when fs baseline drifts."
     log "note: each passing check prints OK: <check> — <why it matters>"
+    log "step: baseline — counting files/dirs/symlinks, then unique regular-file bytes (find | awk dedup; slow = walk + RAM for keys)"
 
     local fc dc lc crawl_files crawl_dirs crawl_symlinks crawl_bytes entries
     local su_files su_dirs su_links su_cap su_scanned su_matched
@@ -213,7 +215,7 @@ run_fs_correlation() {
     local root_abs
     root_abs=$(cd "$root" && pwd)
 
-    log "ecrawl -> ${crawl_out}"
+    log "step: ecrawl → ${crawl_out}"
     ECRAWL_WORKERS="${ECRAWL_WORKERS:-8}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
@@ -243,7 +245,7 @@ run_fs_correlation() {
     # All-users first: always meaningful when ecrawl wrote uid-shard bins. Single-user loads only one shard
     # (uid & (uid_shards-1)); ecrawl omits empty shards — e.g. root maps to shard 0; if no file owner lands
     # there, uid_shard_0000.bin may not exist and ereport single-user cannot run (not a bug).
-    log "ereport all-users aggregate cwd=${td}"
+    log "step: ereport all-users (cwd=${td})"
     (
         cd "$td" || exit 1
         EREPORT_THREADS="${EREPORT_THREADS:-8}" \
@@ -255,7 +257,7 @@ run_fs_correlation() {
     }
 
     local skip_single=0
-    log "ereport single-user ($(id -un)) cwd=${td}"
+    log "step: ereport single-user ($(id -un)) cwd=${td}"
     if (
         cd "$td" || exit 1
         EREPORT_THREADS="${EREPORT_THREADS:-8}" \

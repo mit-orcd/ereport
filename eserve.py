@@ -20,6 +20,9 @@ Requires ereport_index on PATH or set EREPORT_INDEX_BIN to its absolute path.
 Search index directory defaults to ./index under each report path (see URL patterns below).
 Override with --index-dir DIR or EREPORT_SEARCH_INDEX_DIR (CLI wins over env): one directory
 containing tri_keys.bin used for every …/search request (may be outside SERVE_ROOT).
+
+JSON responses include X-Search-Index-Dir with the resolved index directory (compare to the DIR
+you pass to ereport_index --search --index-dir … on the CLI when debugging mismatches).
 """
 
 import argparse
@@ -78,9 +81,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def _normalize_index_dir_string(raw: str) -> str:
+    """Fix paths broken by a common Make typo: SERVE_INDEX_DIR==/abs sets value '=/abs'.
+
+    Path('=/abs') is relative, so .resolve() becomes cwd/=/abs. Strip leading '=' run
+    (from repeated ==/) until the path no longer starts with '=' or is a single '='.
+    """
+    s = raw.strip()
+    while len(s) > 1 and s.startswith('='):
+        s = s[1:]
+    return s.strip()
+
+
 def resolve_search_index_dir_override(cli_path: Optional[str]) -> Optional[Path]:
     """CLI --index-dir overrides EREPORT_SEARCH_INDEX_DIR."""
     raw = cli_path if cli_path else os.environ.get('EREPORT_SEARCH_INDEX_DIR')
+    if not raw:
+        return None
+    raw = _normalize_index_dir_string(raw)
     if not raw:
         return None
     return Path(raw).expanduser().resolve()
@@ -95,6 +113,14 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self._ereport_index_bin = type(self)._ereport_index_override or resolve_ereport_index_bin()
         super().__init__(*args, **kwargs)
+
+    def _send_search_json(self, status: HTTPStatus, body: bytes, index_dir: Path) -> None:
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('X-Search-Index-Dir', str(index_dir.resolve()))
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -135,11 +161,7 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
                     'hint': hint,
                 }
             ).encode('utf-8')
-            self.send_response(HTTPStatus.NOT_FOUND)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_search_json(HTTPStatus.NOT_FOUND, body, index_dir)
             return True
 
         qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -148,11 +170,7 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
             body = json.dumps(
                 {'error': 'search query q must be at least 3 characters (ereport_index rules)'}
             ).encode('utf-8')
-            self.send_response(HTTPStatus.BAD_REQUEST)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_search_json(HTTPStatus.BAD_REQUEST, body, index_dir)
             return True
 
         try:
@@ -174,8 +192,9 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
         cmd = [
             self._ereport_index_bin,
             '--search',
-            term,
+            '--index-dir',
             str(index_dir),
+            term,
             '--json',
             '--skip',
             str(skip),
@@ -207,11 +226,7 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
                     'detail': msg[:2000],
                 }
             ).encode('utf-8')
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(err_body)))
-            self.end_headers()
-            self.wfile.write(err_body)
+            self._send_search_json(HTTPStatus.BAD_GATEWAY, err_body, index_dir)
             return True
 
         out = (proc.stdout or '').strip()
@@ -220,11 +235,7 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
             empty = json.dumps(
                 {'total': 0, 'skip': skip, 'limit': limit, 'paths': []}
             ).encode('utf-8')
-            self.send_response(HTTPStatus.OK)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(empty)))
-            self.end_headers()
-            self.wfile.write(empty)
+            self._send_search_json(HTTPStatus.OK, empty, index_dir)
             return True
         try:
             json.loads(out)
@@ -233,11 +244,7 @@ class ReportHTTPRequestHandler(SimpleHTTPRequestHandler):
             return True
 
         raw = out.encode('utf-8')
-        self.send_response(HTTPStatus.OK)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        self._send_search_json(HTTPStatus.OK, raw, index_dir)
         return True
 
 
@@ -260,7 +267,13 @@ def main():
     print(f'Serving {root}')
     print(f'ereport_index: {index_bin}')
     if idx_dir is not None:
-        print(f'search index dir: {idx_dir}')
+        print(f'path search index (all GET …/search): {idx_dir}')
+    else:
+        print(
+            'path search: no --index-dir / EREPORT_SEARCH_INDEX_DIR; '
+            'each GET /<report>/search uses <SERVE_ROOT>/<report>/index '
+            '(set override to match ereport_index --search --index-dir DIR on the CLI)'
+        )
     if args.bind == '0.0.0.0':
         hostname = socket.gethostname()
         print(f'URL: http://127.0.0.1:{args.port}/')

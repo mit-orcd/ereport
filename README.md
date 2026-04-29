@@ -143,7 +143,7 @@ The **first argument** is treated as a time basis (`atime`, `mtime`, or `ctime`)
 
 Thread count (parallel **bin readers** / `worker_main` pool, plus one **stats** thread): set **`EREPORT_THREADS`** (default **32**). Thread count is **not** set on the command line.
 
-**Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (legacy vs `uid_shards`) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file when you specify a user (uid-sharded layout), **or every shard file** when aggregating all users; legacy layouts still load all matching bins. So twenty servers mean twenty directories and twenty shard files merged into one report (per-user), or all shards from every directory (all-users mode).
+**Multiple crawl directories:** pass several **`bin_dir`** paths (each an `ecrawl` output folder). Every directory must use the same layout (**unsharded** flat bin set vs **`uid_shards`**) and the same **`uid_shards`** count when manifests are present. For each directory, `ereport` loads that user’s shard file when you specify a user (uid-sharded layout), **or every shard file** when aggregating all users; **unsharded** layouts still load all matching bins. So twenty servers mean twenty directories and twenty shard files merged into one report (per-user), or all shards from every directory (all-users mode).
 
 Examples:
 
@@ -199,7 +199,7 @@ Usage:
 ```bash
 ./ereport_index --make [--index-dir <path>] [username|uid] [bin_dir ...]
 ./ereport_index --resume-merge --index-dir <path>
-./ereport_index --search <term> [index_dir] [--json] [--skip N] [--limit M]
+./ereport_index --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]
 ```
 
 **`--make` user vs all-users:** If the **first** argument after optional **`--index-dir`** is a valid login name or numeric uid on this system, it names the report user and any further arguments are crawl directories (default **`./`**). If that first token is **not** a known user (for example it is a crawl output directory name), **every** argument—including the first—is treated as a **`bin_dir`**, and the index is built for **all UIDs** under **`./all_users/index/`** unless **`--index-dir`** overrides the location (same merge semantics as **`ereport`** aggregate output). **`./ereport_index --make`** with nothing after **`--make`** indexes **`./`** for all users.
@@ -214,9 +214,10 @@ Examples:
 ./ereport_index --make crawl_srv01 crawl_srv02
 ./ereport_index --make --index-dir /var/lib/example-search alice crawl_a crawl_b
 ./ereport_index --resume-merge --index-dir /var/lib/example-search
-./ereport_index --search doc alice/index
-./ereport_index --search doc all_users/index
-./ereport_index --search doc alice/index --json --skip 0 --limit 20   # JSON body for APIs
+./ereport_index --search --index-dir alice/index doc
+./ereport_index --search --index-dir all_users/index doc
+./ereport_index --search --index-dir /var/lib/my-index doc
+./ereport_index --search --index-dir alice/index doc --json --skip 0 --limit 20   # JSON body for APIs
 ```
 
 Default behavior:
@@ -224,13 +225,14 @@ Default behavior:
 - **`--make [--index-dir <path>]`** — without **`--index-dir`**, **`--make <user> …`** writes under **`./<username>/index/`** (`paths.bin`, `tri_keys.bin`, etc.). With **`--index-dir`**, those files go directly under **`<path>`** (the directory is created if needed).
 - **`--make`** with only crawl directories (first token not a system user) writes under **`./all_users/index/`** unless **`--index-dir`** is set.
 - **`--make`** with only **`<username|uid>`** and no **`bin_dir`** arguments reads crawl input from **`./`** (same idea as `ereport`).
-- **`--search`** defaults **`index_dir`** to **`./index`** when omitted (relative to current working directory).
+- **`--search [--index-dir <path>] <term>`** — optional **`--index-dir`** (same flag as **`--make`**). If omitted, the index directory defaults to **`./index`** relative to the current working directory.
 - **`EREPORT_INDEX_THREADS`** — optional; if set to an integer in **1…4096**, sets parallelism for **`--make`** (default **32** when unset or invalid): **chunk-boundary mapping** runs with up to this many scanners across distinct input `.bin` files (capped by file count), and **parse/index** uses the same count for parallel chunk workers (including parallel trigram writers). **This does not set trigram merge worker count.** Merge uses up to **16** workers by default, capped by **available RAM** (each merge worker may hold about **2× the largest `tmp_trigrams_*.bin` bucket** in memory during sort). Tune merge parallelism with **`EREPORT_INDEX_MERGE_RAM_FRAC`** / **`EREPORT_INDEX_MERGE_MEMORY_MB`** (see below). Raising thread count increases peak RAM mostly by having more workers fill **bounded** queues (paths writer depth is **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`**); the trigram job queue has a fixed depth (**4096** paths) inside the binary; very high values are rarely useful if storage is the bottleneck.
 - **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** — optional override (**4…4096**) for how many **write batches** may wait on the single writer thread during **`--make`**. Default scales with **`EREPORT_INDEX_THREADS`** (about **threads/4**, clamped **6…48**). Raising this raises peak memory if workers outpace the writer; lowering it adds backpressure (workers block until the writer drains).
+- **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** — optional cap (**32…4096**) on how many **`tmp_trigrams_*.bin`** bucket **`FILE*`** handles stay open during **`--make`**. If unset, **`ereport_index`** picks a limit from **`RLIMIT_NOFILE`** (roughly **`min(512, soft_limit − ~150)`**) or defaults to **384**; least-recently-used buckets are **`fclose`**d when over the cap and reopened with **`ab`** on the next write. Raise **`ulimit -n`** or set this lower if you still hit **`EMFILE`**.
 
 #### Raising open-file limits (`ulimit`)
 
-Large **`--make`** runs may keep **many** **`tmp_trigrams_*.bin`** files open at once (one per active trigram bucket, up to **4096**). Indexing also opens crawl shards and pipes—raise **`RLIMIT_NOFILE`** if you hit **`Too many open files`** (**`EMFILE`**).
+Parallel indexing opens crawl shards, pipes, and up to **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** **`tmp_trigrams_*.bin`** files at a time (not all **4096** buckets at once). If **`Too many open files`** (**`EMFILE`**) persists, raise **`RLIMIT_NOFILE`** or reduce **`EREPORT_INDEX_THREADS`**.
 
 **Inspect limits in the current shell** (Linux **`bash`**):
 
@@ -266,7 +268,7 @@ If **`--json`** is given without **`--limit`**, **limit defaults to 50**.
 
 Roughly two phases:
 
-1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, while **multiple trigram writer threads** append **`tmp_trigrams_*.bin`** records in parallel (per-bucket mutexes and lazy **`FILE*`** handles—many buckets can be open at once; **`ulimit -n`** may be required). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** (how many parsed paths may wait for trigram writers) has fixed depth **4096** (not configurable by environment variable).
+1. **Scan / index** — Input `.bin` files are listed, then **chunk boundaries are mapped in parallel** (same idea as `ereport`, using **`EREPORT_INDEX_THREADS`**, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a **single-user** build, rows whose UID does not match skip reading the path string (`fseek` past it). For an **all-users** **`--make`** (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a **paths writer** thread that appends **`paths.bin`** and **`path_offsets.bin`** in **strict order**, while **multiple trigram writer threads** append **`tmp_trigrams_*.bin`** records in parallel (per-bucket mutexes, lazy **`FILE*`** handles, and **LRU eviction** of idle bucket files against **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** / **`RLIMIT_NOFILE`**). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The **trigram job queue** (how many parsed paths may wait for trigram writers) has fixed depth **4096** (not configurable by environment variable).
 
 2. **Merge** — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs **multiple worker threads** that write per-bucket segment files, then a single thread **stitches** postings offsets and concatenates blobs. Reads prefer **`mmap`** with `malloc`+`read` fallback; sorting uses **LSD radix** on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers.
 
@@ -351,7 +353,7 @@ make serve-public       # bind 0.0.0.0 (all interfaces), same default port
 | `SERVE_ROOT`  | `.`       | Directory whose files are served (last argument to **`eserve.py`**) |
 | `SERVE_PORT`  | `8000`    | TCP port (both **`serve`** and **`serve-public`**) |
 | `SERVE_BIND`  | `127.0.0.1` | For **`make serve`** only: **`eserve.py --bind`**. **`make serve-public`** always uses **`0.0.0.0`** and does not read **`SERVE_BIND`**. |
-| `SERVE_INDEX_DIR` | (empty) | If set, passed to **`eserve.py --index-dir`** (trigram index directory) |
+| `SERVE_INDEX_DIR` | (empty) | If set, passed to **`eserve.py --index-dir`**. Use **`SERVE_INDEX_DIR=/abs/path`** (one `=`); **`==/path`** is a common typo—**`eserve.py`** strips leading `=` so absolute index paths still work. |
 | `PYTHON3`     | `python3` | Python interpreter used to run **`eserve.py`** |
 
 Examples:
@@ -438,7 +440,7 @@ Omit directories to use **`./`** as the only input path: `./ereport_index --make
 
 ```bash
 ./ereport_index --make crawl_srv01 crawl_srv02
-./ereport_index --search foo all_users/index
+./ereport_index --search --index-dir all_users/index foo
 ```
 
 This writes:
@@ -520,7 +522,7 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel bin chunk readers (default 32). |
-| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` | Parallel chunk-boundary mapping (across bin files) and parallel scan/index workers (default 32). Does **not** set merge worker count. |
+| **`EREPORT_INDEX_THREADS`** | `ereport_index --make` / **`--search`** | Parallel chunk-boundary mapping, index build workers, and (for **`--search`**) parallel postings load + path filtering when the query and candidate set are large enough (default 32). Does **not** set merge worker count. |
 | **`EREPORT_INDEX_WRITEQ_MAX_BATCHES`** | `ereport_index --make` | Max depth of batches waiting on the **paths** writer (default scales with thread count). |
 | **`EREPORT_INDEX_MERGE_MEMORY_MB`** | `ereport_index --make` / merge / **resume-merge** | Explicit merge RAM **budget** (MiB) for limiting parallel merge workers (optional). |
 | **`EREPORT_INDEX_MERGE_RAM_FRAC`** | `ereport_index --make` / merge / **resume-merge** | Fraction of `min(MemAvailable, cgroup memory.max)` used as that budget (default **0.55**). |
@@ -529,7 +531,7 @@ where `total_capacity_in_files` is based on matched file records and hard-link-a
 
 ## Notes
 
-- The code assumes local filesystem crawl data written by `ecrawl` format version `2`.
+- The code assumes local filesystem crawl data written by `ecrawl` format version **3** (per-shard **`uid_shard_*.bin.ckpt`** sidecars record sparse byte offsets for parallel chunk mapping in `ereport` / `ereport_index --make`).
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - For **per-user** runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. **All-users** runs load **every** shard file (same as merging full-cluster crawls).
 - **`ECRAWL_UID_SHARDS`** for a crawl run should match across every output directory you later pass together to **`ereport`** / **`ereport_index --make`** (merged reports assume consistent shard layout).
