@@ -1405,6 +1405,20 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
     return 0;
 }
 
+/*
+ * Map corpus_pct (share of corpus, 0..100) to color intensity 0..100.
+ * ref_max_pct is full saturation: inner bucket cells use max share among age×size buckets;
+ * row totals, column totals, and the corner use 100 (whole corpus).
+ */
+static double heatmap_norm_pct(double corpus_pct, double ref_max_pct) {
+    double x;
+
+    if (ref_max_pct <= 0.0) return 0.0;
+    x = 100.0 * corpus_pct / ref_max_pct;
+    if (x > 100.0) x = 100.0;
+    return x;
+}
+
 static void contribution_cell_color(double pct, char *buf, size_t sz) {
     const int low_r = 248, low_g = 244, low_b = 238;
     const int high_r = 245, high_g = 214, high_b = 214;
@@ -1418,6 +1432,50 @@ static void contribution_cell_color(double pct, char *buf, size_t sz) {
     g = (int)(low_g + (high_g - low_g) * t + 0.5);
     b = (int)(low_b + (high_b - low_b) * t + 0.5);
     snprintf(buf, sz, "rgb(%d,%d,%d)", r, g, b);
+}
+
+/* Heat-map diagonal (bytes triangle): light blue → deeper blue by share of total bytes. */
+static void bytes_share_cell_color(double pct, char *buf, size_t sz) {
+    const int low_r = 244, low_g = 249, low_b = 252;
+    const int high_r = 165, high_g = 198, high_b = 242;
+    double t = pct / 100.0;
+    int r, g, b;
+
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+
+    r = (int)(low_r + (high_r - low_r) * t + 0.5);
+    g = (int)(low_g + (high_g - low_g) * t + 0.5);
+    b = (int)(low_b + (high_b - low_b) * t + 0.5);
+    snprintf(buf, sz, "rgb(%d,%d,%d)", r, g, b);
+}
+
+/*
+ * Heat-map file triangle: comma main line + parenthetical "(2M, 12%)" or "(12%)" on a separate badge line.
+ */
+static void format_file_count_main_and_paren(uint64_t f,
+                                           double pct_files,
+                                           char *main_out,
+                                           size_t main_sz,
+                                           char *paren_out,
+                                           size_t paren_sz) {
+    int v;
+
+    format_uint_commas(f, main_out, main_sz);
+    if (f >= 1000000ULL) {
+        if (f >= 1000000000000ULL) {
+            v = (int)((f + 500000000000ULL) / 1000000000000ULL);
+            snprintf(paren_out, paren_sz, "(%dT, %.0f%%)", v, pct_files);
+        } else if (f >= 1000000000ULL) {
+            v = (int)((f + 500000000ULL) / 1000000000ULL);
+            snprintf(paren_out, paren_sz, "(%dB, %.0f%%)", v, pct_files);
+        } else {
+            v = (int)((f + 500000ULL) / 1000000ULL);
+            snprintf(paren_out, paren_sz, "(%dM, %.0f%%)", v, pct_files);
+        }
+    } else {
+        snprintf(paren_out, paren_sz, "(%.0f%%)", pct_files);
+    }
 }
 
 static const char *path_tail_component(const char *path) {
@@ -2083,43 +2141,6 @@ static int emit_all_bucket_detail_pages(const char *username,
     return atomic_load(&ctx.any_fail) ? -1 : 0;
 }
 
-static double clamp01(double x) {
-    if (x < 0.0) return 0.0;
-    if (x > 1.0) return 1.0;
-    return x;
-}
-
-static void heatmap_color(uint64_t cell_bytes,
-                          int age_bucket,
-                          uint64_t max_cell_bytes,
-                          char *buf,
-                          size_t sz) {
-    const int empty_r = 230, empty_g = 244, empty_b = 234;
-    const int low_r   = 228, low_g   = 244, low_b   = 223;
-    const int high_r  = 245, high_g  = 214, high_b  = 214;
-    double volume_score;
-    double age_score;
-    double score;
-    int r, g, b;
-
-    if (cell_bytes == 0 || max_cell_bytes == 0) {
-        snprintf(buf, sz, "rgb(%d,%d,%d)", empty_r, empty_g, empty_b);
-        return;
-    }
-
-    volume_score = (double)cell_bytes / (double)max_cell_bytes;
-    volume_score = clamp01(volume_score);
-    age_score = (double)age_bucket / (double)(AGE_BUCKETS - 1);
-    score = 0.30 * volume_score + 0.55 * age_score + 0.15 * (volume_score * age_score);
-    score = clamp01(score);
-
-    r = (int)(low_r + (high_r - low_r) * score + 0.5);
-    g = (int)(low_g + (high_g - low_g) * score + 0.5);
-    b = (int)(low_b + (high_b - low_b) * score + 0.5);
-
-    snprintf(buf, sz, "rgb(%d,%d,%d)", r, g, b);
-}
-
 static void summary_merge(summary_t *dst, const summary_t *src) {
     int ab, sb;
 
@@ -2480,6 +2501,8 @@ static void *stats_thread_main(void *arg) {
                             if (wpaths[si]) active++;
                         }
                         if (active > 0) {
+                            printf("\n");
+                            fflush(stdout);
                             fprintf(stderr,
                                     "ereport: chunk-map still scanning (%d/%d parallel shard readers busy; large "
                                     "shards or slow storage)\n",
@@ -3179,9 +3202,10 @@ static int emit_html(const char *report_path,
                      const char *crawl_sources_label) {
     FILE *out = counted_fopen(report_path, "w");
     int ab, sb;
+    double max_inner_pct_b = 0.0;
+    double max_inner_pct_f = 0.0;
 
     if (!out) return -1;
-    uint64_t max_cell_bytes = 0;
 
     fprintf(out, "<!DOCTYPE html>\n");
     fprintf(out, "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
@@ -3215,18 +3239,41 @@ static int emit_html(const char *report_path,
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
     fprintf(out, ".heatmap-caption{caption-side:top;text-align:left;font-size:12px;color:#555;line-height:1.45;max-width:720px;margin:10px 0 12px;padding:0}\n");
     fprintf(out, ".heatmap-totals-note{font-size:12px;color:#555;max-width:min(900px,100%%);margin:12px 0 18px;line-height:1.5;padding:0}\n");
-    fprintf(out, ".heatmap-corner{font-weight:600}\n");
     fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
     fprintf(out, "th{background:#f4f4f4}\n");
-    fprintf(out, ".tot{font-weight:600;background:#fafafa}\n");
-    fprintf(out, ".cell,.tot-cell{transition:background-color 0.2s ease}\n");
-    fprintf(out, ".cell a,.tot-block{display:block;color:inherit;text-decoration:none;text-align:center;min-height:42px;padding:1px 0}\n");
-    fprintf(out, ".cell-main{display:flex;align-items:center;justify-content:center;gap:4px;flex-wrap:wrap;line-height:1}\n");
-    fprintf(out, ".cell-bytes{font-size:14px;font-weight:600}\n");
-    fprintf(out, ".cell-pct{font-size:10px;font-weight:700;color:#6a4d1a;background:rgba(255,255,255,0.78);padding:1px 4px;border-radius:999px;line-height:1}\n");
-    fprintf(out, ".cell-sub{color:#666;font-size:10px;margin-top:2px;line-height:1.05}\n");
-    fprintf(out, ".cell.active{outline:3px solid #8a6a2a;outline-offset:-3px}\n");
+    fprintf(out, "table.heatmap th.heatmap-corner{font-weight:600;background-color:transparent;background-image:none}\n");
+    fprintf(out, "table.heatmap th.heatmap-th-neutral{font-weight:600;background-color:transparent;background-image:none}\n");
+    fprintf(out, "table.heatmap th.heatmap-th-neutral[scope=row]{min-width:9em;vertical-align:middle}\n");
+    fprintf(out, "table.heatmap th.heatmap-th-x{background-color:rgb(236,244,252);font-weight:600}\n");
+    fprintf(out, "table.heatmap th.heatmap-th-y{background-color:rgb(252,244,240);font-weight:600;min-width:9em;"
+                "vertical-align:middle}\n");
+    fprintf(out, "tr.tot{font-weight:600;background:transparent}\n");
+    fprintf(out, "td.tot.tot-cell{background-color:#fafafa}\n");
+    fprintf(out, ".cell,.tot-cell{transition:background 0.2s ease}\n");
+    fprintf(out, ".cell a.bucket-link,.tot-block.cell-split{display:block;color:inherit;text-decoration:none;position:relative;"
+                "overflow:hidden;min-height:62px;padding:0}\n");
+    fprintf(out, "td.cell,td.tot-cell{min-width:7.2em;vertical-align:middle}\n");
+    fprintf(out, ".cell-split-bg{position:absolute;inset:0;z-index:0;pointer-events:none}\n");
+    fprintf(out, ".cell-split-part{position:absolute;inset:0}\n");
+    fprintf(out, ".cell-split-bytes{clip-path:polygon(100%% 0,100%% 100%%,0 0)}\n");
+    fprintf(out, ".cell-split-files{clip-path:polygon(0 100%%,100%% 100%%,0 0)}\n");
+    fprintf(out, ".cell-split-text{position:absolute;inset:0;z-index:1;line-height:1.15;box-sizing:border-box;"
+                "pointer-events:none}\n");
+    fprintf(out, ".cell-split-text-bytes{clip-path:polygon(100%% 0,100%% 100%%,0 0);display:flex;flex-direction:column;"
+                "align-items:flex-end;justify-content:flex-start;padding:5px 5px 36%% 36%%}\n");
+    fprintf(out, ".cell-split-text-files{clip-path:polygon(0 100%%,100%% 100%%,0 0);display:flex;flex-direction:column;"
+                "align-items:flex-start;justify-content:flex-end;padding:36%% 36%% 5px 5px}\n");
+    fprintf(out, ".cell-vol-row{display:flex;align-items:baseline;justify-content:flex-end;gap:3px;flex-wrap:wrap;"
+                "max-width:100%%}\n");
+    fprintf(out, ".cell-bytes{font-size:12px;font-weight:700;letter-spacing:-0.02em}\n");
+    fprintf(out, ".cell-pct{font-size:8px;font-weight:700;color:#163a7a;background:rgba(255,255,255,0.9);padding:1px 3px;"
+                "border-radius:999px;line-height:1;white-space:nowrap}\n");
+    fprintf(out, ".cell-pct-files{color:#6b2a2a}\n");
+    fprintf(out, ".cell-files-stack{display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:100%%}\n");
+    fprintf(out, ".cell-files-main{font-size:11px;font-weight:700;color:#1a1a1a;line-height:1.15;letter-spacing:-0.02em;"
+                "text-shadow:0 0 4px #fff,0 0 8px rgba(255,255,255,0.92);word-break:break-all}\n");
+    fprintf(out, ".cell.active{outline:3px solid #2d6a9f;outline-offset:-3px}\n");
     fprintf(out, ".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
     fprintf(out, ".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
     fprintf(out, ".drawer{position:fixed;top:0;right:0;width:min(980px,92vw);height:100vh;background:#fff;box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;z-index:21;display:flex;flex-direction:column}\n");
@@ -3307,119 +3354,186 @@ static int emit_html(const char *report_path,
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-            if (sum->bytes[ab][sb] > max_cell_bytes) max_cell_bytes = sum->bytes[ab][sb];
+            double pb, pf;
+
+            pb = sum->total_bytes ? 100.0 * (double)sum->bytes[ab][sb] / (double)sum->total_bytes : 0.0;
+            pf = sum->total_files ? 100.0 * (double)sum->files[ab][sb] / (double)sum->total_files : 0.0;
+            if (pb > max_inner_pct_b) max_inner_pct_b = pb;
+            if (pf > max_inner_pct_f) max_inner_pct_f = pf;
         }
     }
 
-    fprintf(out, "<table>\n");
+    fprintf(out, "<table class=\"heatmap\">\n");
     fprintf(out,
-            "<caption class=\"heatmap-caption\">Rows: file age (relative to the crawl basis). Columns: file size. Second-line "
-            "values are file counts (regular files; device/inode dedup).</caption>\n");
+            "<caption class=\"heatmap-caption\">Rows: file age (relative to the crawl basis). Columns: file size. Each cell is "
+            "split on the diagonal: upper-right shows data volume and share of total bytes (blue intensity); lower-left shows "
+            "file count with rounded millions/billions when large and share of total files (rose intensity). Inner bucket "
+            "colors peak at the largest age×size cell; row and column totals use the full corpus (100%%) as the color scale. "
+            "Displayed percentages are corpus shares. Regular files only; device/inode dedup.</caption>\n");
     fprintf(out, "<tr><th scope=\"col\" class=\"heatmap-corner\">Age \xc3\x97 Size</th>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-        fprintf(out, "<th>");
+        fprintf(out, "<th scope=\"col\" class=\"heatmap-th-x\">");
         html_escape(out, size_bucket_names[sb]);
         fprintf(out, "</th>");
     }
-    fprintf(out, "<th>Total</th></tr>\n");
+    fprintf(out, "<th scope=\"col\" class=\"heatmap-th-neutral\">Total</th></tr>\n");
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         uint64_t row_total = 0;
         uint64_t row_files = 0;
 
-        fprintf(out, "<tr><td>");
+        fprintf(out, "<tr><th scope=\"row\" class=\"heatmap-th-y\">");
         html_escape(out, age_bucket_names[ab]);
-        fprintf(out, "</td>");
+        fprintf(out, "</th>");
 
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
             char hb[32];
-            char bg[32];
-            char fline[160];
-            double pct = 0.0;
+            char bg_b[32];
+            char bg_f[32];
+            char f_main[48];
+            char f_paren[80];
+            double pct_b = 0.0;
+            double pct_f = 0.0;
             uint64_t b = sum->bytes[ab][sb];
             uint64_t f = sum->files[ab][sb];
 
             row_total += b;
             row_files += f;
 
-            if (sum->total_bytes) pct = 100.0 * (double)b / (double)sum->total_bytes;
+            if (sum->total_bytes) pct_b = 100.0 * (double)b / (double)sum->total_bytes;
+            if (sum->total_files) pct_f = 100.0 * (double)f / (double)sum->total_files;
             human_bytes(b, hb, sizeof(hb));
-            heatmap_color(b, ab, max_cell_bytes, bg, sizeof(bg));
-            format_count_pretty_inline(f, fline, sizeof(fline));
+            bytes_share_cell_color(heatmap_norm_pct(pct_b, max_inner_pct_b), bg_b, sizeof(bg_b));
+            contribution_cell_color(heatmap_norm_pct(pct_f, max_inner_pct_f), bg_f, sizeof(bg_f));
+            format_file_count_main_and_paren(f, pct_f, f_main, sizeof(f_main), f_paren, sizeof(f_paren));
             fprintf(out,
-                    "<td class=\"cell\" style=\"background:%s\"><a class=\"bucket-link\" data-age=\"%d\" data-size=\"%d\" "
-                    "href=\"bucket_a%d_s%d.html\"><div class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span "
-                    "class=\"cell-pct\">%.0f%%</span></div><div class=\"cell-sub\">%s</div></a></td>",
-                    bg,
+                    "<td class=\"cell\"><a class=\"bucket-link cell-split\" data-age=\"%d\" data-size=\"%d\" "
+                    "href=\"bucket_a%d_s%d.html\">"
+                    "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
+                    "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
+                    "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
+                    "</span>"
+                    "<span class=\"cell-split-text cell-split-text-bytes\"><span class=\"cell-vol-row\"><span class=\"cell-bytes\">%s</span>"
+                    "<span class=\"cell-pct\">%.0f%%</span></span></span>"
+                    "<span class=\"cell-split-text cell-split-text-files\"><span class=\"cell-files-stack\"><span "
+                    "class=\"cell-files-main\">%s</span><span class=\"cell-pct cell-pct-files\">%s</span></span></span>"
+                    "</a></td>",
                     ab,
                     sb,
                     ab,
                     sb,
+                    bg_b,
+                    bg_f,
                     hb,
-                    pct,
-                    fline);
+                    pct_b,
+                    f_main,
+                    f_paren);
         }
 
         {
             char hr[32];
-            char bg[32];
-            char rf[160];
-            double pct = 0.0;
+            char bg_b[32];
+            char bg_f[32];
+            char rf_main[48];
+            char rf_paren[80];
+            double pct_b = 0.0;
+            double pct_f = 0.0;
 
-            if (sum->total_bytes) pct = 100.0 * (double)row_total / (double)sum->total_bytes;
+            if (sum->total_bytes) pct_b = 100.0 * (double)row_total / (double)sum->total_bytes;
+            if (sum->total_files) pct_f = 100.0 * (double)row_files / (double)sum->total_files;
             human_bytes(row_total, hr, sizeof(hr));
-            format_count_pretty_inline(row_files, rf, sizeof(rf));
-            contribution_cell_color(pct, bg, sizeof(bg));
+            bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
+            contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
+            format_file_count_main_and_paren(row_files, pct_f, rf_main, sizeof(rf_main), rf_paren, sizeof(rf_paren));
             fprintf(out,
-                    "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div "
-                    "class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div><div "
-                    "class=\"cell-sub\">%s</div></div></td>",
-                    bg,
+                    "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
+                    "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
+                    "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
+                    "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
+                    "</span>"
+                    "<span class=\"cell-split-text cell-split-text-bytes\"><span class=\"cell-vol-row\"><span class=\"cell-bytes\">%s</span>"
+                    "<span class=\"cell-pct\">%.0f%%</span></span></span>"
+                    "<span class=\"cell-split-text cell-split-text-files\"><span class=\"cell-files-stack\"><span "
+                    "class=\"cell-files-main\">%s</span><span class=\"cell-pct cell-pct-files\">%s</span></span></span>"
+                    "</div></td>",
+                    bg_b,
+                    bg_f,
                     hr,
-                    pct,
-                    rf);
+                    pct_b,
+                    rf_main,
+                    rf_paren);
         }
 
         fprintf(out, "</tr>\n");
     }
 
-    fprintf(out, "<tr class=\"tot\"><td>Total</td>");
+    fprintf(out, "<tr class=\"tot\"><th scope=\"row\" class=\"heatmap-th-neutral\">Total</th>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         uint64_t col_total = 0;
         uint64_t col_files = 0;
         char hc[32];
-        char bg[32];
-        char cf[160];
-        double pct = 0.0;
+        char bg_b[32];
+        char bg_f[32];
+        char cf_main[48];
+        char cf_paren[80];
+        double pct_b = 0.0;
+        double pct_f = 0.0;
 
         for (ab = 0; ab < AGE_BUCKETS; ab++) {
             col_total += sum->bytes[ab][sb];
             col_files += sum->files[ab][sb];
         }
-        if (sum->total_bytes) pct = 100.0 * (double)col_total / (double)sum->total_bytes;
+        if (sum->total_bytes) pct_b = 100.0 * (double)col_total / (double)sum->total_bytes;
+        if (sum->total_files) pct_f = 100.0 * (double)col_files / (double)sum->total_files;
         human_bytes(col_total, hc, sizeof(hc));
-        format_count_pretty_inline(col_files, cf, sizeof(cf));
-        contribution_cell_color(pct, bg, sizeof(bg));
+        bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
+        contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
+        format_file_count_main_and_paren(col_files, pct_f, cf_main, sizeof(cf_main), cf_paren, sizeof(cf_paren));
         fprintf(out,
-                "<td class=\"tot tot-cell\" style=\"background:%s\"><div class=\"tot-block\"><div "
-                "class=\"cell-main\"><span class=\"cell-bytes\">%s</span><span class=\"cell-pct\">%.0f%%</span></div><div "
-                "class=\"cell-sub\">%s</div></div></td>",
-                bg,
+                "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
+                "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
+                "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
+                "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
+                "</span>"
+                "<span class=\"cell-split-text cell-split-text-bytes\"><span class=\"cell-vol-row\"><span class=\"cell-bytes\">%s</span>"
+                "<span class=\"cell-pct\">%.0f%%</span></span></span>"
+                "<span class=\"cell-split-text cell-split-text-files\"><span class=\"cell-files-stack\"><span "
+                "class=\"cell-files-main\">%s</span><span class=\"cell-pct cell-pct-files\">%s</span></span></span>"
+                "</div></td>",
+                bg_b,
+                bg_f,
                 hc,
-                pct,
-                cf);
+                pct_b,
+                cf_main,
+                cf_paren);
     }
     {
         char ht[32];
-        char tf[160];
+        char bg_b[32];
+        char bg_f[32];
+        char tf_main[48];
+        char tf_paren[80];
 
         human_bytes(sum->total_bytes, ht, sizeof(ht));
-        format_count_pretty_inline(sum->total_files, tf, sizeof(tf));
+        bytes_share_cell_color(heatmap_norm_pct(100.0, 100.0), bg_b, sizeof(bg_b));
+        contribution_cell_color(heatmap_norm_pct(100.0, 100.0), bg_f, sizeof(bg_f));
+        format_file_count_main_and_paren(sum->total_files, 100.0, tf_main, sizeof(tf_main), tf_paren, sizeof(tf_paren));
         fprintf(out,
-                "<td class=\"tot tot-cell\"><div class=\"tot-block\"><div class=\"cell-main\"><span "
-                "class=\"cell-bytes\">%s</span><span class=\"cell-pct\">100%%</span></div><div class=\"cell-sub\">%s</div></div></td>",
+                "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
+                "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
+                "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
+                "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
+                "</span>"
+                "<span class=\"cell-split-text cell-split-text-bytes\"><span class=\"cell-vol-row\"><span class=\"cell-bytes\">%s</span>"
+                "<span class=\"cell-pct\">100%%</span></span></span>"
+                "<span class=\"cell-split-text cell-split-text-files\"><span class=\"cell-files-stack\"><span "
+                "class=\"cell-files-main\">%s</span><span class=\"cell-pct cell-pct-files\">%s</span></span></span>"
+                "</div></td>",
+                bg_b,
+                bg_f,
                 ht,
-                tf);
+                tf_main,
+                tf_paren);
     }
     fprintf(out, "</tr>\n");
 
@@ -3429,7 +3543,8 @@ static int emit_html(const char *report_path,
             "<p class=\"heatmap-totals-note\"><strong>Row and column totals.</strong> The rightmost column is the total for "
             "each age <em>row</em> (sum over all size buckets). The bottom row is the total for each size <em>column</em> "
             "(sum over all age buckets). The bottom-right cell is the total across the full heat map; it matches the sum "
-            "of the row totals and the sum of the column totals.</p>\n");
+            "of the row totals and the sum of the column totals. Heat colors: inner cells peak at the largest age×size bucket; "
+            "row totals, column totals, and the corner scale vs the full corpus (100%%).</p>\n");
 
     {
         char totalb[32];

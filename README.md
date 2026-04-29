@@ -181,7 +181,9 @@ Outputs:
 
 Place **`--bucket-details N`** (`N` = **1…32**) **first**, before the username (if any) and time basis. Omit it for fast runs and small bucket HTML (no path reads for drill-down tables).
 
-**Search UI (important):** There is **only one** search field. Results stay **below that box**—not in a sliding drawer—so it stays obvious what you are editing. After three characters you get a preview list under the input; press **Enter** for paged results in the same panel. Use **Hide** to collapse the panel without clearing your query. The preview and paged-result lines include timing plus corpus scale: **`indexed_paths`** from the index’s **`meta.txt`** (shown as “~N paths indexed”) when that value is present; otherwise they fall back to **`index_keys`** (distinct trigrams in **`tri_keys.bin`**, shown as “~N trigrams”).
+**Search UI (important):** There is **only one** search field. Results stay **below that box**—not in a sliding drawer—so it stays obvious what you are editing. After three characters you get a preview list under the input; press **Enter** for paged results in the same panel. Use **Hide** to collapse the panel without clearing your query. In-flight preview requests are **aborted** when the query changes so fast typing does not leave **stale** matches on screen. The preview and paged-result lines include timing plus corpus scale: **`indexed_paths`** from the index’s **`meta.txt`** (shown as “~N paths indexed”) when that value is present; otherwise they fall back to **`index_keys`** (distinct trigrams in **`tri_keys.bin`**, shown as “~N trigrams”).
+
+**Heat map (index.html):** Each age×size cell is split **diagonally**: the **upper-right** triangle shows **data volume** and **share of total bytes** (blue intensity); the **lower-left** shows **file count**, a short rounded count in parentheses when large **(e.g. 2M)**, and **share of total files** (rose intensity), with the parenthetical line on a **second** line in a small badge like the byte **%** badge. **Inner** bucket colors scale so the **strongest inner cell** reaches full saturation; **row totals** and **column totals** scale against the **full corpus (100%)** instead, so the margin labels stay comparable to “fraction of everything.” **Column** headers (size buckets) use a light **blue** tint; **row** headers (age buckets) use a light **rose** tint; the **“Age × Size”** corner and the **“Total”** row/column **label** cells stay **neutral** (no axis tint). The table uses **`class="heatmap"`** so those styles do not fight generic **`th`** rules elsewhere.
 
 Usage:
 
@@ -219,7 +221,7 @@ Parse chunks scale with input `.bin` size so parallel workers are not capped by 
 
 Runtime behavior:
 
-- **`ereport` scans crawl directories**, then **maps chunk boundaries** inside each `.bin` shard (reading record headers only). That mapping runs with **`EREPORT_THREADS` parallel scanners**; stdout shows **`chunk-map files:X/Y`** until every shard has been scanned, then the usual records/sec line appears while workers parse chunks.
+- **`ereport` scans crawl directories**, then **maps chunk boundaries** inside each `.bin` shard (reading record headers only). That mapping runs with **`EREPORT_THREADS` parallel scanners**; stdout shows **`chunk-map files:X/Y`** until every shard has been scanned, then the usual records/sec line appears while workers parse chunks. If mapping is slow, an occasional **stderr** advisory may print after a completed progress line so it does not glue to the **`chunk-map`** status text.
 - After parsing finishes, the status line switches to **finalizing** with sub-steps: **merging shard summaries** (in-process merges of per-thread summaries and bucket-detail maps), **writing bucket HTML (n/36)** while **`bucket_*.html`** files are emitted, then **writing index.html**.
 - prints a live progress line during processing
 - prints final run stats to `stdout`
