@@ -208,6 +208,9 @@ typedef struct ereport_run_stats {
     atomic_int stop_stats;
     /* Set after all parse worker threads finish — merges/HTML emit run with no new scanned_records. */
     atomic_int parse_workers_done;
+    /* 1=merging worker summaries, 2=writing bucket_*.html, 3=writing index.html (0=unused). */
+    atomic_int finalize_phase;
+    atomic_uint finalize_bucket_done; /* cells written toward 36 */
     uint64_t input_files_total;
     atomic_ullong chunk_prep_files_done;
     uint64_t chunk_prep_files_total;
@@ -228,6 +231,8 @@ static void ereport_run_stats_reset(ereport_run_stats_t *s) {
     atomic_store(&s->bad_input_files, 0);
     atomic_store(&s->stop_stats, 0);
     atomic_store(&s->parse_workers_done, 0);
+    atomic_store(&s->finalize_phase, 0);
+    atomic_store(&s->finalize_bucket_done, 0);
     s->input_files_total = 0;
     atomic_store(&s->chunk_prep_files_done, 0);
     s->chunk_prep_files_total = 0;
@@ -1886,6 +1891,7 @@ typedef struct {
     int stub_mode;
     atomic_size_t next_task;
     atomic_int any_fail;
+    ereport_run_stats_t *run_stats;
 } bucket_emit_ctx_t;
 
 typedef struct {
@@ -1911,12 +1917,14 @@ static void *bucket_page_emit_worker(void *arg) {
 
         if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) {
             atomic_store(&c->any_fail, 1);
+            if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
             continue;
         }
 
         if (c->stub_mode) {
             if (!c->sum_ref) {
                 atomic_store(&c->any_fail, 1);
+                if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
                 continue;
             }
             page_rc =
@@ -1926,6 +1934,7 @@ static void *bucket_page_emit_worker(void *arg) {
                                               c->bucket_detail_levels, &c->details[ab][sb], c->matched_records);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
+        if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
     }
 
     return NULL;
@@ -1938,7 +1947,8 @@ static int emit_all_bucket_detail_pages(const char *username,
                                         int bucket_detail_levels,
                                         const summary_t *sum_ref,
                                         bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
-                                        const matched_records_t *matched_records) {
+                                        const matched_records_t *matched_records,
+                                        ereport_run_stats_t *run_stats) {
     const size_t ntasks = (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS;
     bucket_emit_ctx_t ctx;
     pthread_t *tids = NULL;
@@ -1958,9 +1968,14 @@ static int emit_all_bucket_detail_pages(const char *username,
     ctx.matched_records = matched_records;
     ctx.sum_ref = sum_ref;
     ctx.stub_mode = (bucket_detail_levels == 0 && sum_ref != NULL) ? 1 : 0;
+    ctx.run_stats = run_stats;
 
     atomic_init(&ctx.next_task, 0);
     atomic_init(&ctx.any_fail, 0);
+    if (run_stats) {
+        atomic_store(&run_stats->finalize_phase, 2);
+        atomic_store(&run_stats->finalize_bucket_done, 0);
+    }
 
     nw = parse_ereport_thread_count();
     if (nw < 1) nw = 1;
@@ -2404,14 +2419,42 @@ static void *stats_thread_main(void *arg) {
                     }
                 }
             } else if (atomic_load(&rs->parse_workers_done)) {
-                printf(
-                    "\rfinalizing: merging output & writing HTML | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
-                    sf,
-                    tf,
-                    sr,
-                    mr,
-                    bad_input_files,
-                    elapsed_buf);
+                int phase = atomic_load(&rs->finalize_phase);
+                unsigned int bdone = atomic_load(&rs->finalize_bucket_done);
+                const char *step;
+
+                if (phase == 1)
+                    step = "merging shard summaries";
+                else if (phase == 2)
+                    step = "writing bucket HTML";
+                else if (phase == 3)
+                    step = "writing index.html";
+                else
+                    step = "finalizing";
+
+                if (phase == 2) {
+                    printf(
+                        "\rfinalizing: %s (%u/%d) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                        step,
+                        bdone,
+                        AGE_BUCKETS * SIZE_BUCKETS,
+                        sf,
+                        tf,
+                        sr,
+                        mr,
+                        bad_input_files,
+                        elapsed_buf);
+                } else {
+                    printf(
+                        "\rfinalizing: %s | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                        step,
+                        sf,
+                        tf,
+                        sr,
+                        mr,
+                        bad_input_files,
+                        elapsed_buf);
+                }
                 fflush(stdout);
             } else {
                 printf("\r%s rec/s(10s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
@@ -4114,6 +4157,9 @@ int main(int argc, char **argv) {
     memset(final_details, 0, sizeof(final_details));
     memset(&final_matched_records, 0, sizeof(final_matched_records));
 
+    atomic_store(&run_stats.parse_workers_done, 1);
+    atomic_store(&run_stats.finalize_phase, 1);
+
     for (i = 0; i < threads_used; i++) {
         pthread_join(tids[i], NULL);
         summary_merge(&final_sum, &args[i].summary);
@@ -4174,8 +4220,6 @@ int main(int argc, char **argv) {
             }
         }
     }
-
-    atomic_store(&run_stats.parse_workers_done, 1);
 
     if (all_users_mode) {
         uid_accum_t merged_uids;
@@ -4251,11 +4295,14 @@ int main(int argc, char **argv) {
     if (emit_all_bucket_detail_pages(display_name, all_users_mode, distinct_uid_count, basis_str,
                                      bucket_detail_levels,
                                      bucket_detail_levels == 0 ? &final_sum : NULL, final_details,
-                                     &final_matched_records) != 0) {
+                                     &final_matched_records,
+                                     &run_stats) != 0) {
         fprintf(stderr, "failed to write bucket detail pages\n");
     } else {
         bucket_pages_written = AGE_BUCKETS * SIZE_BUCKETS;
     }
+
+    atomic_store(&run_stats.finalize_phase, 3);
 
     if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
                    basis_str, &final_sum, path_count, threads_used, bin_dir_count,
