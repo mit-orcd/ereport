@@ -17,7 +17,7 @@ The current toolchain is:
 
 | Program | Parallelism role | Override (env) | Built-in default | Min logical CPUs | Min RAM |
 |---------|------------------|----------------|------------------|------------------|---------|
-| **`ecrawl`** | Walk / queue directory work | **`ECRAWL_WORKERS`** | **16** crawl workers (hard max **16**) | **4** | **4 GiB** |
+| **`ecrawl`** | Walk / queue directory work | **`ECRAWL_WORKERS`** | **16** crawl workers (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
 | **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
@@ -134,7 +134,7 @@ Optional environment variables (no CLI flags for these):
 
 | Variable | Meaning |
 |----------|---------|
-| **`ECRAWL_WORKERS`** | Crawl worker threads (**1…16**, default **16**). |
+| **`ECRAWL_WORKERS`** | Crawl worker threads (minimum **1**, default **16**; no fixed maximum—practical limits are RAM and OS thread capacity). |
 | **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
@@ -568,7 +568,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 | Variable | Tool / context | Role |
 |----------|----------------|------|
-| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (1…16, default **16**). |
+| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (minimum **1**, default **16**; no fixed maximum). |
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |

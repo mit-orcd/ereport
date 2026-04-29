@@ -57,6 +57,8 @@
 #define TRIGRAM_JOB_QUEUE_DEPTH_PER_WORKER 64
 
 static size_t g_write_batch_paths_base = WRITE_BATCH_PATHS;
+/* Like ecrawl/ereport: default output is a concise key=value summary; --verbose enables live detail and extra metrics. */
+static int g_verbose = 0;
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
 #define MERGE_MAX_WORKERS 16
@@ -369,6 +371,10 @@ static void make_io_reset(void) {
 
 /* Fold thread-local make I/O counters into globals (call at thread exit and on main before printing stats). */
 static void mk_io_tls_flush(void) {
+    if (!g_verbose) {
+        memset(&mk_io_tls, 0, sizeof(mk_io_tls));
+        return;
+    }
     if (mk_io_tls.fread_calls)
         atomic_fetch_add_explicit(&g_mk_fread_calls, mk_io_tls.fread_calls, memory_order_relaxed);
     if (mk_io_tls.fread_bytes)
@@ -397,49 +403,54 @@ static void mk_io_tls_flush(void) {
 }
 
 static size_t mk_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    mk_io_tls.fread_calls++;
     size_t r = fread(ptr, size, nmemb, stream);
-    mk_io_tls.fread_bytes += (unsigned long long)(r * size);
+    if (g_verbose) {
+        mk_io_tls.fread_calls++;
+        mk_io_tls.fread_bytes += (unsigned long long)(r * size);
+    }
     return r;
 }
 
 static size_t mk_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    mk_io_tls.fwrite_calls++;
     size_t w = fwrite(ptr, size, nmemb, stream);
-    mk_io_tls.fwrite_bytes += (unsigned long long)(w * size);
+    if (g_verbose) {
+        mk_io_tls.fwrite_calls++;
+        mk_io_tls.fwrite_bytes += (unsigned long long)(w * size);
+    }
     return w;
 }
 
 static FILE *mk_fopen(const char *path, const char *mode) {
-    mk_io_tls.fopen_calls++;
+    if (g_verbose) mk_io_tls.fopen_calls++;
     return fopen(path, mode);
 }
 
 static int mk_fclose(FILE *stream) {
-    mk_io_tls.fclose_calls++;
+    if (g_verbose) mk_io_tls.fclose_calls++;
     return fclose(stream);
 }
 
 static int mk_open(const char *pathname, int flags) {
-    mk_io_tls.open_calls++;
+    if (g_verbose) mk_io_tls.open_calls++;
     return open(pathname, flags);
 }
 
 static ssize_t mk_read(int fd, void *buf, size_t count) {
-    ssize_t n;
-    mk_io_tls.read_calls++;
-    n = read(fd, buf, count);
-    if (n > 0) mk_io_tls.read_bytes += (unsigned long long)n;
+    ssize_t n = read(fd, buf, count);
+    if (g_verbose) {
+        mk_io_tls.read_calls++;
+        if (n > 0) mk_io_tls.read_bytes += (unsigned long long)n;
+    }
     return n;
 }
 
 static void *mk_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    mk_io_tls.mmap_calls++;
+    if (g_verbose) mk_io_tls.mmap_calls++;
     return mmap(addr, length, prot, flags, fd, offset);
 }
 
 static int mk_munmap(void *addr, size_t length) {
-    mk_io_tls.munmap_calls++;
+    if (g_verbose) mk_io_tls.munmap_calls++;
     return munmap(addr, length);
 }
 
@@ -526,10 +537,23 @@ static void maybe_emit_status(build_ctx_t *ctx,
     human_decimal(rate, rate_buf, sizeof(rate_buf));
     human_decimal((double)done_units, done_buf, sizeof(done_buf));
     human_decimal((double)total_units, total_buf, sizeof(total_buf));
+    format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
+
+    if (!g_verbose) {
+        fprintf(stderr, "\r%s %s | %s/%s | el:%s            ", rate_buf, rate_label, done_buf, total_buf, elapsed_buf);
+        status_line_tty_flush();
+        ctx->last_status_sec = now;
+        ctx->last_rate_sec = now;
+        if (strcmp(phase, "merge") == 0)
+            ctx->last_rate_merge_units = done_units;
+        else
+            ctx->last_rate_indexed_paths = ctx->indexed_paths;
+        return;
+    }
+
     human_decimal((double)ctx->scanned_records, rec_buf, sizeof(rec_buf));
     human_decimal((double)ctx->indexed_paths, idx_buf, sizeof(idx_buf));
     human_decimal((double)ctx->trigram_records, tri_buf, sizeof(tri_buf));
-    format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
     fprintf(stderr,
             "\r%s %s | phase:%s unit:%s/%s rec:%s idx:%s tri:%s bad:%" PRIu64 " | el:%s            ",
@@ -635,7 +659,8 @@ static int write_queue_push(write_queue_t *q, write_batch_t *batch) {
         return -1;
     }
     while (q->depth >= q->max_depth && !q->closed) {
-        atomic_fetch_add_explicit(&q->run_stats->writeq_parse_waits, 1ULL, memory_order_relaxed);
+        if (g_verbose)
+            atomic_fetch_add_explicit(&q->run_stats->writeq_parse_waits, 1ULL, memory_order_relaxed);
         pthread_cond_wait(&q->has_space, &q->mutex);
     }
     if (q->closed) {
@@ -659,7 +684,8 @@ static write_batch_t *write_queue_pop_wait(write_queue_t *q) {
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->closed) {
         pthread_cond_wait(&q->has_batch, &q->mutex);
-        atomic_fetch_add_explicit(&q->run_stats->writeq_writer_waits, 1ULL, memory_order_relaxed);
+        if (g_verbose)
+            atomic_fetch_add_explicit(&q->run_stats->writeq_writer_waits, 1ULL, memory_order_relaxed);
     }
     batch = q->head;
     if (batch) {
@@ -733,7 +759,8 @@ static int trigram_job_queue_push_chain_slices(trigram_job_queue_t *q, trigram_j
             return -1;
         }
         while (q->depth >= q->max_depth && !q->closed) {
-            atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
+            if (g_verbose)
+                atomic_fetch_add_explicit(&q->run_stats->trigramq_paths_waits, 1ULL, memory_order_relaxed);
             pthread_cond_wait(&q->has_space, &q->mutex);
         }
         if (q->closed) {
@@ -767,7 +794,8 @@ static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
 
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->closed) {
-        atomic_fetch_add_explicit(&q->run_stats->trigramq_worker_waits, 1ULL, memory_order_relaxed);
+        if (g_verbose)
+            atomic_fetch_add_explicit(&q->run_stats->trigramq_worker_waits, 1ULL, memory_order_relaxed);
         pthread_cond_wait(&q->has_job, &q->mutex);
     }
     job = q->head;
@@ -937,22 +965,41 @@ static void *stats_thread_main(void *arg) {
         char sf[32], tf[32], sr[32], ip[32], tr[32], rate_buf[32], elapsed_buf[32];
         double rate;
 
-        scanned_files = atomic_load(&rs->scanned_input_files);
         scanned_records = atomic_load(&rs->scanned_records);
         indexed_paths = atomic_load(&rs->indexed_paths);
-        trigram_records = atomic_load(&rs->trigram_records);
         bad_input_files = atomic_load(&rs->bad_input_files);
         elapsed_sec = rs->run_start_sec > 0.0 ? now_sec() - rs->run_start_sec : 0.0;
         rate = (double)(indexed_paths - rs->stats_prev_indexed_paths);
         rs->stats_prev_indexed_paths = indexed_paths;
+        human_decimal(rate, rate_buf, sizeof(rate_buf));
+        human_decimal((double)indexed_paths, ip, sizeof(ip));
+        human_decimal((double)scanned_records, sr, sizeof(sr));
+        format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
+        if (!g_verbose) {
+            uint64_t prep_tot_u = rs->chunk_prep_files_total;
+            unsigned long long prep_done_u = atomic_load(&rs->chunk_prep_files_done);
+
+            if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
+                char pdone[32], ptot[32];
+                human_decimal((double)prep_done_u, pdone, sizeof(pdone));
+                human_decimal((double)prep_tot_u, ptot, sizeof(ptot));
+                fprintf(stderr, "\rmapping %s/%s files | el:%s            ", pdone, ptot, elapsed_buf);
+            } else {
+                fprintf(stderr,
+                        "\r%s paths/s | idx:%s rec:%s bad:%llu | el:%s            ",
+                        rate_buf, ip, sr, bad_input_files, elapsed_buf);
+            }
+            status_line_tty_flush();
+            stats_wait_cycle(rs);
+            continue;
+        }
+
+        scanned_files = atomic_load(&rs->scanned_input_files);
+        trigram_records = atomic_load(&rs->trigram_records);
         human_decimal((double)scanned_files, sf, sizeof(sf));
         human_decimal((double)rs->input_files_total, tf, sizeof(tf));
-        human_decimal((double)scanned_records, sr, sizeof(sr));
-        human_decimal((double)indexed_paths, ip, sizeof(ip));
         human_decimal((double)trigram_records, tr, sizeof(tr));
-        human_decimal(rate, rate_buf, sizeof(rate_buf));
-        format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
         {
             uint64_t prep_tot_u = rs->chunk_prep_files_total;
@@ -992,12 +1039,25 @@ static void *stats_thread_main(void *arg) {
     return NULL;
 }
 
+static int arg_is_verbose(const char *s) {
+    return s && strcmp(s, "--verbose") == 0;
+}
+
+/* Skip leading "--verbose" tokens (may appear before or after the subcommand). */
+static int argv_skip_verbose_prefix(int argc, char **argv) {
+    int i = 1;
+    while (i < argc && arg_is_verbose(argv[i])) i++;
+    return i;
+}
+
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
             "  %s --make [--index-dir <path>] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
-            "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n",
+            "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
+            "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
+            "  for --make / --resume-merge; plain --search prints timing to stderr. Default output is a short summary.\n",
             argv0,
             argv0,
             argv0);
@@ -2155,9 +2215,11 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
 
     gmax = compute_max_open_trigram_buckets();
     ctx->tw_worker_max_open = compute_tw_worker_max_open(shard_count, gmax);
-    fprintf(stderr,
-            "ereport_index: tmp_trigram shard writers=%u max_open_per_shard=%u (EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS=%u)\n",
-            shard_count, ctx->tw_worker_max_open, gmax);
+    if (g_verbose) {
+        fprintf(stderr,
+                "ereport_index: tmp_trigram shard writers=%u max_open_per_shard=%u (EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS=%u)\n",
+                shard_count, ctx->tw_worker_max_open, gmax);
+    }
     return 0;
 }
 
@@ -2226,7 +2288,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     if (n == 0) return 0;
     if (worker_id >= ctx->trigram_tmp_shard_count) return -1;
 
-    mk_io_tls.trigram_append_batches++;
+    if (g_verbose) mk_io_tls.trigram_append_batches++;
     ix = tw_worker_fp_ix(worker_id, bucket);
     fp = ctx->tw_worker_fp[ix];
     if (fp) {
@@ -2494,9 +2556,9 @@ static void *trigram_worker_main(void *arg_void) {
 static void finalize_chunk_file_progress(index_run_stats_t *rs, file_state_t *file_states, size_t file_index) {
     unsigned int old_remaining;
     if (!file_states || !rs) return;
-    atomic_fetch_add_explicit(&rs->chunks_index_done, 1ULL, memory_order_relaxed);
+    if (g_verbose) atomic_fetch_add_explicit(&rs->chunks_index_done, 1ULL, memory_order_relaxed);
     old_remaining = atomic_fetch_sub(&file_states[file_index].remaining_chunks, 1U);
-    if (old_remaining == 1U) atomic_fetch_add(&rs->scanned_input_files, 1U);
+    if (old_remaining == 1U && g_verbose) atomic_fetch_add(&rs->scanned_input_files, 1U);
 }
 
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
@@ -2550,7 +2612,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         }
 
         scanned_local++;
-        if (scanned_local - scanned_published >= (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) {
+        if (g_verbose && scanned_local - scanned_published >= (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) {
             uint64_t delta =
                 ((scanned_local - scanned_published) / (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) *
                 (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE;
@@ -3391,7 +3453,7 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     ctx->merge_workers_used = 1;
     ctx->merge_workers_cpu = 1;
 
-    fprintf(stderr, "ereport_index: resuming merge in %s\n", ctx->index_dir);
+    if (g_verbose) fprintf(stderr, "ereport_index: resuming merge in %s\n", ctx->index_dir);
 
     if (build_path(key_path, sizeof(key_path), ctx->index_dir, "tri_keys.bin") != 0 ||
         build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0)
@@ -3435,13 +3497,15 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
         int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
         if (mw < 1) mw = 1;
         if (mw < merge_workers) {
-            fprintf(stderr,
-                    "ereport_index: parallel merge workers %d -> %d "
-                    "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB — a fraction of MemAvailable/cgroup, not full RAM; resume)\n"
-                    "  Each worker needs ~2× max bucket size in RAM. EREPORT_INDEX_THREADS only affects `--make` "
-                    "indexing. For more workers: EREPORT_INDEX_MERGE_RAM_FRAC or EREPORT_INDEX_MERGE_MEMORY_MB.\n",
-                    merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
-                    (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            if (g_verbose) {
+                fprintf(stderr,
+                        "ereport_index: parallel merge workers %d -> %d "
+                        "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB — a fraction of MemAvailable/cgroup, not full RAM; resume)\n"
+                        "  Each worker needs ~2× max bucket size in RAM. EREPORT_INDEX_THREADS only affects `--make` "
+                        "indexing. For more workers: EREPORT_INDEX_MERGE_RAM_FRAC or EREPORT_INDEX_MERGE_MEMORY_MB.\n",
+                        merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
+                        (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            }
             merge_workers = mw;
         }
     }
@@ -3454,18 +3518,22 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
                 uint32_t bkt = need_merge[bi];
                 uint64_t tbs = bucket_tmp_files_total_bytes(ctx, bkt);
 
-                if (tbs > 0) {
-                    fprintf(stderr,
-                            "ereport_index: tmp→seg bucket %04u (%zu/%zu) %.2f GiB — mmap, radix sort, write "
-                            "(one CPU busy; first huge bucket can take tens of minutes)…\n",
-                            bkt, bi + 1, n_need, (double)tbs / (1024.0 * 1024.0 * 1024.0));
-                } else {
-                    fprintf(stderr, "ereport_index: tmp→seg bucket %04u (%zu/%zu)…\n", bkt, bi + 1, n_need);
+                if (g_verbose) {
+                    if (tbs > 0) {
+                        fprintf(stderr,
+                                "ereport_index: tmp→seg bucket %04u (%zu/%zu) %.2f GiB — mmap, radix sort, write "
+                                "(one CPU busy; first huge bucket can take tens of minutes)…\n",
+                                bkt, bi + 1, n_need, (double)tbs / (1024.0 * 1024.0 * 1024.0));
+                    } else {
+                        fprintf(stderr, "ereport_index: tmp→seg bucket %04u (%zu/%zu)…\n", bkt, bi + 1, n_need);
+                    }
+                    fflush(stderr);
                 }
-                fflush(stderr);
                 if (merge_bucket_to_segment_files(ctx, bkt, NULL) != 0) goto out;
-                fprintf(stderr, "ereport_index: bucket %04u tmp→seg finished.\n", bkt);
-                fflush(stderr);
+                if (g_verbose) {
+                    fprintf(stderr, "ereport_index: bucket %04u tmp→seg finished.\n", bkt);
+                    fflush(stderr);
+                }
                 maybe_emit_status(ctx, "merge", (uint64_t)bi + 1U, (uint64_t)n_need);
             }
         } else {
@@ -3589,7 +3657,7 @@ static int resume_merge_index_dir(const char *index_dir) {
     ml_storage.tq = NULL;
     ml_storage.chunkq = NULL;
     atomic_init(&ml_storage.stop, 0);
-    if (build_path(logpath, sizeof(logpath), index_dir, "ereport_index.log") == 0) {
+    if (g_verbose && build_path(logpath, sizeof(logpath), index_dir, "ereport_index.log") == 0) {
         ml_storage.fp = fopen(logpath, "a");
         if (ml_storage.fp) {
             if (pthread_create(&memlog_tid, NULL, memlog_thread_main, &ml_storage) != 0) {
@@ -3619,9 +3687,11 @@ static int resume_merge_index_dir(const char *index_dir) {
     printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
     printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
     printf("merge_workers=%d\n", ctx.merge_workers_used);
-    printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
-    printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
     printf("elapsed_sec=%.3f\n", now_sec() - t0);
+    if (g_verbose) {
+        printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
+        printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
+    }
     return 0;
 }
 
@@ -3682,13 +3752,15 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
         if (mw < 1) mw = 1;
         if (mw < merge_workers) {
-            fprintf(stderr,
-                    "ereport_index: parallel merge workers %d -> %d "
-                    "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB; "
-                    "EREPORT_INDEX_MERGE_MEMORY_MB / EREPORT_INDEX_MERGE_RAM_FRAC to adjust)\n"
-                    "  EREPORT_INDEX_THREADS applies to `--make` indexing only, not merge.\n",
-                    merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
-                    (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            if (g_verbose) {
+                fprintf(stderr,
+                        "ereport_index: parallel merge workers %d -> %d "
+                        "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB; "
+                        "EREPORT_INDEX_MERGE_MEMORY_MB / EREPORT_INDEX_MERGE_RAM_FRAC to adjust)\n"
+                        "  EREPORT_INDEX_THREADS applies to `--make` indexing only, not merge.\n",
+                        merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
+                        (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            }
             merge_workers = mw;
         }
     }
@@ -3972,8 +4044,10 @@ static int build_index_dir(const char *user_spec,
         prep_threads = threads;
         if ((size_t)prep_threads > path_count) prep_threads = (int)path_count;
 
-        fprintf(stderr, "ereport_index: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
-        fflush(stderr);
+        if (g_verbose) {
+            fprintf(stderr, "ereport_index: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
+            fflush(stderr);
+        }
 
         memset(&pool, 0, sizeof(pool));
         pool.paths = paths;
@@ -4206,19 +4280,23 @@ static int build_index_dir(const char *user_spec,
         return 1;
     }
 
-    fprintf(stderr,
-            "ereport_index: make: parse_workers=%d trigram_workers=%d trigram_job_queue_depth=%zu write_batch_paths=%zu\n",
-            threads,
-            trigram_threads,
-            trigram_queue_depth_cfg,
-            g_write_batch_paths_base);
-    fflush(stderr);
+    if (g_verbose) {
+        fprintf(stderr,
+                "ereport_index: make: parse_workers=%d trigram_workers=%d trigram_job_queue_depth=%zu write_batch_paths=%zu\n",
+                threads,
+                trigram_threads,
+                trigram_queue_depth_cfg,
+                g_write_batch_paths_base);
+        fflush(stderr);
+    }
     atomic_store_explicit(&run_stats.chunks_index_done, 0ULL, memory_order_relaxed);
     run_stats.index_chunks_total = (uint64_t)chunk_count;
-    fprintf(stderr,
-            "ereport_index: indexing %zu parallel chunk task(s); stderr updates every ~1s (chunks, rec, idx, tri, ...)\n",
-            chunk_count);
-    fflush(stderr);
+    if (g_verbose) {
+        fprintf(stderr,
+                "ereport_index: indexing %zu parallel chunk task(s); stderr updates every ~1s (chunks, rec, idx, tri, ...)\n",
+                chunk_count);
+        fflush(stderr);
+    }
     atomic_store_explicit(&run_stats.stats_wake, 1, memory_order_relaxed);
 
     queue.chunks = chunks;
@@ -4407,7 +4485,7 @@ static int build_index_dir(const char *user_spec,
     }
 
     memset(&ml_storage, 0, sizeof(ml_storage));
-    {
+    if (g_verbose) {
         char logpath[PATH_MAX];
 
         if (build_path(logpath, sizeof(logpath), ctx.index_dir, "ereport_index.log") == 0) {
@@ -4572,73 +4650,77 @@ static int build_index_dir(const char *user_spec,
     printf("index_phase_sec=%.3f\n", ctx.index_phase_sec);
     printf("index_workers=%d\n", ctx.index_workers_used);
     printf("index_trigram_workers=%d\n", ctx.trigram_writer_workers_used);
-    printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
-    printf("write_batch_paths=%zu\n", g_write_batch_paths_base);
-    {
-        char ips_buf[32];
-        double ips = ctx.index_phase_sec > 0.0 ? (double)ctx.indexed_paths / ctx.index_phase_sec : 0.0;
-        human_decimal(ips, ips_buf, sizeof(ips_buf));
-        printf("index_paths_per_sec=%s\n", ips_buf);
-    }
     printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
     printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
-    printf("merge_buckets_skipped=%u\n", ctx.merge_buckets_skipped);
-    printf("merge_trigram_records_read=%" PRIu64 "\n", ctx.merge_trigram_records_read);
     printf("merge_workers=%d\n", ctx.merge_workers_used);
-    printf("merge_workers_cpu=%d\n", ctx.merge_workers_cpu);
-    printf("merge_max_bucket_mib=%.1f\n", (double)ctx.merge_max_bucket_bytes / (1024.0 * 1024.0));
-    printf("merge_parallel_ram_budget_mib=%.1f\n", (double)ctx.merge_parallel_budget_bytes / (1024.0 * 1024.0));
-    printf("merge_bytes_temp_read=%" PRIu64 "\n", ctx.merge_bytes_temp_read);
-    printf("merge_bucket_ram_peak_est=%" PRIu64 "\n",
-           (uint64_t)atomic_load_explicit(&ctx.merge_bucket_ram_peak, memory_order_relaxed));
-    printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
-    printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
-    {
-        char merge_bkt_buf[32], merge_in_buf[32], merge_out_buf[32];
-        double merge_bkt_s = ctx.merge_phase_sec > 0.0 ? (double)ctx.merge_buckets_nonempty / ctx.merge_phase_sec : 0.0;
-        double merge_in_Bps = ctx.merge_phase_sec > 0.0 ? (double)ctx.merge_bytes_temp_read / ctx.merge_phase_sec : 0.0;
-        uint64_t merge_out_bytes = ctx.merge_bytes_tri_keys_written + ctx.merge_bytes_tri_postings_written;
-        double merge_out_Bps = ctx.merge_phase_sec > 0.0 ? (double)merge_out_bytes / ctx.merge_phase_sec : 0.0;
-        human_decimal(merge_bkt_s, merge_bkt_buf, sizeof(merge_bkt_buf));
-        human_decimal(merge_in_Bps, merge_in_buf, sizeof(merge_in_buf));
-        human_decimal(merge_out_Bps, merge_out_buf, sizeof(merge_out_buf));
-        printf("merge_nonempty_buckets_per_sec=%s\n", merge_bkt_buf);
-        printf("merge_temp_read_bytes_per_sec=%s\n", merge_in_buf);
-        printf("merge_output_bytes_per_sec=%s\n", merge_out_buf);
-    }
-    {
-        char avg_paths_buf[32];
-        double avg_paths = (t1 > t0) ? (double)ctx.indexed_paths / (t1 - t0) : 0.0;
-        human_decimal(avg_paths, avg_paths_buf, sizeof(avg_paths_buf));
-    printf("avg_paths_per_sec=%s\n", avg_paths_buf);
-    }
-    printf("writeq_max_batches=%zu\n", write_queue.max_depth);
-    printf("write_batch_flush_at=%zu\n", batch_paths_flush_limit(threads));
-    printf("writeq_writer_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_writer_waits));
-    printf("writeq_parse_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_parse_waits));
-    printf("trigramq_paths_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_paths_waits));
-    printf("trigramq_worker_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_worker_waits));
-    printf("wall_after_index_sec=%.3f\n", (t1 - t0) - ctx.index_phase_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
-    if (ru_have_start && ru_have_prep) rusage_print_delta("cpu_prep", &ru_after_prep, &ru_make_start);
-    if (ru_have_prep && ru_have_index) rusage_print_delta("cpu_idx", &ru_after_index, &ru_after_prep);
-    if (ru_have_index && ru_have_merge) rusage_print_delta("cpu_mrg", &ru_after_merge, &ru_after_index);
-    if (ru_have_start && ru_have_merge) rusage_print_delta("cpu_make", &ru_after_merge, &ru_make_start);
+    if (g_verbose) {
+        printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
+        printf("write_batch_paths=%zu\n", g_write_batch_paths_base);
+        {
+            char ips_buf[32];
+            double ips = ctx.index_phase_sec > 0.0 ? (double)ctx.indexed_paths / ctx.index_phase_sec : 0.0;
+            human_decimal(ips, ips_buf, sizeof(ips_buf));
+            printf("index_paths_per_sec=%s\n", ips_buf);
+        }
+        printf("merge_buckets_skipped=%u\n", ctx.merge_buckets_skipped);
+        printf("merge_trigram_records_read=%" PRIu64 "\n", ctx.merge_trigram_records_read);
+        printf("merge_workers_cpu=%d\n", ctx.merge_workers_cpu);
+        printf("merge_max_bucket_mib=%.1f\n", (double)ctx.merge_max_bucket_bytes / (1024.0 * 1024.0));
+        printf("merge_parallel_ram_budget_mib=%.1f\n", (double)ctx.merge_parallel_budget_bytes / (1024.0 * 1024.0));
+        printf("merge_bytes_temp_read=%" PRIu64 "\n", ctx.merge_bytes_temp_read);
+        printf("merge_bucket_ram_peak_est=%" PRIu64 "\n",
+               (uint64_t)atomic_load_explicit(&ctx.merge_bucket_ram_peak, memory_order_relaxed));
+        printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
+        printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
+        {
+            char merge_bkt_buf[32], merge_in_buf[32], merge_out_buf[32];
+            double merge_bkt_s = ctx.merge_phase_sec > 0.0 ? (double)ctx.merge_buckets_nonempty / ctx.merge_phase_sec : 0.0;
+            double merge_in_Bps = ctx.merge_phase_sec > 0.0 ? (double)ctx.merge_bytes_temp_read / ctx.merge_phase_sec : 0.0;
+            uint64_t merge_out_bytes = ctx.merge_bytes_tri_keys_written + ctx.merge_bytes_tri_postings_written;
+            double merge_out_Bps = ctx.merge_phase_sec > 0.0 ? (double)merge_out_bytes / ctx.merge_phase_sec : 0.0;
+            human_decimal(merge_bkt_s, merge_bkt_buf, sizeof(merge_bkt_buf));
+            human_decimal(merge_in_Bps, merge_in_buf, sizeof(merge_in_buf));
+            human_decimal(merge_out_Bps, merge_out_buf, sizeof(merge_out_buf));
+            printf("merge_nonempty_buckets_per_sec=%s\n", merge_bkt_buf);
+            printf("merge_temp_read_bytes_per_sec=%s\n", merge_in_buf);
+            printf("merge_output_bytes_per_sec=%s\n", merge_out_buf);
+        }
+        {
+            char avg_paths_buf[32];
+            double avg_paths = (t1 > t0) ? (double)ctx.indexed_paths / (t1 - t0) : 0.0;
+            human_decimal(avg_paths, avg_paths_buf, sizeof(avg_paths_buf));
+            printf("avg_paths_per_sec=%s\n", avg_paths_buf);
+        }
+        printf("writeq_max_batches=%zu\n", write_queue.max_depth);
+        printf("write_batch_flush_at=%zu\n", batch_paths_flush_limit(threads));
+        printf("writeq_writer_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_writer_waits));
+        printf("writeq_parse_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.writeq_parse_waits));
+        printf("trigramq_paths_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_paths_waits));
+        printf("trigramq_worker_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_worker_waits));
+        printf("wall_after_index_sec=%.3f\n", (t1 - t0) - ctx.index_phase_sec);
+        if (ru_have_start && ru_have_prep) rusage_print_delta("cpu_prep", &ru_after_prep, &ru_make_start);
+        if (ru_have_prep && ru_have_index) rusage_print_delta("cpu_idx", &ru_after_index, &ru_after_prep);
+        if (ru_have_index && ru_have_merge) rusage_print_delta("cpu_mrg", &ru_after_merge, &ru_after_index);
+        if (ru_have_start && ru_have_merge) rusage_print_delta("cpu_make", &ru_after_merge, &ru_make_start);
 
-    mk_io_tls_flush();
-    printf("make_fread_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_calls, memory_order_relaxed));
-    printf("make_fread_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_bytes, memory_order_relaxed));
-    printf("make_fwrite_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_calls, memory_order_relaxed));
-    printf("make_fwrite_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_bytes, memory_order_relaxed));
-    printf("make_fopen_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fopen_calls, memory_order_relaxed));
-    printf("make_fclose_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fclose_calls, memory_order_relaxed));
-    printf("make_open_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_open_calls, memory_order_relaxed));
-    printf("make_read_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_calls, memory_order_relaxed));
-    printf("make_read_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_bytes, memory_order_relaxed));
-    printf("make_mmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_mmap_calls, memory_order_relaxed));
-    printf("make_munmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_munmap_calls, memory_order_relaxed));
-    printf("make_trigram_append_batches=%llu\n",
-           (unsigned long long)atomic_load_explicit(&g_mk_trigram_append_batches, memory_order_relaxed));
+        mk_io_tls_flush();
+        printf("make_fread_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_calls, memory_order_relaxed));
+        printf("make_fread_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_bytes, memory_order_relaxed));
+        printf("make_fwrite_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_calls, memory_order_relaxed));
+        printf("make_fwrite_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_bytes, memory_order_relaxed));
+        printf("make_fopen_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fopen_calls, memory_order_relaxed));
+        printf("make_fclose_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fclose_calls, memory_order_relaxed));
+        printf("make_open_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_open_calls, memory_order_relaxed));
+        printf("make_read_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_calls, memory_order_relaxed));
+        printf("make_read_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_bytes, memory_order_relaxed));
+        printf("make_mmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_mmap_calls, memory_order_relaxed));
+        printf("make_munmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_munmap_calls, memory_order_relaxed));
+        printf("make_trigram_append_batches=%llu\n",
+               (unsigned long long)atomic_load_explicit(&g_mk_trigram_append_batches, memory_order_relaxed));
+    } else {
+        mk_io_tls_flush();
+    }
 
     free(tids);
     free(args);
@@ -5314,6 +5396,11 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     rc = 0;
 
 out:
+    if (rc == 0 && g_verbose && !json_output)
+        fprintf(stderr,
+                "ereport_index: search_ms=%" PRIu64 " (EREPORT_INDEX_THREADS=%d)\n",
+                monotonic_ms_elapsed(&t_search_start),
+                search_threads);
     if (lists) {
         for (size_t i = 0; i < query_trigram_count; i++) free(lists[i].ids);
         free(lists);
@@ -5328,23 +5415,35 @@ out:
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) die_usage(argv[0]);
+    int vi;
+    int cmd0;
 
-    if (strcmp(argv[1], "--resume-merge") == 0) {
-        if (argc >= 4 && strcmp(argv[2], "--index-dir") == 0 && argv[3][0] != '\0') return resume_merge_index_dir(argv[3]);
+    if (argc < 2) die_usage(argv[0]);
+    for (vi = 1; vi < argc; vi++) {
+        if (arg_is_verbose(argv[vi])) g_verbose = 1;
+    }
+
+    cmd0 = argv_skip_verbose_prefix(argc, argv);
+    if (cmd0 >= argc) die_usage(argv[0]);
+
+    if (strcmp(argv[cmd0], "--resume-merge") == 0) {
+        if (cmd0 + 2 < argc && strcmp(argv[cmd0 + 1], "--index-dir") == 0 && argv[cmd0 + 2][0] != '\0')
+            return resume_merge_index_dir(argv[cmd0 + 2]);
         fprintf(stderr, "ereport_index: --resume-merge requires --index-dir <path>\n");
         return 2;
     }
 
-    if (strcmp(argv[1], "--make") == 0) {
+    if (strcmp(argv[cmd0], "--make") == 0) {
         const char **dirpaths;
         size_t dirpath_count;
         int all_users_mode;
         const char *user_spec = NULL;
         const char *index_dir_override = NULL;
-        int ai = 2;
+        int ai = cmd0 + 1;
         uid_t probe_uid;
         char probe_disp[256];
+
+        while (ai < argc && arg_is_verbose(argv[ai])) ai++;
 
         if (ai < argc && strcmp(argv[ai], "--index-dir") == 0) {
             if (ai + 2 > argc) {
@@ -5354,6 +5453,8 @@ int main(int argc, char **argv) {
             index_dir_override = argv[ai + 1];
             ai += 2;
         }
+
+        while (ai < argc && arg_is_verbose(argv[ai])) ai++;
 
         if (argc == ai) {
             static const char *dot = ".";
@@ -5380,10 +5481,11 @@ int main(int argc, char **argv) {
             dirpaths = (const char **)(argv + ai);
             dirpath_count = (size_t)(argc - ai);
         }
+        while (dirpath_count > 0 && arg_is_verbose(dirpaths[dirpath_count - 1])) dirpath_count--;
         return build_index_dir(user_spec, dirpaths, dirpath_count, all_users_mode, index_dir_override);
     }
 
-    if (strcmp(argv[1], "--search") == 0) {
+    if (strcmp(argv[cmd0], "--search") == 0) {
         const char *index_dir = "index";
         uint64_t skip_req = 0;
         uint64_t limit_req = UINT64_MAX;
@@ -5391,7 +5493,8 @@ int main(int argc, char **argv) {
         int ai;
         const char *term;
 
-        ai = 2;
+        ai = cmd0 + 1;
+        while (ai < argc && arg_is_verbose(argv[ai])) ai++;
         if (ai < argc && strcmp(argv[ai], "--index-dir") == 0) {
             if (ai + 2 > argc || argv[ai + 1][0] == '\0') {
                 fprintf(stderr, "ereport_index: --search --index-dir requires a path\n");
@@ -5406,6 +5509,10 @@ int main(int argc, char **argv) {
         ai++;
 
         while (ai < argc) {
+            if (arg_is_verbose(argv[ai])) {
+                ai++;
+                continue;
+            }
             if (strcmp(argv[ai], "--json") == 0) {
                 json_output = 1;
                 ai++;

@@ -635,21 +635,27 @@ static void human_decimal(double v, char *buf, size_t sz) {
     else snprintf(buf, sz, "%.2f%s", v, units[i]);
 }
 
-/* Thousands separators for HTML (locale-independent). */
+/* Thousands separators for HTML (locale-independent). First group has 1–3 digits, then groups of 3. */
 static void format_uint_commas(uint64_t n, char *buf, size_t sz) {
     char raw[40];
     size_t raw_len;
-    size_t i, j;
+    size_t i, pos;
+    size_t first_len;
+    unsigned g;
 
     if (sz == 0) return;
     snprintf(raw, sizeof(raw), "%" PRIu64, n);
     raw_len = strlen(raw);
-    j = 0;
-    for (i = 0; i < raw_len && j + 1 < sz; i++) {
-        if (i > 0 && (raw_len - i) % 3 == 0) buf[j++] = ',';
-        buf[j++] = raw[i];
+    first_len = raw_len % 3U;
+    if (first_len == 0) first_len = 3U;
+    pos = 0;
+    for (i = 0; i < first_len && pos + 1 < sz; i++) buf[pos++] = raw[i];
+    while (i < raw_len) {
+        if (pos + 1 >= sz) break;
+        buf[pos++] = ',';
+        for (g = 0; g < 3U && i < raw_len && pos + 1 < sz; g++, i++) buf[pos++] = raw[i];
     }
-    buf[j] = '\0';
+    buf[pos] = '\0';
 }
 
 /* Abbreviated count in parentheses only for 7+ digit totals (>= 1,000,000): (111M), (5T). */
@@ -675,7 +681,7 @@ static void format_count_paren_round(uint64_t n, char *buf, size_t sz) {
 
 /* Comma-separated count; optional abbreviated suffix in parentheses only when >= 1e6. */
 static void format_count_pretty_inline(uint64_t n, char *buf, size_t sz) {
-    char c[48];
+    char c[64];
     char p[16];
 
     format_uint_commas(n, c, sizeof(c));
@@ -1781,6 +1787,9 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "th{background:#ece6da;position:sticky;top:0;z-index:2}\n");
     fprintf(out, "th:first-child,td:first-child{position:sticky;left:0;background:#f8f5ee;z-index:1}\n");
     fprintf(out, "td.r,th.r{text-align:right}\n");
+    fprintf(out,
+            ".bucket-table-wrap td.r,.bucket-table-wrap th.r{box-sizing:border-box;overflow:hidden;overflow-wrap:"
+            "anywhere;word-break:break-word;hyphens:none}\n");
     fprintf(out, "th:first-child{width:40%%;min-width:min(560px,78vw);max-width:720px;box-sizing:border-box}\n");
     fprintf(out, ".path-cell{width:40%%;min-width:min(560px,78vw);max-width:720px;overflow-x:hidden;overflow-y:visible;box-sizing:border-box}\n");
     fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;min-width:0}\n");

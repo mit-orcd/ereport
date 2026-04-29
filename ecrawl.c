@@ -56,7 +56,7 @@
 #define PATH_MAX 4096
 #endif
 
-#define MAX_WORKERS 16
+#define DEFAULT_CRAWL_WORKERS 16
 #define DEFAULT_WRITER_THREADS 8
 #define DEFAULT_UID_SHARDS 8192U
 #define DEFAULT_MAX_OPEN_SHARDS 256U
@@ -344,7 +344,7 @@ static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
-static int g_worker_threads_limit = MAX_WORKERS;
+static int g_worker_threads_limit = DEFAULT_CRAWL_WORKERS;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
 static char g_output_dir[PATH_MAX] = ".";
@@ -434,16 +434,16 @@ static int is_power_of_two_u32(uint32_t v) {
     return v && ((v & (v - 1U)) == 0U);
 }
 
-/* Crawl worker thread count (1..MAX_WORKERS). Default: MAX_WORKERS. */
+/* Crawl worker thread count (>=1). Default: DEFAULT_CRAWL_WORKERS. No fixed upper bound (RAM / OS limits apply). */
 static int parse_ecrawl_workers(void) {
     const char *e = getenv("ECRAWL_WORKERS");
     long t;
     char *end;
 
-    if (!e || !*e) return MAX_WORKERS;
+    if (!e || !*e) return DEFAULT_CRAWL_WORKERS;
     errno = 0;
     t = strtol(e, &end, 10);
-    if (errno || end == e || *end || t < 1 || t > MAX_WORKERS) return MAX_WORKERS;
+    if (errno || end == e || *end || t < 1 || t > (long)INT_MAX) return DEFAULT_CRAWL_WORKERS;
     return (int)t;
 }
 
@@ -961,11 +961,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
-            "Optional env: ECRAWL_WORKERS (1..%d crawl workers, default %d), "
+            "Optional env: ECRAWL_WORKERS (crawl workers, default %d, minimum 1), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE).\n",
-            MAX_WORKERS,
-            MAX_WORKERS,
+            DEFAULT_CRAWL_WORKERS,
             DEFAULT_WRITER_THREADS,
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS);
@@ -2310,8 +2309,8 @@ int main(int argc, char **argv) {
     shared_state_t shared;
     task_queue_t queue;
     writer_queue_t *writer_queues = NULL;
-    pthread_t workers[MAX_WORKERS];
-    worker_arg_t worker_args[MAX_WORKERS];
+    pthread_t *workers = NULL;
+    worker_arg_t *worker_args = NULL;
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
@@ -2591,6 +2590,33 @@ int main(int argc, char **argv) {
     }
     stats_thread_started = 1;
 
+    workers = (pthread_t *)calloc((size_t)g_worker_threads_limit, sizeof(*workers));
+    worker_args = (worker_arg_t *)calloc((size_t)g_worker_threads_limit, sizeof(*worker_args));
+    if (!workers || !worker_args) {
+        free(workers);
+        free(worker_args);
+        fprintf(stderr, "ERROR allocation failed for crawl worker tables (%d workers)\n", g_worker_threads_limit);
+        atomic_store(&g_stop_stats, 1);
+        pthread_join(stats_thread, NULL);
+        clear_status_line();
+        if (!g_no_write) {
+            for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
+            for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
+        }
+        if (!g_no_write) {
+            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
+            free(writer_queues);
+            free(writer_threads);
+            free(writer_args);
+        }
+        queue_destroy(&queue);
+        pthread_mutex_destroy(&shared.stats_mutex);
+        if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+        return 1;
+    }
+
     for (i = 0; i < g_worker_threads_limit; i++) {
         worker_args[i].shared = &shared;
         worker_args[i].queue = &queue;
@@ -2758,6 +2784,9 @@ int main(int argc, char **argv) {
             print_queue_wait_metrics();
         }
     }
+
+    free(workers);
+    free(worker_args);
 
     if (!g_no_write) {
         for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
