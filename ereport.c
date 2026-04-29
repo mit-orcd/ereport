@@ -207,6 +207,9 @@ typedef struct ereport_run_stats {
     uint64_t input_files_total;
     atomic_ullong chunk_prep_files_done;
     uint64_t chunk_prep_files_total;
+    /* During chunk-map: each prep thread sets its slot to the .bin path it is scanning (else NULL). */
+    volatile const char **chunk_map_worker_paths;
+    int chunk_map_path_slots;
     double run_start_sec;
     double records_rate_sum;
     double records_rate_min;
@@ -223,6 +226,8 @@ static void ereport_run_stats_reset(ereport_run_stats_t *s) {
     s->input_files_total = 0;
     atomic_store(&s->chunk_prep_files_done, 0);
     s->chunk_prep_files_total = 0;
+    s->chunk_map_worker_paths = NULL;
+    s->chunk_map_path_slots = 0;
     s->run_start_sec = 0.0;
     s->records_rate_sum = 0.0;
     s->records_rate_min = 0.0;
@@ -2139,6 +2144,33 @@ static void *stats_thread_main(void *arg) {
                 printf("\rchunk-map files:%s/%s | scanning bin headers for parallel parse | el:%s            ", pdone, ptot,
                        elapsed_buf);
                 fflush(stdout);
+                {
+                    static double last_chunk_map_path_log;
+                    double now_cp = now_sec();
+                    volatile const char **wpaths = rs->chunk_map_worker_paths;
+                    int nslots = rs->chunk_map_path_slots;
+                    int si, any;
+
+                    if (wpaths && nslots > 0 && (now_cp - last_chunk_map_path_log) >= 8.0) {
+                        last_chunk_map_path_log = now_cp;
+                        any = 0;
+                        for (si = 0; si < nslots; si++) {
+                            if (wpaths[si]) {
+                                if (!any) {
+                                    fprintf(stderr, "ereport: chunk-map still scanning (slow disk / huge shard): ");
+                                    any = 1;
+                                } else {
+                                    fprintf(stderr, " | ");
+                                }
+                                fprintf(stderr, "%s", wpaths[si]);
+                            }
+                        }
+                        if (any) {
+                            fprintf(stderr, "\n");
+                            fflush(stderr);
+                        }
+                    }
+                }
             } else {
                 printf("\r%s rec/s(10s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
                        rr, sf, tf, sr, mr, bad_input_files, elapsed_buf);
@@ -2429,10 +2461,19 @@ typedef struct {
     size_t *prep_chunk_counts;
     atomic_size_t next_path_index;
     ereport_run_stats_t *run_stats;
+    volatile const char **worker_cur_path;
+    int worker_cur_path_slots;
 } chunk_prep_pool_t;
 
+typedef struct {
+    chunk_prep_pool_t *pool;
+    int slot;
+} chunk_prep_thread_arg_t;
+
 static void *chunk_prep_worker_main(void *arg) {
-    chunk_prep_pool_t *pool = (chunk_prep_pool_t *)arg;
+    chunk_prep_thread_arg_t *ta = (chunk_prep_thread_arg_t *)arg;
+    chunk_prep_pool_t *pool = ta->pool;
+    int slot = ta->slot;
 
     for (;;) {
         size_t i = atomic_fetch_add_explicit(&pool->next_path_index, 1, memory_order_relaxed);
@@ -2443,13 +2484,20 @@ static void *chunk_prep_worker_main(void *arg) {
 
         if (i >= pool->path_count) break;
 
+        if (pool->worker_cur_path && slot >= 0 && slot < pool->worker_cur_path_slots) pool->worker_cur_path[slot] = pool->paths[i];
+
         r = build_chunks_for_file(pool->paths[i], i, pool->chunk_targets[i], &local_chunks, &local_count, &fc);
+
+        if (pool->worker_cur_path && slot >= 0 && slot < pool->worker_cur_path_slots) pool->worker_cur_path[slot] = NULL;
+
         pool->prep_rc[(int)i] = r;
         pool->prep_chunks[(int)i] = local_chunks;
         pool->prep_chunk_counts[(int)i] = local_count;
         (void)fc;
         atomic_fetch_add_explicit(&pool->run_stats->chunk_prep_files_done, 1ULL, memory_order_relaxed);
     }
+
+    if (pool->worker_cur_path && slot >= 0 && slot < pool->worker_cur_path_slots) pool->worker_cur_path[slot] = NULL;
 
     return NULL;
 }
@@ -3168,6 +3216,8 @@ int main(int argc, char **argv) {
         size_t *prep_chunk_counts = (size_t *)calloc(path_count, sizeof(size_t));
         chunk_prep_pool_t pool;
         pthread_t *prep_tids = NULL;
+        chunk_prep_thread_arg_t *prep_args = NULL;
+        volatile const char **chunk_wpaths = NULL;
         int prep_threads;
         size_t merge_off;
 
@@ -3214,6 +3264,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ereport: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
         fflush(stderr);
 
+        chunk_wpaths = (volatile const char **)calloc((size_t)prep_threads, sizeof(*chunk_wpaths));
+        prep_args = (chunk_prep_thread_arg_t *)calloc((size_t)prep_threads, sizeof(*prep_args));
+        if (!chunk_wpaths || !prep_args) {
+            fprintf(stderr, "allocation failed\n");
+            free((void *)chunk_wpaths);
+            free(prep_args);
+            atomic_store(&run_stats.stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            stats_thread_started = 0;
+            free(chunk_targets);
+            free(prep_rc);
+            free(prep_chunks);
+            free(prep_chunk_counts);
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            free(file_states);
+            return 1;
+        }
+
+        run_stats.chunk_map_worker_paths = chunk_wpaths;
+        run_stats.chunk_map_path_slots = prep_threads;
+
         memset(&pool, 0, sizeof(pool));
         pool.paths = paths;
         pool.chunk_targets = chunk_targets;
@@ -3222,11 +3295,17 @@ int main(int argc, char **argv) {
         pool.prep_chunks = prep_chunks;
         pool.prep_chunk_counts = prep_chunk_counts;
         pool.run_stats = &run_stats;
+        pool.worker_cur_path = chunk_wpaths;
+        pool.worker_cur_path_slots = prep_threads;
         atomic_store(&pool.next_path_index, 0);
 
         prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
         if (!prep_tids) {
             fprintf(stderr, "allocation failed\n");
+            free((void *)chunk_wpaths);
+            free(prep_args);
+            run_stats.chunk_map_worker_paths = NULL;
+            run_stats.chunk_map_path_slots = 0;
             atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
             clear_status_line();
@@ -3242,15 +3321,22 @@ int main(int argc, char **argv) {
         }
 
         for (i = 0; i < prep_threads; i++) {
-            if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
+            prep_args[i].pool = &pool;
+            prep_args[i].slot = (int)i;
+            if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &prep_args[i]) != 0) {
                 int j;
                 fprintf(stderr, "failed to create chunk-prep thread\n");
+                for (j = 0; j < i; j++) pthread_join(prep_tids[j], NULL);
+                free(prep_tids);
+                prep_tids = NULL;
+                free((void *)chunk_wpaths);
+                free(prep_args);
+                run_stats.chunk_map_worker_paths = NULL;
+                run_stats.chunk_map_path_slots = 0;
                 atomic_store(&run_stats.stop_stats, 1);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
-                for (j = 0; j < i; j++) pthread_join(prep_tids[j], NULL);
-                free(prep_tids);
                 free(chunk_targets);
                 free(prep_rc);
                 free(prep_chunks);
@@ -3265,6 +3351,12 @@ int main(int argc, char **argv) {
         for (i = 0; i < prep_threads; i++) pthread_join(prep_tids[i], NULL);
         free(prep_tids);
         prep_tids = NULL;
+        free(prep_args);
+        prep_args = NULL;
+        free((void *)chunk_wpaths);
+        chunk_wpaths = NULL;
+        run_stats.chunk_map_worker_paths = NULL;
+        run_stats.chunk_map_path_slots = 0;
 
         chunk_count = 0;
         for (i = 0; (size_t)i < path_count; i++) {

@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -40,9 +42,16 @@
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define WRITE_BATCH_PATHS 4096
 #define TRIGRAM_JOB_QUEUE_DEPTH 4096 /* pending paths between paths writer and trigram workers */
+#define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
 #define MERGE_MAX_WORKERS 16
 #define MERGE_PARALLEL_MIN 4
+/* Each parallel merge worker holds ~2× bucket file bytes (mmap + radix aux) plus stdio buffers — cap workers to avoid OOM. */
+#define MERGE_PER_WORKER_OVERHEAD_BYTES (16ULL << 20)
+/* Fraction of min(MemAvailable, cgroup memory.max) used as merge parallelism budget. 55% lets ~2 workers
+ * run when max bucket ≈50 GiB and the host has ~360+ GiB MemAvailable; 45% often capped to 1 worker. */
+#define MERGE_RAM_FRAC_NUM 55U
+#define MERGE_RAM_FRAC_DEN 100U
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -103,6 +112,7 @@ typedef struct write_batch {
     parsed_path_t *items;
     size_t count;
     size_t cap;
+    size_t approx_body_bytes; /* path strings + trigram codes; excludes batch struct overhead */
     struct write_batch *next;
 } write_batch_t;
 
@@ -153,6 +163,7 @@ typedef struct {
     write_batch_t *tail;
     size_t depth;
     size_t max_depth;
+    uint64_t queued_body_bytes; /* sum of batch->approx_body_bytes in queue */
     int closed;
     index_run_stats_t *run_stats;
 } write_queue_t;
@@ -161,6 +172,7 @@ typedef struct trigram_job {
     uint64_t path_id;
     uint32_t *codes;
     size_t code_count;
+    size_t approx_body_bytes; /* sizeof job + codes array */
     struct trigram_job *next;
 } trigram_job_t;
 
@@ -172,6 +184,7 @@ typedef struct {
     trigram_job_t *tail;
     size_t depth;
     size_t max_depth;
+    uint64_t queued_body_bytes;
     int closed;
     index_run_stats_t *run_stats;
 } trigram_job_queue_t;
@@ -211,9 +224,15 @@ typedef struct {
     FILE **bucket_parallel_fp;             /* lazy-open tmp_trigrams; parallel trigram writers */
     index_run_stats_t *run_stats;
     int merge_workers_used;
+    int merge_workers_cpu; /* before memory cap */
+    uint64_t merge_max_bucket_bytes;
+    uint64_t merge_parallel_budget_bytes;
     double index_phase_sec;
     int index_workers_used;
     int trigram_writer_workers_used;
+    uint64_t chunk_path_bytes_total; /* sum strlen(chunk.path); for backlog estimate */
+    size_t chunk_total_count;
+    atomic_uint_fast64_t merge_bucket_ram_peak; /* ~2× largest bucket file during merge */
 } build_ctx_t;
 
 typedef struct {
@@ -245,6 +264,105 @@ typedef struct {
 
 static const char *g_input_layout = "legacy";
 static uint32_t g_input_uid_shards = 0;
+
+static double rusage_timeval_sec(const struct timeval *tv) {
+    return (double)tv->tv_sec + (double)tv->tv_usec / 1000000.0;
+}
+
+/* Phase CPU from getrusage(RUSAGE_SELF): sums all threads (Linux). No hot-path cost — only called at phase boundaries. */
+static void rusage_print_delta(const char *prefix, const struct rusage *later, const struct rusage *earlier) {
+    double u = rusage_timeval_sec(&later->ru_utime) - rusage_timeval_sec(&earlier->ru_utime);
+    double s = rusage_timeval_sec(&later->ru_stime) - rusage_timeval_sec(&earlier->ru_stime);
+    double tot = u + s;
+    long nvc = (long)((long)later->ru_nvcsw - (long)earlier->ru_nvcsw);
+    long niv = (long)((long)later->ru_nivcsw - (long)earlier->ru_nivcsw);
+    long minf = (long)((long)later->ru_minflt - (long)earlier->ru_minflt);
+    long majf = (long)((long)later->ru_majflt - (long)earlier->ru_majflt);
+
+    printf("%s_cpu_user_sec=%.3f\n", prefix, u);
+    printf("%s_cpu_sys_sec=%.3f\n", prefix, s);
+    if (tot > 1e-9) printf("%s_cpu_sys_frac=%.4f\n", prefix, s / tot);
+    printf("%s_ctx_sw_vol=%ld\n", prefix, nvc);
+    printf("%s_ctx_sw_inv=%ld\n", prefix, niv);
+    printf("%s_pf_minor=%ld\n", prefix, minf);
+    printf("%s_pf_major=%ld\n", prefix, majf);
+}
+
+/* Per-`--make` stdio/POSIX I/O + bucket-lock stats (tune by reducing calls, batching writes, spreading buckets). */
+static atomic_ullong g_mk_fread_calls;
+static atomic_ullong g_mk_fread_bytes;
+static atomic_ullong g_mk_fwrite_calls;
+static atomic_ullong g_mk_fwrite_bytes;
+static atomic_ullong g_mk_fopen_calls;
+static atomic_ullong g_mk_fclose_calls;
+static atomic_ullong g_mk_open_calls;
+static atomic_ullong g_mk_read_calls;
+static atomic_ullong g_mk_read_bytes;
+static atomic_ullong g_mk_mmap_calls;
+static atomic_ullong g_mk_munmap_calls;
+static atomic_ullong g_mk_bucket_lock_acqs;
+
+static void make_io_reset(void) {
+    atomic_store_explicit(&g_mk_fread_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_fread_bytes, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_fwrite_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_fwrite_bytes, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_fopen_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_fclose_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_open_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_read_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_read_bytes, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_mmap_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_munmap_calls, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_mk_bucket_lock_acqs, 0ULL, memory_order_relaxed);
+}
+
+static size_t mk_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    atomic_fetch_add_explicit(&g_mk_fread_calls, 1ULL, memory_order_relaxed);
+    size_t r = fread(ptr, size, nmemb, stream);
+    atomic_fetch_add_explicit(&g_mk_fread_bytes, (unsigned long long)(r * size), memory_order_relaxed);
+    return r;
+}
+
+static size_t mk_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    atomic_fetch_add_explicit(&g_mk_fwrite_calls, 1ULL, memory_order_relaxed);
+    size_t w = fwrite(ptr, size, nmemb, stream);
+    atomic_fetch_add_explicit(&g_mk_fwrite_bytes, (unsigned long long)(w * size), memory_order_relaxed);
+    return w;
+}
+
+static FILE *mk_fopen(const char *path, const char *mode) {
+    atomic_fetch_add_explicit(&g_mk_fopen_calls, 1ULL, memory_order_relaxed);
+    return fopen(path, mode);
+}
+
+static int mk_fclose(FILE *stream) {
+    atomic_fetch_add_explicit(&g_mk_fclose_calls, 1ULL, memory_order_relaxed);
+    return fclose(stream);
+}
+
+static int mk_open(const char *pathname, int flags) {
+    atomic_fetch_add_explicit(&g_mk_open_calls, 1ULL, memory_order_relaxed);
+    return open(pathname, flags);
+}
+
+static ssize_t mk_read(int fd, void *buf, size_t count) {
+    ssize_t n;
+    atomic_fetch_add_explicit(&g_mk_read_calls, 1ULL, memory_order_relaxed);
+    n = read(fd, buf, count);
+    if (n > 0) atomic_fetch_add_explicit(&g_mk_read_bytes, (unsigned long long)n, memory_order_relaxed);
+    return n;
+}
+
+static void *mk_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    atomic_fetch_add_explicit(&g_mk_mmap_calls, 1ULL, memory_order_relaxed);
+    return mmap(addr, length, prot, flags, fd, offset);
+}
+
+static int mk_munmap(void *addr, size_t length) {
+    atomic_fetch_add_explicit(&g_mk_munmap_calls, 1ULL, memory_order_relaxed);
+    return munmap(addr, length);
+}
 
 static double now_sec(void) {
     struct timeval tv;
@@ -367,6 +485,8 @@ static int write_batch_append(write_batch_t *batch, char *path, uint32_t *codes,
     batch->items[batch->count].path = path;
     batch->items[batch->count].codes = codes;
     batch->items[batch->count].code_count = code_count;
+    batch->approx_body_bytes += sizeof(parsed_path_t) + strlen(path) + 1U +
+                                code_count * sizeof(uint32_t);
     batch->count++;
     return 0;
 }
@@ -431,6 +551,7 @@ static int write_queue_push(write_queue_t *q, write_batch_t *batch) {
     else q->head = batch;
     q->tail = batch;
     q->depth++;
+    q->queued_body_bytes += (uint64_t)batch->approx_body_bytes;
     pthread_cond_signal(&q->has_batch);
     pthread_mutex_unlock(&q->mutex);
     return 0;
@@ -449,6 +570,7 @@ static write_batch_t *write_queue_pop_wait(write_queue_t *q) {
         q->head = batch->next;
         if (!q->head) q->tail = NULL;
         q->depth--;
+        q->queued_body_bytes -= (uint64_t)batch->approx_body_bytes;
         pthread_cond_broadcast(&q->has_space);
     }
     pthread_mutex_unlock(&q->mutex);
@@ -482,6 +604,7 @@ static int trigram_job_queue_push(trigram_job_queue_t *q, trigram_job_t *job) {
     else q->head = job;
     q->tail = job;
     q->depth++;
+    q->queued_body_bytes += (uint64_t)job->approx_body_bytes;
     pthread_cond_signal(&q->has_job);
     pthread_mutex_unlock(&q->mutex);
     return 0;
@@ -500,6 +623,7 @@ static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
         q->head = job->next;
         if (!q->head) q->tail = NULL;
         q->depth--;
+        q->queued_body_bytes -= (uint64_t)job->approx_body_bytes;
         pthread_cond_broadcast(&q->has_space);
     }
     pthread_mutex_unlock(&q->mutex);
@@ -512,6 +636,125 @@ static void trigram_job_queue_close(trigram_job_queue_t *q) {
     pthread_cond_broadcast(&q->has_job);
     pthread_cond_broadcast(&q->has_space);
     pthread_mutex_unlock(&q->mutex);
+}
+
+typedef struct {
+    atomic_int stop;
+    write_queue_t *wq;
+    trigram_job_queue_t *tq;
+    work_queue_t *chunkq;
+    build_ctx_t *ctx;
+    FILE *fp;
+} memlog_shared_t;
+
+static uint64_t chunk_queue_est_bytes(work_queue_t *q, const build_ctx_t *ctx) {
+    size_t pending;
+    uint64_t avg_path;
+
+    if (!q || !ctx || ctx->chunk_total_count == 0) return 0;
+    pthread_mutex_lock(&q->mutex);
+    pending = (q->count > q->next_index) ? (q->count - q->next_index) : 0;
+    pthread_mutex_unlock(&q->mutex);
+    if (pending == 0) return 0;
+    avg_path = ctx->chunk_path_bytes_total / ctx->chunk_total_count;
+    return (uint64_t)pending * ((uint64_t)sizeof(file_chunk_t) + avg_path);
+}
+
+static void memlog_sort_top3(uint64_t wq, uint64_t tq, uint64_t cq, uint64_t mq, const char **n1, const char **n2,
+                             const char **n3) {
+    struct {
+        const char *n;
+        uint64_t v;
+    } a[4];
+    size_t i, j;
+
+    a[0].n = "WB";
+    a[0].v = wq;
+    a[1].n = "TJ";
+    a[1].v = tq;
+    a[2].n = "CQ";
+    a[2].v = cq;
+    a[3].n = "MP";
+    a[3].v = mq;
+    for (i = 0; i < 4; i++) {
+        for (j = i + 1; j < 4; j++) {
+            if (a[j].v > a[i].v) {
+                const char *tn;
+                uint64_t tv;
+
+                tn = a[i].n;
+                tv = a[i].v;
+                a[i].n = a[j].n;
+                a[i].v = a[j].v;
+                a[j].n = tn;
+                a[j].v = tv;
+            }
+        }
+    }
+    *n1 = a[0].n;
+    *n2 = a[1].n;
+    *n3 = a[2].n;
+}
+
+static void memlog_shutdown(memlog_shared_t *ml, pthread_t *tid, int *started) {
+    if (!started || !*started || !ml) return;
+    atomic_store_explicit(&ml->stop, 1, memory_order_release);
+    pthread_join(*tid, NULL);
+    if (ml->fp) {
+        fclose(ml->fp);
+        ml->fp = NULL;
+    }
+    *started = 0;
+}
+
+static void *memlog_thread_main(void *arg) {
+    memlog_shared_t *ml = (memlog_shared_t *)arg;
+
+    for (;;) {
+        struct tm tmb;
+        time_t nowt;
+        uint64_t wq_b = 0, tq_b = 0;
+        uint64_t cq_est;
+        uint64_t mq_peak;
+        const char *nm1, *nm2, *nm3;
+        char ts[32];
+        char hw[32], ht[32], hc[32], hm[32];
+
+        if (atomic_load_explicit(&ml->stop, memory_order_acquire)) break;
+        if (!ml->fp || !ml->ctx) {
+            sleep(MEMLOG_INTERVAL_SEC);
+            continue;
+        }
+
+        nowt = time(NULL);
+        gmtime_r(&nowt, &tmb);
+        strftime(ts, sizeof(ts), "%y%m%d %H:%M:%S", &tmb);
+
+        if (ml->wq) {
+            pthread_mutex_lock(&ml->wq->mutex);
+            wq_b = ml->wq->queued_body_bytes;
+            pthread_mutex_unlock(&ml->wq->mutex);
+        }
+        if (ml->tq) {
+            pthread_mutex_lock(&ml->tq->mutex);
+            tq_b = ml->tq->queued_body_bytes;
+            pthread_mutex_unlock(&ml->tq->mutex);
+        }
+        cq_est = chunk_queue_est_bytes(ml->chunkq, ml->ctx);
+        mq_peak = atomic_load_explicit(&ml->ctx->merge_bucket_ram_peak, memory_order_relaxed);
+
+        memlog_sort_top3(wq_b, tq_b, cq_est, mq_peak, &nm1, &nm2, &nm3);
+        human_decimal((double)wq_b, hw, sizeof(hw));
+        human_decimal((double)tq_b, ht, sizeof(ht));
+        human_decimal((double)cq_est, hc, sizeof(hc));
+        human_decimal((double)mq_peak, hm, sizeof(hm));
+
+        fprintf(ml->fp, "%s wb=%s tj=%s cq=%s mp=%s | top:%s>%s>%s\n", ts, hw, ht, hc, hm, nm1, nm2, nm3);
+        fflush(ml->fp);
+
+        sleep(MEMLOG_INTERVAL_SEC);
+    }
+    return NULL;
 }
 
 static void *stats_thread_main(void *arg) {
@@ -572,7 +815,9 @@ static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
             "  %s --make [--index-dir <path>] [username|uid] [bin_dir ...]\n"
+            "  %s --resume-merge --index-dir <path>\n"
             "  %s --search <term> [index_dir] [--json] [--skip N] [--limit M]\n",
+            argv0,
             argv0,
             argv0);
     fprintf(stderr,
@@ -582,6 +827,9 @@ static void die_usage(const char *argv0) {
             "    login or numeric uid, it selects that user; remaining arguments are crawl directories (default .).\n"
             "    If that token is not a known user, every argument is a crawl directory (all-users index).\n"
             "    With no user/bin arguments after flags, the index is all-users for ./\n"
+            "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
+            "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
+            "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
             "  --search: default index_dir is ./index (relative to cwd). Plain search prints paths.\n"
             "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"paths\":[...]}\n");
     exit(2);
@@ -938,13 +1186,13 @@ static int build_chunks_for_file(const char *path,
     *chunk_count_out = 0;
     *file_chunk_counter_out = 0;
 
-    fp = fopen(path, "rb");
+    fp = mk_fopen(path, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", path, strerror(errno));
         return -1;
     }
 
-    if (fread(&fh, sizeof(fh), 1, fp) != 1) {
+    if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) {
         fprintf(stderr, "warn: short read on header: %s\n", path);
         goto out;
     }
@@ -964,7 +1212,7 @@ static int build_chunks_for_file(const char *path,
 
         if (record_start < 0) goto out;
 
-        if (fread(&r, sizeof(r), 1, fp) != 1) {
+        if (mk_fread(&r, sizeof(r), 1, fp) != 1) {
             if (feof(fp)) {
                 uint64_t file_end = (uint64_t)record_start;
                 if (file_end > chunk_start) {
@@ -992,7 +1240,7 @@ static int build_chunks_for_file(const char *path,
     }
 
 out:
-    if (fp) fclose(fp);
+    if (fp) mk_fclose(fp);
     if (rc != 0) {
         free_chunk_array_rows(chunks, chunk_count);
         return -1;
@@ -1124,7 +1372,7 @@ static int write_sorted_bucket_records(FILE *keys_fp, FILE *postings_fp, trigram
         }
 
         key.postings_bytes = (uint64_t)ftello(postings_fp) - key.postings_offset;
-        if (fwrite(&key, sizeof(key), 1, keys_fp) != 1) return -1;
+        if (mk_fwrite(&key, sizeof(key), 1, keys_fp) != 1) return -1;
         (*unique_out)++;
         i = j;
     }
@@ -1319,7 +1567,7 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     if (!ctx->bucket_parallel_fp) return;
     for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
         if (ctx->bucket_parallel_fp[b]) {
-            fclose(ctx->bucket_parallel_fp[b]);
+            mk_fclose(ctx->bucket_parallel_fp[b]);
             ctx->bucket_parallel_fp[b] = NULL;
         }
     }
@@ -1336,6 +1584,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     FILE *fp;
     char path[PATH_MAX];
 
+    atomic_fetch_add_explicit(&g_mk_bucket_lock_acqs, 1ULL, memory_order_relaxed);
     pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
     fp = ctx->bucket_parallel_fp[bucket];
     if (!fp) {
@@ -1344,7 +1593,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             return -1;
         }
-        fp = fopen(path, "ab");
+        fp = mk_fopen(path, "ab");
         if (!fp) {
             fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
@@ -1355,7 +1604,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
         ctx->bucket_nonempty[bucket] = 1;
         ctx->bucket_parallel_fp[bucket] = fp;
     }
-    if (fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+    if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
         fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
         pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
         return -1;
@@ -1373,7 +1622,7 @@ static int write_varint_u64(FILE *fp, uint64_t value) {
         value >>= 7;
     }
     buf[n++] = (unsigned char)value;
-    return fwrite(buf, 1, n, fp) == n ? 0 : -1;
+    return mk_fwrite(buf, 1, n, fp) == n ? 0 : -1;
 }
 
 static int decode_varint_u64_buf(const unsigned char *buf, size_t len, size_t *pos, uint64_t *out) {
@@ -1398,11 +1647,11 @@ static int append_paths_only(build_ctx_t *ctx, const char *path) {
     uint64_t offset;
 
     offset = (uint64_t)ftello(ctx->paths_fp);
-    if (fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) {
+    if (mk_fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) {
         fprintf(stderr, "ereport_index: fwrite path_offsets.bin: %s\n", strerror(errno));
         return -1;
     }
-    if (fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) {
+    if (mk_fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) {
         fprintf(stderr, "ereport_index: fwrite paths.bin: %s\n", strerror(errno));
         return -1;
     }
@@ -1438,6 +1687,7 @@ static void *paths_writer_main(void *arg_void) {
             job->path_id = path_id;
             job->codes = item->codes;
             job->code_count = item->code_count;
+            job->approx_body_bytes = sizeof(trigram_job_t) + item->code_count * sizeof(uint32_t);
             job->next = NULL;
             item->codes = NULL;
 
@@ -1512,7 +1762,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     int rc = -1;
     write_batch_t *batch = NULL;
 
-    fp = fopen(chunk->path, "rb");
+    fp = mk_fopen(chunk->path, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", chunk->path, strerror(errno));
         atomic_fetch_add(&rs->bad_input_files, 1U);
@@ -1541,7 +1791,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         }
 
         memset(&r, 0, sizeof(r));
-        n = fread(&r, sizeof(r), 1, fp);
+        n = mk_fread(&r, sizeof(r), 1, fp);
         if (n != 1) {
             if (feof(fp)) rc = 0;
             else {
@@ -1575,7 +1825,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
-        if (r.path_len > 0 && fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
+        if (r.path_len > 0 && mk_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
             fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
             atomic_fetch_add(&rs->bad_input_files, 1U);
             free(pathbuf);
@@ -1629,7 +1879,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     }
 
 out:
-    fclose(fp);
+    mk_fclose(fp);
     if (batch) {
         if (write_queue_push(write_queue, batch) != 0) {
             atomic_fetch_add(&rs->bad_input_files, 1U);
@@ -1659,7 +1909,7 @@ static void *worker_main(void *arg_void) {
 
 static int write_final_path_offset(build_ctx_t *ctx) {
     uint64_t final_offset = (uint64_t)ftello(ctx->paths_fp);
-    return fwrite(&final_offset, sizeof(final_offset), 1, ctx->path_offsets_fp) == 1 ? 0 : -1;
+    return mk_fwrite(&final_offset, sizeof(final_offset), 1, ctx->path_offsets_fp) == 1 ? 0 : -1;
 }
 
 static int write_meta_file(const build_ctx_t *ctx) {
@@ -1667,7 +1917,7 @@ static int write_meta_file(const build_ctx_t *ctx) {
     FILE *fp;
 
     if (build_path(path, sizeof(path), ctx->index_dir, "meta.txt") != 0) return -1;
-    fp = fopen(path, "w");
+    fp = mk_fopen(path, "w");
     if (!fp) return -1;
 
     fprintf(fp, "ereport_index_version=%d\n", INDEX_VERSION);
@@ -1682,7 +1932,7 @@ static int write_meta_file(const build_ctx_t *ctx) {
     fprintf(fp, "bucket_bits=%d\n", TRIGRAM_BUCKET_BITS);
     fprintf(fp, "bucket_count=%u\n", TRIGRAM_BUCKET_COUNT);
 
-    if (fclose(fp) != 0) return -1;
+    if (mk_fclose(fp) != 0) return -1;
     return 0;
 }
 
@@ -1697,7 +1947,7 @@ typedef struct {
 
 static void merge_loaded_bucket_destroy(merge_loaded_bucket_t *L) {
     if (L->mmap_base && L->mmap_len) {
-        munmap(L->mmap_base, L->mmap_len);
+        mk_munmap(L->mmap_base, L->mmap_len);
     } else if (L->malloc_copy && L->records) {
         free(L->records);
     }
@@ -1711,7 +1961,7 @@ static int merge_read_bucket_file(const char *bucket_path, merge_loaded_bucket_t
     trigram_record_t *buf;
 
     memset(out, 0, sizeof(*out));
-    fd = open(bucket_path, O_RDONLY);
+    fd = mk_open(bucket_path, O_RDONLY);
     if (fd < 0) return -1;
     if (fstat(fd, &st) != 0) {
         close(fd);
@@ -1723,7 +1973,7 @@ static int merge_read_bucket_file(const char *bucket_path, merge_loaded_bucket_t
     }
     out->n = (size_t)(st.st_size / (off_t)sizeof(trigram_record_t));
     out->bytes = (uint64_t)st.st_size;
-    p = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    p = mk_mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     close(fd);
     if (p != MAP_FAILED) {
         out->mmap_base = p;
@@ -1733,12 +1983,12 @@ static int merge_read_bucket_file(const char *bucket_path, merge_loaded_bucket_t
     }
     buf = (trigram_record_t *)malloc((size_t)st.st_size);
     if (!buf) return -1;
-    fd = open(bucket_path, O_RDONLY);
+    fd = mk_open(bucket_path, O_RDONLY);
     if (fd < 0) {
         free(buf);
         return -1;
     }
-    if (read(fd, buf, (size_t)st.st_size) != (ssize_t)st.st_size) {
+    if (mk_read(fd, buf, (size_t)st.st_size) != (ssize_t)st.st_size) {
         close(fd);
         free(buf);
         return -1;
@@ -1810,6 +2060,124 @@ static size_t merge_collect_nonempty_legacy_scan(build_ctx_t *ctx, uint32_t **ou
     return nb;
 }
 
+static uint64_t merge_largest_bucket_file_bytes(const build_ctx_t *ctx, const uint32_t *bucket_list, size_t nbuckets) {
+    size_t bi;
+    uint64_t maxb = 0;
+    char path[PATH_MAX];
+    struct stat st;
+
+    for (bi = 0; bi < nbuckets; bi++) {
+        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket_list[bi]) >= (int)sizeof(path))
+            continue;
+        if (stat(path, &st) != 0) continue;
+        if ((uint64_t)st.st_size > maxb) maxb = (uint64_t)st.st_size;
+    }
+    return maxb;
+}
+
+static uint64_t read_proc_memavailable_kib(void) {
+    FILE *fp;
+    char line[256];
+    unsigned long kb = 0;
+
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "MemAvailable:", 13) == 0) {
+            if (sscanf(line + 13, " %lu", &kb) == 1) break;
+        }
+    }
+    fclose(fp);
+    return (uint64_t)kb;
+}
+
+/* cgroup v2 memory.max for this process, or 0 if unlimited / unreadable. */
+static uint64_t cgroup_v2_memory_max_bytes(void) {
+    FILE *f;
+    char cgroup_line[4096];
+    char maxpath[PATH_MAX + 64];
+    char buf[80];
+    char *rel;
+    size_t len;
+
+    f = fopen("/proc/self/cgroup", "r");
+    if (!f) return 0;
+    while (fgets(cgroup_line, sizeof(cgroup_line), f)) {
+        if (strncmp(cgroup_line, "0::", 3) != 0) continue;
+        rel = cgroup_line + 3;
+        len = strlen(rel);
+        while (len && (rel[len - 1] == '\n' || rel[len - 1] == '\r')) rel[--len] = '\0';
+        fclose(f);
+        if (len == 0) return 0;
+        if (snprintf(maxpath, sizeof(maxpath), "/sys/fs/cgroup/%s/memory.max", rel) >= (int)sizeof(maxpath)) return 0;
+        f = fopen(maxpath, "r");
+        if (!f) return 0;
+        if (!fgets(buf, sizeof(buf), f)) {
+            fclose(f);
+            return 0;
+        }
+        fclose(f);
+        if (strncmp(buf, "max", 3) == 0) return 0;
+        {
+            unsigned long long v = strtoull(buf, NULL, 10);
+            return (uint64_t)v;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+/*
+ * Conservative RAM budget for concurrent parallel merge workers.
+ * Respects the smaller of MemAvailable and cgroup memory.max (user sessions often have a low cap).
+ * Override: EREPORT_INDEX_MERGE_MEMORY_MB=<MiB> sets an explicit budget.
+ *           EREPORT_INDEX_MERGE_RAM_FRAC=0.55 (fraction of min(mem,cgroup) to use; default 55%).
+ */
+static uint64_t merge_parallel_ram_budget_bytes(void) {
+    const char *e;
+    char *end;
+    uint64_t mem_kib;
+    uint64_t host_b;
+    uint64_t cg_b;
+    uint64_t base_b;
+    uint64_t cap_b;
+    unsigned long num = MERGE_RAM_FRAC_NUM;
+    unsigned long den = MERGE_RAM_FRAC_DEN;
+
+    e = getenv("EREPORT_INDEX_MERGE_MEMORY_MB");
+    if (e && *e) {
+        unsigned long mb = strtoul(e, &end, 10);
+        if (end != e && mb > 0 && mb < (ULONG_MAX / (1024UL * 1024UL))) return (uint64_t)mb * 1024ULL * 1024ULL;
+    }
+    e = getenv("EREPORT_INDEX_MERGE_RAM_FRAC");
+    if (e && *e) {
+        double d = strtod(e, &end);
+        if (end != e && d >= 0.05 && d <= 1.0) {
+            num = (unsigned long)(d * 100.0 + 0.5);
+            den = 100;
+            if (num == 0 || num > den) {
+                num = MERGE_RAM_FRAC_NUM;
+                den = MERGE_RAM_FRAC_DEN;
+            }
+        }
+    }
+
+    mem_kib = read_proc_memavailable_kib();
+    host_b = mem_kib * 1024ULL;
+    cg_b = cgroup_v2_memory_max_bytes();
+
+    if (cg_b > 0 && host_b > 0)
+        base_b = host_b < cg_b ? host_b : cg_b;
+    else if (cg_b > 0)
+        base_b = cg_b;
+    else
+        base_b = host_b;
+
+    cap_b = (base_b / den) * num;
+    if (cap_b < 32ULL * 1024 * 1024) cap_b = 32ULL * 1024 * 1024;
+    return cap_b;
+}
+
 typedef struct {
     build_ctx_t *ctx;
     const uint32_t *buckets;
@@ -1824,6 +2192,22 @@ static void merge_unlink_segment_pair(build_ctx_t *ctx, uint32_t bucket) {
     char p[PATH_MAX];
     if (snprintf(p, sizeof(p), "%s/merge_seg_k_%04u.bin", ctx->index_dir, bucket) < (int)sizeof(p)) unlink(p);
     if (snprintf(p, sizeof(p), "%s/merge_seg_p_%04u.bin", ctx->index_dir, bucket) < (int)sizeof(p)) unlink(p);
+}
+
+/* Drop lone merge_seg_k / merge_seg_p left by a crash between creating the two files. */
+static void merge_unlink_orphan_segment_halves(const build_ctx_t *ctx) {
+    uint32_t b;
+    char kpath[PATH_MAX], ppath[PATH_MAX];
+    int hk, hp;
+
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (snprintf(kpath, sizeof(kpath), "%s/merge_seg_k_%04u.bin", ctx->index_dir, b) >= (int)sizeof(kpath)) continue;
+        if (snprintf(ppath, sizeof(ppath), "%s/merge_seg_p_%04u.bin", ctx->index_dir, b) >= (int)sizeof(ppath)) continue;
+        hk = access(kpath, F_OK) == 0;
+        hp = access(ppath, F_OK) == 0;
+        if (hk && !hp) unlink(kpath);
+        else if (!hk && hp) unlink(ppath);
+    }
 }
 
 static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merge_parallel_arg_t *accum) {
@@ -1842,6 +2226,16 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     if (snprintf(pseg, sizeof(pseg), "%s/merge_seg_p_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(pseg)) return -1;
 
     if (merge_read_bucket_file(bucket_path, &L) != 0) return -1;
+    {
+        uint64_t peak = L.bytes * 2ULL;
+        uint64_t cur = atomic_load_explicit(&ctx->merge_bucket_ram_peak, memory_order_relaxed);
+
+        while (peak > cur) {
+            if (atomic_compare_exchange_weak_explicit(&ctx->merge_bucket_ram_peak, &cur, peak, memory_order_relaxed,
+                                                      memory_order_relaxed))
+                break;
+        }
+    }
     aux = (trigram_record_t *)malloc(L.n * sizeof(*aux));
     if (!aux) {
         merge_loaded_bucket_destroy(&L);
@@ -1850,8 +2244,8 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     radix_sort_trigram_records(L.records, L.n, aux);
     free(aux);
 
-    kf = fopen(kseg, "wb");
-    pf = fopen(pseg, "wb");
+    kf = mk_fopen(kseg, "wb");
+    pf = mk_fopen(pseg, "wb");
     if (!kf || !pf) goto err;
     if (setvbuf(kf, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
@@ -1859,12 +2253,12 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     }
 
     if (write_sorted_bucket_records(kf, pf, L.records, L.n, &u) != 0) goto err;
-    if (fclose(kf) != 0) {
+    if (mk_fclose(kf) != 0) {
         kf = NULL;
         goto err;
     }
     kf = NULL;
-    if (fclose(pf) != 0) {
+    if (mk_fclose(pf) != 0) {
         pf = NULL;
         goto err;
     }
@@ -1878,8 +2272,8 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     return 0;
 
 err:
-    if (kf) fclose(kf);
-    if (pf) fclose(pf);
+    if (kf) mk_fclose(kf);
+    if (pf) mk_fclose(pf);
     merge_unlink_segment_pair(ctx, bucket);
     merge_loaded_bucket_destroy(&L);
     return rc;
@@ -1934,11 +2328,11 @@ static int merge_stitch_segments(build_ctx_t *ctx, const uint32_t *buckets, size
         }
         nk = (size_t)(sk.st_size / (off_t)sizeof(trigram_key_t));
 
-        kf = fopen(kpath, "rb");
-        pf = fopen(ppath, "rb");
+        kf = mk_fopen(kpath, "rb");
+        pf = mk_fopen(ppath, "rb");
         if (!kf || !pf) {
-            if (kf) fclose(kf);
-            if (pf) fclose(pf);
+            if (kf) mk_fclose(kf);
+            if (pf) mk_fclose(pf);
             free(iobuf);
             return -1;
         }
@@ -1949,49 +2343,389 @@ static int merge_stitch_segments(build_ctx_t *ctx, const uint32_t *buckets, size
 
         for (k = 0; k < nk; k++) {
             trigram_key_t key;
-            if (fread(&key, sizeof(key), 1, kf) != 1) {
-                fclose(kf);
-                fclose(pf);
+            if (mk_fread(&key, sizeof(key), 1, kf) != 1) {
+                mk_fclose(kf);
+                mk_fclose(pf);
                 free(iobuf);
                 return -1;
             }
             key.postings_offset += post_base;
-            if (fwrite(&key, sizeof(key), 1, keys_fp) != 1) {
-                fclose(kf);
-                fclose(pf);
+            if (mk_fwrite(&key, sizeof(key), 1, keys_fp) != 1) {
+                mk_fclose(kf);
+                mk_fclose(pf);
                 free(iobuf);
                 return -1;
             }
             (*unique_total)++;
         }
-        fclose(kf);
+        mk_fclose(kf);
 
         {
             uint64_t psz = (uint64_t)sp.st_size;
             size_t nread;
 
             for (;;) {
-                nread = fread(iobuf, 1, MERGE_IO_BUFSIZE, pf);
+                nread = mk_fread(iobuf, 1, MERGE_IO_BUFSIZE, pf);
                 if (nread == 0) break;
-                if (fwrite(iobuf, 1, nread, postings_fp) != nread) {
-                    fclose(pf);
+                if (mk_fwrite(iobuf, 1, nread, postings_fp) != nread) {
+                    mk_fclose(pf);
                     free(iobuf);
                     return -1;
                 }
             }
             if (ferror(pf)) {
-                fclose(pf);
+                mk_fclose(pf);
                 free(iobuf);
                 return -1;
             }
             post_base += psz;
         }
-        fclose(pf);
+        mk_fclose(pf);
         unlink(kpath);
         unlink(ppath);
     }
 
     free(iobuf);
+    return 0;
+}
+
+static uint64_t path_offsets_indexed_path_count(const char *index_dir) {
+    char path[PATH_MAX];
+    struct stat st;
+    uint64_t n;
+
+    if (build_path(path, sizeof(path), index_dir, "path_offsets.bin") != 0) return 0;
+    if (stat(path, &st) != 0) return 0;
+    if (st.st_size < (off_t)sizeof(uint64_t) || (st.st_size % (off_t)sizeof(uint64_t)) != 0) return 0;
+    n = (uint64_t)(st.st_size / (off_t)sizeof(uint64_t));
+    if (n == 0) return 0;
+    return n - 1ULL;
+}
+
+/* Buckets that still have tmp_trigrams data (must run tmp → merge_seg). */
+static size_t merge_resume_list_tmp_buckets(const build_ctx_t *ctx, uint32_t *out, size_t out_cap) {
+    uint32_t b;
+    char tpath[PATH_MAX];
+    struct stat st;
+    size_t n = 0;
+
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (snprintf(tpath, sizeof(tpath), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, b) >= (int)sizeof(tpath))
+            continue;
+        if (stat(tpath, &st) != 0) continue;
+        if (st.st_size == 0) {
+            unlink(tpath);
+            continue;
+        }
+        if (n < out_cap) out[n++] = b;
+    }
+    if (n > 1) qsort(out, n, sizeof(uint32_t), cmp_u32);
+    return n;
+}
+
+static int merge_any_merge_seg_k_nonempty(const build_ctx_t *ctx) {
+    uint32_t b;
+    char kpath[PATH_MAX];
+    struct stat st;
+
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (snprintf(kpath, sizeof(kpath), "%s/merge_seg_k_%04u.bin", ctx->index_dir, b) >= (int)sizeof(kpath)) continue;
+        if (stat(kpath, &st) == 0 && st.st_size > 0) return 1;
+    }
+    return 0;
+}
+
+/* Buckets with completed merge_seg pair (ready for stitch). */
+static int merge_list_segment_bucket_ids(const build_ctx_t *ctx, uint32_t *out, size_t *out_n, size_t out_cap) {
+    uint32_t b;
+    char kpath[PATH_MAX], ppath[PATH_MAX];
+    struct stat sk, sp;
+    size_t n = 0;
+
+    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+        if (snprintf(kpath, sizeof(kpath), "%s/merge_seg_k_%04u.bin", ctx->index_dir, b) >= (int)sizeof(kpath)) return -1;
+        if (snprintf(ppath, sizeof(ppath), "%s/merge_seg_p_%04u.bin", ctx->index_dir, b) >= (int)sizeof(ppath)) return -1;
+        if (stat(kpath, &sk) != 0 || stat(ppath, &sp) != 0) continue;
+        if (sk.st_size == 0 && sp.st_size == 0) continue;
+        if (sk.st_size % (off_t)sizeof(trigram_key_t) != 0) {
+            fprintf(stderr, "ereport_index: invalid merge_seg_k_%04u.bin size in %s\n", b, ctx->index_dir);
+            return -1;
+        }
+        if (n >= out_cap) return -1;
+        out[n++] = b;
+    }
+    if (n > 1) qsort(out, n, sizeof(uint32_t), cmp_u32);
+    *out_n = n;
+    return 0;
+}
+
+/*
+ * Finish merge after OOM/interrupt: paths.bin + path_offsets.bin must exist.
+ * Deletes tri_keys.bin / tri_postings.bin and rebuilds them from tmp_trigrams_*.bin (if any)
+ * and merge_seg_* segment files.
+ */
+static int process_trigram_buckets_resume(build_ctx_t *ctx) {
+    char key_path[PATH_MAX], postings_path[PATH_MAX];
+    FILE *keys_fp = NULL;
+    FILE *postings_fp = NULL;
+    uint32_t need_merge[TRIGRAM_BUCKET_COUNT];
+    uint32_t stitch_buckets[TRIGRAM_BUCKET_COUNT];
+    uint32_t *parallel_list = NULL;
+    size_t n_need;
+    size_t n_stitch = 0;
+    uint64_t unique_trigrams = 0;
+    int rc = -1;
+    double merge_wall_start;
+    uint64_t merge_bytes_temp = 0;
+    uint64_t merge_records_in = 0;
+    long ncpu;
+    int merge_workers = 1;
+    size_t bi;
+
+    merge_wall_start = now_sec();
+    ctx->last_rate_sec = merge_wall_start;
+    ctx->last_rate_merge_units = 0;
+    ctx->last_status_sec = 0.0;
+    ctx->merge_workers_used = 1;
+    ctx->merge_workers_cpu = 1;
+
+    fprintf(stderr, "ereport_index: resuming merge in %s\n", ctx->index_dir);
+
+    if (build_path(key_path, sizeof(key_path), ctx->index_dir, "tri_keys.bin") != 0 ||
+        build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0)
+        return -1;
+
+    n_need = merge_resume_list_tmp_buckets(ctx, need_merge, TRIGRAM_BUCKET_COUNT);
+    {
+        struct stat st_tri;
+        int has_tri = (stat(key_path, &st_tri) == 0 && st_tri.st_size > 0);
+
+        if (n_need > 0 && has_tri && !merge_any_merge_seg_k_nonempty(ctx)) {
+            fprintf(stderr,
+                    "ereport_index: cannot resume-merge: tmp_trigrams_*.bin remain but tri_keys.bin exists and there are "
+                    "no merge_seg_*.bin files (merge used the single-thread path). Re-run a full `ereport_index --make`.\n");
+            return -1;
+        }
+    }
+
+    unlink(key_path);
+    unlink(postings_path);
+    merge_unlink_orphan_segment_halves(ctx);
+
+    ctx->merge_max_bucket_bytes = merge_largest_bucket_file_bytes(ctx, need_merge, n_need);
+    ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
+
+    ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 4;
+    if (ncpu > MERGE_MAX_WORKERS) ncpu = MERGE_MAX_WORKERS;
+    if (n_need == 0) {
+        merge_workers = 1;
+    } else {
+        merge_workers = (int)ncpu;
+        if ((size_t)merge_workers > n_need) merge_workers = (int)n_need;
+        if (n_need < (size_t)MERGE_PARALLEL_MIN) merge_workers = 1;
+    }
+
+    ctx->merge_workers_cpu = merge_workers;
+
+    if (merge_workers > 1 && ctx->merge_max_bucket_bytes > 0) {
+        uint64_t per_worker = ctx->merge_max_bucket_bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+        int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
+        if (mw < 1) mw = 1;
+        if (mw < merge_workers) {
+            fprintf(stderr,
+                    "ereport_index: parallel merge workers %d -> %d "
+                    "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB — a fraction of MemAvailable/cgroup, not full RAM; resume)\n"
+                    "  Each worker needs ~2× max bucket size in RAM. EREPORT_INDEX_THREADS only affects `--make` "
+                    "indexing. For more workers: EREPORT_INDEX_MERGE_RAM_FRAC or EREPORT_INDEX_MERGE_MEMORY_MB.\n",
+                    merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            merge_workers = mw;
+        }
+    }
+
+    ctx->merge_workers_used = merge_workers;
+
+    if (n_need > 0) {
+        if (merge_workers <= 1) {
+            for (bi = 0; bi < n_need; bi++) {
+                uint32_t bkt = need_merge[bi];
+                char tpath[PATH_MAX];
+                struct stat st;
+
+                if (snprintf(tpath, sizeof(tpath), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bkt) < (int)sizeof(tpath)) {
+                    if (merge_bucket_to_segment_files(ctx, bkt, NULL) != 0) goto out;
+                    maybe_emit_status(ctx, "merge", (uint64_t)bi + 1U, (uint64_t)n_need);
+                    continue;
+                }
+                if (stat(tpath, &st) == 0) {
+                    fprintf(stderr,
+                            "ereport_index: tmp→seg bucket %04u (%zu/%zu) %.2f GiB — mmap, radix sort, write "
+                            "(one CPU busy; first huge bucket can take tens of minutes)…\n",
+                            bkt, bi + 1, n_need, (double)st.st_size / (1024.0 * 1024.0 * 1024.0));
+                } else {
+                    fprintf(stderr, "ereport_index: tmp→seg bucket %04u (%zu/%zu)…\n", bkt, bi + 1, n_need);
+                }
+                fflush(stderr);
+                if (merge_bucket_to_segment_files(ctx, bkt, NULL) != 0) goto out;
+                fprintf(stderr, "ereport_index: bucket %04u tmp→seg finished.\n", bkt);
+                fflush(stderr);
+                maybe_emit_status(ctx, "merge", (uint64_t)bi + 1U, (uint64_t)n_need);
+            }
+        } else {
+            merge_parallel_arg_t mp;
+            pthread_t *threads = NULL;
+            int ti;
+
+            parallel_list = (uint32_t *)malloc(n_need * sizeof(uint32_t));
+            if (!parallel_list) goto out;
+            memcpy(parallel_list, need_merge, n_need * sizeof(uint32_t));
+
+            memset(&mp, 0, sizeof(mp));
+            mp.ctx = ctx;
+            mp.buckets = parallel_list;
+            mp.bucket_count = n_need;
+            atomic_init(&mp.next, 0);
+            atomic_init(&mp.failed, 0);
+            atomic_init(&mp.bytes_in, 0);
+            atomic_init(&mp.records_in, 0);
+
+            threads = (pthread_t *)calloc((size_t)merge_workers, sizeof(*threads));
+            if (!threads) goto out;
+            for (ti = 0; ti < merge_workers; ti++) {
+                if (pthread_create(&threads[ti], NULL, merge_parallel_worker, &mp) != 0) {
+                    atomic_store(&mp.failed, 1);
+                    break;
+                }
+            }
+            ctx->merge_workers_used = ti;
+            for (ti = 0; ti < ctx->merge_workers_used; ti++) pthread_join(threads[ti], NULL);
+            free(threads);
+
+            if (atomic_load(&mp.failed)) {
+                for (bi = 0; bi < n_need; bi++) merge_unlink_segment_pair(ctx, need_merge[bi]);
+                goto out;
+            }
+            merge_bytes_temp = (uint64_t)atomic_load(&mp.bytes_in);
+            merge_records_in = (uint64_t)atomic_load(&mp.records_in);
+        }
+    }
+
+    if (merge_list_segment_bucket_ids(ctx, stitch_buckets, &n_stitch, TRIGRAM_BUCKET_COUNT) != 0) goto out;
+
+    keys_fp = mk_fopen(key_path, "wb");
+    postings_fp = mk_fopen(postings_path, "wb");
+    if (!keys_fp || !postings_fp) goto out;
+    if (setvbuf(keys_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+    }
+    if (setvbuf(postings_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+    }
+
+    if (merge_stitch_segments(ctx, stitch_buckets, n_stitch, keys_fp, postings_fp, &unique_trigrams) != 0) goto out;
+    rc = 0;
+
+out:
+    ctx->unique_trigrams = unique_trigrams;
+    ctx->merge_phase_sec = now_sec() - merge_wall_start;
+    ctx->merge_buckets_nonempty = (uint32_t)n_stitch;
+    ctx->merge_buckets_skipped = (uint32_t)(TRIGRAM_BUCKET_COUNT - n_stitch);
+    ctx->merge_trigram_records_read = merge_records_in;
+    ctx->merge_bytes_temp_read = merge_bytes_temp;
+    ctx->merge_bytes_tri_keys_written = keys_fp ? (uint64_t)ftello(keys_fp) : 0U;
+    ctx->merge_bytes_tri_postings_written = postings_fp ? (uint64_t)ftello(postings_fp) : 0U;
+    free(parallel_list);
+    parallel_list = NULL;
+    if (keys_fp) mk_fclose(keys_fp);
+    if (postings_fp) mk_fclose(postings_fp);
+    if (rc == 0) return 0;
+    return -1;
+}
+
+static int resume_merge_index_dir(const char *index_dir) {
+    build_ctx_t ctx;
+    char paths_p[PATH_MAX], off_p[PATH_MAX];
+    struct stat st;
+    uint64_t ipc;
+    double t0 = now_sec();
+    memlog_shared_t ml_storage;
+    pthread_t memlog_tid;
+    int memlog_started = 0;
+    char logpath[PATH_MAX];
+
+    memset(&ctx, 0, sizeof(ctx));
+    atomic_init(&ctx.merge_bucket_ram_peak, 0);
+    if (snprintf(ctx.index_dir, sizeof(ctx.index_dir), "%s", index_dir) >= (int)sizeof(ctx.index_dir)) {
+        fprintf(stderr, "ereport_index: index directory path too long\n");
+        return 1;
+    }
+    if (build_path(paths_p, sizeof(paths_p), index_dir, "paths.bin") != 0 ||
+        build_path(off_p, sizeof(off_p), index_dir, "path_offsets.bin") != 0) {
+        return 1;
+    }
+    if (stat(paths_p, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "ereport_index: missing %s (need completed index phase before resume-merge)\n", paths_p);
+        return 1;
+    }
+    if (stat(off_p, &st) != 0 || !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "ereport_index: missing %s (need completed index phase before resume-merge)\n", off_p);
+        return 1;
+    }
+
+    ipc = path_offsets_indexed_path_count(index_dir);
+    ctx.indexed_paths = ipc;
+    ctx.input_files = ipc > 0 ? ipc : 1ULL;
+    ctx.scanned_records = 0;
+    ctx.trigram_records = 0;
+    ctx.bad_input_files = 0;
+    ctx.start_sec = t0;
+    ctx.last_status_sec = 0.0;
+    ctx.last_rate_sec = t0;
+    ctx.last_rate_indexed_paths = 0;
+    ctx.last_rate_merge_units = 0;
+    snprintf(ctx.display_name, sizeof(ctx.display_name), "%s", "resume");
+    ctx.target_uid = (uid_t)0;
+    ctx.aggregate_all_users = 0;
+    ctx.run_stats = NULL;
+
+    memset(&ml_storage, 0, sizeof(ml_storage));
+    ml_storage.ctx = &ctx;
+    ml_storage.wq = NULL;
+    ml_storage.tq = NULL;
+    ml_storage.chunkq = NULL;
+    atomic_init(&ml_storage.stop, 0);
+    if (build_path(logpath, sizeof(logpath), index_dir, "ereport_index.log") == 0) {
+        ml_storage.fp = fopen(logpath, "a");
+        if (ml_storage.fp) {
+            if (pthread_create(&memlog_tid, NULL, memlog_thread_main, &ml_storage) != 0) {
+                fclose(ml_storage.fp);
+                ml_storage.fp = NULL;
+            } else {
+                memlog_started = 1;
+            }
+        }
+    }
+
+    if (process_trigram_buckets_resume(&ctx) != 0) {
+        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+        fprintf(stderr, "ereport_index: resume-merge failed in %s\n", index_dir);
+        return 1;
+    }
+    memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+    if (write_meta_file(&ctx) != 0) {
+        fprintf(stderr, "ereport_index: could not write meta.txt in %s\n", index_dir);
+        return 1;
+    }
+
+    printf("mode=resume_merge\n");
+    printf("index_dir=%s\n", ctx.index_dir);
+    printf("indexed_paths=%" PRIu64 "\n", ctx.indexed_paths);
+    printf("unique_trigrams=%" PRIu64 "\n", ctx.unique_trigrams);
+    printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
+    printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
+    printf("merge_workers=%d\n", ctx.merge_workers_used);
+    printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
+    printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
+    printf("elapsed_sec=%.3f\n", now_sec() - t0);
     return 0;
 }
 
@@ -2027,13 +2761,16 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         return -1;
     }
 
-    keys_fp = fopen(key_path, "wb");
-    postings_fp = fopen(postings_path, "wb");
+    keys_fp = mk_fopen(key_path, "wb");
+    postings_fp = mk_fopen(postings_path, "wb");
     if (!keys_fp || !postings_fp) goto out;
     if (setvbuf(keys_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
     if (setvbuf(postings_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
+
+    ctx->merge_max_bucket_bytes = merge_largest_bucket_file_bytes(ctx, bucket_list, nbuckets);
+    ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
     ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 4;
@@ -2041,6 +2778,25 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     merge_workers = (int)ncpu;
     if ((size_t)merge_workers > nbuckets) merge_workers = (int)nbuckets;
     if (nbuckets < (size_t)MERGE_PARALLEL_MIN) merge_workers = 1;
+
+    ctx->merge_workers_cpu = merge_workers;
+
+    if (merge_workers > 1 && ctx->merge_max_bucket_bytes > 0) {
+        uint64_t per_worker = ctx->merge_max_bucket_bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+        int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
+        if (mw < 1) mw = 1;
+        if (mw < merge_workers) {
+            fprintf(stderr,
+                    "ereport_index: parallel merge workers %d -> %d "
+                    "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB; "
+                    "EREPORT_INDEX_MERGE_MEMORY_MB / EREPORT_INDEX_MERGE_RAM_FRAC to adjust)\n"
+                    "  EREPORT_INDEX_THREADS applies to `--make` indexing only, not merge.\n",
+                    merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
+            merge_workers = mw;
+        }
+    }
+
     ctx->merge_workers_used = merge_workers;
 
     if (nbuckets == 0) {
@@ -2058,6 +2814,16 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
 
             if (snprintf(bucket_path, sizeof(bucket_path), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(bucket_path)) goto out;
             if (merge_read_bucket_file(bucket_path, &L) != 0) goto out;
+            {
+                uint64_t peak = L.bytes * 2ULL;
+                uint64_t cur = atomic_load_explicit(&ctx->merge_bucket_ram_peak, memory_order_relaxed);
+
+                while (peak > cur) {
+                    if (atomic_compare_exchange_weak_explicit(&ctx->merge_bucket_ram_peak, &cur, peak, memory_order_relaxed,
+                                                              memory_order_relaxed))
+                        break;
+                }
+            }
             merge_bytes_temp += L.bytes;
             merge_records_in += (uint64_t)L.n;
             aux = (trigram_record_t *)malloc(L.n * sizeof(*aux));
@@ -2125,8 +2891,8 @@ out:
     ctx->merge_bytes_tri_keys_written = keys_fp ? (uint64_t)ftello(keys_fp) : 0U;
     ctx->merge_bytes_tri_postings_written = postings_fp ? (uint64_t)ftello(postings_fp) : 0U;
     free(bucket_list);
-    if (keys_fp) fclose(keys_fp);
-    if (postings_fp) fclose(postings_fp);
+    if (keys_fp) mk_fclose(keys_fp);
+    if (postings_fp) mk_fclose(postings_fp);
     if (rc == 0) return 0;
     return -1;
 }
@@ -2155,6 +2921,9 @@ static int build_index_dir(const char *user_spec,
     trigram_worker_arg_t trigram_worker_arg;
     pthread_t stats_thread;
     pthread_t paths_writer_thread;
+    pthread_t memlog_tid;
+    memlog_shared_t ml_storage;
+    int memlog_started = 0;
     pthread_t *trigram_tids = NULL;
     build_ctx_t ctx;
     index_run_stats_t run_stats;
@@ -2167,8 +2936,11 @@ static int build_index_dir(const char *user_spec,
     int trigram_threads = threads;
     int trigram_threads_used = 0;
     size_t i;
+    struct rusage ru_make_start, ru_after_prep, ru_after_index, ru_after_merge;
+    int ru_have_start = 0, ru_have_prep = 0, ru_have_index = 0, ru_have_merge = 0;
 
     memset(&ctx, 0, sizeof(ctx));
+    atomic_init(&ctx.merge_bucket_ram_peak, 0);
     memset(&queue, 0, sizeof(queue));
     memset(&write_queue, 0, sizeof(write_queue));
     memset(&trigram_queue, 0, sizeof(trigram_queue));
@@ -2247,6 +3019,9 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         return 1;
     }
+
+    if (getrusage(RUSAGE_SELF, &ru_make_start) == 0) ru_have_start = 1;
+    make_io_reset();
 
     {
         double t_chunk_prep0 = now_sec();
@@ -2407,6 +3182,13 @@ static int build_index_dir(const char *user_spec,
                              prep_chunk_counts[i] > (size_t)UINT_MAX ? UINT_MAX : (unsigned int)prep_chunk_counts[i]);
             }
             chunks = merged;
+            {
+                uint64_t pt = 0;
+
+                for (i = 0; i < chunk_count; i++) pt += strlen(chunks[i].path);
+                ctx.chunk_path_bytes_total = pt;
+                ctx.chunk_total_count = chunk_count;
+            }
         }
 
         free(chunk_targets);
@@ -2417,6 +3199,7 @@ static int build_index_dir(const char *user_spec,
         run_stats.chunk_prep_files_total = 0;
         atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
         chunk_prep_sec = now_sec() - t_chunk_prep0;
+        if (getrusage(RUSAGE_SELF, &ru_after_prep) == 0) ru_have_prep = 1;
     }
 
     atomic_store(&run_stats.bad_input_files, (unsigned long long)ctx.bad_input_files);
@@ -2483,8 +3266,8 @@ static int build_index_dir(const char *user_spec,
         return 1;
     }
 
-    ctx.paths_fp = fopen(paths_path, "wb");
-    ctx.path_offsets_fp = fopen(offsets_path, "wb");
+    ctx.paths_fp = mk_fopen(paths_path, "wb");
+    ctx.path_offsets_fp = mk_fopen(offsets_path, "wb");
     if (ctx.paths_fp && setvbuf(ctx.paths_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
     if (ctx.path_offsets_fp && setvbuf(ctx.path_offsets_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
@@ -2497,8 +3280,8 @@ static int build_index_dir(const char *user_spec,
             clear_status_line();
             stats_thread_started = 0;
         }
-        if (ctx.paths_fp) fclose(ctx.paths_fp);
-        if (ctx.path_offsets_fp) fclose(ctx.path_offsets_fp);
+        if (ctx.paths_fp) mk_fclose(ctx.paths_fp);
+        if (ctx.path_offsets_fp) mk_fclose(ctx.path_offsets_fp);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2515,8 +3298,8 @@ static int build_index_dir(const char *user_spec,
             clear_status_line();
             stats_thread_started = 0;
         }
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
+        mk_fclose(ctx.paths_fp);
+        mk_fclose(ctx.path_offsets_fp);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -2553,8 +3336,8 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
+        mk_fclose(ctx.paths_fp);
+        mk_fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -2582,8 +3365,8 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
+        mk_fclose(ctx.paths_fp);
+        mk_fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -2620,8 +3403,8 @@ static int build_index_dir(const char *user_spec,
                 stats_thread_started = 0;
             }
             parallel_bucket_io_shutdown(&ctx);
-            fclose(ctx.paths_fp);
-            fclose(ctx.path_offsets_fp);
+            mk_fclose(ctx.paths_fp);
+            mk_fclose(ctx.path_offsets_fp);
             pthread_mutex_destroy(&queue.mutex);
             pthread_mutex_destroy(&write_queue.mutex);
             pthread_cond_destroy(&write_queue.has_batch);
@@ -2658,8 +3441,8 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
+        mk_fclose(ctx.paths_fp);
+        mk_fclose(ctx.path_offsets_fp);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -2673,6 +3456,28 @@ static int build_index_dir(const char *user_spec,
         free(chunks);
         free(file_states);
         return 1;
+    }
+
+    memset(&ml_storage, 0, sizeof(ml_storage));
+    {
+        char logpath[PATH_MAX];
+
+        if (build_path(logpath, sizeof(logpath), ctx.index_dir, "ereport_index.log") == 0) {
+            ml_storage.fp = fopen(logpath, "a");
+            if (ml_storage.fp) {
+                ml_storage.wq = &write_queue;
+                ml_storage.tq = &trigram_queue;
+                ml_storage.chunkq = &queue;
+                ml_storage.ctx = &ctx;
+                atomic_init(&ml_storage.stop, 0);
+                if (pthread_create(&memlog_tid, NULL, memlog_thread_main, &ml_storage) != 0) {
+                    fclose(ml_storage.fp);
+                    ml_storage.fp = NULL;
+                } else {
+                    memlog_started = 1;
+                }
+            }
+        }
     }
 
     for (i = 0; i < (size_t)threads; i++) {
@@ -2705,12 +3510,15 @@ static int build_index_dir(const char *user_spec,
         clear_status_line();
     }
 
+    if (getrusage(RUSAGE_SELF, &ru_after_index) == 0) ru_have_index = 1;
+
     ctx.scanned_records = atomic_load(&run_stats.scanned_records);
     ctx.indexed_paths = atomic_load(&run_stats.indexed_paths);
     ctx.trigram_records = atomic_load(&run_stats.trigram_records);
     ctx.bad_input_files = atomic_load(&run_stats.bad_input_files);
     if (atomic_load(&run_stats.writer_failed)) {
         fprintf(stderr, "ereport_index: indexing writer failed while building %s\n", ctx.index_dir);
+        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
         free(tids);
         free(args);
         pthread_mutex_destroy(&queue.mutex);
@@ -2728,13 +3536,14 @@ static int build_index_dir(const char *user_spec,
         free(chunks);
         free(file_states);
         parallel_bucket_io_shutdown(&ctx);
-        fclose(ctx.paths_fp);
-        fclose(ctx.path_offsets_fp);
+        mk_fclose(ctx.paths_fp);
+        mk_fclose(ctx.path_offsets_fp);
         return 1;
     }
 
-    if (write_final_path_offset(&ctx) != 0 || fclose(ctx.paths_fp) != 0 || fclose(ctx.path_offsets_fp) != 0) {
+    if (write_final_path_offset(&ctx) != 0 || mk_fclose(ctx.paths_fp) != 0 || mk_fclose(ctx.path_offsets_fp) != 0) {
         fprintf(stderr, "failed to finalize paths in %s\n", ctx.index_dir);
+        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
         free(tids);
         free(args);
         pthread_mutex_destroy(&queue.mutex);
@@ -2761,25 +3570,32 @@ static int build_index_dir(const char *user_spec,
 
     parallel_bucket_io_shutdown(&ctx);
 
-    if (process_trigram_buckets(&ctx) != 0 || write_meta_file(&ctx) != 0) {
-        fprintf(stderr, "failed to finalize index in %s\n", ctx.index_dir);
-        free(tids);
-        free(args);
-        pthread_mutex_destroy(&queue.mutex);
-        pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.has_batch);
-        pthread_cond_destroy(&write_queue.has_space);
-        pthread_mutex_destroy(&trigram_queue.mutex);
-        pthread_cond_destroy(&trigram_queue.has_job);
-        pthread_cond_destroy(&trigram_queue.has_space);
-        free(trigram_tids);
-        trigram_tids = NULL;
-        for (i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
-        free(chunks);
-        free(file_states);
-        return 1;
+    {
+        int merge_rc = process_trigram_buckets(&ctx);
+
+        if (getrusage(RUSAGE_SELF, &ru_after_merge) == 0) ru_have_merge = 1;
+
+        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+        if (merge_rc != 0 || write_meta_file(&ctx) != 0) {
+            fprintf(stderr, "failed to finalize index in %s\n", ctx.index_dir);
+            free(tids);
+            free(args);
+            pthread_mutex_destroy(&queue.mutex);
+            pthread_mutex_destroy(&write_queue.mutex);
+            pthread_cond_destroy(&write_queue.has_batch);
+            pthread_cond_destroy(&write_queue.has_space);
+            pthread_mutex_destroy(&trigram_queue.mutex);
+            pthread_cond_destroy(&trigram_queue.has_job);
+            pthread_cond_destroy(&trigram_queue.has_space);
+            free(trigram_tids);
+            trigram_tids = NULL;
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            free(file_states);
+            return 1;
+        }
     }
 
     t1 = now_sec();
@@ -2813,7 +3629,12 @@ static int build_index_dir(const char *user_spec,
     printf("merge_buckets_skipped=%u\n", ctx.merge_buckets_skipped);
     printf("merge_trigram_records_read=%" PRIu64 "\n", ctx.merge_trigram_records_read);
     printf("merge_workers=%d\n", ctx.merge_workers_used);
+    printf("merge_workers_cpu=%d\n", ctx.merge_workers_cpu);
+    printf("merge_max_bucket_mib=%.1f\n", (double)ctx.merge_max_bucket_bytes / (1024.0 * 1024.0));
+    printf("merge_parallel_ram_budget_mib=%.1f\n", (double)ctx.merge_parallel_budget_bytes / (1024.0 * 1024.0));
     printf("merge_bytes_temp_read=%" PRIu64 "\n", ctx.merge_bytes_temp_read);
+    printf("merge_bucket_ram_peak_est=%" PRIu64 "\n",
+           (uint64_t)atomic_load_explicit(&ctx.merge_bucket_ram_peak, memory_order_relaxed));
     printf("merge_bytes_tri_keys_written=%" PRIu64 "\n", ctx.merge_bytes_tri_keys_written);
     printf("merge_bytes_tri_postings_written=%" PRIu64 "\n", ctx.merge_bytes_tri_postings_written);
     {
@@ -2843,6 +3664,24 @@ static int build_index_dir(const char *user_spec,
     printf("trigramq_worker_waits=%" PRIu64 "\n", (uint64_t)atomic_load(&run_stats.trigramq_worker_waits));
     printf("wall_after_index_sec=%.3f\n", (t1 - t0) - ctx.index_phase_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
+    if (ru_have_start && ru_have_prep) rusage_print_delta("cpu_prep", &ru_after_prep, &ru_make_start);
+    if (ru_have_prep && ru_have_index) rusage_print_delta("cpu_idx", &ru_after_index, &ru_after_prep);
+    if (ru_have_index && ru_have_merge) rusage_print_delta("cpu_mrg", &ru_after_merge, &ru_after_index);
+    if (ru_have_start && ru_have_merge) rusage_print_delta("cpu_make", &ru_after_merge, &ru_make_start);
+
+    printf("make_fread_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_calls, memory_order_relaxed));
+    printf("make_fread_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fread_bytes, memory_order_relaxed));
+    printf("make_fwrite_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_calls, memory_order_relaxed));
+    printf("make_fwrite_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fwrite_bytes, memory_order_relaxed));
+    printf("make_fopen_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fopen_calls, memory_order_relaxed));
+    printf("make_fclose_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_fclose_calls, memory_order_relaxed));
+    printf("make_open_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_open_calls, memory_order_relaxed));
+    printf("make_read_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_calls, memory_order_relaxed));
+    printf("make_read_bytes=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_read_bytes, memory_order_relaxed));
+    printf("make_mmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_mmap_calls, memory_order_relaxed));
+    printf("make_munmap_calls=%llu\n", (unsigned long long)atomic_load_explicit(&g_mk_munmap_calls, memory_order_relaxed));
+    printf("make_bucket_lock_acquires=%llu\n",
+           (unsigned long long)atomic_load_explicit(&g_mk_bucket_lock_acqs, memory_order_relaxed));
 
     free(tids);
     free(args);
@@ -3235,6 +4074,12 @@ out:
 
 int main(int argc, char **argv) {
     if (argc < 2) die_usage(argv[0]);
+
+    if (strcmp(argv[1], "--resume-merge") == 0) {
+        if (argc >= 4 && strcmp(argv[2], "--index-dir") == 0 && argv[3][0] != '\0') return resume_merge_index_dir(argv[3]);
+        fprintf(stderr, "ereport_index: --resume-merge requires --index-dir <path>\n");
+        return 2;
+    }
 
     if (strcmp(argv[1], "--make") == 0) {
         const char **dirpaths;
