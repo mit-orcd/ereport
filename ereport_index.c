@@ -636,7 +636,8 @@ static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
         if (!q->head) q->tail = NULL;
         q->depth--;
         q->queued_body_bytes -= (uint64_t)job->approx_body_bytes;
-        pthread_cond_broadcast(&q->has_space);
+        /* One slot freed; wake one blocked producer (broadcast is unnecessary and costly at depth). */
+        pthread_cond_signal(&q->has_space);
     }
     pthread_mutex_unlock(&q->mutex);
     return job;
@@ -1971,6 +1972,31 @@ static int parallel_bucket_io_init(build_ctx_t *ctx) {
     return 0;
 }
 
+/* Per trigram worker: sort buffer for batching writes to tmp_trigrams (avoid malloc per path). */
+static __thread trigram_record_t *tw_sort_buf;
+static __thread size_t tw_sort_cap;
+
+static trigram_record_t *tw_ensure_sort_buf(size_t n) {
+    if (n <= tw_sort_cap) return tw_sort_buf;
+    {
+        void *p = realloc(tw_sort_buf, n * sizeof(trigram_record_t));
+        if (!p) return NULL;
+        tw_sort_buf = (trigram_record_t *)p;
+        tw_sort_cap = n;
+    }
+    return tw_sort_buf;
+}
+
+static int trigram_rec_cmp_bucket(const void *aa, const void *bb) {
+    const trigram_record_t *a = (const trigram_record_t *)aa;
+    const trigram_record_t *b = (const trigram_record_t *)bb;
+    uint32_t ba = a->trigram >> (24 - TRIGRAM_BUCKET_BITS);
+    uint32_t bbk = b->trigram >> (24 - TRIGRAM_BUCKET_BITS);
+    if (ba < bbk) return -1;
+    if (ba > bbk) return 1;
+    return 0;
+}
+
 static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     uint32_t b;
 
@@ -1994,10 +2020,16 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     ctx->bucket_parallel_lru_age = NULL;
 }
 
-static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, const trigram_record_t *rec) {
+/*
+ * Write n trigram records for one bucket (caller groups by bucket). One lock + fwrite per call on the
+ * fast path instead of per record — critical for NVMe (fewer syscalls, less mutex contention).
+ */
+static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t bucket, const trigram_record_t *recs, size_t n) {
     FILE *fp;
     char path[PATH_MAX];
     uint64_t tick;
+
+    if (n == 0) return 0;
 
     atomic_fetch_add_explicit(&g_mk_bucket_lock_acqs, 1ULL, memory_order_relaxed);
     pthread_mutex_lock(&ctx->bucket_parallel_mutex[bucket]);
@@ -2005,7 +2037,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     if (fp) {
         tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
         ctx->bucket_parallel_lru_age[bucket] = tick;
-        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+        if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
             fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             return -1;
@@ -2021,7 +2053,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     if (fp) {
         tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
         ctx->bucket_parallel_lru_age[bucket] = tick;
-        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+        if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
             fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
@@ -2067,7 +2099,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
         if (fp) {
             tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
             ctx->bucket_parallel_lru_age[bucket] = tick;
-            if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+            if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
                 fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
                 pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
                 pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
@@ -2085,7 +2117,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     if (fp) {
         tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
         ctx->bucket_parallel_lru_age[bucket] = tick;
-        if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+        if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
             fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
             pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
             pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
@@ -2116,7 +2148,7 @@ static int append_trigram_record_parallel(build_ctx_t *ctx, uint32_t bucket, con
     ctx->bucket_parallel_open_count++;
     tick = atomic_fetch_add_explicit(&ctx->bucket_parallel_lru_clock, 1ULL, memory_order_relaxed);
     ctx->bucket_parallel_lru_age[bucket] = tick;
-    if (mk_fwrite(rec, sizeof(*rec), 1, fp) != 1) {
+    if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
         fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u: %s\n", bucket, strerror(errno));
         pthread_mutex_unlock(&ctx->bucket_parallel_mutex[bucket]);
         pthread_mutex_unlock(&ctx->bucket_parallel_evict_mutex);
@@ -2238,17 +2270,40 @@ static void *trigram_worker_main(void *arg_void) {
             continue;
         }
 
-        for (size_t i = 0; i < job->code_count; i++) {
-            trigram_record_t rec;
-            uint32_t bucket = job->codes[i] >> (24 - TRIGRAM_BUCKET_BITS);
+        if (job->code_count > 0) {
+            trigram_record_t *buf = tw_ensure_sort_buf(job->code_count);
+            size_t i;
+            size_t run_i;
 
-            rec.trigram = job->codes[i];
-            rec.path_id = job->path_id;
-            if (append_trigram_record_parallel(tw->ctx, bucket, &rec) != 0) {
+            if (!buf) {
+                fprintf(stderr, "ereport_index: realloc trigram batch buf (%zu): %s\n", job->code_count, strerror(errno));
                 atomic_store(&rs->writer_failed, 1);
                 free(job->codes);
                 free(job);
                 return NULL;
+            }
+            for (i = 0; i < job->code_count; i++) {
+                buf[i].trigram = job->codes[i];
+                buf[i].path_id = job->path_id;
+            }
+            if (job->code_count > 1) qsort(buf, job->code_count, sizeof(*buf), trigram_rec_cmp_bucket);
+
+            run_i = 0;
+            while (run_i < job->code_count) {
+                uint32_t b = buf[run_i].trigram >> (24 - TRIGRAM_BUCKET_BITS);
+                size_t run_j = run_i + 1;
+                while (run_j < job->code_count) {
+                    uint32_t bj = buf[run_j].trigram >> (24 - TRIGRAM_BUCKET_BITS);
+                    if (bj != b) break;
+                    run_j++;
+                }
+                if (append_trigram_records_batch_parallel(tw->ctx, b, buf + run_i, run_j - run_i) != 0) {
+                    atomic_store(&rs->writer_failed, 1);
+                    free(job->codes);
+                    free(job);
+                    return NULL;
+                }
+                run_i = run_j;
             }
         }
 
