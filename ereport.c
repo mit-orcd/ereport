@@ -1420,7 +1420,12 @@ static const char *path_tail_component(const char *path) {
     return path;
 }
 
-static void compact_path_prefix(const char *path, char *buf, size_t sz) {
+/*
+ * Directory prefix for display: path through the '/' before the last path component.
+ * If anchor_levels >= 1 and anchor is non-empty, keep anchor verbatim and only shorten the
+ * remainder (so Level 2+ rows still show the shared base inside the muted prefix line).
+ */
+static void compact_path_prefix(const char *path, char *buf, size_t sz, const char *anchor, int anchor_levels) {
     const char *slash = strrchr(path, '/');
     size_t prefix_len;
     const size_t keep = 28;
@@ -1431,6 +1436,36 @@ static void compact_path_prefix(const char *path, char *buf, size_t sz) {
     }
 
     prefix_len = (size_t)(slash - path + 1);
+
+    if (anchor_levels >= 1 && anchor && anchor[0] != '\0') {
+        size_t alen = strlen(anchor);
+        if (prefix_len >= alen && strncmp(path, anchor, alen) == 0 &&
+            (path[alen] == '/' || alen == prefix_len)) {
+            size_t ext_len = prefix_len > alen ? prefix_len - alen : 0;
+            const char *ext = path + alen;
+
+            if (ext_len == 0 || (ext_len == 1U && ext[0] == '/')) {
+                int n = snprintf(buf, sz, "%s/", anchor);
+                if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
+                return;
+            }
+
+            if (ext_len <= keep) {
+                int n = snprintf(buf, sz, "%s%.*s", anchor, (int)ext_len, ext);
+                if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
+                return;
+            }
+
+            {
+                const char *start = ext + (ext_len - keep);
+                while (start > ext && *(start - 1) != '/') start--;
+                int n = snprintf(buf, sz, "%s.../%s", anchor, start);
+                if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
+                return;
+            }
+        }
+    }
+
     if (prefix_len < sz && prefix_len <= keep) {
         memcpy(buf, path, prefix_len);
         buf[prefix_len] = '\0';
@@ -1452,11 +1487,11 @@ static void compact_path_prefix(const char *path, char *buf, size_t sz) {
     snprintf(buf, sz, "%.*s", (int)prefix_len, path);
 }
 
-static void emit_compact_path_cell(FILE *out, const char *path) {
+static void emit_compact_path_cell(FILE *out, const char *path, const char *base_prefix, int level_idx) {
     char prefix[96];
     const char *tail = path_tail_component(path);
 
-    compact_path_prefix(path, prefix, sizeof(prefix));
+    compact_path_prefix(path, prefix, sizeof(prefix), base_prefix, level_idx);
 
     fprintf(out, "<td class=\"path-cell\" title=\"");
     html_escape(out, path);
@@ -1487,7 +1522,9 @@ static void emit_path_summary_table(FILE *out,
                                     uint64_t total_bucket_files,
                                     uint64_t total_bucket_bytes,
                                     uint64_t total_user_files,
-                                    uint64_t total_user_bytes) {
+                                    uint64_t total_user_bytes,
+                                    const char *base_prefix,
+                                    int level_idx) {
     path_row_t **rows = NULL;
     size_t count = 0;
     size_t i;
@@ -1531,7 +1568,7 @@ static void emit_path_summary_table(FILE *out,
         contribution_cell_color(share_bytes, byte_bg, sizeof(byte_bg));
 
         fprintf(out, "<tr>");
-        emit_compact_path_cell(out, rows[i]->path);
+        emit_compact_path_cell(out, rows[i]->path, base_prefix, level_idx);
         fprintf(out,
                 "<td class=\"r\" style=\"background:%s\">%s</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\" style=\"background:%s\">%s</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\">%s</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%s</td><td class=\"r\">%.1f</td><td class=\"r\">%.1f</td></tr>\n",
                 file_bg,
@@ -1708,7 +1745,15 @@ static int emit_bucket_detail_page(const char *filename,
     for (d = 0; d < detail_levels; d++) {
         char title[64];
         snprintf(title, sizeof(title), "Level %d Directories", d + 1);
-        emit_path_summary_table(out, title, &maps[d], bucket_files, bucket_bytes, total_user_files, total_user_bytes);
+        emit_path_summary_table(out,
+                                title,
+                                &maps[d],
+                                bucket_files,
+                                bucket_bytes,
+                                total_user_files,
+                                total_user_bytes,
+                                base_prefix,
+                                d);
     }
 
     fputs("<script>\n"
