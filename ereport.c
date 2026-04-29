@@ -18,7 +18,7 @@
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only. Flags must appear first, before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
- * Parallel worker count: EREPORT_THREADS (default 32); see worker_main / stats_thread.
+ * Parallel worker count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
  * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
  * or every shard when aggregating all users).
  *
@@ -1809,6 +1809,65 @@ static int emit_bucket_detail_stub_fast(const char *filename,
     return 0;
 }
 
+static int parse_ereport_thread_count(void);
+
+typedef struct {
+    const char *username;
+    int all_users;
+    uint64_t distinct_uids;
+    const char *basis_str;
+    int bucket_detail_levels;
+    bucket_details_t (*details)[SIZE_BUCKETS];
+    const matched_records_t *matched_records;
+    const summary_t *sum_ref;
+    int stub_mode;
+    atomic_size_t next_task;
+    atomic_int any_fail;
+} bucket_emit_ctx_t;
+
+typedef struct {
+    bucket_emit_ctx_t *ctx;
+} bucket_emit_thread_arg_t;
+
+static void *bucket_page_emit_worker(void *arg) {
+    bucket_emit_thread_arg_t *ta = (bucket_emit_thread_arg_t *)arg;
+    bucket_emit_ctx_t *c = ta->ctx;
+    const size_t ntasks = (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS;
+
+    for (;;) {
+        size_t k = atomic_fetch_add_explicit(&c->next_task, 1U, memory_order_relaxed);
+        int ab;
+        int sb;
+        char fn[PATH_MAX];
+        int page_rc;
+
+        if (k >= ntasks) break;
+
+        ab = (int)(k / (size_t)SIZE_BUCKETS);
+        sb = (int)(k % (size_t)SIZE_BUCKETS);
+
+        if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) {
+            atomic_store(&c->any_fail, 1);
+            continue;
+        }
+
+        if (c->stub_mode) {
+            if (!c->sum_ref) {
+                atomic_store(&c->any_fail, 1);
+                continue;
+            }
+            page_rc =
+                emit_bucket_detail_stub_fast(fn, c->username, c->all_users, c->distinct_uids, c->basis_str, ab, sb, c->sum_ref);
+        } else {
+            page_rc = emit_bucket_detail_page(fn, c->username, c->all_users, c->distinct_uids, c->basis_str, ab, sb,
+                                              c->bucket_detail_levels, &c->details[ab][sb], c->matched_records);
+        }
+        if (page_rc != 0) atomic_store(&c->any_fail, 1);
+    }
+
+    return NULL;
+}
+
 static int emit_all_bucket_detail_pages(const char *username,
                                         int all_users,
                                         uint64_t distinct_uids,
@@ -1817,33 +1876,62 @@ static int emit_all_bucket_detail_pages(const char *username,
                                         const summary_t *sum_ref,
                                         bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
                                         const matched_records_t *matched_records) {
-    int ab, sb;
+    const size_t ntasks = (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS;
+    bucket_emit_ctx_t ctx;
+    pthread_t *tids = NULL;
+    bucket_emit_thread_arg_t *args = NULL;
+    int nw;
+    size_t ti;
 
     if (ensure_bucket_output_dir_exists() != 0) return -1;
 
-    if (bucket_detail_levels == 0 && sum_ref) {
-        for (ab = 0; ab < AGE_BUCKETS; ab++) {
-            for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-                char fn[PATH_MAX];
-                if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) return -1;
-                if (emit_bucket_detail_stub_fast(fn, username, all_users, distinct_uids, basis_str, ab, sb, sum_ref) != 0)
-                    return -1;
-            }
-        }
-        return 0;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.username = username;
+    ctx.all_users = all_users;
+    ctx.distinct_uids = distinct_uids;
+    ctx.basis_str = basis_str;
+    ctx.bucket_detail_levels = bucket_detail_levels;
+    ctx.details = details;
+    ctx.matched_records = matched_records;
+    ctx.sum_ref = sum_ref;
+    ctx.stub_mode = (bucket_detail_levels == 0 && sum_ref != NULL) ? 1 : 0;
+
+    atomic_init(&ctx.next_task, 0);
+    atomic_init(&ctx.any_fail, 0);
+
+    nw = parse_ereport_thread_count();
+    if (nw < 1) nw = 1;
+    if ((size_t)nw > ntasks) nw = (int)ntasks;
+
+    tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+    args = (bucket_emit_thread_arg_t *)calloc((size_t)nw, sizeof(*args));
+    if (!tids || !args) {
+        fprintf(stderr, "ereport: allocation failed (bucket page emit pool)\n");
+        free(tids);
+        free(args);
+        return -1;
     }
 
-    for (ab = 0; ab < AGE_BUCKETS; ab++) {
-        for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-            char fn[PATH_MAX];
-            if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) return -1;
-            if (emit_bucket_detail_page(fn, username, all_users, distinct_uids, basis_str, ab, sb, bucket_detail_levels,
-                                        &details[ab][sb], matched_records) != 0) {
-                return -1;
-            }
+    for (ti = 0; ti < (size_t)nw; ti++) args[ti].ctx = &ctx;
+
+    for (ti = 0; ti < (size_t)nw; ti++) {
+        if (pthread_create(&tids[ti], NULL, bucket_page_emit_worker, &args[ti]) != 0) {
+            size_t j;
+            fprintf(stderr, "ereport: pthread_create failed (bucket page worker); retrying sequentially\n");
+            for (j = 0; j < ti; j++) pthread_join(tids[j], NULL);
+            free(tids);
+            atomic_store(&ctx.next_task, 0);
+            atomic_store(&ctx.any_fail, 0);
+            bucket_page_emit_worker(&args[0]);
+            free(args);
+            return atomic_load(&ctx.any_fail) ? -1 : 0;
         }
     }
-    return 0;
+
+    for (ti = 0; ti < (size_t)nw; ti++) pthread_join(tids[ti], NULL);
+    free(tids);
+    free(args);
+    return atomic_load(&ctx.any_fail) ? -1 : 0;
 }
 
 static double clamp01(double x) {
