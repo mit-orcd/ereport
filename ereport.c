@@ -1428,10 +1428,12 @@ static const char *path_tail_component(const char *path) {
 
 /*
  * Directory prefix for display: path through the '/' before the last path component.
- * If anchor_levels >= 1 and anchor is non-empty, keep anchor verbatim and only shorten the
- * remainder (so Level 2+ rows still show the shared base inside the muted prefix line).
+ * Level 1 (level_idx == 0): no anchor — show the full parent prefix, or generic ".../tail" if long.
+ * Level 2+ (level_idx >= 1): path is under shared base `anchor`; show the part below the base.
+ *   The crawl base is omitted from the muted line (shown as "...") so rows are not dominated by
+ *   repeating it; long middle segments still collapse with ".../tail" within that remainder.
  */
-static void compact_path_prefix(const char *path, char *buf, size_t sz, const char *anchor, int anchor_levels) {
+static void compact_path_prefix(const char *path, char *buf, size_t sz, const char *anchor, int level_idx) {
     const char *slash = strrchr(path, '/');
     size_t prefix_len;
     const size_t keep = 28;
@@ -1443,7 +1445,7 @@ static void compact_path_prefix(const char *path, char *buf, size_t sz, const ch
 
     prefix_len = (size_t)(slash - path + 1);
 
-    if (anchor_levels >= 1 && anchor && anchor[0] != '\0') {
+    if (level_idx >= 1 && anchor && anchor[0] != '\0') {
         size_t alen = strlen(anchor);
         if (prefix_len >= alen && strncmp(path, anchor, alen) == 0 &&
             (path[alen] == '/' || alen == prefix_len)) {
@@ -1451,13 +1453,13 @@ static void compact_path_prefix(const char *path, char *buf, size_t sz, const ch
             const char *ext = path + alen;
 
             if (ext_len == 0 || (ext_len == 1U && ext[0] == '/')) {
-                int n = snprintf(buf, sz, "%s/", anchor);
+                int n = snprintf(buf, sz, ".../");
                 if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
                 return;
             }
 
             if (ext_len <= keep) {
-                int n = snprintf(buf, sz, "%s%.*s", anchor, (int)ext_len, ext);
+                int n = snprintf(buf, sz, "...%.*s", (int)ext_len, ext);
                 if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
                 return;
             }
@@ -1465,7 +1467,7 @@ static void compact_path_prefix(const char *path, char *buf, size_t sz, const ch
             {
                 const char *start = ext + (ext_len - keep);
                 while (start > ext && *(start - 1) != '/') start--;
-                int n = snprintf(buf, sz, "%s.../%s", anchor, start);
+                int n = snprintf(buf, sz, ".../%s", start);
                 if (n < 0 || (size_t)n >= sz) buf[0] = '\0';
                 return;
             }
@@ -1617,6 +1619,48 @@ static void emit_path_summary_table(FILE *out,
     free(rows);
 }
 
+/* Age×size heat map: row total for ab, column total for sb, and full-matrix total (regular files). */
+static void emit_heat_map_margin_summary(FILE *out, const summary_t *sum, int ab, int sb) {
+    uint64_t row_b = 0, row_f = 0, col_b = 0, col_f = 0;
+    int i;
+    char rb[32], cb[32], gb[32];
+    char rf[128], cf[128], gf[128];
+
+    if (!sum) return;
+    for (i = 0; i < SIZE_BUCKETS; i++) {
+        row_b += sum->bytes[ab][i];
+        row_f += sum->files[ab][i];
+    }
+    for (i = 0; i < AGE_BUCKETS; i++) {
+        col_b += sum->bytes[i][sb];
+        col_f += sum->files[i][sb];
+    }
+    human_bytes(row_b, rb, sizeof(rb));
+    human_bytes(col_b, cb, sizeof(cb));
+    human_bytes(sum->total_bytes, gb, sizeof(gb));
+    format_count_pretty_inline(row_f, rf, sizeof(rf));
+    format_count_pretty_inline(col_f, cf, sizeof(cf));
+    format_count_pretty_inline(sum->total_files, gf, sizeof(gf));
+
+    fprintf(out, "<section class=\"heat-map-margins\" aria-label=\"Heat map row, column, and full totals\">\n");
+    fprintf(out,
+            "<p><strong>Age row total</strong> (this age band, all size buckets): <strong>%s</strong> in <strong>%s</strong> "
+            "regular files.</p>\n",
+            rb,
+            rf);
+    fprintf(out,
+            "<p><strong>Size column total</strong> (this size band, all age buckets): <strong>%s</strong> in <strong>%s</strong> "
+            "regular files.</p>\n",
+            cb,
+            cf);
+    fprintf(out,
+            "<p><strong>All buckets</strong> (full heat map, all age×size cells): <strong>%s</strong> in <strong>%s</strong> "
+            "regular files.</p>\n",
+            gb,
+            gf);
+    fprintf(out, "</section>\n");
+}
+
 static int emit_bucket_detail_page(const char *filename,
                                    const char *username,
                                    int all_users,
@@ -1626,7 +1670,8 @@ static int emit_bucket_detail_page(const char *filename,
                                    int sb,
                                    int detail_levels,
                                    const bucket_details_t *details,
-                                   const matched_records_t *matched_records) {
+                                   const matched_records_t *matched_records,
+                                   const summary_t *heat_sum) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
     path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
@@ -1690,6 +1735,8 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n");
     fprintf(out, ".path-full{margin-top:6px;padding:6px 8px;max-width:100%%;box-sizing:border-box;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;overflow-wrap:anywhere;font-size:10px;line-height:1.35;color:#4e4538;user-select:all;overflow-x:auto}\n");
     fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}\n");
+    fprintf(out, ".heat-map-margins{font-size:11px;color:#555;margin:0 0 14px;line-height:1.5;max-width:1200px}\n");
+    fprintf(out, ".heat-map-margins p{margin:6px 0 0}\n");
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
 
@@ -1709,6 +1756,8 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "</strong> | Size: <strong>");
     html_escape(out, size_bucket_names[sb]);
     fprintf(out, "</strong></div>\n");
+
+    if (heat_sum) emit_heat_map_margin_summary(out, heat_sum, ab, sb);
 
     if (details->count == 0) {
         fprintf(out, "<div class=\"note\">This bucket has no matching files.</div>\n</body>\n</html>\n");
@@ -1844,11 +1893,10 @@ static int emit_bucket_detail_stub_fast(const char *filename,
                                         int sb,
                                         const summary_t *sum) {
     FILE *out = counted_fopen(filename, "w");
-    char hb[32], ht[32];
+    char hb[32];
 
     if (!out) return -1;
     human_bytes(sum->bytes[ab][sb], hb, sizeof(hb));
-    human_bytes(sum->total_bytes, ht, sizeof(ht));
 
     fprintf(out, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -1856,6 +1904,8 @@ static int emit_bucket_detail_stub_fast(const char *filename,
     fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222;line-height:1.45}\n");
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;font-size:13px}\n");
     fprintf(out, ".note{margin:16px 0;padding:12px 14px;background:#faf8f0;border:1px solid #e8e4dc;border-radius:8px;font-size:13px}\n");
+    fprintf(out, ".heat-map-margins{font-size:13px;color:#444;margin:14px 0;line-height:1.5;max-width:900px}\n");
+    fprintf(out, ".heat-map-margins p{margin:8px 0 0}\n");
     fprintf(out, "</style>\n</head>\n<body>\n<h1>Bucket summary</h1>\n");
 
     fprintf(out, "<div class=\"meta\">");
@@ -1882,19 +1932,15 @@ static int emit_bucket_detail_stub_fast(const char *filename,
 
     {
         char cell_files[128];
-        char all_files[128];
 
         format_count_pretty_inline(sum->files[ab][sb], cell_files, sizeof(cell_files));
-        format_count_pretty_inline(sum->total_files, all_files, sizeof(all_files));
         fprintf(out,
                 "<p>This age/size cell: <strong>%s</strong> total bytes in <strong>%s</strong> regular files (hard-link "
                 "dedup).</p>\n",
                 hb,
                 cell_files);
-        fprintf(out, "<p>Entire report (all matched regular files): <strong>%s</strong> in <strong>%s</strong> files.</p>\n",
-                ht,
-                all_files);
     }
+    emit_heat_map_margin_summary(out, sum, ab, sb);
 
     fprintf(out, "</body>\n</html>\n");
     if (counted_fclose(out) != 0) return -1;
@@ -1955,7 +2001,8 @@ static void *bucket_page_emit_worker(void *arg) {
                 emit_bucket_detail_stub_fast(fn, c->username, c->all_users, c->distinct_uids, c->basis_str, ab, sb, c->sum_ref);
         } else {
             page_rc = emit_bucket_detail_page(fn, c->username, c->all_users, c->distinct_uids, c->basis_str, ab, sb,
-                                              c->bucket_detail_levels, &c->details[ab][sb], c->matched_records);
+                                              c->bucket_detail_levels, &c->details[ab][sb], c->matched_records,
+                                              c->sum_ref);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
         if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
@@ -3167,6 +3214,7 @@ static int emit_html(const char *report_path,
     fprintf(out, ".stats-num-short{color:#555;font-size:12px;font-weight:500}\n");
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
     fprintf(out, ".heatmap-caption{caption-side:top;text-align:left;font-size:12px;color:#555;line-height:1.45;max-width:720px;margin:10px 0 12px;padding:0}\n");
+    fprintf(out, ".heatmap-totals-note{font-size:12px;color:#555;max-width:min(900px,100%%);margin:12px 0 18px;line-height:1.5;padding:0}\n");
     fprintf(out, ".heatmap-corner{font-weight:600}\n");
     fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
@@ -3376,6 +3424,12 @@ static int emit_html(const char *report_path,
     fprintf(out, "</tr>\n");
 
     fprintf(out, "</table>\n");
+
+    fprintf(out,
+            "<p class=\"heatmap-totals-note\"><strong>Row and column totals.</strong> The rightmost column is the total for "
+            "each age <em>row</em> (sum over all size buckets). The bottom row is the total for each size <em>column</em> "
+            "(sum over all age buckets). The bottom-right cell is the total across the full heat map; it matches the sum "
+            "of the row totals and the sum of the column totals.</p>\n");
 
     {
         char totalb[32];
@@ -4318,7 +4372,8 @@ int main(int argc, char **argv) {
 
     if (emit_all_bucket_detail_pages(display_name, all_users_mode, distinct_uid_count, basis_str,
                                      bucket_detail_levels,
-                                     bucket_detail_levels == 0 ? &final_sum : NULL, final_details,
+                                     &final_sum,
+                                     final_details,
                                      &final_matched_records,
                                      &run_stats) != 0) {
         fprintf(stderr, "failed to write bucket detail pages\n");
