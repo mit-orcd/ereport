@@ -72,7 +72,6 @@
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
 
-#define FILE_MAGIC "NFSCBIN"
 #define FILE_MAGIC_LEN 8
 #define FORMAT_VERSION 3
 
@@ -947,8 +946,7 @@ static int write_bin_header(FILE *fp) {
     bin_file_header_t hdr;
 
     memset(&hdr, 0, sizeof(hdr));
-    memcpy(hdr.magic, FILE_MAGIC, strlen(FILE_MAGIC));
-    hdr.magic[7] = '\0';
+    memcpy(hdr.magic, CRAWL_BIN_MAGIC, (size_t)CRAWL_BIN_MAGIC_LEN);
     hdr.version = FORMAT_VERSION;
     return counted_fwrite(&hdr, sizeof(hdr), 1, fp) == 1 ? 0 : -1;
 }
@@ -1062,8 +1060,7 @@ static int inspect_existing_shard(const char *path, uint64_t *size_out, int *val
     if (!fp) return -1;
 
     if (fread(&hdr, sizeof(hdr), 1, fp) == 1 &&
-        memcmp(hdr.magic, "NFSCBIN", 7) == 0 &&
-        hdr.version == FORMAT_VERSION) {
+        crawl_bin_hdr_magic_ok(hdr.magic, hdr.version, FORMAT_VERSION)) {
         *valid_out = 1;
     }
 

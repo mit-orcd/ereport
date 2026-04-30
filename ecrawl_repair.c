@@ -193,7 +193,7 @@ static int validate_bin_prefix(const char *path, uint64_t file_sz, int *corrupt_
         return -1;
     }
     fclose(fp);
-    if (memcmp(hdr.magic, "NFSCBIN", 7) != 0 || hdr.version != FORMAT_VERSION) {
+    if (!crawl_bin_hdr_magic_ok(hdr.magic, hdr.version, FORMAT_VERSION)) {
         fprintf(stderr, "%s: not an ecrawl uid-shard binary (magic/version)\n", path);
         *corrupt_out = 1;
         return -1;

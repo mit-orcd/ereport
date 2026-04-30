@@ -3155,7 +3155,7 @@ static int build_chunks_for_file(const char *path,
     counted_fclose(fp);
     fp = NULL;
 
-    if (memcmp(fh.magic, "NFSCBIN", 7) != 0 || fh.version != FORMAT_VERSION) {
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
         fprintf(stderr, "warn: bad format/version in %s\n", path);
         return -1;
     }

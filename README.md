@@ -58,7 +58,7 @@ The tools are fast because they combine **compact binary I/O**, **parallelism al
 
 ### Shared ideas (`ecrawl`, `edelete`, `ereport`, `ereport_index`)
 
-- **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (`NFSCBIN` / format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
+- **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (file magic **`ERCBIN03`**, format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
 - **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—and to **truncate** an incomplete last record when possible—see **`ecrawl_repair`** below.
 - **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
 
