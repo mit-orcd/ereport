@@ -22,7 +22,7 @@
  *
  * Usage:
  *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
- * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS (or legacy ECRAWL_WORKERS),
+ * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
  */
 
@@ -435,13 +435,12 @@ static int is_power_of_two_u32(uint32_t v) {
     return v && ((v & (v - 1U)) == 0U);
 }
 
-/* Crawl thread count (>=1). ECRAWL_CRAWL_THREADS preferred; ECRAWL_WORKERS is a legacy alias. */
+/* Crawl thread count (>=1). Env: ECRAWL_CRAWL_THREADS. */
 static int parse_ecrawl_crawl_threads(void) {
     const char *e = getenv("ECRAWL_CRAWL_THREADS");
     long t;
     char *end;
 
-    if (!e || !*e) e = getenv("ECRAWL_WORKERS");
     if (!e || !*e) return DEFAULT_CRAWL_THREADS;
     errno = 0;
     t = strtol(e, &end, 10);
@@ -963,7 +962,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
-            "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1; alias ECRAWL_WORKERS), "
+            "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE).\n",
             DEFAULT_CRAWL_THREADS,

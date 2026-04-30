@@ -13,10 +13,12 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]
- *   ./ereport [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
- *     bucket pages are brief summaries only. Flags must appear first, before username/time basis.
+ *     bucket pages are brief summaries only.
+ *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
+ *     Flags must appear first (in any order), before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
  * Parallel thread count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
  * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
@@ -932,6 +934,57 @@ static void format_storage_base_paths_label(const char **dirs, size_t n, char *b
     }
 }
 
+static void strip_trailing_dir_slashes(char *s) {
+    size_t len;
+
+    if (!s) return;
+    len = strlen(s);
+    while (len > 1U && (s[len - 1U] == '/' || s[len - 1U] == '\\')) {
+        s[--len] = '\0';
+    }
+}
+
+/*
+ * Create directory path (mkdir -p semantics). Mutates path with temporary NULs.
+ */
+static int mkdir_p_path(char *path) {
+    size_t i;
+    size_t len;
+    struct stat st;
+
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    len = strlen(path);
+    for (i = 1U; i < len; i++) {
+        if (path[i] != '/')
+            continue;
+        path[i] = '\0';
+        if (path[0] != '\0') {
+            if (stat(path, &st) != 0) {
+                if (mkdir(path, 0777) != 0 && errno != EEXIST) {
+                    path[i] = '/';
+                    return -1;
+                }
+            } else if (!S_ISDIR(st.st_mode)) {
+                path[i] = '/';
+                errno = ENOTDIR;
+                return -1;
+            }
+        }
+        path[i] = '/';
+    }
+    if (stat(path, &st) != 0) {
+        if (mkdir(path, 0777) != 0 && errno != EEXIST)
+            return -1;
+    } else if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
 static void set_bucket_output_dir(const char *username) {
     size_t i;
     int n;
@@ -1565,7 +1618,9 @@ static void emit_compact_path_cell(FILE *out, const char *path, const char *base
 
     compact_path_prefix(path, prefix, sizeof(prefix), base_prefix, level_idx);
 
-    fprintf(out, "<td class=\"path-cell\" title=\"");
+    fprintf(out, "<td class=\"path-cell\" data-sort-s=\"");
+    html_escape(out, path);
+    fprintf(out, "\" title=\"");
     html_escape(out, path);
     fprintf(out, "\">");
     fprintf(out, "<div class=\"path-line\">");
@@ -1623,8 +1678,8 @@ static void emit_path_summary_table(FILE *out,
         if (shown > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) shown = (size_t)BUCKET_PATH_TABLE_MAX_ROWS;
 
         fprintf(out,
-                "<!-- bucket path table: %zu director%s at this level; %zu rows in HTML (cap %d; sort bucket bytes "
-                "desc) -->\n",
+                "<!-- bucket path table: %zu director%s at this level; %zu rows in HTML (cap %d; default sort bucket "
+                "bytes desc; headers clickable) -->\n",
                 count,
                 count == 1 ? "y" : "ies",
                 shown,
@@ -1633,51 +1688,119 @@ static void emit_path_summary_table(FILE *out,
         if (count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) {
             fprintf(out,
                     "<p class=\"table-trunc-note\">Showing the <strong>top %d</strong> of <strong>%zu</strong> "
-                    "directories at this depth (sorted by bucket bytes, largest first). Omitted rows are lower "
-                    "in that ranking; heat-map and bucket summary totals above still include the full bucket.</p>\n",
+                    "directories at this depth (default sort: bucket bytes, largest first). Omitted rows are lower "
+                    "in that ranking; heat-map and bucket summary totals above still include the full bucket. "
+                    "Use column headers to sort the visible rows.</p>\n",
                     BUCKET_PATH_TABLE_MAX_ROWS,
                     count);
         }
     }
 
-    fprintf(out, "<div class=\"bucket-table-wrap\"><table>\n<thead><tr><th>Path</th><th class=\"r\">Bucket Files</th><th class=\"r\">Share of Bucket Files</th><th class=\"r\">Bucket Bytes</th><th class=\"r\">Share of Bucket Bytes</th><th class=\"r\">Total Files</th><th class=\"r\">Total Dirs</th><th class=\"r\">Total Bytes</th><th class=\"r\">Share of User Bytes</th><th class=\"r\">Share of User Files</th></tr></thead>\n<tbody>\n");
-    for (i = 0; i < count && i < (size_t)BUCKET_PATH_TABLE_MAX_ROWS; i++) {
-        char bb[32];
-        char tb[32];
-        char file_bg[32];
-        char byte_bg[32];
-        double share_bytes = total_bucket_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_bucket_bytes) : 0.0;
-        double share_files = total_bucket_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_bucket_files) : 0.0;
-        double user_bytes_pct = total_user_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_user_bytes) : 0.0;
-        double user_files_pct = total_user_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_user_files) : 0.0;
+    fprintf(out,
+            "<div class=\"bucket-table-wrap\"><table>\n<thead><tr>"
+            "<th class=\"path-cell sort-h\" data-i=\"0\" data-t=\"s\"><span class=\"th-text\">Path</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"1\" data-t=\"n\"><span class=\"th-text\">Bucket Files</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"2\" data-t=\"n\"><span class=\"th-text\">Share of Bucket Files</span></th>"
+            "<th class=\"r num sort-h sort-desc\" data-i=\"3\" data-t=\"n\"><span class=\"th-text\">Bucket Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"4\" data-t=\"n\"><span class=\"th-text\">Share of Bucket Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"5\" data-t=\"n\"><span class=\"th-text\">Total Files</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"6\" data-t=\"n\"><span class=\"th-text\">Total Dirs</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"7\" data-t=\"n\"><span class=\"th-text\">Total Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"8\" data-t=\"n\"><span class=\"th-text\">Share of User Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"9\" data-t=\"n\"><span class=\"th-text\">Share of User Files</span></th>"
+            "</tr></thead>\n<tbody>\n");
 
-        char bpf[96];
-        char tpf[96];
+    {
+        size_t shown_n = count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS ? (size_t)BUCKET_PATH_TABLE_MAX_ROWS : count;
+        uint64_t max_total_files = 0;
+        uint64_t max_total_dirs = 0;
+        uint64_t max_total_bytes = 0;
+        for (i = 0; i < shown_n; i++) {
+            if (rows[i]->total_files > max_total_files) max_total_files = rows[i]->total_files;
+            if (rows[i]->total_dirs > max_total_dirs) max_total_dirs = rows[i]->total_dirs;
+            if (rows[i]->total_bytes > max_total_bytes) max_total_bytes = rows[i]->total_bytes;
+        }
 
-        human_bytes(rows[i]->bucket_bytes, bb, sizeof(bb));
-        human_bytes(rows[i]->total_bytes, tb, sizeof(tb));
-        format_count_pretty_inline(rows[i]->bucket_files, bpf, sizeof(bpf));
-        format_count_pretty_inline(rows[i]->total_files, tpf, sizeof(tpf));
-        contribution_cell_color(share_files, file_bg, sizeof(file_bg));
-        contribution_cell_color(share_bytes, byte_bg, sizeof(byte_bg));
+        for (i = 0; i < count && i < (size_t)BUCKET_PATH_TABLE_MAX_ROWS; i++) {
+            char bb[32];
+            char tb[32];
+            char file_bg[32];
+            char byte_bg[32];
+            char total_files_bg[32];
+            char total_dirs_bg[32];
+            char total_bytes_bg[32];
+            char user_byte_bg[32];
+            char user_file_bg[32];
+            double share_bytes =
+                total_bucket_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_bucket_bytes) : 0.0;
+            double share_files =
+                total_bucket_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_bucket_files) : 0.0;
+            double user_bytes_pct =
+                total_user_bytes ? (100.0 * (double)rows[i]->bucket_bytes / (double)total_user_bytes) : 0.0;
+            double user_files_pct =
+                total_user_files ? (100.0 * (double)rows[i]->bucket_files / (double)total_user_files) : 0.0;
+            double total_files_heat =
+                max_total_files ? (100.0 * (double)rows[i]->total_files / (double)max_total_files) : 0.0;
+            double total_dirs_heat =
+                max_total_dirs ? (100.0 * (double)rows[i]->total_dirs / (double)max_total_dirs) : 0.0;
+            double total_bytes_heat =
+                max_total_bytes ? (100.0 * (double)rows[i]->total_bytes / (double)max_total_bytes) : 0.0;
 
-        fprintf(out, "<tr>");
-        emit_compact_path_cell(out, rows[i]->path, base_prefix, level_idx);
-        fprintf(out,
-                "<td class=\"r\" style=\"background:%s\">%s</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\" style=\"background:%s\">%s</td><td class=\"r\" style=\"background:%s\">%.1f</td><td class=\"r\">%s</td><td class=\"r\">%" PRIu64 "</td><td class=\"r\">%s</td><td class=\"r\">%.1f</td><td class=\"r\">%.1f</td></tr>\n",
-                file_bg,
-                bpf,
-                file_bg,
-                share_files,
-                byte_bg,
-                bb,
-                byte_bg,
-                share_bytes,
-                tpf,
-                rows[i]->total_dirs,
-                tb,
-                user_bytes_pct,
-                user_files_pct);
+            char bpf[96];
+            char tpf[96];
+
+            human_bytes(rows[i]->bucket_bytes, bb, sizeof(bb));
+            human_bytes(rows[i]->total_bytes, tb, sizeof(tb));
+            format_count_pretty_inline(rows[i]->bucket_files, bpf, sizeof(bpf));
+            format_count_pretty_inline(rows[i]->total_files, tpf, sizeof(tpf));
+            contribution_cell_color(share_files, file_bg, sizeof(file_bg));
+            bytes_share_cell_color(share_bytes, byte_bg, sizeof(byte_bg));
+            contribution_cell_color(total_files_heat, total_files_bg, sizeof(total_files_bg));
+            contribution_cell_color(total_dirs_heat, total_dirs_bg, sizeof(total_dirs_bg));
+            bytes_share_cell_color(total_bytes_heat, total_bytes_bg, sizeof(total_bytes_bg));
+            bytes_share_cell_color(user_bytes_pct, user_byte_bg, sizeof(user_byte_bg));
+            contribution_cell_color(user_files_pct, user_file_bg, sizeof(user_file_bg));
+
+            fprintf(out, "<tr>");
+            emit_compact_path_cell(out, rows[i]->path, base_prefix, level_idx);
+            fprintf(out,
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%" PRIu64 "</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
+                    "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td></tr>\n",
+                    file_bg,
+                    rows[i]->bucket_files,
+                    bpf,
+                    file_bg,
+                    share_files,
+                    share_files,
+                    byte_bg,
+                    rows[i]->bucket_bytes,
+                    bb,
+                    byte_bg,
+                    share_bytes,
+                    share_bytes,
+                    total_files_bg,
+                    rows[i]->total_files,
+                    tpf,
+                    total_dirs_bg,
+                    rows[i]->total_dirs,
+                    rows[i]->total_dirs,
+                    total_bytes_bg,
+                    rows[i]->total_bytes,
+                    tb,
+                    user_byte_bg,
+                    user_bytes_pct,
+                    user_bytes_pct,
+                    user_file_bg,
+                    user_files_pct,
+                    user_files_pct);
+        }
     }
     fprintf(out, "</tbody></table></div>\n");
     free(rows);
@@ -1769,40 +1892,64 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     fprintf(out, "<title>Bucket Details</title>\n<style>\n");
-    fprintf(out, "body{font-family:\"DejaVu Sans Mono\",\"Consolas\",monospace;margin:18px;color:#1f2328;background:#fcfcf8}\n");
-    fprintf(out, ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;margin-bottom:18px}\n");
-    fprintf(out, "h1,h2{margin:0 0 10px 0;font-weight:600}\n");
-    fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:12px}\n");
+    fprintf(out, "html{box-sizing:border-box}\n");
+    fprintf(out,
+            "body{font-family:\"DejaVu Sans Mono\",\"Consolas\",monospace;margin:0;padding:"
+            "10px clamp(10px,2.2vw,28px) 28px;width:100%%;max-width:none;box-sizing:border-box;color:#1f2328;"
+            "background:#fcfcf8}\n");
+    fprintf(out,
+            ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;max-width:none;"
+            "margin-bottom:22px}\n");
+    fprintf(out, "h1,h2{margin:0 0 12px 0;font-weight:600}\n");
+    fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:13px}\n");
     fprintf(out, ".meta-sub{font-weight:400;color:#666}\n");
-    fprintf(out, ".note{font-size:11px;color:#666;margin-bottom:14px;max-width:1200px}\n");
-    fprintf(out, ".table-trunc-note{font-size:11px;color:#555;margin:0 0 10px;max-width:1200px;line-height:1.45}\n");
-    fprintf(out, ".bucket-help{margin:0 0 16px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:1200px;font-size:12px;line-height:1.55;color:#555}\n");
+    fprintf(out, ".note{font-size:12px;color:#666;margin-bottom:14px;max-width:none;width:100%%}\n");
+    fprintf(out,
+            ".table-trunc-note{font-size:12px;color:#555;margin:0 0 12px;max-width:none;width:100%%;line-height:1.45}\n");
+    fprintf(out,
+            ".bucket-help{margin:0 0 18px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:none;"
+            "width:100%%;font-size:13px;line-height:1.55;color:#555}\n");
     fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
     fprintf(out, ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n");
     fprintf(out, ".bucket-help .bucket-help-body{padding:0 12px 12px}\n");
     fprintf(out, ".bucket-help .bucket-help-body p{margin:0 0 10px}\n");
     fprintf(out, ".bucket-help .bucket-help-body p:last-child{margin-bottom:0}\n");
-    fprintf(out, "table{border-collapse:collapse;width:100%%;font-size:11px;table-layout:fixed}\n");
-    fprintf(out, "th,td{border:1px solid #d5d0c5;padding:3px 6px;vertical-align:top}\n");
-    fprintf(out, "th{background:#ece6da;position:sticky;top:0;z-index:2}\n");
-    fprintf(out, "th:first-child,td:first-child{position:sticky;left:0;background:#f8f5ee;z-index:1}\n");
+    fprintf(out,
+            "table{border-collapse:collapse;font-size:13px;table-layout:auto;width:max-content;max-width:none}\n");
+    fprintf(out, "th,td{border:1px solid #d5d0c5;padding:5px 12px;vertical-align:top}\n");
+    fprintf(out, "thead th{background:#ece6da;position:sticky;top:0;z-index:3}\n");
+    fprintf(out, "thead th:first-child,tbody td:first-child{position:sticky;left:0;z-index:4}\n");
+    fprintf(out, "thead th:first-child{background:#ece6da;z-index:5}\n");
+    fprintf(out, "tbody td:first-child{background:#f8f5ee;z-index:1}\n");
     fprintf(out, "td.r,th.r{text-align:right}\n");
     fprintf(out,
-            ".bucket-table-wrap td.r,.bucket-table-wrap th.r{box-sizing:border-box;overflow:hidden;overflow-wrap:"
-            "anywhere;word-break:break-word;hyphens:none}\n");
-    fprintf(out, "th:first-child{width:40%%;min-width:min(560px,78vw);max-width:720px;box-sizing:border-box}\n");
-    fprintf(out, ".path-cell{width:40%%;min-width:min(560px,78vw);max-width:720px;overflow-x:hidden;overflow-y:visible;box-sizing:border-box}\n");
+            ".bucket-table-wrap td.num,.bucket-table-wrap th.num{white-space:nowrap;box-sizing:border-box}\n");
+    fprintf(out,
+            ".bucket-table-wrap th.sort-h{cursor:pointer;user-select:none}\n"
+            ".bucket-table-wrap th.sort-h:hover{background:#ddd4c4}\n"
+            ".bucket-table-wrap th.sort-asc .th-text::after{content:\" \\25b2\";font-size:0.72em;opacity:0.85}\n"
+            ".bucket-table-wrap th.sort-desc .th-text::after{content:\" \\25bc\";font-size:0.72em;opacity:0.85}\n");
+    fprintf(out,
+            "th:first-child{min-width:max(260px,min(28vw,560px));max-width:none;box-sizing:border-box}\n");
+    fprintf(out,
+            ".path-cell{min-width:max(260px,min(28vw,560px));max-width:none;overflow-x:hidden;overflow-y:visible;"
+            "box-sizing:border-box}\n");
     fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;min-width:0}\n");
     fprintf(out, ".path-toggle{min-width:0;max-width:100%%;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n");
-    fprintf(out, ".path-prefix{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;font-size:10px;line-height:1.15;margin-bottom:1px}\n");
-    fprintf(out, ".path-tail{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:#1f2328;line-height:1.15}\n");
+    fprintf(out,
+            ".path-prefix{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;"
+            "font-size:11px;line-height:1.15;margin-bottom:1px}\n");
+    fprintf(out,
+            ".path-tail{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;"
+            "color:#1f2328;line-height:1.2}\n");
     fprintf(out, ".copy-path{opacity:0;pointer-events:none;align-self:start;flex-shrink:0;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n");
     fprintf(out, ".path-cell:hover .copy-path,.path-cell:focus-within .copy-path,.path-cell.expanded .copy-path{opacity:1;pointer-events:auto}\n");
     fprintf(out, ".copy-path:hover{background:#eadfc9}\n");
     fprintf(out, ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n");
     fprintf(out, ".path-full{margin-top:6px;padding:6px 8px;max-width:100%%;box-sizing:border-box;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;overflow-wrap:anywhere;font-size:10px;line-height:1.35;color:#4e4538;user-select:all;overflow-x:auto}\n");
     fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}\n");
-    fprintf(out, ".heat-map-margins{font-size:11px;color:#555;margin:0 0 14px;line-height:1.5;max-width:1200px}\n");
+    fprintf(out,
+            ".heat-map-margins{font-size:12px;color:#555;margin:0 0 16px;line-height:1.5;max-width:none;width:100%%}\n");
     fprintf(out, ".heat-map-margins p{margin:6px 0 0}\n");
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
@@ -1872,7 +2019,8 @@ static int emit_bucket_detail_page(const char *filename,
     }
     fputs("<details class=\"bucket-help\"><summary>How to read these tables</summary>\n"
           "<div class=\"bucket-help-body\">\n"
-          "<p><strong>Sorting.</strong> Rows are ordered by bucket bytes (largest first).</p>\n"
+          "<p><strong>Sorting.</strong> Click a column header to sort; click again to reverse. "
+          "The default is bucket bytes (largest first). The path column sorts by full path (A&ndash;Z).</p>\n"
           "<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
           "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path.</p>\n"
           "<p><strong>User share columns.</strong> &ldquo;Share of user bytes/files&rdquo; compares this path to <em>all</em> of the user&rsquo;s files across every bucket (overall footprint).</p>\n"
@@ -1883,7 +2031,9 @@ static int emit_bucket_detail_page(const char *filename,
             "(one segment per level). A row appears at level <em>n</em> only when there is at least one path segment at that depth.</p>\n",
             detail_levels);
     fputs(
-          "<p><strong>Heat colors.</strong> Stronger red in the bucket-share cells means a larger share of this bucket&rsquo;s bytes or files.</p>\n"
+          "<p><strong>Heat colors.</strong> <strong>Blue</strong> tints mark data volume (bucket bytes, share of bucket bytes, "
+          "total bytes, share of user bytes). <strong>Red</strong> tints mark file-style counts (bucket files, share of bucket files, "
+          "total files, total dirs, share of user files). Row-relative columns scale strongest vs other rows in that table.</p>\n"
           "</div></details>\n",
           out);
 
@@ -1904,6 +2054,8 @@ static int emit_bucket_detail_page(const char *filename,
     fputs("<script>\n"
           "(function(){\n"
           "function copyText(text){if(navigator.clipboard&&window.isSecureContext){return navigator.clipboard.writeText(text);}return new Promise(function(resolve,reject){var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');resolve();}catch(err){reject(err);}document.body.removeChild(ta);});}\n"
+          "function sortTable(table,th){var col=parseInt(th.getAttribute('data-i'),10);var typ=th.getAttribute('data-t');var lco=table.getAttribute('data-sort-col');var ldi=table.getAttribute('data-sort-dir');var dir;if(String(col)===lco&&ldi){dir=ldi==='d'?'a':'d';}else{dir=typ==='s'?'a':'d';}table.setAttribute('data-sort-col',String(col));table.setAttribute('data-sort-dir',dir);table.querySelectorAll('thead th.sort-h').forEach(function(x){x.classList.remove('sort-asc','sort-desc');});th.classList.add(dir==='d'?'sort-desc':'sort-asc');var tb=table.querySelector('tbody');if(!tb)return;var rows=Array.prototype.slice.call(tb.rows);rows.sort(function(ra,rb){var ca=ra.cells[col];var cb=rb.cells[col];if(!ca||!cb)return 0;var cmp;if(typ==='s'){var sa=ca.getAttribute('data-sort-s')||'';var sb=cb.getAttribute('data-sort-s')||'';cmp=sa.localeCompare(sb);}else{var va=parseFloat(ca.getAttribute('data-sort-n'));var vb=parseFloat(cb.getAttribute('data-sort-n'));if(isNaN(va))va=0;if(isNaN(vb))vb=0;cmp=va-vb;}if(dir==='d')cmp=-cmp;return cmp||0;});rows.forEach(function(r){tb.appendChild(r);});}\n"
+          "document.querySelectorAll('.bucket-table-wrap thead th.sort-h').forEach(function(th){th.addEventListener('click',function(){sortTable(th.closest('table'),th);});});\n"
           "document.querySelectorAll('.copy-path').forEach(function(btn){btn.addEventListener('click',function(ev){var text=btn.getAttribute('data-copy');var old=btn.textContent;ev.preventDefault();ev.stopPropagation();copyText(text).then(function(){btn.textContent='Copied';setTimeout(function(){btn.textContent=old;},900);}).catch(function(){btn.textContent='Copy?';setTimeout(function(){btn.textContent=old;},1200);});});});\n"
           "document.querySelectorAll('.path-toggle').forEach(function(btn){btn.addEventListener('click',function(ev){var cell=btn.closest('.path-cell');var full=cell.querySelector('.path-full');var expanded=cell.classList.toggle('expanded');full.hidden=!expanded;btn.setAttribute('aria-expanded',expanded?'true':'false');ev.preventDefault();});});\n"
           "})();\n"
@@ -1937,18 +2089,17 @@ static int build_bucket_page_path(char *out, size_t out_sz, int ab, int sb) {
 }
 
 static int ensure_bucket_output_dir_exists(void) {
-    struct stat st;
+    char buf[PATH_MAX];
+    size_t len;
 
     if (g_bucket_output_dir[0] == '\0') return -1;
-
-    if (stat(g_bucket_output_dir, &st) != 0) {
-        if (mkdir(g_bucket_output_dir, 0777) != 0) return -1;
-    } else if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
+    len = strlen(g_bucket_output_dir);
+    if (len >= sizeof(buf)) {
+        errno = ENAMETOOLONG;
         return -1;
     }
-
-    return 0;
+    memcpy(buf, g_bucket_output_dir, len + 1U);
+    return mkdir_p_path(buf);
 }
 
 static int emit_bucket_detail_stub_fast(const char *filename,
@@ -3285,7 +3436,10 @@ static int emit_html(const char *report_path,
     fprintf(out, ".cell.active{outline:3px solid #2d6a9f;outline-offset:-3px}\n");
     fprintf(out, ".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
     fprintf(out, ".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
-    fprintf(out, ".drawer{position:fixed;top:0;right:0;width:min(980px,92vw);height:100vh;background:#fff;box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;z-index:21;display:flex;flex-direction:column}\n");
+    fprintf(out,
+            ".drawer{position:fixed;top:0;right:0;width:85vw;height:100vh;background:#fff;"
+            "box-shadow:-8px 0 24px rgba(0,0,0,0.18);transform:translateX(100%%);transition:transform 0.22s ease;"
+            "z-index:21;display:flex;flex-direction:column}\n");
     fprintf(out, ".drawer.open{transform:translateX(0)}\n");
     fprintf(out, ".drawer-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 18px;border-bottom:1px solid #ddd;background:#faf7ef}\n");
     fprintf(out, ".drawer-title{font-size:18px;font-weight:600;color:#222}\n");
@@ -3899,6 +4053,7 @@ int main(int argc, char **argv) {
     int stats_thread_started = 0;
     int all_users_mode = 0;
     int bucket_detail_levels = 0;
+    char report_dir_opt[PATH_MAX];
     uint64_t distinct_uid_count = 0;
     double t0, t1;
     ereport_run_stats_t run_stats;
@@ -3917,40 +4072,85 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     run_stats.run_start_sec = t0;
 
+    report_dir_opt[0] = '\0';
+
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
-        fprintf(stderr, "       %s [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]  (all users → ./all_users/)\n",
+        fprintf(stderr,
+                "Usage: %s [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n",
+                argv[0]);
+        fprintf(stderr,
+                "       %s [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]  (all users → "
+                "./all_users/)\n",
                 argv[0]);
         fprintf(stderr, "Optional --bucket-details N (1…%d): full per-bucket directory tables; omit for brief buckets.\n",
                 BUCKET_DETAIL_LEVELS_MAX);
-        fprintf(stderr, "Flags must appear first. Thread count: EREPORT_THREADS (default %d).\n", DEFAULT_THREADS);
+        fprintf(stderr,
+                "Optional --report-dir DIR: write reports under DIR/(user or all_users)/; omit for current directory.\n");
+        fprintf(stderr, "Flags must appear first (any order). Thread count: EREPORT_THREADS (default %d).\n",
+                DEFAULT_THREADS);
         return 2;
     }
 
     {
         int ac = argc;
         char **av = argv;
-        while (ac > 1 && strcmp(av[1], "--bucket-details") == 0) {
-            char *end;
-            long lv;
-            if (bucket_detail_levels != 0) {
-                fprintf(stderr, "ereport: duplicate --bucket-details\n");
-                return 2;
+
+        for (;;) {
+            if (ac > 1 && strcmp(av[1], "--bucket-details") == 0) {
+                char *end;
+                long lv;
+
+                if (bucket_detail_levels != 0) {
+                    fprintf(stderr, "ereport: duplicate --bucket-details\n");
+                    return 2;
+                }
+                if (ac < 3) {
+                    fprintf(stderr, "ereport: --bucket-details requires a number\n");
+                    return 2;
+                }
+                errno = 0;
+                lv = strtol(av[2], &end, 10);
+                if (errno || end == av[2] || *end || lv < 1 || lv > BUCKET_DETAIL_LEVELS_MAX) {
+                    fprintf(stderr, "ereport: --bucket-details must be between 1 and %d\n", BUCKET_DETAIL_LEVELS_MAX);
+                    return 2;
+                }
+                bucket_detail_levels = (int)lv;
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
+                argc = ac;
+                continue;
             }
-            if (ac < 3) {
-                fprintf(stderr, "ereport: --bucket-details requires a number\n");
-                return 2;
+            if (ac > 1 && strcmp(av[1], "--report-dir") == 0) {
+                int nr;
+
+                if (report_dir_opt[0] != '\0') {
+                    fprintf(stderr, "ereport: duplicate --report-dir\n");
+                    return 2;
+                }
+                if (ac < 3) {
+                    fprintf(stderr, "ereport: --report-dir requires a directory path\n");
+                    return 2;
+                }
+                if (av[2][0] == '\0') {
+                    fprintf(stderr, "ereport: --report-dir path is empty\n");
+                    return 2;
+                }
+                nr = snprintf(report_dir_opt, sizeof(report_dir_opt), "%s", av[2]);
+                if (nr < 0 || (size_t)nr >= sizeof(report_dir_opt)) {
+                    fprintf(stderr, "ereport: --report-dir path too long\n");
+                    return 2;
+                }
+                strip_trailing_dir_slashes(report_dir_opt);
+                if (report_dir_opt[0] == '\0') {
+                    fprintf(stderr, "ereport: --report-dir path is invalid\n");
+                    return 2;
+                }
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
+                argc = ac;
+                continue;
             }
-            errno = 0;
-            lv = strtol(av[2], &end, 10);
-            if (errno || end == av[2] || *end || lv < 1 || lv > BUCKET_DETAIL_LEVELS_MAX) {
-                fprintf(stderr, "ereport: --bucket-details must be between 1 and %d\n", BUCKET_DETAIL_LEVELS_MAX);
-                return 2;
-            }
-            bucket_detail_levels = (int)lv;
-            memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
-            ac -= 2;
-            argc = ac;
+            break;
         }
     }
 
@@ -3993,11 +4193,16 @@ int main(int argc, char **argv) {
         }
     } else {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n", argv[0]);
-            fprintf(stderr, "       %s [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]  (all users → ./all_users/)\n",
+            fprintf(stderr,
+                    "Usage: %s [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n",
                     argv[0]);
-            fprintf(stderr, "Optional --bucket-details N (1…%d); omit for brief bucket pages. Thread count: EREPORT_THREADS "
-                           "(default %d).\n",
+            fprintf(stderr,
+                    "       %s [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]  (all users → "
+                    "./all_users/)\n",
+                    argv[0]);
+            fprintf(stderr,
+                    "Optional --bucket-details N (1…%d); optional --report-dir DIR; omit for brief bucket pages / cwd. "
+                    "Thread count: EREPORT_THREADS (default %d).\n",
                     BUCKET_DETAIL_LEVELS_MAX, DEFAULT_THREADS);
             return 2;
         }
@@ -4043,6 +4248,18 @@ int main(int argc, char **argv) {
     format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
 
     set_bucket_output_dir(display_name);
+    if (report_dir_opt[0] != '\0') {
+        char joined[PATH_MAX];
+        int nj;
+
+        nj = snprintf(joined, sizeof(joined), "%s/%s", report_dir_opt, g_bucket_output_dir);
+        if (nj < 0 || (size_t)nj >= sizeof(joined)) {
+            fprintf(stderr, "ereport: report output path too long under --report-dir\n");
+            free((void *)bin_dirs);
+            return 1;
+        }
+        memcpy(g_bucket_output_dir, joined, (size_t)nj + 1U);
+    }
     if (snprintf(report_path, sizeof(report_path), "%s/index.html", g_bucket_output_dir) >= (int)sizeof(report_path)) {
         fprintf(stderr, "report path too long for %s\n", g_bucket_output_dir);
         free((void *)bin_dirs);
