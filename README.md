@@ -6,7 +6,7 @@ The current toolchain is:
 
 - `ecrawl`: parallel filesystem crawler that writes compact binary records
 - `ecrawl_repair`: optional utility that rescans `uid_shard_*.bin` shards, writes **`*.bin.ckpt`** sidecars, **truncates** shards at the last good record when the tail is incomplete, quarantines shards that cannot be fixed, and prints a short **tail-truncation summary** on stderr when anything was shortened (or would be, with **`--dry-run`**)
-- `edelete`: parallel filesystem walker (same task-queue / donation model as **`ecrawl`**) that can **`unlink`** non-directory paths older than a chosen **`atime`/`mtime`/`ctime`** threshold; default run is **dry-run**, with **`--delete`** performing real deletes and **`rmdir`** for directories that become empty (still under the start path). Symlinks are **not** followed.
+- `edelete`: parallel filesystem walker (same task-queue / donation model as **`ecrawl`**) that can **`unlink`** non-directory paths—either **everything under a path** (one argument) or only entries older than a chosen **`atime`/`mtime`/`ctime`** threshold (**three** arguments); default run is **dry-run**, with **`--delete`** performing real deletes and **`rmdir`** for directories that become empty (still under the start path). Symlinks are **not** followed.
 - `ereport`: report generator that reads crawl output and writes `index.html`, bucket drilldown pages, and a search box that uses the trigram index when you serve the tree over HTTP
 - `ereport_index`: search-index helper for path-element substring search
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
@@ -58,25 +58,27 @@ The tools are fast because they combine **compact binary I/O**, **parallelism al
 
 ### Shared ideas (`ecrawl`, `edelete`, `ereport`, `ereport_index`)
 
+- **Path arguments** — Directory and crawl-root arguments are normalized to **canonical absolute paths** with **`realpath(3)`** once the path exists (see **`path_canon.h`**). Relative inputs are supported; symlink components are resolved. Output directories that are created on demand are canonicalized after **`mkdir`** where applicable.
 - **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (file magic **`ERCBIN03`**, format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
 - **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—and to **truncate** an incomplete last record when possible—see **`ecrawl_repair`** below.
 - **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
 
-### `edelete`: parallel age-based deletion
+### `edelete`: parallel deletion (optional age filter)
 
 - **Same crawl parallelism pattern as `ecrawl`** — task queue, worker threads, local directory stacks, and **work donation** so wide trees stay busy across threads.
 - **Does not follow symlinks** — traversal uses **`lstat`** / **`fstatat(..., AT_SYMLINK_NOFOLLOW)`**; symlink inodes can be **`unlink`**’d if eligible, but targets are not walked through links.
 - **Deletes non-directory paths only** — regular files, symlinks, FIFOs, sockets, etc.; directories are opened and enumerated, then removed with **`rmdir`** only after **`--delete`** when they become empty (deepest first, without ascending above the start path or removing **`/`**).
-- **Default is dry-run** — counts **`would_delete`** and prints **`mode=dry-run`**; **`--delete`** performs **`unlink`** and empty-dir cleanup.
+- **Default is dry-run** — counts **`would_delete`** and prints **`mode=dry-run`**; **`--delete`** prints a summary of resolved path, filter, thread settings, and **`verbose`**, then requires typing **`YES`** on stdin before any **`unlink`** and empty-dir cleanup—unless **`--force`** is also passed (**`--delete --force`** skips the prompt for scripting).
 - **Live status line** — rolling **`entries/s(10s)`** and totals on stdout (similar spirit to **`ecrawl`**); **`--verbose`** is currently parsed but does not change output.
 
 Usage:
 
 ```bash
-./edelete [--delete] [--verbose] <atime|mtime|ctime> <days> <absolute-path>
+./edelete [--delete] [--force] [--verbose] <path>
+./edelete [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>
 ```
 
-The path must be **absolute**. **`days`** selects entries whose chosen timestamp is at least **`days × 86400`** seconds older than wall-clock now.
+The start path is resolved to an absolute path (**`realpath(3)`**). With **one** argument, every non-directory under **`path`** is eligible (still **dry-run** unless **`--delete`**). With **three** arguments, **`days`** selects entries whose chosen timestamp is at least **`days × 86400`** seconds older than wall-clock now.
 
 Environment variables:
 
@@ -88,12 +90,14 @@ Environment variables:
 Examples:
 
 ```bash
+./edelete /tmp/staging_area
+./edelete --delete /tmp/empty_me
 ./edelete mtime 90 /storage/scratch/job123
 EDELETE_THREADS=32 ./edelete --delete ctime 14 /mnt/cache/tmp
 EDELETE_MAX_UNLINK_INFLIGHT=128 ./edelete --delete atime 30 /big/tree
 ```
 
-Final stdout summary includes **`basis`**, **`mode`**, scan counts, **`deleted_files`**, **`removed_empty_dirs`**, **`would_delete`**, **`errors`**, throughput metrics, and donation counters.
+Final stdout summary includes **`delete_all`** (**`1`** when the one-argument form was used), **`basis`** / **`age_days`** when the age filter is used, **`force`** (**`1`** if **`--force`** was passed), **`mode`**, scan counts, **`deleted_files`**, **`removed_empty_dirs`**, **`would_delete`**, **`errors`**, throughput metrics, and donation counters.
 
 ### `ecrawl`: crawling and capture
 
@@ -167,7 +171,7 @@ Basic usage:
 ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
 ```
 
-Positional arguments are only **`start-path`** (required, absolute) and optionally **`output-dir`**. If **`output-dir`** is omitted, a timestamped directory name is created in the current working directory.
+Positional arguments are only **`start-path`** (required) and optionally **`output-dir`**. **`start-path`** must exist; it is canonicalized with **`realpath(3)`** (relative or absolute). After the output directory is created, it is canonicalized the same way. If **`output-dir`** is omitted, a timestamped directory name is created in the current working directory.
 
 Optional environment variables (no CLI flags for these):
 
@@ -195,7 +199,7 @@ Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
 - `--verbose` enables the full end-of-run diagnostics.
-- **`--record-root <abs-path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. Requires `--record-root` to be an absolute path.
+- **`--record-root <path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with **`realpath(3)`**.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
@@ -650,7 +654,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 ## Source layout
 
-- **`edelete.c`** — standalone parallel walker / deletion utility (no **`crawl_ckpt.h`**).
+- **`edelete.c`** — standalone parallel walker / deletion utility (**`path_canon.h`** only).
 - **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, and **`ecrawl_repair`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 

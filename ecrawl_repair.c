@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "crawl_ckpt.h"
+#include "path_canon.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -717,6 +718,7 @@ static void *ckpt_worker_main(void *arg) {
 
 int main(int argc, char **argv) {
     const char *dir_path = NULL;
+    static char dir_path_abs[PATH_MAX];
     DIR *dp;
     struct dirent *de;
     char **names = NULL;
@@ -755,6 +757,9 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+
+    if (path_resolve_existing(dir_path, dir_path_abs, "ecrawl_repair: ") != 0) return 2;
+    dir_path = dir_path_abs;
 
     trunc_stats_reset();
 

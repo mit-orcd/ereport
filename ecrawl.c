@@ -52,6 +52,7 @@
 #include <stdarg.h>
 
 #include "crawl_ckpt.h"
+#include "path_canon.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -353,6 +354,8 @@ static char g_record_root_buf[PATH_MAX];
 static const char *g_record_root = NULL;
 static char g_phys_prefix[PATH_MAX];
 static size_t g_phys_prefix_len = 0;
+/* Canonical crawl root: absolute, from argv or realpath(relative). */
+static char g_start_path_canon[PATH_MAX];
 static id_registry_t g_uid_registry;
 static id_registry_t g_gid_registry;
 static inode_registry_t g_hardlink_registry;
@@ -968,7 +971,7 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS);
     fprintf(stderr,
-            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (absolute path).\n");
+            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr, "Default output shows a concise human-oriented summary; use --verbose for the full metrics dump.\n");
 }
 
@@ -2340,10 +2343,6 @@ int main(int argc, char **argv) {
                 return 2;
             }
             i++;
-            if (argv[i][0] != '/') {
-                fprintf(stderr, "--record-root must be an absolute path\n");
-                return 2;
-            }
             if (snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", argv[i]) >= (int)sizeof(g_record_root_buf)) {
                 fprintf(stderr, "--record-root path too long\n");
                 return 2;
@@ -2353,6 +2352,36 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--record-root invalid\n");
                 return 2;
             }
+            if (g_record_root_buf[0] != '/') {
+                char joined[PATH_MAX];
+                char cwd[PATH_MAX];
+
+                if (!getcwd(cwd, sizeof(cwd))) {
+                    fprintf(stderr, "--record-root: getcwd: %s\n", strerror(errno));
+                    return 2;
+                }
+                if (snprintf(joined, sizeof(joined), "%s/%s", cwd, g_record_root_buf) >= (int)sizeof(joined)) {
+                    fprintf(stderr, "--record-root path too long\n");
+                    return 2;
+                }
+                if (snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", joined) >= (int)sizeof(g_record_root_buf)) {
+                    fprintf(stderr, "--record-root path too long\n");
+                    return 2;
+                }
+            }
+            {
+                char can[PATH_MAX];
+                int nr;
+
+                if (realpath(g_record_root_buf, can)) {
+                    nr = snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", can);
+                    if (nr < 0 || (size_t)nr >= sizeof(g_record_root_buf)) {
+                        fprintf(stderr, "--record-root path too long after resolution\n");
+                        return 2;
+                    }
+                }
+            }
+            strip_trailing_slashes(g_record_root_buf);
             g_record_root = g_record_root_buf;
             continue;
         }
@@ -2377,11 +2406,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    start_path = positionals[0];
-    if (start_path[0] != '/') {
-        fprintf(stderr, "start-path must begin with '/'\n");
-        return 2;
-    }
+    if (path_resolve_existing(positionals[0], g_start_path_canon, "ecrawl: start-path ") != 0) return 2;
+    start_path = g_start_path_canon;
     if (init_record_path_prefix(start_path) != 0) {
         fprintf(stderr, "ERROR crawl start-path too long for record mapping\n");
         return 1;
@@ -2417,6 +2443,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ERROR invalid output directory %s: %s\n", g_output_dir, strerror(errno));
             return 1;
         }
+        if (path_resolve_inplace(g_output_dir, sizeof(g_output_dir), "ecrawl: output-dir ") != 0) return 1;
 
         {
             char uid_path[PATH_MAX];

@@ -48,6 +48,7 @@
 #include <sys/time.h>
 
 #include "crawl_ckpt.h"
+#include "path_canon.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -62,6 +63,13 @@
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define BUCKET_DETAIL_LEVELS_MAX 32
 #define BUCKET_PATH_TABLE_MAX_ROWS 200
+
+static void ereport_free_bin_dirs_list(const char **dirs, size_t n) {
+    size_t k;
+    if (!dirs) return;
+    for (k = 0; k < n; k++) free((void *)dirs[k]);
+    free((void *)dirs);
+}
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -4244,6 +4252,37 @@ int main(int argc, char **argv) {
         }
     }
 
+    {
+        char **resolved;
+        size_t j;
+
+        resolved = (char **)malloc(bin_dir_count * sizeof(char *));
+        if (!resolved) {
+            fprintf(stderr, "ereport: allocation failed\n");
+            free((void *)bin_dirs);
+            return 1;
+        }
+        for (j = 0; j < bin_dir_count; j++) {
+            char tb[PATH_MAX];
+
+            if (path_resolve_existing(bin_dirs[j], tb, "ereport: ") != 0) {
+                while (j > 0) free(resolved[--j]);
+                free(resolved);
+                free((void *)bin_dirs);
+                return 1;
+            }
+            resolved[j] = strdup(tb);
+            if (!resolved[j]) {
+                while (j > 0) free(resolved[--j]);
+                free(resolved);
+                free((void *)bin_dirs);
+                return 1;
+            }
+        }
+        free((void *)bin_dirs);
+        bin_dirs = (const char **)resolved;
+    }
+
     format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
     format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
 
@@ -4255,22 +4294,22 @@ int main(int argc, char **argv) {
         nj = snprintf(joined, sizeof(joined), "%s/%s", report_dir_opt, g_bucket_output_dir);
         if (nj < 0 || (size_t)nj >= sizeof(joined)) {
             fprintf(stderr, "ereport: report output path too long under --report-dir\n");
-            free((void *)bin_dirs);
+            ereport_free_bin_dirs_list(bin_dirs, bin_dir_count);
             return 1;
         }
         memcpy(g_bucket_output_dir, joined, (size_t)nj + 1U);
     }
     if (snprintf(report_path, sizeof(report_path), "%s/index.html", g_bucket_output_dir) >= (int)sizeof(report_path)) {
         fprintf(stderr, "report path too long for %s\n", g_bucket_output_dir);
-        free((void *)bin_dirs);
+        ereport_free_bin_dirs_list(bin_dirs, bin_dir_count);
         return 1;
     }
 
     if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, all_users_mode, &paths, &path_count) != 0) {
-        free((void *)bin_dirs);
+        ereport_free_bin_dirs_list(bin_dirs, bin_dir_count);
         return 1;
     }
-    free((void *)bin_dirs);
+    ereport_free_bin_dirs_list(bin_dirs, bin_dir_count);
     bin_dirs = NULL;
     if (path_count == 0) {
         if (!all_users_mode && strcmp(g_input_layout, "uid_shards") == 0 && g_input_uid_shards > 0U) {
@@ -4744,6 +4783,7 @@ int main(int argc, char **argv) {
         }
         return 1;
     }
+    (void)path_try_resolve_inplace(g_bucket_output_dir, sizeof(g_bucket_output_dir));
 
     if (emit_all_bucket_detail_pages(display_name, all_users_mode, distinct_uid_count, basis_str,
                                      bucket_detail_levels,

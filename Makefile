@@ -16,19 +16,19 @@ TARGETS = ereport ereport_index ecrawl ecrawl_repair edelete
 # Default target
 all: $(TARGETS)
 
-ecrawl: ecrawl.c crawl_ckpt.h
+ecrawl: ecrawl.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ecrawl.c
 
-edelete: edelete.c
-	$(CC) $(CFLAGS) -o $@ $<
+edelete: edelete.c path_canon.h
+	$(CC) $(CFLAGS) -o $@ edelete.c
 
-ecrawl_repair: ecrawl_repair.c crawl_ckpt.h
+ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ecrawl_repair.c
 
-ereport: ereport.c crawl_ckpt.h
+ereport: ereport.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ereport.c
 
-ereport_index: ereport_index.c crawl_ckpt.h
+ereport_index: ereport_index.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ereport_index.c
 
 # Debug build

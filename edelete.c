@@ -7,14 +7,18 @@
  * Parallel directory walker (same task-queue / donation model as ecrawl) that
  * unlinks non-directory paths (regular files, symlinks, pipes, sockets, etc.)
  * whose atime, mtime, or ctime is at least N full days behind wall-clock now.
+ * With only a path (no time arguments), every non-directory under the start path
+ * is eligible—still dry-run unless --delete.
  * Traversal uses lstat/fstatat without following symlinks. In delete mode, after
  * the crawl finishes it removes directories that became empty (rmdir only),
  * deepest first, without ascending above the start path or removing "/".
  *
  * Usage:
- *   ./edelete [--delete] [--verbose] <atime|mtime|ctime> <days> <absolute-path>
+ *   ./edelete [--delete] [--force] [--verbose] <path>
+ *   ./edelete [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>
  *
- * Default is dry-run (counts would_delete, no unlink). Pass --delete to unlink.
+ * Default is dry-run (counts would_delete, no unlink). Pass --delete to be prompted (type YES), then unlink,
+ * unless --force is also given (--delete --force skips the prompt).
  *
  * Thread count: EDELETE_THREADS (default 16, minimum 1).
  * Delete mode: EDELETE_MAX_UNLINK_INFLIGHT caps concurrent unlink(2) calls across all threads
@@ -30,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -39,6 +44,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include "path_canon.h"
 #include <stdatomic.h>
 #include <dirent.h>
 #include <limits.h>
@@ -152,6 +159,7 @@ static atomic_int g_stop_stats = 0;
 static atomic_uint g_seconds_seen = 0;
 
 static int g_verbose = 0;
+static int g_force = 0;
 static int g_dry_run = 1;
 static int g_threads = DEFAULT_THREADS;
 static int g_max_unlink_inflight = 0;
@@ -160,6 +168,7 @@ static pthread_cond_t g_unlink_gate_cond = PTHREAD_COND_INITIALIZER;
 static int g_unlink_inflight = 0;
 static time_basis_t g_basis = TB_MTIME;
 static int g_age_days = 0;
+static int g_delete_all = 0;
 static time_t g_now = 0;
 
 #define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
@@ -279,6 +288,7 @@ static time_t pick_ts(const struct stat *st, time_basis_t b) {
 
 static int age_eligible_seconds(time_t ts) {
     time_t cutoff;
+    if (g_delete_all) return 1;
     if (g_age_days <= 0) return 0;
     if ((time_t)-1 == g_now) return 0;
     cutoff = g_now - (time_t)g_age_days * (time_t)86400;
@@ -1011,14 +1021,73 @@ static void *stats_thread_main(void *arg) {
     return NULL;
 }
 
+static int line_confirms_yes(char *buf) {
+    char *p = buf;
+
+    if (!p) return 0;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "YES", 3) != 0) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p == '\0';
+}
+
+/*
+ * Returns 0 if the user typed YES, -1 on cancel / EOF / wrong answer.
+ */
+static int confirm_delete_prompt(const char *root_path, int delete_all, const char *basis_str, int age_days) {
+    char line[64];
+
+    fprintf(stderr,
+            "\n"
+            "edelete: --delete will permanently unlink non-directory paths under the start path\n"
+            "         and remove directories that become empty (never the root path itself).\n"
+            "\n"
+            "  Resolved start path: %s\n"
+            "  Filter:              %s\n",
+            root_path,
+            delete_all ? "all non-directories (no age filter)" : "age-based (see below)");
+    if (!delete_all && basis_str) {
+        fprintf(stderr,
+                "  Time basis:          %s\n"
+                "  Minimum age:         %d day(s)\n",
+                basis_str,
+                age_days);
+    }
+    fprintf(stderr,
+            "  Threads:             %d  (EDELETE_THREADS)\n"
+            "  Max unlink inflight: %d  (EDELETE_MAX_UNLINK_INFLIGHT; 0 = unlimited)\n"
+            "  Verbose:             %s\n"
+            "\n"
+            "Type YES to proceed, anything else cancels: ",
+            g_threads,
+            g_max_unlink_inflight,
+            g_verbose ? "yes" : "no");
+    fflush(stderr);
+
+    if (!fgets(line, sizeof(line), stdin)) {
+        fprintf(stderr, "\nedelete: cancelled (no input).\n");
+        return -1;
+    }
+    if (!line_confirms_yes(line)) {
+        fprintf(stderr, "edelete: cancelled.\n");
+        return -1;
+    }
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--delete] [--verbose] <atime|mtime|ctime> <days> <absolute-path>\n"
+            "Usage: %s [--delete] [--force] [--verbose] <path>\n"
+            "       %s [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>\n"
+            "  First form: every non-directory under <path> is eligible (still dry-run unless --delete).\n"
+            "  Second form: only entries whose chosen timestamp is at least <days> full days old.\n"
             "  Walks in parallel without following symlinks; by default dry-run (counts would_delete, no unlink).\n"
-            "  --delete: unlink matching non-directory entries (any type), then rmdir empty dirs (under start path).\n"
+            "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs.\n"
+            "  --force:  with --delete only, skip the YES prompt (non-interactive / scripting).\n"
             "  Thread count: EDELETE_THREADS (default %d).\n"
             "  Max concurrent unlinks (all threads): EDELETE_MAX_UNLINK_INFLIGHT (default %d; 0 = unlimited).\n",
-            prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT);
+            prog, prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT);
 }
 
 int main(int argc, char **argv) {
@@ -1047,6 +1116,11 @@ int main(int argc, char **argv) {
             ai++;
             continue;
         }
+        if (strcmp(argv[ai], "--force") == 0) {
+            g_force = 1;
+            ai++;
+            continue;
+        }
         if (strcmp(argv[ai], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -1056,14 +1130,41 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (argc - ai < 3) {
+    if (argc - ai < 1) {
         usage(argv[0]);
         return 2;
     }
 
-    basis_str = argv[ai++];
-    days_str = argv[ai++];
-    root_path = argv[ai++];
+    if (argc - ai == 1) {
+        g_delete_all = 1;
+        root_path = argv[ai++];
+    } else if (argc - ai == 3) {
+        basis_str = argv[ai++];
+        days_str = argv[ai++];
+        root_path = argv[ai++];
+
+        if (parse_basis(basis_str, &g_basis) != 0) {
+            fprintf(stderr, "edelete: time basis must be atime, mtime, or ctime\n");
+            return 2;
+        }
+
+        {
+            long d;
+            char *end = NULL;
+            errno = 0;
+            d = strtol(days_str, &end, 10);
+            if (errno || !end || *end || d < 1 || d > 365000L) {
+                fprintf(stderr, "edelete: days must be an integer in [1, 365000]\n");
+                return 2;
+            }
+            g_age_days = (int)d;
+        }
+    } else {
+        fprintf(stderr,
+                "edelete: use either one argument (<path>) or three (<atime|mtime|ctime> <days> <path>)\n");
+        usage(argv[0]);
+        return 2;
+    }
 
     if (ai != argc) {
         fprintf(stderr, "edelete: extra arguments after start path\n");
@@ -1071,36 +1172,28 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    if (parse_basis(basis_str, &g_basis) != 0) {
-        fprintf(stderr, "edelete: time basis must be atime, mtime, or ctime\n");
-        return 2;
-    }
-
     {
-        long d;
-        char *end = NULL;
-        errno = 0;
-        d = strtol(days_str, &end, 10);
-        if (errno || !end || *end || d < 1 || d > 365000L) {
-            fprintf(stderr, "edelete: days must be an integer in [1, 365000]\n");
-            return 2;
+        static char root_abs[PATH_MAX];
+
+        if (path_resolve_existing(root_path, root_abs, "edelete: ") != 0) return 2;
+        root_path = root_abs;
+    }
+
+    if (!g_delete_all) {
+        g_now = time(NULL);
+        if (g_now == (time_t)-1) {
+            fprintf(stderr, "edelete: time() failed\n");
+            return 1;
         }
-        g_age_days = (int)d;
-    }
-
-    if (root_path[0] != '/') {
-        fprintf(stderr, "edelete: path must be absolute\n");
-        return 2;
-    }
-
-    g_now = time(NULL);
-    if (g_now == (time_t)-1) {
-        fprintf(stderr, "edelete: time() failed\n");
-        return 1;
+    } else {
+        g_now = 0;
     }
 
     g_threads = parse_thread_count();
     g_max_unlink_inflight = parse_max_unlink_inflight();
+
+    if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, g_delete_all, basis_str, g_age_days) != 0)
+        return 3;
 
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.stats_mutex, NULL);
@@ -1227,8 +1320,12 @@ int main(int argc, char **argv) {
         char avg_ops_buf[32];
 
         human_decimal(avg_ops, avg_ops_buf, sizeof(avg_ops_buf));
-        printf("basis=%s\n", basis_str);
-        printf("age_days=%d\n", g_age_days);
+        printf("delete_all=%d\n", g_delete_all);
+        if (!g_delete_all) {
+            printf("basis=%s\n", basis_str);
+            printf("age_days=%d\n", g_age_days);
+        }
+        printf("force=%d\n", g_force);
         printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
         printf("start_path=%s\n", root_path);
         printf("threads=%d\n", worker_count_started);

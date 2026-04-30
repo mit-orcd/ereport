@@ -29,6 +29,7 @@
 #include <time.h>
 
 #include "crawl_ckpt.h"
+#include "path_canon.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -3618,12 +3619,9 @@ static int resume_merge_index_dir(const char *index_dir) {
 
     memset(&ctx, 0, sizeof(ctx));
     atomic_init(&ctx.merge_bucket_ram_peak, 0);
-    if (snprintf(ctx.index_dir, sizeof(ctx.index_dir), "%s", index_dir) >= (int)sizeof(ctx.index_dir)) {
-        fprintf(stderr, "ereport_index: index directory path too long\n");
-        return 1;
-    }
-    if (build_path(paths_p, sizeof(paths_p), index_dir, "paths.bin") != 0 ||
-        build_path(off_p, sizeof(off_p), index_dir, "path_offsets.bin") != 0) {
+    if (path_resolve_existing(index_dir, ctx.index_dir, "ereport_index: ") != 0) return 1;
+    if (build_path(paths_p, sizeof(paths_p), ctx.index_dir, "paths.bin") != 0 ||
+        build_path(off_p, sizeof(off_p), ctx.index_dir, "path_offsets.bin") != 0) {
         return 1;
     }
     if (stat(paths_p, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -3635,7 +3633,7 @@ static int resume_merge_index_dir(const char *index_dir) {
         return 1;
     }
 
-    ipc = path_offsets_indexed_path_count(index_dir);
+    ipc = path_offsets_indexed_path_count(ctx.index_dir);
     ctx.indexed_paths = ipc;
     ctx.input_files = ipc > 0 ? ipc : 1ULL;
     ctx.scanned_records = 0;
@@ -3657,7 +3655,7 @@ static int resume_merge_index_dir(const char *index_dir) {
     ml_storage.tq = NULL;
     ml_storage.chunkq = NULL;
     atomic_init(&ml_storage.stop, 0);
-    if (g_verbose && build_path(logpath, sizeof(logpath), index_dir, "ereport_index.log") == 0) {
+    if (g_verbose && build_path(logpath, sizeof(logpath), ctx.index_dir, "ereport_index.log") == 0) {
         ml_storage.fp = fopen(logpath, "a");
         if (ml_storage.fp) {
             if (pthread_create(&memlog_tid, NULL, memlog_thread_main, &ml_storage) != 0) {
@@ -3671,12 +3669,12 @@ static int resume_merge_index_dir(const char *index_dir) {
 
     if (process_trigram_buckets_resume(&ctx) != 0) {
         memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
-        fprintf(stderr, "ereport_index: resume-merge failed in %s\n", index_dir);
+        fprintf(stderr, "ereport_index: resume-merge failed in %s\n", ctx.index_dir);
         return 1;
     }
     memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
     if (write_meta_file(&ctx) != 0) {
-        fprintf(stderr, "ereport_index: could not write meta.txt in %s\n", index_dir);
+        fprintf(stderr, "ereport_index: could not write meta.txt in %s\n", ctx.index_dir);
         return 1;
     }
 
@@ -4221,6 +4219,8 @@ static int build_index_dir(const char *user_spec,
         free(file_states);
         return 1;
     }
+
+    (void)path_try_resolve_inplace(ctx.index_dir, sizeof(ctx.index_dir));
 
     if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
         build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0) {
@@ -5414,6 +5414,51 @@ out:
     return rc;
 }
 
+static int run_build_index_dir_resolved(const char *user_spec,
+                                        const char **dirpaths_in,
+                                        size_t dirpath_count,
+                                        int all_users_mode,
+                                        const char *index_dir_override) {
+    char *dir_blob = NULL;
+    const char **dir_heap = NULL;
+    char index_override_canon[PATH_MAX];
+    const char *index_pass = index_dir_override;
+    int rc;
+    size_t i;
+
+    if (index_dir_override && index_dir_override[0] != '\0') {
+        if (path_resolve_existing(index_dir_override, index_override_canon, "ereport_index: --index-dir ") != 0) return 2;
+        index_pass = index_override_canon;
+    }
+
+    if (dirpath_count > 0) {
+        dir_blob = (char *)malloc(dirpath_count * (size_t)PATH_MAX);
+        dir_heap = (const char **)malloc(dirpath_count * sizeof(char *));
+        if (!dir_blob || !dir_heap) {
+            fprintf(stderr, "ereport_index: allocation failed\n");
+            free(dir_blob);
+            free(dir_heap);
+            return 1;
+        }
+        for (i = 0; i < dirpath_count; i++) {
+            char *slot = dir_blob + i * (size_t)PATH_MAX;
+
+            if (path_resolve_existing(dirpaths_in[i], slot, "ereport_index: ") != 0) {
+                free(dir_blob);
+                free(dir_heap);
+                return 2;
+            }
+            dir_heap[i] = slot;
+        }
+        dirpaths_in = dir_heap;
+    }
+
+    rc = build_index_dir(user_spec, dirpaths_in, dirpath_count, all_users_mode, index_pass);
+    free(dir_blob);
+    free(dir_heap);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     int vi;
     int cmd0;
@@ -5461,7 +5506,7 @@ int main(int argc, char **argv) {
             all_users_mode = 1;
             dirpaths = &dot;
             dirpath_count = 1;
-            return build_index_dir(NULL, dirpaths, dirpath_count, all_users_mode, index_dir_override);
+            return run_build_index_dir_resolved(NULL, dirpaths, dirpath_count, all_users_mode, index_dir_override);
         }
 
         if (resolve_target_user(argv[ai], &probe_uid, probe_disp, sizeof(probe_disp)) == 0) {
@@ -5482,11 +5527,12 @@ int main(int argc, char **argv) {
             dirpath_count = (size_t)(argc - ai);
         }
         while (dirpath_count > 0 && arg_is_verbose(dirpaths[dirpath_count - 1])) dirpath_count--;
-        return build_index_dir(user_spec, dirpaths, dirpath_count, all_users_mode, index_dir_override);
+        return run_build_index_dir_resolved(user_spec, dirpaths, dirpath_count, all_users_mode, index_dir_override);
     }
 
     if (strcmp(argv[cmd0], "--search") == 0) {
         const char *index_dir = "index";
+        char index_dir_buf[PATH_MAX];
         uint64_t skip_req = 0;
         uint64_t limit_req = UINT64_MAX;
         int json_output = 0;
@@ -5538,6 +5584,9 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
+
+        if (path_resolve_existing(index_dir, index_dir_buf, "ereport_index: ") != 0) return 2;
+        index_dir = index_dir_buf;
 
         return search_index_dir(term, index_dir, skip_req, limit_req, json_output);
     }
