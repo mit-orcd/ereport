@@ -6,6 +6,7 @@ The current toolchain is:
 
 - `ecrawl`: parallel filesystem crawler that writes compact binary records
 - `ecrawl_repair`: optional utility that rescans `uid_shard_*.bin` shards, writes **`*.bin.ckpt`** sidecars, **truncates** shards at the last good record when the tail is incomplete, quarantines shards that cannot be fixed, and prints a short **tail-truncation summary** on stderr when anything was shortened (or would be, with **`--dry-run`**)
+- `edelete`: parallel filesystem walker (same task-queue / donation model as **`ecrawl`**) that can **`unlink`** non-directory paths older than a chosen **`atime`/`mtime`/`ctime`** threshold; default run is **dry-run**, with **`--delete`** performing real deletes and **`rmdir`** for directories that become empty (still under the start path). Symlinks are **not** followed.
 - `ereport`: report generator that reads crawl output and writes `index.html`, bucket drilldown pages, and a search box that uses the trigram index when you serve the tree over HTTP
 - `ereport_index`: search-index helper for path-element substring search
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
@@ -21,6 +22,7 @@ The current toolchain is:
 | **`ecrawl`** | Walk / queue directory work | **`ECRAWL_CRAWL_THREADS`** | **16** crawl threads (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
 | **`ecrawl_repair`** | Parallel rescans; optional **`truncate`** on incomplete tail; checkpoint rebuild / verify | **`ECRAWL_REPAIR_THREADS`** | **16** | **4** | **4 GiB** |
+| **`edelete`** | Parallel directory walk; optional **`unlink`** (bounded concurrency in **`--delete`**) | **`EDELETE_THREADS`**, **`EDELETE_MAX_UNLINK_INFLIGHT`** | **16** threads; **256** max concurrent **`unlink`** (**`0`** = unlimited) | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
 | **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
 
@@ -41,6 +43,7 @@ make ecrawl
 make ereport
 make ereport_index
 make ecrawl_repair
+make edelete
 ```
 
 Clean:
@@ -53,11 +56,44 @@ make clean
 
 The tools are fast because they combine **compact binary I/O**, **parallelism along natural boundaries**, and **bounded pipelines** instead of naïvely scanning everything twice or holding giant locks over shared mutable state.
 
-### Shared ideas (`ecrawl`, `ereport`, `ereport_index`)
+### Shared ideas (`ecrawl`, `edelete`, `ereport`, `ereport_index`)
 
 - **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (`NFSCBIN` / format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
 - **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—and to **truncate** an incomplete last record when possible—see **`ecrawl_repair`** below.
 - **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
+
+### `edelete`: parallel age-based deletion
+
+- **Same crawl parallelism pattern as `ecrawl`** — task queue, worker threads, local directory stacks, and **work donation** so wide trees stay busy across threads.
+- **Does not follow symlinks** — traversal uses **`lstat`** / **`fstatat(..., AT_SYMLINK_NOFOLLOW)`**; symlink inodes can be **`unlink`**’d if eligible, but targets are not walked through links.
+- **Deletes non-directory paths only** — regular files, symlinks, FIFOs, sockets, etc.; directories are opened and enumerated, then removed with **`rmdir`** only after **`--delete`** when they become empty (deepest first, without ascending above the start path or removing **`/`**).
+- **Default is dry-run** — counts **`would_delete`** and prints **`mode=dry-run`**; **`--delete`** performs **`unlink`** and empty-dir cleanup.
+- **Live status line** — rolling **`entries/s(10s)`** and totals on stdout (similar spirit to **`ecrawl`**); **`--verbose`** is currently parsed but does not change output.
+
+Usage:
+
+```bash
+./edelete [--delete] [--verbose] <atime|mtime|ctime> <days> <absolute-path>
+```
+
+The path must be **absolute**. **`days`** selects entries whose chosen timestamp is at least **`days × 86400`** seconds older than wall-clock now.
+
+Environment variables:
+
+| Variable | Meaning |
+|----------|---------|
+| **`EDELETE_THREADS`** | Parallel crawl workers (default **16**, minimum **1**). |
+| **`EDELETE_MAX_UNLINK_INFLIGHT`** | In **`--delete`** mode, max concurrent **`unlink(2)`** calls **across all threads** (default **256**; **`0`** = unlimited). |
+
+Examples:
+
+```bash
+./edelete mtime 90 /storage/scratch/job123
+EDELETE_THREADS=32 ./edelete --delete ctime 14 /mnt/cache/tmp
+EDELETE_MAX_UNLINK_INFLIGHT=128 ./edelete --delete atime 30 /big/tree
+```
+
+Final stdout summary includes **`basis`**, **`mode`**, scan counts, **`deleted_files`**, **`removed_empty_dirs`**, **`would_delete`**, **`errors`**, throughput metrics, and donation counters.
 
 ### `ecrawl`: crawling and capture
 
@@ -598,6 +634,8 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
+| **`EDELETE_THREADS`** | `edelete` | Parallel walk workers (default **16**, minimum **1**). |
+| **`EDELETE_MAX_UNLINK_INFLIGHT`** | `edelete` **`--delete`** | Max concurrent **`unlink`** syscalls across all workers (default **256**; **`0`** = unlimited). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default **32**). |
 | **`EREPORT_INDEX_THREADS`** | `ereport_index --make` / **`--search`** | Parallel chunk-boundary mapping, index **parse** workers, and (for **`--search`**) parallel postings load + path filtering when the query and candidate set are large enough (default **32**). Does **not** set merge worker count. Trigram temp writers default to this count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. |
 | **`EREPORT_INDEX_TRIGRAM_THREADS`** | `ereport_index --make` | Parallel writers to **`tmp_trigrams_*.bin`** (default: **same as `EREPORT_INDEX_THREADS`** when unset). |
@@ -612,6 +650,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 ## Source layout
 
+- **`edelete.c`** — standalone parallel walker / deletion utility (no **`crawl_ckpt.h`**).
 - **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, and **`ecrawl_repair`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 
