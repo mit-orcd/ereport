@@ -18,9 +18,9 @@
  * Other corrupt uid_shard_*.bin shards are renamed into <crawl-dir>/corrupt_shards/ (and matching
  * .bin.ckpt sidecars when present). Dry-run does not truncate, move, or write.
  *
- * After a normal run, every remaining top-level uid_shard_*.bin is checked for an ereport-compatible
- * .ckpt (same rules as ereport load_bin_ckpt). Exit status is 0 only if none failed and that check passes,
- * so ./ereport can load checkpoint sidecars for all shards still in the crawl directory.
+ * After a normal run, every remaining top-level uid_shard_*.bin is checked for a sidecar compatible with
+ * crawl_bin_load_ckpt() in crawl_bin_chunks.c (same rules as ereport / ereport_index). Exit status is 0 only
+ * if none failed and that check passes, so readers can load checkpoint sidecars for all shards still in the crawl directory.
  */
 
 #define _FILE_OFFSET_BITS 64
@@ -46,8 +46,6 @@
 #define PATH_MAX 4096
 #endif
 
-#define FILE_MAGIC_LEN 8
-#define FORMAT_VERSION 3
 #define DEFAULT_REPAIR_THREADS 16U
 #define REPAIR_THREADS_MAX 4096U
 #define CORRUPT_SUBDIR "corrupt_shards"
@@ -108,29 +106,6 @@ static void print_truncation_summary(int dry_run) {
             "original total %" PRIu64 " bytes (%s) -> new total %" PRIu64 " bytes (%s)\n",
             dry_run ? "would-be " : "", nsh, removed, rem_buf, orig, orig_buf, newb, new_buf);
 }
-
-typedef struct __attribute__((packed)) {
-    char magic[FILE_MAGIC_LEN];
-    uint32_t version;
-    uint32_t reserved;
-} bin_file_header_t;
-
-typedef struct __attribute__((packed)) {
-    uint16_t path_len;
-    uint8_t type;
-    uint8_t reserved8;
-    uint32_t mode;
-    uint64_t uid;
-    uint64_t gid;
-    uint64_t size;
-    uint64_t inode;
-    uint32_t dev_major;
-    uint32_t dev_minor;
-    uint64_t nlink;
-    uint64_t atime;
-    uint64_t mtime;
-    uint64_t ctime;
-} bin_record_hdr_t;
 
 static int g_verbose;
 static int g_dry_run;
@@ -348,7 +323,7 @@ static int write_ckpt_file(const char *bin_path, const uint64_t *offs, size_t n)
 }
 
 /*
- * Same acceptance rules as ereport.c load_bin_ckpt() — required for chunk mapping to succeed.
+ * Same acceptance rules as crawl_bin_load_ckpt() (crawl_bin_chunks.c) — required for chunk mapping to succeed.
  */
 static int sidecar_ok_for_ereport(const char *bin_path, uint64_t file_sz) {
     char ckpath[PATH_MAX];

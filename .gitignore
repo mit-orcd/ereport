@@ -1,0 +1,7 @@
+/test/
+*.o
+/ecrawl
+/ereport
+/ereport_index
+/ecrawl_repair
+/edelete

@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 #
-# Verification harness for ecrawl + ereport (optional: correlate with live filesystem counts).
+# Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_repair / edelete /
+# ereport_index, optional live-tree correlation with find/fd.
 #
 # Usage:
-#   ./test.sh                      # integration test only (temp tree + built binaries)
-#   ./test.sh /path/to/tree        # integration + filesystem correlation for that root
+#   ./test.sh                      # integration + tool smoke tests (temp tree + built binaries)
+#   ./test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./test.sh
+#   ECRAWL_REPAIR EDELETE EREPORT_INDEX override those binaries (same dir as this script by default).
 #
-# Requires: bash, coreutils, ecrawl + ereport built (default: same directory as this script).
+# Requires: bash, coreutils, all Makefile targets built (default: same directory as this script).
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ECRAWL="${ECRAWL:-$SCRIPT_DIR/ecrawl}"
 EREPORT="${EREPORT:-$SCRIPT_DIR/ereport}"
+ECRAWL_REPAIR="${ECRAWL_REPAIR:-$SCRIPT_DIR/ecrawl_repair}"
+EDELETE="${EDELETE:-$SCRIPT_DIR/edelete}"
+EREPORT_INDEX="${EREPORT_INDEX:-$SCRIPT_DIR/ereport_index}"
 
 # ANSI colors: disabled for non-tty or NO_COLOR (https://no-color.org/)
 _init_colors() {
@@ -143,12 +148,14 @@ need_exe() {
 }
 
 # --- Optional: correlate crawl totals with find/fd on a real tree (slow on huge trees) ---
+# find(1) exits 1 if any path errors (e.g. permission denied); with pipefail + set -e that would kill
+# the script mid-baseline with no message. Ignore find/fd failure after collecting stdout.
 count_files() {
     local root=$1
     if command -v fd >/dev/null 2>&1; then
-        fd --hidden --no-ignore -t f . "$root" 2>/dev/null | wc -l | tr -d ' '
+        { fd --hidden --no-ignore -t f . "$root" 2>/dev/null || true; } | wc -l | tr -d ' '
     else
-        find "$root" -type f 2>/dev/null | wc -l | tr -d ' '
+        { find "$root" -type f 2>/dev/null || true; } | wc -l | tr -d ' '
     fi
 }
 
@@ -156,15 +163,15 @@ count_dirs() {
     local root=$1
     # Always use find: ecrawl counts the crawl root directory when it runs; `fd -t d . ROOT` omits ROOT
     # from results (off-by-one vs ecrawl). `find ROOT -type d` includes ROOT like ecrawl.
-    find "$root" -type d 2>/dev/null | wc -l | tr -d ' '
+    { find "$root" -type d 2>/dev/null || true; } | wc -l | tr -d ' '
 }
 
 count_symlinks() {
     local root=$1
     if command -v fd >/dev/null 2>&1; then
-        fd --hidden --no-ignore -t l . "$root" 2>/dev/null | wc -l | tr -d ' '
+        { fd --hidden --no-ignore -t l . "$root" 2>/dev/null || true; } | wc -l | tr -d ' '
     else
-        find "$root" -type l 2>/dev/null | wc -l | tr -d ' '
+        { find "$root" -type l 2>/dev/null || true; } | wc -l | tr -d ' '
     fi
 }
 
@@ -172,7 +179,8 @@ sum_unique_regular_bytes() {
     local root=$1
     # Sum st_size once per (dev,inode) so hard links count once, matching ecrawl total_bytes spirit.
     # One awk pass (no sort). RAM scales with unique (dev,inode) keys.
-    find "$root" -type f -printf '%D:%i %s\n' 2>/dev/null | awk '!seen[$1]++ { s += $2 } END { printf "%.0f\n", s + 0 }'
+    { find "$root" -type f -printf '%D:%i %s\n' 2>/dev/null || true; } |
+        awk '!seen[$1]++ { s += $2 } END { printf "%.0f\n", s + 0 }'
 }
 
 run_fs_correlation() {
@@ -463,6 +471,30 @@ run_integration() {
     expect_eq "all_users: matched_records vs scanned" "$sscan" "$smat" \
         "all-users keeps every row (matched == scanned)"
 
+    section_int "[integration] ecrawl_repair, edelete, ereport_index (smoke)"
+
+    log "ecrawl_repair --dry-run (sidecar rules vs crawl_bin_load_ckpt)"
+    "$ECRAWL_REPAIR" --dry-run "$crawl_out" >"${td}/repair.stdout" 2>"${td}/repair.stderr" || {
+        tail -n 40 "${td}/repair.stderr" >&2 || true
+        die "ecrawl_repair --dry-run failed"
+    }
+
+    log "edelete dry-run (synthetic walk tree)"
+    "$EDELETE" "$root_abs" >"${td}/edelete.stdout" 2>"${td}/edelete.stderr" || {
+        tail -n 40 "${td}/edelete.stderr" >&2 || true
+        die "edelete dry-run failed"
+    }
+
+    local idx_make="${td}/index_make"
+    log "ereport_index --make (trigram index under ${idx_make})"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --index-dir "$idx_make" "$(id -un)" "$crawl_out" >"${td}/ei.stdout" 2>"${td}/ei.stderr" || {
+        tail -n 80 "${td}/ei.stderr" >&2 || true
+        die "ereport_index --make failed"
+    }
+    [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" ]] ||
+        die "ereport_index did not write tri_keys.bin / paths.bin under ${idx_make}"
+
     trap - EXIT
     cleanup_int
     pass "integration test"
@@ -473,6 +505,9 @@ ROOT="${1:-}"
 
 need_exe "$ECRAWL"
 need_exe "$EREPORT"
+need_exe "$ECRAWL_REPAIR"
+need_exe "$EDELETE"
+need_exe "$EREPORT_INDEX"
 
 run_integration
 

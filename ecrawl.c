@@ -53,6 +53,7 @@
 
 #include "crawl_ckpt.h"
 #include "path_canon.h"
+#include "path_utils.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -72,9 +73,6 @@
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
-
-#define FILE_MAGIC_LEN 8
-#define FORMAT_VERSION 3
 
 #define LOCAL_STACK_DONATE_FLOOR 8
 #define DONATE_CHUNK_MIN 4
@@ -138,29 +136,6 @@ typedef struct {
     uint64_t donation_attempts;
     uint64_t donation_successes;
 } shared_state_t;
-
-typedef struct __attribute__((packed)) {
-    char magic[FILE_MAGIC_LEN];
-    uint32_t version;
-    uint32_t reserved;
-} bin_file_header_t;
-
-typedef struct __attribute__((packed)) {
-    uint16_t path_len;
-    uint8_t  type;
-    uint8_t  reserved8;
-    uint32_t mode;
-    uint64_t uid;
-    uint64_t gid;
-    uint64_t size;
-    uint64_t inode;
-    uint32_t dev_major;
-    uint32_t dev_minor;
-    uint64_t nlink;
-    uint64_t atime;
-    uint64_t mtime;
-    uint64_t ctime;
-} bin_record_hdr_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t shard;
@@ -535,58 +510,6 @@ static int shard_digits_for(uint32_t shards) {
         digits++;
     }
     return digits;
-}
-
-static int join_path_fast(const char *base, size_t base_len,
-                          const char *name, size_t name_len,
-                          char *out, size_t out_sz) {
-    size_t need;
-
-    if (!base || !name || !out || out_sz == 0) return -1;
-
-    if (base_len == 1 && base[0] == '/') {
-        need = 1 + name_len + 1;
-        if (need > out_sz) return -1;
-        out[0] = '/';
-        if (name_len > 0) memcpy(out + 1, name, name_len);
-        out[1 + name_len] = '\0';
-        return 0;
-    }
-
-    need = base_len + 1 + name_len + 1;
-    if (need > out_sz) return -1;
-    memcpy(out, base, base_len);
-    out[base_len] = '/';
-    if (name_len > 0) memcpy(out + base_len + 1, name, name_len);
-    out[base_len + 1 + name_len] = '\0';
-    return 0;
-}
-
-static int join_path_alloc(const char *base, size_t base_len,
-                           const char *name, size_t name_len,
-                           char **out_path, size_t *out_len) {
-    char *path;
-    size_t need;
-
-    if (!base || !name || !out_path || !out_len) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (base_len == 1 && base[0] == '/') need = 1 + name_len + 1;
-    else need = base_len + 1 + name_len + 1;
-
-    path = (char *)malloc(need);
-    if (!path) return -1;
-    if (join_path_fast(base, base_len, name, name_len, path, need) != 0) {
-        free(path);
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    *out_path = path;
-    *out_len = need - 1;
-    return 0;
 }
 
 static void human_decimal(double v, char *buf, size_t sz) {
@@ -1530,20 +1453,9 @@ static int ensure_pending_capacity(pending_batch_t *p, size_t need) {
     return 0;
 }
 
-static void strip_trailing_slashes(char *s) {
-    size_t n;
-
-    if (!s) return;
-    n = strlen(s);
-    while (n > 1 && s[n - 1] == '/') {
-        s[n - 1] = '\0';
-        n--;
-    }
-}
-
 static int init_record_path_prefix(const char *start_path) {
     if (snprintf(g_phys_prefix, sizeof(g_phys_prefix), "%s", start_path) >= (int)sizeof(g_phys_prefix)) return -1;
-    strip_trailing_slashes(g_phys_prefix);
+    path_rstrip_slashes(g_phys_prefix);
     g_phys_prefix_len = strlen(g_phys_prefix);
     return 0;
 }
@@ -1835,7 +1747,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     char *child_path_owned;
                     size_t child_path_len;
 
-                    if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                    if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
                                         &child_path_owned, &child_path_len) != 0) {
                         fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
                         stats_add_error(shared);
@@ -1864,7 +1776,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                         char *child_path_owned;
                         size_t child_path_len;
 
-                        if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                        if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
                                             &child_path_owned, &child_path_len) != 0) {
                             fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
                             stats_add_error(shared);
@@ -1891,7 +1803,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             size_t child_path_len = dir_path_len + child_name_len +
                                                     ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
 
-                            if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
+                            if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
                                 fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
                                 stats_add_error(shared);
                                 continue;
@@ -2347,7 +2259,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--record-root path too long\n");
                 return 2;
             }
-            strip_trailing_slashes(g_record_root_buf);
+            path_rstrip_slashes(g_record_root_buf);
             if (g_record_root_buf[0] == '\0') {
                 fprintf(stderr, "--record-root invalid\n");
                 return 2;
@@ -2381,7 +2293,7 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            strip_trailing_slashes(g_record_root_buf);
+            path_rstrip_slashes(g_record_root_buf);
             g_record_root = g_record_root_buf;
             continue;
         }

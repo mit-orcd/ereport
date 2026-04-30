@@ -46,6 +46,7 @@
 #include <unistd.h>
 
 #include "path_canon.h"
+#include "path_utils.h"
 #include <stdatomic.h>
 #include <dirent.h>
 #include <limits.h>
@@ -295,17 +296,6 @@ static int age_eligible_seconds(time_t ts) {
     return ts <= cutoff;
 }
 
-static int path_is_under_root(const char *path, const char *root) {
-    size_t lr;
-
-    if (!path || !root) return 0;
-    if (strcmp(root, "/") == 0) return strcmp(path, "/") != 0;
-    lr = strlen(root);
-    if (strcmp(path, root) == 0) return 1;
-    if (strncmp(path, root, lr) != 0) return 0;
-    return path[lr] == '/';
-}
-
 static char *dup_parent_dir(const char *path) {
     const char *slash;
     size_t len;
@@ -479,56 +469,6 @@ static void perf_flush_local(perf_local_t *perf) {
     if (perf->files > 0) ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
 
     memset(perf, 0, sizeof(*perf));
-}
-
-static int join_path_fast(const char *base, size_t base_len, const char *name, size_t name_len, char *out,
-                          size_t out_sz) {
-    size_t need;
-
-    if (!base || !name || !out || out_sz == 0) return -1;
-
-    if (base_len == 1 && base[0] == '/') {
-        need = 1 + name_len + 1;
-        if (need > out_sz) return -1;
-        out[0] = '/';
-        if (name_len > 0) memcpy(out + 1, name, name_len);
-        out[1 + name_len] = '\0';
-        return 0;
-    }
-
-    need = base_len + 1 + name_len + 1;
-    if (need > out_sz) return -1;
-    memcpy(out, base, base_len);
-    out[base_len] = '/';
-    if (name_len > 0) memcpy(out + base_len + 1, name, name_len);
-    out[base_len + 1 + name_len] = '\0';
-    return 0;
-}
-
-static int join_path_alloc(const char *base, size_t base_len, const char *name, size_t name_len, char **out_path,
-                           size_t *out_len) {
-    char *path;
-    size_t need;
-
-    if (!base || !name || !out_path || !out_len) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    if (base_len == 1 && base[0] == '/') need = 1 + name_len + 1;
-    else need = base_len + 1 + name_len + 1;
-
-    path = (char *)malloc(need);
-    if (!path) return -1;
-    if (join_path_fast(base, base_len, name, name_len, path, need) != 0) {
-        free(path);
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    *out_path = path;
-    *out_len = need - 1;
-    return 0;
 }
 
 static void emfile_retry_pause(unsigned attempt) {
@@ -844,7 +784,7 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
                     char *child_path_owned;
                     size_t child_path_len;
 
-                    if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
+                    if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
                                         &child_path_len) != 0) {
                         fprintf(stderr, "edelete: path alloc %s/%s\n", dir_path, ent->d_name);
                         stats_add_error(shared);
@@ -872,7 +812,7 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
                         char *child_path_owned;
                         size_t child_path_len;
 
-                        if (join_path_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
+                        if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len, &child_path_owned,
                                             &child_path_len) != 0) {
                             fprintf(stderr, "edelete: path alloc %s/%s\n", dir_path, ent->d_name);
                             stats_add_error(shared);
@@ -895,7 +835,7 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
 
                         account_leaf(perf, &child_st);
 
-                        if (join_path_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) !=
+                        if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) !=
                             0) {
                             fprintf(stderr, "edelete: path too long %s/%s\n", dir_path, ent->d_name);
                             stats_add_error(shared);

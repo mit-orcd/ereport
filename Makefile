@@ -16,20 +16,26 @@ TARGETS = ereport ereport_index ecrawl ecrawl_repair edelete
 # Default target
 all: $(TARGETS)
 
-ecrawl: ecrawl.c crawl_ckpt.h path_canon.h
-	$(CC) $(CFLAGS) -o $@ ecrawl.c
+path_utils.o: path_utils.c path_utils.h
+	$(CC) $(CFLAGS) -c path_utils.c -o path_utils.o
 
-edelete: edelete.c path_canon.h
-	$(CC) $(CFLAGS) -o $@ edelete.c
+crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
+	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
+
+ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o
+	$(CC) $(CFLAGS) -o $@ ecrawl.c path_utils.o
+
+edelete: edelete.c path_canon.h path_utils.h path_utils.o
+	$(CC) $(CFLAGS) -o $@ edelete.c path_utils.o
 
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ecrawl_repair.c
 
-ereport: ereport.c crawl_ckpt.h path_canon.h
-	$(CC) $(CFLAGS) -o $@ ereport.c
+ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o
+	$(CC) $(CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o
 
-ereport_index: ereport_index.c crawl_ckpt.h path_canon.h
-	$(CC) $(CFLAGS) -o $@ ereport_index.c
+ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
+	$(CC) $(CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o
 
 # Debug build
 debug: CFLAGS = -O0 -g -Wall -Wextra -pthread
