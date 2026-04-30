@@ -5,6 +5,7 @@ Small C tools for crawling filesystem metadata, writing compact binary crawl dat
 The current toolchain is:
 
 - `ecrawl`: parallel filesystem crawler that writes compact binary records
+- `ecrawl_repair`: optional utility that rescans `uid_shard_*.bin` shards and writes **`*.bin.ckpt`** sidecars (and quarantines unreadable shards) so **`ereport`** / **`ereport_index`** can map chunks
 - `ereport`: report generator that reads crawl output and writes `index.html`, bucket drilldown pages, and a search box that uses the trigram index when you serve the tree over HTTP
 - `ereport_index`: search-index helper for path-element substring search
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
@@ -19,6 +20,7 @@ The current toolchain is:
 |---------|------------------|----------------|------------------|------------------|---------|
 | **`ecrawl`** | Walk / queue directory work | **`ECRAWL_WORKERS`** | **16** crawl workers (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
+| **`ecrawl_repair`** | Parallel rescans of shard `.bin` files (checkpoint rebuild / verify) | **`ECRAWL_REPAIR_THREADS`** | **16** | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
 | **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
 
@@ -38,6 +40,7 @@ Build individual binaries:
 make ecrawl
 make ereport
 make ereport_index
+make ecrawl_repair
 ```
 
 Clean:
@@ -53,7 +56,7 @@ The tools are fast because they combine **compact binary I/O**, **parallelism al
 ### Shared ideas (`ecrawl`, `ereport`, `ereport_index`)
 
 - **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (`NFSCBIN` / format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
-- **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers).
+- **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—see **`ecrawl_repair`** below.
 - **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
 
 ### `ecrawl`: crawling and capture
@@ -168,6 +171,23 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (workers not feeding writers fast enough).
 
 Interpret these as **counts of blocking episodes**, not wall-clock time.
+
+### `ecrawl_repair`
+
+Use **`ecrawl_repair`** when a crawl directory has **`uid_shard_*.bin`** files but **`ereport`** or **`ereport_index --make`** cannot map chunks because **`.ckpt`** sidecars are missing or invalid—or when you want to confirm sidecars match **`ereport`**’s **`load_bin_ckpt`** rules before running readers.
+
+It **does not modify `ecrawl` or `ereport`**; it reads shard binaries and writes **only** **`*.bin.ckpt`** files next to them (same format **`ecrawl`** uses). Behavior highlights:
+
+- **Parallel shard rescans** — Set **`ECRAWL_REPAIR_THREADS`** (default **16**, minimum **1**).
+- **Corrupt shards** — Shards that fail header or record-stream validation are **`rename`**’d into **`corrupt_shards/`** under the crawl directory (optional **`*.bin.ckpt`** beside them moves too when possible). **`ereport`** only scans **`uid_shard_*.bin`** in the crawl directory root, so quarantined files are excluded until you move or fix them manually.
+- **Exit status** — On a normal run (not **`--dry-run`**), exit **0** means every remaining top-level **`uid_shard_*.bin`** has an **`ereport`-compatible** sidecar; exit **nonzero** if operational errors occurred, verification failed, or every shard was quarantined so **`ereport`** would see **no** shard files.
+
+Usage:
+
+```bash
+./ecrawl_repair [--dry-run] [--verbose] <crawl-output-dir>
+ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
+```
 
 ### `ereport`
 
@@ -572,6 +592,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
+| **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans / checkpoint rebuild (default **16**, minimum **1**). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default **32**). |
 | **`EREPORT_INDEX_THREADS`** | `ereport_index --make` / **`--search`** | Parallel chunk-boundary mapping, index **parse** workers, and (for **`--search`**) parallel postings load + path filtering when the query and candidate set are large enough (default **32**). Does **not** set merge worker count. Trigram temp writers default to this count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. |
 | **`EREPORT_INDEX_TRIGRAM_THREADS`** | `ereport_index --make` | Parallel writers to **`tmp_trigrams_*.bin`** (default: **same as `EREPORT_INDEX_THREADS`** when unset). |
@@ -586,12 +607,12 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 ## Source layout
 
-- **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, and **`ereport_index`**.
+- **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, and **`ecrawl_repair`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 
 ## Notes
 
-- The code assumes local filesystem crawl data written by `ecrawl` format version **3** (per-shard **`uid_shard_*.bin.ckpt`** sidecars record sparse byte offsets for parallel chunk mapping in `ereport` / `ereport_index --make`).
+- The code assumes local filesystem crawl data written by `ecrawl` format version **3** (per-shard **`uid_shard_*.bin.ckpt`** sidecars record sparse byte offsets for parallel chunk mapping in `ereport` / `ereport_index --make`). Use **`ecrawl_repair`** to regenerate missing sidecars without re-crawling.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - For **per-user** runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. **All-users** runs load **every** shard file (same as merging full-cluster crawls).
 - **`ECRAWL_UID_SHARDS`** for a crawl run should match across every output directory you later pass together to **`ereport`** / **`ereport_index --make`** (merged reports assume consistent shard layout).

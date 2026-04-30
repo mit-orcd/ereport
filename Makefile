@@ -11,13 +11,16 @@ SERVE_BIND ?= 127.0.0.1
 SERVE_INDEX_DIR ?=
 
 # Targets
-TARGETS = ereport ereport_index ecrawl
+TARGETS = ereport ereport_index ecrawl ecrawl_repair
 
 # Default target
 all: $(TARGETS)
 
 ecrawl: ecrawl.c
 	$(CC) $(CFLAGS) -o $@ $<
+
+ecrawl_repair: ecrawl_repair.c crawl_ckpt.h
+	$(CC) $(CFLAGS) -o $@ ecrawl_repair.c
 
 ereport: ereport.c
 	$(CC) $(CFLAGS) -o $@ $<
