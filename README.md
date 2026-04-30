@@ -18,7 +18,7 @@ The current toolchain is:
 
 | Program | Parallelism role | Override (env) | Built-in default | Min logical CPUs | Min RAM |
 |---------|------------------|----------------|------------------|------------------|---------|
-| **`ecrawl`** | Walk / queue directory work | **`ECRAWL_WORKERS`** | **16** crawl workers (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
+| **`ecrawl`** | Walk / queue directory work | **`ECRAWL_CRAWL_THREADS`** (legacy **`ECRAWL_WORKERS**`) | **16** crawl threads (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
 | **`ecrawl_repair`** | Parallel rescans; optional **`truncate`** on incomplete tail; checkpoint rebuild / verify | **`ECRAWL_REPAIR_THREADS`** | **16** | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
@@ -61,7 +61,7 @@ The tools are fast because they combine **compact binary I/O**, **parallelism al
 
 ### `ecrawl`: crawling and capture
 
-- **Parallel walkers** feed a **task queue**; multiple threads traverse the tree concurrently while respecting directory boundaries.
+- **Parallel crawl threads** feed a **task queue**; multiple threads traverse the tree concurrently while respecting directory boundaries.
 - **Uid-sharded output** — Records hash to many **`uid_shard_*.bin`** files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
 - **Separate writer threads** — Crawl threads batch work to **bounded writer queues**; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record.
 - **Checkpoint rows during write** — Sidecars capture sparse offsets so **later tools** can parallel-read without rescanning from zero.
@@ -92,7 +92,7 @@ make check              # ./test.sh integration only (tiny /tmp tree; fast)
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs ecrawl/ereport built)
 ```
 
-- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_WORKERS`**, **`EREPORT_THREADS`** override defaults.
+- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_CRAWL_THREADS`** (legacy **`ECRAWL_WORKERS`**), **`EREPORT_THREADS`** override defaults.
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
@@ -109,7 +109,7 @@ Manual sequence:
 
 `ecrawl` walks a local filesystem tree and writes binary metadata records. It supports:
 
-- parallel crawl workers
+- parallel crawl threads
 - uid-sharded output files
 - optional `--no-write` benchmarking mode
 - live status output
@@ -137,7 +137,7 @@ Optional environment variables (no CLI flags for these):
 
 | Variable | Meaning |
 |----------|---------|
-| **`ECRAWL_WORKERS`** | Crawl worker threads (minimum **1**, default **16**; no fixed maximum—practical limits are RAM and OS thread capacity). |
+| **`ECRAWL_CRAWL_THREADS`** | Crawl threads (minimum **1**, default **16**; no fixed maximum—practical limits are RAM and OS thread capacity). **`ECRAWL_WORKERS`** is accepted as a legacy alias when **`ECRAWL_CRAWL_THREADS`** is unset. |
 | **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
@@ -148,7 +148,7 @@ Examples:
 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --no-write /path/to/filesystem-tree
 ./ecrawl --no-write --verbose /path/to/filesystem-tree
-ECRAWL_WORKERS=8 ./ecrawl /path/to/filesystem-tree
+ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl /path/to/filesystem-tree host-a_apr-17-2026_15-03-01
 ./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
@@ -166,9 +166,9 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `uid_shards`: uid shard count used for the output layout.
 - `max_open_shards`: effective per-writer shard file cache after any open-file-limit auto-cap.
 - `writer_failed`: `1` means at least one writer batch failed; the process exits nonzero in this case.
-- `wait_crawl_tasks`: worker wakeups waiting on the crawl task queue (idle workers).
-- `wait_writer_push`: worker wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
-- `wait_writer_pop`: writer wakeups waiting on an **empty** queue (workers not feeding writers fast enough).
+- `wait_crawl_tasks`: crawl-thread wakeups waiting on the crawl task queue (idle crawl threads).
+- `wait_writer_push`: crawl-thread wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
+- `wait_writer_pop`: writer wakeups waiting on an **empty** queue (crawl threads not feeding writers fast enough).
 
 Interpret these as **counts of blocking episodes**, not wall-clock time.
 
@@ -593,7 +593,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 | Variable | Tool / context | Role |
 |----------|----------------|------|
-| **`ECRAWL_WORKERS`** | `ecrawl` | Crawl worker threads (minimum **1**, default **16**; no fixed maximum). |
+| **`ECRAWL_CRAWL_THREADS`** | `ecrawl` | Crawl threads (minimum **1**, default **16**; no fixed maximum). Legacy alias: **`ECRAWL_WORKERS`**. |
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |

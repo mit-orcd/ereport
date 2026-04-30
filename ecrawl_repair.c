@@ -140,7 +140,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--dry-run] [--verbose] <crawl-output-dir>\n"
             "  Writes uid_shard_*.bin.ckpt next to ecrawl v%u shard files (full scan).\n"
-            "  Parallel workers: ECRAWL_REPAIR_THREADS (default %u).\n"
+            "  Parallel threads: ECRAWL_REPAIR_THREADS (default %u).\n"
             "  Truncates tail when the record stream fails at an incomplete last record; else corrupt "
             "shards go to %s/.\n"
             "  Verifies remaining shards have ereport-valid .ckpt before exit 0.\n",

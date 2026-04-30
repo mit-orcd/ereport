@@ -216,7 +216,7 @@ run_fs_correlation() {
     root_abs=$(cd "$root" && pwd)
 
     log "step: ecrawl → ${crawl_out}"
-    ECRAWL_WORKERS="${ECRAWL_WORKERS:-8}" \
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-${ECRAWL_WORKERS:-8}}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
         die "ecrawl failed"
@@ -378,7 +378,7 @@ run_integration() {
     root_abs=$(cd "${td}/walk" && pwd)
 
     log "ecrawl ${root_abs} -> ${crawl_out}"
-    ECRAWL_WORKERS="${ECRAWL_WORKERS:-4}" \
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-${ECRAWL_WORKERS:-4}}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
         die "ecrawl failed on synthetic tree"

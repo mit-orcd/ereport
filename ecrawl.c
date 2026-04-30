@@ -22,7 +22,8 @@
  *
  * Usage:
  *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
- * Threading / shard layout (optional env): ECRAWL_WORKERS, ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
+ * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS (or legacy ECRAWL_WORKERS),
+ * ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
  */
 
 #define _XOPEN_SOURCE 700
@@ -56,13 +57,13 @@
 #define PATH_MAX 4096
 #endif
 
-#define DEFAULT_CRAWL_WORKERS 16
+#define DEFAULT_CRAWL_THREADS 16
 #define DEFAULT_WRITER_THREADS 8
 #define DEFAULT_UID_SHARDS 8192U
 #define DEFAULT_MAX_OPEN_SHARDS 256U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
 #define FD_RESERVE_BASE 128U
-#define FD_RESERVE_PER_WORKER 4U
+#define FD_RESERVE_PER_CRAWL_THREAD 4U
 #define FD_RESERVE_PER_WRITER 4U
 #define EMFILE_RETRY_LIMIT 8U
 #define EMFILE_RETRY_USEC 50000U
@@ -131,7 +132,7 @@ typedef struct {
     uint64_t dir_apparent_bytes;
     uint64_t symlink_apparent_bytes;
     uint64_t other_apparent_bytes;
-    uint64_t worker_threads_started;
+    uint64_t crawl_threads_started;
     uint64_t split_dirs_enqueued;
     uint64_t donated_dirs;
     uint64_t donation_attempts;
@@ -344,7 +345,7 @@ static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
-static int g_worker_threads_limit = DEFAULT_CRAWL_WORKERS;
+static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
 static char g_output_dir[PATH_MAX] = ".";
@@ -434,16 +435,17 @@ static int is_power_of_two_u32(uint32_t v) {
     return v && ((v & (v - 1U)) == 0U);
 }
 
-/* Crawl worker thread count (>=1). Default: DEFAULT_CRAWL_WORKERS. No fixed upper bound (RAM / OS limits apply). */
-static int parse_ecrawl_workers(void) {
-    const char *e = getenv("ECRAWL_WORKERS");
+/* Crawl thread count (>=1). ECRAWL_CRAWL_THREADS preferred; ECRAWL_WORKERS is a legacy alias. */
+static int parse_ecrawl_crawl_threads(void) {
+    const char *e = getenv("ECRAWL_CRAWL_THREADS");
     long t;
     char *end;
 
-    if (!e || !*e) return DEFAULT_CRAWL_WORKERS;
+    if (!e || !*e) e = getenv("ECRAWL_WORKERS");
+    if (!e || !*e) return DEFAULT_CRAWL_THREADS;
     errno = 0;
     t = strtol(e, &end, 10);
-    if (errno || end == e || *end || t < 1 || t > (long)INT_MAX) return DEFAULT_CRAWL_WORKERS;
+    if (errno || end == e || *end || t < 1 || t > (long)INT_MAX) return DEFAULT_CRAWL_THREADS;
     return (int)t;
 }
 
@@ -488,7 +490,7 @@ static void configure_max_open_shards(void) {
 
     soft = lim.rlim_cur;
     reserve = FD_RESERVE_BASE +
-              (rlim_t)g_worker_threads_limit * FD_RESERVE_PER_WORKER +
+              (rlim_t)g_crawl_threads * FD_RESERVE_PER_CRAWL_THREAD +
               (rlim_t)g_writer_threads * FD_RESERVE_PER_WRITER;
     if (soft <= reserve + (rlim_t)g_writer_threads) {
         g_max_open_shards = 1U;
@@ -896,9 +898,9 @@ static void stats_add_error(shared_state_t *s) {
     pthread_mutex_unlock(&s->stats_mutex);
 }
 
-static void stats_add_worker_started(shared_state_t *s) {
+static void stats_add_crawl_thread_started(shared_state_t *s) {
     pthread_mutex_lock(&s->stats_mutex);
-    s->worker_threads_started++;
+    s->crawl_threads_started++;
     pthread_mutex_unlock(&s->stats_mutex);
 }
 
@@ -961,10 +963,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
-            "Optional env: ECRAWL_WORKERS (crawl workers, default %d, minimum 1), "
+            "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1; alias ECRAWL_WORKERS), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE).\n",
-            DEFAULT_CRAWL_WORKERS,
+            DEFAULT_CRAWL_THREADS,
             DEFAULT_WRITER_THREADS,
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS);
@@ -1705,7 +1707,7 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
     uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
     int active = atomic_load(&g_active_workers);
-    int started = (int)shared->worker_threads_started;
+    int started = (int)shared->crawl_threads_started;
     int idle = started - active;
 
     if (started <= 1) return 0;
@@ -2286,7 +2288,7 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     if (g_record_root && g_record_root[0] != '\0') fprintf(fp, "record_root=%s\n", g_record_root);
     fprintf(fp, "split_depth=%d\n", g_split_depth);
     fprintf(fp, "byte_accounting=unique_regular_files\n");
-    fprintf(fp, "crawl_workers=%d\n", worker_count_started);
+    fprintf(fp, "crawl_threads=%d\n", worker_count_started);
     fprintf(fp, "writer_threads=%d\n", g_writer_threads);
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
     fprintf(fp, "uid_shard_digits=%d\n", g_shard_digits);
@@ -2397,7 +2399,7 @@ int main(int argc, char **argv) {
         output_dir_explicit = 1;
     }
 
-    g_worker_threads_limit = parse_ecrawl_workers();
+    g_crawl_threads = parse_ecrawl_crawl_threads();
     g_uid_shards = parse_ecrawl_uid_shards_env();
     g_writer_threads = parse_ecrawl_writer_threads_env();
     if ((uint32_t)g_writer_threads > g_uid_shards) g_writer_threads = (int)g_uid_shards;
@@ -2590,12 +2592,12 @@ int main(int argc, char **argv) {
     }
     stats_thread_started = 1;
 
-    workers = (pthread_t *)calloc((size_t)g_worker_threads_limit, sizeof(*workers));
-    worker_args = (worker_arg_t *)calloc((size_t)g_worker_threads_limit, sizeof(*worker_args));
+    workers = (pthread_t *)calloc((size_t)g_crawl_threads, sizeof(*workers));
+    worker_args = (worker_arg_t *)calloc((size_t)g_crawl_threads, sizeof(*worker_args));
     if (!workers || !worker_args) {
         free(workers);
         free(worker_args);
-        fprintf(stderr, "ERROR allocation failed for crawl worker tables (%d workers)\n", g_worker_threads_limit);
+        fprintf(stderr, "ERROR allocation failed for crawl thread table (%d threads)\n", g_crawl_threads);
         atomic_store(&g_stop_stats, 1);
         pthread_join(stats_thread, NULL);
         clear_status_line();
@@ -2617,7 +2619,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    for (i = 0; i < g_worker_threads_limit; i++) {
+    for (i = 0; i < g_crawl_threads; i++) {
         worker_args[i].shared = &shared;
         worker_args[i].queue = &queue;
         worker_args[i].writer_queues = writer_queues;
@@ -2633,7 +2635,7 @@ int main(int argc, char **argv) {
             break;
         }
         worker_count_started++;
-        stats_add_worker_started(&shared);
+        stats_add_crawl_thread_started(&shared);
     }
 
     enqueue_root_task(start_path, &shared, &queue);
@@ -2692,7 +2694,7 @@ int main(int argc, char **argv) {
             if (g_record_root) printf("record_root=%s\n", g_record_root);
             printf("no_write=%d\n", g_no_write);
             printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
-            printf("workers=%" PRIu64 "\n", shared.worker_threads_started);
+            printf("crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
             printf("writer_threads=%d\n", writer_threads_used);
             printf("uid_shards=%u\n", g_uid_shards);
             printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
@@ -2725,13 +2727,13 @@ int main(int argc, char **argv) {
             printf("uid_shards=%u\n", g_uid_shards);
             printf("uid_shard_digits=%d\n", g_shard_digits);
             printf("writer_threads=%d\n", writer_threads_used);
-            printf("max_worker_threads=%d\n", g_worker_threads_limit);
+            printf("crawl_threads=%d\n", g_crawl_threads);
             printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
             printf("writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
             printf("record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
             printf("write_buffer_size=%u\n", g_no_write ? 0U : (unsigned)WRITE_BUFFER_SIZE);
             printf("byte_accounting=%s\n", "unique_regular_files");
-            printf("worker_threads_started=%" PRIu64 "\n", shared.worker_threads_started);
+            printf("crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
             printf("split_dirs_enqueued=%" PRIu64 "\n", shared.split_dirs_enqueued);
             printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
             printf("donation_attempts=%" PRIu64 "\n", shared.donation_attempts);

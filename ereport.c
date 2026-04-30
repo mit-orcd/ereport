@@ -18,7 +18,7 @@
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only. Flags must appear first, before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
- * Parallel worker count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
+ * Parallel thread count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
  * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
  * or every shard when aggregating all users).
  *
