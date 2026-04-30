@@ -12,8 +12,11 @@
  *
  * Parallelism: environment variable ECRAWL_REPAIR_THREADS (default 16, minimum 1).
  *
- * Corrupt uid_shard_*.bin shards (bad header or unreadable record stream) are renamed into
- * <crawl-dir>/corrupt_shards/ (and matching .bin.ckpt sidecars when present). Dry-run does not move.
+ * Incomplete tail (truncated last record): the shard .bin is shortened to the last complete record
+ * boundary, then rescanned and given a .ckpt.
+ *
+ * Other corrupt uid_shard_*.bin shards are renamed into <crawl-dir>/corrupt_shards/ (and matching
+ * .bin.ckpt sidecars when present). Dry-run does not truncate, move, or write.
  *
  * After a normal run, every remaining top-level uid_shard_*.bin is checked for an ereport-compatible
  * .ckpt (same rules as ereport load_bin_ckpt). Exit status is 0 only if none failed and that check passes,
@@ -28,6 +31,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +53,60 @@
 
 static pthread_mutex_t g_verbose_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_quarantine_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static _Atomic uint64_t g_trunc_shard_count;
+static _Atomic uint64_t g_trunc_bytes_removed;
+static _Atomic uint64_t g_trunc_orig_bytes_total;
+static _Atomic uint64_t g_trunc_new_bytes_total;
+
+static void trunc_stats_reset(void) {
+    atomic_store_explicit(&g_trunc_shard_count, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_trunc_bytes_removed, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_trunc_orig_bytes_total, 0ULL, memory_order_relaxed);
+    atomic_store_explicit(&g_trunc_new_bytes_total, 0ULL, memory_order_relaxed);
+}
+
+static void trunc_stats_add(uint64_t orig_sz, uint64_t new_sz) {
+    atomic_fetch_add_explicit(&g_trunc_shard_count, 1ULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_trunc_bytes_removed, orig_sz - new_sz, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_trunc_orig_bytes_total, orig_sz, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_trunc_new_bytes_total, new_sz, memory_order_relaxed);
+}
+
+static void format_bytes_human(uint64_t n, char *out, size_t out_sz) {
+    static const char *const suf[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB"};
+    double v = (double)n;
+    unsigned si = 0;
+
+    while (v >= 1024.0 && si + 1U < sizeof(suf) / sizeof(suf[0])) {
+        v /= 1024.0;
+        si++;
+    }
+    if (si == 0) {
+        snprintf(out, out_sz, "%" PRIu64 " B", n);
+    } else {
+        snprintf(out, out_sz, "%.2f %s", v, suf[si]);
+    }
+}
+
+static void print_truncation_summary(int dry_run) {
+    uint64_t nsh = atomic_load_explicit(&g_trunc_shard_count, memory_order_relaxed);
+    uint64_t removed = atomic_load_explicit(&g_trunc_bytes_removed, memory_order_relaxed);
+    uint64_t orig = atomic_load_explicit(&g_trunc_orig_bytes_total, memory_order_relaxed);
+    uint64_t newb = atomic_load_explicit(&g_trunc_new_bytes_total, memory_order_relaxed);
+    char rem_buf[48], orig_buf[48], new_buf[48];
+
+    if (nsh == 0ULL) return;
+
+    format_bytes_human(removed, rem_buf, sizeof(rem_buf));
+    format_bytes_human(orig, orig_buf, sizeof(orig_buf));
+    format_bytes_human(newb, new_buf, sizeof(new_buf));
+
+    fprintf(stderr,
+            "ecrawl_repair: %stail truncation — %" PRIu64 " shard(s); removed %" PRIu64 " bytes (%s); "
+            "original total %" PRIu64 " bytes (%s) -> new total %" PRIu64 " bytes (%s)\n",
+            dry_run ? "would-be " : "", nsh, removed, rem_buf, orig, orig_buf, newb, new_buf);
+}
 
 typedef struct __attribute__((packed)) {
     char magic[FILE_MAGIC_LEN];
@@ -83,7 +141,8 @@ static void usage(const char *prog) {
             "Usage: %s [--dry-run] [--verbose] <crawl-output-dir>\n"
             "  Writes uid_shard_*.bin.ckpt next to ecrawl v%u shard files (full scan).\n"
             "  Parallel workers: ECRAWL_REPAIR_THREADS (default %u).\n"
-            "  Corrupt shards are moved to %s/ under the crawl directory.\n"
+            "  Truncates tail when the record stream fails at an incomplete last record; else corrupt "
+            "shards go to %s/.\n"
             "  Verifies remaining shards have ereport-valid .ckpt before exit 0.\n",
             prog,
             FORMAT_VERSION,
@@ -142,17 +201,24 @@ static int validate_bin_prefix(const char *path, uint64_t file_sz, int *corrupt_
     return 0;
 }
 
+/*
+ * On corrupt scan (*corrupt_out=1), if salvage_exclusive_end_out is non-NULL, sets it to the byte
+ * offset immediately after the last fully validated record (or sizeof(bin_file_header_t) if none),
+ * suitable for truncate() when salvage_exclusive_end_out < file_sz.
+ */
 static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t **offs_out, size_t *n_out,
-                                int *corrupt_out) {
+                                int *corrupt_out, uint64_t *salvage_exclusive_end_out) {
     FILE *fp;
     uint64_t *buf = NULL;
     size_t n, cap;
     uint64_t seg0;
+    uint64_t last_good_exclusive;
     off_t pos;
 
     *offs_out = NULL;
     *n_out = 0;
     *corrupt_out = 0;
+    if (salvage_exclusive_end_out) *salvage_exclusive_end_out = sizeof(bin_file_header_t);
     fp = fopen(bin_path, "rb");
     if (!fp) {
         perror(bin_path);
@@ -168,8 +234,12 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     cap = 16;
     buf[0] = sizeof(bin_file_header_t);
     seg0 = sizeof(bin_file_header_t);
+    last_good_exclusive = sizeof(bin_file_header_t);
 
-    if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto corrupt;
+    if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) {
+        if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+        goto corrupt;
+    }
     pos = (off_t)sizeof(bin_file_header_t);
 
     while ((uint64_t)pos < file_sz) {
@@ -187,22 +257,40 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
             buf[n++] = rec_start;
             seg0 = rec_start;
         }
-        if (fread(&rh, sizeof(rh), 1, fp) != 1) goto corrupt;
-        pos = ftello(fp);
-        if (pos < 0) goto corrupt;
-        if (rh.path_len) {
-            if ((uint64_t)pos + rh.path_len > file_sz) goto corrupt;
-            if (fseeko(fp, (off_t)rh.path_len, SEEK_CUR) != 0) goto corrupt;
-            pos = ftello(fp);
-            if (pos < 0) goto corrupt;
+        if (fread(&rh, sizeof(rh), 1, fp) != 1) {
+            if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+            goto corrupt;
         }
+        pos = ftello(fp);
+        if (pos < 0) {
+            if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+            goto corrupt;
+        }
+        if (rh.path_len) {
+            if ((uint64_t)pos + rh.path_len > file_sz) {
+                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+                goto corrupt;
+            }
+            if (fseeko(fp, (off_t)rh.path_len, SEEK_CUR) != 0) {
+                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+                goto corrupt;
+            }
+            pos = ftello(fp);
+            if (pos < 0) {
+                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+                goto corrupt;
+            }
+        }
+        last_good_exclusive = (uint64_t)pos;
     }
     if ((uint64_t)pos != file_sz) {
         fprintf(stderr, "%s: scan did not consume whole file (corrupt or wrong format?)\n", bin_path);
         errno = EINVAL;
+        if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
         goto corrupt;
     }
     fclose(fp);
+    if (salvage_exclusive_end_out) *salvage_exclusive_end_out = file_sz;
     *offs_out = buf;
     *n_out = n;
     return 0;
@@ -215,6 +303,14 @@ corrupt:
     fclose(fp);
     free(buf);
     return -1;
+}
+
+static int salvage_truncate_shard(const char *path, uint64_t new_sz) {
+    if (truncate(path, (off_t)new_sz) != 0) {
+        perror(path);
+        return -1;
+    }
+    return 0;
 }
 
 static int write_ckpt_file(const char *bin_path, const uint64_t *offs, size_t n) {
@@ -510,14 +606,67 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
         return -1;
     }
 
-    if (rebuild_offsets_scan(full, (uint64_t)st.st_size, &offs, &n_off, &corrupt) != 0) {
-        if (corrupt) {
-            quarantine_corrupt_shard(dir_path, full, name);
-            corrupt_quarantine_inc(corrupt_quarantined);
-        } else {
-            ops_fail_inc(ops_fail);
+    {
+        uint64_t salvage_end = 0;
+
+        if (rebuild_offsets_scan(full, (uint64_t)st.st_size, &offs, &n_off, &corrupt, &salvage_end) != 0) {
+            int can_truncate =
+                corrupt && salvage_end >= sizeof(bin_file_header_t) && salvage_end < (uint64_t)st.st_size;
+
+            if (can_truncate) {
+                uint64_t orig_sz = (uint64_t)st.st_size;
+
+                if (g_dry_run) {
+                    trunc_stats_add(orig_sz, salvage_end);
+                    fprintf(stderr,
+                            "%s: incomplete tail — would truncate %" PRIu64 " -> %" PRIu64 " bytes then write "
+                            ".ckpt\n",
+                            full, orig_sz, salvage_end);
+                    return 0;
+                }
+                if (g_verbose) {
+                    pthread_mutex_lock(&g_verbose_mutex);
+                    printf("%s: truncating %" PRIu64 " -> %" PRIu64 " bytes (salvage valid prefix)\n", full,
+                           orig_sz, salvage_end);
+                    pthread_mutex_unlock(&g_verbose_mutex);
+                } else {
+                    fprintf(stderr, "%s: truncating %" PRIu64 " -> %" PRIu64 " bytes (incomplete last record)\n",
+                            full, orig_sz, salvage_end);
+                }
+                if (salvage_truncate_shard(full, salvage_end) != 0) {
+                    ops_fail_inc(ops_fail);
+                    quarantine_corrupt_shard(dir_path, full, name);
+                    corrupt_quarantine_inc(corrupt_quarantined);
+                    return -1;
+                }
+                trunc_stats_add(orig_sz, salvage_end);
+                if (stat(full, &st) != 0) {
+                    perror(full);
+                    ops_fail_inc(ops_fail);
+                    return -1;
+                }
+                salvage_end = 0;
+                corrupt = 0;
+                if (rebuild_offsets_scan(full, (uint64_t)st.st_size, &offs, &n_off, &corrupt, &salvage_end) !=
+                    0) {
+                    if (corrupt) {
+                        quarantine_corrupt_shard(dir_path, full, name);
+                        corrupt_quarantine_inc(corrupt_quarantined);
+                    } else {
+                        ops_fail_inc(ops_fail);
+                    }
+                    return -1;
+                }
+            } else {
+                if (corrupt) {
+                    quarantine_corrupt_shard(dir_path, full, name);
+                    corrupt_quarantine_inc(corrupt_quarantined);
+                } else {
+                    ops_fail_inc(ops_fail);
+                }
+                return -1;
+            }
         }
-        return -1;
     }
 
     if (g_verbose) {
@@ -607,6 +756,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    trunc_stats_reset();
+
     dp = opendir(dir_path);
     if (!dp) {
         perror(dir_path);
@@ -684,6 +835,8 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < (int)name_count; i++) free(names[i]);
     free(names);
+
+    print_truncation_summary(g_dry_run);
 
     ereport_ready_fail = 0;
     if (!g_dry_run) {
