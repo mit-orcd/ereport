@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "path_canon.h"
@@ -70,6 +71,8 @@
 #define DONATE_QUEUE_TARGET_PER_IDLE 4
 #define EMFILE_RETRY_LIMIT 8U
 #define EMFILE_RETRY_USEC 50000U
+#define QUEUE_COND_WAIT_MS 250
+#define READDIR_SHUTDOWN_CHECK_STRIDE 4096U
 
 typedef struct task_node task_node_t;
 
@@ -158,6 +161,10 @@ static atomic_ullong g_bucket_entries[WINDOW_SECONDS];
 static atomic_int g_bucket_index = 0;
 static atomic_int g_stop_stats = 0;
 static atomic_uint g_seconds_seen = 0;
+static atomic_ullong g_live_would_unlink = 0;
+static atomic_ullong g_live_unlinked = 0;
+
+static volatile sig_atomic_t g_shutdown_requested = 0;
 
 static int g_verbose = 0;
 static int g_force = 0;
@@ -216,6 +223,46 @@ static void clear_status_line(void) {
     fflush(stdout);
 }
 
+static void edelete_signal_handler(int signo) {
+    (void)signo;
+    g_shutdown_requested = 1;
+}
+
+static void install_job_signals(void) {
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = edelete_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    (void)sigaction(SIGINT, &sa, NULL);
+    (void)sigaction(SIGTERM, &sa, NULL);
+}
+
+static void queue_cond_timedwait_ms(pthread_cond_t *cond, pthread_mutex_t *mutex, int ms) {
+    struct timespec ts;
+    long add_ns = (long)ms * 1000000L;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += add_ns;
+    while (ts.tv_nsec >= 1000000000L) {
+        ts.tv_nsec -= 1000000000L;
+        ts.tv_sec++;
+    }
+
+    for (;;) {
+        int rc = pthread_cond_timedwait(cond, mutex, &ts);
+        if (rc == 0 || rc == ETIMEDOUT) return;
+        if (rc != EINTR) return;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += add_ns;
+        while (ts.tv_nsec >= 1000000000L) {
+            ts.tv_nsec -= 1000000000L;
+            ts.tv_sec++;
+        }
+    }
+}
+
 static int parse_basis(const char *s, time_basis_t *out) {
     if (!s || !out) return -1;
     if (strcmp(s, "atime") == 0) {
@@ -259,12 +306,19 @@ static int parse_max_unlink_inflight(void) {
     return (int)v;
 }
 
-static void unlink_gate_enter(void) {
-    if (g_max_unlink_inflight <= 0) return;
+static int unlink_gate_enter(void) {
+    if (g_max_unlink_inflight <= 0) return 0;
     pthread_mutex_lock(&g_unlink_gate_mutex);
-    while (g_unlink_inflight >= g_max_unlink_inflight) pthread_cond_wait(&g_unlink_gate_cond, &g_unlink_gate_mutex);
+    while (g_unlink_inflight >= g_max_unlink_inflight) {
+        if (g_shutdown_requested) {
+            pthread_mutex_unlock(&g_unlink_gate_mutex);
+            return -1;
+        }
+        queue_cond_timedwait_ms(&g_unlink_gate_cond, &g_unlink_gate_mutex, QUEUE_COND_WAIT_MS);
+    }
     g_unlink_inflight++;
     pthread_mutex_unlock(&g_unlink_gate_mutex);
+    return 0;
 }
 
 static void unlink_gate_leave(void) {
@@ -553,7 +607,13 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
             pthread_mutex_unlock(&q->mutex);
             return -1;
         }
-        pthread_cond_wait(&q->cond, &q->mutex);
+        if (g_shutdown_requested) {
+            q->closed = 1;
+            pthread_cond_broadcast(&q->cond);
+            pthread_mutex_unlock(&q->mutex);
+            return -1;
+        }
+        queue_cond_timedwait_ms(&q->cond, &q->mutex, QUEUE_COND_WAIT_MS);
         atomic_fetch_add_explicit(&g_wait_crawl_tasks, 1ULL, memory_order_relaxed);
     }
 
@@ -675,6 +735,7 @@ static int try_delete_nondir(shared_state_t *shared, const char *path, const str
     time_t ts;
 
     if (S_ISDIR(st->st_mode)) return 0;
+    if (g_shutdown_requested) return 0;
 
     ts = pick_ts(st, g_basis);
     if (!age_eligible_seconds(ts)) return 0;
@@ -683,10 +744,11 @@ static int try_delete_nondir(shared_state_t *shared, const char *path, const str
         pthread_mutex_lock(&shared->stats_mutex);
         shared->would_delete++;
         pthread_mutex_unlock(&shared->stats_mutex);
+        atomic_fetch_add_explicit(&g_live_would_unlink, 1ULL, memory_order_relaxed);
         return 0;
     }
 
-    unlink_gate_enter();
+    if (unlink_gate_enter() != 0) return 0;
     if (unlink(path) != 0) {
         fprintf(stderr, "edelete: unlink %s: %s\n", path, strerror(errno));
         stats_add_error(shared);
@@ -698,6 +760,7 @@ static int try_delete_nondir(shared_state_t *shared, const char *path, const str
     pthread_mutex_lock(&shared->stats_mutex);
     shared->deleted_files++;
     pthread_mutex_unlock(&shared->stats_mutex);
+    atomic_fetch_add_explicit(&g_live_unlinked, 1ULL, memory_order_relaxed);
     return 1;
 }
 
@@ -710,6 +773,11 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
         struct stat st;
         DIR *dir = NULL;
         struct dirent *ent;
+
+        if (g_shutdown_requested) {
+            dir_stack_destroy(stack);
+            return 0;
+        }
 
         if (dir_stack_pop(stack, &work) != 0) break;
         dir_path = work.path;
@@ -758,8 +826,12 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
             continue;
         }
 
+        int shutdown_mid_readdir = 0;
+
         {
             int dir_fd = dirfd(dir);
+            unsigned readdir_i = 0;
+
             if (dir_fd < 0) {
                 fprintf(stderr, "edelete: dirfd %s: %s\n", dir_path, strerror(errno));
                 stats_add_error(shared);
@@ -769,6 +841,11 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
             }
 
             while ((ent = readdir(dir)) != NULL) {
+                if ((++readdir_i & (READDIR_SHUTDOWN_CHECK_STRIDE - 1U)) == 0U && g_shutdown_requested) {
+                    shutdown_mid_readdir = 1;
+                    break;
+                }
+
                 size_t child_name_len;
                 struct stat child_st;
 #if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
@@ -796,7 +873,7 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
                         stats_add_error(shared);
                         continue;
                     }
-                    while (should_donate_work(shared, stack)) {
+                    while (!g_shutdown_requested && should_donate_work(shared, stack)) {
                         if (donate_stack_chunk(stack, queue, aux) != 0) {
                             stats_add_error(shared);
                             break;
@@ -824,7 +901,7 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
                             stats_add_error(shared);
                             continue;
                         }
-                        while (should_donate_work(shared, stack)) {
+                        while (!g_shutdown_requested && should_donate_work(shared, stack)) {
                             if (donate_stack_chunk(stack, queue, aux) != 0) {
                                 stats_add_error(shared);
                                 break;
@@ -850,6 +927,11 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
         }
 
         closedir(dir);
+        if (shutdown_mid_readdir) {
+            free(dir_path);
+            dir_stack_destroy(stack);
+            return 0;
+        }
         free(dir_path);
     }
 
@@ -942,18 +1024,26 @@ static void *stats_thread_main(void *arg) {
         {
             unsigned long long total_entries = atomic_load(&g_total_entries);
             unsigned long long window_entries = atomic_load(&g_window_entries);
+            unsigned long long unlink_live =
+                g_dry_run ? atomic_load(&g_live_would_unlink) : atomic_load(&g_live_unlinked);
             unsigned int divisor = atomic_load(&g_seconds_seen);
-            double ops_rate;
+            double walk_rate;
             double elapsed_sec = now_sec() - *run_start_ptr;
-            char te[32], re[32], elapsed_buf[32];
+            char walked_buf[32], rate_buf[32], unlink_buf[32], elapsed_buf[32];
 
             if (divisor == 0) divisor = 1;
-            ops_rate = (double)window_entries / (double)divisor;
-            human_decimal((double)total_entries, te, sizeof(te));
-            human_decimal(ops_rate, re, sizeof(re));
+            walk_rate = (double)window_entries / (double)divisor;
+            human_decimal((double)total_entries, walked_buf, sizeof(walked_buf));
+            human_decimal(walk_rate, rate_buf, sizeof(rate_buf));
+            human_decimal((double)unlink_live, unlink_buf, sizeof(unlink_buf));
             format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
-            printf("\r%s entries/s(10s) | scanned:%s | el:%s            ", re, te, elapsed_buf);
+            if (g_dry_run)
+                printf("\r%s walk/s(10s) | walked:%s | would_unlink:%s | el:%s            ", rate_buf, walked_buf,
+                       unlink_buf, elapsed_buf);
+            else
+                printf("\r%s walk/s(10s) | walked:%s | unlinked:%s | el:%s            ", rate_buf, walked_buf,
+                       unlink_buf, elapsed_buf);
             fflush(stdout);
         }
     }
@@ -1006,7 +1096,10 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
     fflush(stderr);
 
     if (!fgets(line, sizeof(line), stdin)) {
-        fprintf(stderr, "\nedelete: cancelled (no input).\n");
+        if (g_shutdown_requested)
+            fprintf(stderr, "\nedelete: interrupted.\n");
+        else
+            fprintf(stderr, "\nedelete: cancelled (no input).\n");
         return -1;
     }
     if (!line_confirms_yes(line)) {
@@ -1075,6 +1168,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    install_job_signals();
+
     if (argc - ai == 1) {
         g_delete_all = 1;
         root_path = argv[ai++];
@@ -1135,6 +1230,13 @@ int main(int argc, char **argv) {
     if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, g_delete_all, basis_str, g_age_days) != 0)
         return 3;
 
+    /*
+     * Handlers are installed early; a stray SIGINT/SIGTERM during path resolve or the YES prompt can set
+     * g_shutdown_requested. Once we pass confirm/setup, start the crawl with a clean interrupt scope so
+     * try_delete_nondir is not permanently skipped.
+     */
+    g_shutdown_requested = 0;
+
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.stats_mutex, NULL);
     pthread_mutex_init(&shared.rmdir_list_mutex, NULL);
@@ -1142,6 +1244,8 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < WINDOW_SECONDS; i++) atomic_store(&g_bucket_entries[i], 0);
     atomic_store(&g_total_entries, 0);
+    atomic_store(&g_live_would_unlink, 0);
+    atomic_store(&g_live_unlinked, 0);
     atomic_store(&g_total_dirs, 0);
     atomic_store(&g_total_files, 0);
     atomic_store(&g_window_entries, 0);
@@ -1232,61 +1336,70 @@ int main(int argc, char **argv) {
     pthread_cond_broadcast(&queue.cond);
     pthread_mutex_unlock(&queue.mutex);
 
-    for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
-
-    pthread_mutex_lock(&queue.mutex);
-    queue.closed = 1;
-    pthread_cond_broadcast(&queue.cond);
-    pthread_mutex_unlock(&queue.mutex);
-
-    for (i = 0; i < worker_count_started; i++) stats_merge_aux(&shared, &worker_args[i].aux);
-
-    if (!g_dry_run) remove_empty_directories_after_delete(&shared, root_path);
-
-    atomic_store(&g_stop_stats, 1);
-    pthread_join(stats_thread, NULL);
-    clear_status_line();
-
-    t1 = now_sec();
-
-    free(workers);
-    free(worker_args);
-    queue_destroy(&queue);
-
     {
-        double elapsed = t1 - t0;
-        double avg_ops =
-            elapsed > 0.0 ? (double)atomic_load(&g_total_entries) / elapsed : 0.0;
-        char avg_ops_buf[32];
+        int interrupted = 0;
 
-        human_decimal(avg_ops, avg_ops_buf, sizeof(avg_ops_buf));
-        printf("delete_all=%d\n", g_delete_all);
-        if (!g_delete_all) {
-            printf("basis=%s\n", basis_str);
-            printf("age_days=%d\n", g_age_days);
+        for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
+        interrupted = g_shutdown_requested;
+
+        pthread_mutex_lock(&queue.mutex);
+        queue.closed = 1;
+        pthread_cond_broadcast(&queue.cond);
+        pthread_mutex_unlock(&queue.mutex);
+
+        for (i = 0; i < worker_count_started; i++) stats_merge_aux(&shared, &worker_args[i].aux);
+
+        if (!g_dry_run && !interrupted) remove_empty_directories_after_delete(&shared, root_path);
+
+        atomic_store(&g_stop_stats, 1);
+        pthread_join(stats_thread, NULL);
+        clear_status_line();
+        if (interrupted) fprintf(stderr, "edelete: interrupted by signal; partial results below.\n");
+
+        t1 = now_sec();
+
+        free(workers);
+        free(worker_args);
+        queue_destroy(&queue);
+
+        {
+            double elapsed = t1 - t0;
+            double avg_walk =
+                elapsed > 0.0 ? (double)atomic_load(&g_total_entries) / elapsed : 0.0;
+            char avg_walk_buf[32];
+
+            human_decimal(avg_walk, avg_walk_buf, sizeof(avg_walk_buf));
+            printf("delete_all=%d\n", g_delete_all);
+            if (!g_delete_all) {
+                printf("basis=%s\n", basis_str);
+                printf("age_days=%d\n", g_age_days);
+            }
+            printf("force=%d\n", g_force);
+            printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
+            printf("start_path=%s\n", root_path);
+            printf("threads=%d\n", worker_count_started);
+            printf("max_unlink_inflight=%d\n", g_max_unlink_inflight);
+            printf("walk_entries=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
+            printf("entries_scanned=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
+            printf("dirs_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_dirs));
+            printf("files_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_files));
+            printf("deleted_files=%" PRIu64 "\n", shared.deleted_files);
+            printf("removed_empty_dirs=%" PRIu64 "\n", shared.removed_empty_dirs);
+            printf("would_delete=%" PRIu64 "\n", shared.would_delete);
+            printf("errors=%" PRIu64 "\n", shared.total_errors);
+            printf("elapsed_sec=%.3f\n", elapsed);
+            printf("avg_walk_per_sec=%s\n", avg_walk_buf);
+            printf("avg_entries_per_sec=%s\n", avg_walk_buf);
+            printf("tasks_popped=%" PRIu64 "\n", (uint64_t)atomic_load(&g_tasks_popped));
+            printf("wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
+            printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
+            printf("donation_attempts=%" PRIu64 "\n", shared.donation_attempts);
+            printf("donation_successes=%" PRIu64 "\n", shared.donation_successes);
         }
-        printf("force=%d\n", g_force);
-        printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
-        printf("start_path=%s\n", root_path);
-        printf("threads=%d\n", worker_count_started);
-        printf("max_unlink_inflight=%d\n", g_max_unlink_inflight);
-        printf("entries_scanned=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
-        printf("dirs_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_dirs));
-        printf("files_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_files));
-        printf("deleted_files=%" PRIu64 "\n", shared.deleted_files);
-        printf("removed_empty_dirs=%" PRIu64 "\n", shared.removed_empty_dirs);
-        printf("would_delete=%" PRIu64 "\n", shared.would_delete);
-        printf("errors=%" PRIu64 "\n", shared.total_errors);
-        printf("elapsed_sec=%.3f\n", elapsed);
-        printf("avg_entries_per_sec=%s\n", avg_ops_buf);
-        printf("tasks_popped=%" PRIu64 "\n", (uint64_t)atomic_load(&g_tasks_popped));
-        printf("wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
-        printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
-        printf("donation_attempts=%" PRIu64 "\n", shared.donation_attempts);
-        printf("donation_successes=%" PRIu64 "\n", shared.donation_successes);
-    }
 
-    pthread_mutex_destroy(&shared.rmdir_list_mutex);
-    pthread_mutex_destroy(&shared.stats_mutex);
-    return shared.total_errors ? 1 : 0;
+        pthread_mutex_destroy(&shared.rmdir_list_mutex);
+        pthread_mutex_destroy(&shared.stats_mutex);
+        if (interrupted) return 130;
+        return shared.total_errors ? 1 : 0;
+    }
 }
