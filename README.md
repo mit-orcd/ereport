@@ -54,7 +54,7 @@ make clean
 
 ## systemd: daily `ecrawl` and binary sync
 
-Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then **`rsync`** each job’s **`output_dir`** (crawl shard data) under **`RSYNC_DEST`** using that directory’s basename as the remote subdirectory; after each successful sync the script deletes matching crawl artifact files locally (see **`contrib/systemd/ecrawl-daily.conf.example`**).
+Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then **`rsync`** each job’s **`output_dir`** (crawl shard data) under **`RSYNC_DEST`** (typically **`RSYNC_DEST/<basename(output_dir)>/`**, or directly into **`RSYNC_DEST`** when its last path component already matches that basename); after each successful sync the script deletes matching crawl artifact files locally (see **`contrib/systemd/ecrawl-daily.conf.example`**).
 
 Install (adjust paths if you install elsewhere):
 

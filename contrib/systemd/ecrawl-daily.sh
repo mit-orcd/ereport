@@ -3,8 +3,9 @@
 # then rsync each job output_dir’s crawl data to RSYNC_DEST (optional). After each directory’s
 # rsync succeeds, the same ecrawl artifact filenames are removed locally (see remove patterns below).
 #
-# RSYNC_DEST is the remote (or local) *parent* for crawl mirrors: output_dir /path/foo syncs to
-# DEST/foo/ (basename of output_dir). Requires non-empty output_dir on each job line.
+# RSYNC_DEST is the remote (or local) crawl mirror root. Normally output_dir /path/foo syncs to
+# DEST/foo/. If basename(DEST) already equals basename(output_dir), sync goes directly to DEST/
+# (avoids DEST/foo/foo when both names match).
 #
 # On any non-zero exit, ecrawl artifact files under each touched output_dir are also deleted (by name:
 # uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
@@ -166,7 +167,7 @@ sync_crawl_outputs() {
 		rsync_cmd+=(-e "$RSYNC_RSH")
 	fi
 
-	local remote_parent canon base dest
+	local remote_parent remote_leaf parent_base canon base dest
 	if parse_rsync_ssh_dest "$RSYNC_DEST"; then
 		remote_parent="${RSYNC_REMOTE_PATH%/}"
 		ensure_remote_deploy_parent "$RSYNC_SSH_TARGET" "$remote_parent"
@@ -175,17 +176,25 @@ sync_crawl_outputs() {
 		mkdir -p -- "$remote_parent" || die "cannot create RSYNC_DEST parent: $remote_parent"
 	fi
 
+	parent_base=$(basename -- "$remote_parent")
+
 	for local_dir in "${CRAWL_RSYNC_OUTPUT_DIRS[@]}"; do
 		[[ -d "$local_dir" ]] || die "crawl output directory missing for rsync: $local_dir"
 		canon=$(readlink -f -- "$local_dir" 2>/dev/null) || die "cannot resolve crawl output dir: $local_dir"
 		base=$(basename -- "$canon")
 		[[ -n "$base" ]] || die "invalid basename for crawl output dir: $local_dir"
 
-		if parse_rsync_ssh_dest "$RSYNC_DEST"; then
-			dest="${RSYNC_SSH_TARGET}:${remote_parent}/${base}/"
+		if [[ "$parent_base" == "$base" ]]; then
+			remote_leaf="$remote_parent"
 		else
-			mkdir -p -- "${remote_parent}/${base}" || die "cannot create ${remote_parent}/${base}"
-			dest="${remote_parent}/${base}/"
+			remote_leaf="${remote_parent}/${base}"
+		fi
+
+		if parse_rsync_ssh_dest "$RSYNC_DEST"; then
+			dest="${RSYNC_SSH_TARGET}:${remote_leaf}/"
+		else
+			mkdir -p -- "$remote_leaf" || die "cannot create ${remote_leaf}"
+			dest="${remote_leaf}/"
 		fi
 		echo "ecrawl-daily: rsync crawl output ${canon}/ -> ${dest}"
 		if ! "${rsync_cmd[@]}" "${canon}/" "$dest"; then
