@@ -66,6 +66,8 @@
 #define BUCKET_PATH_TABLE_MAX_ROWS 200
 /* C-led: ctime must exceed max(atime,mtime) by at least this many seconds ("substantially newer"; hardcoded). */
 #define CTIME_LED_MIN_DELTA_SEC (180ULL * 86400ULL)
+/* Purple C-led badges (heat map, bucket pill) only when C-led bytes are at least this fraction of the slice. */
+#define CTIME_LED_BADGE_MIN_SHARE_FRAC (0.30)
 
 static void ereport_free_bin_dirs_list(const char **dirs, size_t n) {
     size_t k;
@@ -1194,6 +1196,11 @@ static int record_ctime_led(const bin_record_hdr_t *r) {
     return (r->ctime - tam) >= CTIME_LED_MIN_DELTA_SEC;
 }
 
+static int ctime_led_badge_visible(uint64_t led_bytes, uint64_t total_bytes) {
+    if (total_bytes == 0 || led_bytes == 0) return 0;
+    return (double)led_bytes / (double)total_bytes >= CTIME_LED_BADGE_MIN_SHARE_FRAC;
+}
+
 static int size_bucket_for(uint64_t size) {
     if (size < 4ULL * 1024ULL) return 0;
     if (size < 1ULL * 1024ULL * 1024ULL) return 1;
@@ -1850,8 +1857,9 @@ static void emit_path_summary_table(FILE *out,
             "<th class=\"r num sort-h sort-desc\" data-i=\"3\" data-t=\"n\"><span class=\"th-text\">Bucket Bytes</span></th>"
             "<th class=\"r num sort-h\" data-i=\"4\" data-t=\"n\"><span class=\"th-text\">Share of Bucket Bytes</span></th>"
             "<th class=\"r num sort-h\" data-i=\"5\" data-t=\"n\" title=\"Percent of bucket bytes whose ctime is substantially "
-            "newer than both atime and mtime (>=180 days). High values: metadata-led recency; possible chmod, chown, ACL, "
-            "rsync attrs, migration.\"><span class=\"th-text\">C-led bytes</span></th>"
+            "newer than both atime and mtime (>=180 days). Purple C-led pill only when this percent is at least 30. High "
+            "values: metadata-led recency; chmod, chown, ACL, rsync attrs, migration.\"><span class=\"th-text\">C-led "
+            "bytes</span></th>"
             "<th class=\"r num sort-h\" data-i=\"6\" data-t=\"n\"><span class=\"th-text\">Total Files</span></th>"
             "<th class=\"r num sort-h\" data-i=\"7\" data-t=\"n\"><span class=\"th-text\">Total Dirs</span></th>"
             "<th class=\"r num sort-h\" data-i=\"8\" data-t=\"n\"><span class=\"th-text\">Total Bytes</span></th>"
@@ -1932,9 +1940,10 @@ static void emit_path_summary_table(FILE *out,
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
-                    "<td class=\"r num\" style=\"background:%s\" title=\"C-led %%: bytes whose ctime is substantially newer "
-                    "than atime and mtime (>=180 days). High values suggest metadata-only refresh (chmod, chown, ACL, rsync, "
-                    "migration).\" data-sort-n=\"%.17g\">%s<span class=\"path-ctime-led-pct\">%s</span></td>"
+                    "<td class=\"r num\" style=\"background:%s\" title=\"C-led %%: percent of bucket bytes (purple pill only "
+                    "if >=30). Ctime substantially newer than atime and mtime (>=180 days); high values suggest metadata-only "
+                    "refresh (chmod, chown, ACL, rsync, migration).\" data-sort-n=\"%.17g\">%s<span "
+                    "class=\"path-ctime-led-pct\">%s</span></td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%" PRIu64 "</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
@@ -1954,7 +1963,9 @@ static void emit_path_summary_table(FILE *out,
                     share_bytes,
                     cled_bg,
                     ctime_led_pct,
-                    rows[i]->bucket_ctime_led_bytes ? "<span class=\"path-ctime-led-badge\">C-led</span> " : "",
+                    ctime_led_badge_visible(rows[i]->bucket_ctime_led_bytes, rows[i]->bucket_bytes)
+                        ? "<span class=\"path-ctime-led-badge\">C-led</span> "
+                        : "",
                     cl_label,
                     total_files_bg,
                     rows[i]->total_files,
@@ -2204,7 +2215,7 @@ static int emit_bucket_detail_page(const char *filename,
           "two), suggesting apparent recency is metadata-led rather than usage- or content-led. High values may indicate "
           "stale data artificially refreshed by metadata-only changes (e.g. <strong>chmod</strong>, <strong>chown</strong>, "
           "<strong>ACL</strong> updates, <strong>rsync</strong> attribute updates, migration). The purple "
-          "<strong>C-led</strong> pill marks rows where that share is non-zero.</p>\n"
+          "<strong>C-led</strong> pill appears only when that share is at least <strong>30%</strong> of bucket bytes.</p>\n"
           "<p><strong>User share columns.</strong> &ldquo;Share of user bytes/files&rdquo; compares this path to <em>all</em> of the user&rsquo;s files across every bucket (overall footprint).</p>\n"
           "<p><strong>Totals under each path.</strong> Total files, dirs, and bytes include everything recorded below that directory prefix.</p>\n",
           out);
@@ -3391,7 +3402,7 @@ static int emit_html(const char *report_path,
                     sb,
                     ab,
                     sb);
-            if (cl_b > 0) {
+            if (ctime_led_badge_visible(cl_b, b)) {
                 fprintf(out,
                         "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this cell where ctime is "
                         "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
@@ -3434,7 +3445,7 @@ static int emit_html(const char *report_path,
             format_file_count_main_and_paren(row_files, pct_f, rf_main, sizeof(rf_main), rf_paren, sizeof(rf_paren));
             format_ctime_led_share_label(row_ctime_led_bytes, row_total, row_led_lbl, sizeof(row_led_lbl));
             fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-            if (row_ctime_led_bytes > 0) {
+            if (ctime_led_badge_visible(row_ctime_led_bytes, row_total)) {
                 fprintf(out,
                         "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this age row where ctime is "
                         "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
@@ -3489,7 +3500,7 @@ static int emit_html(const char *report_path,
         format_file_count_main_and_paren(col_files, pct_f, cf_main, sizeof(cf_main), cf_paren, sizeof(cf_paren));
         format_ctime_led_share_label(col_ctime_led_bytes, col_total, col_led_lbl, sizeof(col_led_lbl));
         fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-        if (col_ctime_led_bytes > 0) {
+        if (ctime_led_badge_visible(col_ctime_led_bytes, col_total)) {
             fprintf(out,
                     "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this size column where ctime is "
                     "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
@@ -3527,7 +3538,7 @@ static int emit_html(const char *report_path,
         format_file_count_main_and_paren(sum->total_files, 100.0, tf_main, sizeof(tf_main), tf_paren, sizeof(tf_paren));
         format_ctime_led_share_label(sum->total_ctime_led_bytes, sum->total_bytes, tot_led_lbl, sizeof(tot_led_lbl));
         fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-        if (sum->total_ctime_led_bytes > 0) {
+        if (ctime_led_badge_visible(sum->total_ctime_led_bytes, sum->total_bytes)) {
             fprintf(out,
                     "<span class=\"heat-ctime-led-badge\" title=\"Percentage of all reported bytes where ctime is "
                     "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
@@ -3570,11 +3581,12 @@ static int emit_html(const char *report_path,
           "updated on every read: <em>relatime</em>, mount options). <em>mtime</em> &mdash; last time file "
           "<strong>contents</strong> were modified. <em>ctime</em> &mdash; last time <strong>inode metadata</strong> "
           "changed (mode, owner, link count; not file creation time on Linux).</li>\n"
-          "<li><strong>C-led badge.</strong> The purple <strong>C</strong> is the <strong>percentage of bytes</strong> in "
-          "that slice where <em>ctime</em> is <strong>substantially</strong> newer than both <em>atime</em> and "
+          "<li><strong>C-led badge.</strong> The purple <strong>C</strong> shows the <strong>percentage of bytes</strong> "
+          "in that slice where <em>ctime</em> is <strong>substantially</strong> newer than both <em>atime</em> and "
           "<em>mtime</em>, suggesting the data&rsquo;s apparent recency is <strong>metadata-led</strong> rather than "
           "<strong>usage-</strong> or <strong>content-led</strong>. Here &ldquo;substantially&rdquo; is defined as at "
-          "least <strong>180 days</strong> newer than the newer of <em>atime</em> and <em>mtime</em>.</li>\n"
+          "least <strong>180 days</strong> newer than the newer of <em>atime</em> and <em>mtime</em>. The badge is shown "
+          "only when that share is at least <strong>30%</strong>.</li>\n"
           "<li><strong>C-led % (interpretation).</strong> This is the percent of bytes whose <em>ctime</em> is much "
           "newer than both <em>atime</em> and <em>mtime</em> (same 180-day rule). <strong>High values</strong> suggest "
           "<strong>stale data</strong> that may have been artificially refreshed by metadata-only changes such as "
