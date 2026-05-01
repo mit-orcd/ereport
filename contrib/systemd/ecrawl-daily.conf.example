@@ -13,8 +13,9 @@ BIN_SOURCE_DIR=/opt/ereport
 # Deployment parent on the target: after promotion, ecrawl/ereport/… sit *in this directory*,
 # not under a child such as bin/ unless you set RSYNC_DEST to that child path explicitly.
 # (So avoid paths that read like an “app prefix” unless you really keep binaries flat there.)
-# Flow: rsync → PARENT/.ecrawl-daily-staging/, then that directory's prior contents (except
-# archive/ and the staging dir) move to PARENT/archive/<timestamp>/, then staging → PARENT.
+# Flow: mkdir -p PARENT on the target if missing, then rsync → PARENT/.ecrawl-daily-staging/,
+# then that directory's prior contents (except archive/ and the staging dir) move to
+# PARENT/archive/<timestamp>/, then staging → PARENT.
 RSYNC_DEST=backup.example.com:/opt/ereport-live/
 # Optional: remote shell for rsync and ssh promote step (same -e as rsync)
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new

@@ -3,7 +3,8 @@
 # then rsync toolchain binaries to a staging area and atomically swap them into place (optional).
 #
 # RSYNC_DEST is the deployment *parent*: binaries live directly in that directory after a
-# successful run. Rsync fills DEST/.ecrawl-daily-staging/ first; when rsync succeeds, current
+# successful run. The script mkdir -p that path on the target (ssh or local), then rsync fills
+# DEST/.ecrawl-daily-staging/; when rsync succeeds, current
 # entries in DEST (except archive/ and the staging dir) move to DEST/archive/<timestamp>/,
 # then staged files move into DEST.
 #
@@ -122,6 +123,16 @@ atomic_promote_local_parent() {
 	rmdir "$staging" 2>/dev/null || true
 }
 
+ensure_remote_deploy_parent() {
+	local ssh_target=$1 parent=$2
+	local q
+	q=$(printf '%q' "$parent")
+	# shellcheck disable=SC2206
+	local ssh_cmd=( $(ssh_cmd_base) )
+	echo "ecrawl-daily: mkdir -p (remote) ${ssh_target}:${parent}"
+	"${ssh_cmd[@]}" "$ssh_target" "mkdir -p -- $q"
+}
+
 sync_binaries() {
 	if [[ -z "$RSYNC_DEST" ]]; then
 		echo "ecrawl-daily: RSYNC_DEST unset; skipping rsync."
@@ -145,9 +156,11 @@ sync_binaries() {
 	if parse_rsync_ssh_dest "$RSYNC_DEST"; then
 		parent="${RSYNC_REMOTE_PATH%/}"
 		staging_dest="${RSYNC_SSH_TARGET}:${parent}/${RSYNC_STAGING_DIR_NAME}/"
+		ensure_remote_deploy_parent "$RSYNC_SSH_TARGET" "$parent"
 	else
 		parent="${RSYNC_DEST%/}"
 		staging_dest="${parent}/${RSYNC_STAGING_DIR_NAME}/"
+		mkdir -p -- "$parent" || die "cannot create RSYNC_DEST parent: $parent"
 	fi
 
 	rsync_cmd+=("$BIN_SOURCE_DIR/" "$staging_dest")
