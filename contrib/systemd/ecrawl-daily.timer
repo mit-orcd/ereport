@@ -3,7 +3,7 @@
 # lands between 01:00 and 04:00 local time (inclusive of both endpoints).
 
 [Unit]
-Description=Daily ecrawl and binary rsync
+Description=Daily ecrawl and optional rsync of crawl output
 
 [Timer]
 OnCalendar=*-*-* 01:00:00

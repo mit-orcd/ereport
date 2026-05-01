@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ecrawl-daily.sh — read ecrawl job list from a config file, run ecrawl for each tree,
-# then rsync toolchain binaries to a staging area and atomically swap them into place (optional).
+# then rsync each job output_dir’s crawl data to RSYNC_DEST (optional).
 #
-# RSYNC_DEST is the deployment *parent*: binaries live directly in that directory after a
-# successful run. The script mkdir -p that path on the target (ssh or local), then rsync fills
-# DEST/.ecrawl-daily-staging/; when rsync succeeds, current
-# entries in DEST (except archive/ and the staging dir) move to DEST/archive/<timestamp>/,
-# then staged files move into DEST.
+# RSYNC_DEST is the remote (or local) *parent* for crawl mirrors: output_dir /path/foo syncs to
+# DEST/foo/ (basename of output_dir). Requires non-empty output_dir on each job line.
+#
+# Optional EREPORT_INSTALL_DEST=host:/path repeats the old toolchain deploy: rsync ecrawl/ereport/…
+# from EREPORT_SOURCE_DIR via staging + archive + promote (see RSYNC_STAGING_DIR_NAME).
 #
 # On any non-zero exit, ecrawl artifact files under each touched output_dir are deleted (by name:
 # uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
@@ -22,14 +22,17 @@ set -uo pipefail
 CONF=${1:-/etc/ereport/ecrawl-daily.conf}
 
 ECRAWL_BIN=${ECRAWL_BIN:-}
-BIN_SOURCE_DIR=${BIN_SOURCE_DIR:-}
+EREPORT_SOURCE_DIR=${EREPORT_SOURCE_DIR:-}
 RSYNC_DEST=${RSYNC_DEST:-}
+EREPORT_INSTALL_DEST=${EREPORT_INSTALL_DEST:-}
 RSYNC_RSH=${RSYNC_RSH:-}
 RSYNC_DELETE=${RSYNC_DELETE:-0}
 RSYNC_STAGING_DIR_NAME=${RSYNC_STAGING_DIR_NAME:-.ecrawl-daily-staging}
 RSYNC_ARCHIVE_DIR_NAME=${RSYNC_ARCHIVE_DIR_NAME:-archive}
+EREPORT_RSYNC_ALL=${EREPORT_RSYNC_ALL:-0}
 
 ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS=()
+CRAWL_RSYNC_OUTPUT_DIRS=()
 
 die() {
 	echo "ecrawl-daily: $*" >&2
@@ -43,6 +46,15 @@ register_cleanup_output_dir() {
 		[[ "$x" == "$d" ]] && return 0
 	done
 	ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS+=("$d")
+}
+
+register_rsync_crawl_dir() {
+	local d=$1 x
+	[[ -n "$d" ]] || return 0
+	for x in "${CRAWL_RSYNC_OUTPUT_DIRS[@]}"; do
+		[[ "$x" == "$d" ]] && return 0
+	done
+	CRAWL_RSYNC_OUTPUT_DIRS+=("$d")
 }
 
 crawl_output_dir_safe_for_file_cleanup() {
@@ -97,14 +109,16 @@ set_directive() {
 	local v=$2
 	case "$k" in
 	ECRAWL_BIN) ECRAWL_BIN=$v ;;
-	BIN_SOURCE_DIR) BIN_SOURCE_DIR=$v ;;
+	EREPORT_SOURCE_DIR) EREPORT_SOURCE_DIR=$v ;;
 	RSYNC_DEST) RSYNC_DEST=$v ;;
+	EREPORT_INSTALL_DEST) EREPORT_INSTALL_DEST=$v ;;
 	RSYNC_RSH) RSYNC_RSH=$v ;;
 	RSYNC_DELETE) RSYNC_DELETE=$v ;;
 	RSYNC_STAGING_DIR_NAME) RSYNC_STAGING_DIR_NAME=$v ;;
 	RSYNC_ARCHIVE_DIR_NAME) RSYNC_ARCHIVE_DIR_NAME=$v ;;
+	EREPORT_RSYNC_ALL) EREPORT_RSYNC_ALL=$v ;;
 	*)
-		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, BIN_SOURCE_DIR, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE, RSYNC_STAGING_DIR_NAME, RSYNC_ARCHIVE_DIR_NAME)" >&2
+		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, EREPORT_SOURCE_DIR, EREPORT_RSYNC_ALL, RSYNC_DEST, EREPORT_INSTALL_DEST, RSYNC_RSH, RSYNC_DELETE, RSYNC_STAGING_DIR_NAME, RSYNC_ARCHIVE_DIR_NAME)" >&2
 		;;
 	esac
 }
@@ -195,13 +209,57 @@ ensure_remote_deploy_parent() {
 	"${ssh_cmd[@]}" "$ssh_target" "mkdir -p -- $q"
 }
 
-sync_binaries() {
+sync_crawl_outputs() {
 	if [[ -z "$RSYNC_DEST" ]]; then
-		echo "ecrawl-daily: RSYNC_DEST unset; skipping rsync."
+		echo "ecrawl-daily: RSYNC_DEST unset; skipping crawl output rsync."
 		return 0
 	fi
-	[[ -n "$BIN_SOURCE_DIR" ]] || die "BIN_SOURCE_DIR must be set when RSYNC_DEST is set"
-	[[ -d "$BIN_SOURCE_DIR" ]] || die "BIN_SOURCE_DIR is not a directory: $BIN_SOURCE_DIR"
+	if [[ ${#CRAWL_RSYNC_OUTPUT_DIRS[@]} -eq 0 ]]; then
+		echo "ecrawl-daily: RSYNC_DEST set but no job output_dir paths registered (use a non-empty output_dir column); skipping crawl rsync." >&2
+		return 0
+	fi
+
+	local -a rsync_cmd=(rsync -a)
+	if [[ "$RSYNC_DELETE" == "1" || "$RSYNC_DELETE" == "yes" || "$RSYNC_DELETE" == "true" ]]; then
+		rsync_cmd+=(--delete)
+	fi
+	if [[ -n "$RSYNC_RSH" ]]; then
+		rsync_cmd+=(-e "$RSYNC_RSH")
+	fi
+
+	local remote_parent canon base dest
+	if parse_rsync_ssh_dest "$RSYNC_DEST"; then
+		remote_parent="${RSYNC_REMOTE_PATH%/}"
+		ensure_remote_deploy_parent "$RSYNC_SSH_TARGET" "$remote_parent"
+	else
+		remote_parent="${RSYNC_DEST%/}"
+		mkdir -p -- "$remote_parent" || die "cannot create RSYNC_DEST parent: $remote_parent"
+	fi
+
+	for local_dir in "${CRAWL_RSYNC_OUTPUT_DIRS[@]}"; do
+		[[ -d "$local_dir" ]] || die "crawl output directory missing for rsync: $local_dir"
+		canon=$(readlink -f -- "$local_dir" 2>/dev/null) || die "cannot resolve crawl output dir: $local_dir"
+		base=$(basename -- "$canon")
+		[[ -n "$base" ]] || die "invalid basename for crawl output dir: $local_dir"
+
+		if parse_rsync_ssh_dest "$RSYNC_DEST"; then
+			dest="${RSYNC_SSH_TARGET}:${remote_parent}/${base}/"
+		else
+			mkdir -p -- "${remote_parent}/${base}" || die "cannot create ${remote_parent}/${base}"
+			dest="${remote_parent}/${base}/"
+		fi
+		echo "ecrawl-daily: rsync crawl output ${canon}/ -> ${dest}"
+		"${rsync_cmd[@]}" "${canon}/" "$dest"
+	done
+}
+
+sync_ereport_toolchain_install() {
+	if [[ -z "$EREPORT_INSTALL_DEST" ]]; then
+		echo "ecrawl-daily: EREPORT_INSTALL_DEST unset; skipping ereport toolchain install rsync."
+		return 0
+	fi
+	[[ -n "$EREPORT_SOURCE_DIR" ]] || die "EREPORT_SOURCE_DIR must be set when EREPORT_INSTALL_DEST is set"
+	[[ -d "$EREPORT_SOURCE_DIR" ]] || die "EREPORT_SOURCE_DIR is not a directory: $EREPORT_SOURCE_DIR"
 	[[ -n "$RSYNC_STAGING_DIR_NAME" ]] || die "RSYNC_STAGING_DIR_NAME must not be empty"
 	[[ -n "$RSYNC_ARCHIVE_DIR_NAME" ]] || die "RSYNC_ARCHIVE_DIR_NAME must not be empty"
 	[[ "$RSYNC_STAGING_DIR_NAME" != "$RSYNC_ARCHIVE_DIR_NAME" ]] || die "staging and archive directory names must differ"
@@ -215,23 +273,35 @@ sync_binaries() {
 	fi
 
 	local parent staging_dest
-	if parse_rsync_ssh_dest "$RSYNC_DEST"; then
+	if parse_rsync_ssh_dest "$EREPORT_INSTALL_DEST"; then
 		parent="${RSYNC_REMOTE_PATH%/}"
 		staging_dest="${RSYNC_SSH_TARGET}:${parent}/${RSYNC_STAGING_DIR_NAME}/"
 		ensure_remote_deploy_parent "$RSYNC_SSH_TARGET" "$parent"
 	else
-		parent="${RSYNC_DEST%/}"
+		parent="${EREPORT_INSTALL_DEST%/}"
 		staging_dest="${parent}/${RSYNC_STAGING_DIR_NAME}/"
-		mkdir -p -- "$parent" || die "cannot create RSYNC_DEST parent: $parent"
+		mkdir -p -- "$parent" || die "cannot create EREPORT_INSTALL_DEST parent: $parent"
 	fi
 
-	rsync_cmd+=("$BIN_SOURCE_DIR/" "$staging_dest")
+	local -a rsync_sources=()
+	if [[ "$EREPORT_RSYNC_ALL" == "1" || "$EREPORT_RSYNC_ALL" == "yes" || "$EREPORT_RSYNC_ALL" == "true" ]]; then
+		rsync_sources=("$EREPORT_SOURCE_DIR/")
+		echo "ecrawl-daily: rsync entire ${EREPORT_SOURCE_DIR}/ -> ${staging_dest} (staging)"
+	else
+		local name path
+		for name in ecrawl ereport ereport_index ecrawl_repair edelete; do
+			path="$EREPORT_SOURCE_DIR/$name"
+			[[ -f "$path" ]] || die "missing built binary $path (run make in ereport, or set EREPORT_RSYNC_ALL=1 to rsync the whole directory)"
+			rsync_sources+=("$path")
+		done
+		echo "ecrawl-daily: rsync ereport toolchain (${#rsync_sources[@]} files) from ${EREPORT_SOURCE_DIR}/ -> ${staging_dest} (staging)"
+	fi
+	rsync_cmd+=("${rsync_sources[@]}" "$staging_dest")
 
-	echo "ecrawl-daily: rsync ${BIN_SOURCE_DIR}/ -> ${staging_dest} (staging)"
 	"${rsync_cmd[@]}"
 
-	echo "ecrawl-daily: promote staged tree into ${RSYNC_DEST%%/}"
-	if parse_rsync_ssh_dest "$RSYNC_DEST"; then
+	echo "ecrawl-daily: promote staged ereport toolchain into ${EREPORT_INSTALL_DEST%%/}"
+	if parse_rsync_ssh_dest "$EREPORT_INSTALL_DEST"; then
 		atomic_promote_remote_parent "$RSYNC_SSH_TARGET" "$parent"
 	else
 		atomic_promote_local_parent "$parent"
@@ -279,8 +349,8 @@ main() {
 	fi
 	[[ -x "$ECRAWL_BIN" ]] || die "ecrawl binary not executable: $ECRAWL_BIN"
 
-	if [[ -z "$BIN_SOURCE_DIR" ]]; then
-		BIN_SOURCE_DIR=$(dirname -- "$(readlink -f "$ECRAWL_BIN" 2>/dev/null || realpath "$ECRAWL_BIN" 2>/dev/null || echo "$ECRAWL_BIN")")
+	if [[ -z "$EREPORT_SOURCE_DIR" ]]; then
+		EREPORT_SOURCE_DIR=$(dirname -- "$(readlink -f "$ECRAWL_BIN" 2>/dev/null || realpath "$ECRAWL_BIN" 2>/dev/null || echo "$ECRAWL_BIN")")
 	fi
 
 	if [[ ${#job_lines[@]} -eq 0 ]]; then
@@ -306,6 +376,7 @@ main() {
 		if [[ -n "$output_dir" ]]; then
 			mkdir -p -- "$output_dir" || die "cannot create output directory: $output_dir"
 			register_cleanup_output_dir "$output_dir"
+			register_rsync_crawl_dir "$output_dir"
 			ecrawl_cmd+=("$output_dir")
 		fi
 
@@ -319,7 +390,8 @@ main() {
 		fi
 	done
 
-	sync_binaries || jobs_fail=1
+	sync_crawl_outputs || jobs_fail=1
+	sync_ereport_toolchain_install || jobs_fail=1
 
 	[[ "$jobs_fail" -eq 0 ]] || exit 1
 }

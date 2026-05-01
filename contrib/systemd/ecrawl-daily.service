@@ -10,7 +10,7 @@
 # Override User=/Group= if ecrawl must read restricted trees or write crawl output.
 
 [Unit]
-Description=Run ecrawl on configured directories and rsync ereport binaries
+Description=Run ecrawl on configured directories and rsync crawl output (optional ereport install)
 Documentation=file:///usr/local/lib/ereport/ecrawl-daily.sh
 After=network-online.target
 Wants=network-online.target

@@ -1,25 +1,32 @@
 # Copy to /etc/ereport/ecrawl-daily.conf and adjust paths.
+#
+# What rsync does (two independent targets):
+#   RSYNC_DEST — Parent on another machine (or local path) that receives *crawl output*. Each job’s
+#       output_dir is mirrored to DEST/<basename(output_dir)>/. Example: output_dir
+#       /var/lib/ecrawl/server-a → RSYNC_DEST/server-a/ So RSYNC_DEST must be set, and every job
+#       needs a non-empty output_dir column (TAB-separated).
+#   EREPORT_INSTALL_DEST — Optional. If set, the script also pushes built ecrawl/ereport/… binaries
+#       using staging + archive + promote. Sources from EREPORT_SOURCE_DIR, which defaults to the
+#       directory containing ECRAWL_BIN if you omit EREPORT_SOURCE_DIR (override only if ecrawl is
+#       not next to the other built binaries you want to ship).
+#
 # Syntax:
 #   - Lines before ---jobs--- are directives: KEY=value
 #   - After ---jobs---, one crawl per line, TAB-separated:
 #       start_path — directory ecrawl walks
-#       output_dir — where crawl output (shards, etc.) is written; empty → ecrawl default beside the tree;
-#                    parent dirs are created if missing (mkdir -p); on a failed run the script deletes only
-#                    known ecrawl outputs in that dir (uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt,
-#                    uid.txt, gid.txt), not the directory itself—skipped if the path does not resolve
-#                    to a normal directory (never "/", ".", or "..").
-#       record_root — optional --record-root (logical root in metadata); empty → omit --record-root
+#       output_dir — where crawl output is written on *this* host (required if you use RSYNC_DEST);
+#                    parent dirs are created if missing (mkdir -p); on a failed run known ecrawl
+#                    artifact filenames under output_dir may be deleted (see ecrawl-daily.sh header).
+#       record_root — optional --record-root; empty → omit --record-root
 #     Empty middle/right columns still need tabs (e.g. path<TAB><TAB>).
 
 ECRAWL_BIN=/opt/ereport/ecrawl
-BIN_SOURCE_DIR=/opt/ereport
-# Deployment parent on the target: after promotion, ecrawl/ereport/… sit *in this directory*,
-# not under a child such as bin/ unless you set RSYNC_DEST to that child path explicitly.
-# (So avoid paths that read like an “app prefix” unless you really keep binaries flat there.)
-# Flow: mkdir -p PARENT on the target if missing, then rsync → PARENT/.ecrawl-daily-staging/,
-# then that directory's prior contents (except archive/ and the staging dir) move to
-# PARENT/archive/<timestamp>/, then staging → PARENT.
-RSYNC_DEST=backup.example.com:/opt/ereport-live/
+
+RSYNC_DEST=backup.example.com:/var/lib/ereport-crawl/
+# Optional toolchain deploy (staging dir .ecrawl-daily-staging under this path):
+# EREPORT_INSTALL_DEST=backup.example.com:/opt/ereport-live/
+# EREPORT_RSYNC_ALL=1
+
 # Optional: remote shell for rsync and ssh promote step (same -e as rsync)
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
