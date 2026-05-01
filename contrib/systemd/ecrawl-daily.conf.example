@@ -2,8 +2,9 @@
 #
 # RSYNC_DEST — Parent on another machine (or local path) that receives *crawl output*. Each job’s
 #     output_dir is mirrored to DEST/<basename(output_dir)>/. Example: output_dir
-#     /var/lib/ecrawl/server-a → RSYNC_DEST/server-a/. Use RSYNC_DEST only when you want sync;
-#     every mirrored job needs a non-empty output_dir column (TAB-separated).
+#     /var/lib/ecrawl/server-a → RSYNC_DEST/server-a/. After each successful rsync, shard/manifest
+#     files in that output_dir are deleted locally (same names as on failed-run cleanup). Use
+#     RSYNC_DEST only when you want sync; every mirrored job needs a non-empty output_dir column.
 #
 # Syntax:
 #   - Lines before ---jobs--- are directives: KEY=value

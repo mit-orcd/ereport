@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # ecrawl-daily.sh — read ecrawl job list from a config file, run ecrawl for each tree,
-# then rsync each job output_dir’s crawl data to RSYNC_DEST (optional).
+# then rsync each job output_dir’s crawl data to RSYNC_DEST (optional). After each directory’s
+# rsync succeeds, the same ecrawl artifact filenames are removed locally (see remove patterns below).
 #
 # RSYNC_DEST is the remote (or local) *parent* for crawl mirrors: output_dir /path/foo syncs to
 # DEST/foo/ (basename of output_dir). Requires non-empty output_dir on each job line.
 #
-# On any non-zero exit, ecrawl artifact files under each touched output_dir are deleted (by name:
+# On any non-zero exit, ecrawl artifact files under each touched output_dir are also deleted (by name:
 # uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
 # when the directory resolves with readlink -f to a real path that is not /, ., or ...
 #
@@ -187,7 +188,12 @@ sync_crawl_outputs() {
 			dest="${remote_parent}/${base}/"
 		fi
 		echo "ecrawl-daily: rsync crawl output ${canon}/ -> ${dest}"
-		"${rsync_cmd[@]}" "${canon}/" "$dest"
+		if ! "${rsync_cmd[@]}" "${canon}/" "$dest"; then
+			echo "ecrawl-daily: rsync failed for ${canon}" >&2
+			return 1
+		fi
+		echo "ecrawl-daily: removing local crawl artifacts after successful rsync under ${canon}"
+		remove_ecrawl_artifact_files_in_dir "$canon"
 	done
 }
 
