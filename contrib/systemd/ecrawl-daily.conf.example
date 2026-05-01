@@ -4,7 +4,10 @@
 #   - After ---jobs---, one crawl per line, TAB-separated:
 #       start_path — directory ecrawl walks
 #       output_dir — where crawl output (shards, etc.) is written; empty → ecrawl default beside the tree;
-#                    parent dirs are created if missing (mkdir -p)
+#                    parent dirs are created if missing (mkdir -p); on a failed run the script deletes only
+#                    known ecrawl outputs in that dir (uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt,
+#                    uid.txt, gid.txt), not the directory itself—skipped if the path does not resolve
+#                    to a normal directory (never "/", ".", or "..").
 #       record_root — optional --record-root (logical root in metadata); empty → omit --record-root
 #     Empty middle/right columns still need tabs (e.g. path<TAB><TAB>).
 

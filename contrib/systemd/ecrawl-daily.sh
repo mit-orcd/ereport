@@ -8,6 +8,10 @@
 # entries in DEST (except archive/ and the staging dir) move to DEST/archive/<timestamp>/,
 # then staged files move into DEST.
 #
+# On any non-zero exit, ecrawl artifact files under each touched output_dir are deleted (by name:
+# uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
+# when the directory resolves with readlink -f to a real path that is not /, ., or ...
+#
 # Usage:
 #   ecrawl-daily.sh [/path/to/ecrawl-daily.conf]
 #
@@ -25,9 +29,67 @@ RSYNC_DELETE=${RSYNC_DELETE:-0}
 RSYNC_STAGING_DIR_NAME=${RSYNC_STAGING_DIR_NAME:-.ecrawl-daily-staging}
 RSYNC_ARCHIVE_DIR_NAME=${RSYNC_ARCHIVE_DIR_NAME:-archive}
 
+ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS=()
+
 die() {
 	echo "ecrawl-daily: $*" >&2
 	exit 1
+}
+
+register_cleanup_output_dir() {
+	local d=$1 x
+	[[ -n "$d" ]] || return 0
+	for x in "${ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS[@]}"; do
+		[[ "$x" == "$d" ]] && return 0
+	done
+	ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS+=("$d")
+}
+
+crawl_output_dir_safe_for_file_cleanup() {
+	local raw=$1 canon noslash
+	[[ -n "$raw" ]] || return 1
+	case "$raw" in
+	"/"|"."|".."|"/."|"/..") return 1 ;;
+	esac
+	noslash=${raw//\/}
+	[[ -n "$noslash" ]] || return 1
+
+	canon=$(readlink -f -- "$raw" 2>/dev/null) || return 1
+	[[ -n "$canon" ]] || return 1
+	case "$canon" in
+	"/"|"."|"..") return 1 ;;
+	esac
+	[[ -d "$canon" ]] || return 1
+	return 0
+}
+
+remove_ecrawl_artifact_files_in_dir() {
+	local dir=$1 canon
+	[[ -d "$dir" ]] || return 0
+	if ! crawl_output_dir_safe_for_file_cleanup "$dir"; then
+		echo "ecrawl-daily: refusing artifact cleanup under unsafe path: $dir" >&2
+		return 0
+	fi
+	canon=$(readlink -f -- "$dir" 2>/dev/null) || return 0
+	# Names produced by ecrawl for uid-sharded layout (see ecrawl.c).
+	find "$canon" -maxdepth 1 -type f \( \
+		-name 'uid_shard_*.bin' -o \
+		-name 'uid_shard_*.bin.ckpt' -o \
+		-name 'crawl_manifest.txt' -o \
+		-name 'uid.txt' -o \
+		-name 'gid.txt' \
+		\) -delete 2>/dev/null || true
+}
+
+cleanup_failed_run_outputs() {
+	local status=$?
+	[[ $status -eq 0 ]] && return 0
+	local d
+	for d in "${ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS[@]}"; do
+		[[ -n "$d" && -d "$d" ]] || continue
+		echo "ecrawl-daily: removing ecrawl artifact files after failure (exit $status) under: $d" >&2
+		remove_ecrawl_artifact_files_in_dir "$d"
+	done
 }
 
 set_directive() {
@@ -181,6 +243,7 @@ main() {
 	local -a ecrawl_cmd job_lines
 
 	[[ -r "$CONF" ]] || die "cannot read config: $CONF"
+	trap cleanup_failed_run_outputs EXIT
 
 	while IFS= read -r line || [[ -n "$line" ]]; do
 		[[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -242,6 +305,7 @@ main() {
 		output_dir="${output_dir%"${output_dir##*[![:space:]]}"}"
 		if [[ -n "$output_dir" ]]; then
 			mkdir -p -- "$output_dir" || die "cannot create output directory: $output_dir"
+			register_cleanup_output_dir "$output_dir"
 			ecrawl_cmd+=("$output_dir")
 		fi
 
