@@ -21,7 +21,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ *   ./ecrawl [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]
+ *   --verbose: full metrics to stderr every N minutes (default 5); optional integer sets N.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
  */
@@ -320,6 +321,7 @@ static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
+static int g_verbose_interval_minutes = 5;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
@@ -879,7 +881,7 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
+            "Usage: %s [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
@@ -895,7 +897,9 @@ static void print_usage(const char *prog) {
             DEFAULT_MAX_OPEN_SHARDS);
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
-    fprintf(stderr, "Default output shows a concise human-oriented summary; use --verbose for the full metrics dump.\n");
+    fprintf(stderr,
+            "Default output is a concise summary. --verbose prints full metrics to stdout at exit, and the same "
+            "metrics to stderr every N minutes (default N=5; optional integer 1..10080 after --verbose).\n");
 }
 
 static int ensure_output_dir_exists(const char *path) {
@@ -2210,10 +2214,164 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     return 0;
 }
 
-static void print_queue_wait_metrics(void) {
-    printf("wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
-    printf("wait_writer_push=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_push));
-    printf("wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
+static void print_queue_wait_metrics_to(FILE *fp) {
+    fprintf(fp, "wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
+    fprintf(fp, "wait_writer_push=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_push));
+    fprintf(fp, "wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
+}
+
+static void print_queue_wait_metrics(void) { print_queue_wait_metrics_to(stdout); }
+
+static void merge_live_snapshot(shared_state_t *out, shared_state_t *shared, worker_arg_t *w, int nworkers) {
+    int i;
+
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < nworkers; i++) {
+        out->total_entries += w[i].stats.total_entries;
+        out->total_dirs += w[i].stats.total_dirs;
+        out->total_files += w[i].stats.total_files;
+        out->total_hardlink_files += w[i].stats.total_hardlink_files;
+        out->total_symlinks += w[i].stats.total_symlinks;
+        out->total_other += w[i].stats.total_other;
+        out->total_bytes += w[i].stats.total_bytes;
+        out->dir_apparent_bytes += w[i].stats.dir_apparent_bytes;
+        out->symlink_apparent_bytes += w[i].stats.symlink_apparent_bytes;
+        out->other_apparent_bytes += w[i].stats.other_apparent_bytes;
+        out->donated_dirs += w[i].aux.donated_dirs;
+        out->donation_attempts += w[i].aux.donation_attempts;
+        out->donation_successes += w[i].aux.donation_successes;
+    }
+    pthread_mutex_lock(&shared->stats_mutex);
+    out->total_errors = shared->total_errors;
+    out->crawl_threads_started = shared->crawl_threads_started;
+    pthread_mutex_unlock(&shared->stats_mutex);
+    out->split_dirs_enqueued = shared->split_dirs_enqueued;
+}
+
+static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, double elapsed_sec,
+                                      int writer_threads_used, const char *start_path) {
+    double avg_ops = elapsed_sec > 0.0 ? (double)shared->total_entries / elapsed_sec : 0.0;
+    double mean_ops = g_ops_rate_samples ? g_ops_rate_sum / (double)g_ops_rate_samples : avg_ops;
+    double max_ops = g_ops_rate_samples ? g_ops_rate_max : avg_ops;
+    double min_ops = g_ops_rate_samples ? g_ops_rate_min : avg_ops;
+    uint64_t tasks_popped = (uint64_t)atomic_load(&g_tasks_popped);
+    uint64_t apparent_bytes_total = shared->total_bytes + shared->dir_apparent_bytes + shared->symlink_apparent_bytes +
+                                    shared->other_apparent_bytes;
+    char avg_ops_buf[32], mean_ops_buf[32], max_ops_buf[32], min_ops_buf[32];
+
+    human_decimal(avg_ops, avg_ops_buf, sizeof(avg_ops_buf));
+    human_decimal(mean_ops, mean_ops_buf, sizeof(mean_ops_buf));
+    human_decimal(max_ops, max_ops_buf, sizeof(max_ops_buf));
+    human_decimal(min_ops, min_ops_buf, sizeof(min_ops_buf));
+
+    fprintf(fp, "start_path=%s\n", start_path);
+    if (g_record_root) fprintf(fp, "record_root=%s\n", g_record_root);
+    fprintf(fp, "no_write=%d\n", g_no_write);
+    fprintf(fp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
+    fprintf(fp, "output_layout=%s\n", g_no_write ? "none" : "uid_shards");
+    fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
+    fprintf(fp, "seed_mode=%s\n", "root_only");
+    fprintf(fp, "uid_shards=%u\n", g_uid_shards);
+    fprintf(fp, "uid_shard_digits=%d\n", g_shard_digits);
+    fprintf(fp, "writer_threads=%d\n", writer_threads_used);
+    fprintf(fp, "crawl_threads=%d\n", g_crawl_threads);
+    fprintf(fp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
+    fprintf(fp, "writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
+    fprintf(fp, "record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
+    fprintf(fp, "write_buffer_size=%u\n", g_no_write ? 0U : (unsigned)WRITE_BUFFER_SIZE);
+    fprintf(fp, "byte_accounting=%s\n", "unique_regular_files");
+    fprintf(fp, "crawl_threads_started=%" PRIu64 "\n", shared->crawl_threads_started);
+    fprintf(fp, "split_dirs_enqueued=%" PRIu64 "\n", shared->split_dirs_enqueued);
+    fprintf(fp, "donated_dirs=%" PRIu64 "\n", shared->donated_dirs);
+    fprintf(fp, "donation_attempts=%" PRIu64 "\n", shared->donation_attempts);
+    fprintf(fp, "donation_successes=%" PRIu64 "\n", shared->donation_successes);
+    fprintf(fp, "donation_success_pct=%.1f\n",
+            shared->donation_attempts ? (100.0 * (double)shared->donation_successes) / (double)shared->donation_attempts
+                                      : 0.0);
+    fprintf(fp, "tasks_popped=%" PRIu64 "\n", tasks_popped);
+    fprintf(fp, "avg_entries_per_task=%.2f\n", tasks_popped ? (double)shared->total_entries / (double)tasks_popped : 0.0);
+    fprintf(fp, "avg_dirs_per_task=%.2f\n", tasks_popped ? (double)shared->total_dirs / (double)tasks_popped : 0.0);
+    fprintf(fp, "avg_files_per_task=%.2f\n", tasks_popped ? (double)shared->total_files / (double)tasks_popped : 0.0);
+    fprintf(fp, "batches_enqueued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_batches_enqueued));
+    fprintf(fp, "batches_dequeued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_batches_dequeued));
+    fprintf(fp, "entries=%" PRIu64 "\n", shared->total_entries);
+    fprintf(fp, "dirs=%" PRIu64 "\n", shared->total_dirs);
+    fprintf(fp, "files=%" PRIu64 "\n", shared->total_files);
+    fprintf(fp, "hardlink_files=%" PRIu64 "\n", shared->total_hardlink_files);
+    fprintf(fp, "symlinks=%" PRIu64 "\n", shared->total_symlinks);
+    fprintf(fp, "other=%" PRIu64 "\n", shared->total_other);
+    fprintf(fp, "total_bytes=%" PRIu64 "\n", shared->total_bytes);
+    fprintf(fp, "dir_apparent_bytes=%" PRIu64 "\n", shared->dir_apparent_bytes);
+    fprintf(fp, "symlink_apparent_bytes=%" PRIu64 "\n", shared->symlink_apparent_bytes);
+    fprintf(fp, "other_apparent_bytes=%" PRIu64 "\n", shared->other_apparent_bytes);
+    fprintf(fp, "apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
+    fprintf(fp, "errors=%" PRIu64 "\n", shared->total_errors);
+    fprintf(fp, "writer_failed=%u\n", atomic_load(&g_writer_failed));
+    fprintf(fp, "io_lstat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_lstat_calls));
+    fprintf(fp, "io_stat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_stat_calls));
+    fprintf(fp, "io_mkdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_mkdir_calls));
+    fprintf(fp, "io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
+    fprintf(fp, "io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
+    fprintf(fp, "io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
+    fprintf(fp, "io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
+    fprintf(fp, "io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
+    fprintf(fp, "io_fwrite_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fwrite_calls));
+    fprintf(fp, "io_fflush_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fflush_calls));
+    fprintf(fp, "manifest=%s\n", g_no_write ? "(disabled)" : "crawl_manifest.txt");
+    fprintf(fp, "uid_output=%s\n", g_no_write ? "(disabled)" : g_uid_registry.path);
+    fprintf(fp, "gid_output=%s\n", g_no_write ? "(disabled)" : g_gid_registry.path);
+    fprintf(fp, "ops_window_sec=%d\n", WINDOW_SECONDS);
+    fprintf(fp, "avg_ops_per_sec=%s\n", avg_ops_buf);
+    fprintf(fp, "mean_ops_per_sec=%s\n", mean_ops_buf);
+    fprintf(fp, "max_ops_per_sec=%s\n", max_ops_buf);
+    fprintf(fp, "min_ops_per_sec=%s\n", min_ops_buf);
+    fprintf(fp, "donate_floor=%d\n", LOCAL_STACK_DONATE_FLOOR);
+    fprintf(fp, "avg_active_workers=%.2f\n",
+            g_active_workers_samples ? (double)g_active_workers_sum / (double)g_active_workers_samples : 0.0);
+    fprintf(fp, "min_active_workers=%d\n", g_active_workers_min);
+    fprintf(fp, "max_active_workers=%d\n", g_active_workers_max);
+    fprintf(fp, "seconds_single_worker=%" PRIu64 "\n", g_seconds_single_worker);
+    fprintf(fp, "seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
+    fprintf(fp, "elapsed_sec=%.3f\n", elapsed_sec);
+    print_queue_wait_metrics_to(fp);
+}
+
+typedef struct {
+    shared_state_t *shared;
+    worker_arg_t *worker_args;
+    int worker_count;
+    const char *start_path;
+    int writer_threads_used;
+    double t0;
+} verbose_periodic_arg_t;
+
+static void *verbose_periodic_main(void *arg) {
+    verbose_periodic_arg_t *p = (verbose_periodic_arg_t *)arg;
+    int interval_sec = g_verbose_interval_minutes * 60;
+
+    if (interval_sec < 60) interval_sec = 300;
+
+    for (;;) {
+        int s;
+        for (s = 0; s < interval_sec; s++) {
+            if (atomic_load(&g_stop_stats)) goto out;
+            sleep(1);
+        }
+        if (atomic_load(&g_stop_stats)) break;
+        {
+            shared_state_t snap;
+            double el = now_sec() - p->t0;
+
+            merge_live_snapshot(&snap, p->shared, p->worker_args, p->worker_count);
+            fprintf(stderr, "\necrawl: verbose snapshot (interval %d min, elapsed %.3f s)\n",
+                    g_verbose_interval_minutes, el);
+            print_verbose_full_stats(stderr, &snap, el, p->writer_threads_used, p->start_path);
+            fflush(stderr);
+        }
+    }
+out:
+    free(p);
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -2227,6 +2385,8 @@ int main(int argc, char **argv) {
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
+    pthread_t verbose_periodic_thread;
+    int verbose_periodic_started = 0;
     double t0, t1;
     int worker_count_started = 0;
     int positional_count = 0;
@@ -2246,6 +2406,18 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
+            g_verbose_interval_minutes = 5;
+            if (i + 1 < argc) {
+                char *end = NULL;
+                long m;
+
+                errno = 0;
+                m = strtol(argv[i + 1], &end, 10);
+                if (end != argv[i + 1] && *end == '\0' && errno == 0 && m >= 1L && m <= 10080L) {
+                    g_verbose_interval_minutes = (int)m;
+                    i++;
+                }
+            }
             continue;
         }
         if (strcmp(argv[i], "--record-root") == 0) {
@@ -2573,6 +2745,22 @@ int main(int argc, char **argv) {
         stats_add_crawl_thread_started(&shared);
     }
 
+    if (g_verbose && g_verbose_interval_minutes > 0 && worker_count_started > 0) {
+        verbose_periodic_arg_t *vpa = (verbose_periodic_arg_t *)malloc(sizeof(*vpa));
+
+        if (vpa) {
+            vpa->shared = &shared;
+            vpa->worker_args = worker_args;
+            vpa->worker_count = worker_count_started;
+            vpa->start_path = start_path;
+            vpa->writer_threads_used = writer_threads_used;
+            vpa->t0 = t0;
+            if (pthread_create(&verbose_periodic_thread, NULL, verbose_periodic_main, vpa) != 0) free(vpa);
+            else
+                verbose_periodic_started = 1;
+        }
+    }
+
     enqueue_root_task(start_path, &shared, &queue);
 
     atomic_store(&g_main_done, 1);
@@ -2599,6 +2787,7 @@ int main(int argc, char **argv) {
 
     if (stats_thread_started) {
         atomic_store(&g_stop_stats, 1);
+        if (verbose_periodic_started) pthread_join(verbose_periodic_thread, NULL);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
@@ -2614,7 +2803,6 @@ int main(int argc, char **argv) {
         double mean_ops = g_ops_rate_samples ? g_ops_rate_sum / (double)g_ops_rate_samples : avg_ops;
         double max_ops = g_ops_rate_samples ? g_ops_rate_max : avg_ops;
         double min_ops = g_ops_rate_samples ? g_ops_rate_min : avg_ops;
-        uint64_t tasks_popped = 0;
         uint64_t apparent_bytes_total = shared.total_bytes + shared.dir_apparent_bytes +
                                         shared.symlink_apparent_bytes + shared.other_apparent_bytes;
         char avg_ops_buf[32], mean_ops_buf[32], max_ops_buf[32], min_ops_buf[32];
@@ -2651,74 +2839,7 @@ int main(int argc, char **argv) {
             printf("writer_failed=%u\n", atomic_load(&g_writer_failed));
             print_queue_wait_metrics();
         } else {
-            tasks_popped = (uint64_t)atomic_load(&g_tasks_popped);
-            printf("start_path=%s\n", start_path);
-            if (g_record_root) printf("record_root=%s\n", g_record_root);
-            printf("no_write=%d\n", g_no_write);
-            printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
-            printf("output_layout=%s\n", g_no_write ? "none" : "uid_shards");
-            printf("format_version=%u\n", FORMAT_VERSION);
-            printf("seed_mode=%s\n", "root_only");
-            printf("uid_shards=%u\n", g_uid_shards);
-            printf("uid_shard_digits=%d\n", g_shard_digits);
-            printf("writer_threads=%d\n", writer_threads_used);
-            printf("crawl_threads=%d\n", g_crawl_threads);
-            printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
-            printf("writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
-            printf("record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
-            printf("write_buffer_size=%u\n", g_no_write ? 0U : (unsigned)WRITE_BUFFER_SIZE);
-            printf("byte_accounting=%s\n", "unique_regular_files");
-            printf("crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
-            printf("split_dirs_enqueued=%" PRIu64 "\n", shared.split_dirs_enqueued);
-            printf("donated_dirs=%" PRIu64 "\n", shared.donated_dirs);
-            printf("donation_attempts=%" PRIu64 "\n", shared.donation_attempts);
-            printf("donation_successes=%" PRIu64 "\n", shared.donation_successes);
-            printf("donation_success_pct=%.1f\n", shared.donation_attempts ? (100.0 * (double)shared.donation_successes) / (double)shared.donation_attempts : 0.0);
-            printf("tasks_popped=%" PRIu64 "\n", tasks_popped);
-            printf("avg_entries_per_task=%.2f\n", tasks_popped ? (double)shared.total_entries / (double)tasks_popped : 0.0);
-            printf("avg_dirs_per_task=%.2f\n", tasks_popped ? (double)shared.total_dirs / (double)tasks_popped : 0.0);
-            printf("avg_files_per_task=%.2f\n", tasks_popped ? (double)shared.total_files / (double)tasks_popped : 0.0);
-            printf("batches_enqueued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_batches_enqueued));
-            printf("batches_dequeued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_batches_dequeued));
-            printf("entries=%" PRIu64 "\n", shared.total_entries);
-            printf("dirs=%" PRIu64 "\n", shared.total_dirs);
-            printf("files=%" PRIu64 "\n", shared.total_files);
-            printf("hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
-            printf("symlinks=%" PRIu64 "\n", shared.total_symlinks);
-            printf("other=%" PRIu64 "\n", shared.total_other);
-            printf("total_bytes=%" PRIu64 "\n", shared.total_bytes);
-            printf("dir_apparent_bytes=%" PRIu64 "\n", shared.dir_apparent_bytes);
-            printf("symlink_apparent_bytes=%" PRIu64 "\n", shared.symlink_apparent_bytes);
-            printf("other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
-            printf("apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
-            printf("errors=%" PRIu64 "\n", shared.total_errors);
-            printf("writer_failed=%u\n", atomic_load(&g_writer_failed));
-            printf("io_lstat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_lstat_calls));
-            printf("io_stat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_stat_calls));
-            printf("io_mkdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_mkdir_calls));
-            printf("io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
-            printf("io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
-            printf("io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
-            printf("io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
-            printf("io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
-            printf("io_fwrite_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fwrite_calls));
-            printf("io_fflush_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fflush_calls));
-            printf("manifest=%s\n", g_no_write ? "(disabled)" : "crawl_manifest.txt");
-            printf("uid_output=%s\n", g_no_write ? "(disabled)" : g_uid_registry.path);
-            printf("gid_output=%s\n", g_no_write ? "(disabled)" : g_gid_registry.path);
-            printf("ops_window_sec=%d\n", WINDOW_SECONDS);
-            printf("avg_ops_per_sec=%s\n", avg_ops_buf);
-            printf("mean_ops_per_sec=%s\n", mean_ops_buf);
-            printf("max_ops_per_sec=%s\n", max_ops_buf);
-            printf("min_ops_per_sec=%s\n", min_ops_buf);
-            printf("donate_floor=%d\n", LOCAL_STACK_DONATE_FLOOR);
-            printf("avg_active_workers=%.2f\n", g_active_workers_samples ? (double)g_active_workers_sum / (double)g_active_workers_samples : 0.0);
-            printf("min_active_workers=%d\n", g_active_workers_min);
-            printf("max_active_workers=%d\n", g_active_workers_max);
-            printf("seconds_single_worker=%" PRIu64 "\n", g_seconds_single_worker);
-            printf("seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
-            printf("elapsed_sec=%.3f\n", elapsed);
-            print_queue_wait_metrics();
+            print_verbose_full_stats(stdout, &shared, elapsed, writer_threads_used, start_path);
         }
     }
 

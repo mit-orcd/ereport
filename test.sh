@@ -147,6 +147,87 @@ need_exe() {
     [[ -x "$1" ]] || die "missing or not executable: $1 (run 'make' in ${SCRIPT_DIR})"
 }
 
+# Synthetic edelete checks: "." / ".." as argv path components, cwd ".", and dot-prefixed directory names.
+# Ensures we never rely on deleting the literal dot-directory entries from readdir (tested in edelete.c)
+# and that path normalization / containment behave as expected.
+edelete_synthetic_dot_dotdot_tests() {
+    local td_root=$1
+    local base out err ef
+
+    base="${td_root}/edelete_dot_probe"
+    rm -rf "$base"
+    mkdir -p "$base"
+
+    log "edelete synthetic: probe tree under ${base}"
+
+    # t1: start path is "." resolved from inside the deepest directory (realpath → absolute).
+    mkdir -p "${base}/t1_rel_dot/deep"
+    echo x >"${base}/t1_rel_dot/deep/f.txt"
+    out="${base}/t1.stdout"
+    err="${base}/t1.stderr"
+    (cd "${base}/t1_rel_dot/deep" && "$EDELETE" --delete --force . >"$out" 2>"$err") || {
+        cat "$err" >&2 || true
+        die "edelete dots: t1 (cwd .) failed"
+    }
+    [[ ! -f "${base}/t1_rel_dot/deep/f.txt" ]] || die "edelete dots: t1 file should be removed"
+    [[ ! -d "${base}/t1_rel_dot/deep" ]] || die "edelete dots: t1 leaf dir should be removed"
+    ef=$(kv_last errors "$out")
+    expect_eq "edelete dots: t1 errors" "0" "${ef:-missing_errors_line}"
+
+    # t2: redundant "./" segments in the start path argument.
+    mkdir -p "${base}/t2_dotslash/walk/inner"
+    echo y >"${base}/t2_dotslash/walk/inner/g.txt"
+    out="${base}/t2.stdout"
+    "$EDELETE" --delete --force "${base}/t2_dotslash/walk/./inner/./" >"$out" 2>"${base}/t2.stderr" || die "edelete dots: t2 (./ segments) failed"
+    [[ ! -e "${base}/t2_dotslash/walk/inner/g.txt" ]] || die "edelete dots: t2 file should be removed"
+    expect_eq "edelete dots: t2 errors" "0" "$(kv_last errors "$out")"
+
+    # t3: ".." in argv collapsing to the intended directory (bash resolves before edelete runs).
+    mkdir -p "${base}/t3_dotdot/norm/a/b"
+    echo z >"${base}/t3_dotdot/norm/a/b/h.txt"
+    out="${base}/t3.stdout"
+    "$EDELETE" --delete --force "${base}/t3_dotdot/norm/a/b/../.." >"$out" 2>"${base}/t3.stderr" || die "edelete dots: t3 (.. collapse) failed"
+    [[ ! -d "${base}/t3_dotdot/norm" ]] || die "edelete dots: t3 norm/ should be removed"
+    expect_eq "edelete dots: t3 errors" "0" "$(kv_last errors "$out")"
+
+    # t4: deleting one subtree must not remove a sibling (exercises containment vs .. semantics).
+    mkdir -p "${base}/t4_sibling/keep" "${base}/t4_sibling/delete_me/sub"
+    echo keep >"${base}/t4_sibling/keep/preserved.txt"
+    echo x >"${base}/t4_sibling/delete_me/sub/x.txt"
+    out="${base}/t4.stdout"
+    "$EDELETE" --delete --force "${base}/t4_sibling/delete_me" >"$out" 2>"${base}/t4.stderr" || die "edelete dots: t4 sibling containment failed"
+    [[ -f "${base}/t4_sibling/keep/preserved.txt" ]] || die "edelete dots: t4 sibling file must survive"
+    [[ ! -e "${base}/t4_sibling/delete_me" ]] || die "edelete dots: t4 delete_me subtree should be gone"
+    expect_eq "edelete dots: t4 errors" "0" "$(kv_last errors "$out")"
+
+    # t5: dot-prefixed directory names (not the special "." / ".." entries) are visited and removed.
+    mkdir -p "${base}/t5_dotnames/.hidden/deep"
+    echo h >"${base}/t5_dotnames/.hidden/deep/h.txt"
+    out="${base}/t5.stdout"
+    "$EDELETE" --delete --force "${base}/t5_dotnames" >"$out" 2>"${base}/t5.stderr" || die "edelete dots: t5 .hidden dir failed"
+    [[ ! -d "${base}/t5_dotnames/.hidden" ]] || die "edelete dots: t5 .hidden should be removed"
+    expect_eq "edelete dots: t5 errors" "0" "$(kv_last errors "$out")"
+
+    # t6: dry-run with "./" and ".." only in argv path — tree must remain untouched.
+    mkdir -p "${base}/t6_dry/sub"
+    echo d >"${base}/t6_dry/sub/file.txt"
+    out="${base}/t6.stdout"
+    "$EDELETE" "${base}/t6_dry/./sub/../" >"$out" 2>"${base}/t6.stderr" || die "edelete dots: t6 dry-run failed"
+    [[ -f "${base}/t6_dry/sub/file.txt" ]] || die "edelete dots: t6 dry-run must keep files"
+    expect_eq "edelete dots: t6 mode dry-run" "dry-run" "$(kv_last mode "$out")"
+    expect_eq "edelete dots: t6 deleted_files stays 0" "0" "$(kv_last deleted_files "$out")"
+
+    # t7: legal names that start with "." but are not "." or ".." (e.g. .local).
+    mkdir -p "${base}/t7_dotprefix/.local/bin"
+    echo p >"${base}/t7_dotprefix/.local/bin/p.txt"
+    out="${base}/t7.stdout"
+    "$EDELETE" --delete --force "${base}/t7_dotprefix" >"$out" 2>"${base}/t7.stderr" || die "edelete dots: t7 .local failed"
+    [[ ! -f "${base}/t7_dotprefix/.local/bin/p.txt" ]] || die "edelete dots: t7 dot-prefix path should be deleted"
+    expect_eq "edelete dots: t7 errors" "0" "$(kv_last errors "$out")"
+
+    pass "edelete synthetic (. .. argv paths, cwd ., dot-named dirs)"
+}
+
 # --- Optional: correlate crawl totals with find/fd on a real tree (slow on huge trees) ---
 # find(1) exits 1 if any path errors (e.g. permission denied); with pipefail + set -e that would kill
 # the script mid-baseline with no message. Ignore find/fd failure after collecting stdout.
@@ -484,6 +565,9 @@ run_integration() {
         tail -n 40 "${td}/edelete.stderr" >&2 || true
         die "edelete dry-run failed"
     }
+
+    section_int "[integration] edelete — synthetic . / .. path probes (--delete)"
+    edelete_synthetic_dot_dotdot_tests "$td"
 
     local idx_make="${td}/index_make"
     log "ereport_index --make (trigram index under ${idx_make})"

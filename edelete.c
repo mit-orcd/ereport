@@ -50,6 +50,7 @@
 #include "path_utils.h"
 #include <stdatomic.h>
 #include <dirent.h>
+#include <ftw.h>
 #include <limits.h>
 #include <time.h>
 
@@ -366,11 +367,38 @@ static char *dup_parent_dir(const char *path) {
     return out;
 }
 
+/*
+ * True if path must never be passed to unlink(2) or rmdir(2): the special entries
+ * "." and ".." (alone or as the final path component). The directory walker also
+ * skips these names from readdir(3); this is defense in depth for all delete paths.
+ */
+static int edelete_is_forbidden_dot_entry_path(const char *path) {
+    const char *base;
+    size_t n, i;
+
+    if (!path || path[0] == '\0') return 1;
+    if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0) return 1;
+
+    n = strlen(path);
+    while (n > 1U && path[n - 1U] == '/') n--;
+
+    base = path;
+    for (i = 0; i < n; i++) {
+        if (path[i] == '/') base = path + i + 1U;
+    }
+
+    if (*base == '\0') return 0;
+
+    return strcmp(base, ".") == 0 || strcmp(base, "..") == 0;
+}
+
 static int record_deleted_file_parent(shared_state_t *s, const char *parent_dir) {
-    char *dup = strdup(parent_dir);
+    char *dup;
     char **np;
     size_t nc;
 
+    if (edelete_is_forbidden_dot_entry_path(parent_dir)) return 0;
+    dup = strdup(parent_dir);
     if (!dup) return -1;
     pthread_mutex_lock(&s->rmdir_list_mutex);
     if (s->rmdir_parents_n == s->rmdir_parents_cap) {
@@ -422,6 +450,10 @@ static void try_rmdir_chain(shared_state_t *shared, const char *root_path, const
     }
 
     while (cur && strcmp(cur, "/") != 0) {
+        if (edelete_is_forbidden_dot_entry_path(cur)) {
+            free(cur);
+            return;
+        }
         if (!path_is_under_root(cur, root_path)) {
             free(cur);
             return;
@@ -486,6 +518,99 @@ static void remove_empty_directories_after_delete(shared_state_t *shared, const 
 
     for (i = 0; i < n; i++) free(list[i]);
     free(list);
+}
+
+typedef struct {
+    char **paths;
+    size_t n;
+    size_t cap;
+} edelete_dir_list_t;
+
+static edelete_dir_list_t *g_edelete_dir_collect;
+
+static int edelete_nftw_collect_dir(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+    edelete_dir_list_t *list = g_edelete_dir_collect;
+    char **np;
+    size_t nc;
+
+    (void)sb;
+    (void)ftwbuf;
+    if (!list) return 0;
+    if (typeflag != FTW_D && typeflag != FTW_DP) return 0;
+
+    if (list->n == list->cap) {
+        nc = list->cap ? list->cap * 2 : 4096;
+        np = (char **)realloc(list->paths, nc * sizeof(*np));
+        if (!np) return -1;
+        list->paths = np;
+        list->cap = nc;
+    }
+    list->paths[list->n] = strdup(fpath);
+    if (!list->paths[list->n]) return -1;
+    list->n++;
+    return 0;
+}
+
+/*
+ * Deepest-first rmdir pass: removes empty directories left after unlinks (including branches that
+ * never had eligible files, so no parent was recorded for try_rmdir_chain).
+ */
+static void remove_empty_directories_scan_pass(const char *root_path, shared_state_t *shared) {
+    edelete_dir_list_t list = {0};
+    size_t i;
+    int nftw_rc;
+    struct stat st_root;
+
+    if (lstat(root_path, &st_root) != 0) {
+        if (errno == ENOENT) {
+            /* Start directory may already have been removed by try_rmdir_chain (e.g. leaf dir). */
+            return;
+        }
+        fprintf(stderr, "edelete: lstat %s: %s\n", root_path, strerror(errno));
+        stats_add_error(shared);
+        return;
+    }
+    if (!S_ISDIR(st_root.st_mode)) return;
+
+    g_edelete_dir_collect = &list;
+    errno = 0;
+    nftw_rc = nftw(root_path, edelete_nftw_collect_dir, 64, FTW_PHYS);
+    g_edelete_dir_collect = NULL;
+
+    if (nftw_rc != 0) {
+        if (errno == ENOENT) {
+            for (i = 0; i < list.n; i++) free(list.paths[i]);
+            free(list.paths);
+            return;
+        }
+        fprintf(stderr, "edelete: directory scan %s: %s\n", root_path, errno ? strerror(errno) : "failed");
+        stats_add_error(shared);
+        for (i = 0; i < list.n; i++) free(list.paths[i]);
+        free(list.paths);
+        return;
+    }
+
+    qsort(list.paths, list.n, sizeof(*list.paths), cmp_parent_path_desc);
+
+    for (i = 0; i < list.n; i++) {
+        const char *p = list.paths[i];
+
+        if (strcmp(p, "/") == 0) continue;
+        if (edelete_is_forbidden_dot_entry_path(p)) continue;
+        if (!path_is_under_root(p, root_path)) continue;
+
+        if (rmdir(p) == 0) {
+            pthread_mutex_lock(&shared->stats_mutex);
+            shared->removed_empty_dirs++;
+            pthread_mutex_unlock(&shared->stats_mutex);
+        } else if (errno != ENOTEMPTY && errno != ENOENT && errno != EBUSY && errno != ENOTDIR) {
+            fprintf(stderr, "edelete: rmdir %s: %s\n", p, strerror(errno));
+            stats_add_error(shared);
+        }
+    }
+
+    for (i = 0; i < list.n; i++) free(list.paths[i]);
+    free(list.paths);
 }
 
 static void stats_add_started(shared_state_t *s) {
@@ -734,6 +859,7 @@ static void account_leaf(perf_local_t *perf, const struct stat *st) {
 static int try_delete_nondir(shared_state_t *shared, const char *path, const struct stat *st) {
     time_t ts;
 
+    if (edelete_is_forbidden_dot_entry_path(path)) return 0;
     if (S_ISDIR(st->st_mode)) return 0;
     if (g_shutdown_requested) return 0;
 
@@ -1117,6 +1243,7 @@ static void usage(const char *prog) {
             "  First form: every non-directory under <path> is eligible (still dry-run unless --delete).\n"
             "  Second form: only entries whose chosen timestamp is at least <days> full days old.\n"
             "  Walks in parallel without following symlinks; by default dry-run (counts would_delete, no unlink).\n"
+            "  Pass <path> itself; shell globs like parent/* skip hidden names (e.g. .om2) unless matched explicitly.\n"
             "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs\n"
             "            (including the start directory if empty; never removes `/`).\n"
             "  --force:  with --delete only, skip the YES prompt (non-interactive / scripting).\n"
@@ -1351,7 +1478,10 @@ int main(int argc, char **argv) {
 
         for (i = 0; i < worker_count_started; i++) stats_merge_aux(&shared, &worker_args[i].aux);
 
-        if (!g_dry_run && !interrupted) remove_empty_directories_after_delete(&shared, root_path);
+        if (!g_dry_run && !interrupted) {
+            remove_empty_directories_after_delete(&shared, root_path);
+            remove_empty_directories_scan_pass(root_path, &shared);
+        }
 
         atomic_store(&g_stop_stats, 1);
         pthread_join(stats_thread, NULL);
