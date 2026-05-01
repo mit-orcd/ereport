@@ -57,6 +57,9 @@
 #ifndef DT_UNKNOWN
 #define DT_UNKNOWN 0
 #endif
+#ifndef DT_DIR
+#define DT_DIR 4
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -651,10 +654,14 @@ static void perf_flush_local(perf_local_t *perf) {
 }
 
 static void emfile_retry_pause(unsigned attempt) {
-    useconds_t delay = EMFILE_RETRY_USEC;
+    unsigned long usec = (unsigned long)EMFILE_RETRY_USEC;
+    struct timespec ts;
 
-    if (attempt < 4U) delay *= (useconds_t)(attempt + 1U);
-    usleep(delay);
+    if (attempt < 4U) usec *= (unsigned long)(attempt + 1U);
+    ts.tv_sec = (time_t)(usec / 1000000UL);
+    ts.tv_nsec = (long)((usec % 1000000UL) * 1000UL);
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
+    }
 }
 
 static void queue_init(task_queue_t *q) {
