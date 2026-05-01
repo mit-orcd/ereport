@@ -1,24 +1,27 @@
 # Copy to /etc/ereport/ecrawl-daily.conf and adjust paths.
 # Syntax:
 #   - Lines before ---jobs--- are directives: KEY=value
-#   - After ---jobs---, one crawl per line, fields separated by TAB characters:
-#       start_path    output_dir    record_root
-#     output_dir and record_root may be empty (still use tabs: path<TAB><TAB>).
-#     Empty output_dir: ecrawl uses its default output directory next to the tree.
-#     Empty record_root: omit --record-root
+#   - After ---jobs---, one crawl per line, TAB-separated:
+#       start_path — directory ecrawl walks
+#       output_dir — where crawl output (shards, etc.) is written; empty → ecrawl default beside the tree
+#       record_root — optional --record-root (logical root in metadata); empty → omit --record-root
+#     Empty middle/right columns still need tabs (e.g. path<TAB><TAB>).
 
 ECRAWL_BIN=/opt/ereport/ecrawl
 BIN_SOURCE_DIR=/opt/ereport
-# Deployment parent on the target: binaries must live *directly* in this directory after a run.
+# Deployment parent on the target: after promotion, ecrawl/ereport/… sit *in this directory*,
+# not under a child such as bin/ unless you set RSYNC_DEST to that child path explicitly.
+# (So avoid paths that read like an “app prefix” unless you really keep binaries flat there.)
 # Flow: rsync → PARENT/.ecrawl-daily-staging/, then that directory's prior contents (except
 # archive/ and the staging dir) move to PARENT/archive/<timestamp>/, then staging → PARENT.
-RSYNC_DEST=backup.example.com:/usr/local/ereport/
+RSYNC_DEST=backup.example.com:/opt/ereport-live/
 # Optional: remote shell for rsync and ssh promote step (same -e as rsync)
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
 # RSYNC_STAGING_DIR_NAME=.ecrawl-daily-staging
 # RSYNC_ARCHIVE_DIR_NAME=archive
 
+# --- jobs (TAB-separated: start_path, output_dir, record_root) ---
 ---jobs---
 /mnt/server-a/data	/var/lib/ecrawl/server-a	
 /mnt/server-b/home	/var/lib/ecrawl/server-b	/mnt/server-b/home
