@@ -285,6 +285,7 @@ static uint64_t g_active_workers_samples = 0;
 static uint64_t g_seconds_single_worker = 0;
 static uint64_t g_seconds_queue_empty_single_worker = 0;
 static double g_run_start_sec = 0.0;
+static time_t g_crawl_wall_clock_start;
 
 static double now_sec(void);
 static void dir_stack_destroy(dir_stack_t *s);
@@ -2203,9 +2204,10 @@ static double now_sec(void) {
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
-static int write_crawl_manifest(const char *start_path, int worker_count_started) {
+static int write_crawl_manifest(const char *start_path, int worker_count_started, double elapsed_sec) {
     FILE *fp;
     char manifest_path[PATH_MAX];
+    time_t end_wall = time(NULL);
 
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", g_output_dir) >= (int)sizeof(manifest_path)) return -1;
     fp = counted_fopen(manifest_path, "w");
@@ -2225,6 +2227,9 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     fprintf(fp, "max_open_shards=%u\n", g_max_open_shards);
     fprintf(fp, "uid_output=uid.txt\n");
     fprintf(fp, "gid_output=gid.txt\n");
+    fprintf(fp, "crawl_started_epoch=%lld\n", (long long)g_crawl_wall_clock_start);
+    fprintf(fp, "crawl_finished_epoch=%lld\n", (long long)end_wall);
+    fprintf(fp, "crawl_elapsed_sec=%.3f\n", elapsed_sec);
     counted_fclose(fp);
     return 0;
 }
@@ -2665,6 +2670,7 @@ int main(int argc, char **argv) {
 
     t0 = now_sec();
     g_run_start_sec = t0;
+    g_crawl_wall_clock_start = time(NULL);
 
     if (!g_no_write) {
         writer_threads_used = 0;
@@ -2808,12 +2814,13 @@ int main(int argc, char **argv) {
     }
     t1 = now_sec();
 
-    if (!g_no_write && write_crawl_manifest(start_path, worker_count_started) != 0) {
-        fprintf(stderr, "ERROR failed to write crawl manifest: %s\n", strerror(errno));
-    }
-
     {
         double elapsed = t1 - t0;
+
+        if (!g_no_write && write_crawl_manifest(start_path, worker_count_started, elapsed) != 0) {
+            fprintf(stderr, "ERROR failed to write crawl manifest: %s\n", strerror(errno));
+        }
+
         double avg_ops = elapsed > 0.0 ? (double)shared.total_entries / elapsed : 0.0;
         double mean_ops = g_ops_rate_samples ? g_ops_rate_sum / (double)g_ops_rate_samples : avg_ops;
         double max_ops = g_ops_rate_samples ? g_ops_rate_max : avg_ops;

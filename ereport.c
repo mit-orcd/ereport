@@ -98,6 +98,15 @@ static const char *age_bucket_names[AGE_BUCKETS] = {
     "3+ years"
 };
 
+/* crawl_manifest.txt crawl_*epoch / crawl_elapsed_sec (written by ecrawl); aggregated for merged reports. */
+typedef struct {
+    int valid;
+    time_t wall_start;
+    time_t wall_end;
+    double elapsed_sec;
+    int merged;
+} ereport_crawl_timing_t;
+
 typedef struct {
     uint64_t bytes[AGE_BUCKETS][SIZE_BUCKETS];
     uint64_t files[AGE_BUCKETS][SIZE_BUCKETS];
@@ -883,6 +892,115 @@ static int read_manifest_storage_display_path(const char *bin_dir, char *out, si
         return -1;
     }
     return -1;
+}
+
+static int read_manifest_crawl_timing(const char *bin_dir, time_t *start_out, time_t *end_out, double *elapsed_out) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[4096];
+    time_t st = 0, en = 0;
+    double el = 0.0;
+    int have_el = 0;
+
+    if (!bin_dir || !start_out || !end_out || !elapsed_out) return 0;
+    *start_out = *end_out = 0;
+    *elapsed_out = 0.0;
+
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", bin_dir) >= (int)sizeof(manifest_path)) return 0;
+
+    fp = counted_fopen(manifest_path, "r");
+    if (!fp) return 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        if (strncmp(line, "crawl_started_epoch=", 20) == 0) {
+            errno = 0;
+            st = (time_t)strtoull(line + 20, NULL, 10);
+            if (errno) st = 0;
+        } else if (strncmp(line, "crawl_finished_epoch=", 21) == 0) {
+            errno = 0;
+            en = (time_t)strtoull(line + 21, NULL, 10);
+            if (errno) en = 0;
+        } else if (strncmp(line, "crawl_elapsed_sec=", 18) == 0) {
+            char *endp = NULL;
+            el = strtod(line + 18, &endp);
+            if (endp != line + 18 && el >= 0.0) have_el = 1;
+        }
+    }
+
+    counted_fclose(fp);
+
+    if (st <= 0 || en < st) return 0;
+    *start_out = st;
+    *end_out = en;
+    if (have_el) *elapsed_out = el;
+    return 1;
+}
+
+static void aggregate_crawl_timing_from_manifests(const char **bin_dirs, size_t n, ereport_crawl_timing_t *out) {
+    size_t i;
+    int got = 0;
+    time_t mn = 0, mx = 0;
+    double single_el = 0.0;
+    double max_el = 0.0;
+
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!bin_dirs || n == 0) return;
+
+    for (i = 0; i < n; i++) {
+        time_t st, en;
+        double el = 0.0;
+
+        if (!read_manifest_crawl_timing(bin_dirs[i], &st, &en, &el)) continue;
+        got++;
+        if (got == 1 || st < mn) mn = st;
+        if (got == 1 || en > mx) mx = en;
+        if (el > max_el) max_el = el;
+        if (n == 1U) single_el = el;
+    }
+
+    if (got == 0 || mn <= 0 || mx < mn) return;
+
+    out->valid = 1;
+    out->wall_start = mn;
+    out->wall_end = mx;
+    out->merged = (n > 1U);
+
+    if (n == 1U && single_el > 0.0)
+        out->elapsed_sec = single_el;
+    else {
+        double span = difftime(mx, mn);
+        out->elapsed_sec = span > 0.0 ? span : max_el;
+        if (out->elapsed_sec <= 0.0 && max_el > 0.0) out->elapsed_sec = max_el;
+    }
+}
+
+static void format_wall_clock_local(time_t t, char *buf, size_t sz) {
+    struct tm tm_local;
+
+    if (!buf || sz == 0) return;
+    buf[0] = '\0';
+    if (!localtime_r(&t, &tm_local)) {
+        snprintf(buf, sz, "(unknown)");
+        return;
+    }
+    if (!strftime(buf, sz, "%Y-%m-%d %H:%M:%S %Z", &tm_local)) snprintf(buf, sz, "(unknown)");
+}
+
+static void format_duration_approx(double sec, char *buf, size_t sz) {
+    if (!buf || sz == 0) return;
+    if (sec < 0.0) sec = 0.0;
+    if (sec < 60.0)
+        snprintf(buf, sz, "%.1f s", sec);
+    else if (sec < 3600.0)
+        snprintf(buf, sz, "%.1f min", sec / 60.0);
+    else if (sec < 86400.0)
+        snprintf(buf, sz, "%.2f h", sec / 3600.0);
+    else
+        snprintf(buf, sz, "%.2f days", sec / 86400.0);
 }
 
 static void format_storage_base_paths_label(const char **dirs, size_t n, char *buf, size_t buf_sz) {
@@ -2937,7 +3055,8 @@ static int emit_html(const char *report_path,
                      size_t input_files,
                      int threads_used,
                      size_t crawl_source_count,
-                     const char *crawl_sources_label) {
+                     const char *crawl_sources_label,
+                     const ereport_crawl_timing_t *crawl_timing) {
     FILE *out = counted_fopen(report_path, "w");
     int ab, sb;
     double max_inner_pct_b = 0.0;
@@ -2974,6 +3093,7 @@ static int emit_html(const char *report_path,
     fprintf(out, ".stats-dl dd{margin:0;color:#222;text-align:right;word-break:break-word}\n");
     fprintf(out, ".stats-num{font-variant-numeric:tabular-nums;font-weight:600;color:#1a1a1a}\n");
     fprintf(out, ".stats-num-short{color:#555;font-size:12px;font-weight:500}\n");
+    fprintf(out, ".stats-timing-foot{margin:10px 0 0;font-size:12px;color:#666;line-height:1.45}\n");
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
     fprintf(out, ".heatmap-caption{caption-side:top;text-align:left;font-size:12px;color:#555;line-height:1.45;max-width:720px;margin:10px 0 12px;padding:0}\n");
     fprintf(out, ".heatmap-totals-note{font-size:12px;color:#555;max-width:min(900px,100%%);margin:12px 0 18px;line-height:1.5;padding:0}\n");
@@ -3315,7 +3435,32 @@ static int emit_html(const char *report_path,
         fprintf(out, "</dd>\n");
         emit_stats_count_dd(out, "Input .bin files", (uint64_t)input_files);
         emit_stats_count_dd(out, "Threads used", (uint64_t)threads_used);
-        fprintf(out, "</dl></article>\n");
+        if (crawl_timing && crawl_timing->valid) {
+            char ws[96], we[96], dhms[32], dapprox[48];
+
+            format_wall_clock_local(crawl_timing->wall_start, ws, sizeof(ws));
+            format_wall_clock_local(crawl_timing->wall_end, we, sizeof(we));
+            format_duration(crawl_timing->elapsed_sec, dhms, sizeof(dhms));
+            format_duration_approx(crawl_timing->elapsed_sec, dapprox, sizeof(dapprox));
+
+            fprintf(out, "<dt>Crawl started</dt><dd><span class=\"stats-num\">");
+            html_escape(out, ws);
+            fprintf(out, "</span></dd>\n");
+            fprintf(out, "<dt>Crawl finished</dt><dd><span class=\"stats-num\">");
+            html_escape(out, we);
+            fprintf(out, "</span></dd>\n");
+            fprintf(out,
+                    "<dt>Crawl runtime</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num-short\">(%s)</span></dd>\n",
+                    dhms,
+                    dapprox);
+        }
+        fprintf(out, "</dl>\n");
+        if (crawl_timing && crawl_timing->valid && crawl_timing->merged) {
+            fprintf(out,
+                    "<p class=\"stats-timing-foot\">Merged report: wall-clock span from earliest crawl start to latest crawl finish "
+                    "across inputs.</p>\n");
+        }
+        fprintf(out, "</article>\n");
 
         fprintf(out, "<article class=\"stats-card\"><h3>Records processed</h3><dl class=\"stats-dl\">\n");
         emit_stats_count_dd(out, "Scanned records", sum->scanned_records);
@@ -3635,6 +3780,7 @@ int main(int argc, char **argv) {
     uint64_t distinct_uid_count = 0;
     double t0, t1;
     ereport_run_stats_t run_stats;
+    ereport_crawl_timing_t crawl_timing;
 
     atomic_store(&g_io_opendir_calls, 0);
     atomic_store(&g_io_readdir_calls, 0);
@@ -3855,6 +4001,9 @@ int main(int argc, char **argv) {
 
     format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
     format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
+
+    memset(&crawl_timing, 0, sizeof(crawl_timing));
+    aggregate_crawl_timing_from_manifests(bin_dirs, bin_dir_count, &crawl_timing);
 
     set_bucket_output_dir(display_name);
     if (report_dir_opt[0] != '\0') {
@@ -4369,8 +4518,8 @@ int main(int argc, char **argv) {
     atomic_store(&run_stats.finalize_phase, 3);
 
     if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
-                   basis_str, &final_sum, path_count, threads_used, bin_dir_count,
-                   storage_base_paths_label) != 0) {
+                   basis_str, &final_sum, path_count, threads_used, bin_dir_count, storage_base_paths_label,
+                   &crawl_timing) != 0) {
         fprintf(stderr, "failed to write main report %s\n", report_path);
     }
     final_sum.scanned_input_files = (uint64_t)path_count;
