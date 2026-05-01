@@ -7,10 +7,10 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ecrawl-daily.timer
 #
-# Override User=/Group= if ecrawl must read restricted trees or write crawl output.
+# Override User=/Group= if ecrawl must read restricted trees, write crawl output, or use rsync/ssh.
 
 [Unit]
-Description=Run ecrawl on configured directories and rsync crawl output (optional ereport install)
+Description=Run ecrawl on configured directories and rsync crawl output
 Documentation=file:///usr/local/lib/ereport/ecrawl-daily.sh
 After=network-online.target
 Wants=network-online.target

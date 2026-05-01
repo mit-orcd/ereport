@@ -54,7 +54,7 @@ make clean
 
 ## systemd: daily `ecrawl` and binary sync
 
-Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then **`rsync`** each job’s **`output_dir`** (crawl shard data) under **`RSYNC_DEST`** using that directory’s basename as the remote subdirectory. Optional **`EREPORT_INSTALL_DEST`** performs the separate staged install of the built toolchain from **`EREPORT_SOURCE_DIR`** (see **`contrib/systemd/ecrawl-daily.conf.example`**).
+Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then **`rsync`** each job’s **`output_dir`** (crawl shard data) under **`RSYNC_DEST`** using that directory’s basename as the remote subdirectory (see **`contrib/systemd/ecrawl-daily.conf.example`**).
 
 Install (adjust paths if you install elsewhere):
 

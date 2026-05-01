@@ -1,14 +1,9 @@
 # Copy to /etc/ereport/ecrawl-daily.conf and adjust paths.
 #
-# What rsync does (two independent targets):
-#   RSYNC_DEST — Parent on another machine (or local path) that receives *crawl output*. Each job’s
-#       output_dir is mirrored to DEST/<basename(output_dir)>/. Example: output_dir
-#       /var/lib/ecrawl/server-a → RSYNC_DEST/server-a/ So RSYNC_DEST must be set, and every job
-#       needs a non-empty output_dir column (TAB-separated).
-#   EREPORT_INSTALL_DEST — Optional. If set, the script also pushes built ecrawl/ereport/… binaries
-#       using staging + archive + promote. Sources from EREPORT_SOURCE_DIR, which defaults to the
-#       directory containing ECRAWL_BIN if you omit EREPORT_SOURCE_DIR (override only if ecrawl is
-#       not next to the other built binaries you want to ship).
+# RSYNC_DEST — Parent on another machine (or local path) that receives *crawl output*. Each job’s
+#     output_dir is mirrored to DEST/<basename(output_dir)>/. Example: output_dir
+#     /var/lib/ecrawl/server-a → RSYNC_DEST/server-a/. Use RSYNC_DEST only when you want sync;
+#     every mirrored job needs a non-empty output_dir column (TAB-separated).
 #
 # Syntax:
 #   - Lines before ---jobs--- are directives: KEY=value
@@ -23,15 +18,10 @@
 ECRAWL_BIN=/opt/ereport/ecrawl
 
 RSYNC_DEST=backup.example.com:/var/lib/ereport-crawl/
-# Optional toolchain deploy (staging dir .ecrawl-daily-staging under this path):
-# EREPORT_INSTALL_DEST=backup.example.com:/opt/ereport-live/
-# EREPORT_RSYNC_ALL=1
 
-# Optional: remote shell for rsync and ssh promote step (same -e as rsync)
+# Optional: remote shell for rsync (same -e as rsync)
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
-# RSYNC_STAGING_DIR_NAME=.ecrawl-daily-staging
-# RSYNC_ARCHIVE_DIR_NAME=archive
 
 # --- jobs (TAB-separated: start_path, output_dir, record_root) ---
 ---jobs---
