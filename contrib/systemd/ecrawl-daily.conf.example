@@ -3,7 +3,8 @@
 #   - Lines before ---jobs--- are directives: KEY=value
 #   - After ---jobs---, one crawl per line, TAB-separated:
 #       start_path — directory ecrawl walks
-#       output_dir — where crawl output (shards, etc.) is written; empty → ecrawl default beside the tree
+#       output_dir — where crawl output (shards, etc.) is written; empty → ecrawl default beside the tree;
+#                    parent dirs are created if missing (mkdir -p)
 #       record_root — optional --record-root (logical root in metadata); empty → omit --record-root
 #     Empty middle/right columns still need tabs (e.g. path<TAB><TAB>).
 

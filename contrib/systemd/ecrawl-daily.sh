@@ -228,6 +228,7 @@ main() {
 		output_dir="${output_dir#"${output_dir%%[![:space:]]*}"}"
 		output_dir="${output_dir%"${output_dir##*[![:space:]]}"}"
 		if [[ -n "$output_dir" ]]; then
+			mkdir -p -- "$output_dir" || die "cannot create output directory: $output_dir"
 			ecrawl_cmd+=("$output_dir")
 		fi
 
