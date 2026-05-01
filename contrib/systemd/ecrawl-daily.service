@@ -1,0 +1,25 @@
+# Install (adjust paths):
+#   sudo install -d /etc/ereport /usr/local/lib/ereport
+#   sudo install -m0644 ecrawl-daily.conf.example /etc/ereport/ecrawl-daily.conf
+#   sudo install -m0755 ecrawl-daily.sh /usr/local/lib/ereport/ecrawl-daily.sh
+#   sudo install -m0644 ecrawl-daily.service /etc/systemd/system/
+#   sudo install -m0644 ecrawl-daily.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ecrawl-daily.timer
+#
+# Override User=/Group= if ecrawl must read restricted trees or write crawl output.
+
+[Unit]
+Description=Run ecrawl on configured directories and rsync ereport binaries
+Documentation=file:///usr/local/lib/ereport/ecrawl-daily.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ereport/ecrawl-daily.sh /etc/ereport/ecrawl-daily.conf
+# User=crawler
+# Group=crawler
+
+[Install]
+WantedBy=multi-user.target

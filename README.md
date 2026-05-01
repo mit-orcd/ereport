@@ -52,6 +52,25 @@ Clean:
 make clean
 ```
 
+## systemd: daily `ecrawl` and binary sync
+
+Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then rsync built binaries to a target using a **staging directory** and an **archive timestamp** before promoting files into place (see **`contrib/systemd/ecrawl-daily.conf.example`**).
+
+Install (adjust paths if you install elsewhere):
+
+```bash
+sudo install -d /etc/ereport /usr/local/lib/ereport
+sudo install -m0644 contrib/systemd/ecrawl-daily.conf.example /etc/ereport/ecrawl-daily.conf
+# edit /etc/ereport/ecrawl-daily.conf
+sudo install -m0755 contrib/systemd/ecrawl-daily.sh /usr/local/lib/ereport/ecrawl-daily.sh
+sudo install -m0644 contrib/systemd/ecrawl-daily.service /etc/systemd/system/
+sudo install -m0644 contrib/systemd/ecrawl-daily.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ecrawl-daily.timer
+```
+
+Set **`User=`** / **`Group=`** in **`ecrawl-daily.service`** if the job must not run as root. The same block appears as comments at the top of **`contrib/systemd/ecrawl-daily.service`**.
+
 ## Why this is fast (design concepts)
 
 The tools are fast because they combine **compact binary I/O**, **parallelism along natural boundaries**, and **bounded pipelines** instead of naïvely scanning everything twice or holding giant locks over shared mutable state.

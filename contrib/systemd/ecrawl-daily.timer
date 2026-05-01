@@ -1,0 +1,14 @@
+# Fires ecrawl-daily.service once per calendar day (after boot if a run was missed).
+# First triggers at 01:00, then adds a uniform random delay in [0, 3h], so each run
+# lands between 01:00 and 04:00 local time (inclusive of both endpoints).
+
+[Unit]
+Description=Daily ecrawl and binary rsync
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+RandomizedDelaySec=10800
+
+[Install]
+WantedBy=timers.target

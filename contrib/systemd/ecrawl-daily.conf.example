@@ -1,0 +1,24 @@
+# Copy to /etc/ereport/ecrawl-daily.conf and adjust paths.
+# Syntax:
+#   - Lines before ---jobs--- are directives: KEY=value
+#   - After ---jobs---, one crawl per line, fields separated by TAB characters:
+#       start_path    output_dir    record_root
+#     output_dir and record_root may be empty (still use tabs: path<TAB><TAB>).
+#     Empty output_dir: ecrawl uses its default output directory next to the tree.
+#     Empty record_root: omit --record-root
+
+ECRAWL_BIN=/opt/ereport/ecrawl
+BIN_SOURCE_DIR=/opt/ereport
+# Deployment parent on the target: binaries must live *directly* in this directory after a run.
+# Flow: rsync → PARENT/.ecrawl-daily-staging/, then that directory's prior contents (except
+# archive/ and the staging dir) move to PARENT/archive/<timestamp>/, then staging → PARENT.
+RSYNC_DEST=backup.example.com:/usr/local/ereport/
+# Optional: remote shell for rsync and ssh promote step (same -e as rsync)
+# RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+# RSYNC_DELETE=1
+# RSYNC_STAGING_DIR_NAME=.ecrawl-daily-staging
+# RSYNC_ARCHIVE_DIR_NAME=archive
+
+---jobs---
+/mnt/server-a/data	/var/lib/ecrawl/server-a	
+/mnt/server-b/home	/var/lib/ecrawl/server-b	/mnt/server-b/home
