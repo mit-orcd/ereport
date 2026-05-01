@@ -1071,7 +1071,8 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
     fprintf(stderr,
             "\n"
             "edelete: --delete will permanently unlink non-directory paths under the start path\n"
-            "         and remove directories that become empty (never the root path itself).\n"
+            "         and remove directories that become empty (including the start path when empty;\n"
+            "         never removes the filesystem root `/`).\n"
             "\n"
             "  Resolved start path: %s\n"
             "  Filter:              %s\n",
@@ -1116,7 +1117,8 @@ static void usage(const char *prog) {
             "  First form: every non-directory under <path> is eligible (still dry-run unless --delete).\n"
             "  Second form: only entries whose chosen timestamp is at least <days> full days old.\n"
             "  Walks in parallel without following symlinks; by default dry-run (counts would_delete, no unlink).\n"
-            "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs.\n"
+            "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs\n"
+            "            (including the start directory if empty; never removes `/`).\n"
             "  --force:  with --delete only, skip the YES prompt (non-interactive / scripting).\n"
             "  Thread count: EDELETE_THREADS (default %d).\n"
             "  Max concurrent unlinks (all threads): EDELETE_MAX_UNLINK_INFLIGHT (default %d; 0 = unlimited).\n",
