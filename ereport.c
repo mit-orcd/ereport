@@ -13,8 +13,9 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
@@ -63,6 +64,8 @@
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define BUCKET_DETAIL_LEVELS_MAX 32
 #define BUCKET_PATH_TABLE_MAX_ROWS 200
+/* C-led: ctime must exceed max(atime,mtime) by at least this many seconds ("substantially newer"; hardcoded). */
+#define CTIME_LED_MIN_DELTA_SEC (180ULL * 86400ULL)
 
 static void ereport_free_bin_dirs_list(const char **dirs, size_t n) {
     size_t k;
@@ -74,7 +77,8 @@ static void ereport_free_bin_dirs_list(const char **dirs, size_t n) {
 typedef enum {
     TIME_ATIME = 0,
     TIME_MTIME = 1,
-    TIME_CTIME = 2
+    TIME_CTIME = 2,
+    TIME_EFFECTIVE = 3
 } time_basis_t;
 
 enum { SIZE_BUCKETS = 6 };
@@ -110,6 +114,9 @@ typedef struct {
 typedef struct {
     uint64_t bytes[AGE_BUCKETS][SIZE_BUCKETS];
     uint64_t files[AGE_BUCKETS][SIZE_BUCKETS];
+    /* Regular files whose ctime exceeds max(atime,mtime) by at least CTIME_LED_MIN_DELTA_SEC (inode/metadata recency). */
+    uint64_t ctime_led_bytes[AGE_BUCKETS][SIZE_BUCKETS];
+    uint64_t ctime_led_files[AGE_BUCKETS][SIZE_BUCKETS];
     uint64_t total_bytes;
     uint64_t total_capacity_bytes;
     uint64_t total_files;
@@ -125,11 +132,14 @@ typedef struct {
     uint64_t matched_others;
     uint64_t scanned_input_files;
     uint64_t bad_input_files;
+    uint64_t total_ctime_led_bytes;
+    uint64_t total_ctime_led_files;
 } summary_t;
 
 typedef struct {
     char *path;
     uint64_t size;
+    uint8_t ctime_led;
 } detail_record_t;
 
 typedef struct {
@@ -274,6 +284,8 @@ typedef struct {
     char *path;
     uint64_t bucket_files;
     uint64_t bucket_bytes;
+    uint64_t bucket_ctime_led_files;
+    uint64_t bucket_ctime_led_bytes;
     uint64_t total_files;
     uint64_t total_dirs;
     uint64_t total_bytes;
@@ -498,7 +510,7 @@ static int uid_accum_merge_into(uid_accum_t *dst, const uid_accum_t *src) {
     return 0;
 }
 
-static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t size) {
+static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t size, int ctime_led) {
     detail_record_t *tmp;
 
     if (b->count == b->cap) {
@@ -512,6 +524,7 @@ static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t
     b->items[b->count].path = strdup(path ? path : "");
     if (!b->items[b->count].path) return -1;
     b->items[b->count].size = size;
+    b->items[b->count].ctime_led = (uint8_t)(ctime_led ? 1 : 0);
     b->count++;
     return 0;
 }
@@ -1147,16 +1160,38 @@ static int parse_time_basis(const char *s, time_basis_t *out) {
         *out = TIME_CTIME;
         return 0;
     }
+    if (strcmp(s, "effective") == 0) {
+        *out = TIME_EFFECTIVE;
+        return 0;
+    }
     return -1;
 }
 
 static uint64_t pick_time(const bin_record_hdr_t *r, time_basis_t basis) {
     switch (basis) {
-        case TIME_ATIME: return r->atime;
-        case TIME_MTIME: return r->mtime;
-        case TIME_CTIME: return r->ctime;
-        default: return r->mtime;
+        case TIME_ATIME:
+            return r->atime;
+        case TIME_MTIME:
+            return r->mtime;
+        case TIME_CTIME:
+            return r->ctime;
+        case TIME_EFFECTIVE: {
+            uint64_t t = r->atime;
+            if (r->mtime > t) t = r->mtime;
+            if (r->ctime > t) t = r->ctime;
+            return t;
+        }
+        default:
+            return r->mtime;
     }
+}
+
+static int record_ctime_led(const bin_record_hdr_t *r) {
+    uint64_t tam = r->atime;
+
+    if (r->mtime > tam) tam = r->mtime;
+    if (r->ctime <= tam) return 0;
+    return (r->ctime - tam) >= CTIME_LED_MIN_DELTA_SEC;
 }
 
 static int size_bucket_for(uint64_t size) {
@@ -1496,6 +1531,10 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
             if (!row) return -1;
             row->bucket_files++;
             row->bucket_bytes += r->size;
+            if (r->ctime_led) {
+                row->bucket_ctime_led_files++;
+                row->bucket_ctime_led_bytes += r->size;
+            }
 
             if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) return -1;
         }
@@ -1566,6 +1605,23 @@ static double heatmap_norm_pct(double corpus_pct, double ref_max_pct) {
     x = 100.0 * corpus_pct / ref_max_pct;
     if (x > 100.0) x = 100.0;
     return x;
+}
+
+/* Label for “ctime-led” share of bytes within a bucket (heat map cell or path row). */
+static void format_ctime_led_share_label(uint64_t ctime_led_bytes, uint64_t bucket_bytes, char *buf, size_t sz) {
+    double p;
+
+    if (bucket_bytes == 0 || ctime_led_bytes == 0) {
+        snprintf(buf, sz, "0%%");
+        return;
+    }
+    p = 100.0 * (double)ctime_led_bytes / (double)bucket_bytes;
+    if (p < 1.0)
+        snprintf(buf, sz, "<1%%");
+    else if (p < 10.0)
+        snprintf(buf, sz, "%.1f%%", p);
+    else
+        snprintf(buf, sz, "%.0f%%", p);
 }
 
 static void contribution_cell_color(double pct, char *buf, size_t sz) {
@@ -1793,11 +1849,14 @@ static void emit_path_summary_table(FILE *out,
             "<th class=\"r num sort-h\" data-i=\"2\" data-t=\"n\"><span class=\"th-text\">Share of Bucket Files</span></th>"
             "<th class=\"r num sort-h sort-desc\" data-i=\"3\" data-t=\"n\"><span class=\"th-text\">Bucket Bytes</span></th>"
             "<th class=\"r num sort-h\" data-i=\"4\" data-t=\"n\"><span class=\"th-text\">Share of Bucket Bytes</span></th>"
-            "<th class=\"r num sort-h\" data-i=\"5\" data-t=\"n\"><span class=\"th-text\">Total Files</span></th>"
-            "<th class=\"r num sort-h\" data-i=\"6\" data-t=\"n\"><span class=\"th-text\">Total Dirs</span></th>"
-            "<th class=\"r num sort-h\" data-i=\"7\" data-t=\"n\"><span class=\"th-text\">Total Bytes</span></th>"
-            "<th class=\"r num sort-h\" data-i=\"8\" data-t=\"n\"><span class=\"th-text\">Share of User Bytes</span></th>"
-            "<th class=\"r num sort-h\" data-i=\"9\" data-t=\"n\"><span class=\"th-text\">Share of User Files</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"5\" data-t=\"n\" title=\"Percent of bucket bytes whose ctime is substantially "
+            "newer than both atime and mtime (>=180 days). High values: metadata-led recency; possible chmod, chown, ACL, "
+            "rsync attrs, migration.\"><span class=\"th-text\">C-led bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"6\" data-t=\"n\"><span class=\"th-text\">Total Files</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"7\" data-t=\"n\"><span class=\"th-text\">Total Dirs</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"8\" data-t=\"n\"><span class=\"th-text\">Total Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"9\" data-t=\"n\"><span class=\"th-text\">Share of User Bytes</span></th>"
+            "<th class=\"r num sort-h\" data-i=\"10\" data-t=\"n\"><span class=\"th-text\">Share of User Files</span></th>"
             "</tr></thead>\n<tbody>\n");
 
     {
@@ -1805,17 +1864,24 @@ static void emit_path_summary_table(FILE *out,
         uint64_t max_total_files = 0;
         uint64_t max_total_dirs = 0;
         uint64_t max_total_bytes = 0;
+        double max_ctime_led_pct = 0.0;
         for (i = 0; i < shown_n; i++) {
+            double row_cl_pct = rows[i]->bucket_bytes
+                                  ? (100.0 * (double)rows[i]->bucket_ctime_led_bytes / (double)rows[i]->bucket_bytes)
+                                  : 0.0;
             if (rows[i]->total_files > max_total_files) max_total_files = rows[i]->total_files;
             if (rows[i]->total_dirs > max_total_dirs) max_total_dirs = rows[i]->total_dirs;
             if (rows[i]->total_bytes > max_total_bytes) max_total_bytes = rows[i]->total_bytes;
+            if (row_cl_pct > max_ctime_led_pct) max_ctime_led_pct = row_cl_pct;
         }
 
         for (i = 0; i < count && i < (size_t)BUCKET_PATH_TABLE_MAX_ROWS; i++) {
             char bb[32];
             char tb[32];
+            char cl_label[24];
             char file_bg[32];
             char byte_bg[32];
+            char cled_bg[32];
             char total_files_bg[32];
             char total_dirs_bg[32];
             char total_bytes_bg[32];
@@ -1835,16 +1901,24 @@ static void emit_path_summary_table(FILE *out,
                 max_total_dirs ? (100.0 * (double)rows[i]->total_dirs / (double)max_total_dirs) : 0.0;
             double total_bytes_heat =
                 max_total_bytes ? (100.0 * (double)rows[i]->total_bytes / (double)max_total_bytes) : 0.0;
+            double ctime_led_pct = rows[i]->bucket_bytes
+                                       ? (100.0 * (double)rows[i]->bucket_ctime_led_bytes / (double)rows[i]->bucket_bytes)
+                                       : 0.0;
+            double ctime_led_heat =
+                max_ctime_led_pct > 0.0 ? (100.0 * ctime_led_pct / max_ctime_led_pct) : 0.0;
 
             char bpf[96];
             char tpf[96];
 
             human_bytes(rows[i]->bucket_bytes, bb, sizeof(bb));
             human_bytes(rows[i]->total_bytes, tb, sizeof(tb));
+            format_ctime_led_share_label(rows[i]->bucket_ctime_led_bytes, rows[i]->bucket_bytes, cl_label,
+                                         sizeof(cl_label));
             format_count_pretty_inline(rows[i]->bucket_files, bpf, sizeof(bpf));
             format_count_pretty_inline(rows[i]->total_files, tpf, sizeof(tpf));
             contribution_cell_color(share_files, file_bg, sizeof(file_bg));
             bytes_share_cell_color(share_bytes, byte_bg, sizeof(byte_bg));
+            contribution_cell_color(ctime_led_heat, cled_bg, sizeof(cled_bg));
             contribution_cell_color(total_files_heat, total_files_bg, sizeof(total_files_bg));
             contribution_cell_color(total_dirs_heat, total_dirs_bg, sizeof(total_dirs_bg));
             bytes_share_cell_color(total_bytes_heat, total_bytes_bg, sizeof(total_bytes_bg));
@@ -1858,6 +1932,9 @@ static void emit_path_summary_table(FILE *out,
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
+                    "<td class=\"r num\" style=\"background:%s\" title=\"C-led %%: bytes whose ctime is substantially newer "
+                    "than atime and mtime (>=180 days). High values suggest metadata-only refresh (chmod, chown, ACL, rsync, "
+                    "migration).\" data-sort-n=\"%.17g\">%s<span class=\"path-ctime-led-pct\">%s</span></td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%" PRIu64 "</td>"
                     "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
@@ -1875,6 +1952,10 @@ static void emit_path_summary_table(FILE *out,
                     byte_bg,
                     share_bytes,
                     share_bytes,
+                    cled_bg,
+                    ctime_led_pct,
+                    rows[i]->bucket_ctime_led_bytes ? "<span class=\"path-ctime-led-badge\">C-led</span> " : "",
+                    cl_label,
                     total_files_bg,
                     rows[i]->total_files,
                     tpf,
@@ -2042,6 +2123,11 @@ static int emit_bucket_detail_page(const char *filename,
             ".heat-map-margins{font-size:12px;color:#555;margin:0 0 16px;line-height:1.5;max-width:none;width:100%%}\n");
     fprintf(out, ".heat-map-margins p{margin:6px 0 0}\n");
     fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
+    fprintf(out,
+            ".path-ctime-led-badge{font-size:9px;font-weight:700;line-height:1;padding:2px 6px;border-radius:999px;"
+            "background:rgba(109,40,217,0.92);color:#faf5ff;border:1px solid rgba(76,29,149,0.85);margin-right:6px;"
+            "vertical-align:middle;white-space:nowrap;display:inline-block}\n");
+    fprintf(out, ".path-ctime-led-pct{font-variant-numeric:tabular-nums}\n");
     fprintf(out, "</style>\n</head>\n<body>\n");
 
     fprintf(out, "<h1>Bucket Details</h1>\n<div class=\"meta\">");
@@ -2112,7 +2198,13 @@ static int emit_bucket_detail_page(const char *filename,
           "<p><strong>Sorting.</strong> Click a column header to sort; click again to reverse. "
           "The default is bucket bytes (largest first). The path column sorts by full path (A&ndash;Z).</p>\n"
           "<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
-          "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path.</p>\n"
+          "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path. "
+          "&ldquo;C-led bytes&rdquo; is the percent of those bucket bytes whose <em>ctime</em> is substantially newer than "
+          "both <em>atime</em> and <em>mtime</em> (here: at least <strong>180 days</strong> newer than the newer of the "
+          "two), suggesting apparent recency is metadata-led rather than usage- or content-led. High values may indicate "
+          "stale data artificially refreshed by metadata-only changes (e.g. <strong>chmod</strong>, <strong>chown</strong>, "
+          "<strong>ACL</strong> updates, <strong>rsync</strong> attribute updates, migration). The purple "
+          "<strong>C-led</strong> pill marks rows where that share is non-zero.</p>\n"
           "<p><strong>User share columns.</strong> &ldquo;Share of user bytes/files&rdquo; compares this path to <em>all</em> of the user&rsquo;s files across every bucket (overall footprint).</p>\n"
           "<p><strong>Totals under each path.</strong> Total files, dirs, and bytes include everything recorded below that directory prefix.</p>\n",
           out);
@@ -2410,10 +2502,15 @@ static void summary_merge(summary_t *dst, const summary_t *src) {
     dst->scanned_input_files += src->scanned_input_files;
     dst->bad_input_files += src->bad_input_files;
 
+    dst->total_ctime_led_bytes += src->total_ctime_led_bytes;
+    dst->total_ctime_led_files += src->total_ctime_led_files;
+
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
             dst->bytes[ab][sb] += src->bytes[ab][sb];
             dst->files[ab][sb] += src->files[ab][sb];
+            dst->ctime_led_bytes[ab][sb] += src->ctime_led_bytes[ab][sb];
+            dst->ctime_led_files[ab][sb] += src->ctime_led_files[ab][sb];
         }
     }
 }
@@ -2572,6 +2669,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             int sb = size_bucket_for(r.size);
             int ab = age_bucket_for(pick_time(&r, basis), now);
             int count_bytes = 1;
+            int ctime_led = record_ctime_led(&r);
 
             if (r.nlink > 1) {
                 int ins = inode_set_insert_if_new(seen_inodes, r.dev_major, r.dev_minor, r.inode);
@@ -2590,14 +2688,22 @@ static int read_one_chunk(const file_chunk_t *chunk,
             sum->files[ab][sb] += 1;
             accounted_size = count_bytes ? r.size : 0;
 
+            if (ctime_led) {
+                sum->ctime_led_files[ab][sb] += 1;
+                sum->total_ctime_led_files++;
+            }
             if (count_bytes) {
                 sum->total_capacity_bytes += r.size;
                 sum->total_bytes += r.size;
                 sum->bytes[ab][sb] += r.size;
+                if (ctime_led) {
+                    sum->ctime_led_bytes[ab][sb] += r.size;
+                    sum->total_ctime_led_bytes += r.size;
+                }
             }
 
             if (!skip_paths) {
-                if (bucket_details_append(&details[ab][sb], pathbuf, accounted_size) != 0) {
+                if (bucket_details_append(&details[ab][sb], pathbuf, accounted_size, ctime_led) != 0) {
                     fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
@@ -3095,8 +3201,15 @@ static int emit_html(const char *report_path,
     fprintf(out, ".stats-num-short{color:#555;font-size:12px;font-weight:500}\n");
     fprintf(out, ".stats-timing-foot{margin:10px 0 0;font-size:12px;color:#666;line-height:1.45}\n");
     fprintf(out, "table{border-collapse:collapse;margin-top:16px;min-width:900px}\n");
-    fprintf(out, ".heatmap-caption{caption-side:top;text-align:left;font-size:12px;color:#555;line-height:1.45;max-width:720px;margin:10px 0 12px;padding:0}\n");
-    fprintf(out, ".heatmap-totals-note{font-size:12px;color:#555;max-width:min(900px,100%%);margin:12px 0 18px;line-height:1.5;padding:0}\n");
+    fprintf(out,
+            ".bucket-help{margin:12px 0 18px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:none;"
+            "width:min(900px,100%%);font-size:13px;line-height:1.55;color:#555;box-sizing:border-box}\n");
+    fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
+    fprintf(out, ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n");
+    fprintf(out, ".bucket-help .bucket-help-body{padding:0 12px 12px}\n");
+    fprintf(out, ".bucket-help .bucket-help-body ul{margin:0;padding-left:1.35em}\n");
+    fprintf(out, ".bucket-help .bucket-help-body li{margin:0 0 8px;line-height:1.5}\n");
+    fprintf(out, ".bucket-help .bucket-help-body li:last-child{margin-bottom:0}\n");
     fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
     fprintf(out, "th{background:#f4f4f4}\n");
@@ -3132,6 +3245,10 @@ static int emit_html(const char *report_path,
     fprintf(out, ".cell-files-main{font-size:11px;font-weight:700;color:#1a1a1a;line-height:1.15;letter-spacing:-0.02em;"
                 "text-shadow:0 0 4px #fff,0 0 8px rgba(255,255,255,0.92);word-break:break-all}\n");
     fprintf(out, ".cell.active{outline:3px solid #2d6a9f;outline-offset:-3px}\n");
+    fprintf(out,
+            ".heat-ctime-led-badge{position:absolute;top:3px;left:4px;z-index:2;font-size:7px;font-weight:700;line-height:1;"
+            "padding:2px 5px;border-radius:4px;background:rgba(109,40,217,0.94);color:#faf5ff;border:1px solid rgba(76,29,149,0.88);"
+            "pointer-events:none;letter-spacing:0.02em;white-space:nowrap}\n");
     fprintf(out, ".drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.28);opacity:0;pointer-events:none;transition:opacity 0.2s ease;z-index:20}\n");
     fprintf(out, ".drawer-backdrop.open{opacity:1;pointer-events:auto}\n");
     fprintf(out,
@@ -3224,13 +3341,7 @@ static int emit_html(const char *report_path,
         }
     }
 
-    fprintf(out, "<table class=\"heatmap\">\n");
-    fprintf(out,
-            "<caption class=\"heatmap-caption\">Rows: file age (relative to the crawl basis). Columns: file size. Each cell is "
-            "split on the diagonal: upper-right shows data volume and share of total bytes (blue intensity); lower-left shows "
-            "file count with rounded millions/billions when large and share of total files (rose intensity). Inner bucket "
-            "colors peak at the largest age×size cell; row and column totals use the full corpus (100%%) as the color scale. "
-            "Displayed percentages are corpus shares. Regular files only; device/inode dedup.</caption>\n");
+    fprintf(out, "<table class=\"heatmap\" aria-label=\"File age by size heat map\">\n");
     fprintf(out, "<tr><th scope=\"col\" class=\"heatmap-corner\">Age \xc3\x97 Size</th>");
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         fprintf(out, "<th scope=\"col\" class=\"heatmap-th-x\">");
@@ -3242,6 +3353,7 @@ static int emit_html(const char *report_path,
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         uint64_t row_total = 0;
         uint64_t row_files = 0;
+        uint64_t row_ctime_led_bytes = 0;
 
         fprintf(out, "<tr><th scope=\"row\" class=\"heatmap-th-y\">");
         html_escape(out, age_bucket_names[ab]);
@@ -3253,13 +3365,16 @@ static int emit_html(const char *report_path,
             char bg_f[32];
             char f_main[48];
             char f_paren[80];
+            char led_lbl[24];
             double pct_b = 0.0;
             double pct_f = 0.0;
             uint64_t b = sum->bytes[ab][sb];
             uint64_t f = sum->files[ab][sb];
+            uint64_t cl_b = sum->ctime_led_bytes[ab][sb];
 
             row_total += b;
             row_files += f;
+            row_ctime_led_bytes += cl_b;
 
             if (sum->total_bytes) pct_b = 100.0 * (double)b / (double)sum->total_bytes;
             if (sum->total_files) pct_f = 100.0 * (double)f / (double)sum->total_files;
@@ -3267,9 +3382,23 @@ static int emit_html(const char *report_path,
             bytes_share_cell_color(heatmap_norm_pct(pct_b, max_inner_pct_b), bg_b, sizeof(bg_b));
             contribution_cell_color(heatmap_norm_pct(pct_f, max_inner_pct_f), bg_f, sizeof(bg_f));
             format_file_count_main_and_paren(f, pct_f, f_main, sizeof(f_main), f_paren, sizeof(f_paren));
+            format_ctime_led_share_label(cl_b, b, led_lbl, sizeof(led_lbl));
+
             fprintf(out,
                     "<td class=\"cell\"><a class=\"bucket-link cell-split\" data-age=\"%d\" data-size=\"%d\" "
-                    "href=\"bucket_a%d_s%d.html\">"
+                    "href=\"bucket_a%d_s%d.html\">",
+                    ab,
+                    sb,
+                    ab,
+                    sb);
+            if (cl_b > 0) {
+                fprintf(out,
+                        "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this cell where ctime is "
+                        "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
+                        "usage- or content-led apparent recency.\">C %s</span>",
+                        led_lbl);
+            }
+            fprintf(out,
                     "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                     "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
                     "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
@@ -3279,10 +3408,6 @@ static int emit_html(const char *report_path,
                     "<span class=\"cell-split-text cell-split-text-files\"><span class=\"cell-files-stack\"><span "
                     "class=\"cell-files-main\">%s</span><span class=\"cell-pct cell-pct-files\">%s</span></span></span>"
                     "</a></td>",
-                    ab,
-                    sb,
-                    ab,
-                    sb,
                     bg_b,
                     bg_f,
                     hb,
@@ -3297,6 +3422,7 @@ static int emit_html(const char *report_path,
             char bg_f[32];
             char rf_main[48];
             char rf_paren[80];
+            char row_led_lbl[24];
             double pct_b = 0.0;
             double pct_f = 0.0;
 
@@ -3306,8 +3432,16 @@ static int emit_html(const char *report_path,
             bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
             contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
             format_file_count_main_and_paren(row_files, pct_f, rf_main, sizeof(rf_main), rf_paren, sizeof(rf_paren));
+            format_ctime_led_share_label(row_ctime_led_bytes, row_total, row_led_lbl, sizeof(row_led_lbl));
+            fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
+            if (row_ctime_led_bytes > 0) {
+                fprintf(out,
+                        "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this age row where ctime is "
+                        "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
+                        "usage- or content-led apparent recency.\">C %s</span>",
+                        row_led_lbl);
+            }
             fprintf(out,
-                    "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
                     "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                     "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
                     "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
@@ -3332,17 +3466,20 @@ static int emit_html(const char *report_path,
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         uint64_t col_total = 0;
         uint64_t col_files = 0;
+        uint64_t col_ctime_led_bytes = 0;
         char hc[32];
         char bg_b[32];
         char bg_f[32];
         char cf_main[48];
         char cf_paren[80];
+        char col_led_lbl[24];
         double pct_b = 0.0;
         double pct_f = 0.0;
 
         for (ab = 0; ab < AGE_BUCKETS; ab++) {
             col_total += sum->bytes[ab][sb];
             col_files += sum->files[ab][sb];
+            col_ctime_led_bytes += sum->ctime_led_bytes[ab][sb];
         }
         if (sum->total_bytes) pct_b = 100.0 * (double)col_total / (double)sum->total_bytes;
         if (sum->total_files) pct_f = 100.0 * (double)col_files / (double)sum->total_files;
@@ -3350,8 +3487,16 @@ static int emit_html(const char *report_path,
         bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
         contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
         format_file_count_main_and_paren(col_files, pct_f, cf_main, sizeof(cf_main), cf_paren, sizeof(cf_paren));
+        format_ctime_led_share_label(col_ctime_led_bytes, col_total, col_led_lbl, sizeof(col_led_lbl));
+        fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
+        if (col_ctime_led_bytes > 0) {
+            fprintf(out,
+                    "<span class=\"heat-ctime-led-badge\" title=\"Percentage of bytes in this size column where ctime is "
+                    "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
+                    "usage- or content-led apparent recency.\">C %s</span>",
+                    col_led_lbl);
+        }
         fprintf(out,
-                "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
                 "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                 "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
                 "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
@@ -3374,13 +3519,22 @@ static int emit_html(const char *report_path,
         char bg_f[32];
         char tf_main[48];
         char tf_paren[80];
+        char tot_led_lbl[24];
 
         human_bytes(sum->total_bytes, ht, sizeof(ht));
         bytes_share_cell_color(heatmap_norm_pct(100.0, 100.0), bg_b, sizeof(bg_b));
         contribution_cell_color(heatmap_norm_pct(100.0, 100.0), bg_f, sizeof(bg_f));
         format_file_count_main_and_paren(sum->total_files, 100.0, tf_main, sizeof(tf_main), tf_paren, sizeof(tf_paren));
+        format_ctime_led_share_label(sum->total_ctime_led_bytes, sum->total_bytes, tot_led_lbl, sizeof(tot_led_lbl));
+        fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
+        if (sum->total_ctime_led_bytes > 0) {
+            fprintf(out,
+                    "<span class=\"heat-ctime-led-badge\" title=\"Percentage of all reported bytes where ctime is "
+                    "substantially newer than both atime and mtime (>=180 days), suggesting metadata-led rather than "
+                    "usage- or content-led apparent recency.\">C %s</span>",
+                    tot_led_lbl);
+        }
         fprintf(out,
-                "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">"
                 "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                 "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
                 "<span class=\"cell-split-part cell-split-files\" style=\"background:%s\"></span>"
@@ -3400,12 +3554,37 @@ static int emit_html(const char *report_path,
 
     fprintf(out, "</table>\n");
 
-    fprintf(out,
-            "<p class=\"heatmap-totals-note\"><strong>Row and column totals.</strong> The rightmost column is the total for "
-            "each age <em>row</em> (sum over all size buckets). The bottom row is the total for each size <em>column</em> "
-            "(sum over all age buckets). The bottom-right cell is the total across the full heat map; it matches the sum "
-            "of the row totals and the sum of the column totals. Heat colors: inner cells peak at the largest age×size bucket; "
-            "row totals, column totals, and the corner scale vs the full corpus (100%%).</p>\n");
+    fputs("<details class=\"bucket-help\"><summary>How to read this heat map</summary>\n"
+          "<div class=\"bucket-help-body\"><ul>\n"
+          "<li><strong>Axes.</strong> Rows are file age from the report time basis (<em>atime</em>, <em>mtime</em>, "
+          "<em>ctime</em>, or <em>effective</em>: newest of the three). Columns are file size bands.</li>\n"
+          "<li><strong>Split cells.</strong> Each cell is divided on the diagonal: upper-right is data volume and share of "
+          "total bytes (blue intensity); lower-left is file count (rounded millions/billions when large) and share of "
+          "total files (rose intensity).</li>\n"
+          "<li><strong>Color scale.</strong> Inner age&times;size cells peak at the largest bucket in the grid; row "
+          "totals, column totals, and the corner cell use the full corpus (100%) as the reference so their hues reflect "
+          "share of everything reported.</li>\n"
+          "<li><strong>Percentages and scope.</strong> Shown percentages are corpus shares. Only regular files; "
+          "device/inode dedup applies as elsewhere in the report.</li>\n"
+          "<li><strong>Timestamps (Linux).</strong> <em>atime</em> &mdash; last time file data was read (often not "
+          "updated on every read: <em>relatime</em>, mount options). <em>mtime</em> &mdash; last time file "
+          "<strong>contents</strong> were modified. <em>ctime</em> &mdash; last time <strong>inode metadata</strong> "
+          "changed (mode, owner, link count; not file creation time on Linux).</li>\n"
+          "<li><strong>C-led badge.</strong> The purple <strong>C</strong> is the <strong>percentage of bytes</strong> in "
+          "that slice where <em>ctime</em> is <strong>substantially</strong> newer than both <em>atime</em> and "
+          "<em>mtime</em>, suggesting the data&rsquo;s apparent recency is <strong>metadata-led</strong> rather than "
+          "<strong>usage-</strong> or <strong>content-led</strong>. Here &ldquo;substantially&rdquo; is defined as at "
+          "least <strong>180 days</strong> newer than the newer of <em>atime</em> and <em>mtime</em>.</li>\n"
+          "<li><strong>C-led % (interpretation).</strong> This is the percent of bytes whose <em>ctime</em> is much "
+          "newer than both <em>atime</em> and <em>mtime</em> (same 180-day rule). <strong>High values</strong> suggest "
+          "<strong>stale data</strong> that may have been artificially refreshed by metadata-only changes such as "
+          "<strong>chmod</strong>, <strong>chown</strong>, <strong>ACL</strong> updates, <strong>rsync</strong> attribute "
+          "updates, or <strong>migration</strong> activity.</li>\n"
+          "<li><strong>Margins.</strong> The rightmost column totals each age row (sum over size buckets). The bottom row "
+          "totals each size column (sum over age buckets). The bottom-right cell is the full heat-map total and matches "
+          "both the sum of row totals and the sum of column totals.</li>\n"
+          "</ul></div></details>\n",
+          out);
 
     {
         char totalb[32];
@@ -3800,12 +3979,16 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n",
+                "Usage: %s [--bucket-details N] [--report-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] "
+                "[bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]  (all users → "
-                "./all_users/)\n",
+                "       %s [--bucket-details N] [--report-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]  "
+                "(all users → ./all_users/)\n",
                 argv[0]);
+        fprintf(stderr,
+                "Default when the time argument is omitted (single-user form): effective = max(atime,mtime,ctime) "
+                "for age buckets. First arg matches a time keyword only when exact.\n");
         fprintf(stderr, "Optional --bucket-details N (1…%d): full per-bucket directory tables; omit for brief buckets.\n",
                 BUCKET_DETAIL_LEVELS_MAX);
         fprintf(stderr,
@@ -3879,7 +4062,9 @@ int main(int argc, char **argv) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "ereport: missing arguments (need a time basis, or username and time basis)\n");
+        fprintf(stderr,
+                "ereport: missing arguments (pass a crawl directory, or a time basis, or user plus optional time "
+                "basis)\n");
         return 2;
     }
 
@@ -3916,55 +4101,95 @@ int main(int argc, char **argv) {
             }
         }
     } else {
-        if (argc < 3) {
-            fprintf(stderr,
-                    "Usage: %s [--bucket-details N] [--report-dir DIR] <username|uid> <atime|mtime|ctime> [bin_dir ...]\n",
-                    argv[0]);
-            fprintf(stderr,
-                    "       %s [--bucket-details N] [--report-dir DIR] <atime|mtime|ctime> [bin_dir ...]  (all users → "
-                    "./all_users/)\n",
-                    argv[0]);
-            fprintf(stderr,
-                    "Optional --bucket-details N (1…%d); optional --report-dir DIR; omit for brief bucket pages / cwd. "
-                    "Thread count: EREPORT_THREADS (default %d).\n",
-                    BUCKET_DETAIL_LEVELS_MAX, DEFAULT_THREADS);
-            return 2;
-        }
-
         user_spec = argv[1];
-        basis_str = argv[2];
 
-        {
-            int ai = 3;
-            bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
-            if (!bin_dirs) die("allocation failed");
-            while (ai < argc) {
-                if (argv[ai][0] == '-') {
-                    fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+        if (argc >= 3 && parse_time_basis(argv[2], &basis) == 0) {
+            basis_str = argv[2];
+            all_users_mode = 0;
+            if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
+                fprintf(stderr, "unknown user or uid: %s\n", user_spec);
+                return 1;
+            }
+            {
+                int ai = 3;
+                bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
+                if (!bin_dirs) die("allocation failed");
+                while (ai < argc) {
+                    if (argv[ai][0] == '-') {
+                        fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                        free((void *)bin_dirs);
+                        return 2;
+                    }
+                    bin_dirs[bin_dir_count++] = argv[ai];
+                    ai++;
+                }
+                if (bin_dir_count == 0) {
                     free((void *)bin_dirs);
+                    bin_dirs = (const char **)malloc(sizeof(char *));
+                    if (!bin_dirs) die("allocation failed");
+                    bin_dirs[0] = ".";
+                    bin_dir_count = 1;
+                }
+            }
+        } else {
+            if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) == 0) {
+                all_users_mode = 0;
+                basis = TIME_EFFECTIVE;
+                basis_str = "effective";
+                {
+                    int ai = 2;
+                    bin_dirs = (const char **)calloc((size_t)(argc > 2 ? (size_t)(argc - 2) : 1), sizeof(char *));
+                    if (!bin_dirs) die("allocation failed");
+                    while (ai < argc) {
+                        if (argv[ai][0] == '-') {
+                            fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n",
+                                    argv[ai]);
+                            free((void *)bin_dirs);
+                            return 2;
+                        }
+                        bin_dirs[bin_dir_count++] = argv[ai];
+                        ai++;
+                    }
+                    if (bin_dir_count == 0) {
+                        free((void *)bin_dirs);
+                        bin_dirs = (const char **)malloc(sizeof(char *));
+                        if (!bin_dirs) die("allocation failed");
+                        bin_dirs[0] = ".";
+                        bin_dir_count = 1;
+                    }
+                }
+            } else {
+                all_users_mode = 1;
+                basis = TIME_EFFECTIVE;
+                basis_str = "effective";
+                target_uid = (uid_t)0;
+                if (snprintf(display_name, sizeof(display_name), "all_users") >= (int)sizeof(display_name)) {
+                    fprintf(stderr, "ereport: output name too long\n");
                     return 2;
                 }
-                bin_dirs[bin_dir_count++] = argv[ai];
-                ai++;
+                {
+                    int ai = 1;
+                    bin_dirs = (const char **)calloc((size_t)(argc > 1 ? (size_t)(argc - 1) : 1), sizeof(char *));
+                    if (!bin_dirs) die("allocation failed");
+                    while (ai < argc) {
+                        if (argv[ai][0] == '-') {
+                            fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n",
+                                    argv[ai]);
+                            free((void *)bin_dirs);
+                            return 2;
+                        }
+                        bin_dirs[bin_dir_count++] = argv[ai];
+                        ai++;
+                    }
+                    if (bin_dir_count == 0) {
+                        free((void *)bin_dirs);
+                        bin_dirs = (const char **)malloc(sizeof(char *));
+                        if (!bin_dirs) die("allocation failed");
+                        bin_dirs[0] = ".";
+                        bin_dir_count = 1;
+                    }
+                }
             }
-            if (bin_dir_count == 0) {
-                free((void *)bin_dirs);
-                bin_dirs = (const char **)malloc(sizeof(char *));
-                if (!bin_dirs) die("allocation failed");
-                bin_dirs[0] = ".";
-                bin_dir_count = 1;
-            }
-        }
-
-        if (parse_time_basis(basis_str, &basis) != 0) {
-            free((void *)bin_dirs);
-            die("time basis must be one of: atime, mtime, ctime");
-        }
-
-        if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) != 0) {
-            fprintf(stderr, "unknown user or uid: %s\n", user_spec);
-            free((void *)bin_dirs);
-            return 1;
         }
     }
 

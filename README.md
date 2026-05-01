@@ -236,7 +236,7 @@ ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
 
 ### `ereport`
 
-`ereport` reads crawl output and builds an HTML report under **`./<username>/`** (resolved login name), unless that name is unusable—then it falls back to `./tmp/`. If you **omit the username** and pass only the time basis (`./ereport atime …`), it aggregates **all UIDs** present in the crawl and writes under **`./all_users/`**.
+`ereport` reads crawl output and builds an HTML report under **`./<username>/`** (resolved login name), unless that name is unusable—then it falls back to `./tmp/`. If you **omit the username** and pass only the time basis (`./ereport atime …`), it aggregates **all UIDs** present in the crawl and writes under **`./all_users/`**. If the **first token is not** a time keyword and **does not** resolve as a login/UID, it is treated as the first **`bin_dir`** and the run is **all-users** with **effective** age buckets (**`max(atime,mtime,ctime)`** per file). For **single-user** runs, omitting the time argument also selects **effective**.
 
 Outputs:
 
@@ -253,13 +253,13 @@ Place **`--bucket-details N`** (`N` = **1…32**) **first**, before the username
 Usage:
 
 ```bash
-./ereport [--bucket-details N] <username|uid> <atime|mtime|ctime> [bin_dir ...]
-./ereport [--bucket-details N] <atime|mtime|ctime> [bin_dir ...]   # all users → ./all_users/
+./ereport [--bucket-details N] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+./ereport [--bucket-details N] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
 ```
 
 If you **omit every `bin_dir`**, `ereport` reads crawl `.bin` files from the **current working directory** (`./`).
 
-The **first argument** is treated as a time basis (`atime`, `mtime`, or `ctime`) only when it matches exactly—otherwise it is interpreted as a username or numeric UID (so you cannot name an account literally `atime` without passing it as a UID).
+The **first argument** is treated as a time basis (`atime`, `mtime`, `ctime`, or **`effective`**) only when it matches exactly—otherwise it is interpreted as a username or numeric UID, or (if that fails) as the start of the **`bin_dir`** list for an **all-users** run with **effective** time. You cannot name an account literally `atime` without resolving that ambiguity (e.g. numeric UID).
 
 Thread count: set **`EREPORT_THREADS`** (default **32**). This controls parallel **`.bin` chunk readers** during the scan, **parallel emission of `bucket_aX_sY.html`** (36 heat-map cells), and the **stats** thread. It is **not** set on the command line.
 
@@ -278,6 +278,9 @@ EREPORT_THREADS=16 ./ereport mtime crawl_srv01 crawl_srv02
 EREPORT_THREADS=64 ./ereport ctime /path/to/crawl
 ./ereport --bucket-details 3 alice mtime crawl_out
 ./ereport --bucket-details 3 mtime crawl_srv01 crawl_srv02
+./ereport alice /tmp/crawl-out                               # single-user, effective time (default)
+./ereport effective /tmp/crawl-out                          # all-users, explicit effective
+./ereport /tmp/crawl-out                                    # all-users effective if path is not a user name
 ```
 
 Parse chunks scale with input `.bin` size so parallel workers are not capped by a tiny chunk count.
