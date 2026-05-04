@@ -13,6 +13,8 @@
  *   - Workers may donate batches of accumulated subdirectories back to the global queue.
  *   - Crawl workers only crawl and enqueue record batches.
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output.
+ *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
+ *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
  *   - Existing shard files are appended to, never truncated.
  *   - Rolling 10-second stats are printed once per second.
  *   - Live stats always show q, t, p, and wq even when zero.
@@ -44,6 +46,7 @@
 #include <sys/sysmacros.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/statvfs.h>
 #include <stdatomic.h>
 #include <dirent.h>
 #include <limits.h>
@@ -85,6 +88,8 @@
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
+#define DISK_SPACE_CHECK_INTERVAL_SEC 30
+#define DISK_MIN_FREE_BYTES ((uint64_t)(10ULL * 1024 * 1024 * 1024))
 
 #define LOCAL_STACK_DONATE_FLOOR 8
 #define DONATE_CHUNK_MIN 4
@@ -337,6 +342,9 @@ static int g_verbose_interval_minutes = 5;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
+static atomic_uint g_disk_low = 0;
+static atomic_uint g_disk_monitor_stop = 0;
+static atomic_uint g_disk_wait_disabled = 0;
 static char g_output_dir[PATH_MAX] = ".";
 /* When set, bin records store paths under this root instead of the physical crawl start-path. */
 static char g_record_root_buf[PATH_MAX];
@@ -2076,12 +2084,85 @@ static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_inde
     return 0;
 }
 
+static void writer_wait_disk_ok(void) {
+    if (g_no_write) return;
+    for (;;) {
+        if (atomic_load_explicit(&g_disk_wait_disabled, memory_order_acquire)) return;
+        if (!atomic_load_explicit(&g_disk_low, memory_order_acquire)) return;
+        {
+            struct timespec ts;
+
+            ts.tv_sec = 0;
+            ts.tv_nsec = 100000000L;
+            nanosleep(&ts, NULL);
+        }
+    }
+}
+
+static void *disk_monitor_thread_main(void *arg) {
+    int show_paused = 0;
+    int s;
+
+    (void)arg;
+
+    for (;;) {
+        struct statvfs sv;
+        uint64_t avail = 0;
+        int err = 0;
+        int have = 0;
+
+        if (atomic_load_explicit(&g_disk_monitor_stop, memory_order_acquire)) break;
+
+        if (statvfs(g_output_dir, &sv) != 0) {
+            err = errno;
+            have = 0;
+        } else if (sv.f_frsize == 0) {
+            err = EINVAL;
+            have = 0;
+        } else {
+            avail = (uint64_t)sv.f_bavail * (uint64_t)sv.f_frsize;
+            have = 1;
+        }
+
+        if (!have || avail < DISK_MIN_FREE_BYTES) {
+            if (!show_paused) {
+                if (!have)
+                    fprintf(stderr, "PAUSE ecrawl: statvfs(%s) failed: %s — shard writes paused until check succeeds\n",
+                            g_output_dir, strerror(err));
+                else
+                    fprintf(stderr,
+                            "PAUSE ecrawl: output filesystem free space %" PRIu64 " bytes (minimum %" PRIu64 " bytes) — shard writes paused\n",
+                            avail, (uint64_t)DISK_MIN_FREE_BYTES);
+                fflush(stderr);
+                show_paused = 1;
+            }
+            atomic_store_explicit(&g_disk_low, 1U, memory_order_release);
+        } else {
+            if (show_paused) {
+                fprintf(stderr, "RESUME ecrawl: output filesystem free space %" PRIu64 " bytes — continuing shard writes\n", avail);
+                fflush(stderr);
+                show_paused = 0;
+            }
+            atomic_store_explicit(&g_disk_low, 0U, memory_order_release);
+        }
+
+        for (s = 0; s < DISK_SPACE_CHECK_INTERVAL_SEC; s++) {
+            if (atomic_load_explicit(&g_disk_monitor_stop, memory_order_relaxed)) break;
+            sleep(1);
+        }
+    }
+
+    return NULL;
+}
+
 static int writer_process_batch(uint32_t writer_index,
                                 shard_file_state_t *shards,
                                 unsigned *open_count,
                                 uint64_t *tick,
                                 record_batch_t *batch) {
     size_t off = 0;
+
+    writer_wait_disk_ok();
 
     if (atomic_load(&g_fd_pressure) && *open_count > 1U) {
         writer_trim_shards(shards, writer_index, g_uid_shards, open_count, *open_count / 2U);
@@ -2405,8 +2486,10 @@ int main(int argc, char **argv) {
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
+    pthread_t disk_monitor_thread;
     pthread_t verbose_periodic_thread;
     int verbose_periodic_started = 0;
+    int disk_monitor_started = 0;
     double t0, t1;
     int worker_count_started = 0;
     int positional_count = 0;
@@ -2650,6 +2733,9 @@ int main(int argc, char **argv) {
     atomic_store(&g_main_done, 0);
     atomic_store(&g_fd_pressure, 0);
     atomic_store(&g_writer_failed, 0);
+    atomic_store(&g_disk_low, 0);
+    atomic_store(&g_disk_monitor_stop, 0);
+    atomic_store(&g_disk_wait_disabled, 0);
     atomic_store(&g_tasks_popped, 0);
     atomic_store(&g_writer_queue_depth, 0);
     atomic_store(&g_batches_enqueued, 0);
@@ -2697,11 +2783,32 @@ int main(int argc, char **argv) {
             return 1;
         }
         g_writer_threads = writer_threads_used;
+        if (pthread_create(&disk_monitor_thread, NULL, disk_monitor_thread_main, NULL) != 0) {
+            fprintf(stderr, "ERROR failed to create disk space monitor thread\n");
+            atomic_store(&g_disk_wait_disabled, 1);
+            for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
+            for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
+            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
+            free(writer_queues);
+            free(writer_threads);
+            free(writer_args);
+            queue_destroy(&queue);
+            pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+            if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+            if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+            return 1;
+        }
+        disk_monitor_started = 1;
     }
 
     if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
         fprintf(stderr, "ERROR failed to create stats thread\n");
         if (!g_no_write) {
+            atomic_store(&g_disk_wait_disabled, 1);
+            atomic_store(&g_disk_monitor_stop, 1);
+            if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
+            disk_monitor_started = 0;
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
             for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
         }
@@ -2730,6 +2837,10 @@ int main(int argc, char **argv) {
         pthread_join(stats_thread, NULL);
         clear_status_line();
         if (!g_no_write) {
+            atomic_store(&g_disk_wait_disabled, 1);
+            atomic_store(&g_disk_monitor_stop, 1);
+            if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
+            disk_monitor_started = 0;
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
             for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
         }
@@ -2802,8 +2913,11 @@ int main(int argc, char **argv) {
     }
 
     if (!g_no_write) {
+        atomic_store(&g_disk_wait_disabled, 1);
         for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
         for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
+        atomic_store(&g_disk_monitor_stop, 1);
+        if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
     }
 
     if (stats_thread_started) {
