@@ -15,8 +15,11 @@
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output.
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
- *   - Existing shard files are appended to, never truncated.
- *   - Rolling 10-second stats are printed once per second.
+ *   - Each run clears prior crawl outputs in the chosen output-dir: uid_shard_*.bin, matching *.bin.ckpt,
+ *     and crawl_manifest.txt (uid.txt/gid.txt are reopened truncated). An interrupted crawl has nothing to
+ *     resume across runs; only in-process shard reopen (LRU) reloads checkpoints for shards written this run.
+ *   - Rolling 10-second stats are printed once per second on a TTY only; omitted when stdout
+ *     is redirected so logs are not filled with carriage-return lines.
  *   - Live stats always show q, t, p, and wq even when zero.
  *
  * Build:
@@ -567,8 +570,8 @@ static void format_duration(double sec, char *out, size_t out_sz) {
 }
 
 static void clear_status_line(void) {
-    if (isatty(STDOUT_FILENO)) printf("\r\033[2K\r");
-    else printf("\r%160s\r", "");
+    if (!isatty(STDOUT_FILENO)) return;
+    printf("\r\033[2K\r");
     fflush(stdout);
 }
 
@@ -945,6 +948,48 @@ static int ensure_output_dir_exists(const char *path) {
     return counted_mkdir(path, 0775) == 0 ? 0 : -1;
 }
 
+static int crawl_output_artifact_should_delete(const char *name) {
+    size_t len = strlen(name);
+
+    if (strcmp(name, "crawl_manifest.txt") == 0) return 1;
+    if (len < 15 || strncmp(name, "uid_shard_", 10) != 0) return 0;
+    if (len >= 19 && strcmp(name + len - 9, ".bin.ckpt") == 0) return 1;
+    return strcmp(name + len - 4, ".bin") == 0;
+}
+
+/* Remove leftover shard binaries/manifest from a previous run; interrupted crawls are not resumed. */
+static int crawl_output_dir_scrub_prior_artifacts(void) {
+    DIR *dir;
+    struct dirent *de;
+    char path[PATH_MAX];
+    int n;
+
+    dir = counted_opendir(g_output_dir);
+    if (!dir) {
+        fprintf(stderr, "ERROR cannot open output directory %s: %s\n", g_output_dir, strerror(errno));
+        return -1;
+    }
+    while ((de = counted_readdir(dir)) != NULL) {
+        const char *name = de->d_name;
+        if (name[0] == '.') continue;
+        if (!crawl_output_artifact_should_delete(name)) continue;
+        n = snprintf(path, sizeof(path), "%s/%s", g_output_dir, name);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            fprintf(stderr, "ERROR crawl scrub path too long under %s\n", g_output_dir);
+            counted_closedir(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (unlink(path) != 0 && errno != ENOENT) {
+            fprintf(stderr, "ERROR unlink %s: %s\n", path, strerror(errno));
+            counted_closedir(dir);
+            return -1;
+        }
+    }
+    counted_closedir(dir);
+    return 0;
+}
+
 static int build_default_output_dir(char *out, size_t out_sz) {
     static const char *months[] = {
         "jan", "feb", "mar", "apr", "may", "jun",
@@ -992,34 +1037,6 @@ static int build_default_output_dir(char *out, size_t out_sz) {
 static int build_shard_path(uint32_t shard, char *out, size_t out_sz) {
     int n = snprintf(out, out_sz, "%s/uid_shard_%0*u.bin", g_output_dir, g_shard_digits, shard);
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
-}
-
-static int inspect_existing_shard(const char *path, uint64_t *size_out, int *valid_out) {
-    struct stat st;
-    FILE *fp = NULL;
-    bin_file_header_t hdr;
-
-    *size_out = 0;
-    *valid_out = 0;
-
-    if (counted_stat(path, &st) != 0) {
-        if (errno == ENOENT) return 0;
-        return -1;
-    }
-
-    *size_out = (uint64_t)st.st_size;
-    if (st.st_size == 0) return 0;
-
-    fp = counted_fopen(path, "rb");
-    if (!fp) return -1;
-
-    if (fread(&hdr, sizeof(hdr), 1, fp) == 1 &&
-        crawl_bin_hdr_magic_ok(hdr.magic, hdr.version, FORMAT_VERSION)) {
-        *valid_out = 1;
-    }
-
-    counted_fclose(fp);
-    return 0;
 }
 
 static int ckpt_sidecar_path(const char *bin_path, char *out, size_t out_sz) {
@@ -1188,6 +1205,7 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
 fail:
     counted_fclose(fp);
     free(buf);
+    if (errno == 0) errno = EINVAL;
     return -1;
 }
 
@@ -1201,14 +1219,19 @@ static int shard_ckpt_load_for_append(shard_file_state_t *s, const char *bin_pat
         s->ckpt_n = rn;
         s->ckpt_cap = rn;
         s->seg_start_byte = rd[rn - 1];
+        errno = 0;
         return 0;
     }
+    /* Missing *.bin.ckpt is normal; do not leak ENOENT into rebuild failure reporting. */
+    if (errno == ENOENT) errno = 0;
     if (shard_ckpt_rebuild_scan(bin_path, file_sz, &rd, &rn, &s->seg_start_byte) == 0) {
         s->ckpt_offs = rd;
         s->ckpt_n = rn;
         s->ckpt_cap = rn;
+        errno = 0;
         return 0;
     }
+    if (errno == 0 || errno == ENOENT) errno = EINVAL;
     return -1;
 }
 
@@ -1911,21 +1934,23 @@ static void *stats_thread_main(void *arg) {
             human_decimal(ops_rate, re, sizeof(re));
             format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
-            if (!g_verbose) {
-                printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | el:%s            ",
-                       re, te, tf, td, ts, elapsed_buf);
-            } else {
-                unsigned long long qdepth = atomic_load(&g_queue_depth);
-                unsigned long long popped = atomic_load(&g_tasks_popped);
-                unsigned long long writer_qdepth = atomic_load(&g_writer_queue_depth);
-                int active = atomic_load(&g_active_workers);
-                char pp[32];
+            if (isatty(STDOUT_FILENO)) {
+                if (!g_verbose) {
+                    printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | el:%s            ",
+                           re, te, tf, td, ts, elapsed_buf);
+                } else {
+                    unsigned long long qdepth = atomic_load(&g_queue_depth);
+                    unsigned long long popped = atomic_load(&g_tasks_popped);
+                    unsigned long long writer_qdepth = atomic_load(&g_writer_queue_depth);
+                    int active = atomic_load(&g_active_workers);
+                    char pp[32];
 
-                human_decimal((double)popped, pp, sizeof(pp));
-                printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s | el:%s            ",
-                       re, te, tf, td, ts, qdepth, writer_qdepth, active, pp, elapsed_buf);
+                    human_decimal((double)popped, pp, sizeof(pp));
+                    printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s | el:%s            ",
+                           re, te, tf, td, ts, qdepth, writer_qdepth, active, pp, elapsed_buf);
+                }
+                fflush(stdout);
             }
-            fflush(stdout);
         }
     }
 
@@ -2045,21 +2070,7 @@ static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_inde
     }
 
     if (!state->initialized) {
-        uint64_t sz = 0;
-        int valid = 0;
-        if (build_shard_path(shard, path, sizeof(path)) != 0) return -1;
-        for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
-            if (inspect_existing_shard(path, &sz, &valid) == 0) break;
-            if (errno != EMFILE || retry == EMFILE_RETRY_LIMIT) return -1;
-            atomic_store(&g_fd_pressure, 1U);
-            writer_close_lru_shard(shards, writer_index, uid_shards, open_count);
-            emfile_retry_pause(retry);
-        }
-        if (sz != 0 && !valid) {
-            errno = EINVAL;
-            return -1;
-        }
-        state->bytes_written = sz;
+        state->bytes_written = 0;
         state->initialized = 1;
     }
 
@@ -2139,7 +2150,9 @@ static void *disk_monitor_thread_main(void *arg) {
             atomic_store_explicit(&g_disk_low, 1U, memory_order_release);
         } else {
             if (show_paused) {
-                fprintf(stderr, "RESUME ecrawl: output filesystem free space %" PRIu64 " bytes — continuing shard writes\n", avail);
+                fprintf(stderr,
+                        "CONTINUE ecrawl: output filesystem free space %" PRIu64 " bytes — shard writes unpaused\n",
+                        avail);
                 fflush(stderr);
                 show_paused = 0;
             }
@@ -2176,8 +2189,14 @@ static int writer_process_batch(uint32_t writer_index,
         memcpy(&frame, batch->data + off, sizeof(frame));
         off += sizeof(frame);
 
-        if (frame.shard >= g_uid_shards || off + frame.data_len > batch->len) return -1;
-        if ((frame.shard % (uint32_t)g_writer_threads) != writer_index) return -1;
+        if (frame.shard >= g_uid_shards || off + frame.data_len > batch->len) {
+            errno = EINVAL;
+            return -1;
+        }
+        if ((frame.shard % (uint32_t)g_writer_threads) != writer_index) {
+            errno = EINVAL;
+            return -1;
+        }
 
         if (writer_acquire_shard(shards, writer_index, frame.shard, g_uid_shards,
                                  g_max_open_shards, open_count, tick, &fp) != 0) {
@@ -2189,7 +2208,10 @@ static int writer_process_batch(uint32_t writer_index,
             uint64_t rec_start = st->bytes_written;
 
             if (rec_start - st->seg_start_byte >= CRAWL_CKPT_STRIDE_BYTES) {
-                if (shard_ckpt_push(st, rec_start) != 0) return -1;
+                if (shard_ckpt_push(st, rec_start) != 0) {
+                    if (errno == 0) errno = ENOMEM;
+                    return -1;
+                }
                 st->seg_start_byte = rec_start;
             }
         }
@@ -2200,7 +2222,11 @@ static int writer_process_batch(uint32_t writer_index,
         off += frame.data_len;
     }
 
-    return (off == batch->len) ? 0 : -1;
+    if (off != batch->len) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
 }
 
 static void *writer_thread_main(void *arg_void) {
@@ -2631,6 +2657,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (path_resolve_inplace(g_output_dir, sizeof(g_output_dir), "ecrawl: output-dir ") != 0) return 1;
+
+        if (crawl_output_dir_scrub_prior_artifacts() != 0) return 1;
 
         {
             char uid_path[PATH_MAX];
