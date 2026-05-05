@@ -42,6 +42,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
 
 #include "crawl_ckpt.h"
 #include "path_canon.h"
@@ -138,7 +139,7 @@ static int is_uid_shard_bin_name(const char *name);
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--dry-run] [--verbose] <crawl-output-dir>\n"
-            "  Writes uid_shard_*.bin.ckpt next to ecrawl v%u shard files (full scan).\n"
+            "  Default: writes uid_shard_*.bin.ckpt next to ecrawl v%u shard files (full scan).\n"
             "  Non-current bin headers are rewritten to %s v%u after a successful record scan.\n"
             "  Parallel threads: ECRAWL_REPAIR_THREADS (default %u).\n"
             "  Truncates tail when the record stream fails at an incomplete last record; else corrupt "
