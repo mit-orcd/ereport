@@ -12,6 +12,9 @@
  *   - Workers traverse directories iteratively with a local stack.
  *   - Workers may donate batches of accumulated subdirectories back to the global queue.
  *   - Crawl workers only crawl and enqueue record batches.
+ *   - Parallel stat pool (ECRAWL_STAT_THREADS, default 8; set 0 to disable): one readdir hop per directory while
+ *     crawl workers batch non-directory names and stat threads run fstatat concurrently (bounded queue + chunk size).
+ *     Default ECRAWL_STAT_RANDOM_QUEUE=1 dequeues pending batches in pseudo-random order (set 0 for FIFO).
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output.
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
@@ -29,7 +32,7 @@
  *   ./ecrawl [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]
  *   --verbose: full metrics to stderr every N minutes (default 5); optional integer sets N.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
- * ECRAWL_WRITER_THREADS, ECRAWL_UID_SHARDS
+ * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
  */
 
 #define _XOPEN_SOURCE 700
@@ -91,6 +94,10 @@
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
+#define DEFAULT_STAT_THREADS 8
+#define DEFAULT_STAT_RANDOM_QUEUE 1
+#define DEFAULT_STAT_BATCH_ENTRIES 1024U
+#define DEFAULT_STAT_QUEUE_BATCHES 64U
 #define DISK_SPACE_CHECK_INTERVAL_SEC 30
 #define DISK_MIN_FREE_BYTES ((uint64_t)(10ULL * 1024 * 1024 * 1024))
 
@@ -239,7 +246,41 @@ typedef struct {
     crawl_stats_t stats;
     perf_local_t perf;
     worker_aux_stats_t aux;
+    pthread_mutex_t emit_stats_lock;
 } worker_arg_t;
+
+typedef struct stat_batch stat_batch_t;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_nonempty;
+    pthread_cond_t cond_nonfull;
+    stat_batch_t **slots;
+    size_t q_count;
+    size_t q_max;
+    int stop;
+    int nthreads;
+    pthread_t *threads;
+} stat_pool_t;
+
+struct stat_batch {
+    struct stat_batch *queue_next; /* unused; kept for stable struct layout */
+    int dirfd_dup;
+    const char *parent_path;
+    size_t parent_len;
+    unsigned char *names_blob;
+    size_t names_blob_len;
+    size_t name_count;
+    worker_arg_t *owner;
+    emit_context_t *emit_ctx;
+    dir_work_t *discovered;
+    size_t discovered_count;
+    size_t discovered_cap;
+    pthread_mutex_t discovered_mutex;
+    pthread_mutex_t done_mutex;
+    pthread_cond_t done_cond;
+    int finished;
+};
 
 struct task_node {
     dir_work_t *items;
@@ -309,8 +350,16 @@ static atomic_ullong g_tasks_popped        = 0;
 static atomic_ullong g_writer_queue_depth  = 0;
 static atomic_ullong g_batches_enqueued    = 0;
 static atomic_ullong g_batches_dequeued    = 0;
+static atomic_ullong g_stat_batches_enqueued   = 0;
+static atomic_ullong g_stat_batches_completed  = 0;
+static atomic_ullong g_stat_batches_dup_fallback = 0;
+static atomic_ullong g_wait_stat_pop      = 0;
+static atomic_ullong g_wait_stat_enqueue  = 0;
+static atomic_ullong g_stat_queue_depth_max = 0;
 
-/* pthread_cond_wait wakeups (cheap relaxed atomics); high counts suggest queue starvation. */
+/* pthread_cond_wait wakeups (cheap relaxed atomics); high counts suggest queue starvation.
+ * Stat pool: wait_stat_pop = workers blocked on empty queue; wait_stat_enqueue = crawl blocked on full queue;
+ * stat_queue_depth_max = peak pending batches (cap = stat_queue_max_batches). */
 static atomic_ullong g_wait_crawl_tasks = 0;
 static atomic_ullong g_wait_writer_push = 0;
 static atomic_ullong g_wait_writer_pop  = 0;
@@ -343,6 +392,12 @@ static int g_no_write = 0;
 static int g_verbose = 0;
 static int g_verbose_interval_minutes = 5;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
+static int g_stat_threads_configured = 0;
+static size_t g_stat_batch_entries_cfg = DEFAULT_STAT_BATCH_ENTRIES;
+static size_t g_stat_queue_max_batches_cfg = DEFAULT_STAT_QUEUE_BATCHES;
+static int g_stat_random_queue_dequeue = 0;
+static stat_pool_t g_stat_pool;
+static int g_stat_pool_ready = 0;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
 static atomic_uint g_disk_low = 0;
@@ -454,6 +509,56 @@ static int parse_ecrawl_crawl_threads(void) {
     return (int)t;
 }
 
+/* Parallel stat workers for megadir non-directory dirents. Env: ECRAWL_STAT_THREADS (default DEFAULT_STAT_THREADS; 0 = off). */
+static int parse_ecrawl_stat_threads(void) {
+    const char *e = getenv("ECRAWL_STAT_THREADS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_THREADS;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 0 || t > (long)INT_MAX) return DEFAULT_STAT_THREADS;
+    return (int)t;
+}
+
+static size_t parse_ecrawl_stat_batch_entries(void) {
+    const char *e = getenv("ECRAWL_STAT_BATCH_ENTRIES");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_BATCH_ENTRIES;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 64UL || v > 65536UL) return DEFAULT_STAT_BATCH_ENTRIES;
+    return (size_t)v;
+}
+
+static size_t parse_ecrawl_stat_queue_batches(void) {
+    const char *e = getenv("ECRAWL_STAT_QUEUE_BATCHES");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_QUEUE_BATCHES;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 4UL || v > 4096UL) return DEFAULT_STAT_QUEUE_BATCHES;
+    return (size_t)v;
+}
+
+/* Stat batch dequeue order: non-zero = pseudo-random (default); 0 = FIFO. Env: ECRAWL_STAT_RANDOM_QUEUE. */
+static int parse_ecrawl_stat_random_queue(void) {
+    const char *e = getenv("ECRAWL_STAT_RANDOM_QUEUE");
+    long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_RANDOM_QUEUE;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno || end == e || *end) return DEFAULT_STAT_RANDOM_QUEUE;
+    return v != 0 ? 1 : 0;
+}
+
 /* Writer thread count for uid-sharded output. Default: DEFAULT_WRITER_THREADS. */
 static int parse_ecrawl_writer_threads_env(void) {
     const char *e = getenv("ECRAWL_WRITER_THREADS");
@@ -465,6 +570,19 @@ static int parse_ecrawl_writer_threads_env(void) {
     t = strtol(e, &end, 10);
     if (errno || end == e || *end || t < 1 || t > 4096) return DEFAULT_WRITER_THREADS;
     return (int)t;
+}
+
+/* Pending record batches cap per writer queue. Env: ECRAWL_WRITER_QUEUE_BATCHES. */
+static unsigned parse_ecrawl_writer_queue_batches_env(void) {
+    const char *e = getenv("ECRAWL_WRITER_QUEUE_BATCHES");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_WRITER_QUEUE_BATCHES;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 4UL || v > 4096UL) return DEFAULT_WRITER_QUEUE_BATCHES;
+    return (unsigned)v;
 }
 
 /* Per-writer shard cache target. Auto-capped against RLIMIT_NOFILE later. */
@@ -916,12 +1034,21 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr,
             "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
-            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_UID_SHARDS (power of 2, default %u), "
-            "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE).\n",
+            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
+            "ECRAWL_UID_SHARDS (power of 2, default %u), "
+            "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE), "
+            "ECRAWL_STAT_THREADS (parallel stat workers, default %d; 0=off), "
+            "ECRAWL_STAT_BATCH_ENTRIES (default %u, range 64..65536), "
+            "ECRAWL_STAT_QUEUE_BATCHES (pending stat batches cap, default %u), "
+            "ECRAWL_STAT_RANDOM_QUEUE (default 1: random stat-batch dequeue; 0=FIFO).\n",
             DEFAULT_CRAWL_THREADS,
             DEFAULT_WRITER_THREADS,
+            (unsigned)DEFAULT_WRITER_QUEUE_BATCHES,
             (unsigned)DEFAULT_UID_SHARDS,
-            DEFAULT_MAX_OPEN_SHARDS);
+            DEFAULT_MAX_OPEN_SHARDS,
+            DEFAULT_STAT_THREADS,
+            (unsigned)DEFAULT_STAT_BATCH_ENTRIES,
+            (unsigned)DEFAULT_STAT_QUEUE_BATCHES);
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
@@ -1712,13 +1839,536 @@ static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, wor
     return 0;
 }
 
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+    size_t count;
+} stat_names_builder_t;
+
+typedef struct {
+    stat_batch_t **items;
+    size_t count;
+    size_t cap;
+} stat_pending_vec_t;
+
+static void stat_names_builder_clear(stat_names_builder_t *nb) {
+    if (!nb) return;
+    nb->len = 0;
+    nb->count = 0;
+}
+
+static void stat_names_builder_free(stat_names_builder_t *nb) {
+    if (!nb) return;
+    free(nb->buf);
+    nb->buf = NULL;
+    nb->len = nb->cap = nb->count = 0;
+}
+
+static int stat_names_builder_append(stat_names_builder_t *nb, const char *name, size_t name_len) {
+    size_t need;
+
+    if (!nb || !name) return -1;
+    need = name_len + 1;
+    if (nb->len + need > nb->cap) {
+        size_t nc = nb->cap ? nb->cap * 2 : 4096;
+        while (nb->len + need > nc) {
+            if (nc >= (((size_t)1) << (sizeof(size_t) * 8 - 2))) return -1;
+            nc *= 2;
+        }
+        {
+            unsigned char *p = (unsigned char *)realloc(nb->buf, nc);
+            if (!p) return -1;
+            nb->buf = p;
+            nb->cap = nc;
+        }
+    }
+    memcpy(nb->buf + nb->len, name, name_len);
+    nb->buf[nb->len + name_len] = '\0';
+    nb->len += need;
+    nb->count++;
+    return 0;
+}
+
+static void stat_pending_vec_free(stat_pending_vec_t *v) {
+    if (!v) return;
+    free(v->items);
+    v->items = NULL;
+    v->count = v->cap = 0;
+}
+
+static int stat_pending_push(stat_pending_vec_t *v, stat_batch_t *b) {
+    if (!v || !b) return -1;
+    if (v->count >= v->cap) {
+        size_t nc = v->cap ? v->cap * 2 : 8;
+        stat_batch_t **ni = (stat_batch_t **)realloc(v->items, nc * sizeof(*ni));
+        if (!ni) return -1;
+        v->items = ni;
+        v->cap = nc;
+    }
+    v->items[v->count++] = b;
+    return 0;
+}
+
+static stat_batch_t *stat_batch_create(void) {
+    stat_batch_t *b = (stat_batch_t *)calloc(1, sizeof(*b));
+
+    if (!b) return NULL;
+    b->dirfd_dup = -1;
+    if (pthread_mutex_init(&b->discovered_mutex, NULL) != 0) {
+        free(b);
+        return NULL;
+    }
+    if (pthread_mutex_init(&b->done_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&b->discovered_mutex);
+        free(b);
+        return NULL;
+    }
+    if (pthread_cond_init(&b->done_cond, NULL) != 0) {
+        pthread_mutex_destroy(&b->done_mutex);
+        pthread_mutex_destroy(&b->discovered_mutex);
+        free(b);
+        return NULL;
+    }
+    return b;
+}
+
+static void stat_batch_destroy(stat_batch_t *b) {
+    size_t i;
+
+    if (!b) return;
+    if (b->dirfd_dup >= 0) {
+        close(b->dirfd_dup);
+        b->dirfd_dup = -1;
+    }
+    free(b->names_blob);
+    pthread_mutex_lock(&b->discovered_mutex);
+    for (i = 0; i < b->discovered_count; i++) free(b->discovered[i].path);
+    free(b->discovered);
+    b->discovered = NULL;
+    pthread_mutex_unlock(&b->discovered_mutex);
+    pthread_mutex_destroy(&b->discovered_mutex);
+    pthread_mutex_destroy(&b->done_mutex);
+    pthread_cond_destroy(&b->done_cond);
+    free(b);
+}
+
+static int stat_batch_discovered_append(stat_batch_t *b, char *path_owned, size_t path_len, const struct stat *st) {
+    pthread_mutex_lock(&b->discovered_mutex);
+    if (b->discovered_count >= b->discovered_cap) {
+        size_t nc = b->discovered_cap ? b->discovered_cap * 2 : 8;
+        dir_work_t *nw = (dir_work_t *)realloc(b->discovered, nc * sizeof(*nw));
+
+        if (!nw) {
+            pthread_mutex_unlock(&b->discovered_mutex);
+            free(path_owned);
+            return -1;
+        }
+        b->discovered = nw;
+        b->discovered_cap = nc;
+    }
+    b->discovered[b->discovered_count].path = path_owned;
+    b->discovered[b->discovered_count].path_len = path_len;
+    if (st) {
+        b->discovered[b->discovered_count].st = *st;
+        b->discovered[b->discovered_count].have_stat = 1;
+    } else {
+        memset(&b->discovered[b->discovered_count].st, 0, sizeof(struct stat));
+        b->discovered[b->discovered_count].have_stat = 0;
+    }
+    b->discovered_count++;
+    pthread_mutex_unlock(&b->discovered_mutex);
+    return 0;
+}
+
+static void stat_batch_wait_done(stat_batch_t *b) {
+    pthread_mutex_lock(&b->done_mutex);
+    while (!b->finished) pthread_cond_wait(&b->done_cond, &b->done_mutex);
+    pthread_mutex_unlock(&b->done_mutex);
+}
+
+static void merge_discovered_from_batch(stat_batch_t *batch, dir_stack_t *stack, task_queue_t *queue,
+                                        worker_aux_stats_t *aux, shared_state_t *shared) {
+    size_t i;
+
+    pthread_mutex_lock(&batch->discovered_mutex);
+    for (i = 0; i < batch->discovered_count; i++) {
+        dir_work_t *w = &batch->discovered[i];
+
+        if (!w->path) continue;
+        if (dir_stack_push_take(stack, w->path, w->path_len, w->have_stat ? &w->st : NULL) != 0) {
+            fprintf(stderr, "ERROR worker stack push %s: %s\n", w->path, strerror(errno));
+            free(w->path);
+            stats_add_error(shared);
+        }
+        w->path = NULL;
+    }
+    batch->discovered_count = 0;
+    pthread_mutex_unlock(&batch->discovered_mutex);
+
+    while (should_donate_work(shared, stack)) {
+        if (donate_stack_chunk(stack, queue, aux) != 0) {
+            fprintf(stderr, "ERROR worker donate chunk: %s\n", strerror(errno));
+            stats_add_error(shared);
+            break;
+        }
+    }
+}
+
+static void stat_pending_drain_all(stat_pending_vec_t *v, dir_stack_t *stack, task_queue_t *queue,
+                                   worker_aux_stats_t *aux, shared_state_t *shared) {
+    size_t i;
+
+    for (i = 0; i < v->count; i++) {
+        stat_batch_t *b = v->items[i];
+
+        stat_batch_wait_done(b);
+        merge_discovered_from_batch(b, stack, queue, aux, shared);
+        stat_batch_destroy(b);
+    }
+    v->count = 0;
+}
+
+static void process_stat_batch_worker(stat_batch_t *batch) {
+    unsigned char *p = batch->names_blob;
+    unsigned char *end = batch->names_blob + batch->names_blob_len;
+    worker_arg_t *wa = batch->owner;
+    emit_context_t *emit = batch->emit_ctx;
+
+    while (p < end) {
+        const char *name = (const char *)p;
+        size_t nl = strlen(name);
+        struct stat child_st;
+
+        if (nl == 0) break;
+        p += nl + 1;
+
+        if (counted_fstatat_nofollow(batch->dirfd_dup, name, &child_st) != 0) {
+            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", batch->parent_path, name, strerror(errno));
+            stats_add_error(wa->shared);
+            continue;
+        }
+        if (S_ISDIR(child_st.st_mode)) {
+            char *child_path_owned;
+            size_t child_path_len;
+
+            if (path_join_alloc(batch->parent_path, batch->parent_len, name, nl, &child_path_owned, &child_path_len) != 0) {
+                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", batch->parent_path, name, strerror(errno));
+                stats_add_error(wa->shared);
+                continue;
+            }
+            if (stat_batch_discovered_append(batch, child_path_owned, child_path_len, &child_st) != 0)
+                stats_add_error(wa->shared);
+        } else {
+            pthread_mutex_lock(&wa->emit_stats_lock);
+            record_ids_from_stat(&child_st);
+            account_entry_local(wa->shared, &wa->stats, &wa->perf, &child_st);
+            if (!g_no_write) {
+                char child[PATH_MAX];
+                size_t child_path_len =
+                    batch->parent_len + nl + ((batch->parent_len == 1 && batch->parent_path[0] == '/') ? 0U : 1U);
+
+                if (path_join_fast(batch->parent_path, batch->parent_len, name, nl, child, sizeof(child)) != 0) {
+                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", batch->parent_path, name);
+                    stats_add_error(wa->shared);
+                    pthread_mutex_unlock(&wa->emit_stats_lock);
+                    continue;
+                }
+                if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                    fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                    stats_add_error(wa->shared);
+                }
+            }
+            pthread_mutex_unlock(&wa->emit_stats_lock);
+        }
+    }
+
+    if (batch->dirfd_dup >= 0) {
+        close(batch->dirfd_dup);
+        batch->dirfd_dup = -1;
+    }
+
+    atomic_fetch_add_explicit(&g_stat_batches_completed, 1ULL, memory_order_relaxed);
+
+    pthread_mutex_lock(&batch->done_mutex);
+    batch->finished = 1;
+    pthread_cond_broadcast(&batch->done_cond);
+    pthread_mutex_unlock(&batch->done_mutex);
+}
+
+static __thread unsigned int g_stat_dequeue_rng;
+
+static size_t stat_queue_pick_dequeue_idx(size_t n) {
+    if (n <= 1) return 0;
+    if (!g_stat_random_queue_dequeue) return 0;
+    if (g_stat_dequeue_rng == 0)
+        g_stat_dequeue_rng = (unsigned int)((uintptr_t)pthread_self() ^ (uintptr_t)clock());
+    return (size_t)((unsigned long long)rand_r(&g_stat_dequeue_rng) * (unsigned long long)n /
+                    ((unsigned long long)RAND_MAX + 1ULL));
+}
+
+static void *stat_worker_main(void *arg) {
+    (void)arg;
+
+    for (;;) {
+        stat_batch_t *batch = NULL;
+
+        pthread_mutex_lock(&g_stat_pool.mutex);
+        for (;;) {
+            if (g_stat_pool.q_count > 0) {
+                size_t n = g_stat_pool.q_count;
+                size_t idx = stat_queue_pick_dequeue_idx(n);
+
+                batch = g_stat_pool.slots[idx];
+                if (g_stat_random_queue_dequeue && n > 1) {
+                    g_stat_pool.slots[idx] = g_stat_pool.slots[n - 1];
+                } else if (n > 1) {
+                    memmove(g_stat_pool.slots, g_stat_pool.slots + 1, (n - 1) * sizeof(stat_batch_t *));
+                }
+                g_stat_pool.q_count--;
+                pthread_cond_signal(&g_stat_pool.cond_nonfull);
+                break;
+            }
+            if (g_stat_pool.stop) {
+                pthread_mutex_unlock(&g_stat_pool.mutex);
+                return NULL;
+            }
+            atomic_fetch_add_explicit(&g_wait_stat_pop, 1ULL, memory_order_relaxed);
+            pthread_cond_wait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex);
+        }
+        pthread_mutex_unlock(&g_stat_pool.mutex);
+
+        process_stat_batch_worker(batch);
+    }
+}
+
+static void stat_queue_track_depth_max_locked(size_t depth) {
+    unsigned long long cur;
+    unsigned long long d = (unsigned long long)depth;
+
+    do {
+        cur = atomic_load_explicit(&g_stat_queue_depth_max, memory_order_relaxed);
+        if (d <= cur) break;
+    } while (!atomic_compare_exchange_weak_explicit(&g_stat_queue_depth_max, &cur, d, memory_order_relaxed,
+                                                     memory_order_relaxed));
+}
+
+static int stat_batch_enqueue(stat_batch_t *batch) {
+    pthread_mutex_lock(&g_stat_pool.mutex);
+    while (g_stat_pool.q_count >= g_stat_pool.q_max && !g_stat_pool.stop) {
+        atomic_fetch_add_explicit(&g_wait_stat_enqueue, 1ULL, memory_order_relaxed);
+        pthread_cond_wait(&g_stat_pool.cond_nonfull, &g_stat_pool.mutex);
+    }
+    if (g_stat_pool.stop) {
+        pthread_mutex_unlock(&g_stat_pool.mutex);
+        return -1;
+    }
+    batch->queue_next = NULL;
+    g_stat_pool.slots[g_stat_pool.q_count++] = batch;
+    stat_queue_track_depth_max_locked(g_stat_pool.q_count);
+    pthread_cond_signal(&g_stat_pool.cond_nonempty);
+    pthread_mutex_unlock(&g_stat_pool.mutex);
+    return 0;
+}
+
+static int stat_pool_start(void) {
+    size_t i;
+
+    if (g_stat_threads_configured <= 0) return 0;
+    memset(&g_stat_pool, 0, sizeof(g_stat_pool));
+    g_stat_pool.q_max = g_stat_queue_max_batches_cfg;
+    if (pthread_mutex_init(&g_stat_pool.mutex, NULL) != 0) return -1;
+    if (pthread_cond_init(&g_stat_pool.cond_nonempty, NULL) != 0) {
+        pthread_mutex_destroy(&g_stat_pool.mutex);
+        return -1;
+    }
+    if (pthread_cond_init(&g_stat_pool.cond_nonfull, NULL) != 0) {
+        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
+        pthread_mutex_destroy(&g_stat_pool.mutex);
+        return -1;
+    }
+    g_stat_pool.slots = (stat_batch_t **)calloc(g_stat_pool.q_max, sizeof(stat_batch_t *));
+    if (!g_stat_pool.slots) {
+        pthread_cond_destroy(&g_stat_pool.cond_nonfull);
+        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
+        pthread_mutex_destroy(&g_stat_pool.mutex);
+        memset(&g_stat_pool, 0, sizeof(g_stat_pool));
+        return -1;
+    }
+    g_stat_pool.threads =
+        (pthread_t *)calloc((size_t)g_stat_threads_configured, sizeof(*g_stat_pool.threads));
+    if (!g_stat_pool.threads) {
+        free(g_stat_pool.slots);
+        pthread_cond_destroy(&g_stat_pool.cond_nonfull);
+        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
+        pthread_mutex_destroy(&g_stat_pool.mutex);
+        memset(&g_stat_pool, 0, sizeof(g_stat_pool));
+        return -1;
+    }
+    for (i = 0; i < (size_t)g_stat_threads_configured; i++) {
+        if (pthread_create(&g_stat_pool.threads[i], NULL, stat_worker_main, NULL) != 0) {
+            pthread_mutex_lock(&g_stat_pool.mutex);
+            g_stat_pool.stop = 1;
+            pthread_cond_broadcast(&g_stat_pool.cond_nonempty);
+            pthread_cond_broadcast(&g_stat_pool.cond_nonfull);
+            pthread_mutex_unlock(&g_stat_pool.mutex);
+            while (i > 0) pthread_join(g_stat_pool.threads[--i], NULL);
+            free(g_stat_pool.threads);
+            free(g_stat_pool.slots);
+            pthread_cond_destroy(&g_stat_pool.cond_nonfull);
+            pthread_cond_destroy(&g_stat_pool.cond_nonempty);
+            pthread_mutex_destroy(&g_stat_pool.mutex);
+            memset(&g_stat_pool, 0, sizeof(g_stat_pool));
+            return -1;
+        }
+        g_stat_pool.nthreads++;
+    }
+    g_stat_pool_ready = 1;
+    return 0;
+}
+
+static void stat_pool_stop(void) {
+    size_t i;
+
+    if (!g_stat_pool_ready) return;
+    pthread_mutex_lock(&g_stat_pool.mutex);
+    g_stat_pool.stop = 1;
+    pthread_cond_broadcast(&g_stat_pool.cond_nonempty);
+    pthread_cond_broadcast(&g_stat_pool.cond_nonfull);
+    pthread_mutex_unlock(&g_stat_pool.mutex);
+    for (i = 0; i < (size_t)g_stat_pool.nthreads; i++) pthread_join(g_stat_pool.threads[i], NULL);
+    free(g_stat_pool.threads);
+    g_stat_pool.threads = NULL;
+    g_stat_pool.nthreads = 0;
+    free(g_stat_pool.slots);
+    g_stat_pool.slots = NULL;
+    pthread_mutex_destroy(&g_stat_pool.mutex);
+    pthread_cond_destroy(&g_stat_pool.cond_nonempty);
+    pthread_cond_destroy(&g_stat_pool.cond_nonfull);
+    memset(&g_stat_pool, 0, sizeof(g_stat_pool));
+    g_stat_pool_ready = 0;
+}
+
+static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *parent_path, size_t parent_len,
+                              worker_arg_t *wa, emit_context_t *emit, dir_stack_t *stack, task_queue_t *queue,
+                              worker_aux_stats_t *aux, stat_pending_vec_t *pend) {
+    stat_batch_t *b;
+    int dfd;
+    shared_state_t *shared = wa->shared;
+
+    if (!nb || nb->count == 0) return 0;
+
+    dfd = dup(dir_fd);
+    if (dfd < 0) {
+        unsigned char *p = nb->buf;
+        unsigned char *end = nb->buf + nb->len;
+
+        while (p < end) {
+            const char *name = (const char *)p;
+            size_t nl = strlen(name);
+            struct stat child_st;
+
+            if (nl == 0) break;
+            p += nl + 1;
+
+            if (counted_fstatat_nofollow(dir_fd, name, &child_st) != 0) {
+                fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", parent_path, name, strerror(errno));
+                stats_add_error(shared);
+                continue;
+            }
+            if (S_ISDIR(child_st.st_mode)) {
+                char *child_path_owned;
+                size_t child_path_len;
+
+                if (path_join_alloc(parent_path, parent_len, name, nl, &child_path_owned, &child_path_len) != 0) {
+                    fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", parent_path, name, strerror(errno));
+                    stats_add_error(shared);
+                    continue;
+                }
+                if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                    fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                    free(child_path_owned);
+                    stats_add_error(shared);
+                    continue;
+                }
+                while (should_donate_work(shared, stack)) {
+                    if (donate_stack_chunk(stack, queue, aux) != 0) {
+                        fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", parent_path, strerror(errno));
+                        stats_add_error(shared);
+                        break;
+                    }
+                }
+            } else {
+                record_ids_from_stat(&child_st);
+                account_entry_local(shared, &wa->stats, &wa->perf, &child_st);
+                if (!g_no_write) {
+                    char child[PATH_MAX];
+                    size_t child_path_len =
+                        parent_len + nl + ((parent_len == 1 && parent_path[0] == '/') ? 0U : 1U);
+
+                    if (path_join_fast(parent_path, parent_len, name, nl, child, sizeof(child)) != 0) {
+                        fprintf(stderr, "ERROR worker path too long: %s/%s\n", parent_path, name);
+                        stats_add_error(shared);
+                        continue;
+                    }
+                    if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                        fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                        stats_add_error(shared);
+                    }
+                }
+            }
+        }
+        stat_names_builder_clear(nb);
+        atomic_fetch_add_explicit(&g_stat_batches_dup_fallback, 1ULL, memory_order_relaxed);
+        return 0;
+    }
+
+    b = stat_batch_create();
+    if (!b) {
+        fprintf(stderr, "ERROR stat batch OOM\n");
+        stats_add_error(shared);
+        close(dfd);
+        return -1;
+    }
+    b->dirfd_dup = dfd;
+    b->parent_path = parent_path;
+    b->parent_len = parent_len;
+    b->names_blob = nb->buf;
+    b->names_blob_len = nb->len;
+    b->name_count = nb->count;
+    b->owner = wa;
+    b->emit_ctx = emit;
+
+    nb->buf = NULL;
+    nb->cap = 0;
+    stat_names_builder_clear(nb);
+
+    if (stat_pending_push(pend, b) != 0) {
+        fprintf(stderr, "ERROR stat pending OOM\n");
+        stats_add_error(shared);
+        stat_batch_destroy(b);
+        return -1;
+    }
+    if (stat_batch_enqueue(b) != 0) {
+        fprintf(stderr, "ERROR stat enqueue (pool stopped)\n");
+        stats_add_error(shared);
+        pend->count--;
+        stat_batch_destroy(b);
+        return -1;
+    }
+    atomic_fetch_add_explicit(&g_stat_batches_enqueued, 1ULL, memory_order_relaxed);
+    return 0;
+}
+
 static int process_directory_iterative(dir_stack_t *stack,
-                                       shared_state_t *shared,
-                                       crawl_stats_t *stats,
-                                       perf_local_t *perf,
-                                       worker_aux_stats_t *aux,
+                                       worker_arg_t *wa,
                                        emit_context_t *emit,
                                        task_queue_t *queue) {
+    shared_state_t *shared = wa->shared;
+    crawl_stats_t *stats = &wa->stats;
+    perf_local_t *perf = &wa->perf;
+    worker_aux_stats_t *aux = &wa->aux;
+
     while (stack->count > 0) {
         dir_work_t work;
         char *dir_path;
@@ -1782,58 +2432,38 @@ static int process_directory_iterative(dir_stack_t *stack,
                 continue;
             }
 
-            while ((ent = counted_readdir(dir)) != NULL) {
-                size_t child_name_len;
-                struct stat child_st;
+            if (g_stat_threads_configured > 0) {
+                stat_names_builder_t nb;
+                stat_pending_vec_t pend;
+
+                memset(&nb, 0, sizeof(nb));
+                memset(&pend, 0, sizeof(pend));
+
+                while ((ent = counted_readdir(dir)) != NULL) {
+                    size_t child_name_len;
 #if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
-                unsigned char child_d_type = ent->d_type;
+                    unsigned char child_d_type = ent->d_type;
 #else
-                unsigned char child_d_type = DT_UNKNOWN;
+                    unsigned char child_d_type = DT_UNKNOWN;
 #endif
 
-                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
 
-                child_name_len = strlen(ent->d_name);
-                if (child_d_type == DT_DIR) {
-                    char *child_path_owned;
-                    size_t child_path_len;
-
-                    if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
-                                        &child_path_owned, &child_path_len) != 0) {
-                        fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
-                        fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
-                        free(child_path_owned);
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    while (should_donate_work(shared, stack)) {
-                        if (donate_stack_chunk(stack, queue, aux) != 0) {
-                            fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
-                            stats_add_error(shared);
-                            break;
-                        }
-                    }
-                } else {
-                    if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
-                        fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
-                        stats_add_error(shared);
-                        continue;
-                    }
-                    if (S_ISDIR(child_st.st_mode)) {
+                    child_name_len = strlen(ent->d_name);
+                    if (child_d_type == DT_DIR) {
                         char *child_path_owned;
                         size_t child_path_len;
 
+                        stat_pending_drain_all(&pend, stack, queue, aux, shared);
+
                         if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
                                             &child_path_owned, &child_path_len) != 0) {
-                            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
+                            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name,
+                                    strerror(errno));
                             stats_add_error(shared);
                             continue;
                         }
-                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
                             fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
                             free(child_path_owned);
                             stats_add_error(shared);
@@ -1847,21 +2477,124 @@ static int process_directory_iterative(dir_stack_t *stack,
                             }
                         }
                     } else {
-                        record_ids_from_stat(&child_st);
-                        account_entry_local(shared, stats, perf, &child_st);
-                        if (!g_no_write) {
-                            char child[PATH_MAX];
-                            size_t child_path_len = dir_path_len + child_name_len +
-                                                    ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+                        if (stat_names_builder_append(&nb, ent->d_name, child_name_len) != 0) {
+                            fprintf(stderr, "ERROR worker stat batch append %s/%s: %s\n", dir_path, ent->d_name,
+                                    strerror(errno));
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        if (nb.count >= g_stat_batch_entries_cfg) {
+                            if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
+                                                   &pend) != 0) {
+                                stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                                counted_closedir(dir);
+                                stat_names_builder_free(&nb);
+                                stat_pending_vec_free(&pend);
+                                free(dir_path);
+                                goto outer_continue;
+                            }
+                        }
+                    }
+                }
 
-                            if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) != 0) {
-                                fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux, &pend) != 0) {
+                    stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                    counted_closedir(dir);
+                    stat_names_builder_free(&nb);
+                    stat_pending_vec_free(&pend);
+                    free(dir_path);
+                    goto outer_continue;
+                }
+                stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                stat_names_builder_free(&nb);
+                stat_pending_vec_free(&pend);
+            } else {
+                while ((ent = counted_readdir(dir)) != NULL) {
+                    size_t child_name_len;
+                    struct stat child_st;
+#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
+                    unsigned char child_d_type = ent->d_type;
+#else
+                    unsigned char child_d_type = DT_UNKNOWN;
+#endif
+
+                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+                    child_name_len = strlen(ent->d_name);
+                    if (child_d_type == DT_DIR) {
+                        char *child_path_owned;
+                        size_t child_path_len;
+
+                        if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                            &child_path_owned, &child_path_len) != 0) {
+                            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name,
+                                    strerror(errno));
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
+                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                            free(child_path_owned);
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        while (should_donate_work(shared, stack)) {
+                            if (donate_stack_chunk(stack, queue, aux) != 0) {
+                                fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
+                                stats_add_error(shared);
+                                break;
+                            }
+                        }
+                    } else {
+                        if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        if (S_ISDIR(child_st.st_mode)) {
+                            char *child_path_owned;
+                            size_t child_path_len;
+
+                            if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                                &child_path_owned, &child_path_len) != 0) {
+                                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name,
+                                        strerror(errno));
                                 stats_add_error(shared);
                                 continue;
                             }
-                            if (emit_record(emit, child, child_path_len, &child_st) != 0) {
-                                fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                            if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
+                                fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                                free(child_path_owned);
                                 stats_add_error(shared);
+                                continue;
+                            }
+                            while (should_donate_work(shared, stack)) {
+                                if (donate_stack_chunk(stack, queue, aux) != 0) {
+                                    fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path,
+                                            strerror(errno));
+                                    stats_add_error(shared);
+                                    break;
+                                }
+                            }
+                        } else {
+                            record_ids_from_stat(&child_st);
+                            account_entry_local(shared, stats, perf, &child_st);
+                            if (!g_no_write) {
+                                char child[PATH_MAX];
+                                size_t child_path_len = dir_path_len + child_name_len +
+                                                        ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+
+                                if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child,
+                                                   sizeof(child)) != 0) {
+                                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                                    stats_add_error(shared);
+                                    continue;
+                                }
+                                if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                                    fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+                                    stats_add_error(shared);
+                                }
                             }
                         }
                     }
@@ -1871,6 +2604,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
         counted_closedir(dir);
         free(dir_path);
+    outer_continue:;
     }
 
     return 0;
@@ -1972,7 +2706,7 @@ static void *worker_thread_main(void *arg_void) {
 
         if (queue_pop_wait(arg->queue, &task) != 0) break;
 
-        process_directory_iterative(&task, arg->shared, &arg->stats, &arg->perf, &arg->aux, &emit, arg->queue);
+        process_directory_iterative(&task, arg, &emit, arg->queue);
         atomic_fetch_sub(&g_active_workers, 1);
 
         if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
@@ -2345,6 +3079,8 @@ static void print_queue_wait_metrics_to(FILE *fp) {
     fprintf(fp, "wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
     fprintf(fp, "wait_writer_push=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_push));
     fprintf(fp, "wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
+    fprintf(fp, "wait_stat_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_pop));
+    fprintf(fp, "wait_stat_enqueue=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_enqueue));
 }
 
 static void print_queue_wait_metrics(void) { print_queue_wait_metrics_to(stdout); }
@@ -2402,6 +3138,14 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "uid_shard_digits=%d\n", g_shard_digits);
     fprintf(fp, "writer_threads=%d\n", writer_threads_used);
     fprintf(fp, "crawl_threads=%d\n", g_crawl_threads);
+    fprintf(fp, "stat_threads=%d\n", g_stat_threads_configured);
+    fprintf(fp, "stat_batch_entries=%zu\n", g_stat_batch_entries_cfg);
+    fprintf(fp, "stat_queue_max_batches=%zu\n", g_stat_queue_max_batches_cfg);
+    fprintf(fp, "stat_random_queue_dequeue=%d\n", g_stat_random_queue_dequeue);
+    fprintf(fp, "stat_batches_enqueued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_enqueued));
+    fprintf(fp, "stat_batches_completed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_completed));
+    fprintf(fp, "stat_batches_dup_fallback=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_dup_fallback));
+    fprintf(fp, "stat_queue_depth_max=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_queue_depth_max));
     fprintf(fp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
     fprintf(fp, "writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
     fprintf(fp, "record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
@@ -2527,6 +3271,7 @@ int main(int argc, char **argv) {
     int hardlink_registry_ready = 0;
     int stats_thread_started = 0;
     int i;
+    int j;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-write") == 0) {
@@ -2635,8 +3380,13 @@ int main(int argc, char **argv) {
     }
 
     g_crawl_threads = parse_ecrawl_crawl_threads();
+    g_stat_threads_configured = parse_ecrawl_stat_threads();
+    g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
+    g_stat_queue_max_batches_cfg = parse_ecrawl_stat_queue_batches();
+    g_stat_random_queue_dequeue = parse_ecrawl_stat_random_queue();
     g_uid_shards = parse_ecrawl_uid_shards_env();
     g_writer_threads = parse_ecrawl_writer_threads_env();
+    g_writer_queue_batches = parse_ecrawl_writer_queue_batches_env();
     if ((uint32_t)g_writer_threads > g_uid_shards) g_writer_threads = (int)g_uid_shards;
     g_requested_max_open_shards = parse_ecrawl_max_open_shards_env();
     configure_max_open_shards();
@@ -2768,6 +3518,12 @@ int main(int argc, char **argv) {
     atomic_store(&g_writer_queue_depth, 0);
     atomic_store(&g_batches_enqueued, 0);
     atomic_store(&g_batches_dequeued, 0);
+    atomic_store(&g_stat_batches_enqueued, 0);
+    atomic_store(&g_stat_batches_completed, 0);
+    atomic_store(&g_stat_batches_dup_fallback, 0);
+    atomic_store(&g_wait_stat_pop, 0);
+    atomic_store(&g_wait_stat_enqueue, 0);
+    atomic_store(&g_stat_queue_depth_max, 0);
     atomic_store(&g_wait_crawl_tasks, 0);
     atomic_store(&g_wait_writer_push, 0);
     atomic_store(&g_wait_writer_pop, 0);
@@ -2887,6 +3643,68 @@ int main(int argc, char **argv) {
     }
 
     for (i = 0; i < g_crawl_threads; i++) {
+        if (pthread_mutex_init(&worker_args[i].emit_stats_lock, NULL) != 0) {
+            fprintf(stderr, "ERROR crawl worker mutex init failed\n");
+            while (i > 0) pthread_mutex_destroy(&worker_args[--i].emit_stats_lock);
+            free(workers);
+            free(worker_args);
+            atomic_store(&g_stop_stats, 1);
+            pthread_join(stats_thread, NULL);
+            clear_status_line();
+            if (!g_no_write) {
+                atomic_store(&g_disk_wait_disabled, 1);
+                atomic_store(&g_disk_monitor_stop, 1);
+                if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
+                disk_monitor_started = 0;
+                for (j = 0; j < writer_threads_used; j++) writer_queue_close(&writer_queues[j]);
+                for (j = 0; j < writer_threads_used; j++) pthread_join(writer_threads[j], NULL);
+            }
+            if (!g_no_write) {
+                for (j = 0; j < writer_slots; j++) writer_queue_destroy(&writer_queues[j]);
+                free(writer_queues);
+                free(writer_threads);
+                free(writer_args);
+            }
+            queue_destroy(&queue);
+            pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+            if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+            if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+            return 1;
+        }
+    }
+
+    if (stat_pool_start() != 0) {
+        fprintf(stderr, "ERROR failed to start stat worker pool\n");
+        for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
+        free(workers);
+        free(worker_args);
+        atomic_store(&g_stop_stats, 1);
+        pthread_join(stats_thread, NULL);
+        clear_status_line();
+        if (!g_no_write) {
+            atomic_store(&g_disk_wait_disabled, 1);
+            atomic_store(&g_disk_monitor_stop, 1);
+            if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
+            disk_monitor_started = 0;
+            for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
+            for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
+        }
+        if (!g_no_write) {
+            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
+            free(writer_queues);
+            free(writer_threads);
+            free(writer_args);
+        }
+        queue_destroy(&queue);
+        pthread_mutex_destroy(&shared.stats_mutex);
+        if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+        return 1;
+    }
+
+    for (i = 0; i < g_crawl_threads; i++) {
         worker_args[i].shared = &shared;
         worker_args[i].queue = &queue;
         worker_args[i].writer_queues = writer_queues;
@@ -2929,6 +3747,8 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&queue.mutex);
 
     for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
+
+    stat_pool_stop();
 
     pthread_mutex_lock(&queue.mutex);
     queue.closed = 1;
@@ -3006,6 +3826,8 @@ int main(int argc, char **argv) {
             print_verbose_full_stats(stdout, &shared, elapsed, writer_threads_used, start_path);
         }
     }
+
+    for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
 
     free(workers);
     free(worker_args);

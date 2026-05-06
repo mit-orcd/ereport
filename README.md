@@ -6,6 +6,7 @@ The current toolchain is:
 
 - `ecrawl`: parallel filesystem crawler that writes compact binary records
 - `ecrawl_repair`: optional utility that rescans `uid_shard_*.bin` shards, writes **`*.bin.ckpt`** sidecars, **truncates** shards at the last good record when the tail is incomplete, quarantines shards that cannot be fixed, and prints a short **tail-truncation summary** on stderr when anything was shortened (or would be, with **`--dry-run`**)
+- `ecrawl_analyze`: read-only parallel scan of crawl shards; prints **directory-shape** statistics on stdout (parent-directory histograms, path-depth histograms, top parents by regular-file count)
 - `edelete`: parallel filesystem walker (same task-queue / donation model as **`ecrawl`**) that can **`unlink`** non-directory paths—either **everything under a path** (one argument) or only entries older than a chosen **`atime`/`mtime`/`ctime`** threshold (**three** arguments); default run is **dry-run**, with **`--delete`** performing real deletes and **`rmdir`** for directories that become empty (still under the start path). Symlinks are **not** followed.
 - `ereport`: report generator that reads crawl output and writes `index.html`, bucket drilldown pages, and a search box that uses the trigram index when you serve the tree over HTTP
 - `ereport_index`: search-index helper for path-element substring search
@@ -20,8 +21,10 @@ The current toolchain is:
 | Program | Parallelism role | Override (env) | Built-in default | Min logical CPUs | Min RAM |
 |---------|------------------|----------------|------------------|------------------|---------|
 | **`ecrawl`** | Walk / queue directory work | **`ECRAWL_CRAWL_THREADS`** | **16** crawl threads (minimum **1**; no fixed maximum) | **4** | **4 GiB** |
+| **`ecrawl`** | Parallel **`fstatat`** on batched non-directory names (per-directory **`readdir`** stays on crawl workers) | **`ECRAWL_STAT_THREADS`** | **8** stat threads (**`0`** disables pool; legacy inline stat) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
 | **`ecrawl_repair`** | Parallel rescans; optional **`truncate`** on incomplete tail; checkpoint rebuild / verify | **`ECRAWL_REPAIR_THREADS`** | **16** | **4** | **4 GiB** |
+| **`ecrawl_analyze`** | Parallel shard scan for **stats only** (no writes) | **`ECRAWL_ANALYZE_THREADS`** (falls back to **`ECRAWL_REPAIR_THREADS`**) | **16** | **4** | **4 GiB** |
 | **`edelete`** | Parallel directory walk; optional **`unlink`** (bounded concurrency in **`--delete`**) | **`EDELETE_THREADS`**, **`EDELETE_MAX_UNLINK_INFLIGHT`** | **16** threads; **256** max concurrent **`unlink`** (**`0`** = unlimited) | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
 | **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
@@ -43,6 +46,7 @@ make ecrawl
 make ereport
 make ereport_index
 make ecrawl_repair
+make ecrawl_analyze
 make edelete
 ```
 
@@ -121,8 +125,9 @@ Final stdout summary includes **`delete_all`** (**`1`** when the one-argument fo
 ### `ecrawl`: crawling and capture
 
 - **Parallel crawl threads** feed a **task queue**; multiple threads traverse the tree concurrently while respecting directory boundaries.
+- **Parallel stat pool** — By default **`ECRAWL_STAT_THREADS=8`** crawl workers still perform a single **`readdir`** stream per open directory, but **non-directory** names are packed into batches ( **`ECRAWL_STAT_BATCH_ENTRIES`**, default **1024**) and processed by shared stat threads (**`fstatat`** relative to a **`dup`'d directory fd**). Pending batches are capped by **`ECRAWL_STAT_QUEUE_BATCHES`** (default **64**). **`ECRAWL_STAT_THREADS=0`** disables the pool and restores **inline `fstatat` on the crawl thread** (legacy behavior). **`ECRAWL_STAT_RANDOM_QUEUE`** defaults to **1** so workers dequeue pending batches in **pseudo-random** order (**`0`** = strict FIFO). **`--verbose`** reports **`stat_batches_*`**, **`stat_queue_depth_max`**, **`wait_stat_pop`** (stat threads blocking on an empty queue), and **`wait_stat_enqueue`** (crawl threads blocking on a full stat queue).
 - **Uid-sharded output** — Records hash to many **`uid_shard_*.bin`** files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
-- **Separate writer threads** — Crawl threads batch work to **bounded writer queues**; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record.
+- **Separate writer threads** — Crawl threads batch work to **bounded writer queues**; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record. **`ECRAWL_WRITER_QUEUE_BATCHES`** caps pending **record** batches **per writer** (default **64**, range **4…4096**).
 - **Checkpoint rows during write** — Sidecars capture sparse offsets so **later tools** can parallel-read without rescanning from zero.
 
 ### `ereport`: reports from crawl bins
@@ -151,7 +156,7 @@ make check              # ./test.sh: integration + ecrawl_repair / edelete / ere
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs all binaries built)
 ```
 
-- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**), then **smoke tests** on the same tree: **`ecrawl_repair --dry-run`**, **`edelete`** (default dry-run), **`ereport_index --make`** with a temp **`--index-dir`** (checks **`tri_keys.bin`** / **`paths.bin`** exist). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **`find`** often exits with status **1** when some subdirectories are unreadable; **`test.sh`** still uses the paths **`find`** printed so the correlation phase does not abort mid-baseline (without this, **`set -e`** / **pipefail** could exit the script with no error line). **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_REPAIR`**, **`EDELETE`**, **`EREPORT_INDEX`**, **`ECRAWL_CRAWL_THREADS`**, **`EREPORT_THREADS`**, **`EREPORT_INDEX_THREADS`** override defaults.
+- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**), then **smoke tests** on the same tree: **`ecrawl_repair --dry-run`**, **`ecrawl_analyze`**, **`edelete`** (default dry-run), **`ereport_index --make`** with a temp **`--index-dir`** (checks **`tri_keys.bin`** / **`paths.bin`** exist). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **`find`** often exits with status **1** when some subdirectories are unreadable; **`test.sh`** still uses the paths **`find`** printed so the correlation phase does not abort mid-baseline (without this, **`set -e`** / **pipefail** could exit the script with no error line). **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_REPAIR`**, **`EDELETE`**, **`EREPORT_INDEX`**, **`ECRAWL_CRAWL_THREADS`**, **`EREPORT_THREADS`**, **`EREPORT_INDEX_THREADS`** override defaults.
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
@@ -198,8 +203,13 @@ Optional environment variables (no CLI flags for these):
 |----------|---------|
 | **`ECRAWL_CRAWL_THREADS`** | Crawl threads (minimum **1**, default **16**; no fixed maximum—practical limits are RAM and OS thread capacity). |
 | **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
+| **`ECRAWL_WRITER_QUEUE_BATCHES`** | Max pending **record** batches **per uid-shard writer queue** when writing output (default **64**, range **4…4096**); larger values buffer more ~1 MiB batches in RAM. Ignored with **`--no-write`**. |
 | **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
+| **`ECRAWL_STAT_THREADS`** | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables the pool). |
+| **`ECRAWL_STAT_BATCH_ENTRIES`** | Directory names per stat batch (default **1024**, range **64…65536**). |
+| **`ECRAWL_STAT_QUEUE_BATCHES`** | Max pending stat batches **globally** (default **64**, range **4…4096**); bounds **`dup(dirfd)`** backlog and crawl-thread blocking when the pool is full. |
+| **`ECRAWL_STAT_RANDOM_QUEUE`** | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random dequeue among pending batches. |
 
 Examples:
 
@@ -212,6 +222,8 @@ ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
+ECRAWL_STAT_THREADS=0 ./ecrawl /path/to/filesystem-tree
+ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
 ```
 
 Notes:
@@ -228,6 +240,8 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `wait_crawl_tasks`: crawl-thread wakeups waiting on the crawl task queue (idle crawl threads).
 - `wait_writer_push`: crawl-thread wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (crawl threads not feeding writers fast enough).
+
+With **`--verbose`**, full metrics also include **`wait_stat_pop`** / **`wait_stat_enqueue`** (same idea for the stat batch pool), **`stat_queue_depth_max`**, and **`stat_batches_*`** counters.
 
 Interpret these as **counts of blocking episodes**, not wall-clock time.
 
@@ -251,6 +265,18 @@ Usage:
 ```bash
 ./ecrawl_repair [--dry-run] [--verbose] <crawl-output-dir>
 ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
+```
+
+### `ecrawl_analyze`
+
+**`ecrawl_analyze`** reads **`uid_shard_*.bin`** shards in a crawl directory (**no writes**) and prints aggregate **path-shape** metrics on stdout: counts, histograms of regular files per parent directory, slash-count (**depth**) histograms for stored paths, and the top **`N`** parent directories by regular-file count.
+
+Parallelism defaults match **`ecrawl_repair`** style scans; override with **`ECRAWL_ANALYZE_THREADS`**. If that variable is unset, **`ECRAWL_REPAIR_THREADS`** is used so existing tuning carries over.
+
+Usage:
+
+```bash
+./ecrawl_analyze [--verbose] [--top N] <crawl-output-dir>
 ```
 
 ### `ereport`
@@ -657,9 +683,15 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 |----------|----------------|------|
 | **`ECRAWL_CRAWL_THREADS`** | `ecrawl` | Crawl threads (minimum **1**, default **16**; no fixed maximum). |
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
+| **`ECRAWL_WRITER_QUEUE_BATCHES`** | `ecrawl` | Pending record batches **per writer queue** when writing shards (default **64**, range **4…4096**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
+| **`ECRAWL_STAT_THREADS`** | `ecrawl` | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables). |
+| **`ECRAWL_STAT_BATCH_ENTRIES`** | `ecrawl` | Names per stat batch (default **1024**, range **64…65536**). |
+| **`ECRAWL_STAT_QUEUE_BATCHES`** | `ecrawl` | Max pending stat batches (default **64**, range **4…4096**). |
+| **`ECRAWL_STAT_RANDOM_QUEUE`** | `ecrawl` | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random. |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
+| **`ECRAWL_ANALYZE_THREADS`** | `ecrawl_analyze` | Parallel shard scan for **stats only** (default **16**, minimum **1**). If unset, **`ECRAWL_REPAIR_THREADS`** is used when set. |
 | **`EDELETE_THREADS`** | `edelete` | Parallel walk workers (default **16**, minimum **1**). |
 | **`EDELETE_MAX_UNLINK_INFLIGHT`** | `edelete` **`--delete`** | Max concurrent **`unlink`** syscalls across all workers (default **256**; **`0`** = unlimited). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default **32**). |
@@ -677,7 +709,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 ## Source layout
 
 - **`edelete.c`** — standalone parallel walker / deletion utility (**`path_canon.h`** only).
-- **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, and **`ecrawl_repair`**.
+- **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, **`ecrawl_repair`**, and **`ecrawl_analyze`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 
 ## Notes
