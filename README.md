@@ -12,6 +12,12 @@ The current toolchain is:
 - `ereport_index`: search-index helper for path-element substring search
 - `eserve.py`: HTTP server for static reports plus **server-side path search** (calls `ereport_index` on the trigram index)
 
+**How to read this file:** Each tool has a detailed section under **[What The Tools Do](#what-the-tools-do)** (usage, examples, env tables). **[Default thread counts](#default-thread-counts-per-binary)** summarizes parallelism defaults. **[Typical Workflow](#typical-workflow)** is the shortest path from crawl → HTML → search index → HTTP. **[Environment variables (quick reference)](#environment-variables-quick-reference)** lists every tuning knob in one place.
+
+### Contents
+
+- [Build](#build) · [Testing](#testing) · [systemd](#systemd-daily-ecrawl-and-binary-sync) · [Why this is fast](#why-this-is-fast) · [What The Tools Do](#what-the-tools-do) · [Typical Workflow](#typical-workflow) · [Validation / tests](#validation-helpers) · [Output semantics](#output-semantics) · [Environment variables](#environment-variables-quick-reference) · [Source layout](#source-layout) · [License](#license)
+
 ## Default thread counts (per binary)
 
 **Each program has its own defaults.** There is no single global “thread count” for the whole toolchain: `ecrawl`, `ereport`, and `ereport_index` read **different** environment variables and use **different** built-in numbers when those variables are unset.
@@ -125,7 +131,7 @@ Final stdout summary includes **`delete_all`** (**`1`** when the one-argument fo
 ### `ecrawl`: crawling and capture
 
 - **Parallel crawl threads** feed a **task queue**; multiple threads traverse the tree concurrently while respecting directory boundaries.
-- **Parallel stat pool** — By default **`ECRAWL_STAT_THREADS=8`** crawl workers still perform a single **`readdir`** stream per open directory, but only **`d_type` values treated as trusted non-directories** (**`DT_REG`**, **`DT_LNK`**, **`DT_FIFO`**, **`DT_SOCK`**, **`DT_CHR`**, **`DT_BLK`**, **`DT_WHT`**) are packed into batches (**`ECRAWL_STAT_BATCH_ENTRIES`**, default **1024**) for shared stat threads (**`fstatat`** relative to a **`dup`'d directory fd**). Within each directory, the first **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** such entries (default **4096**) are **`fstatat`**’d inline on the crawl thread so tiny folders avoid stat-pool overhead; **`0`** means batch from the first trusted non-dir. **`DT_DIR`** and **`DT_UNKNOWN`** are never batched: they are classified on the crawl thread (**`fstatat`** when needed). If **`fstatat`** in a batch still reports a directory (rare race or incorrect **`d_type`**), **`ecrawl`** increments **`stat_batch_unexpected_dir_total`**, prints a **`WARN`** on stderr after the run with up to **100** example paths (noting truncation), and **does not crawl** those directories. Pending batches are capped by **`ECRAWL_STAT_QUEUE_BATCHES`** (default **64**). **`ECRAWL_STAT_THREADS=0`** disables the pool and restores **inline `fstatat` on the crawl thread** (legacy behavior). **`ECRAWL_STAT_RANDOM_QUEUE`** defaults to **1** so workers dequeue pending batches in **pseudo-random** order (**`0`** = strict FIFO). **`--verbose`** reports **`stat_batches_*`**, **`stat_batch_unexpected_dir_total`**, **`stat_queue_depth_max`**, **`wait_stat_pop`** (stat threads blocking on an empty queue), and **`wait_stat_enqueue`** (crawl threads blocking on a full stat queue).
+- **Parallel stat pool** (when **`ECRAWL_STAT_THREADS`** > **0**, default **8**) — Each crawl worker does one **`readdir`** per open directory. Entry classification and batching are described under **[Directory scanning and stat workers](#directory-scanning-and-stat-workers)** in the **`ecrawl`** tool section (trusted **`d_type`** batching, inline prefix **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`**, **`DT_DIR`/`DT_UNKNOWN`** never batched, unexpected-dir **`WARN`** on stderr). Set **`ECRAWL_STAT_THREADS=0`** for legacy **inline-only** `fstatat` on crawl threads (often faster on very low-latency metadata). **`--verbose`** adds **`stat_batches_*`**, **`stat_batch_unexpected_dir_total`**, **`stat_queue_depth_max`**, **`wait_stat_pop`**, **`wait_stat_enqueue`**.
 - **Uid-sharded output** — Records hash to many **`uid_shard_*.bin`** files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
 - **Separate writer threads** — Crawl threads batch work to **bounded writer queues**; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record. **`ECRAWL_WRITER_QUEUE_BATCHES`** caps pending **record** batches **per writer** (default **64**, range **4…4096**).
 - **Checkpoint rows during write** — Sidecars capture sparse offsets so **later tools** can parallel-read without rescanning from zero.
@@ -156,7 +162,7 @@ make check              # ./test.sh: integration + ecrawl_repair / edelete / ere
 make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs all binaries built)
 ```
 
-- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**), then **smoke tests** on the same tree: **`ecrawl_repair --dry-run`**, **`ecrawl_analyze`**, **`edelete`** (default dry-run), **`ereport_index --make`** with a temp **`--index-dir`** (checks **`tri_keys.bin`** / **`paths.bin`** exist). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **`find`** often exits with status **1** when some subdirectories are unreadable; **`test.sh`** still uses the paths **`find`** printed so the correlation phase does not abort mid-baseline (without this, **`set -e`** / **pipefail** could exit the script with no error line). **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_REPAIR`**, **`EDELETE`**, **`EREPORT_INDEX`**, **`ECRAWL_CRAWL_THREADS`**, **`EREPORT_THREADS`**, **`EREPORT_INDEX_THREADS`** override defaults.
+- **`test.sh`** — Always runs **integration** first: **`ecrawl`** on a tiny synthetic tree under `/tmp`, then **`ereport`** **single-user** (`mtime`, counts vs **`ecrawl`**), then **`ereport`** **all-users** (including **`distinct_uids`**), then **smoke tests** on the same tree: **`ecrawl_repair --dry-run`**, **`ecrawl_analyze`**, **`edelete`** (default dry-run), **`ereport_index --make`** with a temp **`--index-dir`** (checks **`tri_keys.bin`** / **`paths.bin`** exist). With a **directory argument**, it runs **filesystem correlation**: one **`find`/`fd`** baseline (file/dir/symlink counts and **unique regular-file bytes** via **`find`** `%D:%i`, not **`du`**) is compared to **`ecrawl`** and again to **`ereport` all-users** (terminal-style snapshot vs crawl-derived report totals); **`ecrawl`** is also compared to **`ereport` all-users** (**`entries` ↔ `scanned_records`**, etc.); **single-user** checks are **consistency and subset** vs **`ecrawl`** / all-users when **`ereport` single-user** can load that UID’s shard (**uid-shard** crawls omit empty shards — e.g. **root** uses shard **0**; if nothing maps there, those checks are skipped). **All-users** runs first so correlation still validates **`ecrawl` ↔ `ereport`**. **All** checks print; any failure fails the step. On **busy live trees**, the baseline can drift before **`ecrawl`** completes—expect strict equality mainly on **quiescent** data. **`find`** often exits with status **1** when some subdirectories are unreadable; **`test.sh`** still uses the paths **`find`** printed so the correlation phase does not abort mid-baseline (without this, **`set -e`** / **pipefail** could exit the script with no error line). **Directory counts** use **`find -type d`** (not **`fd`**) for the baseline so the **crawl root** is included—**`ecrawl`** seeds that path and counts it; **`fd`** omits the search-root directory and would disagree by one on a stable tree. **`SKIP_FS=1`** skips only the directory correlation when a path is given. Override binaries / thread counts with **`ECRAWL`**, **`EREPORT`**, **`ECRAWL_REPAIR`**, **`ECRAWL_ANALYZE`**, **`EDELETE`**, **`EREPORT_INDEX`**, **`ECRAWL_CRAWL_THREADS`**, **`EREPORT_THREADS`**, **`EREPORT_INDEX_THREADS`** (see **`test.sh`** header for **`ECRAWL_ANALYZE`**).
 - **`test_setup.sh`** — Removes and recreates **`./test`** (default: **`…/ereport/test`**) with a **deep** chain (**`deep/seg001/…`**), a **wide** branch layout (**`wide/b00/…`**), symlinks, hardlinks, and root files. Tune size with **`DEPTH`**, **`BRANCHES`**, **`FILES_WIDE`**.
 - **`test_full.sh`** — Runs **`test_setup.sh`** and then **`./test.sh`** on that tree (same as **`make check-tree`**).
 
@@ -197,7 +203,21 @@ Basic usage:
 
 Positional arguments are only **`start-path`** (required) and optionally **`output-dir`**. **`start-path`** must exist; it is canonicalized with **`realpath(3)`** (relative or absolute). After the output directory is created, it is canonicalized the same way. If **`output-dir`** is omitted, a timestamped directory name is created in the current working directory.
 
-Optional environment variables (no CLI flags for these):
+#### Directory scanning and stat workers
+
+Applies when **`ECRAWL_STAT_THREADS`** > **0** (the default). **`ECRAWL_STAT_THREADS=0`** skips this pool: every child name is **`fstatat`**’d on the crawl thread that read the directory (same semantics, no cross-thread batch queue).
+
+| Step | What happens |
+|------|----------------|
+| **1. `readdir`** | One crawl worker reads each directory stream sequentially; skips `.` and `..`. |
+| **2. Obvious subdirectories** | If **`d_type`** is **`DT_DIR`**, the child path is pushed onto that worker’s directory stack (and may be **donated** to other crawl threads). No stat worker involved. |
+| **3. Trusted non-directory types** | If **`d_type`** is one of **`DT_REG`**, **`DT_LNK`**, **`DT_FIFO`**, **`DT_SOCK`**, **`DT_CHR`**, **`DT_BLK`**, **`DT_WHT`**, the name is either **`fstatat`**’d **inline** on the crawl thread or **queued for stat workers**, depending on how many such entries were already seen **in this directory** (see **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`**, default **4096**). **`0`** means **always** send these names to stat workers (no inline prefix). |
+| **4. Everything else (`DT_UNKNOWN`, etc.)** | **`fstatat`** on the crawl thread; if it is a directory, behave like step **2**; otherwise emit like a file. These names are **never** placed in stat-worker batches (the batch path assumes the dentry already looked like a non-directory). |
+| **5. Workers + flush points** | Stat threads **`fstatat`** batched names against a **`dup`'d** directory fd. Pending batches are capped globally (**`ECRAWL_STAT_QUEUE_BATCHES`**). When **`readdir`** finishes that directory, the crawl thread **waits for** its pending batches for that folder, then continues. |
+
+**Unexpected directory inside a batch:** If **`fstatat`** still reports a directory for a batched name (rare: wrong **`d_type`** or rename race), **`ecrawl`** counts **`stat_batch_unexpected_dir_total`**, prints a **`WARN`** block on **stderr** after the run (up to **100** example paths; message notes truncation), and **does not descend** into those paths—so totals may be incomplete if that warning appears.
+
+Optional environment variables (no CLI flags for these; see also **[quick reference](#environment-variables-quick-reference)**):
 
 | Variable | Meaning |
 |----------|---------|
@@ -224,6 +244,7 @@ ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_STAT_THREADS=0 ./ecrawl /path/to/filesystem-tree
+ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
 ```
 
@@ -242,9 +263,9 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `wait_writer_push`: crawl-thread wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (crawl threads not feeding writers fast enough).
 
-With **`--verbose`**, full metrics also include **`wait_stat_pop`** / **`wait_stat_enqueue`** (same idea for the stat batch pool), **`stat_queue_depth_max`**, and **`stat_batches_*`** counters.
+With **`--verbose`**, full metrics also include **`wait_stat_pop`** / **`wait_stat_enqueue`** (same idea for the stat batch pool), **`stat_queue_depth_max`**, **`stat_batches_*`**, and **`stat_batch_unexpected_dir_total`**.
 
-Interpret these as **counts of blocking episodes**, not wall-clock time.
+Interpret these as **counts of blocking episodes**, not wall-clock time. Summary **`WARN`** lines for unexpected batched directories always go to **stderr**, even when stdout is concise.
 
 ### `ecrawl_repair`
 
@@ -353,10 +374,7 @@ Runtime behavior:
 
 - **`ereport` scans crawl directories**, then **maps chunk boundaries** inside each `.bin` shard (reading record headers only). That mapping runs with **`EREPORT_THREADS` parallel scanners**; stdout shows **`chunk-map files:X/Y`** until every shard has been scanned, then the usual records/sec line appears while workers parse chunks. If mapping is slow, an occasional **stderr** advisory may print after a completed progress line so it does not glue to the **`chunk-map`** status text.
 - After parsing finishes, the status line switches to **finalizing** with sub-steps: **merging shard summaries** (in-process merges of per-thread summaries and bucket-detail maps), **writing bucket HTML (n/36)** while **`bucket_*.html`** files are emitted, then **writing index.html**.
-- prints a live progress line during processing
-- prints final run stats to `stdout`
-- writes warnings/errors to `stderr`
-- uses local progress counters with chunked flushes to avoid per-record atomics in the hot path
+- Final run stats go to **stdout**; warnings/errors to **stderr**. Progress uses local counters with chunked flushes to avoid per-record atomics on the hot path.
 
 Interactive search in `index.html` requires **`ereport_index --make`** (see below), **`eserve`** running with **`ereport_index`** available, and opening the report **over HTTP** (browser `fetch` does not work reliably from `file://`).
 
@@ -615,22 +633,24 @@ Several crawl output directories (merged index for the same user):
 
 Omit directories to use **`./`** as the only input path: `./ereport_index --make alice`.
 
-**All-users** index (same crawl inputs as `./ereport ctime …`, output beside **`./all_users/`**). Omit a username: list crawl dirs first so the first token is **not** resolved as a login or uid:
+**All-users** index (same crawl inputs as `./ereport ctime …`). Omit a username: list crawl dirs first so the first token is **not** resolved as a login or uid:
 
 ```bash
 ./ereport_index --make crawl_srv01 crawl_srv02
 ./ereport_index --search --index-dir all_users/index foo
 ```
 
-This writes:
+By default this writes under **`./all_users/index/`** (unless **`--index-dir`** points elsewhere):
 
 ```text
-alice/index/meta.txt
-alice/index/path_offsets.bin
-alice/index/paths.bin
-alice/index/tri_keys.bin
-alice/index/tri_postings.bin
+all_users/index/meta.txt
+all_users/index/path_offsets.bin
+all_users/index/paths.bin
+all_users/index/tri_keys.bin
+all_users/index/tri_postings.bin
 ```
+
+For a **single-user** index (example user **`alice`**), the same filenames appear under **`alice/index/`**.
 
 ### 4. Serve the results over HTTP
 
