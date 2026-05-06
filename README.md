@@ -24,7 +24,7 @@ The current toolchain is:
 | **`ecrawl`** | Parallel **`fstatat`** on batched non-directory names (per-directory **`readdir`** stays on crawl workers) | **`ECRAWL_STAT_THREADS`** | **8** stat threads (**`0`** disables pool; legacy inline stat) | **4** | **4 GiB** |
 | **`ecrawl`** | Flush uid-sharded `.bin` output | **`ECRAWL_WRITER_THREADS`** | **8** writer threads | **4** | **4 GiB** |
 | **`ecrawl_repair`** | Parallel rescans; optional **`truncate`** on incomplete tail; checkpoint rebuild / verify | **`ECRAWL_REPAIR_THREADS`** | **16** | **4** | **4 GiB** |
-| **`ecrawl_analyze`** | Parallel shard scan for **stats only** (no writes) | **`ECRAWL_ANALYZE_THREADS`** (falls back to **`ECRAWL_REPAIR_THREADS`**) | **16** | **4** | **4 GiB** |
+| **`ecrawl_analyze`** | Parallel shard scan for **stats only** (no writes) | **`ECRAWL_ANALYZE_THREADS`** (falls back to **`ECRAWL_REPAIR_THREADS`**) | **16** (maximum **4096**) | **4** | **4 GiB** |
 | **`edelete`** | Parallel directory walk; optional **`unlink`** (bounded concurrency in **`--delete`**) | **`EDELETE_THREADS`**, **`EDELETE_MAX_UNLINK_INFLIGHT`** | **16** threads; **256** max concurrent **`unlink`** (**`0`** = unlimited) | **4** | **4 GiB** |
 | **`ereport`** | Map/parse `.bin` chunks, emit up to **36** `bucket_*.html` files, live stderr stats | **`EREPORT_THREADS`** | **32** | **8** | **8 GiB** |
 | **`ereport_index`** | **`--make`:** parallel chunk-boundary scan, parse workers; **trigram** temp writers default to the **same** count unless **`EREPORT_INDEX_TRIGRAM_THREADS`** is set. **`--search`:** parallel postings load and path filtering when the query and candidate set are large enough | **`EREPORT_INDEX_THREADS`** (and optionally **`EREPORT_INDEX_TRIGRAM_THREADS`**) | **32** | **16** | **16 GiB** |
@@ -269,14 +269,30 @@ ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
 
 ### `ecrawl_analyze`
 
-**`ecrawl_analyze`** reads **`uid_shard_*.bin`** shards in a crawl directory (**no writes**) and prints aggregate **path-shape** metrics on stdout: counts, histograms of regular files per parent directory, slash-count (**depth**) histograms for stored paths, and the top **`N`** parent directories by regular-file count.
+**`ecrawl_analyze`** reads **`uid_shard_*.bin`** shards in a crawl output directory (**read-only**—no shard or `.ckpt` writes) and prints aggregate **directory-shape** metrics on stdout.
 
-Parallelism defaults match **`ecrawl_repair`** style scans; override with **`ECRAWL_ANALYZE_THREADS`**. If that variable is unset, **`ECRAWL_REPAIR_THREADS`** is used so existing tuning carries over.
+Behavior highlights:
+
+- **Chunk boundaries** — Parse jobs follow **`*.bin.ckpt`** segment boundaries when sidecars are valid (same spirit as **`ereport`** / **`ereport_index`** chunk mapping). If a checkpoint is missing or unusable, that shard is scanned as a single range from after the file header through EOF.
+- **Parallelism** — Worker count comes from **`ECRAWL_ANALYZE_THREADS`** (default **16**, range **1…4096**). If **`ECRAWL_ANALYZE_THREADS`** is unset, **`ECRAWL_REPAIR_THREADS`** is used when set, so existing repair-tuning scripts can drive analyze without a second variable.
+- **Progress** — When stderr is a TTY, a one-line status (bytes scanned, chunk and record rates, elapsed time, ETA) updates about once per second; the final report is always plain text on stdout.
+- **`--top N`** — List the **`N`** parent directories with the most regular files (**1…100000**; default **32**). The table includes **`nfile`**, **`ndir`**, **`nsym`**, **`nother`**, and the parent path.
+- **`--verbose` / `-v`** — While scanning, prints one line per successfully parsed chunk (shard path, byte range, record count), mutex-serialized so lines are not interleaved mid-line; chunk failures are reported on stderr (often corrupt data or checkpoint mismatch).
+
+Stdout summary (stable **`key=value`** / section headers) includes: shard and chunk job counts, **`records_total`**, distinct-parent counts, a **histogram of regular files per parent** (bucketed counts among parents that have at least one file), a **slash-count (depth) histogram** over stored paths, and **`top_parents_by_regular_file_count`**.
 
 Usage:
 
 ```bash
 ./ecrawl_analyze [--verbose] [--top N] <crawl-output-dir>
+```
+
+Examples:
+
+```bash
+./ecrawl_analyze /path/to/crawl-out
+./ecrawl_analyze --top 100 /path/to/crawl-out
+ECRAWL_ANALYZE_THREADS=32 ./ecrawl_analyze -v /path/to/crawl-out
 ```
 
 ### `ereport`
@@ -691,7 +707,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_STAT_QUEUE_BATCHES`** | `ecrawl` | Max pending stat batches (default **64**, range **4…4096**). |
 | **`ECRAWL_STAT_RANDOM_QUEUE`** | `ecrawl` | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random. |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
-| **`ECRAWL_ANALYZE_THREADS`** | `ecrawl_analyze` | Parallel shard scan for **stats only** (default **16**, minimum **1**). If unset, **`ECRAWL_REPAIR_THREADS`** is used when set. |
+| **`ECRAWL_ANALYZE_THREADS`** | `ecrawl_analyze` | Parallel shard scan for **stats only** (default **16**, minimum **1**, maximum **4096**). If unset, **`ECRAWL_REPAIR_THREADS`** is used when set. |
 | **`EDELETE_THREADS`** | `edelete` | Parallel walk workers (default **16**, minimum **1**). |
 | **`EDELETE_MAX_UNLINK_INFLIGHT`** | `edelete` **`--delete`** | Max concurrent **`unlink`** syscalls across all workers (default **256**; **`0`** = unlimited). |
 | **`EREPORT_THREADS`** | `ereport` | Parallel **`.bin` chunk readers**, parallel **`bucket_*.html`** emission, and stats thread (default **32**). |
@@ -709,6 +725,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 ## Source layout
 
 - **`edelete.c`** — standalone parallel walker / deletion utility (**`path_canon.h`** only).
+- **`ecrawl_analyze.c`** — read-only **`uid_shard_*.bin`** analyzer (parent and depth histograms); links **`crawl_bin_chunks.o`** for shared chunk parsing.
 - **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, **`ecrawl_repair`**, and **`ecrawl_analyze`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 

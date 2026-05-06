@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_repair / edelete /
-# ereport_index, optional live-tree correlation with find/fd.
+# Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_repair / ecrawl_analyze /
+# edelete / ereport_index, optional live-tree correlation with find/fd.
 #
 # Usage:
 #   ./test.sh                      # integration + tool smoke tests (temp tree + built binaries)
 #   ./test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./test.sh
-#   ECRAWL_REPAIR EDELETE EREPORT_INDEX override those binaries (same dir as this script by default).
+#   ECRAWL_REPAIR ECRAWL_ANALYZE EDELETE EREPORT_INDEX override those binaries (same dir as this script by default).
 #
 # Requires: bash, coreutils, all Makefile targets built (default: same directory as this script).
 
@@ -18,6 +18,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ECRAWL="${ECRAWL:-$SCRIPT_DIR/ecrawl}"
 EREPORT="${EREPORT:-$SCRIPT_DIR/ereport}"
 ECRAWL_REPAIR="${ECRAWL_REPAIR:-$SCRIPT_DIR/ecrawl_repair}"
+ECRAWL_ANALYZE="${ECRAWL_ANALYZE:-$SCRIPT_DIR/ecrawl_analyze}"
 EDELETE="${EDELETE:-$SCRIPT_DIR/edelete}"
 EREPORT_INDEX="${EREPORT_INDEX:-$SCRIPT_DIR/ereport_index}"
 
@@ -552,13 +553,22 @@ run_integration() {
     expect_eq "all_users: matched_records vs scanned" "$sscan" "$smat" \
         "all-users keeps every row (matched == scanned)"
 
-    section_int "[integration] ecrawl_repair, edelete, ereport_index (smoke)"
+    section_int "[integration] ecrawl_repair, ecrawl_analyze, edelete, ereport_index (smoke)"
 
     log "ecrawl_repair --dry-run (sidecar rules vs crawl_bin_load_ckpt)"
     "$ECRAWL_REPAIR" --dry-run "$crawl_out" >"${td}/repair.stdout" 2>"${td}/repair.stderr" || {
         tail -n 40 "${td}/repair.stderr" >&2 || true
         die "ecrawl_repair --dry-run failed"
     }
+
+    log "ecrawl_analyze (shard scan / parent histogram smoke)"
+    "$ECRAWL_ANALYZE" --top 5 "$crawl_out" >"${td}/analyze.stdout" 2>"${td}/analyze.stderr" || {
+        tail -n 40 "${td}/analyze.stderr" >&2 || true
+        die "ecrawl_analyze failed"
+    }
+    grep -q '^ecrawl_analyze$' "${td}/analyze.stdout" || die "ecrawl_analyze missing banner line"
+    grep -q '^records_total=' "${td}/analyze.stdout" || die "ecrawl_analyze missing records_total"
+    grep -q '^parse_chunk_jobs=' "${td}/analyze.stdout" || die "ecrawl_analyze missing parse_chunk_jobs"
 
     log "edelete dry-run (synthetic walk tree)"
     "$EDELETE" "$root_abs" >"${td}/edelete.stdout" 2>"${td}/edelete.stderr" || {

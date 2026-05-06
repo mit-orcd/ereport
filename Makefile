@@ -11,7 +11,7 @@ SERVE_BIND ?= 127.0.0.1
 SERVE_INDEX_DIR ?=
 
 # Targets
-TARGETS = ereport ereport_index ecrawl ecrawl_repair edelete
+TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_analyze edelete
 
 # Optional NFS probe (needs libnfs, e.g. dnf install libnfs-devel)
 LIBNFS_CFLAGS ?= $(shell pkg-config --cflags libnfs 2>/dev/null)
@@ -54,6 +54,9 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) -o $@ ecrawl_repair.c
+
+ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
+	$(CC) $(CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o
 
 ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o
 	$(CC) $(CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o
