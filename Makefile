@@ -37,6 +37,21 @@ endif
 # dlopen/dlsym: optional nfs_set_version at runtime (missing on EL7 libnfs)
 ENFSPROBE_LIBDL := -ldl
 
+# Optional jemalloc for the allocator-heavy ereport binaries (ereport, ereport_index).
+# Auto-detected via pkg-config; needs jemalloc-devel (RHEL/Fedora) or libjemalloc-dev
+# (Debian/Ubuntu). The runtime-only package ships just libjemalloc.so.2 with no .pc,
+# so pkg-config correctly reports "not available" and the build silently falls back
+# to glibc malloc. No source #include is required: linking -ljemalloc interposes
+# malloc/free/calloc/realloc transparently. Override by setting JEMALLOC_LIBS= to ""
+# to force-disable, or to a literal "-ljemalloc" to force-enable.
+JEMALLOC_CFLAGS ?= $(shell pkg-config --cflags jemalloc 2>/dev/null)
+JEMALLOC_LIBS ?= $(shell pkg-config --libs jemalloc 2>/dev/null)
+ifneq ($(strip $(JEMALLOC_LIBS)),)
+EREPORT_JEMALLOC_NOTE := jemalloc enabled ($(strip $(JEMALLOC_LIBS)))
+else
+EREPORT_JEMALLOC_NOTE := jemalloc not found; using glibc malloc
+endif
+
 # Default target
 all: $(TARGETS)
 
@@ -59,10 +74,12 @@ ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h cr
 	$(CC) $(CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o
 
 ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o
+	@echo "ereport: $(EREPORT_JEMALLOC_NOTE)"
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o $(JEMALLOC_LIBS)
 
 ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o
+	@echo "ereport_index: $(EREPORT_JEMALLOC_NOTE)"
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL)

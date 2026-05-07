@@ -62,6 +62,21 @@ Clean:
 make clean
 ```
 
+### Optional: link `ereport` / `ereport_index` against jemalloc
+
+The Makefile auto-detects **jemalloc** via **`pkg-config`** and, when present, links **only** the allocator-heavy binaries — **`ereport`** and **`ereport_index`** — against **`-ljemalloc`**. The other tools (**`ecrawl`**, **`edelete`**, **`ecrawl_repair`**, **`ecrawl_analyze`**, **`enfsprobe`**) are **not** linked against jemalloc; their hot paths are bound by syscalls (**`getdents64`** / **`fstatat`**), not allocator contention. Install the dev package so **`pkg-config`** can find it:
+
+```bash
+sudo dnf install jemalloc-devel    # RHEL / Fedora / EL8+ (EPEL)
+sudo apt install libjemalloc-dev   # Debian / Ubuntu
+make clean && make ereport ereport_index
+ldd ./ereport_index | grep jemalloc   # verify libjemalloc.so.2 is linked
+```
+
+Each rule prints **`ereport[_index]: jemalloc enabled (...)`** or **`... jemalloc not found; using glibc malloc`** on its build line. No source **`#include`** is required — linking **`-ljemalloc`** transparently interposes **`malloc`** / **`calloc`** / **`realloc`** / **`free`**. Without the dev package the link line is byte-for-byte identical to a vanilla build, so the change is a no-op on hosts that lack jemalloc. Override the auto-detect by passing **`JEMALLOC_LIBS=`** (empty) on the make command line to force-disable, or **`JEMALLOC_LIBS=-ljemalloc`** to force-enable.
+
+In measurements on a 14.9M-path crawl with **`EREPORT_INDEX_THREADS=64`**, **`ereport_index --make`** ran ~**27 %** faster end-to-end (index phase ~**31 %** faster, merge phase unchanged) once linked against jemalloc; **`ecrawl`** showed **no** measurable benefit on adversarial trees and is intentionally left unlinked. Runtime requirement when enabled: **`libjemalloc.so.2`** must be present on the deployment host (the runtime-only RHEL package **`jemalloc`** suffices; the dev package is only needed at build time).
+
 ## systemd: daily `ecrawl` and binary sync
 
 Optional units under **`contrib/systemd/`** run **`ecrawl`** on paths listed in **`/etc/ereport/ecrawl-daily.conf`**, then **`rsync`** each job’s **`output_dir`** (crawl shard data) under **`RSYNC_DEST`** (typically **`RSYNC_DEST/<basename(output_dir)>/`**, or directly into **`RSYNC_DEST`** when its last path component already matches that basename); after each successful sync the script deletes matching crawl artifact files locally (see **`contrib/systemd/ecrawl-daily.conf.example`**).
