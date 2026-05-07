@@ -37,6 +37,10 @@
  *   --verbose: full metrics to stderr every N minutes (default 5); optional integer sets N.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
+ *
+ * Diagnostics (optional env): ECRAWL_PROGRESS_LOG=<path> appends one CSV line per second from the stats thread.
+ * ECRAWL_STALL_HINT_SECONDS=N (default 5; 0 disables): after the rolling window is warm, emit one stderr line if
+ * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
  */
 
 #define _XOPEN_SOURCE 700
@@ -358,6 +362,14 @@ static uint64_t g_seconds_single_worker = 0;
 static uint64_t g_seconds_queue_empty_single_worker = 0;
 static double g_run_start_sec = 0.0;
 static time_t g_crawl_wall_clock_start;
+
+static FILE *g_progress_log_fp = NULL;
+static int g_progress_log_header_written = 0;
+static int g_progress_log_atexit_registered = 0;
+static unsigned long long g_progress_prev_tot_entries = 0;
+static unsigned long long g_progress_prev_readdir = 0;
+static unsigned long long g_progress_prev_lstat = 0;
+static int g_stall_hint_seconds_cfg = 5;
 
 static double now_sec(void);
 static void dir_stack_destroy(dir_stack_t *s);
@@ -685,6 +697,19 @@ static uint32_t parse_ecrawl_uid_shards_env(void) {
     if (errno || end == e || *end || v == 0UL || v > (unsigned long)UINT32_MAX || !is_power_of_two_u32((uint32_t)v))
         return DEFAULT_UID_SHARDS;
     return (uint32_t)v;
+}
+
+/* Default 5; 0 disables stall hints. Env: ECRAWL_STALL_HINT_SECONDS. */
+static int parse_ecrawl_stall_hint_seconds(void) {
+    const char *e = getenv("ECRAWL_STALL_HINT_SECONDS");
+    long v;
+    char *end;
+
+    if (!e || !*e) return 5;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno || end == e || *end || v < 0 || v > 86400L) return 5;
+    return (int)v;
 }
 
 static uint32_t shard_for_uid(uid_t uid) {
@@ -1093,6 +1118,10 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_STAT_BATCH_ENTRIES,
             (unsigned)DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS,
             (unsigned)DEFAULT_STAT_QUEUE_BATCHES);
+    fprintf(stderr,
+            "Diagnostics: ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
+            "ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive seconds with "
+            "zero rolling-window entries once the window is warm (default 5; 0=off).\n");
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
@@ -2727,8 +2756,16 @@ static int process_directory_iterative(dir_stack_t *stack,
     return 0;
 }
 
+static void progress_log_close(void) {
+    if (g_progress_log_fp) {
+        fclose(g_progress_log_fp);
+        g_progress_log_fp = NULL;
+    }
+}
 
 static void *stats_thread_main(void *arg) {
+    static int stall_zero_secs = 0;
+    static int stall_announced = 0;
     (void)arg;
 
     while (!atomic_load(&g_stop_stats)) {
@@ -2756,13 +2793,97 @@ static void *stats_thread_main(void *arg) {
             unsigned long long total_dirs = atomic_load(&g_total_dirs);
             unsigned long long total_bytes = atomic_load(&g_total_bytes);
             unsigned long long window_entries = atomic_load(&g_window_entries);
+            unsigned long long window_files = atomic_load(&g_window_files);
+            unsigned long long window_dirs = atomic_load(&g_window_dirs);
             unsigned int divisor = atomic_load(&g_seconds_seen);
             double ops_rate;
             double elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
             char te[32], tf[32], td[32], ts[32], re[32], elapsed_buf[32];
+            unsigned long long io_rd = atomic_load(&g_io_readdir_calls);
+            unsigned long long io_ls = atomic_load(&g_io_lstat_calls);
+            unsigned long long d_tot = total_entries - g_progress_prev_tot_entries;
+            unsigned long long d_rd = io_rd - g_progress_prev_readdir;
+            unsigned long long d_ls = io_ls - g_progress_prev_lstat;
 
             if (divisor == 0) divisor = 1;
             ops_rate = (double)window_entries / (double)divisor;
+
+            if (g_stall_hint_seconds_cfg > 0 && elapsed_sec >= (double)WINDOW_SECONDS &&
+                divisor >= (unsigned int)WINDOW_SECONDS && window_entries == 0ULL) {
+                stall_zero_secs++;
+                if (stall_zero_secs >= g_stall_hint_seconds_cfg && !stall_announced) {
+                    unsigned long long qdepth = atomic_load(&g_queue_depth);
+                    unsigned long long wqdepth = atomic_load(&g_writer_queue_depth);
+                    int active = atomic_load(&g_active_workers);
+                    unsigned long long wcrawl = atomic_load(&g_wait_crawl_tasks);
+                    unsigned long long wwp = atomic_load(&g_wait_writer_push);
+                    unsigned long long wwc = atomic_load(&g_wait_writer_pop);
+                    unsigned long long wsp = atomic_load(&g_wait_stat_pop);
+                    unsigned long long wse = atomic_load(&g_wait_stat_enqueue);
+
+                    fprintf(stderr,
+                            "ecrawl: stall hint: rolling-window entries stayed at 0 for %d s "
+                            "(elapsed %.1f s; total_entries=%llu; q=%llu wq=%llu active=%d; "
+                            "last_sec delta: entries=%llu readdir=%llu lstat=%llu; "
+                            "wait: crawl_q=%llu wr_push=%llu wr_pop=%llu st_pop=%llu st_enq=%llu)\n",
+                            stall_zero_secs, elapsed_sec, (unsigned long long)total_entries, qdepth, wqdepth, active,
+                            d_tot, d_rd, d_ls, wcrawl, wwp, wwc, wsp, wse);
+                    fflush(stderr);
+                    stall_announced = 1;
+                }
+            } else {
+                stall_zero_secs = 0;
+                stall_announced = 0;
+            }
+
+            g_progress_prev_tot_entries = total_entries;
+            g_progress_prev_readdir = io_rd;
+            g_progress_prev_lstat = io_ls;
+
+            if (g_progress_log_fp) {
+                unsigned long long qdepth = atomic_load(&g_queue_depth);
+                unsigned long long writer_qdepth = atomic_load(&g_writer_queue_depth);
+                int active = atomic_load(&g_active_workers);
+                unsigned long long popped = atomic_load(&g_tasks_popped);
+                unsigned long long benq = atomic_load(&g_batches_enqueued);
+                unsigned long long bdeq = atomic_load(&g_batches_dequeued);
+                unsigned long long sbenq = atomic_load(&g_stat_batches_enqueued);
+                unsigned long long sbdone = atomic_load(&g_stat_batches_completed);
+                unsigned long long sbdup = atomic_load(&g_stat_batches_dup_fallback);
+                unsigned long long wcrawl = atomic_load(&g_wait_crawl_tasks);
+                unsigned long long wwp = atomic_load(&g_wait_writer_push);
+                unsigned long long wwc = atomic_load(&g_wait_writer_pop);
+                unsigned long long wsp = atomic_load(&g_wait_stat_pop);
+                unsigned long long wse = atomic_load(&g_wait_stat_enqueue);
+                unsigned long long sqmax = atomic_load(&g_stat_queue_depth_max);
+                unsigned long long io_cd = atomic_load(&g_io_closedir_calls);
+                unsigned long long io_od = atomic_load(&g_io_opendir_calls);
+                unsigned int disk_low = atomic_load(&g_disk_low);
+                unsigned int wf = atomic_load(&g_writer_failed);
+
+                if (!g_progress_log_header_written) {
+                    fprintf(g_progress_log_fp,
+                            "unix_ts,elapsed_sec,total_entries,total_files,total_dirs,total_bytes,"
+                            "window_entries,window_files,window_dirs,seconds_seen,ops_rate,"
+                            "queue_depth,writer_queue_depth,active_workers,tasks_popped,"
+                            "batches_enqueued,batches_dequeued,"
+                            "stat_batches_enqueued,stat_batches_completed,stat_batches_dup_fallback,"
+                            "wait_crawl_tasks,wait_writer_push,wait_writer_pop,wait_stat_pop,wait_stat_enqueue,"
+                            "stat_queue_depth_max,"
+                            "delta_total_entries,delta_readdir_calls,delta_lstat_calls,"
+                            "io_readdir_calls,io_closedir_calls,io_opendir_calls,"
+                            "disk_low,writer_failed\n");
+                    g_progress_log_header_written = 1;
+                }
+                fprintf(g_progress_log_fp,
+                        "%lld,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%.6f,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
+                        (long long)time(NULL), elapsed_sec, total_entries, total_files, total_dirs, total_bytes,
+                        window_entries, window_files, window_dirs, divisor, ops_rate, qdepth, writer_qdepth, active,
+                        popped, benq, bdeq, sbenq, sbdone, sbdup, wcrawl, wwp, wwc, wsp, wse, sqmax, d_tot, d_rd,
+                        d_ls, io_rd, io_cd, io_od, disk_low, wf);
+                fflush(g_progress_log_fp);
+            }
+
             if (g_verbose) {
                 unsigned long long qdepth = atomic_load(&g_queue_depth);
                 int active = atomic_load(&g_active_workers);
@@ -3500,6 +3621,7 @@ int main(int argc, char **argv) {
     }
 
     g_crawl_threads = parse_ecrawl_crawl_threads();
+    g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
     g_stat_threads_configured = parse_ecrawl_stat_threads();
     g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
     g_stat_batch_after_reliable_nondirs_cfg = parse_ecrawl_stat_batch_after_reliable_nondirs();
@@ -3627,6 +3749,9 @@ int main(int argc, char **argv) {
     g_active_workers_samples = 0;
     g_seconds_single_worker = 0;
     g_seconds_queue_empty_single_worker = 0;
+    g_progress_prev_tot_entries = 0;
+    g_progress_prev_readdir = 0;
+    g_progress_prev_lstat = 0;
     atomic_store(&g_queue_depth, 0);
     atomic_store(&g_active_workers, 0);
     atomic_store(&g_main_done, 0);
@@ -3662,6 +3787,22 @@ int main(int argc, char **argv) {
     t0 = now_sec();
     g_run_start_sec = t0;
     g_crawl_wall_clock_start = time(NULL);
+
+    {
+        const char *plog = getenv("ECRAWL_PROGRESS_LOG");
+
+        if (plog && *plog) {
+            g_progress_log_fp = fopen(plog, "a");
+            if (!g_progress_log_fp) {
+                fprintf(stderr, "WARNING: cannot open ECRAWL_PROGRESS_LOG %s: %s\n", plog, strerror(errno));
+            } else {
+                setvbuf(g_progress_log_fp, NULL, _IOLBF, 0);
+                g_progress_log_header_written = 0;
+                if (!g_progress_log_atexit_registered && atexit(progress_log_close) == 0)
+                    g_progress_log_atexit_registered = 1;
+            }
+        }
+    }
 
     if (!g_no_write) {
         writer_threads_used = 0;

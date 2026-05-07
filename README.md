@@ -231,6 +231,8 @@ Optional environment variables (no CLI flags for these; see also **[quick refere
 | **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | Per directory, trusted non-dir **`d_type`** entries handled **inline** before stat batching (default **4096**; **`0`** = batch from the first entry). Max **2097152**. |
 | **`ECRAWL_STAT_QUEUE_BATCHES`** | Max pending stat batches **globally** (default **64**, range **4…4096**); bounds **`dup(dirfd)`** backlog and crawl-thread blocking when the pool is full. |
 | **`ECRAWL_STAT_RANDOM_QUEUE`** | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random dequeue among pending batches. |
+| **`ECRAWL_PROGRESS_LOG`** | Append **one CSV row per second** from the stats thread (live **`total_*`**, rolling-window **`window_*`** / **`ops_rate`**, queue depths, **`wait_*`**, **`stat_batches_*`**, per-second **`delta_*`** vs **`g_total_entries`** / **`io_*`**, etc.). Opens with **`"a"`**; first row is a header. Use a fresh path per run if you want a self-contained file. |
+| **`ECRAWL_STALL_HINT_SECONDS`** | After the rolling window is **warm** (~**10** seconds), emit **one stderr line** if **`window_entries`** stays **0** for this many consecutive seconds (**default `5`**; **`0`** disables). Another hint is allowed only after **`window_entries`** goes non-zero again. |
 
 Examples:
 
@@ -246,6 +248,14 @@ ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_STAT_THREADS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
+ECRAWL_PROGRESS_LOG=/tmp/ecrawl_progress.csv ./ecrawl --verbose /path/to/filesystem-tree /tmp/crawl-out 2>stderr.log >stdout.log
+```
+
+**Parsing `ECRAWL_PROGRESS_LOG`:** **`scripts/parse-ecrawl-progress.sh`** reads the CSV (by path or stdin **`-`**) and prints **`elapsed_sec`**, rolling **`ops_rate`**, per-second **`delta_total_entries`**, **`window_entries`**, and crawl/writer queue depths. **`--last`** feeds only the header plus the newest row—use with **`watch`** when stdout is redirected and you still want a live snapshot:
+
+```bash
+watch -n 1 ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.csv
+watch -n 1 -t -d ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.csv   # no banner; highlight changes
 ```
 
 Notes:
@@ -728,6 +738,8 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | `ecrawl` | Trusted non-dir **`d_type`** entries per directory handled inline before batching (default **4096**; **`0`** = always batch). |
 | **`ECRAWL_STAT_QUEUE_BATCHES`** | `ecrawl` | Max pending stat batches (default **64**, range **4…4096**). |
 | **`ECRAWL_STAT_RANDOM_QUEUE`** | `ecrawl` | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random. |
+| **`ECRAWL_PROGRESS_LOG`** | `ecrawl` | Append **1 Hz** CSV of live counters for post-run plots (see detailed **`ecrawl`** env table). |
+| **`ECRAWL_STALL_HINT_SECONDS`** | `ecrawl` | Stderr hint when the rolling **`window_entries`** stays at **0** for **N** consecutive seconds after warmup (**default `5`**; **`0`** = off). |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
 | **`ECRAWL_ANALYZE_THREADS`** | `ecrawl_analyze` | Parallel shard scan for **stats only** (default **16**, minimum **1**, maximum **4096**). If unset, **`ECRAWL_REPAIR_THREADS`** is used when set. |
 | **`EDELETE_THREADS`** | `edelete` | Parallel walk workers (default **16**, minimum **1**). |
