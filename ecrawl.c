@@ -39,6 +39,15 @@
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
  *
  * Diagnostics (optional env): ECRAWL_PROGRESS_LOG=<path> appends one CSV line per second from the stats thread.
+ * ECRAWL_DEBUG_LOG=<path> (rewrite): RFC 4180-style CSV (quoted headers and path column). Rows with status
+ * active / finished list child counts excluding "." / "..". Finished rows are written first, active rows last
+ * so tail -f shows in-flight megadirs. Wall-clock elapsed_sec is crawl-thread time in the directory readdir loop,
+ * recorded only when that scan exceeds STAT_PENDING_DRAIN_EVERY_READDIRS children.
+ * stat_batches_submitted counts successful stat-worker batch enqueues per scan (dup(dirfd) inline fallback excluded);
+ * it is 0 when ECRAWL_STAT_THREADS=0 or on the legacy crawl path.
+ * Active rows appear once a directory reaches ECRAWL_DEBUG_LOG_ACTIVE_AFTER counted children (default 4096), then
+ * refresh on megadir milestones and on the same ~65536 readdir cadence as stat backlog drains. Finished megadir
+ * rows still require cumulative counts above STAT_PENDING_DRAIN_EVERY_READDIRS. On NFS use tail -F.
  * ECRAWL_STALL_HINT_SECONDS=N (default 5; 0 disables): after the rolling window is warm, emit one stderr line if
  * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
  */
@@ -123,6 +132,13 @@
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
+/* During one directory's readdir, periodically drain pending stat batches so megadirs do not hold an
+ * unbounded number of completed batches until EOF (see stat_pending_drain_all). */
+#define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
+/* Minimum counted children (excl. "." / "..") before ECRAWL_DEBUG_LOG emits an "active" row. Env overrides. */
+#define DEFAULT_DEBUG_LOG_ACTIVE_MIN_CHILDREN 4096U
+/* Pass as scan_elapsed_sec to debug_dir_children_note when below megadir threshold (skip elapsed update). */
+#define DEBUG_DIR_SCAN_ELAPSED_OMIT (-1.0)
 #define DEFAULT_STAT_THREADS 8
 #define DEFAULT_STAT_RANDOM_QUEUE 1
 #define DEFAULT_STAT_BATCH_ENTRIES 1024U
@@ -366,6 +382,23 @@ static time_t g_crawl_wall_clock_start;
 static FILE *g_progress_log_fp = NULL;
 static int g_progress_log_header_written = 0;
 static int g_progress_log_atexit_registered = 0;
+static char *g_debug_log_path                     = NULL;
+static int g_debug_log_atexit_registered          = 0;
+static pthread_mutex_t g_debug_dir_children_mu    = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    char *path;
+    uint64_t children;
+    double elapsed_sec;           /* last megadir scan, crawl-thread wall time in readdir loop */
+    uint64_t stat_batches_submitted; /* stat worker batches enqueued in last megadir scan (0 if legacy/no pool) */
+} debug_dir_children_ent_t;
+static debug_dir_children_ent_t *g_debug_dir_children_tab = NULL;
+static size_t g_debug_dir_children_tab_n                  = 0;
+static size_t g_debug_dir_children_tab_cap                = 0;
+static debug_dir_children_ent_t *g_debug_dir_active_tab   = NULL;
+static size_t g_debug_dir_active_n                      = 0;
+static size_t g_debug_dir_active_cap                    = 0;
+static int g_debug_log_flush_open_warned                = 0;
+static size_t g_debug_log_active_min_children_cfg     = DEFAULT_DEBUG_LOG_ACTIVE_MIN_CHILDREN;
 static unsigned long long g_progress_prev_tot_entries = 0;
 static unsigned long long g_progress_prev_readdir = 0;
 static unsigned long long g_progress_prev_lstat = 0;
@@ -373,9 +406,15 @@ static int g_stall_hint_seconds_cfg = 5;
 
 static double now_sec(void);
 static void dir_stack_destroy(dir_stack_t *s);
+static int dir_stack_init(dir_stack_t *s);
+static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len, const struct stat *st);
 static void stats_add_error(shared_state_t *s);
 static void perf_flush_local(perf_local_t *perf);
 static int build_default_output_dir(char *out, size_t out_sz);
+static void debug_dir_children_note(const char *path, size_t add_children, double scan_elapsed_sec,
+                                    uint64_t stat_batches_this_scan);
+static void debug_dir_children_active_touch(const char *path, size_t partial_children, double elapsed_so_far_sec,
+                                            uint64_t stat_batches_submitted);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -611,6 +650,19 @@ static int parse_ecrawl_stat_random_queue(void) {
     v = strtol(e, &end, 10);
     if (errno || end == e || *end) return DEFAULT_STAT_RANDOM_QUEUE;
     return v != 0 ? 1 : 0;
+}
+
+/* First "active" debug row after this many counted children per dir. Env: ECRAWL_DEBUG_LOG_ACTIVE_AFTER. */
+static size_t parse_ecrawl_debug_log_active_after(void) {
+    const char *e = getenv("ECRAWL_DEBUG_LOG_ACTIVE_AFTER");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_DEBUG_LOG_ACTIVE_MIN_CHILDREN;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 1UL || v > 2097152UL) return DEFAULT_DEBUG_LOG_ACTIVE_MIN_CHILDREN;
+    return (size_t)v;
 }
 
 /* Writer thread count for uid-sharded output. Default: DEFAULT_WRITER_THREADS. */
@@ -1120,8 +1172,11 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_STAT_QUEUE_BATCHES);
     fprintf(stderr,
             "Diagnostics: ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
+            "ECRAWL_DEBUG_LOG=<path> megadir CSV (quoted path; active rows after %u counted children, "
+            "elapsed_sec when child_count > %u); ECRAWL_DEBUG_LOG_ACTIVE_AFTER=N overrides active threshold; "
             "ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive seconds with "
-            "zero rolling-window entries once the window is warm (default 5; 0=off).\n");
+            "zero rolling-window entries once the window is warm (default 5; 0=off).\n",
+            (unsigned)DEFAULT_DEBUG_LOG_ACTIVE_MIN_CHILDREN, (unsigned)STAT_PENDING_DRAIN_EVERY_READDIRS);
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
@@ -1511,6 +1566,28 @@ static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
     task->items = NULL;
     task->count = 0;
     task->cap = 0;
+    return 0;
+}
+
+/* Enqueue a discovered subdirectory as its own task so other workers can run while this thread blocks
+ * in readdir. Same pattern as enqueue_root_task (single-item dir_stack_t + queue_push_stack_take). */
+static int enqueue_discovered_dir_task(task_queue_t *queue, char *path_owned, size_t path_len,
+                                       const struct stat *st_opt, shared_state_t *shared) {
+    dir_stack_t task;
+
+    dir_stack_init(&task);
+    if (dir_stack_push_take(&task, path_owned, path_len, st_opt) != 0) {
+        fprintf(stderr, "ERROR worker stack push %s: %s\n", path_owned, strerror(errno));
+        free(path_owned);
+        stats_add_error(shared);
+        return -1;
+    }
+    if (queue_push_stack_take(queue, &task) != 0) {
+        fprintf(stderr, "ERROR worker failed to enqueue subdirectory task: %s\n", strerror(errno));
+        dir_stack_destroy(&task);
+        stats_add_error(shared);
+        return -1;
+    }
     return 0;
 }
 
@@ -2319,7 +2396,7 @@ static int d_type_reliable_nondir_for_stat_batch(unsigned char t) {
 
 static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *parent_path, size_t parent_len,
                               worker_arg_t *wa, emit_context_t *emit, dir_stack_t *stack, task_queue_t *queue,
-                              worker_aux_stats_t *aux, stat_pending_vec_t *pend) {
+                              worker_aux_stats_t *aux, stat_pending_vec_t *pend, uint64_t *worker_batch_count_out) {
     stat_batch_t *b;
     int dfd;
     shared_state_t *shared = wa->shared;
@@ -2408,6 +2485,7 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
         return -1;
     }
     atomic_fetch_add_explicit(&g_stat_batches_enqueued, 1ULL, memory_order_relaxed);
+    if (worker_batch_count_out) (*worker_batch_count_out)++;
     return 0;
 }
 
@@ -2490,16 +2568,30 @@ static int process_directory_iterative(dir_stack_t *stack,
                 memset(&nb, 0, sizeof(nb));
                 memset(&pend, 0, sizeof(pend));
 
-                /* Pending stat batches are waited on at end of this directory (and on error). We do not
-                 * drain before each DT_DIR or DT_UNKNOWN: batches no longer enqueue discovered subtrees
-                 * to merge, so there is no correctness need to barrier there; that avoids a wait on the
-                 * stat pool at every subdirectory. Tradeoff: interleaved subdirs can grow `pend` until
-                 * readdir finishes (more live stat_batch_t until the final drain). */
+                /* Pending stat batches are drained at end of directory, on stat-flush errors, and every
+                 * STAT_PENDING_DRAIN_EVERY_READDIRS dirents during readdir so backlog stays bounded on
+                 * megadirs. We do not drain before each DT_DIR/UNKNOWN (no correctness barrier there). */
 
                 {
                     size_t reliable_nondir_seen_in_dir = 0;
+                    size_t readdir_drain_counter       = 0;
+                    size_t dirents_seen_in_dir         = 0;
+                    uint64_t stat_worker_batches_in_dir = 0;
+                    double dir_dbg_t0                   = 0.0;
+
+                    if (g_debug_log_path) dir_dbg_t0 = now_sec();
 
                 while ((ent = counted_readdir(dir)) != NULL) {
+                    readdir_drain_counter++;
+                    if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
+                        readdir_drain_counter = 0;
+                        if (pend.count > 0) stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                        /* Refresh debug active rows between milestones so large-dir readdir stays visible. */
+                        if (g_debug_log_path && dirents_seen_in_dir >= g_debug_log_active_min_children_cfg)
+                            debug_dir_children_active_touch(dir_path, dirents_seen_in_dir,
+                                                            now_sec() - dir_dbg_t0, stat_worker_batches_in_dir);
+                    }
+
                     size_t child_name_len;
                     struct stat child_st;
 #if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
@@ -2509,6 +2601,19 @@ static int process_directory_iterative(dir_stack_t *stack,
 #endif
 
                     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+                    dirents_seen_in_dir++;
+                    if (g_debug_log_path && dirents_seen_in_dir >= g_debug_log_active_min_children_cfg) {
+                        int hit_active_min = (dirents_seen_in_dir == g_debug_log_active_min_children_cfg);
+                        int mega_milestone =
+                            (dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS &&
+                             (dirents_seen_in_dir == STAT_PENDING_DRAIN_EVERY_READDIRS + 1 ||
+                              (dirents_seen_in_dir % STAT_PENDING_DRAIN_EVERY_READDIRS) == 0));
+
+                        if (hit_active_min || mega_milestone)
+                            debug_dir_children_active_touch(dir_path, dirents_seen_in_dir,
+                                                            now_sec() - dir_dbg_t0, stat_worker_batches_in_dir);
+                    }
 
                     child_name_len = strlen(ent->d_name);
                     if (child_d_type == DT_DIR) {
@@ -2522,12 +2627,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                             stats_add_error(shared);
                             continue;
                         }
-                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
-                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
-                            free(child_path_owned);
-                            stats_add_error(shared);
+                        if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, NULL, shared) != 0)
                             continue;
-                        }
                         while (should_donate_work(shared, stack)) {
                             if (donate_stack_chunk(stack, queue, aux) != 0) {
                                 fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
@@ -2577,8 +2678,14 @@ static int process_directory_iterative(dir_stack_t *stack,
                             }
                             if (nb.count >= g_stat_batch_entries_cfg) {
                                 if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
-                                                       &pend) != 0) {
+                                                       &pend, &stat_worker_batches_in_dir) != 0) {
+                                    double dbg_scan_el = DEBUG_DIR_SCAN_ELAPSED_OMIT;
+
                                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                                    if (g_debug_log_path && dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS)
+                                        dbg_scan_el = now_sec() - dir_dbg_t0;
+                                    debug_dir_children_note(dir_path, dirents_seen_in_dir, dbg_scan_el,
+                                                            stat_worker_batches_in_dir);
                                     counted_closedir(dir);
                                     stat_names_builder_free(&nb);
                                     stat_pending_vec_free(&pend);
@@ -2605,12 +2712,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 stats_add_error(shared);
                                 continue;
                             }
-                            if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
-                                fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
-                                free(child_path_owned);
-                                stats_add_error(shared);
+                            if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, &child_st,
+                                                            shared) != 0)
                                 continue;
-                            }
                             while (should_donate_work(shared, stack)) {
                                 if (donate_stack_chunk(stack, queue, aux) != 0) {
                                     fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path,
@@ -2642,8 +2746,15 @@ static int process_directory_iterative(dir_stack_t *stack,
                     }
                 }
 
+                /* Elapsed for debug log = crawl-thread time in readdir loop only (not tail flush/drain). */
+                double dir_dbg_scan_el = DEBUG_DIR_SCAN_ELAPSED_OMIT;
+
+                if (g_debug_log_path && dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS)
+                    dir_dbg_scan_el = now_sec() - dir_dbg_t0;
+
                 stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux, &pend) != 0) {
+                if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux, &pend,
+                                       &stat_worker_batches_in_dir) != 0) {
                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
                     counted_closedir(dir);
                     stat_names_builder_free(&nb);
@@ -2652,10 +2763,17 @@ static int process_directory_iterative(dir_stack_t *stack,
                     goto outer_continue;
                 }
                 stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                debug_dir_children_note(dir_path, dirents_seen_in_dir, dir_dbg_scan_el, stat_worker_batches_in_dir);
                 stat_names_builder_free(&nb);
                 stat_pending_vec_free(&pend);
                 }
             } else {
+                size_t dirents_seen_in_dir = 0;
+                size_t legacy_dbg_readdir_drain = 0;
+                double dir_dbg_t0 = 0.0;
+
+                if (g_debug_log_path) dir_dbg_t0 = now_sec();
+
                 while ((ent = counted_readdir(dir)) != NULL) {
                     size_t child_name_len;
                     struct stat child_st;
@@ -2665,7 +2783,28 @@ static int process_directory_iterative(dir_stack_t *stack,
                     unsigned char child_d_type = DT_UNKNOWN;
 #endif
 
+                    legacy_dbg_readdir_drain++;
+                    if (legacy_dbg_readdir_drain >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
+                        legacy_dbg_readdir_drain = 0;
+                        if (g_debug_log_path && dirents_seen_in_dir >= g_debug_log_active_min_children_cfg)
+                            debug_dir_children_active_touch(dir_path, dirents_seen_in_dir,
+                                                            now_sec() - dir_dbg_t0, 0ULL);
+                    }
+
                     if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+                    dirents_seen_in_dir++;
+                    if (g_debug_log_path && dirents_seen_in_dir >= g_debug_log_active_min_children_cfg) {
+                        int hit_active_min = (dirents_seen_in_dir == g_debug_log_active_min_children_cfg);
+                        int mega_milestone =
+                            (dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS &&
+                             (dirents_seen_in_dir == STAT_PENDING_DRAIN_EVERY_READDIRS + 1 ||
+                              (dirents_seen_in_dir % STAT_PENDING_DRAIN_EVERY_READDIRS) == 0));
+
+                        if (hit_active_min || mega_milestone)
+                            debug_dir_children_active_touch(dir_path, dirents_seen_in_dir,
+                                                            now_sec() - dir_dbg_t0, 0ULL);
+                    }
 
                     child_name_len = strlen(ent->d_name);
                     if (child_d_type == DT_DIR) {
@@ -2679,12 +2818,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                             stats_add_error(shared);
                             continue;
                         }
-                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL) != 0) {
-                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
-                            free(child_path_owned);
-                            stats_add_error(shared);
+                        if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, NULL, shared) != 0)
                             continue;
-                        }
                         while (should_donate_work(shared, stack)) {
                             if (donate_stack_chunk(stack, queue, aux) != 0) {
                                 fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path, strerror(errno));
@@ -2709,12 +2844,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 stats_add_error(shared);
                                 continue;
                             }
-                            if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) != 0) {
-                                fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
-                                free(child_path_owned);
-                                stats_add_error(shared);
+                            if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, &child_st,
+                                                            shared) != 0)
                                 continue;
-                            }
                             while (should_donate_work(shared, stack)) {
                                 if (donate_stack_chunk(stack, queue, aux) != 0) {
                                     fprintf(stderr, "ERROR worker donate chunk under %s: %s\n", dir_path,
@@ -2745,6 +2877,13 @@ static int process_directory_iterative(dir_stack_t *stack,
                         }
                     }
                 }
+                {
+                    double dbg_scan_el = DEBUG_DIR_SCAN_ELAPSED_OMIT;
+
+                    if (g_debug_log_path && dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS)
+                        dbg_scan_el = now_sec() - dir_dbg_t0;
+                    debug_dir_children_note(dir_path, dirents_seen_in_dir, dbg_scan_el, 0ULL);
+                }
             }
         }
 
@@ -2761,6 +2900,213 @@ static void progress_log_close(void) {
         fclose(g_progress_log_fp);
         g_progress_log_fp = NULL;
     }
+}
+
+static int debug_dir_children_cmp(const void *a, const void *b) {
+    const debug_dir_children_ent_t *x = (const debug_dir_children_ent_t *)a;
+    const debug_dir_children_ent_t *y = (const debug_dir_children_ent_t *)b;
+
+    return strcmp(x->path, y->path);
+}
+
+static void csv_fprint_qfield(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (; *s; s++) {
+            if (*s == '"')
+                fputs("\"\"", fp);
+            else
+                fputc((unsigned char)*s, fp);
+        }
+    }
+    fputc('"', fp);
+}
+
+/* Caller holds g_debug_dir_children_mu. Rewrites the whole file (active + finished rows). */
+static void debug_dir_children_flush_unlocked(void) {
+    FILE *fp;
+    size_t i;
+
+    if (!g_debug_log_path) return;
+    fp = fopen(g_debug_log_path, "w");
+    if (!fp) {
+        if (!g_debug_log_flush_open_warned) {
+            fprintf(stderr, "WARNING: ECRAWL_DEBUG_LOG cannot open %s for write: %s\n", g_debug_log_path,
+                    strerror(errno));
+            g_debug_log_flush_open_warned = 1;
+        }
+        return;
+    }
+
+    fprintf(fp, "\"status\",\"path\",\"child_count\",\"elapsed_sec\",\"stat_batches_submitted\"\n");
+    if (g_debug_dir_active_n > 1U)
+        qsort(g_debug_dir_active_tab, g_debug_dir_active_n, sizeof(g_debug_dir_active_tab[0]),
+              debug_dir_children_cmp);
+    if (g_debug_dir_children_tab_n > 1U)
+        qsort(g_debug_dir_children_tab, g_debug_dir_children_tab_n, sizeof(g_debug_dir_children_tab[0]),
+              debug_dir_children_cmp);
+
+    /* Finished rows first; active rows last so `tail -f` shows directories still in readdir. */
+    for (i = 0; i < g_debug_dir_children_tab_n; i++) {
+        if (g_debug_dir_children_tab[i].children > (uint64_t)STAT_PENDING_DRAIN_EVERY_READDIRS) {
+            fputs("\"finished\",", fp);
+            csv_fprint_qfield(fp, g_debug_dir_children_tab[i].path);
+            fprintf(fp, ",%" PRIu64 ",%.6f,%" PRIu64 "\n", g_debug_dir_children_tab[i].children,
+                    g_debug_dir_children_tab[i].elapsed_sec, g_debug_dir_children_tab[i].stat_batches_submitted);
+        }
+    }
+
+    for (i = 0; i < g_debug_dir_active_n; i++) {
+        fputs("\"active\",", fp);
+        csv_fprint_qfield(fp, g_debug_dir_active_tab[i].path);
+        fprintf(fp, ",%" PRIu64 ",%.6f,%" PRIu64 "\n", g_debug_dir_active_tab[i].children,
+                g_debug_dir_active_tab[i].elapsed_sec,                 g_debug_dir_active_tab[i].stat_batches_submitted);
+    }
+
+    fflush(fp);
+    {
+        int log_fd = fileno(fp);
+
+        if (log_fd >= 0) (void)fsync(log_fd);
+    }
+    fclose(fp);
+}
+
+static void debug_dir_children_active_touch(const char *path, size_t partial_children,
+                                            double elapsed_so_far_sec, uint64_t stat_batches_submitted) {
+    size_t i;
+    char *dup_path;
+
+    if (!g_debug_log_path || !path || partial_children < g_debug_log_active_min_children_cfg) return;
+
+    pthread_mutex_lock(&g_debug_dir_children_mu);
+    for (i = 0; i < g_debug_dir_active_n; i++) {
+        if (strcmp(g_debug_dir_active_tab[i].path, path) == 0) {
+            g_debug_dir_active_tab[i].children               = (uint64_t)partial_children;
+            g_debug_dir_active_tab[i].elapsed_sec            = elapsed_so_far_sec;
+            g_debug_dir_active_tab[i].stat_batches_submitted = stat_batches_submitted;
+            debug_dir_children_flush_unlocked();
+            pthread_mutex_unlock(&g_debug_dir_children_mu);
+            return;
+        }
+    }
+
+    if (g_debug_dir_active_n >= g_debug_dir_active_cap) {
+        size_t nc = g_debug_dir_active_cap ? g_debug_dir_active_cap * 2 : 8;
+        debug_dir_children_ent_t *nt =
+            (debug_dir_children_ent_t *)realloc(g_debug_dir_active_tab, nc * sizeof(*nt));
+        if (!nt) {
+            pthread_mutex_unlock(&g_debug_dir_children_mu);
+            return;
+        }
+        g_debug_dir_active_tab = nt;
+        g_debug_dir_active_cap = nc;
+    }
+    dup_path = strdup(path);
+    if (!dup_path) {
+        pthread_mutex_unlock(&g_debug_dir_children_mu);
+        return;
+    }
+    g_debug_dir_active_tab[g_debug_dir_active_n].path                  = dup_path;
+    g_debug_dir_active_tab[g_debug_dir_active_n].children                = (uint64_t)partial_children;
+    g_debug_dir_active_tab[g_debug_dir_active_n].elapsed_sec           = elapsed_so_far_sec;
+    g_debug_dir_active_tab[g_debug_dir_active_n].stat_batches_submitted = stat_batches_submitted;
+    g_debug_dir_active_n++;
+    debug_dir_children_flush_unlocked();
+    pthread_mutex_unlock(&g_debug_dir_children_mu);
+}
+
+static void debug_dir_children_note(const char *path, size_t add_children, double scan_elapsed_sec,
+                                    uint64_t stat_batches_this_scan) {
+    size_t i;
+    uint64_t new_total;
+    int merged       = 0;
+    int dropped_act  = 0;
+    int megadir_scan = (add_children > STAT_PENDING_DRAIN_EVERY_READDIRS);
+    int have_elapsed = (scan_elapsed_sec >= 0.0);
+
+    if (!g_debug_log_path || add_children == 0 || !path) return;
+
+    pthread_mutex_lock(&g_debug_dir_children_mu);
+    for (i = 0; i < g_debug_dir_active_n;) {
+        if (strcmp(g_debug_dir_active_tab[i].path, path) == 0) {
+            free(g_debug_dir_active_tab[i].path);
+            g_debug_dir_active_tab[i] = g_debug_dir_active_tab[g_debug_dir_active_n - 1];
+            g_debug_dir_active_n--;
+            dropped_act = 1;
+            continue;
+        }
+        i++;
+    }
+
+    for (i = 0; i < g_debug_dir_children_tab_n; i++) {
+        if (strcmp(g_debug_dir_children_tab[i].path, path) == 0) {
+            g_debug_dir_children_tab[i].children += (uint64_t)add_children;
+            new_total = g_debug_dir_children_tab[i].children;
+            merged    = 1;
+            if (megadir_scan && have_elapsed)
+                g_debug_dir_children_tab[i].elapsed_sec = scan_elapsed_sec;
+            if (megadir_scan)
+                g_debug_dir_children_tab[i].stat_batches_submitted = stat_batches_this_scan;
+            break;
+        }
+    }
+    if (!merged) {
+        char *dup_path;
+
+        if (g_debug_dir_children_tab_n >= g_debug_dir_children_tab_cap) {
+            size_t nc =
+                g_debug_dir_children_tab_cap ? g_debug_dir_children_tab_cap * 2 : 16;
+            debug_dir_children_ent_t *nt =
+                (debug_dir_children_ent_t *)realloc(g_debug_dir_children_tab, nc * sizeof(*nt));
+            if (!nt) {
+                pthread_mutex_unlock(&g_debug_dir_children_mu);
+                return;
+            }
+            g_debug_dir_children_tab     = nt;
+            g_debug_dir_children_tab_cap = nc;
+        }
+        dup_path = strdup(path);
+        if (!dup_path) {
+            pthread_mutex_unlock(&g_debug_dir_children_mu);
+            return;
+        }
+        g_debug_dir_children_tab[g_debug_dir_children_tab_n].path     = dup_path;
+        g_debug_dir_children_tab[g_debug_dir_children_tab_n].children = (uint64_t)add_children;
+        g_debug_dir_children_tab[g_debug_dir_children_tab_n].elapsed_sec =
+            (megadir_scan && have_elapsed) ? scan_elapsed_sec : 0.0;
+        g_debug_dir_children_tab[g_debug_dir_children_tab_n].stat_batches_submitted =
+            megadir_scan ? stat_batches_this_scan : 0;
+        new_total = (uint64_t)add_children;
+        g_debug_dir_children_tab_n++;
+    }
+
+    if (new_total > (uint64_t)STAT_PENDING_DRAIN_EVERY_READDIRS || dropped_act)
+        debug_dir_children_flush_unlocked();
+
+    pthread_mutex_unlock(&g_debug_dir_children_mu);
+}
+
+static void debug_dir_children_shutdown(void) {
+    size_t i;
+
+    if (!g_debug_log_path) return;
+
+    pthread_mutex_lock(&g_debug_dir_children_mu);
+    debug_dir_children_flush_unlocked();
+    for (i = 0; i < g_debug_dir_children_tab_n; i++) free(g_debug_dir_children_tab[i].path);
+    free(g_debug_dir_children_tab);
+    g_debug_dir_children_tab     = NULL;
+    g_debug_dir_children_tab_n   = 0;
+    g_debug_dir_children_tab_cap = 0;
+    for (i = 0; i < g_debug_dir_active_n; i++) free(g_debug_dir_active_tab[i].path);
+    free(g_debug_dir_active_tab);
+    g_debug_dir_active_tab = NULL;
+    g_debug_dir_active_n   = 0;
+    g_debug_dir_active_cap = 0;
+    free(g_debug_log_path);
+    g_debug_log_path = NULL;
+    pthread_mutex_unlock(&g_debug_dir_children_mu);
 }
 
 static void *stats_thread_main(void *arg) {
@@ -3622,6 +3968,7 @@ int main(int argc, char **argv) {
 
     g_crawl_threads = parse_ecrawl_crawl_threads();
     g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
+    g_debug_log_active_min_children_cfg = parse_ecrawl_debug_log_active_after();
     g_stat_threads_configured = parse_ecrawl_stat_threads();
     g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
     g_stat_batch_after_reliable_nondirs_cfg = parse_ecrawl_stat_batch_after_reliable_nondirs();
@@ -3801,6 +4148,18 @@ int main(int argc, char **argv) {
                 if (!g_progress_log_atexit_registered && atexit(progress_log_close) == 0)
                     g_progress_log_atexit_registered = 1;
             }
+        }
+    }
+
+    {
+        const char *dlog = getenv("ECRAWL_DEBUG_LOG");
+
+        if (dlog && *dlog) {
+            g_debug_log_path = strdup(dlog);
+            if (!g_debug_log_path) {
+                fprintf(stderr, "WARNING: ECRAWL_DEBUG_LOG strdup failed\n");
+            } else if (!g_debug_log_atexit_registered && atexit(debug_dir_children_shutdown) == 0)
+                g_debug_log_atexit_registered = 1;
         }
     }
 
