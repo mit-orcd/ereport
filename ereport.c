@@ -642,6 +642,44 @@ static double now_sec(void) {
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
+// #region agent log
+static void agent_dbg_ndjson(const char *hypothesis_id, const char *location, const char *message, long long n1,
+                             long long n2, long long n3) {
+    FILE *fp = NULL;
+    struct timeval tv;
+    long long ts_ms;
+    const char *env_path = getenv("EREPORT_DEBUG_LOG");
+    static int warned_env_open;
+    static int warned_default_open;
+
+    /* EREPORT_DEBUG_LOG: optional path; if unset, try workspace log then /tmp (cluster-friendly). */
+    if (env_path && env_path[0]) {
+        fp = fopen(env_path, "a");
+        if (!fp && !warned_env_open) {
+            warned_env_open = 1;
+            fprintf(stderr, "ereport: cannot open EREPORT_DEBUG_LOG (%s): %s\n", env_path, strerror(errno));
+        }
+        if (!fp) return;
+    } else {
+        fp = fopen("/home/erbmi1/git/ereport/.cursor/debug-614931.log", "a");
+        if (!fp) fp = fopen("/tmp/ereport-debug-614931.log", "a");
+        if (!fp && !warned_default_open) {
+            warned_default_open = 1;
+            fprintf(stderr,
+                    "ereport: cannot open debug log (tried workspace .cursor path and /tmp/ereport-debug-614931.log)\n");
+        }
+        if (!fp) return;
+    }
+    gettimeofday(&tv, NULL);
+    ts_ms = (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;
+    fprintf(fp,
+            "{\"sessionId\":\"614931\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\","
+            "\"data\":{\"n1\":%lld,\"n2\":%lld,\"n3\":%lld},\"timestamp\":%lld}\n",
+            hypothesis_id, location, message, n1, n2, n3, ts_ms);
+    fclose(fp);
+}
+// #endregion
+
 static void clear_status_line(void) {
     printf("\r%160s\r", "");
     fflush(stdout);
@@ -6304,16 +6342,46 @@ int main(int argc, char **argv) {
     memset(final_details, 0, sizeof(final_details));
     memset(&final_matched_records, 0, sizeof(final_matched_records));
 
-    for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
+    {
+        double dbg_tm = now_sec();
+        // #region agent log
+        agent_dbg_ndjson("H1", "ereport.c:main_finalize", "pre_worker_join",
+                         (long long)threads_used, (long long)path_count, (long long)bucket_detail_levels);
+        // #endregion
 
-    /* Progress thread: keep parsing status (rec/s line) until workers exit; then finalize banner. */
-    atomic_store(&run_stats.parse_workers_done, 1);
-    atomic_store(&run_stats.finalize_phase, 1);
+        for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
 
-    summary_reduce_from_worker_args(&final_sum, args, threads_used);
+        /* Progress thread: keep parsing status (rec/s line) until workers exit; then finalize banner. */
+        atomic_store(&run_stats.parse_workers_done, 1);
+        atomic_store(&run_stats.finalize_phase, 1);
+
+        // #region agent log
+        agent_dbg_ndjson(
+            "H1",
+            "ereport.c:main_finalize",
+            "post_worker_join",
+            (long long)((now_sec() - dbg_tm) * 1000.0),
+            (long long)atomic_load(&run_stats.scanned_input_files),
+            (long long)atomic_load(&run_stats.matched_records));
+        // #endregion
+        dbg_tm = now_sec();
+
+        summary_reduce_from_worker_args(&final_sum, args, threads_used);
+
+        // #region agent log
+        agent_dbg_ndjson(
+            "H2",
+            "ereport.c:main_finalize",
+            "post_summary_reduce",
+            (long long)((now_sec() - dbg_tm) * 1000.0),
+            (long long)final_sum.matched_records,
+            (long long)final_sum.scanned_records);
+        // #endregion
+    }
 
     memset(&path_shape, 0, sizeof(path_shape));
     if (bucket_detail_levels > 0) {
+        double dbg_bd = now_sec();
         if (matched_records_finalize_parallel(args, threads_used, &final_matched_records) != 0) {
             fprintf(stderr, "allocation failed merging matched records\n");
             if (stats_thread_started) {
@@ -6341,14 +6409,36 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        // #region agent log
+        agent_dbg_ndjson(
+            "H3",
+            "ereport.c:main_finalize",
+            "post_matched_records_finalize",
+            (long long)((now_sec() - dbg_bd) * 1000.0),
+            (long long)final_matched_records.count,
+            0LL);
+        // #endregion
+
         {
             dense_cell_map_t merged_fanout;
             dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS];
+            double dbg_step;
 
             memset(&merged_fanout, 0, sizeof(merged_fanout));
+            dbg_step = now_sec();
             for (i = 0; i < threads_used; i++) dense_cell_merge_into(&merged_fanout, &args[i].parent_fanout, NULL);
+            // #region agent log
+            agent_dbg_ndjson(
+                "H4",
+                "ereport.c:main_finalize",
+                "post_merge_parent_fanout",
+                (long long)((now_sec() - dbg_step) * 1000.0),
+                (long long)threads_used,
+                0LL);
+            // #endregion
 
             memset(&merged_dense, 0, sizeof(merged_dense));
+            dbg_step = now_sec();
             if (bucket_dense_cells_finalize_parallel(args, threads_used, final_details, merged_dense) != 0) {
                 fprintf(stderr, "allocation failed merging bucket details\n");
                 dense_cell_free(&merged_fanout);
@@ -6376,6 +6466,15 @@ int main(int argc, char **argv) {
                 inode_set_destroy(&seen_inodes);
                 return 1;
             }
+            // #region agent log
+            agent_dbg_ndjson(
+                "H5",
+                "ereport.c:main_finalize",
+                "post_bucket_dense_finalize",
+                (long long)((now_sec() - dbg_step) * 1000.0),
+                (long long)(AGE_BUCKETS * SIZE_BUCKETS),
+                (long long)threads_used);
+            // #endregion
             {
                 dense_cell_fanout_lookup_t fanout_lookup;
 
@@ -6383,7 +6482,17 @@ int main(int argc, char **argv) {
                 dense_cell_steal_into_fanout_lookup(&merged_fanout, &fanout_lookup);
                 dense_cell_free(&merged_fanout);
 
+                dbg_step = now_sec();
                 path_shape_fill_from_merged_dense(&final_sum, merged_dense, &fanout_lookup, &path_shape);
+                // #region agent log
+                agent_dbg_ndjson(
+                    "H6",
+                    "ereport.c:main_finalize",
+                    "post_path_shape_fill",
+                    (long long)((now_sec() - dbg_step) * 1000.0),
+                    0LL,
+                    0LL);
+                // #endregion
                 dense_cell_fanout_lookup_free(&fanout_lookup);
             }
             for (ab = 0; ab < AGE_BUCKETS; ab++) {
