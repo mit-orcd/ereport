@@ -62,20 +62,20 @@ Clean:
 make clean
 ```
 
-### Optional: link `ereport` / `ereport_index` against jemalloc
+### Optional: link native binaries against jemalloc
 
-The Makefile auto-detects **jemalloc** via **`pkg-config`** and, when present, links **only** the allocator-heavy binaries — **`ereport`** and **`ereport_index`** — against **`-ljemalloc`**. The other tools (**`ecrawl`**, **`edelete`**, **`ecrawl_repair`**, **`ecrawl_analyze`**, **`enfsprobe`**) are **not** linked against jemalloc; their hot paths are bound by syscalls (**`getdents64`** / **`fstatat`**), not allocator contention. Install the dev package so **`pkg-config`** can find it:
+The Makefile auto-detects **jemalloc** via **`pkg-config`** and, when **`jemalloc-devel`** / **`libjemalloc-dev`** is installed, links **all** native targets built by **`make all`** — **`ereport`**, **`ereport_index`**, **`ecrawl`**, **`edelete`**, **`ecrawl_repair`**, **`ecrawl_analyze`**, and **`enfsprobe`** / **`enfsprobe-dist`** — against **`-ljemalloc`**. **`enfsprobe-static`** is unchanged (fully static link + jemalloc is fragile). Install the dev package so **`pkg-config`** can find it:
 
 ```bash
 sudo dnf install jemalloc-devel    # RHEL / Fedora / EL8+ (EPEL)
 sudo apt install libjemalloc-dev   # Debian / Ubuntu
-make clean && make ereport ereport_index
+make clean && make
 ldd ./ereport_index | grep jemalloc   # verify libjemalloc.so.2 is linked
 ```
 
-Each rule prints **`ereport[_index]: jemalloc enabled (...)`** or **`... jemalloc not found; using glibc malloc`** on its build line. No source **`#include`** is required — linking **`-ljemalloc`** transparently interposes **`malloc`** / **`calloc`** / **`realloc`** / **`free`**. Without the dev package the link line is byte-for-byte identical to a vanilla build, so the change is a no-op on hosts that lack jemalloc. Override the auto-detect by passing **`JEMALLOC_LIBS=`** (empty) on the make command line to force-disable, or **`JEMALLOC_LIBS=-ljemalloc`** to force-enable.
+A single **`build: jemalloc …`** line prints once when you run **`make`** / **`make all`**. No source **`#include`** is required — linking **`-ljemalloc`** transparently interposes **`malloc`** / **`calloc`** / **`realloc`** / **`free`**. Without the dev package the link line is byte-for-byte identical to a vanilla build, so the change is a no-op on hosts that lack jemalloc. Override the auto-detect by passing **`JEMALLOC_LIBS=`** (empty) on the make command line to force-disable, or **`JEMALLOC_LIBS=-ljemalloc`** to force-enable.
 
-In measurements on a 14.9M-path crawl with **`EREPORT_INDEX_THREADS=64`**, **`ereport_index --make`** ran ~**27 %** faster end-to-end (index phase ~**31 %** faster, merge phase unchanged) once linked against jemalloc; **`ecrawl`** showed **no** measurable benefit on adversarial trees and is intentionally left unlinked. Runtime requirement when enabled: **`libjemalloc.so.2`** must be present on the deployment host (the runtime-only RHEL package **`jemalloc`** suffices; the dev package is only needed at build time).
+In measurements on a 14.9M-path crawl with **`EREPORT_INDEX_THREADS=64`**, **`ereport_index --make`** ran ~**27 %** faster end-to-end (index phase ~**31 %** faster, merge phase unchanged) once linked against jemalloc; **`ecrawl`** showed **no** measurable benefit on adversarial trees in that test, but the Makefile applies the same link flags everywhere when jemalloc is available. Runtime requirement when enabled: **`libjemalloc.so.2`** must be present on the deployment host (the runtime-only RHEL package **`jemalloc`** suffices; the dev package is only needed at build time).
 
 ## systemd: daily `ecrawl` and binary sync
 
@@ -266,7 +266,7 @@ ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/files
 ECRAWL_PROGRESS_LOG=/tmp/ecrawl_progress.csv ./ecrawl --verbose /path/to/filesystem-tree /tmp/crawl-out 2>stderr.log >stdout.log
 ```
 
-**Parsing `ECRAWL_PROGRESS_LOG`:** **`scripts/parse-ecrawl-progress.sh`** reads the CSV (by path or stdin **`-`**) and prints **`elapsed_sec`**, rolling **`ops_rate`**, per-second **`delta_total_entries`**, **`window_entries`**, and crawl/writer queue depths. **`--last`** feeds only the header plus the newest row—use with **`watch`** when stdout is redirected and you still want a live snapshot:
+**Parsing `ECRAWL_PROGRESS_LOG`:** **`scripts/parse-ecrawl-progress.sh`** reads the CSV (by path or stdin **`-`**) and prints **`elapsed_sec`**, rolling **`ops_rate`**, per-second **`delta_total_entries`**, **`window_entries`**, and crawl/writer queue depths. The CSV path is **whatever you pass to `ECRAWL_PROGRESS_LOG`** (for example **`/tmp/ecrawl_progress.csv`** or **`scripts/ecrawl_progress.csv`**); there is **no** standard **`scripts/scripts/`** layout under this repo unless you create it yourself. **`--last`** feeds only the header plus the newest row—use with **`watch`** when stdout is redirected and you still want a live snapshot:
 
 ```bash
 watch -n 1 ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.csv

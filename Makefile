@@ -37,7 +37,7 @@ endif
 # dlopen/dlsym: optional nfs_set_version at runtime (missing on EL7 libnfs)
 ENFSPROBE_LIBDL := -ldl
 
-# Optional jemalloc for the allocator-heavy ereport binaries (ereport, ereport_index).
+# Optional jemalloc for native C binaries (all linked targets except enfsprobe-static).
 # Auto-detected via pkg-config; needs jemalloc-devel (RHEL/Fedora) or libjemalloc-dev
 # (Debian/Ubuntu). The runtime-only package ships just libjemalloc.so.2 with no .pc,
 # so pkg-config correctly reports "not available" and the build silently falls back
@@ -47,13 +47,16 @@ ENFSPROBE_LIBDL := -ldl
 JEMALLOC_CFLAGS ?= $(shell pkg-config --cflags jemalloc 2>/dev/null)
 JEMALLOC_LIBS ?= $(shell pkg-config --libs jemalloc 2>/dev/null)
 ifneq ($(strip $(JEMALLOC_LIBS)),)
-EREPORT_JEMALLOC_NOTE := jemalloc enabled ($(strip $(JEMALLOC_LIBS)))
+JEMALLOC_NOTE := jemalloc enabled ($(strip $(JEMALLOC_LIBS)))
 else
-EREPORT_JEMALLOC_NOTE := jemalloc not found; using glibc malloc
+JEMALLOC_NOTE := jemalloc not found; using glibc malloc
 endif
 
-# Default target
-all: $(TARGETS)
+# Default target (listed first so bare `make` builds everything, not only jemalloc-note).
+all: jemalloc-note $(TARGETS)
+
+jemalloc-note:
+	@echo "build: $(JEMALLOC_NOTE)"
 
 path_utils.o: path_utils.c path_utils.h
 	$(CC) $(CFLAGS) -c path_utils.c -o path_utils.o
@@ -62,27 +65,25 @@ crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h cra
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
 
 ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o
-	$(CC) $(CFLAGS) -o $@ ecrawl.c path_utils.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl.c path_utils.o $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
-	$(CC) $(CFLAGS) -o $@ edelete.c path_utils.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
 
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
-	$(CC) $(CFLAGS) -o $@ ecrawl_repair.c
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
 ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o $(JEMALLOC_LIBS)
 
 ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o
-	@echo "ereport: $(EREPORT_JEMALLOC_NOTE)"
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o $(JEMALLOC_LIBS)
 
 ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
-	@echo "ereport_index: $(EREPORT_JEMALLOC_NOTE)"
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
-	$(CC) $(CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL)
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
 
 # Fully static libnfs (needs libnfs.a — often unavailable on RHEL; try Fedora or build libnfs from source).
 enfsprobe-static: enfsprobe.c
@@ -93,8 +94,8 @@ enfsprobe-static: enfsprobe.c
 enfsprobe-dist: enfsprobe.c
 	rm -rf $@
 	mkdir -p $@
-	$(CC) $(CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) \
-	  -Wl,-rpath,'$$ORIGIN' -o $@/enfsprobe enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL)
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) \
+	  -Wl,-rpath,'$$ORIGIN' -o $@/enfsprobe enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
 	SO=; \
 	for d in $$(pkg-config --variable=libdir libnfs 2>/dev/null) /usr/lib64 /usr/lib; do \
 	  test -n "$$d" || continue; \
@@ -130,4 +131,4 @@ check: $(TARGETS)
 check-tree: $(TARGETS)
 	./test_full.sh
 
-.PHONY: all clean debug serve serve-public check check-tree enfsprobe-static enfsprobe-dist
+.PHONY: all clean debug serve serve-public check check-tree jemalloc-note enfsprobe-static enfsprobe-dist
