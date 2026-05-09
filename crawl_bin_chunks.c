@@ -52,8 +52,8 @@ int crawl_bin_append_chunk(crawl_bin_file_chunk_t **chunks, size_t *count, size_
     return 0;
 }
 
-int crawl_bin_load_ckpt(const crawl_bin_chunk_stdio_t *io, const char *bin_path, uint64_t file_sz, uint64_t **offs_out,
-                        size_t *n_out) {
+int crawl_bin_load_ckpt(const crawl_bin_chunk_stdio_t *io, const char *bin_path, uint64_t record_region_end,
+                        uint64_t **offs_out, size_t *n_out) {
     char ckpath[PATH_MAX];
     crawl_ckpt_file_hdr_t ch;
     uint64_t *buf = NULL;
@@ -92,7 +92,7 @@ int crawl_bin_load_ckpt(const crawl_bin_chunk_stdio_t *io, const char *bin_path,
         return -1;
     }
     for (i = 1; i < (size_t)ch.num_offsets; i++) {
-        if (buf[i] <= buf[i - 1] || buf[i] > file_sz) {
+        if (buf[i] <= buf[i - 1] || buf[i] >= record_region_end) {
             free(buf);
             errno = EINVAL;
             return -1;
@@ -158,7 +158,7 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
             goto out;
         }
 
-        if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) goto out;
+        if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) goto out;
         record_end = ftello(fp);
         if (record_end < 0) goto out;
         if ((uint64_t)record_end > seg_end) goto out;
@@ -288,111 +288,123 @@ int crawl_bin_build_chunks_for_file(const crawl_bin_chunk_stdio_t *io, void (*tl
         return -1;
     }
 
-    if (crawl_bin_load_ckpt(io, path, fsz, &offs, &n_off) != 0) {
-        fprintf(stderr, "warn: missing or invalid checkpoint sidecar (.ckpt) for %s\n", path);
-        return -1;
-    }
-    if (n_off == 0 || offs[0] != (uint64_t)sizeof(fh)) {
-        fprintf(stderr, "warn: bad checkpoint offsets in %s\n", path);
-        free(offs);
-        return -1;
-    }
-
-    if (chunk_target_bytes == 0) chunk_target_bytes = CRAWL_BIN_PARSE_CHUNK_BYTES;
-
-    nw = chunk_workers;
-    if (nw < 1) nw = 1;
-
     {
-        size_t n_seg = n_off;
+        uint64_t record_end = fsz;
 
-        if (nw > (int)n_seg) nw = (int)n_seg;
-
-        if (n_seg <= 1 || nw <= 1) {
-            rc = crawl_bin_build_chunks_for_segment(io, path, file_index, chunk_target_bytes, offs[0], fsz, &chunks,
-                                                    &chunk_count, &fc);
-            free(offs);
-            if (rc != 0) return -1;
-            *chunks_out = chunks;
-            *chunk_count_out = chunk_count;
-            *file_chunk_counter_out = fc;
-            return 0;
-        }
-
-        {
-            crawl_bin_chunk_bundle_t *bundles = (crawl_bin_chunk_bundle_t *)calloc((size_t)nw, sizeof(*bundles));
-            pthread_t *tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
-            int w, lo, base, rem;
-
-            if (!bundles || !tids) {
-                free(bundles);
-                free(tids);
-                free(offs);
+        if (fh.catalog_offset != 0ULL) {
+            if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset > fsz) {
+                fprintf(stderr, "warn: invalid catalog_offset in %s\n", path);
                 return -1;
             }
-            lo = 0;
-            base = (int)n_seg / nw;
-            rem = (int)n_seg % nw;
-            for (w = 0; w < nw; w++) {
-                int cnt = base + (w < rem ? 1 : 0);
-                bundles[w].path = path;
-                bundles[w].file_index = file_index;
-                bundles[w].chunk_target_bytes = chunk_target_bytes;
-                bundles[w].offs = offs;
-                bundles[w].n_offs = n_off;
-                bundles[w].file_size = fsz;
-                bundles[w].seg_a = lo;
-                bundles[w].seg_b = lo + cnt;
-                bundles[w].io = *io;
-                bundles[w].tls_flush = tls_flush;
-                lo += cnt;
-            }
-            for (w = 0; w < nw; w++) {
-                if (pthread_create(&tids[w], NULL, crawl_bin_chunk_bundle_worker_main, &bundles[w]) != 0) {
-                    int j;
-                    for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
-                    for (j = w; j < nw; j++) {
-                        crawl_bin_free_chunk_array_rows(bundles[j].chunks, bundles[j].chunk_count);
-                        bundles[j].chunks = NULL;
-                    }
-                    free(bundles);
-                    free(tids);
-                    free(offs);
-                    return -1;
-                }
-            }
-            for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+            record_end = fh.catalog_offset;
+        }
 
-            chunks = NULL;
-            chunk_count = 0;
+        if (crawl_bin_load_ckpt(io, path, record_end, &offs, &n_off) != 0) {
+            fprintf(stderr, "warn: missing or invalid checkpoint sidecar (.ckpt) for %s\n", path);
+            return -1;
+        }
+        if (n_off == 0 || offs[0] != (uint64_t)sizeof(fh)) {
+            fprintf(stderr, "warn: bad checkpoint offsets in %s\n", path);
+            free(offs);
+            return -1;
+        }
+
+        if (chunk_target_bytes == 0) chunk_target_bytes = CRAWL_BIN_PARSE_CHUNK_BYTES;
+
+        nw = chunk_workers;
+        if (nw < 1) nw = 1;
+
+        {
+            size_t n_seg = n_off;
+
+            if (nw > (int)n_seg) nw = (int)n_seg;
+
+            if (n_seg <= 1 || nw <= 1) {
+                rc = crawl_bin_build_chunks_for_segment(io, path, file_index, chunk_target_bytes, offs[0], record_end,
+                                                        &chunks, &chunk_count, &fc);
+                free(offs);
+                if (rc != 0) return -1;
+                *chunks_out = chunks;
+                *chunk_count_out = chunk_count;
+                *file_chunk_counter_out = fc;
+                return 0;
+            }
+
             {
-                size_t cap = 0;
-                fc = 0;
-                rc = 0;
-                for (w = 0; w < nw; w++) {
-                    if (bundles[w].rc != 0) {
-                        rc = -1;
-                        break;
-                    }
-                    if (chunk_list_take_all(&chunks, &chunk_count, &cap, bundles[w].chunks, bundles[w].chunk_count) != 0) {
-                        rc = -1;
-                        break;
-                    }
-                    bundles[w].chunks = NULL;
-                    bundles[w].chunk_count = 0;
-                    fc += bundles[w].fc;
-                }
-                if (rc != 0) {
-                    crawl_bin_free_chunk_array_rows(chunks, chunk_count);
-                    for (w = 0; w < nw; w++) crawl_bin_free_chunk_array_rows(bundles[w].chunks, bundles[w].chunk_count);
+                crawl_bin_chunk_bundle_t *bundles = (crawl_bin_chunk_bundle_t *)calloc((size_t)nw, sizeof(*bundles));
+                pthread_t *tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+                int w, lo, base, rem;
+
+                if (!bundles || !tids) {
                     free(bundles);
                     free(tids);
                     free(offs);
                     return -1;
                 }
+                lo = 0;
+                base = (int)n_seg / nw;
+                rem = (int)n_seg % nw;
+                for (w = 0; w < nw; w++) {
+                    int cnt = base + (w < rem ? 1 : 0);
+                    bundles[w].path = path;
+                    bundles[w].file_index = file_index;
+                    bundles[w].chunk_target_bytes = chunk_target_bytes;
+                    bundles[w].offs = offs;
+                    bundles[w].n_offs = n_off;
+                    bundles[w].file_size = record_end;
+                    bundles[w].seg_a = lo;
+                    bundles[w].seg_b = lo + cnt;
+                    bundles[w].io = *io;
+                    bundles[w].tls_flush = tls_flush;
+                    lo += cnt;
+                }
+                for (w = 0; w < nw; w++) {
+                    if (pthread_create(&tids[w], NULL, crawl_bin_chunk_bundle_worker_main, &bundles[w]) != 0) {
+                        int j;
+                        for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
+                        for (j = w; j < nw; j++) {
+                            crawl_bin_free_chunk_array_rows(bundles[j].chunks, bundles[j].chunk_count);
+                            bundles[j].chunks = NULL;
+                        }
+                        free(bundles);
+                        free(tids);
+                        free(offs);
+                        return -1;
+                    }
+                }
+                for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+
+                chunks = NULL;
+                chunk_count = 0;
+                {
+                    size_t cap = 0;
+                    fc = 0;
+                    rc = 0;
+                    for (w = 0; w < nw; w++) {
+                        if (bundles[w].rc != 0) {
+                            rc = -1;
+                            break;
+                        }
+                        if (chunk_list_take_all(&chunks, &chunk_count, &cap, bundles[w].chunks, bundles[w].chunk_count) != 0) {
+                            rc = -1;
+                            break;
+                        }
+                        bundles[w].chunks = NULL;
+                        bundles[w].chunk_count = 0;
+                        fc += bundles[w].fc;
+                    }
+                    if (rc != 0) {
+                        crawl_bin_free_chunk_array_rows(chunks, chunk_count);
+                        for (w = 0; w < nw; w++) crawl_bin_free_chunk_array_rows(bundles[w].chunks, bundles[w].chunk_count);
+                        free(bundles);
+                        free(tids);
+                        free(offs);
+                        return -1;
+                    }
+                }
+                free(bundles);
+                free(tids);
             }
-            free(bundles);
-            free(tids);
         }
     }
 

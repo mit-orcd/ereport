@@ -335,6 +335,9 @@ run_fs_correlation() {
     # All-users first: always meaningful when ecrawl wrote uid-shard bins. Single-user loads only one shard
     # (uid & (uid_shards-1)); ecrawl omits empty shards — e.g. root maps to shard 0; if no file owner lands
     # there, uid_shard_0000.bin may not exist and ereport single-user cannot run (not a bug).
+    # That shard still holds every uid that hashes to the same slot (uid % uid_shards collides), so
+    # scanned_records counts all rows read from the file while matched_records counts only rows for the
+    # target uid — expect matched <= scanned, not equality, on large multi-owner trees.
     log "step: ereport all-users (cwd=${td})"
     (
         cd "$td" || exit 1
@@ -417,8 +420,8 @@ run_fs_correlation() {
 
     if [[ "$skip_single" -eq 0 ]]; then
         section_fs "[4] ereport single-user ($(id -un)) — slice must be consistent vs full crawl"
-        expect_eq_continue "single-user: matched_records vs scanned" "$su_scanned" "$su_matched" \
-            "after UID filter, every scanned record matches (no dropped rows in slice)" || fs_fail=1
+        expect_le_continue "single-user: matched_records <= scanned_records" "$su_scanned" "$su_matched" \
+            "shard file contains all uids mapping to that slot; matched counts only target uid" || fs_fail=1
         expect_le_continue "single-user: scanned_records <= ecrawl.entries" "$entries" "$su_scanned" \
             "single-user cannot scan more rows than the full crawl recorded" || fs_fail=1
         expect_le_continue "single-user: scanned_records <= all-users scanned_records" "$au_scanned" "$su_scanned" \

@@ -32,8 +32,12 @@ void crawl_bin_free_chunk_array_rows(crawl_bin_file_chunk_t *chunks, size_t coun
 int crawl_bin_append_chunk(crawl_bin_file_chunk_t **chunks, size_t *count, size_t *cap, const char *path,
                            uint64_t start_offset, uint64_t end_offset, size_t file_index);
 
-int crawl_bin_load_ckpt(const crawl_bin_chunk_stdio_t *io, const char *bin_path, uint64_t file_sz, uint64_t **offs_out,
-                        size_t *n_out);
+/*
+ * Load checkpoint offsets; each offset must be < record_region_end.
+ * record_region_end is typically header.catalog_offset for finalized shards, or physical file size if incomplete.
+ */
+int crawl_bin_load_ckpt(const crawl_bin_chunk_stdio_t *io, const char *bin_path, uint64_t record_region_end,
+                        uint64_t **offs_out, size_t *n_out);
 
 int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const char *path, size_t file_index,
                                        uint64_t chunk_target_bytes, uint64_t seg_start, uint64_t seg_end,

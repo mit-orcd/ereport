@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <pwd.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 #include <sys/resource.h>
 #include <time.h>
 
+#include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
 #include "path_canon.h"
@@ -191,6 +193,7 @@ typedef struct {
 
 typedef struct {
     atomic_uint remaining_chunks;
+    crawl_bin_catalog_t *catalog;
 } file_state_t;
 
 typedef struct {
@@ -374,59 +377,141 @@ static void mk_io_tls_flush(void) {
     memset(&mk_io_tls, 0, sizeof(mk_io_tls));
 }
 
-static size_t mk_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+static size_t mk_fread_verbose(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     size_t r = fread(ptr, size, nmemb, stream);
-    if (g_verbose) {
-        mk_io_tls.fread_calls++;
-        mk_io_tls.fread_bytes += (unsigned long long)(r * size);
-    }
+
+    mk_io_tls.fread_calls++;
+    mk_io_tls.fread_bytes += (unsigned long long)(r * size);
     return r;
 }
 
-static size_t mk_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+static size_t mk_fwrite_verbose(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
     size_t w = fwrite(ptr, size, nmemb, stream);
-    if (g_verbose) {
-        mk_io_tls.fwrite_calls++;
-        mk_io_tls.fwrite_bytes += (unsigned long long)(w * size);
-    }
+
+    mk_io_tls.fwrite_calls++;
+    mk_io_tls.fwrite_bytes += (unsigned long long)(w * size);
     return w;
 }
 
-static FILE *mk_fopen(const char *path, const char *mode) {
-    if (g_verbose) mk_io_tls.fopen_calls++;
+static FILE *mk_fopen_verbose(const char *path, const char *mode) {
+    mk_io_tls.fopen_calls++;
     return fopen(path, mode);
 }
 
-static int mk_fclose(FILE *stream) {
-    if (g_verbose) mk_io_tls.fclose_calls++;
+static int mk_fclose_verbose(FILE *stream) {
+    mk_io_tls.fclose_calls++;
     return fclose(stream);
 }
 
-static const crawl_bin_chunk_stdio_t index_chunk_io = {mk_fopen, mk_fread, mk_fclose};
+static int mk_open_verbose(const char *pathname, int flags, ...) {
+    va_list ap;
+    int ret;
 
-static int mk_open(const char *pathname, int flags) {
-    if (g_verbose) mk_io_tls.open_calls++;
-    return open(pathname, flags);
+    mk_io_tls.open_calls++;
+    if (flags & O_CREAT) {
+        mode_t mode;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        ret = open(pathname, flags, mode);
+    } else {
+        ret = open(pathname, flags);
+    }
+    return ret;
 }
 
-static ssize_t mk_read(int fd, void *buf, size_t count) {
+static ssize_t mk_read_verbose(int fd, void *buf, size_t count) {
     ssize_t n = read(fd, buf, count);
-    if (g_verbose) {
-        mk_io_tls.read_calls++;
-        if (n > 0) mk_io_tls.read_bytes += (unsigned long long)n;
-    }
+
+    mk_io_tls.read_calls++;
+    if (n > 0) mk_io_tls.read_bytes += (unsigned long long)n;
     return n;
 }
 
-static void *mk_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    if (g_verbose) mk_io_tls.mmap_calls++;
+static void *mk_mmap_verbose(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    mk_io_tls.mmap_calls++;
     return mmap(addr, length, prot, flags, fd, offset);
 }
 
-static int mk_munmap(void *addr, size_t length) {
-    if (g_verbose) mk_io_tls.munmap_calls++;
+static int mk_munmap_verbose(void *addr, size_t length) {
+    mk_io_tls.munmap_calls++;
     return munmap(addr, length);
 }
+
+static crawl_bin_chunk_stdio_t index_chunk_stdio;
+
+static FILE *(*ei_fopen)(const char *, const char *) = fopen;
+static size_t (*ei_fread)(void *, size_t, size_t, FILE *) = fread;
+static int (*ei_fclose)(FILE *) = fclose;
+static size_t (*ei_fwrite)(const void *, size_t, size_t, FILE *) = fwrite;
+static int (*ei_open)(const char *, int, ...) = open;
+static ssize_t (*ei_read)(int, void *, size_t) = read;
+static void *(*ei_mmap)(void *, size_t, int, int, int, off_t) = mmap;
+static int (*ei_munmap)(void *, size_t) = munmap;
+
+static void ei_note_trigram_append_nop(void) {}
+static void (*ei_note_trigram_append_batch)(void) = ei_note_trigram_append_nop;
+
+static void ei_finalize_chunk_nop(index_run_stats_t *rs, file_state_t *fs, size_t fi) {
+    (void)rs;
+    if (!fs) return;
+    (void)atomic_fetch_sub(&fs[fi].remaining_chunks, 1U);
+}
+
+static void (*ei_finalize_chunk_file)(index_run_stats_t *, file_state_t *, size_t) = ei_finalize_chunk_nop;
+
+static void ei_note_trigram_append_verbose(void) { mk_io_tls.trigram_append_batches++; }
+
+static void finalize_chunk_progress_track(index_run_stats_t *rs, file_state_t *file_states, size_t file_index) {
+    unsigned int old_remaining;
+
+    if (!file_states || !rs) return;
+    atomic_fetch_add_explicit(&rs->chunks_index_done, 1ULL, memory_order_relaxed);
+    old_remaining = atomic_fetch_sub(&file_states[file_index].remaining_chunks, 1U);
+    if (old_remaining == 1U) atomic_fetch_add(&rs->scanned_input_files, 1U);
+}
+
+static void ereport_index_sync_chunk_stdio(void) {
+    index_chunk_stdio.fopen = ei_fopen;
+    index_chunk_stdio.fread = ei_fread;
+    index_chunk_stdio.fclose = ei_fclose;
+}
+
+static void ereport_index_install_verbose_io(void) {
+    if (g_verbose) {
+        ei_fopen = mk_fopen_verbose;
+        ei_fread = mk_fread_verbose;
+        ei_fclose = mk_fclose_verbose;
+        ei_fwrite = mk_fwrite_verbose;
+        ei_open = mk_open_verbose;
+        ei_read = mk_read_verbose;
+        ei_mmap = mk_mmap_verbose;
+        ei_munmap = mk_munmap_verbose;
+        ei_note_trigram_append_batch = ei_note_trigram_append_verbose;
+        ei_finalize_chunk_file = finalize_chunk_progress_track;
+    } else {
+        ei_fopen = fopen;
+        ei_fread = fread;
+        ei_fclose = fclose;
+        ei_fwrite = fwrite;
+        ei_open = open;
+        ei_read = read;
+        ei_mmap = mmap;
+        ei_munmap = munmap;
+        ei_note_trigram_append_batch = ei_note_trigram_append_nop;
+        ei_finalize_chunk_file = ei_finalize_chunk_nop;
+    }
+    ereport_index_sync_chunk_stdio();
+}
+
+#define mk_fopen(path, mode) ((*ei_fopen)((path), (mode)))
+#define mk_fclose(stream) ((*ei_fclose)((stream)))
+#define mk_fread(ptr, size, nmemb, stream) ((*ei_fread)((ptr), (size), (nmemb), (stream)))
+#define mk_fwrite(ptr, size, nmemb, stream) ((*ei_fwrite)((ptr), (size), (nmemb), (stream)))
+#define mk_open(pathname, flags) ((*ei_open)((pathname), (flags)))
+#define mk_read(fd, buf, count) ((*ei_read)((fd), (buf), (count)))
+#define mk_mmap(addr, length, prot, flags, fd, offset) ((*ei_mmap)((addr), (length), (prot), (flags), (fd), (offset)))
+#define mk_munmap(addr, length) ((*ei_munmap)((addr), (length)))
 
 static double now_sec(void) {
     struct timeval tv;
@@ -1432,7 +1517,7 @@ static void *chunk_prep_worker_main(void *arg) {
 
         if (i >= pool->path_count) break;
 
-        r = crawl_bin_build_chunks_for_file(&index_chunk_io, mk_io_tls_flush, pool->paths[i], i, pool->chunk_targets[i],
+        r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i, pool->chunk_targets[i],
                                             parse_index_thread_count(), &local_chunks, &local_count, &fc);
         pool->prep_rc[(int)i] = r;
         pool->prep_chunks[(int)i] = local_chunks;
@@ -1866,7 +1951,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     if (n == 0) return 0;
     if (worker_id >= ctx->trigram_tmp_shard_count) return -1;
 
-    if (g_verbose) mk_io_tls.trigram_append_batches++;
+    ei_note_trigram_append_batch();
     ix = tw_worker_fp_ix(worker_id, bucket);
     fp = ctx->tw_worker_fp[ix];
     if (fp) {
@@ -2132,11 +2217,63 @@ static void *trigram_worker_main(void *arg_void) {
 }
 
 static void finalize_chunk_file_progress(index_run_stats_t *rs, file_state_t *file_states, size_t file_index) {
-    unsigned int old_remaining;
-    if (!file_states || !rs) return;
-    if (g_verbose) atomic_fetch_add_explicit(&rs->chunks_index_done, 1ULL, memory_order_relaxed);
-    old_remaining = atomic_fetch_sub(&file_states[file_index].remaining_chunks, 1U);
-    if (old_remaining == 1U && g_verbose) atomic_fetch_add(&rs->scanned_input_files, 1U);
+    ei_finalize_chunk_file(rs, file_states, file_index);
+}
+
+static void index_free_file_states(file_state_t *fs, size_t n) {
+    size_t i;
+
+    if (!fs) return;
+    for (i = 0; i < n; i++) {
+        if (fs[i].catalog) {
+            crawl_bin_catalog_free(fs[i].catalog);
+            free(fs[i].catalog);
+            fs[i].catalog = NULL;
+        }
+    }
+    free(fs);
+}
+
+static int index_attach_shard_catalog(file_state_t *fs, const char *path) {
+    FILE *fp;
+    bin_file_header_t fh;
+    struct stat st;
+    crawl_bin_catalog_t *cat;
+
+    if (!fs || fs->catalog) return -1;
+    cat = (crawl_bin_catalog_t *)malloc(sizeof(*cat));
+    if (!cat) return -1;
+    crawl_bin_catalog_init_empty(cat);
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) goto fail;
+    fp = mk_fopen(path, "rb");
+    if (!fp) goto fail;
+    if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) {
+        mk_fclose(fp);
+        goto fail;
+    }
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
+        mk_fclose(fp);
+        errno = EINVAL;
+        goto fail;
+    }
+    if (fh.catalog_offset == 0ULL || fh.catalog_offset > (uint64_t)st.st_size) {
+        mk_fclose(fp);
+        errno = EINVAL;
+        goto fail;
+    }
+    if (crawl_bin_catalog_load(fp, fh.catalog_offset, (uint64_t)st.st_size, cat) != 0) {
+        mk_fclose(fp);
+        goto fail;
+    }
+    mk_fclose(fp);
+    fs->catalog = cat;
+    return 0;
+
+fail:
+    crawl_bin_catalog_free(cat);
+    free(cat);
+    return -1;
 }
 
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
@@ -2171,7 +2308,6 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         char *pathbuf = NULL;
         size_t n;
         off_t record_offset = ftello(fp);
-        uint64_t bytes_left_after_hdr;
 
         if (record_offset < 0 || (uint64_t)record_offset >= chunk->end_offset) {
             rc = 0;
@@ -2189,6 +2325,15 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             break;
         }
 
+        {
+            size_t rec_total = crawl_bin_record_total_bytes(&r);
+            if ((uint64_t)record_offset + rec_total > chunk->end_offset) {
+                fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
+                break;
+            }
+        }
+
         scanned_local++;
         if (g_verbose && scanned_local - scanned_published >= (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) {
             uint64_t delta =
@@ -2198,15 +2343,14 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             scanned_published += delta;
         }
 
-        bytes_left_after_hdr = chunk->end_offset - (uint64_t)ftello(fp);
-        if ((uint64_t)r.path_len > bytes_left_after_hdr) {
-            fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
+        if (!file_states[chunk->file_index].catalog) {
+            fprintf(stderr, "warn: shard catalog not loaded for %s\n", chunk->path);
             atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
 
         if (!ctx->aggregate_all_users && (uid_t)r.uid != ctx->target_uid) {
-            if (r.path_len > 0 && fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
+            if (r.name_len > 0 && fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
                 fprintf(stderr, "warn: seek failed skipping path in %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
                 break;
@@ -2214,19 +2358,47 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             continue;
         }
 
-        pathbuf = (char *)malloc((size_t)r.path_len + 1);
+        if (r.parent_dir_id == 0ULL) {
+            fprintf(stderr, "warn: incomplete/wire-format record in %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            break;
+        }
+
+        pathbuf = (char *)malloc(PATH_MAX);
         if (!pathbuf) {
             fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
             atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
-        if (r.path_len > 0 && mk_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
-            fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            free(pathbuf);
-            break;
+        {
+            unsigned char *name_bytes = NULL;
+
+            if (r.name_len > 0) {
+                name_bytes = (unsigned char *)malloc((size_t)r.name_len);
+                if (!name_bytes) {
+                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+                    atomic_fetch_add(&rs->bad_input_files, 1U);
+                    free(pathbuf);
+                    break;
+                }
+                if (mk_fread(name_bytes, 1, r.name_len, fp) != r.name_len) {
+                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
+                    atomic_fetch_add(&rs->bad_input_files, 1U);
+                    free(name_bytes);
+                    free(pathbuf);
+                    break;
+                }
+            }
+            if (crawl_bin_catalog_entry_path(file_states[chunk->file_index].catalog, r.parent_dir_id,
+                                             (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
+                fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
+                free(name_bytes);
+                free(pathbuf);
+                break;
+            }
+            free(name_bytes);
         }
-        pathbuf[r.path_len] = '\0';
 
         {
             uint32_t *codes = NULL;
@@ -3587,7 +3759,7 @@ static int build_index_dir(const char *user_spec,
             free(prep_chunk_counts);
             for (i = 0; i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            index_free_file_states(file_states, path_count);
             return 1;
         }
 
@@ -3611,7 +3783,7 @@ static int build_index_dir(const char *user_spec,
             free(prep_chunk_counts);
             for (i = 0; i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            index_free_file_states(file_states, path_count);
             return 1;
         }
         stats_thread_started = 1;
@@ -3647,7 +3819,7 @@ static int build_index_dir(const char *user_spec,
             free(prep_chunk_counts);
             for (i = 0; i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            index_free_file_states(file_states, path_count);
             return 1;
         }
 
@@ -3667,7 +3839,7 @@ static int build_index_dir(const char *user_spec,
                 free(prep_chunk_counts);
                 for (j = 0; j < path_count; j++) free(paths[j]);
                 free(paths);
-                free(file_states);
+                index_free_file_states(file_states, path_count);
                 return 1;
             }
         }
@@ -3714,7 +3886,7 @@ static int build_index_dir(const char *user_spec,
                 free(prep_chunk_counts);
                 for (i = 0; i < path_count; i++) free(paths[i]);
                 free(paths);
-                free(file_states);
+                index_free_file_states(file_states, path_count);
                 return 1;
             }
 
@@ -3761,9 +3933,28 @@ static int build_index_dir(const char *user_spec,
         }
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         free(chunks);
         return 1;
+    }
+
+    for (i = 0; i < path_count; i++) {
+        if (atomic_load(&file_states[i].remaining_chunks) == 0U) continue;
+        if (index_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
+            fprintf(stderr, "ereport_index: cannot load directory catalog from %s\n", paths[i]);
+            if (stats_thread_started) {
+                atomic_store(&run_stats.stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+            }
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            index_free_file_states(file_states, path_count);
+            return 1;
+        }
     }
 
     if ((!index_dir_override || index_dir_override[0] == '\0') && ensure_dir_recursive(sanitized_name) != 0) {
@@ -3778,7 +3969,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
     if (ensure_dir_recursive(ctx.index_dir) != 0) {
@@ -3793,7 +3984,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3811,7 +4002,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3835,7 +4026,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3853,7 +4044,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3917,7 +4108,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3946,7 +4137,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -3977,7 +4168,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -4017,7 +4208,7 @@ static int build_index_dir(const char *user_spec,
             free(paths);
             for (j = 0; j < chunk_count; j++) free(chunks[j].path);
             free(chunks);
-            free(file_states);
+            index_free_file_states(file_states, path_count);
             return 1;
         }
     }
@@ -4057,7 +4248,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -4139,7 +4330,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         parallel_bucket_io_shutdown(&ctx);
         mk_fclose(ctx.paths_fp);
         mk_fclose(ctx.path_offsets_fp);
@@ -4166,7 +4357,7 @@ static int build_index_dir(const char *user_spec,
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
         free(chunks);
-        free(file_states);
+        index_free_file_states(file_states, path_count);
         parallel_bucket_io_shutdown(&ctx);
         return 1;
     }
@@ -4202,7 +4393,7 @@ static int build_index_dir(const char *user_spec,
             free(paths);
             for (i = 0; i < chunk_count; i++) free(chunks[i].path);
             free(chunks);
-            free(file_states);
+            index_free_file_states(file_states, path_count);
             return 1;
         }
     }
@@ -4316,7 +4507,7 @@ static int build_index_dir(const char *user_spec,
     free(paths);
     for (i = 0; i < chunk_count; i++) free(chunks[i].path);
     free(chunks);
-    free(file_states);
+    index_free_file_states(file_states, path_count);
     return 0;
 }
 
@@ -5062,6 +5253,8 @@ int main(int argc, char **argv) {
     for (vi = 1; vi < argc; vi++) {
         if (arg_is_verbose(argv[vi])) g_verbose = 1;
     }
+
+    ereport_index_install_verbose_io();
 
     cmd0 = argv_skip_verbose_prefix(argc, argv);
     if (cmd0 >= argc) die_usage(argv[0]);

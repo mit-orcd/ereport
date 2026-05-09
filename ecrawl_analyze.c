@@ -37,6 +37,7 @@
 #include "crawl_bin_format.h"
 #include "crawl_ckpt.h"
 #include "crawl_bin_chunks.h"
+#include "crawl_bin_catalog.h"
 #include "path_canon.h"
 
 #ifndef PATH_MAX
@@ -706,40 +707,50 @@ static int analyze_build_all_chunks(const char *dir_path, char **names, size_t n
             goto fail;
         }
         fclose(fp);
-        (void)fh;
 
-        if (crawl_bin_load_ckpt(&analyze_chunk_io, full, sizes[fi], &offs, &n_off) == 0 && n_off > 0) {
-            int bad = 0;
+        {
+            uint64_t record_end = sizes[fi];
 
-            for (j = 0; j < n_off; j++) {
-                uint64_t lo = offs[j];
-                uint64_t hi = (j + 1 < n_off) ? offs[j + 1] : sizes[fi];
-                if (lo >= hi || hi > sizes[fi]) {
-                    bad = 1;
-                    break;
-                }
+            if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) continue;
+            if (fh.catalog_offset != 0ULL) {
+                if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset > sizes[fi]) continue;
+                record_end = fh.catalog_offset;
             }
-            if (!bad) {
+
+            if (crawl_bin_load_ckpt(&analyze_chunk_io, full, record_end, &offs, &n_off) == 0 && n_off > 0) {
+                int bad = 0;
+
                 for (j = 0; j < n_off; j++) {
                     uint64_t lo = offs[j];
-                    uint64_t hi = (j + 1 < n_off) ? offs[j + 1] : sizes[fi];
-                    if (analyze_append_chunk_job(&all, &all_n, &all_cap, full, lo, hi, fi, &byte_sum) != 0) {
-                        free(offs);
-                        goto fail;
+                    uint64_t hi = (j + 1 < n_off) ? offs[j + 1] : record_end;
+                    if (lo >= hi || hi > record_end) {
+                        bad = 1;
+                        break;
                     }
                 }
+                if (!bad) {
+                    for (j = 0; j < n_off; j++) {
+                        uint64_t lo = offs[j];
+                        uint64_t hi = (j + 1 < n_off) ? offs[j + 1] : record_end;
+                        if (analyze_append_chunk_job(&all, &all_n, &all_cap, full, lo, hi, fi, &byte_sum) != 0) {
+                            free(offs);
+                            goto fail;
+                        }
+                    }
+                    free(offs);
+                    continue;
+                }
                 free(offs);
-                continue;
+                offs = NULL;
+            } else {
+                free(offs);
+                offs = NULL;
             }
-            free(offs);
-            offs = NULL;
-        } else {
-            free(offs);
-            offs = NULL;
-        }
 
-        if (sizes[fi] <= hdr_end) continue;
-        if (analyze_append_chunk_job(&all, &all_n, &all_cap, full, hdr_end, sizes[fi], fi, &byte_sum) != 0) goto fail;
+            if (record_end <= hdr_end) continue;
+            if (analyze_append_chunk_job(&all, &all_n, &all_cap, full, hdr_end, record_end, fi, &byte_sum) != 0)
+                goto fail;
+        }
     }
 
     if (all_n > 0U && analyze_interleave_chunks_shard_round_robin(&all, all_n, name_count) != 0) goto fail;
@@ -760,37 +771,45 @@ fail:
 }
 
 static int analyze_scan_fp_until(FILE *fp, uint64_t scan_end_exclusive, uint64_t file_sz,
-                                 unsigned char *pathbuf, char *parentbuf, parent_map_t *map, uint64_t *depth_hist,
+                                 const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
+                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
                                  uint64_t *nrec_out) {
     uint64_t nrec = 0;
 
     if (nrec_out) *nrec_out = 0;
 
     for (;;) {
-        off_t pos = ftello(fp);
+        off_t rec0 = ftello(fp);
         bin_record_hdr_t rh;
+        size_t rec_tot;
 
-        if (pos < 0) return -1;
-        if ((uint64_t)pos >= scan_end_exclusive) break;
+        if (rec0 < 0) return -1;
+        if ((uint64_t)rec0 >= scan_end_exclusive) break;
 
         if (fread(&rh, sizeof(rh), 1, fp) != 1) return -1;
-        pos = ftello(fp);
-        if (pos < 0) return -1;
-        if ((uint64_t)pos + (uint64_t)rh.path_len > file_sz) return -1;
-        if ((uint64_t)pos + (uint64_t)rh.path_len > scan_end_exclusive) return -1;
+        rec_tot = crawl_bin_record_total_bytes(&rh);
+        if ((uint64_t)rec0 + rec_tot > scan_end_exclusive) return -1;
+        if ((uint64_t)rec0 + rec_tot > file_sz) return -1;
 
-        if (rh.path_len) {
-            if (fread(pathbuf, rh.path_len, 1, fp) != 1) return -1;
+        if (rh.parent_dir_id == 0ULL) return -1;
+
+        if (rh.name_len) {
+            if (fread(pathbuf, rh.name_len, 1, fp) != 1) return -1;
         }
-        pos = ftello(fp);
-        if (pos < 0) return -1;
-        if ((uint64_t)pos > scan_end_exclusive) return -1;
 
-        if (rh.path_len > 0) {
-            unsigned db = analyze_depth_slash_bin(pathbuf, rh.path_len);
-            depth_hist[db]++;
-            if (parent_dir_from_path(pathbuf, rh.path_len, parentbuf, 65536U) == 0)
-                parent_map_add_record(map, parentbuf, rh.type);
+        if (crawl_bin_catalog_entry_path(cat, rh.parent_dir_id, (char *)pathbuf, rh.name_len, fullpath_buf,
+                                         fullpath_sz) != 0)
+            return -1;
+        {
+            size_t flen = strlen(fullpath_buf);
+            uint16_t pl = flen > 65535U ? 65535U : (uint16_t)flen;
+
+            if (flen > 0) {
+                unsigned db = analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl);
+                depth_hist[db]++;
+                if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, 65536U) == 0)
+                    parent_map_add_record(map, parentbuf, rh.type);
+            }
         }
         nrec++;
     }
@@ -805,10 +824,12 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t scan_end_exclusive, uint64_t
 }
 
 static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
-                                 unsigned char *pathbuf, char *parentbuf, parent_map_t *map, uint64_t *depth_hist,
-                                 uint64_t *nrec_out) {
+                                 unsigned char *pathbuf, char *parentbuf, char *fullpath_buf, size_t fullpath_sz,
+                                 parent_map_t *map, uint64_t *depth_hist, uint64_t *nrec_out) {
     FILE *fp;
     int rc;
+    bin_file_header_t fh;
+    crawl_bin_catalog_t cat;
 
     if (start_off > file_sz || end_off > file_sz || start_off >= end_off) return -1;
     fp = fopen(full_path, "rb");
@@ -816,11 +837,32 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
         perror(full_path);
         return -1;
     }
-    if (fseeko(fp, (off_t)start_off, SEEK_SET) != 0) {
+    if (fread(&fh, sizeof(fh), 1, fp) != 1) {
         fclose(fp);
         return -1;
     }
-    rc = analyze_scan_fp_until(fp, end_off, file_sz, pathbuf, parentbuf, map, depth_hist, nrec_out);
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
+        fclose(fp);
+        return -1;
+    }
+    if (fh.catalog_offset == 0ULL || fh.catalog_offset > file_sz) {
+        fclose(fp);
+        return -1;
+    }
+    crawl_bin_catalog_init_empty(&cat);
+    if (crawl_bin_catalog_load(fp, fh.catalog_offset, file_sz, &cat) != 0) {
+        crawl_bin_catalog_free(&cat);
+        fclose(fp);
+        return -1;
+    }
+    if (fseeko(fp, (off_t)start_off, SEEK_SET) != 0) {
+        crawl_bin_catalog_free(&cat);
+        fclose(fp);
+        return -1;
+    }
+    rc = analyze_scan_fp_until(fp, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf, fullpath_sz, map,
+                               depth_hist, nrec_out);
+    crawl_bin_catalog_free(&cat);
     fclose(fp);
     return rc;
 }
@@ -832,8 +874,10 @@ static void *analyze_worker_main(void *arg) {
     uint64_t *dh = (uint64_t *)calloc((size_t)ANALYZE_DEPTH_BINS, sizeof(uint64_t));
     unsigned char *pathbuf = (unsigned char *)malloc(65536);
     char *parentbuf = (char *)malloc(65536);
+    char *fullpath_buf = (char *)malloc(PATH_MAX);
 
-    if (!map || !dh || !pathbuf || !parentbuf) {
+    if (!map || !dh || !pathbuf || !parentbuf || !fullpath_buf) {
+        free(fullpath_buf);
         free(pathbuf);
         free(parentbuf);
         free(dh);
@@ -857,7 +901,8 @@ static void *analyze_worker_main(void *arg) {
         fsz = p->shard_file_sizes[c->file_index];
         chunk_bytes = c->end_offset - c->start_offset;
 
-        ar = analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, pathbuf, parentbuf, map, dh, &nrec);
+        ar = analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, pathbuf, parentbuf, fullpath_buf,
+                                   PATH_MAX, map, dh, &nrec);
 
         atomic_fetch_add_explicit(&p->analyze_bytes_done, chunk_bytes, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->analyze_chunks_done, 1ULL, memory_order_relaxed);
@@ -880,6 +925,7 @@ static void *analyze_worker_main(void *arg) {
 
     free(pathbuf);
     free(parentbuf);
+    free(fullpath_buf);
     return NULL;
 }
 

@@ -16,7 +16,7 @@ The current toolchain is:
 
 ### Contents
 
-- [Build](#build) · [Testing](#testing) · [systemd](#systemd-daily-ecrawl-and-binary-sync) · [Why this is fast](#why-this-is-fast) · [What The Tools Do](#what-the-tools-do) · [Typical Workflow](#typical-workflow) · [Validation / tests](#validation-helpers) · [Output semantics](#output-semantics) · [Environment variables](#environment-variables-quick-reference) · [Source layout](#source-layout) · [License](#license)
+- [Build](#build) · [Testing](#testing) · [Synthetic adversarial trees](#synthetic-adversarial-trees) · [systemd](#systemd-daily-ecrawl-and-binary-sync) · [Why this is fast](#why-this-is-fast) · [Crawl shard binary format](#crawl-shard-binary-format) · [What The Tools Do](#what-the-tools-do) · [Typical Workflow](#typical-workflow) · [Validation / tests](#validation-helpers) · [Output semantics](#output-semantics) · [Environment variables](#environment-variables-quick-reference) · [Source layout](#source-layout) · [License](#license)
 
 ## Default thread counts (per binary)
 
@@ -103,9 +103,25 @@ The tools are fast because they combine **compact binary I/O**, **parallelism al
 ### Shared ideas (`ecrawl`, `edelete`, `ereport`, `ereport_index`)
 
 - **Path arguments** — Directory and crawl-root arguments are normalized to **canonical absolute paths** with **`realpath(3)`** once the path exists (see **`path_canon.h`**). Relative inputs are supported; symlink components are resolved. Output directories that are created on demand are canonicalized after **`mkdir`** where applicable.
-- **Binary crawl records** — Paths and metadata are stored in a tight on-disk format (file magic **`ERCBIN03`**, format version **3**). Readers parse record headers first and skip or read payloads in bulk instead of parsing text line-by-line.
-- **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—and to **truncate** an incomplete last record when possible—see **`ecrawl_repair`** below.
+- **Binary crawl records** — Paths and metadata use a fixed header plus a record stream and (when finalized) a **catalog tail** (file magic **`ERCBIN05`**, format version **5**). Layout and rejection rules are spelled out under **[Crawl shard binary format](#crawl-shard-binary-format)** below.
+- **Checkpoint sidecars (`*.bin.ckpt`)** — While crawling, **`ecrawl`** records **record-aligned byte offsets** at a fixed stride into `uid_shard_*.bin.ckpt`. **`ereport`** and **`ereport_index`** load those offsets to split each shard into **valid segments** without a preliminary full-file scan to find boundaries. That enables **many threads** to work on **different byte ranges** of the same file safely (no record torn across workers). Checkpoint offsets apply only to the **record region** (from just after the file header up to **`catalog_offset`** on finalized shards—see below). If sidecars are missing or stale (for example an interrupted crawl), run **`ecrawl_repair`** on the crawl output directory to rebuild them—and to **truncate** an incomplete last record when possible—see **`ecrawl_repair`** below.
 - **Embarrassingly parallel units** — Work is split by **shard file**, **chunk**, **age×size bucket**, or **trigram bucket** so threads rarely contend on the same byte or the same mutex for long.
+
+### Crawl shard binary format
+
+Each **`uid_shard_*.bin`** file uses this layout.
+
+**What changed (high level):** Current shards are **format version 5** (**`ERCBIN05`**), replacing older **`ERCBIN03`** / version **3** files. Version **5** adds a **`catalog_offset`** field to the fixed header and appends a **directory catalog** after the record stream. Each catalog row carries **immediate-child** byte and time aggregates for that directory within the shard (child subtree totals are **not** rolled into parents on disk). **`ecrawl`** writes **`catalog_offset == 0`** until the shard is finalized; **`ereport`**, **`ereport_index --make`**, and **`ecrawl_analyze`** paths that load the catalog require a **nonzero**, in-range **`catalog_offset`** and a parseable catalog blob.
+
+**File header (32 bytes, packed):** **`magic[8]`** (`ERCBIN05`), **`version`** (**`uint32_t`**, must match **5**), **`reserved`** **`uint32_t`**, **`catalog_offset`** **`uint64_t`** (byte offset from BOF to the catalog blob), **`reserved64`** **`uint64_t`**.
+
+**Record region:** **`[sizeof(header), catalog_offset)`** on finalized shards — a concatenation of variable-length records. Each record starts with **`bin_record_hdr_t`** (`parent_dir_id`, `name_len`, `type`, `mode`, `uid`, `gid`, `size`, `inode`, `dev_major`, `dev_minor`, `nlink`, `atime`, `mtime`, `ctime`) followed by **`name_len`** bytes of UTF-8 for a **single path component** (see **`crawl_bin_format.h`**).
+
+**Catalog tail:** **`[catalog_offset, EOF)`** — begins with **`uint64_t n_entries`**, then **`n_entries`** packed **`bin_dir_catalog_entry_t`** rows (`dir_id`, `parent_dir_id`, `depth`, `name_len`, reserved padding, then **`imm_child_bytes`**, **`imm_child_count`**, **`imm_child_ctime_led_count`**, **`imm_child_min_eff_time`**, **`imm_child_max_eff_time`**). **`imm_child_*`** fields sum **only records whose on-disk `parent_dir_id` equals this row’s `dir_id`** (scoped to the shard). **`imm_child_bytes`** follows **`ecrawl`** accounting (regular files: hardlink-aware credit; other types: apparent `st_size`). **`imm_child_min_eff_time`** / **`imm_child_max_eff_time`** use **`max(atime, mtime, ctime)`** per child; **`imm_child_min_eff_time`** is **`UINT64_MAX`** when **`imm_child_count == 0`**. **`imm_child_ctime_led_count`** uses the same “ctime-led” rule as **`ereport`** (**`ctime`** strictly greater than **`max(atime, mtime)`** and at least **180** days newer). Each row ends with **`name_len`** UTF-8 bytes (directory component only; root uses **`name_len == 0`**).
+
+**`catalog_offset`:** On a completed crawl **`ecrawl`** sets this to the first byte of the catalog (**≥** header size, **≤** file size). **`catalog_offset == 0`** means the shard was never finalized (still writing or interrupted).
+
+**Incomplete / invalid shards:** **`ereport`** and **`ereport_index`** reject a shard when **`catalog_offset == 0`**, **`catalog_offset`** is out of range, magic/version mismatch, or **`crawl_bin_catalog_load()`** fails (truncated catalog, bogus counts, etc.). Chunk mapping in **`crawl_bin_chunks`** caps the record region at **`catalog_offset`** when it is nonzero; when it is **zero**, loaders may still align checkpoints against EOF for diagnostics, but report/index consumers treat the shard as unusable until **`ecrawl_repair`** (or a fresh crawl) fixes it. **`ecrawl_repair`** behavior for bad tails and **`corrupt_shards/`** quarantine is unchanged in spirit—see **`ecrawl_repair`** above.
 
 ### `edelete`: parallel deletion (optional age filter)
 
@@ -186,6 +202,26 @@ Manual sequence:
 ```bash
 ./test_setup.sh
 ./test.sh "$(pwd)/test"
+```
+
+## Synthetic adversarial trees
+
+**`scripts/generate-ecrawl-adversarial-tree.sh`** builds stress layouts for **`ecrawl`** (flat megadir, optional depth chain, wide fan-out, optional **`ecrawl_analyze`** depth slices, optional ereport badge fixtures). Choose scale with **`SYNTH_PROFILE`** (**unset** = quick smoke, **`medium`**, **`heavy`**, **`extreme`**).
+
+**`SYNTH_PROFILE=extreme`** layers two extra megadirs on top of the heavy-class baseline:
+
+- **`mega_dir1/`** — about **20M** regular files in **one** directory by default (**`SYNTH_EXTREME_MEGA_DIR1_FILES`**; always unsharded).
+- **`mega_dir2/`** — **`SYNTH_EXTREME_MEGA_DIR2_TOP_FILES`** (default **2M**) top-level **`f…`** files plus **`SYNTH_EXTREME_MEGA_DIR2_NESTED_PAIR_DIRS`** (default **1M**) subdirectories **`d…/`**, each with a single regular file **`file`** (**~3M files + 1M dirs** under **`mega_dir2/`**).
+
+**`python3` + bulk create:** extreme requires **`BATCH_CREATE=1`** (the default) and **`python3`** on **`PATH`** — **`mega_dir1`** / **`mega_dir2`** use the same threaded bulk creator as large flat dirs and the script errors out if bulk mode or **`python3`** is unavailable.
+
+**Disk budget (`DISK_BUDGET_BYTES`):** generation refuses when the **estimated** footprint exceeds the cap (default **~100 GiB**). Extreme trees are metadata-heavy; **100 GiB** is only an order-of-magnitude guardrail—raise **`DISK_BUDGET_BYTES`**, tune **`ASSUMED_BYTES_PER_FLAT_FILE`**, **`AUTO_CAP_FLAT`**, or lower **`SYNTH_EXTREME_*`** counts for your filesystem. **All presets and tunables** (**`DISK_BUDGET_BYTES`**, **`FLAT_FILES`**, badge fixtures, etc.) are documented in the **comment header** at the top of **`scripts/generate-ecrawl-adversarial-tree.sh`**.
+
+Example (larger cap only — adjust paths and budgets to match your host):
+
+```bash
+SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
+  ./scripts/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl-adversarial
 ```
 
 ## What The Tools Do
@@ -393,7 +429,7 @@ EREPORT_THREADS=64 ./ereport ctime /path/to/crawl
 
 Parse chunks scale with input `.bin` size so parallel workers are not capped by a tiny chunk count.
 
-**Bucket drill-down:** By default, **`ereport` does not read path strings** into per-bucket tables—the parser seeks past path bytes and **`bucket_aX_sY.html`** files stay short summaries. Pass **`--bucket-details N`** so **`ereport` reads paths** and emits **N** directory-level rollup tables per bucket page (`N` between **1** and **32**). This applies to **single-user** and **all-users** runs; larger **`N`** and all-users crawls cost more I/O and memory. Each level table lists directories **sorted by bucket bytes** (largest first); if more than **200** directories exist at that depth, only the **top 200** rows are written and a short note appears under the section heading (totals in the heat map and bucket header still reflect the full bucket).
+**Bucket drill-down:** By default, **`ereport` does not read path strings** into per-bucket tables—the parser seeks past path bytes and **`bucket_aX_sY.html`** files stay short summaries. Pass **`--bucket-details N`** so **`ereport` reads paths** and emits **N** directory-level rollup tables per bucket page (`N` between **1** and **32**). This applies to **single-user** and **all-users** runs; larger **`N`** and all-users crawls cost more I/O and memory. Each level table lists directories **sorted by bucket bytes** (largest first); if more than **200** directories exist at that depth, only the **top 200** rows are written and a short note appears under the section heading (totals in the heat map and bucket header still reflect the full bucket). With **`--bucket-details`**, bucket pages also include a **path-shape** drill-down (**Dense** / **Deep** / **Skew**) with **collapsible** sections, **sortable** table headers, and **slice-first** ordering so the shape summary stays easy to scan before deeper directory tables.
 
 Runtime behavior:
 
@@ -775,12 +811,15 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 
 - **`edelete.c`** — standalone parallel walker / deletion utility (**`path_canon.h`** only).
 - **`ecrawl_analyze.c`** — read-only **`uid_shard_*.bin`** analyzer (parent and depth histograms); links **`crawl_bin_chunks.o`** for shared chunk parsing.
+- **`crawl_bin_format.h`** — magic, format version, **`bin_file_header_t`**, **`bin_record_hdr_t`**, **`bin_dir_catalog_entry_t`** (immediate-child aggregates).
+- **`crawl_bin_catalog.h`** / **`crawl_bin_catalog.c`** — load catalog tails (**`crawl_bin_catalog_load()`**, path helpers).
+- **`crawl_bin_chunks.h`** / **`crawl_bin_chunks.c`** — checkpoint-driven chunk boundaries (**`crawl_bin_load_ckpt()`**, **`crawl_bin_build_chunks_for_file()`**).
 - **`crawl_ckpt.h`** — shared on-disk checkpoint layout for **`uid_shard_*.bin.ckpt`** sidecars; included by **`ecrawl`**, **`ereport`**, **`ereport_index`**, **`ecrawl_repair`**, and **`ecrawl_analyze`**.
 - HTML **emitters** in **`ereport.c`** follow a common argument order where practical: output path / `FILE*` target first, then **`username`**, **`all_users`**, **`distinct_uids`**, **`basis_str`**, then function-specific fields (e.g. age/size bucket indices, detail levels).
 
 ## Notes
 
-- The code assumes local filesystem crawl data written by `ecrawl` format version **3** (per-shard **`uid_shard_*.bin.ckpt`** sidecars record sparse byte offsets for parallel chunk mapping in `ereport` / `ereport_index --make`). Use **`ecrawl_repair`** to regenerate missing sidecars without re-crawling, and optionally **`truncate`** shards whose **last record** was cut off mid-write.
+- The code assumes local filesystem crawl data in **`ERCBIN05`** / format version **5** (nonzero **`catalog_offset`** and trailing catalog). Per-shard **`uid_shard_*.bin.ckpt`** sidecars still record sparse byte offsets within the **record region** for parallel chunk mapping in **`ereport`** / **`ereport_index --make`**. Use **`ecrawl_repair`** to regenerate missing sidecars without re-crawling, and optionally **`truncate`** shards whose **last record** was cut off mid-write.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - For **per-user** runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. **All-users** runs load **every** shard file (same as merging full-cluster crawls).
 - **`ECRAWL_UID_SHARDS`** for a crawl run should match across every output directory you later pass together to **`ereport`** / **`ereport_index --make`** (merged reports assume consistent shard layout).

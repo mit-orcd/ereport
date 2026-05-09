@@ -51,6 +51,7 @@
 #include <stdatomic.h>
 #include <sys/time.h>
 
+#include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
 #include "path_canon.h"
@@ -69,6 +70,7 @@
 #define PARSE_CHUNK_MIN_BYTES (1ULL << 20)
 #define BUCKET_DETAIL_LEVELS_MAX 32
 #define BUCKET_PATH_TABLE_MAX_ROWS 200
+#define BUCKET_SHAPE_DRILL_MAX_ROWS 10
 /* C-led: ctime must exceed max(atime,mtime) by at least this many seconds ("substantially newer"; hardcoded). */
 #define CTIME_LED_MIN_DELTA_SEC (180ULL * 86400ULL)
 /* Purple C-led badges (heat map, bucket pill) only when C-led bytes are at least this fraction of the slice. */
@@ -199,6 +201,7 @@ typedef struct {
 
 typedef struct {
     atomic_uint remaining_chunks;
+    crawl_bin_catalog_t *catalog;
 } file_state_t;
 
 typedef struct {
@@ -289,6 +292,25 @@ typedef struct {
     dense_node_t *buckets[DENSE_PARENT_BUCKETS_FANOUT_LOOKUP];
 } dense_cell_fanout_lookup_t;
 
+/*
+ * Crawl-wide immediate-child breakdown under each parent directory (matched records only).
+ * Used for Dense drill-down: files vs dirs vs other types, min/max of the report time basis across children.
+ */
+typedef struct fanout_parent_stat_node {
+    struct fanout_parent_stat_node *next;
+    char *parent;
+    uint64_t n_files;
+    uint64_t n_dirs;
+    uint64_t n_others;
+    uint64_t t_min;
+    uint64_t t_max;
+    unsigned char have_time;
+} fanout_parent_stat_node_t;
+
+typedef struct {
+    fanout_parent_stat_node_t *buckets[DENSE_PARENT_BUCKETS_FANOUT_LOOKUP];
+} fanout_parent_stat_map_t;
+
 typedef struct {
     uint64_t deep_bytes;
     /* Max immediate-child count (crawl-wide) among parent dirs of regular files represented in this slice. */
@@ -331,6 +353,7 @@ typedef struct {
     dense_cell_map_t dense_maps[AGE_BUCKETS][SIZE_BUCKETS];
     /* Crawl-wide: immediate children per parent dir (all matched types with paths). */
     dense_cell_map_t parent_fanout;
+    fanout_parent_stat_map_t parent_fanout_stats;
 } worker_arg_t;
 
 static atomic_ullong g_io_opendir_calls = 0;
@@ -641,44 +664,6 @@ static double now_sec(void) {
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
-
-// #region agent log
-static void agent_dbg_ndjson(const char *hypothesis_id, const char *location, const char *message, long long n1,
-                             long long n2, long long n3) {
-    FILE *fp = NULL;
-    struct timeval tv;
-    long long ts_ms;
-    const char *env_path = getenv("EREPORT_DEBUG_LOG");
-    static int warned_env_open;
-    static int warned_default_open;
-
-    /* EREPORT_DEBUG_LOG: optional path; if unset, try workspace log then /tmp (cluster-friendly). */
-    if (env_path && env_path[0]) {
-        fp = fopen(env_path, "a");
-        if (!fp && !warned_env_open) {
-            warned_env_open = 1;
-            fprintf(stderr, "ereport: cannot open EREPORT_DEBUG_LOG (%s): %s\n", env_path, strerror(errno));
-        }
-        if (!fp) return;
-    } else {
-        fp = fopen("/home/erbmi1/git/ereport/.cursor/debug-614931.log", "a");
-        if (!fp) fp = fopen("/tmp/ereport-debug-614931.log", "a");
-        if (!fp && !warned_default_open) {
-            warned_default_open = 1;
-            fprintf(stderr,
-                    "ereport: cannot open debug log (tried workspace .cursor path and /tmp/ereport-debug-614931.log)\n");
-        }
-        if (!fp) return;
-    }
-    gettimeofday(&tv, NULL);
-    ts_ms = (long long)tv.tv_sec * 1000LL + (long long)tv.tv_usec / 1000LL;
-    fprintf(fp,
-            "{\"sessionId\":\"614931\",\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\","
-            "\"data\":{\"n1\":%lld,\"n2\":%lld,\"n3\":%lld},\"timestamp\":%lld}\n",
-            hypothesis_id, location, message, n1, n2, n3, ts_ms);
-    fclose(fp);
-}
-// #endregion
 
 static void clear_status_line(void) {
     printf("\r%160s\r", "");
@@ -1268,6 +1253,20 @@ static int shape_dense_badge_visible(uint64_t max_fanout_among_slice_parents) {
     return max_fanout_among_slice_parents >= PATH_SHAPE_DENSE_MIN_CHILDREN;
 }
 
+static int heat_cell_skew_visible(const summary_t *sum, const path_shape_view_t *shape, int ab, int sb) {
+    uint64_t cb;
+    uint64_t cf;
+    uint64_t db;
+    uint64_t dmax;
+
+    if (!sum || !shape) return 0;
+    cb = sum->bytes[ab][sb];
+    cf = sum->files[ab][sb];
+    db = shape->cell[ab][sb].deep_bytes;
+    dmax = shape->cell[ab][sb].dense_fanout_max;
+    return shape_deep_badge_visible(db, cb, cf) && shape_dense_badge_visible(dmax);
+}
+
 static unsigned path_slash_count_str(const char *path) {
     unsigned c = 0;
     if (!path) return 0;
@@ -1455,6 +1454,18 @@ static uint64_t dense_cell_fanout_lookup_get_n(const dense_cell_fanout_lookup_t 
     return 0;
 }
 
+static uint64_t dense_cell_map_get_n(const dense_cell_map_t *m, const char *parent) {
+    uint32_t bi;
+    const dense_node_t *n;
+
+    if (!m || !parent) return 0;
+    bi = dense_parent_bucket(parent);
+    for (n = m->buckets[bi]; n; n = n->next) {
+        if (strcmp(n->parent, parent) == 0) return n->n;
+    }
+    return 0;
+}
+
 static void dense_cell_fanout_lookup_free(dense_cell_fanout_lookup_t *lk) {
     size_t bi;
 
@@ -1513,12 +1524,167 @@ static void dense_cell_free(dense_cell_map_t *m) {
     }
 }
 
+static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
+    size_t bi;
+
+    if (!m) return;
+    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+        fanout_parent_stat_node_t *n = m->buckets[bi];
+
+        m->buckets[bi] = NULL;
+        while (n) {
+            fanout_parent_stat_node_t *nx = n->next;
+
+            free(n->parent);
+            free(n);
+            n = nx;
+        }
+    }
+}
+
+static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_parent_stat_node_t *src_node, summary_t *sum) {
+    uint32_t biw;
+    fanout_parent_stat_node_t **pp;
+
+    (void)sum;
+    biw = dense_parent_bucket_fanout_lookup(src_node->parent);
+    pp = &dst->buckets[biw];
+    while (*pp) {
+        if (strcmp((*pp)->parent, src_node->parent) == 0) {
+            (*pp)->n_files += src_node->n_files;
+            (*pp)->n_dirs += src_node->n_dirs;
+            (*pp)->n_others += src_node->n_others;
+            if (src_node->have_time) {
+                if (!(*pp)->have_time) {
+                    (*pp)->t_min = src_node->t_min;
+                    (*pp)->t_max = src_node->t_max;
+                    (*pp)->have_time = 1;
+                } else {
+                    if (src_node->t_min < (*pp)->t_min) (*pp)->t_min = src_node->t_min;
+                    if (src_node->t_max > (*pp)->t_max) (*pp)->t_max = src_node->t_max;
+                }
+            }
+            free(src_node->parent);
+            free(src_node);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    src_node->next = dst->buckets[biw];
+    dst->buckets[biw] = src_node;
+}
+
+static void fanout_parent_stat_merge_into(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum) {
+    size_t bi;
+
+    if (!dst || !src) return;
+    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+        fanout_parent_stat_node_t *n = src->buckets[bi];
+
+        src->buckets[bi] = NULL;
+        while (n) {
+            fanout_parent_stat_node_t *nx = n->next;
+
+            n->next = NULL;
+            fanout_parent_stat_absorb_one(dst, n, sum);
+            n = nx;
+        }
+    }
+}
+
+static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
+                                          const char *child_path,
+                                          uint8_t type,
+                                          uint64_t pick_ts,
+                                          summary_t *sum) {
+    char parent[PATH_MAX];
+    uint32_t biw;
+    fanout_parent_stat_node_t **pp;
+    fanout_parent_stat_node_t *node;
+    uint64_t nf = 0;
+    uint64_t nd = 0;
+    uint64_t no = 0;
+
+    if (!m || !child_path) return;
+    if (parent_dir_to_buf(child_path, parent, sizeof(parent)) != 0) return;
+    if (type == 'f')
+        nf = 1;
+    else if (type == 'd')
+        nd = 1;
+    else
+        no = 1;
+
+    biw = dense_parent_bucket_fanout_lookup(parent);
+    pp = &m->buckets[biw];
+    while (*pp) {
+        if (strcmp((*pp)->parent, parent) == 0) {
+            (*pp)->n_files += nf;
+            (*pp)->n_dirs += nd;
+            (*pp)->n_others += no;
+            if (!(*pp)->have_time) {
+                (*pp)->t_min = pick_ts;
+                (*pp)->t_max = pick_ts;
+                (*pp)->have_time = 1;
+            } else {
+                if (pick_ts < (*pp)->t_min) (*pp)->t_min = pick_ts;
+                if (pick_ts > (*pp)->t_max) (*pp)->t_max = pick_ts;
+            }
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    node = (fanout_parent_stat_node_t *)malloc(sizeof(*node));
+    if (!node) {
+        if (sum) sum->bad_input_files++;
+        return;
+    }
+    node->parent = strdup(parent);
+    if (!node->parent) {
+        free(node);
+        if (sum) sum->bad_input_files++;
+        return;
+    }
+    node->n_files = nf;
+    node->n_dirs = nd;
+    node->n_others = no;
+    node->t_min = pick_ts;
+    node->t_max = pick_ts;
+    node->have_time = 1;
+    node->next = m->buckets[biw];
+    m->buckets[biw] = node;
+}
+
+static const fanout_parent_stat_node_t *fanout_parent_stat_lookup(const fanout_parent_stat_map_t *m, const char *parent) {
+    uint32_t biw;
+    const fanout_parent_stat_node_t *n;
+
+    if (!m || !parent) return NULL;
+    biw = dense_parent_bucket_fanout_lookup(parent);
+    for (n = m->buckets[biw]; n; n = n->next) {
+        if (strcmp(n->parent, parent) == 0) return n;
+    }
+    return NULL;
+}
+
+static void bucket_shape_maps_destroy(dense_cell_fanout_lookup_t *lk,
+                                      dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS],
+                                      fanout_parent_stat_map_t *fanout_stats) {
+    int ab, sb;
+
+    dense_cell_fanout_lookup_free(lk);
+    for (ab = 0; ab < AGE_BUCKETS; ab++) {
+        for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense[ab][sb]);
+    }
+    fanout_parent_stat_map_free(fanout_stats);
+}
+
 static void worker_dense_maps_free(worker_arg_t *args, int nthreads) {
     int ti, ab, sb;
 
     if (!args || nthreads < 1) return;
     for (ti = 0; ti < nthreads; ti++) {
         dense_cell_free(&args[ti].parent_fanout);
+        fanout_parent_stat_map_free(&args[ti].parent_fanout_stats);
         for (ab = 0; ab < AGE_BUCKETS; ab++) {
             for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&args[ti].dense_maps[ab][sb]);
         }
@@ -2527,7 +2693,7 @@ static void emit_path_summary_table(FILE *out,
                         "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
                         "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">%.1f</td>"
                         "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%.17g\">"
-                        "<span class=\"heat-badge-tip\" tabindex=\"0\" title=\"",
+                        "<span class=\"heat-badge-tip\" tabindex=\"0\" data-tip=\"",
                         file_bg,
                         rows[i]->bucket_files,
                         bpf,
@@ -2542,8 +2708,6 @@ static void emit_path_summary_table(FILE *out,
                         share_bytes,
                         cled_bg,
                         ctime_led_pct);
-                html_escape(out, clin_title);
-                fprintf(out, "\" data-tip=\"");
                 html_escape(out, clin_title);
                 fputs("\">", out);
                 if (ctime_led_badge_visible(rows[i]->bucket_ctime_led_bytes, rows[i]->bucket_bytes))
@@ -2621,6 +2785,297 @@ static void emit_heat_map_margin_summary(FILE *out, const summary_t *sum, int ab
     fprintf(out, "</section>\n");
 }
 
+typedef struct {
+    const char *parent;
+    uint64_t slice_files;
+    uint64_t global_fanout;
+} dense_drill_row_t;
+
+typedef struct {
+    const char *parent;
+    uint64_t bytes;
+    uint64_t files;
+} deep_drill_row_t;
+
+static int cmp_dense_drill_desc(const void *a, const void *b) {
+    const dense_drill_row_t *ra = (const dense_drill_row_t *)a;
+    const dense_drill_row_t *rb = (const dense_drill_row_t *)b;
+
+    if (ra->slice_files > rb->slice_files) return -1;
+    if (ra->slice_files < rb->slice_files) return 1;
+    return strcmp(ra->parent, rb->parent);
+}
+
+static int cmp_deep_drill_desc(const void *a, const void *b) {
+    const deep_drill_row_t *ra = (const deep_drill_row_t *)a;
+    const deep_drill_row_t *rb = (const deep_drill_row_t *)b;
+
+    if (ra->files > rb->files) return -1;
+    if (ra->files < rb->files) return 1;
+    if (ra->bytes > rb->bytes) return -1;
+    if (ra->bytes < rb->bytes) return 1;
+    return strcmp(ra->parent, rb->parent);
+}
+
+/*
+ * Tables tying heat-map Deep/Dense/Skew badges to concrete parent directories for one bucket page.
+ */
+static void emit_drill_iso_time_cell(FILE *out, int have_t, uint64_t ts) {
+    char buf[72];
+
+    if (!have_t) {
+        fputs("<td class=\"num r\" data-sort-n=\"-1\">&mdash;</td>\n", out);
+        return;
+    }
+    format_wall_clock_local((time_t)ts, buf, sizeof(buf));
+    fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">", (double)ts);
+    html_escape(out, buf);
+    fputs("</td>\n", out);
+}
+
+static void emit_bucket_shape_drill_section(FILE *out,
+                                            int ab,
+                                            int sb,
+                                            const bucket_details_t *details,
+                                            const dense_cell_map_t *slice_dense_parents,
+                                            const dense_cell_fanout_lookup_t *fanout_lookup,
+                                            const fanout_parent_stat_map_t *fanout_stats,
+                                            const summary_t *heat_sum,
+                                            const path_shape_view_t *shape,
+                                            const char *basis_str) {
+    uint64_t cell_bytes = heat_sum->bytes[ab][sb];
+    uint64_t cell_files = heat_sum->files[ab][sb];
+    uint64_t deep_b = shape->cell[ab][sb].deep_bytes;
+    uint64_t dense_max = shape->cell[ab][sb].dense_fanout_max;
+    char hb[32], hf[96], db[32];
+    double deep_pct = 0.0;
+    size_t i;
+    uint32_t bi;
+    const dense_node_t *n;
+
+    if (cell_bytes > 0ULL && deep_b > 0ULL) deep_pct = 100.0 * (double)deep_b / (double)cell_bytes;
+
+    human_bytes(cell_bytes, hb, sizeof(hb));
+    format_count_pretty_inline(cell_files, hf, sizeof(hf));
+    human_bytes(deep_b, db, sizeof(db));
+
+    fputs("<h2 class=\"shape-drill-h2\">Path-shape drill-down</h2>\n", out);
+    fprintf(out,
+            "<p class=\"note\">This age&times;size slice has <strong>%s</strong> files totaling <strong>%s</strong> "
+            "(same basis as the heat map). Deep-labelled bytes here are <strong>%s</strong> (~<strong>%.2f%%</strong> "
+            "of slice bytes). Among parents represented in this slice, the largest crawl-wide immediate-child fan-out "
+            "seen is <strong>%llu</strong> (the Dense badge uses parents with at least <strong>%u</strong> crawl-wide "
+            "children).</p>\n",
+            hf, hb, db, deep_pct, (unsigned long long)dense_max, (unsigned)PATH_SHAPE_DENSE_MIN_CHILDREN);
+
+    /* Dense parents: slice grouping × crawl-wide fan-out */
+    {
+        size_t dense_cnt = 0;
+        dense_drill_row_t *rows = NULL;
+        size_t show_n;
+
+        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++)
+            for (n = slice_dense_parents->buckets[bi]; n; n = n->next) dense_cnt++;
+
+        if (dense_cnt > 0) {
+            rows = (dense_drill_row_t *)calloc(dense_cnt, sizeof(*rows));
+            if (rows) {
+                size_t k = 0;
+                for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                    for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
+                        rows[k].parent = n->parent;
+                        rows[k].slice_files = n->n;
+                        rows[k].global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+                        k++;
+                    }
+                }
+                qsort(rows, dense_cnt, sizeof(*rows), cmp_dense_drill_desc);
+                show_n = dense_cnt;
+                if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+
+                fprintf(out,
+                        "<details class=\"bucket-help shape-drill-details\"><summary>Dense parents &mdash; up to "
+                        "%u rows by slice files</summary>\n"
+                        "<div class=\"bucket-help-body\">\n",
+                        (unsigned)BUCKET_SHAPE_DRILL_MAX_ROWS);
+                fprintf(out,
+                        "<p class=\"table-trunc-note\">Immediate parent directories of files in this slice (each row is one "
+                        "parent), ranked by <strong>slice files</strong> (most in this bucket first; click headers to sort). "
+                        "At most %u unique parents are shown. <strong>Slice files</strong> counts regular files in this bucket "
+                        "only. <strong>Child files / dirs / other</strong> count immediate crawl entries under that parent "
+                        "(matched records only; crawl-wide fan-out drives the Dense badge). <strong>Min / max</strong> use this "
+                        "report&rsquo;s time basis across those children.</p>\n",
+                        (unsigned)BUCKET_SHAPE_DRILL_MAX_ROWS);
+                fputs("<div class=\"bucket-table-wrap\"><table data-sort-col=\"0\" data-sort-dir=\"d\">\n", out);
+                fputs("<thead><tr>"
+                      "<th class=\"num r sort-h sort-desc\" data-i=\"0\" data-t=\"n\"><span class=\"th-text\">Slice files</span></th>"
+                      "<th class=\"num r sort-h\" data-i=\"1\" data-t=\"n\"><span class=\"th-text\">Child files</span></th>"
+                      "<th class=\"num r sort-h\" data-i=\"2\" data-t=\"n\"><span class=\"th-text\">Child dirs</span></th>"
+                      "<th class=\"num r sort-h\" data-i=\"3\" data-t=\"n\"><span class=\"th-text\">Child other</span></th>"
+                      "<th class=\"num r sort-h\" data-i=\"4\" data-t=\"n\"><span class=\"th-text\">Min",
+                      out);
+                if (basis_str && basis_str[0]) {
+                    fputs(" <span class=\"meta-sub\">(", out);
+                    html_escape(out, basis_str);
+                    fputs(")</span>", out);
+                }
+                fputs("</span></th>"
+                      "<th class=\"num r sort-h\" data-i=\"5\" data-t=\"n\"><span class=\"th-text\">Max",
+                      out);
+                if (basis_str && basis_str[0]) {
+                    fputs(" <span class=\"meta-sub\">(", out);
+                    html_escape(out, basis_str);
+                    fputs(")</span>", out);
+                }
+                fputs("</span></th>"
+                      "<th class=\"path-cell sort-h\" data-i=\"6\" data-t=\"s\"><span class=\"th-text\">Parent directory</span></th>"
+                      "</tr></thead>\n<tbody>\n",
+                      out);
+                for (i = 0; i < show_n; i++) {
+                    char sf[96], cf[96], cd[96], co[96];
+                    const fanout_parent_stat_node_t *st =
+                        (fanout_stats && rows[i].parent) ? fanout_parent_stat_lookup(fanout_stats, rows[i].parent) : NULL;
+                    uint64_t ch_f = st ? st->n_files : 0ULL;
+                    uint64_t ch_d = st ? st->n_dirs : 0ULL;
+                    uint64_t ch_o = st ? st->n_others : 0ULL;
+
+                    format_count_pretty_inline(rows[i].slice_files, sf, sizeof(sf));
+                    format_count_pretty_inline(ch_f, cf, sizeof(cf));
+                    format_count_pretty_inline(ch_d, cd, sizeof(cd));
+                    format_count_pretty_inline(ch_o, co, sizeof(co));
+                    fputs("<tr>", out);
+                    fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)rows[i].slice_files, sf);
+                    fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)ch_f, cf);
+                    fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)ch_d, cd);
+                    fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)ch_o, co);
+                    emit_drill_iso_time_cell(out, st ? (int)st->have_time : 0, st ? st->t_min : 0ULL);
+                    emit_drill_iso_time_cell(out, st ? (int)st->have_time : 0, st ? st->t_max : 0ULL);
+                    fputs("<td class=\"path-cell\" data-sort-s=\"", out);
+                    html_escape(out, rows[i].parent);
+                    fputs("\">", out);
+                    html_escape(out, rows[i].parent);
+                    fputs("</td></tr>\n", out);
+                }
+                fputs("</tbody></table></div>\n", out);
+                if (dense_cnt > show_n) {
+                    fprintf(out,
+                            "<p class=\"table-trunc-note\">Showing %zu of %zu unique parents ranked by slice files (most first).</p>\n",
+                            show_n, dense_cnt);
+                }
+                fputs("</div></details>\n", out);
+            }
+            free(rows);
+        }
+    }
+
+    /* Deep parents: bucket files with deep paths */
+    {
+        dense_cell_map_t dm_bytes;
+        dense_cell_map_t dm_files;
+        deep_drill_row_t *rows = NULL;
+        size_t deep_cnt = 0;
+        size_t show_n;
+        int deep_ok = 1;
+
+        memset(&dm_bytes, 0, sizeof(dm_bytes));
+        memset(&dm_files, 0, sizeof(dm_files));
+
+        if (details && details->count > 0) {
+            for (i = 0; i < details->count; i++) {
+                char parent[PATH_MAX];
+                const detail_record_t *rec = &details->items[i];
+
+                if (!rec->path) continue;
+                if (path_slash_count_str(rec->path) < PATH_SHAPE_DEEP_MIN_SLASHES) continue;
+                if (parent_dir_to_buf(rec->path, parent, sizeof(parent)) != 0) continue;
+                if (dense_cell_add(&dm_bytes, parent, rec->size, NULL) != 0 ||
+                    dense_cell_add(&dm_files, parent, 1ULL, NULL) != 0) {
+                    deep_ok = 0;
+                    break;
+                }
+            }
+        }
+
+        if (deep_ok) {
+            for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++)
+                for (n = dm_bytes.buckets[bi]; n; n = n->next) deep_cnt++;
+
+            if (deep_cnt > 0) {
+                rows = (deep_drill_row_t *)calloc(deep_cnt, sizeof(*rows));
+                if (rows) {
+                    size_t k = 0;
+                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                        for (n = dm_bytes.buckets[bi]; n; n = n->next) {
+                            rows[k].parent = n->parent;
+                            rows[k].bytes = n->n;
+                            rows[k].files = dense_cell_map_get_n(&dm_files, n->parent);
+                            k++;
+                        }
+                    }
+                    qsort(rows, deep_cnt, sizeof(*rows), cmp_deep_drill_desc);
+                    show_n = deep_cnt;
+                    if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+
+                    fprintf(out,
+                            "<details class=\"bucket-help shape-drill-details\"><summary>Deep parents &mdash; up to "
+                            "%u rows by deep slice files</summary>\n"
+                            "<div class=\"bucket-help-body\">\n",
+                            (unsigned)BUCKET_SHAPE_DRILL_MAX_ROWS);
+                    fprintf(out,
+                            "<p class=\"table-trunc-note\">Immediate parents of bucket files whose full path has at least "
+                            "<strong>%u</strong> &lsquo;<strong>/</strong>&rsquo; characters, ranked by <strong>deep slice "
+                            "files</strong> (most first; click headers to sort). At most %u unique parents are shown.</p>\n",
+                            (unsigned)PATH_SHAPE_DEEP_MIN_SLASHES,
+                            (unsigned)BUCKET_SHAPE_DRILL_MAX_ROWS);
+                    fputs("<div class=\"bucket-table-wrap\"><table data-sort-col=\"1\" data-sort-dir=\"d\">\n", out);
+                    fputs("<thead><tr>"
+                          "<th class=\"path-cell sort-h\" data-i=\"0\" data-t=\"s\"><span class=\"th-text\">Parent directory</span></th>"
+                          "<th class=\"num r sort-h sort-desc\" data-i=\"1\" data-t=\"n\"><span class=\"th-text\">Deep slice "
+                          "files</span></th>"
+                          "<th class=\"num r sort-h\" data-i=\"2\" data-t=\"n\"><span class=\"th-text\">Deep slice bytes</span></th>"
+                          "</tr></thead>\n<tbody>\n",
+                          out);
+                    for (i = 0; i < show_n; i++) {
+                        char sf[96], sbytes[32];
+                        format_count_pretty_inline(rows[i].files, sf, sizeof(sf));
+                        human_bytes(rows[i].bytes, sbytes, sizeof(sbytes));
+                        fputs("<tr><td class=\"path-cell\" data-sort-s=\"", out);
+                        html_escape(out, rows[i].parent);
+                        fputs("\">", out);
+                        html_escape(out, rows[i].parent);
+                        fputs("</td>", out);
+                        fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)rows[i].files, sf);
+                        fprintf(out, "<td class=\"num r\" data-sort-n=\"%.15g\">%s</td>", (double)rows[i].bytes, sbytes);
+                        fputs("</tr>\n", out);
+                    }
+                    fputs("</tbody></table></div>\n", out);
+                    if (deep_cnt > show_n) {
+                        fprintf(out,
+                                "<p class=\"table-trunc-note\">Showing %zu of %zu unique parents ranked by deep slice files "
+                                "(most first).</p>\n",
+                                show_n, deep_cnt);
+                    }
+                    fputs("</div></details>\n", out);
+                }
+                free(rows);
+            }
+        }
+
+        dense_cell_free(&dm_bytes);
+        dense_cell_free(&dm_files);
+    }
+
+    if (heat_cell_skew_visible(heat_sum, shape, ab, sb)) {
+        fputs("<details class=\"bucket-help shape-drill-details\"><summary>Skew &mdash; how Deep and Dense overlap</summary>\n"
+              "<div class=\"bucket-help-body\">\n"
+              "<p class=\"note\"><strong>Skew.</strong> The heat-map <strong>Skew</strong> pill applies when both Deep and Dense "
+              "would badge this slice: substantial bytes under unusually deep paths while some parents here also sit under "
+              "very large crawl-wide fan-out. Compare parent directories that appear in both tables above.</p>\n"
+              "</div></details>\n",
+              out);
+    }
+}
+
 static int emit_bucket_detail_page(const char *filename,
                                    const char *username,
                                    int all_users,
@@ -2635,7 +3090,10 @@ static int emit_bucket_detail_page(const char *filename,
                                    uint64_t corpus_total_user_files,
                                    uint64_t corpus_total_user_bytes,
                                    const summary_t *heat_sum,
-                                   const path_shape_view_t *shape) {
+                                   const path_shape_view_t *shape,
+                                   const dense_cell_map_t (*merged_dense_matrix)[SIZE_BUCKETS],
+                                   const dense_cell_fanout_lookup_t *fanout_lookup_shape,
+                                   const fanout_parent_stat_map_t *fanout_parent_stats) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
     path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
@@ -2678,6 +3136,9 @@ static int emit_bucket_detail_page(const char *filename,
             ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;max-width:none;"
             "margin-bottom:22px}\n");
     fprintf(out, "h1,h2{margin:0 0 12px 0;font-weight:600}\n");
+    fprintf(out, "h3{margin:18px 0 10px;font-weight:600;font-size:14px;color:#3d362c}\n");
+    fprintf(out, ".shape-drill-h2{margin-top:22px}\n");
+    fprintf(out, ".shape-drill-details{margin-top:12px}\n");
     fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:13px}\n");
     fprintf(out, ".meta-sub{font-weight:400;color:#666}\n");
     fprintf(out, ".note{font-size:12px;color:#666;margin-bottom:14px;max-width:none;width:100%%}\n");
@@ -2849,8 +3310,15 @@ static int emit_bucket_detail_page(const char *filename,
           "<p><strong>Heat map slice badges.</strong> When shown below the title, the pills match the corresponding "
           "<a href=\"index.html\">index.html</a> heat-map cell for this age&times;size slice (purple <strong>C</strong>; "
           "<strong>Deep</strong> or <strong>Dense</strong> alone; or <strong>Skew</strong> when both apply&mdash;Skew replaces "
-          "the separate Deep and Dense pills) under the same rules as the main report.</p>\n"
-          "<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
+          "the separate Deep and Dense pills) under the same rules as the main report.</p>\n",
+          out);
+    fprintf(out,
+            "<p><strong>Path-shape drill-down.</strong> Below this box, collapsible sections list up to <strong>%u</strong> "
+            "worst unique parent directories for <strong>Dense</strong> fan-out (with child type counts and min/max times) "
+            "and <strong>Deep</strong> paths (many slashes). If this slice earns a <strong>Skew</strong> badge, a third "
+            "collapsible section explains how Deep and Dense overlap.</p>\n",
+            (unsigned)BUCKET_SHAPE_DRILL_MAX_ROWS);
+    fputs("<p><strong>Bucket columns.</strong> &ldquo;Bucket files&rdquo; and &ldquo;Bucket bytes&rdquo; count only files that fall in this age/size bucket. "
           "&ldquo;Share of bucket files/bytes&rdquo; is the fraction of <em>this bucket&rsquo;s</em> total that sits under each path. "
           "&ldquo;C-led bytes&rdquo; is the percent of those bucket bytes whose <em>ctime</em> is substantially newer than "
           "both <em>atime</em> and <em>mtime</em> (here: at least <strong>180 days</strong> newer than the newer of the "
@@ -2871,6 +3339,11 @@ static int emit_bucket_detail_page(const char *filename,
           "total files, total dirs, share of user files). Row-relative columns scale strongest vs other rows in that table.</p>\n"
           "</div></details>\n",
           out);
+
+    if (merged_dense_matrix && fanout_lookup_shape && heat_sum && shape && details) {
+        emit_bucket_shape_drill_section(out, ab, sb, details, &merged_dense_matrix[ab][sb], fanout_lookup_shape,
+                                        fanout_parent_stats, heat_sum, shape, basis_str);
+    }
 
     for (d = 0; d < detail_levels; d++) {
         char title[64];
@@ -3014,6 +3487,9 @@ typedef struct {
     uint64_t corpus_total_user_bytes;
     const summary_t *sum_ref;
     const path_shape_view_t *path_shape;
+    const dense_cell_map_t (*merged_dense_matrix)[SIZE_BUCKETS];
+    const dense_cell_fanout_lookup_t *fanout_lookup_shape;
+    const fanout_parent_stat_map_t *fanout_parent_stats;
     int stub_mode;
     atomic_size_t next_task;
     atomic_int any_fail;
@@ -3160,7 +3636,8 @@ static void *bucket_page_emit_worker(void *arg) {
                 emit_bucket_detail_page(fn, c->username, c->all_users, c->distinct_uids, c->basis_str, ab, sb,
                                         c->bucket_detail_levels, &c->details[ab][sb], c->matched_records,
                                         c->matched_path_ord, c->corpus_total_user_files, c->corpus_total_user_bytes,
-                                        c->sum_ref, c->path_shape);
+                                        c->sum_ref, c->path_shape, c->merged_dense_matrix, c->fanout_lookup_shape,
+                                        c->fanout_parent_stats);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
         if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
@@ -3178,7 +3655,10 @@ static int emit_all_bucket_detail_pages(const char *username,
                                         const path_shape_view_t *path_shape,
                                         bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
                                         const matched_records_t *matched_records,
-                                        ereport_run_stats_t *run_stats) {
+                                        ereport_run_stats_t *run_stats,
+                                        const dense_cell_map_t (*merged_dense_matrix)[SIZE_BUCKETS],
+                                        const dense_cell_fanout_lookup_t *fanout_lookup_shape,
+                                        const fanout_parent_stat_map_t *fanout_parent_stats) {
     const size_t ntasks = (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS;
     bucket_emit_ctx_t ctx;
     pthread_t *tids = NULL;
@@ -3201,6 +3681,9 @@ static int emit_all_bucket_detail_pages(const char *username,
     ctx.corpus_total_user_bytes = 0;
     ctx.sum_ref = sum_ref;
     ctx.path_shape = path_shape;
+    ctx.merged_dense_matrix = merged_dense_matrix;
+    ctx.fanout_lookup_shape = fanout_lookup_shape;
+    ctx.fanout_parent_stats = fanout_parent_stats;
     ctx.stub_mode = (bucket_detail_levels == 0 && sum_ref != NULL) ? 1 : 0;
     ctx.run_stats = run_stats;
 
@@ -4030,6 +4513,62 @@ static int finalize_chunk_file_progress(file_state_t *file_states,
     return 0;
 }
 
+static void ereport_free_file_states(file_state_t *fs, size_t n) {
+    size_t i;
+
+    if (!fs) return;
+    for (i = 0; i < n; i++) {
+        if (fs[i].catalog) {
+            crawl_bin_catalog_free(fs[i].catalog);
+            free(fs[i].catalog);
+            fs[i].catalog = NULL;
+        }
+    }
+    free(fs);
+}
+
+static int ereport_attach_shard_catalog(file_state_t *fs, const char *path) {
+    FILE *fp;
+    bin_file_header_t fh;
+    struct stat st;
+    crawl_bin_catalog_t *cat;
+
+    if (!fs || fs->catalog) return -1;
+    cat = (crawl_bin_catalog_t *)malloc(sizeof(*cat));
+    if (!cat) return -1;
+    crawl_bin_catalog_init_empty(cat);
+
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) goto fail;
+    fp = counted_fopen(path, "rb");
+    if (!fp) goto fail;
+    if (counted_fread(&fh, sizeof(fh), 1, fp) != 1) {
+        counted_fclose(fp);
+        goto fail;
+    }
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
+        counted_fclose(fp);
+        errno = EINVAL;
+        goto fail;
+    }
+    if (fh.catalog_offset == 0ULL || fh.catalog_offset > (uint64_t)st.st_size) {
+        counted_fclose(fp);
+        errno = EINVAL;
+        goto fail;
+    }
+    if (crawl_bin_catalog_load(fp, fh.catalog_offset, (uint64_t)st.st_size, cat) != 0) {
+        counted_fclose(fp);
+        goto fail;
+    }
+    counted_fclose(fp);
+    fs->catalog = cat;
+    return 0;
+
+fail:
+    crawl_bin_catalog_free(cat);
+    free(cat);
+    return -1;
+}
+
 static int read_one_chunk(const file_chunk_t *chunk,
                           file_state_t *file_states,
                           uid_t target_uid,
@@ -4045,6 +4584,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
                           matched_records_t *matched_records,
                           dense_cell_map_t dense_maps[AGE_BUCKETS][SIZE_BUCKETS],
                           dense_cell_map_t *parent_fanout,
+                          fanout_parent_stat_map_t *parent_fanout_stats,
                           ereport_run_stats_t *run_stats) {
     FILE *fp = NULL;
     int rc = -1;
@@ -4091,6 +4631,16 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
+        {
+            size_t rec_total = crawl_bin_record_total_bytes(&r);
+            if ((uint64_t)record_offset + rec_total > chunk->end_offset) {
+                fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                break;
+            }
+        }
+
         sum->scanned_records++;
         if (progress) {
             progress->scanned_records++;
@@ -4100,9 +4650,16 @@ static int read_one_chunk(const file_chunk_t *chunk,
         record_match = all_users || ((uid_t)r.uid == target_uid);
         skip_paths = record_match && bucket_detail_levels == 0;
 
+        if (!file_states[chunk->file_index].catalog) {
+            fprintf(stderr, "warn: shard catalog not loaded for %s\n", chunk->path);
+            sum->bad_input_files++;
+            if (progress) progress->bad_input_files++;
+            break;
+        }
+
         if (!record_match) {
-            if (r.path_len > 0) {
-                if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
+            if (r.name_len > 0) {
+                if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
                     fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
@@ -4112,9 +4669,16 @@ static int read_one_chunk(const file_chunk_t *chunk,
             continue;
         }
 
+        if (r.parent_dir_id == 0ULL) {
+            fprintf(stderr, "warn: incomplete/wire-format record in %s\n", chunk->path);
+            sum->bad_input_files++;
+            if (progress) progress->bad_input_files++;
+            break;
+        }
+
         if (skip_paths) {
-            if (r.path_len > 0) {
-                if (fseeko(fp, (off_t)r.path_len, SEEK_CUR) != 0) {
+            if (r.name_len > 0) {
+                if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
                     fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
@@ -4123,31 +4687,43 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
             pathbuf = NULL;
         } else {
-            if (r.path_len > 0) {
-                pathbuf = (char *)malloc((size_t)r.path_len + 1);
-                if (!pathbuf) {
+            unsigned char *name_bytes = NULL;
+
+            pathbuf = (char *)malloc(PATH_MAX);
+            if (!pathbuf) {
+                fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                break;
+            }
+            if (r.name_len > 0) {
+                name_bytes = (unsigned char *)malloc((size_t)r.name_len);
+                if (!name_bytes) {
                     fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                    sum->bad_input_files++;
-                    if (progress) progress->bad_input_files++;
-                    break;
-                }
-                if (counted_fread(pathbuf, 1, r.path_len, fp) != r.path_len) {
-                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
                     free(pathbuf);
                     break;
                 }
-                pathbuf[r.path_len] = '\0';
-            } else {
-                pathbuf = strdup("");
-                if (!pathbuf) {
-                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+                if (counted_fread(name_bytes, 1, r.name_len, fp) != r.name_len) {
+                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
+                    free(name_bytes);
+                    free(pathbuf);
                     break;
                 }
             }
+            if (crawl_bin_catalog_entry_path(file_states[chunk->file_index].catalog, r.parent_dir_id,
+                                             (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
+                fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                free(name_bytes);
+                free(pathbuf);
+                break;
+            }
+            free(name_bytes);
         }
 
         if (all_users && uid_distinct && uid_accum_insert_if_new(uid_distinct, r.uid) < 0) {
@@ -4239,7 +4815,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
         }
 
-        if (pathbuf && bucket_detail_levels > 0 && parent_fanout) path_fanout_accumulate(parent_fanout, pathbuf);
+        if (pathbuf && bucket_detail_levels > 0 && parent_fanout) {
+            path_fanout_accumulate(parent_fanout, pathbuf);
+            if (parent_fanout_stats)
+                fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.type, pick_time(&r, basis), sum);
+        }
 
         if (pathbuf) free(pathbuf);
     }
@@ -4276,6 +4856,7 @@ static void *worker_main(void *arg_void) {
                        &                       arg->matched_records,
                        arg->dense_maps,
                        &arg->parent_fanout,
+                       &arg->parent_fanout_stats,
                        arg->run_stats);
     }
 
@@ -4740,9 +5321,7 @@ static void emit_heat_map_badges(FILE *out,
                  basis_str,
                  cl_pct,
                  g_ctime_led_badge_min_share_frac * 100.0);
-        fprintf(out, "<span class=\"heat-badge-tip heat-ctime-led-badge\" tabindex=\"0\" title=\"");
-        html_escape(out, tbuf);
-        fprintf(out, "\" data-tip=\"");
+        fprintf(out, "<span class=\"heat-badge-tip heat-ctime-led-badge\" tabindex=\"0\" data-tip=\"");
         html_escape(out, tbuf);
         fprintf(out, "\">C %s</span>", ctime_led_label);
     }
@@ -4755,9 +5334,7 @@ static void emit_heat_map_badges(FILE *out,
                  dp_pct,
                  (unsigned)PATH_SHAPE_DEEP_MIN_SLASHES,
                  (unsigned)PATH_SHAPE_DENSE_MIN_CHILDREN);
-        fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-skew\" tabindex=\"0\" title=\"");
-        html_escape(out, tbuf);
-        fprintf(out, "\" data-tip=\"");
+        fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-skew\" tabindex=\"0\" data-tip=\"");
         html_escape(out, tbuf);
         fputs("\">Skew</span>", out);
     } else {
@@ -4770,9 +5347,7 @@ static void emit_heat_map_badges(FILE *out,
                      dp_pct,
                      (unsigned)PATH_SHAPE_DEEP_MIN_SLASHES,
                      PATH_SHAPE_BADGE_MIN_SHARE_FRAC * 100.0);
-            fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-deep\" tabindex=\"0\" title=\"");
-            html_escape(out, tbuf);
-            fprintf(out, "\" data-tip=\"");
+            fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-deep\" tabindex=\"0\" data-tip=\"");
             html_escape(out, tbuf);
             fputs("\">Deep</span>", out);
         }
@@ -4784,9 +5359,7 @@ static void emit_heat_map_badges(FILE *out,
                      basis_str,
                      dense_fanout_max,
                      (unsigned)PATH_SHAPE_DENSE_MIN_CHILDREN);
-            fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-dense\" tabindex=\"0\" title=\"");
-            html_escape(out, tbuf);
-            fprintf(out, "\" data-tip=\"");
+            fprintf(out, "<span class=\"heat-badge-tip heat-shape-badge heat-shape-dense\" tabindex=\"0\" data-tip=\"");
             html_escape(out, tbuf);
             fputs("\">Dense</span>", out);
         }
@@ -5010,7 +5583,6 @@ static int emit_html(const char *report_path,
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         uint64_t row_total = 0;
         uint64_t row_files = 0;
-        uint64_t row_ctime_led_bytes = 0;
 
         fprintf(out, "<tr><th scope=\"row\" class=\"heatmap-th-y\">");
         html_escape(out, age_bucket_names[ab]);
@@ -5031,7 +5603,6 @@ static int emit_html(const char *report_path,
 
             row_total += b;
             row_files += f;
-            row_ctime_led_bytes += cl_b;
 
             if (sum->total_bytes) pct_b = 100.0 * (double)b / (double)sum->total_bytes;
             if (sum->total_files) pct_f = 100.0 * (double)f / (double)sum->total_files;
@@ -5087,7 +5658,6 @@ static int emit_html(const char *report_path,
             char bg_f[32];
             char rf_main[48];
             char rf_paren[80];
-            char row_led_lbl[24];
             double pct_b = 0.0;
             double pct_f = 0.0;
 
@@ -5097,23 +5667,7 @@ static int emit_html(const char *report_path,
             bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
             contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
             format_file_count_main_and_paren(row_files, pct_f, rf_main, sizeof(rf_main), rf_paren, sizeof(rf_paren));
-            format_ctime_led_share_label(row_ctime_led_bytes, row_total, row_led_lbl, sizeof(row_led_lbl));
             fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-            {
-                char row_scope[192];
-                snprintf(row_scope, sizeof(row_scope), "Row total: %s (all size bands)", age_bucket_names[ab]);
-                emit_heat_map_badges(out,
-                                     bucket_detail_levels > 0,
-                                     ctime_led_badge_visible(row_ctime_led_bytes, row_total),
-                                     row_led_lbl,
-                                     row_ctime_led_bytes,
-                                     shape->row[ab].deep_bytes,
-                                     row_total,
-                                     row_files,
-                                     shape->row[ab].dense_fanout_max,
-                                     basis_str,
-                                     row_scope);
-            }
             fprintf(out,
                     "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                     "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
@@ -5139,20 +5693,17 @@ static int emit_html(const char *report_path,
     for (sb = 0; sb < SIZE_BUCKETS; sb++) {
         uint64_t col_total = 0;
         uint64_t col_files = 0;
-        uint64_t col_ctime_led_bytes = 0;
         char hc[32];
         char bg_b[32];
         char bg_f[32];
         char cf_main[48];
         char cf_paren[80];
-        char col_led_lbl[24];
         double pct_b = 0.0;
         double pct_f = 0.0;
 
         for (ab = 0; ab < AGE_BUCKETS; ab++) {
             col_total += sum->bytes[ab][sb];
             col_files += sum->files[ab][sb];
-            col_ctime_led_bytes += sum->ctime_led_bytes[ab][sb];
         }
         if (sum->total_bytes) pct_b = 100.0 * (double)col_total / (double)sum->total_bytes;
         if (sum->total_files) pct_f = 100.0 * (double)col_files / (double)sum->total_files;
@@ -5160,23 +5711,7 @@ static int emit_html(const char *report_path,
         bytes_share_cell_color(heatmap_norm_pct(pct_b, 100.0), bg_b, sizeof(bg_b));
         contribution_cell_color(heatmap_norm_pct(pct_f, 100.0), bg_f, sizeof(bg_f));
         format_file_count_main_and_paren(col_files, pct_f, cf_main, sizeof(cf_main), cf_paren, sizeof(cf_paren));
-        format_ctime_led_share_label(col_ctime_led_bytes, col_total, col_led_lbl, sizeof(col_led_lbl));
         fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-        {
-            char col_scope[192];
-            snprintf(col_scope, sizeof(col_scope), "Column total: %s (all age bands)", size_bucket_names[sb]);
-            emit_heat_map_badges(out,
-                                 bucket_detail_levels > 0,
-                                 ctime_led_badge_visible(col_ctime_led_bytes, col_total),
-                                 col_led_lbl,
-                                 col_ctime_led_bytes,
-                                 shape->col[sb].deep_bytes,
-                                 col_total,
-                                 col_files,
-                                 shape->col[sb].dense_fanout_max,
-                                 basis_str,
-                                 col_scope);
-        }
         fprintf(out,
                 "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                 "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
@@ -5200,25 +5735,12 @@ static int emit_html(const char *report_path,
         char bg_f[32];
         char tf_main[48];
         char tf_paren[80];
-        char tot_led_lbl[24];
 
         human_bytes(sum->total_bytes, ht, sizeof(ht));
         bytes_share_cell_color(heatmap_norm_pct(100.0, 100.0), bg_b, sizeof(bg_b));
         contribution_cell_color(heatmap_norm_pct(100.0, 100.0), bg_f, sizeof(bg_f));
         format_file_count_main_and_paren(sum->total_files, 100.0, tf_main, sizeof(tf_main), tf_paren, sizeof(tf_paren));
-        format_ctime_led_share_label(sum->total_ctime_led_bytes, sum->total_bytes, tot_led_lbl, sizeof(tot_led_lbl));
         fprintf(out, "<td class=\"tot tot-cell\"><div class=\"tot-block cell-split\">");
-        emit_heat_map_badges(out,
-                             bucket_detail_levels > 0,
-                             ctime_led_badge_visible(sum->total_ctime_led_bytes, sum->total_bytes),
-                             tot_led_lbl,
-                             sum->total_ctime_led_bytes,
-                             shape->all.deep_bytes,
-                             sum->total_bytes,
-                             sum->total_files,
-                             shape->all.dense_fanout_max,
-                             basis_str,
-                             "Grand total (all ages and sizes)");
         fprintf(out,
                 "<span class=\"cell-split-bg\" aria-hidden=\"true\">"
                 "<span class=\"cell-split-part cell-split-bytes\" style=\"background:%s\"></span>"
@@ -5284,7 +5806,8 @@ static int emit_html(const char *report_path,
     }
     fputs("<li><strong>Margins.</strong> The rightmost column totals each age row (sum over size buckets). The bottom row "
           "totals each size column (sum over age buckets). The bottom-right cell is the full heat-map total and matches "
-          "both the sum of row totals and the sum of column totals.</li>\n"
+          "both the sum of row totals and the sum of column totals. <strong>C-led / Deep / Dense / Skew</strong> badges "
+          "appear only on inner age&times;size cells, not on these margin totals.</li>\n"
           "</ul></div></details>\n",
           out);
 
@@ -6049,7 +6572,7 @@ int main(int argc, char **argv) {
             free(prep_chunk_counts);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             return 1;
         }
 
@@ -6073,7 +6596,7 @@ int main(int argc, char **argv) {
             free(prep_chunk_counts);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             return 1;
         }
         stats_thread_started = 1;
@@ -6100,7 +6623,7 @@ int main(int argc, char **argv) {
             free(prep_chunk_counts);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             return 1;
         }
 
@@ -6136,7 +6659,7 @@ int main(int argc, char **argv) {
             free(prep_chunk_counts);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             return 1;
         }
 
@@ -6163,7 +6686,7 @@ int main(int argc, char **argv) {
                 free(prep_chunk_counts);
                 for (j = 0; (size_t)j < path_count; j++) free(paths[j]);
                 free(paths);
-                free(file_states);
+                ereport_free_file_states(file_states, path_count);
                 return 1;
             }
         }
@@ -6210,7 +6733,7 @@ int main(int argc, char **argv) {
                 free(prep_chunk_counts);
                 for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
                 free(paths);
-                free(file_states);
+                ereport_free_file_states(file_states, path_count);
                 return 1;
             }
 
@@ -6246,8 +6769,28 @@ int main(int argc, char **argv) {
         }
         for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
         free(paths);
-        free(file_states);
+        ereport_free_file_states(file_states, path_count);
         return 1;
+    }
+
+    for (i = 0; (size_t)i < path_count; i++) {
+        if (atomic_load(&file_states[i].remaining_chunks) == 0U) continue;
+        if (ereport_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
+            fprintf(stderr, "ereport: cannot load directory catalog from %s\n", paths[i]);
+            if (stats_thread_started) {
+                atomic_store(&run_stats.stop_stats, 1);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+            }
+            for (i = 0; (size_t)i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            chunks = NULL;
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            ereport_free_file_states(file_states, path_count);
+            return 1;
+        }
     }
 
     threads_used = threads;
@@ -6273,7 +6816,7 @@ int main(int argc, char **argv) {
         }
         for (k = 0; k < path_count; k++) free(paths[k]);
         free(paths);
-        free(file_states);
+        ereport_free_file_states(file_states, path_count);
         pthread_mutex_destroy(&queue.mutex);
         return 1;
     }
@@ -6289,7 +6832,7 @@ int main(int argc, char **argv) {
         free(paths);
         pthread_mutex_destroy(&queue.mutex);
         inode_set_destroy(&seen_inodes);
-        free(file_states);
+        ereport_free_file_states(file_states, path_count);
         return 1;
     }
 
@@ -6324,7 +6867,7 @@ int main(int argc, char **argv) {
                 free(chunks);
                 for (j = 0; (size_t)j < path_count; j++) free(paths[j]);
                 free(paths);
-                free(file_states);
+                ereport_free_file_states(file_states, path_count);
                 pthread_mutex_destroy(&queue.mutex);
                 inode_set_destroy(&seen_inodes);
                 return 1;
@@ -6343,45 +6886,27 @@ int main(int argc, char **argv) {
     memset(&final_matched_records, 0, sizeof(final_matched_records));
 
     {
-        double dbg_tm = now_sec();
-        // #region agent log
-        agent_dbg_ndjson("H1", "ereport.c:main_finalize", "pre_worker_join",
-                         (long long)threads_used, (long long)path_count, (long long)bucket_detail_levels);
-        // #endregion
-
         for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
 
         /* Progress thread: keep parsing status (rec/s line) until workers exit; then finalize banner. */
         atomic_store(&run_stats.parse_workers_done, 1);
         atomic_store(&run_stats.finalize_phase, 1);
 
-        // #region agent log
-        agent_dbg_ndjson(
-            "H1",
-            "ereport.c:main_finalize",
-            "post_worker_join",
-            (long long)((now_sec() - dbg_tm) * 1000.0),
-            (long long)atomic_load(&run_stats.scanned_input_files),
-            (long long)atomic_load(&run_stats.matched_records));
-        // #endregion
-        dbg_tm = now_sec();
-
         summary_reduce_from_worker_args(&final_sum, args, threads_used);
-
-        // #region agent log
-        agent_dbg_ndjson(
-            "H2",
-            "ereport.c:main_finalize",
-            "post_summary_reduce",
-            (long long)((now_sec() - dbg_tm) * 1000.0),
-            (long long)final_sum.matched_records,
-            (long long)final_sum.scanned_records);
-        // #endregion
     }
 
     memset(&path_shape, 0, sizeof(path_shape));
+
+    dense_cell_map_t merged_dense_shape[AGE_BUCKETS][SIZE_BUCKETS];
+    dense_cell_fanout_lookup_t fanout_lookup_shape;
+    fanout_parent_stat_map_t merged_fanout_stats;
+    int bucket_shape_maps_live = 0;
+
+    memset(&merged_dense_shape, 0, sizeof(merged_dense_shape));
+    memset(&fanout_lookup_shape, 0, sizeof(fanout_lookup_shape));
+    memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
+
     if (bucket_detail_levels > 0) {
-        double dbg_bd = now_sec();
         if (matched_records_finalize_parallel(args, threads_used, &final_matched_records) != 0) {
             fprintf(stderr, "allocation failed merging matched records\n");
             if (stats_thread_started) {
@@ -6403,45 +6928,29 @@ int main(int argc, char **argv) {
             free(chunks);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             pthread_mutex_destroy(&queue.mutex);
             inode_set_destroy(&seen_inodes);
             return 1;
         }
 
-        // #region agent log
-        agent_dbg_ndjson(
-            "H3",
-            "ereport.c:main_finalize",
-            "post_matched_records_finalize",
-            (long long)((now_sec() - dbg_bd) * 1000.0),
-            (long long)final_matched_records.count,
-            0LL);
-        // #endregion
-
         {
             dense_cell_map_t merged_fanout;
-            dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS];
-            double dbg_step;
 
             memset(&merged_fanout, 0, sizeof(merged_fanout));
-            dbg_step = now_sec();
-            for (i = 0; i < threads_used; i++) dense_cell_merge_into(&merged_fanout, &args[i].parent_fanout, NULL);
-            // #region agent log
-            agent_dbg_ndjson(
-                "H4",
-                "ereport.c:main_finalize",
-                "post_merge_parent_fanout",
-                (long long)((now_sec() - dbg_step) * 1000.0),
-                (long long)threads_used,
-                0LL);
-            // #endregion
+            for (i = 0; i < threads_used; i++) {
+                dense_cell_merge_into(&merged_fanout, &args[i].parent_fanout, NULL);
+                fanout_parent_stat_merge_into(&merged_fanout_stats, &args[i].parent_fanout_stats, NULL);
+            }
 
-            memset(&merged_dense, 0, sizeof(merged_dense));
-            dbg_step = now_sec();
-            if (bucket_dense_cells_finalize_parallel(args, threads_used, final_details, merged_dense) != 0) {
+            if (bucket_dense_cells_finalize_parallel(args, threads_used, final_details, merged_dense_shape) != 0) {
                 fprintf(stderr, "allocation failed merging bucket details\n");
                 dense_cell_free(&merged_fanout);
+                fanout_parent_stat_map_free(&merged_fanout_stats);
+                memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
+                for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                    for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense_shape[ab][sb]);
+                }
                 if (stats_thread_started) {
                     atomic_store(&run_stats.stop_stats, 1);
                     pthread_join(stats_thread, NULL);
@@ -6461,43 +6970,16 @@ int main(int argc, char **argv) {
                 free(chunks);
                 for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
                 free(paths);
-                free(file_states);
+                ereport_free_file_states(file_states, path_count);
                 pthread_mutex_destroy(&queue.mutex);
                 inode_set_destroy(&seen_inodes);
                 return 1;
             }
-            // #region agent log
-            agent_dbg_ndjson(
-                "H5",
-                "ereport.c:main_finalize",
-                "post_bucket_dense_finalize",
-                (long long)((now_sec() - dbg_step) * 1000.0),
-                (long long)(AGE_BUCKETS * SIZE_BUCKETS),
-                (long long)threads_used);
-            // #endregion
-            {
-                dense_cell_fanout_lookup_t fanout_lookup;
+            dense_cell_steal_into_fanout_lookup(&merged_fanout, &fanout_lookup_shape);
+            dense_cell_free(&merged_fanout);
 
-                memset(&fanout_lookup, 0, sizeof(fanout_lookup));
-                dense_cell_steal_into_fanout_lookup(&merged_fanout, &fanout_lookup);
-                dense_cell_free(&merged_fanout);
-
-                dbg_step = now_sec();
-                path_shape_fill_from_merged_dense(&final_sum, merged_dense, &fanout_lookup, &path_shape);
-                // #region agent log
-                agent_dbg_ndjson(
-                    "H6",
-                    "ereport.c:main_finalize",
-                    "post_path_shape_fill",
-                    (long long)((now_sec() - dbg_step) * 1000.0),
-                    0LL,
-                    0LL);
-                // #endregion
-                dense_cell_fanout_lookup_free(&fanout_lookup);
-            }
-            for (ab = 0; ab < AGE_BUCKETS; ab++) {
-                for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense[ab][sb]);
-            }
+            path_shape_fill_from_merged_dense(&final_sum, merged_dense_shape, &fanout_lookup_shape, &path_shape);
+            bucket_shape_maps_live = 1;
         }
     }
 
@@ -6505,6 +6987,10 @@ int main(int argc, char **argv) {
         uid_accum_t merged_uids;
         if (uid_accum_init(&merged_uids, 65536) != 0) {
             fprintf(stderr, "allocation failed merging uid tallies\n");
+            if (bucket_shape_maps_live) {
+                bucket_shape_maps_destroy(&fanout_lookup_shape, merged_dense_shape, &merged_fanout_stats);
+                bucket_shape_maps_live = 0;
+            }
             for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
             worker_dense_maps_free(args, threads_used);
             free(tids);
@@ -6513,7 +6999,7 @@ int main(int argc, char **argv) {
             free(chunks);
             for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
             free(paths);
-            free(file_states);
+            ereport_free_file_states(file_states, path_count);
             pthread_mutex_destroy(&queue.mutex);
             inode_set_destroy(&seen_inodes);
             matched_records_free(&final_matched_records);
@@ -6526,6 +7012,10 @@ int main(int argc, char **argv) {
             if (uid_accum_merge_into(&merged_uids, &args[i].uid_distinct) != 0) {
                 int j;
                 fprintf(stderr, "allocation failed merging uid tallies\n");
+                if (bucket_shape_maps_live) {
+                    bucket_shape_maps_destroy(&fanout_lookup_shape, merged_dense_shape, &merged_fanout_stats);
+                    bucket_shape_maps_live = 0;
+                }
                 uid_accum_destroy(&merged_uids);
                 for (j = i; j < threads; j++) uid_accum_destroy(&args[j].uid_distinct);
                 worker_dense_maps_free(args, threads_used);
@@ -6535,7 +7025,7 @@ int main(int argc, char **argv) {
                 free(chunks);
                 for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
                 free(paths);
-                free(file_states);
+                ereport_free_file_states(file_states, path_count);
                 pthread_mutex_destroy(&queue.mutex);
                 inode_set_destroy(&seen_inodes);
                 matched_records_free(&final_matched_records);
@@ -6553,6 +7043,10 @@ int main(int argc, char **argv) {
 
     if (ensure_bucket_output_dir_exists() != 0) {
         fprintf(stderr, "failed to create report output directory %s: %s\n", g_bucket_output_dir, strerror(errno));
+        if (bucket_shape_maps_live) {
+            bucket_shape_maps_destroy(&fanout_lookup_shape, merged_dense_shape, &merged_fanout_stats);
+            bucket_shape_maps_live = 0;
+        }
         if (stats_thread_started) {
             atomic_store(&run_stats.stop_stats, 1);
             pthread_join(stats_thread, NULL);
@@ -6565,7 +7059,7 @@ int main(int argc, char **argv) {
         free(chunks);
         for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
         free(paths);
-        free(file_states);
+        ereport_free_file_states(file_states, path_count);
         pthread_mutex_destroy(&queue.mutex);
         inode_set_destroy(&seen_inodes);
         matched_records_free(&final_matched_records);
@@ -6582,10 +7076,18 @@ int main(int argc, char **argv) {
                                      &path_shape,
                                      final_details,
                                      &final_matched_records,
-                                     &run_stats) != 0) {
+                                     &run_stats,
+                                     bucket_detail_levels > 0 ? merged_dense_shape : NULL,
+                                     bucket_detail_levels > 0 ? &fanout_lookup_shape : NULL,
+                                     bucket_detail_levels > 0 ? &merged_fanout_stats : NULL) != 0) {
         fprintf(stderr, "failed to write bucket detail pages\n");
     } else {
         bucket_pages_written = AGE_BUCKETS * SIZE_BUCKETS;
+    }
+
+    if (bucket_shape_maps_live) {
+        bucket_shape_maps_destroy(&fanout_lookup_shape, merged_dense_shape, &merged_fanout_stats);
+        bucket_shape_maps_live = 0;
     }
 
     atomic_store(&run_stats.finalize_phase, 3);
@@ -6612,7 +7114,7 @@ int main(int argc, char **argv) {
     free(chunks);
     for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
     free(paths);
-    free(file_states);
+    ereport_free_file_states(file_states, path_count);
     pthread_mutex_destroy(&queue.mutex);
     inode_set_destroy(&seen_inodes);
     matched_records_free(&final_matched_records);

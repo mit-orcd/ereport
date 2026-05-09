@@ -35,19 +35,13 @@
  * Usage:
  *   ./ecrawl [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]
  *   --verbose: full metrics to stderr every N minutes (default 5); optional integer sets N.
+ *              Also required for ECRAWL_PROGRESS_LOG and ECRAWL_DEBUG_LOG (paths in env).
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
  *
- * Diagnostics (optional env): ECRAWL_PROGRESS_LOG=<path> appends one CSV line per second from the stats thread.
- * ECRAWL_DEBUG_LOG=<path> (rewrite): RFC 4180-style CSV (quoted headers and path column). Rows with status
- * active / finished list child counts excluding "." / "..". Finished rows are written first, active rows last
- * so tail -f shows in-flight megadirs. Wall-clock elapsed_sec is crawl-thread time in the directory readdir loop,
- * recorded only when that scan exceeds STAT_PENDING_DRAIN_EVERY_READDIRS children.
- * stat_batches_submitted counts successful stat-worker batch enqueues per scan (dup(dirfd) inline fallback excluded);
- * it is 0 when ECRAWL_STAT_THREADS=0 or on the legacy crawl path.
- * Active rows appear once a directory reaches ECRAWL_DEBUG_LOG_ACTIVE_AFTER counted children (default 4096), then
- * refresh on megadir milestones and on the same ~65536 readdir cadence as stat backlog drains. Finished megadir
- * rows still require cumulative counts above STAT_PENDING_DRAIN_EVERY_READDIRS. On NFS use tail -F.
+ * Diagnostics (optional env, require --verbose): ECRAWL_PROGRESS_LOG=<path> appends one CSV line per second
+ * from the stats thread. ECRAWL_DEBUG_LOG=<path> megadir CSV (RFC 4180; ECRAWL_DEBUG_LOG_ACTIVE_AFTER=N).
+ * Active/finished rows, elapsed_sec in readdir, and stat_batches_submitted behave as in prior releases.
  * ECRAWL_STALL_HINT_SECONDS=N (default 5; 0 disables): after the rolling window is warm, emit one stderr line if
  * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
  */
@@ -78,6 +72,7 @@
 #include <grp.h>
 #include <stdarg.h>
 
+#include "crawl_bin_catalog.h"
 #include "crawl_ckpt.h"
 #include "path_canon.h"
 #include "path_utils.h"
@@ -214,6 +209,10 @@ typedef struct {
 typedef struct __attribute__((packed)) {
     uint32_t shard;
     uint32_t data_len;
+    /* Per-record byte contribution (account_entry_local result). Wire-only —
+     * carried so the writer can roll it into per-dir catalog aggregates without
+     * re-running hardlink dedup. Not written to disk. */
+    uint64_t byte_credit;
 } batch_frame_hdr_t;
 
 typedef struct {
@@ -282,6 +281,7 @@ typedef struct {
     writer_queue_t *writer_queues;
     int writer_threads;
     pending_batch_t *pending;
+    perf_local_t *perf;
 } emit_context_t;
 
 typedef struct {
@@ -337,6 +337,33 @@ typedef struct {
     uint32_t writer_index;
 } writer_arg_t;
 
+typedef struct shard_cat_path_entry {
+    char *path_key;
+    uint64_t dir_id;
+    struct shard_cat_path_entry *next;
+} shard_cat_path_entry_t;
+
+#define SHARD_CAT_HT_BITS 16
+#define SHARD_CAT_HT_BUCKETS (1U << SHARD_CAT_HT_BITS)
+
+typedef struct {
+    shard_cat_path_entry_t *ht[SHARD_CAT_HT_BUCKETS];
+    uint64_t next_dir_id;
+    uint64_t *parent_dir_id;
+    uint32_t *depth;
+    uint16_t *name_len;
+    char **name_comp;
+    /* Per-dir_id rollups over immediate child records (records whose on-disk
+     * parent_dir_id == dir_id). Updated by the writer thread when each record's
+     * disk parent_dir_id is resolved. min_eff_time defaults to UINT64_MAX. */
+    uint64_t *imm_child_bytes;
+    uint64_t *imm_child_count;
+    uint64_t *imm_child_ctime_led_count;
+    uint64_t *imm_child_min_eff_time;
+    uint64_t *imm_child_max_eff_time;
+    size_t arr_cap;
+} shard_cat_t;
+
 typedef struct {
     FILE *fp;
     uint64_t bytes_written;
@@ -346,6 +373,7 @@ typedef struct {
     size_t ckpt_n;
     size_t ckpt_cap;
     uint64_t seg_start_byte;
+    shard_cat_t cat;
 } shard_file_state_t;
 
 /* Rolling 10-second stats */
@@ -361,6 +389,9 @@ static atomic_ullong g_window_dirs    = 0;
 static atomic_ullong g_bucket_entries[WINDOW_SECONDS];
 static atomic_ullong g_bucket_files[WINDOW_SECONDS];
 static atomic_ullong g_bucket_dirs[WINDOW_SECONDS];
+/* Rolling window for stat(2)/lstat(2)/fstatat stat-like metadata reads (per-second deltas). */
+static atomic_ullong g_bucket_stat_meta[WINDOW_SECONDS];
+static atomic_ullong g_window_stat_meta = 0;
 
 static atomic_int  g_bucket_index = 0;
 static atomic_int  g_stop_stats   = 0;
@@ -402,6 +433,7 @@ static size_t g_debug_log_active_min_children_cfg     = DEFAULT_DEBUG_LOG_ACTIVE
 static unsigned long long g_progress_prev_tot_entries = 0;
 static unsigned long long g_progress_prev_readdir = 0;
 static unsigned long long g_progress_prev_lstat = 0;
+static unsigned long long g_progress_prev_stat = 0;
 static int g_stall_hint_seconds_cfg = 5;
 
 static double now_sec(void);
@@ -456,8 +488,107 @@ static atomic_ullong g_io_fflush_calls     = 0;
 #define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
 #define ATOMIC_SUB_RELAXED(obj, value) atomic_fetch_sub_explicit((obj), (value), memory_order_relaxed)
 #define ATOMIC_LOAD_RELAXED(obj) atomic_load_explicit((obj), memory_order_relaxed)
-#define VERBOSE_ADD_RELAXED(obj, value) do { if (g_verbose) ATOMIC_ADD_RELAXED((obj), (value)); } while (0)
-#define VERBOSE_SUB_RELAXED(obj, value) do { if (g_verbose) ATOMIC_SUB_RELAXED((obj), (value)); } while (0)
+
+/* Batch frequent relaxed counter updates on hot paths; flush remainders on thread exit / main enqueue. */
+#define TLS_QDEPTH_BATCH 64
+#define TLS_WAIT_COUNTER_BATCH 256U
+
+static _Thread_local long tls_qdepth_pending;
+static _Thread_local uint32_t tls_wait_crawl_pending;
+static _Thread_local uint32_t tls_wait_writer_push_pending;
+static _Thread_local uint32_t tls_wait_writer_pop_pending;
+static _Thread_local uint32_t tls_wait_stat_pop_pending;
+static _Thread_local uint32_t tls_wait_stat_enqueue_pending;
+
+static void tls_qdepth_flush(void) {
+    long d = tls_qdepth_pending;
+
+    if (d == 0) return;
+    if (d > 0)
+        ATOMIC_ADD_RELAXED(&g_queue_depth, (unsigned long long)d);
+    else
+        ATOMIC_SUB_RELAXED(&g_queue_depth, (unsigned long long)(-d));
+    tls_qdepth_pending = 0;
+}
+
+static void tls_qdepth_bump(long delta) {
+    tls_qdepth_pending += delta;
+    if (tls_qdepth_pending >= TLS_QDEPTH_BATCH || tls_qdepth_pending <= -TLS_QDEPTH_BATCH) tls_qdepth_flush();
+}
+
+static void tls_wait_crawl_inc(void) {
+    tls_wait_crawl_pending++;
+    if (tls_wait_crawl_pending >= TLS_WAIT_COUNTER_BATCH) {
+        atomic_fetch_add_explicit(&g_wait_crawl_tasks, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
+                                  memory_order_relaxed);
+        tls_wait_crawl_pending -= TLS_WAIT_COUNTER_BATCH;
+    }
+}
+
+static void tls_wait_writer_push_inc(void) {
+    tls_wait_writer_push_pending++;
+    if (tls_wait_writer_push_pending >= TLS_WAIT_COUNTER_BATCH) {
+        atomic_fetch_add_explicit(&g_wait_writer_push, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
+                                  memory_order_relaxed);
+        tls_wait_writer_push_pending -= TLS_WAIT_COUNTER_BATCH;
+    }
+}
+
+static void tls_wait_writer_pop_inc(void) {
+    tls_wait_writer_pop_pending++;
+    if (tls_wait_writer_pop_pending >= TLS_WAIT_COUNTER_BATCH) {
+        atomic_fetch_add_explicit(&g_wait_writer_pop, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
+                                  memory_order_relaxed);
+        tls_wait_writer_pop_pending -= TLS_WAIT_COUNTER_BATCH;
+    }
+}
+
+static void tls_wait_stat_pop_inc(void) {
+    tls_wait_stat_pop_pending++;
+    if (tls_wait_stat_pop_pending >= TLS_WAIT_COUNTER_BATCH) {
+        atomic_fetch_add_explicit(&g_wait_stat_pop, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
+                                  memory_order_relaxed);
+        tls_wait_stat_pop_pending -= TLS_WAIT_COUNTER_BATCH;
+    }
+}
+
+static void tls_wait_stat_enqueue_inc(void) {
+    tls_wait_stat_enqueue_pending++;
+    if (tls_wait_stat_enqueue_pending >= TLS_WAIT_COUNTER_BATCH) {
+        atomic_fetch_add_explicit(&g_wait_stat_enqueue, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
+                                  memory_order_relaxed);
+        tls_wait_stat_enqueue_pending -= TLS_WAIT_COUNTER_BATCH;
+    }
+}
+
+static void tls_flush_thread_batch_counters(void) {
+    tls_qdepth_flush();
+    if (tls_wait_crawl_pending) {
+        atomic_fetch_add_explicit(&g_wait_crawl_tasks, (unsigned long long)tls_wait_crawl_pending,
+                                  memory_order_relaxed);
+        tls_wait_crawl_pending = 0;
+    }
+    if (tls_wait_writer_push_pending) {
+        atomic_fetch_add_explicit(&g_wait_writer_push, (unsigned long long)tls_wait_writer_push_pending,
+                                  memory_order_relaxed);
+        tls_wait_writer_push_pending = 0;
+    }
+    if (tls_wait_writer_pop_pending) {
+        atomic_fetch_add_explicit(&g_wait_writer_pop, (unsigned long long)tls_wait_writer_pop_pending,
+                                  memory_order_relaxed);
+        tls_wait_writer_pop_pending = 0;
+    }
+    if (tls_wait_stat_pop_pending) {
+        atomic_fetch_add_explicit(&g_wait_stat_pop, (unsigned long long)tls_wait_stat_pop_pending,
+                                  memory_order_relaxed);
+        tls_wait_stat_pop_pending = 0;
+    }
+    if (tls_wait_stat_enqueue_pending) {
+        atomic_fetch_add_explicit(&g_wait_stat_enqueue, (unsigned long long)tls_wait_stat_enqueue_pending,
+                                  memory_order_relaxed);
+        tls_wait_stat_enqueue_pending = 0;
+    }
+}
 
 static int g_split_depth = 2;
 static int g_writer_threads = DEFAULT_WRITER_THREADS;
@@ -494,59 +625,125 @@ static id_registry_t g_uid_registry;
 static id_registry_t g_gid_registry;
 static inode_registry_t g_hardlink_registry;
 
-static FILE *counted_fopen(const char *path, const char *mode) {
-    VERBOSE_ADD_RELAXED(&g_io_fopen_calls, 1);
-    return fopen(path, mode);
-}
+static FILE *ecrawl_pfopen(const char *path, const char *mode);
+static int ecrawl_pfclose(FILE *fp);
+static size_t ecrawl_pfwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp);
+static int ecrawl_pfflush(FILE *fp);
+static int ecrawl_pstat(const char *path, struct stat *st);
+static int ecrawl_plstat(const char *path, struct stat *st);
+static int ecrawl_pfstatat_nf(int dirfd_value, const char *name, struct stat *st);
+static int ecrawl_pmkdir(const char *path, mode_t mode);
+static DIR *ecrawl_popendir(const char *path);
+static struct dirent *ecrawl_preaddir(DIR *dir);
+static int ecrawl_pclosedir(DIR *dir);
 
-static int counted_fclose(FILE *fp) {
-    VERBOSE_ADD_RELAXED(&g_io_fclose_calls, 1);
-    return fclose(fp);
-}
+static FILE *(*ecrawl_io_fopen)(const char *, const char *) = fopen;
+static int (*ecrawl_io_fclose)(FILE *) = fclose;
+static size_t (*ecrawl_io_fwrite)(const void *, size_t, size_t, FILE *) = fwrite;
+static int (*ecrawl_io_fflush)(FILE *) = fflush;
+static int (*ecrawl_io_stat)(const char *, struct stat *) = stat;
+static int (*ecrawl_io_lstat)(const char *, struct stat *) = lstat;
+static int (*ecrawl_io_fstatat_nf)(int, const char *, struct stat *) = ecrawl_pfstatat_nf;
+static int (*ecrawl_io_mkdir)(const char *, mode_t) = mkdir;
+static DIR *(*ecrawl_io_opendir)(const char *) = opendir;
+static struct dirent *(*ecrawl_io_readdir)(DIR *) = readdir;
+static int (*ecrawl_io_closedir)(DIR *) = closedir;
 
-static size_t counted_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp) {
-    VERBOSE_ADD_RELAXED(&g_io_fwrite_calls, 1);
-    return fwrite(ptr, size, nmemb, fp);
-}
+static void ecrawl_hook_task_popped_nop(void) {}
+static void ecrawl_hook_writer_push_nop(void) {}
+static void ecrawl_hook_writer_pop_nop(void) {}
 
-static int counted_fflush(FILE *fp) {
-    VERBOSE_ADD_RELAXED(&g_io_fflush_calls, 1);
-    return fflush(fp);
-}
+static void (*ecrawl_hook_task_popped)(void) = ecrawl_hook_task_popped_nop;
+static void (*ecrawl_hook_writer_push)(void) = ecrawl_hook_writer_push_nop;
+static void (*ecrawl_hook_writer_pop)(void) = ecrawl_hook_writer_pop_nop;
 
-static int counted_stat(const char *path, struct stat *st) {
-    VERBOSE_ADD_RELAXED(&g_io_stat_calls, 1);
-    return stat(path, st);
-}
-
-static int counted_lstat(const char *path, struct stat *st) {
-    VERBOSE_ADD_RELAXED(&g_io_lstat_calls, 1);
-    return lstat(path, st);
-}
-
-static int counted_fstatat_nofollow(int dirfd_value, const char *name, struct stat *st) {
-    VERBOSE_ADD_RELAXED(&g_io_lstat_calls, 1);
+static int ecrawl_pfstatat_nf(int dirfd_value, const char *name, struct stat *st) {
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
     return fstatat(dirfd_value, name, st, AT_SYMLINK_NOFOLLOW);
 }
 
-static int counted_mkdir(const char *path, mode_t mode) {
-    VERBOSE_ADD_RELAXED(&g_io_mkdir_calls, 1);
+static FILE *ecrawl_pfopen(const char *path, const char *mode) {
+    ATOMIC_ADD_RELAXED(&g_io_fopen_calls, 1);
+    return fopen(path, mode);
+}
+
+static int ecrawl_pfclose(FILE *fp) {
+    ATOMIC_ADD_RELAXED(&g_io_fclose_calls, 1);
+    return fclose(fp);
+}
+
+static size_t ecrawl_pfwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp) {
+    ATOMIC_ADD_RELAXED(&g_io_fwrite_calls, 1);
+    return fwrite(ptr, size, nmemb, fp);
+}
+
+static int ecrawl_pfflush(FILE *fp) {
+    ATOMIC_ADD_RELAXED(&g_io_fflush_calls, 1);
+    return fflush(fp);
+}
+
+static int ecrawl_pstat(const char *path, struct stat *st) {
+    ATOMIC_ADD_RELAXED(&g_io_stat_calls, 1);
+    return stat(path, st);
+}
+
+static int ecrawl_plstat(const char *path, struct stat *st) {
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
+    return lstat(path, st);
+}
+
+static int ecrawl_pfstatat_nf_verbose(int dirfd_value, const char *name, struct stat *st) {
+    return ecrawl_pfstatat_nf(dirfd_value, name, st);
+}
+
+static int ecrawl_pmkdir(const char *path, mode_t mode) {
+    ATOMIC_ADD_RELAXED(&g_io_mkdir_calls, 1);
     return mkdir(path, mode);
 }
 
-static DIR *counted_opendir(const char *path) {
-    VERBOSE_ADD_RELAXED(&g_io_opendir_calls, 1);
+static DIR *ecrawl_popendir(const char *path) {
+    ATOMIC_ADD_RELAXED(&g_io_opendir_calls, 1);
     return opendir(path);
 }
 
-static struct dirent *counted_readdir(DIR *dir) {
-    VERBOSE_ADD_RELAXED(&g_io_readdir_calls, 1);
+static struct dirent *ecrawl_preaddir(DIR *dir) {
+    ATOMIC_ADD_RELAXED(&g_io_readdir_calls, 1);
     return readdir(dir);
 }
 
-static int counted_closedir(DIR *dir) {
-    VERBOSE_ADD_RELAXED(&g_io_closedir_calls, 1);
+static int ecrawl_pclosedir(DIR *dir) {
+    ATOMIC_ADD_RELAXED(&g_io_closedir_calls, 1);
     return closedir(dir);
+}
+
+static void ecrawl_hook_task_popped_verbose(void) { ATOMIC_ADD_RELAXED(&g_tasks_popped, 1); }
+
+static void ecrawl_hook_writer_push_verbose(void) {
+    ATOMIC_ADD_RELAXED(&g_writer_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_batches_enqueued, 1);
+}
+
+static void ecrawl_hook_writer_pop_verbose(void) {
+    ATOMIC_SUB_RELAXED(&g_writer_queue_depth, 1);
+    ATOMIC_ADD_RELAXED(&g_batches_dequeued, 1);
+}
+
+static void ecrawl_install_verbose_profile(void) {
+    if (!g_verbose) return;
+    ecrawl_io_fopen = ecrawl_pfopen;
+    ecrawl_io_fclose = ecrawl_pfclose;
+    ecrawl_io_fwrite = ecrawl_pfwrite;
+    ecrawl_io_fflush = ecrawl_pfflush;
+    ecrawl_io_stat = ecrawl_pstat;
+    ecrawl_io_lstat = ecrawl_plstat;
+    ecrawl_io_fstatat_nf = ecrawl_pfstatat_nf_verbose;
+    ecrawl_io_mkdir = ecrawl_pmkdir;
+    ecrawl_io_opendir = ecrawl_popendir;
+    ecrawl_io_readdir = ecrawl_preaddir;
+    ecrawl_io_closedir = ecrawl_pclosedir;
+    ecrawl_hook_task_popped = ecrawl_hook_task_popped_verbose;
+    ecrawl_hook_writer_push = ecrawl_hook_writer_push_verbose;
+    ecrawl_hook_writer_pop = ecrawl_hook_writer_pop_verbose;
 }
 
 static void emfile_retry_pause(unsigned attempt) {
@@ -846,7 +1043,7 @@ static int id_registry_init(id_registry_t *r, const char *path) {
         return -1;
     }
 
-    r->fp = counted_fopen(path, "w");
+    r->fp = ecrawl_io_fopen(path, "w");
     if (!r->fp) {
         pthread_mutex_destroy(&r->mutex);
         return -1;
@@ -856,7 +1053,7 @@ static int id_registry_init(id_registry_t *r, const char *path) {
 }
 
 static void id_registry_destroy(id_registry_t *r) {
-    if (r->fp) counted_fclose(r->fp);
+    if (r->fp) ecrawl_io_fclose(r->fp);
     free(r->items);
     r->fp = NULL;
     r->items = NULL;
@@ -885,7 +1082,7 @@ static void write_uid_if_new(uid_t uid) {
     else name = "UNKNOWN";
 
     fprintf(g_uid_registry.fp, "%u %s\n", (unsigned int)uid, name);
-    counted_fflush(g_uid_registry.fp);
+    ecrawl_io_fflush(g_uid_registry.fp);
     pthread_mutex_unlock(&g_uid_registry.mutex);
 }
 
@@ -909,7 +1106,7 @@ static void write_gid_if_new(gid_t gid) {
     else name = "UNKNOWN";
 
     fprintf(g_gid_registry.fp, "%u %s\n", (unsigned int)gid, name);
-    counted_fflush(g_gid_registry.fp);
+    ecrawl_io_fflush(g_gid_registry.fp);
     pthread_mutex_unlock(&g_gid_registry.mutex);
 }
 
@@ -1038,11 +1235,22 @@ static uint64_t regular_file_byte_credit(shared_state_t *shared, crawl_stats_t *
     return seen_result ? (uint64_t)st->st_size : 0;
 }
 
-static void account_entry_local(shared_state_t *shared, crawl_stats_t *stats, perf_local_t *perf, const struct stat *st) {
+/*
+ * Account a single record locally and return its byte contribution for catalog
+ * rollups. The contribution mirrors how each entry counts toward total bytes:
+ *   - regular files: hardlink-aware credit (st_size on first inode visit, 0 on
+ *     subsequent visits across the whole crawl via g_hardlink_registry)
+ *   - dirs / symlinks / other: apparent st_size
+ * Callers must thread this value into emit_record() so the writer can fold it
+ * into the per-directory immediate-child rollup without recomputing the
+ * hardlink dedup (which would double-count or undercount across threads).
+ */
+static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats, perf_local_t *perf, const struct stat *st) {
     uint64_t byte_credit = 0;
     uint64_t apparent_size;
+    uint64_t contrib = 0;
 
-    if (!shared || !stats || !perf || !st) return;
+    if (!shared || !stats || !perf || !st) return 0;
 
     apparent_size = (uint64_t)st->st_size;
     stats->total_entries++;
@@ -1052,21 +1260,25 @@ static void account_entry_local(shared_state_t *shared, crawl_stats_t *stats, pe
         stats->total_dirs++;
         stats->dir_apparent_bytes += apparent_size;
         perf->dirs++;
+        contrib = apparent_size;
     } else if (S_ISREG(st->st_mode)) {
         stats->total_files++;
         perf->files++;
         byte_credit = regular_file_byte_credit(shared, stats, st);
         stats->total_bytes += byte_credit;
         perf->bytes += byte_credit;
+        contrib = byte_credit;
     } else if (S_ISLNK(st->st_mode)) {
         stats->total_symlinks++;
         stats->symlink_apparent_bytes += apparent_size;
+        contrib = apparent_size;
     } else {
         stats->total_other++;
         stats->other_apparent_bytes += apparent_size;
+        contrib = apparent_size;
     }
 
-    if (perf->entries >= PERF_FLUSH_INTERVAL) perf_flush_local(perf);
+    return contrib;
 }
 
 static void stats_merge(shared_state_t *shared, const crawl_stats_t *local) {
@@ -1140,7 +1352,7 @@ static int write_bin_header(FILE *fp) {
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, CRAWL_BIN_MAGIC, (size_t)CRAWL_BIN_MAGIC_LEN);
     hdr.version = FORMAT_VERSION;
-    return counted_fwrite(&hdr, sizeof(hdr), 1, fp) == 1 ? 0 : -1;
+    return ecrawl_io_fwrite(&hdr, sizeof(hdr), 1, fp) == 1 ? 0 : -1;
 }
 
 static void print_usage(const char *prog) {
@@ -1171,7 +1383,7 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS,
             (unsigned)DEFAULT_STAT_QUEUE_BATCHES);
     fprintf(stderr,
-            "Diagnostics: ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
+            "Diagnostics (with --verbose): ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
             "ECRAWL_DEBUG_LOG=<path> megadir CSV (quoted path; active rows after %u counted children, "
             "elapsed_sec when child_count > %u); ECRAWL_DEBUG_LOG_ACTIVE_AFTER=N overrides active threshold; "
             "ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive seconds with "
@@ -1181,7 +1393,8 @@ static void print_usage(const char *prog) {
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
             "Default output is a concise summary. --verbose prints full metrics to stdout at exit, and the same "
-            "metrics to stderr every N minutes (default N=5; optional integer 1..10080 after --verbose).\n");
+            "metrics to stderr every N minutes (default N=5; optional integer 1..10080 after --verbose); "
+            "ECRAWL_PROGRESS_LOG and ECRAWL_DEBUG_LOG are honored only with --verbose.\n");
 }
 
 static int ensure_output_dir_exists(const char *path) {
@@ -1192,7 +1405,7 @@ static int ensure_output_dir_exists(const char *path) {
         return -1;
     }
 
-    if (counted_stat(path, &st) == 0) {
+    if (ecrawl_io_stat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode)) {
             errno = ENOTDIR;
             return -1;
@@ -1200,7 +1413,7 @@ static int ensure_output_dir_exists(const char *path) {
         return 0;
     }
     if (errno != ENOENT) return -1;
-    return counted_mkdir(path, 0775) == 0 ? 0 : -1;
+    return ecrawl_io_mkdir(path, 0775) == 0 ? 0 : -1;
 }
 
 static int crawl_output_artifact_should_delete(const char *name) {
@@ -1219,29 +1432,29 @@ static int crawl_output_dir_scrub_prior_artifacts(void) {
     char path[PATH_MAX];
     int n;
 
-    dir = counted_opendir(g_output_dir);
+    dir = ecrawl_io_opendir(g_output_dir);
     if (!dir) {
         fprintf(stderr, "ERROR cannot open output directory %s: %s\n", g_output_dir, strerror(errno));
         return -1;
     }
-    while ((de = counted_readdir(dir)) != NULL) {
+    while ((de = ecrawl_io_readdir(dir)) != NULL) {
         const char *name = de->d_name;
         if (name[0] == '.') continue;
         if (!crawl_output_artifact_should_delete(name)) continue;
         n = snprintf(path, sizeof(path), "%s/%s", g_output_dir, name);
         if (n < 0 || (size_t)n >= sizeof(path)) {
             fprintf(stderr, "ERROR crawl scrub path too long under %s\n", g_output_dir);
-            counted_closedir(dir);
+            ecrawl_io_closedir(dir);
             errno = ENAMETOOLONG;
             return -1;
         }
         if (unlink(path) != 0 && errno != ENOENT) {
             fprintf(stderr, "ERROR unlink %s: %s\n", path, strerror(errno));
-            counted_closedir(dir);
+            ecrawl_io_closedir(dir);
             return -1;
         }
     }
-    counted_closedir(dir);
+    ecrawl_io_closedir(dir);
     return 0;
 }
 
@@ -1299,6 +1512,312 @@ static int ckpt_sidecar_path(const char *bin_path, char *out, size_t out_sz) {
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
 }
 
+static uint32_t shard_cat_hash_str(const char *s) {
+    uint32_t h = 2166136261u;
+    while (s && *s) {
+        h ^= (uint32_t)(unsigned char)*s++;
+        h *= 16777619u;
+    }
+    return h & (SHARD_CAT_HT_BUCKETS - 1U);
+}
+
+static void shard_cat_destroy(shard_cat_t *c) {
+    size_t bi;
+    if (!c) return;
+    for (bi = 0; bi < SHARD_CAT_HT_BUCKETS; bi++) {
+        shard_cat_path_entry_t *e = c->ht[bi];
+        while (e) {
+            shard_cat_path_entry_t *nx = e->next;
+            free(e->path_key);
+            free(e);
+            e = nx;
+        }
+        c->ht[bi] = NULL;
+    }
+    free(c->parent_dir_id);
+    free(c->depth);
+    free(c->name_len);
+    if (c->name_comp) {
+        size_t i;
+        for (i = 0; i < c->arr_cap; i++) free(c->name_comp[i]);
+        free(c->name_comp);
+    }
+    free(c->imm_child_bytes);
+    free(c->imm_child_count);
+    free(c->imm_child_ctime_led_count);
+    free(c->imm_child_min_eff_time);
+    free(c->imm_child_max_eff_time);
+    memset(c, 0, sizeof(*c));
+}
+
+static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
+    uint64_t ncap = c->arr_cap ? c->arr_cap : 8;
+    uint64_t i;
+    uint64_t *pp;
+    uint32_t *dp;
+    uint16_t *nl;
+    char **nm;
+    uint64_t *icb;
+    uint64_t *icc;
+    uint64_t *icl;
+    uint64_t *icmin;
+    uint64_t *icmax;
+
+    while (need_id >= ncap) ncap *= 2;
+    if (need_id >= ncap) return -1;
+
+    pp = (uint64_t *)realloc(c->parent_dir_id, (size_t)ncap * sizeof(*pp));
+    dp = (uint32_t *)realloc(c->depth, (size_t)ncap * sizeof(*dp));
+    nl = (uint16_t *)realloc(c->name_len, (size_t)ncap * sizeof(*nl));
+    nm = (char **)realloc(c->name_comp, (size_t)ncap * sizeof(*nm));
+    icb = (uint64_t *)realloc(c->imm_child_bytes, (size_t)ncap * sizeof(*icb));
+    icc = (uint64_t *)realloc(c->imm_child_count, (size_t)ncap * sizeof(*icc));
+    icl = (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)ncap * sizeof(*icl));
+    icmin = (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)ncap * sizeof(*icmin));
+    icmax = (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)ncap * sizeof(*icmax));
+    if (!pp || !dp || !nl || !nm || !icb || !icc || !icl || !icmin || !icmax) return -1;
+    c->parent_dir_id = pp;
+    c->depth = dp;
+    c->name_len = nl;
+    c->name_comp = nm;
+    c->imm_child_bytes = icb;
+    c->imm_child_count = icc;
+    c->imm_child_ctime_led_count = icl;
+    c->imm_child_min_eff_time = icmin;
+    c->imm_child_max_eff_time = icmax;
+    for (i = c->arr_cap; i < ncap; i++) {
+        c->parent_dir_id[i] = 0;
+        c->depth[i] = 0;
+        c->name_len[i] = 0;
+        c->name_comp[i] = NULL;
+        c->imm_child_bytes[i] = 0;
+        c->imm_child_count[i] = 0;
+        c->imm_child_ctime_led_count[i] = 0;
+        c->imm_child_min_eff_time[i] = UINT64_MAX;
+        c->imm_child_max_eff_time[i] = 0;
+    }
+    c->arr_cap = (size_t)ncap;
+    return 0;
+}
+
+static int shard_cat_ht_insert(shard_cat_t *c, char *path_owned, uint64_t dir_id) {
+    uint32_t h = shard_cat_hash_str(path_owned);
+    shard_cat_path_entry_t *e = (shard_cat_path_entry_t *)malloc(sizeof(*e));
+    if (!e) {
+        free(path_owned);
+        return -1;
+    }
+    e->path_key = path_owned;
+    e->dir_id = dir_id;
+    e->next = c->ht[h];
+    c->ht[h] = e;
+    return 0;
+}
+
+static uint64_t shard_cat_lookup_dir_id(const shard_cat_t *c, const char *path_z) {
+    uint32_t h = shard_cat_hash_str(path_z);
+    shard_cat_path_entry_t *e = c->ht[h];
+    while (e) {
+        if (strcmp(e->path_key, path_z) == 0) return e->dir_id;
+        e = e->next;
+    }
+    return 0;
+}
+
+static int shard_cat_init_fresh(shard_cat_t *c) {
+    memset(c, 0, sizeof(*c));
+    if (shard_cat_grow_arrays(c, 2) != 0) return -1;
+    c->parent_dir_id[1] = 0;
+    c->depth[1] = 0;
+    c->name_len[1] = 0;
+    c->name_comp[1] = NULL;
+    c->next_dir_id = 2;
+    {
+        char *root_key = strdup("");
+        if (!root_key) return -1;
+        if (shard_cat_ht_insert(c, root_key, 1ULL) != 0) return -1;
+    }
+    return 0;
+}
+
+static int shard_cat_load_from_disk_catalog(shard_cat_t *c, const crawl_bin_catalog_t *L) {
+    uint64_t id;
+
+    shard_cat_destroy(c);
+    if (!L || L->max_dir_id == 0ULL) return shard_cat_init_fresh(c);
+
+    if (shard_cat_grow_arrays(c, L->max_dir_id + 1ULL) != 0) return -1;
+    c->next_dir_id = L->max_dir_id + 1ULL;
+
+    for (id = 1; id <= L->max_dir_id; id++) {
+        char pb[PATH_MAX];
+        char *key;
+
+        if (crawl_bin_catalog_dir_path(L, id, pb, sizeof(pb)) != 0) {
+            shard_cat_destroy(c);
+            return -1;
+        }
+        key = strdup(pb);
+        if (!key) {
+            shard_cat_destroy(c);
+            return -1;
+        }
+        c->parent_dir_id[id] = L->parent_dir_id[id];
+        c->depth[id] = L->depth[id];
+        c->name_len[id] = L->name_len[id];
+        if (L->name_len[id] > 0 && L->name_comp[id]) {
+            c->name_comp[id] = strdup(L->name_comp[id]);
+            if (!c->name_comp[id]) {
+                free(key);
+                shard_cat_destroy(c);
+                return -1;
+            }
+        } else {
+            c->name_comp[id] = NULL;
+        }
+        c->imm_child_bytes[id] = L->imm_child_bytes[id];
+        c->imm_child_count[id] = L->imm_child_count[id];
+        c->imm_child_ctime_led_count[id] = L->imm_child_ctime_led_count[id];
+        c->imm_child_min_eff_time[id] = L->imm_child_min_eff_time[id];
+        c->imm_child_max_eff_time[id] = L->imm_child_max_eff_time[id];
+        if (shard_cat_ht_insert(c, key, id) != 0) {
+            shard_cat_destroy(c);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int split_parent_basename(const char *path_z, char *parent, size_t parent_sz, const char **base_out,
+                                 size_t *base_len_out) {
+    const char *slash = strrchr(path_z, '/');
+
+    if (!slash) {
+        if (parent_sz < 1) return -1;
+        parent[0] = '\0';
+        *base_out = path_z;
+        *base_len_out = strlen(path_z);
+        return 0;
+    }
+    if ((size_t)(slash - path_z) >= parent_sz) return -1;
+    memcpy(parent, path_z, (size_t)(slash - path_z));
+    parent[slash - path_z] = '\0';
+    *base_out = slash + 1;
+    *base_len_out = strlen(*base_out);
+    return 0;
+}
+
+static uint64_t shard_cat_ensure_dir(shard_cat_t *c, const char *path_z) {
+    char parent[PATH_MAX];
+    const char *base;
+    size_t base_len;
+    uint64_t pid;
+    uint64_t nid;
+    char *path_owned;
+    char *comp_owned;
+
+    if (!path_z || path_z[0] == '\0') return 1ULL;
+
+    {
+        uint64_t ex = shard_cat_lookup_dir_id(c, path_z);
+        if (ex != 0ULL) return ex;
+    }
+
+    if (split_parent_basename(path_z, parent, sizeof(parent), &base, &base_len) != 0) return 0;
+    if (base_len > (size_t)UINT16_MAX) return 0;
+
+    pid = shard_cat_ensure_dir(c, parent);
+    if (pid == 0ULL) return 0ULL;
+
+    nid = c->next_dir_id++;
+    if (shard_cat_grow_arrays(c, nid) != 0) return 0;
+    comp_owned = (char *)malloc(base_len + 1);
+    path_owned = strdup(path_z);
+    if (!comp_owned || !path_owned) {
+        free(comp_owned);
+        free(path_owned);
+        return 0;
+    }
+    memcpy(comp_owned, base, base_len);
+    comp_owned[base_len] = '\0';
+
+    c->parent_dir_id[nid] = pid;
+    c->depth[nid] = c->depth[pid] + 1U;
+    c->name_len[nid] = (uint16_t)base_len;
+    c->name_comp[nid] = comp_owned;
+
+    if (shard_cat_ht_insert(c, path_owned, nid) != 0) {
+        free(comp_owned);
+        c->name_comp[nid] = NULL;
+        return 0;
+    }
+    return nid;
+}
+
+/* Fold a single emitted record into the rollup of its on-disk parent. */
+static void shard_cat_update_imm_child_rollup(shard_cat_t *c, uint64_t pid, uint64_t byte_credit,
+                                              const bin_record_hdr_t *r) {
+    uint64_t eff;
+
+    if (!c || pid == 0ULL || (size_t)pid >= c->arr_cap) return;
+
+    c->imm_child_bytes[pid] += byte_credit;
+    c->imm_child_count[pid]++;
+    eff = crawl_bin_record_eff_time(r);
+    if (eff < c->imm_child_min_eff_time[pid]) c->imm_child_min_eff_time[pid] = eff;
+    if (eff > c->imm_child_max_eff_time[pid]) c->imm_child_max_eff_time[pid] = eff;
+    if (crawl_bin_record_ctime_led(r)) c->imm_child_ctime_led_count[pid]++;
+}
+
+static int shard_cat_write_tail(shard_cat_t *c, FILE *fp, uint64_t *catalog_start_out) {
+    uint64_t n;
+    uint64_t id;
+    off_t st;
+
+    if (!c || !fp || !catalog_start_out) return -1;
+    st = ftello(fp);
+    if (st < 0) return -1;
+    *catalog_start_out = (uint64_t)st;
+
+    if (c->next_dir_id <= 1ULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = c->next_dir_id - 1ULL;
+    if (fwrite(&n, sizeof(n), 1, fp) != 1) return -1;
+
+    for (id = 1; id < c->next_dir_id; id++) {
+        bin_dir_catalog_entry_t ent;
+
+        memset(&ent, 0, sizeof(ent));
+        ent.dir_id = id;
+        ent.parent_dir_id = c->parent_dir_id[id];
+        ent.depth = c->depth[id];
+        ent.name_len = c->name_len[id];
+        ent.imm_child_bytes = c->imm_child_bytes[id];
+        ent.imm_child_count = c->imm_child_count[id];
+        ent.imm_child_ctime_led_count = c->imm_child_ctime_led_count[id];
+        ent.imm_child_min_eff_time = c->imm_child_min_eff_time[id];
+        ent.imm_child_max_eff_time = c->imm_child_max_eff_time[id];
+        if (fwrite(&ent, sizeof(ent), 1, fp) != 1) return -1;
+        if (ent.name_len > 0 && c->name_comp[id]) {
+            if (fwrite(c->name_comp[id], 1, ent.name_len, fp) != ent.name_len) return -1;
+        }
+    }
+    return 0;
+}
+
+static int patch_bin_header_catalog_offset(FILE *fp, uint64_t catalog_off) {
+    bin_file_header_t hdr;
+
+    if (!fp) return -1;
+    if (fseeko(fp, 0, SEEK_SET) != 0) return -1;
+    if (fread(&hdr, sizeof(hdr), 1, fp) != 1) return -1;
+    hdr.catalog_offset = catalog_off;
+    if (fseeko(fp, 0, SEEK_SET) != 0) return -1;
+    return ecrawl_io_fwrite(&hdr, sizeof(hdr), 1, fp) == 1 ? 0 : -1;
+}
+
 static void shard_ckpt_free(shard_file_state_t *s) {
     free(s->ckpt_offs);
     s->ckpt_offs = NULL;
@@ -1325,7 +1844,7 @@ static int shard_ckpt_write_sidecar(const char *bin_path, const uint64_t *offs, 
 
     if (!offs || n == 0) return -1;
     if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
-    fp = counted_fopen(ckpath, "wb");
+    fp = ecrawl_io_fopen(ckpath, "wb");
     if (!fp) return -1;
     memset(&ch, 0, sizeof(ch));
     memcpy(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN);
@@ -1334,15 +1853,16 @@ static int shard_ckpt_write_sidecar(const char *bin_path, const uint64_t *offs, 
     ch.num_offsets = (uint64_t)n;
     if (fwrite(&ch, sizeof(ch), 1, fp) != 1 || fwrite(offs, sizeof(uint64_t), n, fp) != n) {
         int e = errno ? errno : EIO;
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         errno = e;
         return -1;
     }
-    if (counted_fflush(fp) != 0 || counted_fclose(fp) != 0) return -1;
+    if (ecrawl_io_fflush(fp) != 0 || ecrawl_io_fclose(fp) != 0) return -1;
     return 0;
 }
 
-static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t file_sz, uint64_t **offs_out, size_t *n_out) {
+static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t record_region_end, uint64_t **offs_out,
+                                   size_t *n_out) {
     char ckpath[PATH_MAX];
     crawl_ckpt_file_hdr_t ch;
     uint64_t *buf = NULL;
@@ -1352,25 +1872,25 @@ static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t file_sz, uint6
     *offs_out = NULL;
     *n_out = 0;
     if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
-    fp = counted_fopen(ckpath, "rb");
+    fp = ecrawl_io_fopen(ckpath, "rb");
     if (!fp) return -1;
     if (fread(&ch, sizeof(ch), 1, fp) != 1) {
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         errno = EINVAL;
         return -1;
     }
     if (memcmp(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN) != 0 || ch.version != CRAWL_CKPT_ONDISK_VERSION ||
         ch.stride_bytes != CRAWL_CKPT_STRIDE_BYTES || ch.num_offsets == 0 || ch.num_offsets > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         errno = EINVAL;
         return -1;
     }
     buf = (uint64_t *)malloc((size_t)ch.num_offsets * sizeof(*buf));
     if (!buf) {
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         return -1;
     }
-    if (fread(buf, sizeof(uint64_t), (size_t)ch.num_offsets, fp) != (size_t)ch.num_offsets || counted_fclose(fp) != 0) {
+    if (fread(buf, sizeof(uint64_t), (size_t)ch.num_offsets, fp) != (size_t)ch.num_offsets || ecrawl_io_fclose(fp) != 0) {
         free(buf);
         errno = EINVAL;
         return -1;
@@ -1381,7 +1901,7 @@ static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t file_sz, uint6
         return -1;
     }
     for (i = 1; i < (size_t)ch.num_offsets; i++) {
-        if (buf[i] <= buf[i - 1] || buf[i] > file_sz) {
+        if (buf[i] <= buf[i - 1] || buf[i] >= record_region_end) {
             free(buf);
             errno = EINVAL;
             return -1;
@@ -1399,20 +1919,36 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
     size_t n, cap;
     uint64_t seg0;
     off_t pos;
+    bin_file_header_t fh;
+    uint64_t scan_end;
 
     *offs_out = NULL;
     *n_out = 0;
-    fp = counted_fopen(bin_path, "rb");
+    fp = ecrawl_io_fopen(bin_path, "rb");
     if (!fp) return -1;
     if (file_sz < sizeof(bin_file_header_t)) {
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         errno = EINVAL;
         return -1;
+    }
+    if (fread(&fh, sizeof(fh), 1, fp) != 1) {
+        ecrawl_io_fclose(fp);
+        errno = EINVAL;
+        return -1;
+    }
+    scan_end = file_sz;
+    if (fh.catalog_offset != 0ULL) {
+        if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset > file_sz) {
+            ecrawl_io_fclose(fp);
+            errno = EINVAL;
+            return -1;
+        }
+        scan_end = fh.catalog_offset;
     }
 
     buf = (uint64_t *)malloc(16 * sizeof(*buf));
     if (!buf) {
-        counted_fclose(fp);
+        ecrawl_io_fclose(fp);
         return -1;
     }
     n = 1;
@@ -1423,7 +1959,7 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
     if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto fail;
     pos = (off_t)sizeof(bin_file_header_t);
 
-    while ((uint64_t)pos < file_sz) {
+    while ((uint64_t)pos < scan_end) {
         uint64_t rec_start = (uint64_t)pos;
         bin_record_hdr_t rh;
 
@@ -1441,24 +1977,24 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
         if (fread(&rh, sizeof(rh), 1, fp) != 1) goto fail;
         pos = ftello(fp);
         if (pos < 0) goto fail;
-        if (rh.path_len) {
-            if ((uint64_t)pos + rh.path_len > file_sz) goto fail;
-            if (fseeko(fp, (off_t)rh.path_len, SEEK_CUR) != 0) goto fail;
+        if (rh.name_len) {
+            if ((uint64_t)pos + rh.name_len > scan_end) goto fail;
+            if (fseeko(fp, (off_t)rh.name_len, SEEK_CUR) != 0) goto fail;
             pos = ftello(fp);
             if (pos < 0) goto fail;
         }
     }
-    if ((uint64_t)pos != file_sz) {
+    if ((uint64_t)pos != scan_end) {
         errno = EINVAL;
         goto fail;
     }
-    counted_fclose(fp);
+    ecrawl_io_fclose(fp);
     *offs_out = buf;
     *n_out = n;
     *seg_start_out = seg0;
     return 0;
 fail:
-    counted_fclose(fp);
+    ecrawl_io_fclose(fp);
     free(buf);
     if (errno == 0) errno = EINVAL;
     return -1;
@@ -1502,12 +2038,30 @@ static int shard_ckpt_init_new(shard_file_state_t *s) {
 }
 
 static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_path) {
+    uint64_t cat_off;
     int r;
 
     if (!s->fp) return 0;
     if (!s->ckpt_offs || s->ckpt_n == 0) return -1;
+
+    if (ecrawl_io_fflush(s->fp) != 0) return -1;
+    if (fseeko(s->fp, 0, SEEK_END) != 0) return -1;
+    if ((uint64_t)ftello(s->fp) != s->bytes_written) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (shard_cat_write_tail(&s->cat, s->fp, &cat_off) != 0) return -1;
+    if (cat_off != s->bytes_written) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ecrawl_io_fflush(s->fp) != 0) return -1;
+    if (patch_bin_header_catalog_offset(s->fp, cat_off) != 0) return -1;
+    if (ecrawl_io_fflush(s->fp) != 0) return -1;
+
     r = shard_ckpt_write_sidecar(bin_path, s->ckpt_offs, s->ckpt_n);
     shard_ckpt_free(s);
+    shard_cat_destroy(&s->cat);
     s->seg_start_byte = 0;
     return r;
 }
@@ -1559,7 +2113,7 @@ static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
     else q->head = node;
     q->tail = node;
     q->queued_tasks++;
-    ATOMIC_ADD_RELAXED(&g_queue_depth, 1);
+    tls_qdepth_bump(1);
     pthread_cond_signal(&q->cond);
     pthread_mutex_unlock(&q->mutex);
 
@@ -1608,7 +2162,7 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
             return -1;
         }
         pthread_cond_wait(&q->cond, &q->mutex);
-        atomic_fetch_add_explicit(&g_wait_crawl_tasks, 1ULL, memory_order_relaxed);
+        tls_wait_crawl_inc();
     }
 
     node = q->head;
@@ -1617,8 +2171,8 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
     atomic_fetch_add(&g_active_workers, 1);
     pthread_mutex_unlock(&q->mutex);
 
-    ATOMIC_SUB_RELAXED(&g_queue_depth, 1);
-    VERBOSE_ADD_RELAXED(&g_tasks_popped, 1);
+    tls_qdepth_bump(-1);
+    ecrawl_hook_task_popped();
 
     task->items = node->items;
     task->count = node->count;
@@ -1674,7 +2228,7 @@ static int writer_queue_push(writer_queue_t *q, record_batch_t *batch) {
     pthread_mutex_lock(&q->mutex);
     while (!q->closed && q->count >= q->max_batches) {
         pthread_cond_wait(&q->cond_nonfull, &q->mutex);
-        atomic_fetch_add_explicit(&g_wait_writer_push, 1ULL, memory_order_relaxed);
+        tls_wait_writer_push_inc();
     }
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
@@ -1687,8 +2241,7 @@ static int writer_queue_push(writer_queue_t *q, record_batch_t *batch) {
     q->tail = batch;
     q->count++;
 
-    VERBOSE_ADD_RELAXED(&g_writer_queue_depth, 1);
-    VERBOSE_ADD_RELAXED(&g_batches_enqueued, 1);
+    ecrawl_hook_writer_push();
 
     pthread_cond_signal(&q->cond_nonempty);
     pthread_mutex_unlock(&q->mutex);
@@ -1706,7 +2259,7 @@ static record_batch_t *writer_queue_pop(writer_queue_t *q) {
             return NULL;
         }
         pthread_cond_wait(&q->cond_nonempty, &q->mutex);
-        atomic_fetch_add_explicit(&g_wait_writer_pop, 1ULL, memory_order_relaxed);
+        tls_wait_writer_pop_inc();
     }
 
     batch = q->head;
@@ -1716,15 +2269,16 @@ static record_batch_t *writer_queue_pop(writer_queue_t *q) {
     pthread_cond_signal(&q->cond_nonfull);
     pthread_mutex_unlock(&q->mutex);
 
-    VERBOSE_SUB_RELAXED(&g_writer_queue_depth, 1);
-    VERBOSE_ADD_RELAXED(&g_batches_dequeued, 1);
+    ecrawl_hook_writer_pop();
     return batch;
 }
 
-static int emit_context_init(emit_context_t *ctx, writer_queue_t *writer_queues, int writer_threads) {
+static int emit_context_init(emit_context_t *ctx, writer_queue_t *writer_queues, int writer_threads,
+                             perf_local_t *perf) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->writer_queues = writer_queues;
     ctx->writer_threads = writer_threads;
+    ctx->perf = perf;
     if (g_no_write || writer_threads <= 0) return 0;
     ctx->pending = (pending_batch_t *)calloc((size_t)writer_threads, sizeof(*ctx->pending));
     return ctx->pending ? 0 : -1;
@@ -1759,6 +2313,8 @@ static int flush_pending_batch(emit_context_t *ctx, int writer_index) {
         free(batch);
         return -1;
     }
+
+    if (ctx->perf) perf_flush_local(ctx->perf);
 
     return 0;
 }
@@ -1808,7 +2364,14 @@ static int map_path_for_record(const char *path, size_t path_len, char *out, siz
 
     if (strncmp(tmp, g_phys_prefix, g_phys_prefix_len) != 0 ||
         !(tmp[g_phys_prefix_len] == '/' || tmp[g_phys_prefix_len] == '\0')) {
-        fprintf(stderr, "warn: path does not start with crawl root %s — storing raw path for %s\n", g_phys_prefix, tmp);
+        static int warned_record_root_prefix;
+        if (!warned_record_root_prefix) {
+            warned_record_root_prefix = 1;
+            fprintf(stderr,
+                    "warn: path does not start with crawl root %s — storing raw path "
+                    "(further occurrences suppressed)\n",
+                    g_phys_prefix);
+        }
         if (path_len >= out_sz) return -1;
         memcpy(out, path, path_len);
         *out_len = path_len;
@@ -1828,7 +2391,8 @@ static int map_path_for_record(const char *path, size_t path_len, char *out, siz
     return 0;
 }
 
-static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, const struct stat *st) {
+static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, const struct stat *st,
+                       uint64_t byte_credit) {
     bin_record_hdr_t hdr;
     batch_frame_hdr_t frame;
     pending_batch_t *pending;
@@ -1848,7 +2412,9 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     path_write = path_buf;
 
     memset(&hdr, 0, sizeof(hdr));
-    hdr.path_len = (uint16_t)path_len_write;
+    /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to on-disk v5. */
+    hdr.parent_dir_id = 0;
+    hdr.name_len = (uint16_t)path_len_write;
     hdr.type = (uint8_t)file_type_char(st->st_mode);
     hdr.mode = (uint32_t)st->st_mode;
     hdr.uid = (uint64_t)st->st_uid;
@@ -1867,8 +2433,10 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     pending = &ctx->pending[writer_index];
 
     record_len = sizeof(hdr) + path_len_write;
+    memset(&frame, 0, sizeof(frame));
     frame.shard = shard;
     frame.data_len = (uint32_t)record_len;
+    frame.byte_credit = byte_credit;
     frame_len = sizeof(frame) + record_len;
 
     if (pending->len > 0 && pending->len + frame_len > pending->cap) {
@@ -2177,7 +2745,7 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
         if (nl == 0) break;
         p += nl + 1;
 
-        if (counted_fstatat_nofollow(batch->dirfd_dup, name, &child_st) != 0) {
+        if (ecrawl_io_fstatat_nf(batch->dirfd_dup, name, &child_st) != 0) {
             fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", batch->parent_path, name, strerror(errno));
             stats_add_error(wa->shared);
             continue;
@@ -2185,9 +2753,11 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
         if (S_ISDIR(child_st.st_mode)) {
             stat_batch_record_unexpected_dir(batch->parent_path, batch->parent_len, name, nl);
         } else {
+            uint64_t contrib;
+
             pthread_mutex_lock(&wa->emit_stats_lock);
             record_ids_from_stat(&child_st);
-            account_entry_local(wa->shared, &wa->stats, &wa->perf, &child_st);
+            contrib = account_entry_local(wa->shared, &wa->stats, &wa->perf, &child_st);
             if (!g_no_write) {
                 char child[PATH_MAX];
                 size_t child_path_len =
@@ -2199,7 +2769,7 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
                     pthread_mutex_unlock(&wa->emit_stats_lock);
                     continue;
                 }
-                if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
                     fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                     stats_add_error(wa->shared);
                 }
@@ -2256,9 +2826,10 @@ static void *stat_worker_main(void *arg) {
             }
             if (g_stat_pool.stop) {
                 pthread_mutex_unlock(&g_stat_pool.mutex);
+                tls_flush_thread_batch_counters();
                 return NULL;
             }
-            atomic_fetch_add_explicit(&g_wait_stat_pop, 1ULL, memory_order_relaxed);
+            tls_wait_stat_pop_inc();
             pthread_cond_wait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex);
         }
         pthread_mutex_unlock(&g_stat_pool.mutex);
@@ -2281,7 +2852,7 @@ static void stat_queue_track_depth_max_locked(size_t depth) {
 static int stat_batch_enqueue(stat_batch_t *batch) {
     pthread_mutex_lock(&g_stat_pool.mutex);
     while (g_stat_pool.q_count >= g_stat_pool.q_max && !g_stat_pool.stop) {
-        atomic_fetch_add_explicit(&g_wait_stat_enqueue, 1ULL, memory_order_relaxed);
+        tls_wait_stat_enqueue_inc();
         pthread_cond_wait(&g_stat_pool.cond_nonfull, &g_stat_pool.mutex);
     }
     if (g_stat_pool.stop) {
@@ -2419,7 +2990,7 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
             if (nl == 0) break;
             p += nl + 1;
 
-            if (counted_fstatat_nofollow(dir_fd, name, &child_st) != 0) {
+            if (ecrawl_io_fstatat_nf(dir_fd, name, &child_st) != 0) {
                 fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", parent_path, name, strerror(errno));
                 stats_add_error(shared);
                 continue;
@@ -2427,8 +2998,10 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
             if (S_ISDIR(child_st.st_mode)) {
                 stat_batch_record_unexpected_dir(parent_path, parent_len, name, nl);
             } else {
+                uint64_t contrib;
+
                 record_ids_from_stat(&child_st);
-                account_entry_local(shared, &wa->stats, &wa->perf, &child_st);
+                contrib = account_entry_local(shared, &wa->stats, &wa->perf, &child_st);
                 if (!g_no_write) {
                     char child[PATH_MAX];
                     size_t child_path_len =
@@ -2439,7 +3012,7 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
                         stats_add_error(shared);
                         continue;
                     }
-                    if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                    if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
                         fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                         stats_add_error(shared);
                     }
@@ -2512,7 +3085,7 @@ static int process_directory_iterative(dir_stack_t *stack,
         if (work.have_stat) st = work.st;
         else {
             memset(&st, 0, sizeof(st));
-            if (counted_lstat(dir_path, &st) != 0) {
+            if (ecrawl_io_lstat(dir_path, &st) != 0) {
                 fprintf(stderr, "ERROR worker lstat %s: %s\n", dir_path, strerror(errno));
                 stats_add_error(shared);
                 free(dir_path);
@@ -2521,13 +3094,16 @@ static int process_directory_iterative(dir_stack_t *stack,
         }
 
         record_ids_from_stat(&st);
-        account_entry_local(shared, stats, perf, &st);
-        dir_path_len = work.path_len;
-        if (emit_record(emit, dir_path, dir_path_len, &st) != 0) {
-            fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
-            stats_add_error(shared);
-            free(dir_path);
-            continue;
+        {
+            uint64_t contrib = account_entry_local(shared, stats, perf, &st);
+
+            dir_path_len = work.path_len;
+            if (emit_record(emit, dir_path, dir_path_len, &st, contrib) != 0) {
+                fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
+                stats_add_error(shared);
+                free(dir_path);
+                continue;
+            }
         }
 
         if (!S_ISDIR(st.st_mode)) {
@@ -2538,7 +3114,7 @@ static int process_directory_iterative(dir_stack_t *stack,
         {
             unsigned retry;
             for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
-                dir = counted_opendir(dir_path);
+                dir = ecrawl_io_opendir(dir_path);
                 if (dir || errno != EMFILE || retry == EMFILE_RETRY_LIMIT) break;
                 atomic_store(&g_fd_pressure, 1U);
                 emfile_retry_pause(retry);
@@ -2556,7 +3132,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             if (dir_fd < 0) {
                 fprintf(stderr, "ERROR worker dirfd %s: %s\n", dir_path, strerror(errno));
                 stats_add_error(shared);
-                counted_closedir(dir);
+                ecrawl_io_closedir(dir);
                 free(dir_path);
                 continue;
             }
@@ -2577,11 +3153,11 @@ static int process_directory_iterative(dir_stack_t *stack,
                     size_t readdir_drain_counter       = 0;
                     size_t dirents_seen_in_dir         = 0;
                     uint64_t stat_worker_batches_in_dir = 0;
-                    double dir_dbg_t0                   = 0.0;
+                    double dir_dbg_t0 = 0.0;
 
                     if (g_debug_log_path) dir_dbg_t0 = now_sec();
 
-                while ((ent = counted_readdir(dir)) != NULL) {
+                while ((ent = ecrawl_io_readdir(dir)) != NULL) {
                     readdir_drain_counter++;
                     if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
                         readdir_drain_counter = 0;
@@ -2639,7 +3215,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     } else if (d_type_reliable_nondir_for_stat_batch(child_d_type)) {
                         if (g_stat_batch_after_reliable_nondirs_cfg > 0U &&
                             reliable_nondir_seen_in_dir < g_stat_batch_after_reliable_nondirs_cfg) {
-                            if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                            if (ecrawl_io_fstatat_nf(dir_fd, ent->d_name, &child_st) != 0) {
                                 fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name,
                                         strerror(errno));
                                 stats_add_error(shared);
@@ -2648,8 +3224,10 @@ static int process_directory_iterative(dir_stack_t *stack,
                             if (S_ISDIR(child_st.st_mode)) {
                                 stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent->d_name, child_name_len);
                             } else {
+                                uint64_t contrib;
+
                                 record_ids_from_stat(&child_st);
-                                account_entry_local(shared, stats, perf, &child_st);
+                                contrib = account_entry_local(shared, stats, perf, &child_st);
                                 if (!g_no_write) {
                                     char child[PATH_MAX];
                                     size_t child_path_emitted_len = dir_path_len + child_name_len +
@@ -2662,7 +3240,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                         stats_add_error(shared);
                                         continue;
                                     }
-                                    if (emit_record(emit, child, child_path_emitted_len, &child_st) != 0) {
+                                    if (emit_record(emit, child, child_path_emitted_len, &child_st, contrib) != 0) {
                                         fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                                         stats_add_error(shared);
                                     }
@@ -2679,14 +3257,16 @@ static int process_directory_iterative(dir_stack_t *stack,
                             if (nb.count >= g_stat_batch_entries_cfg) {
                                 if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
                                                        &pend, &stat_worker_batches_in_dir) != 0) {
-                                    double dbg_scan_el = DEBUG_DIR_SCAN_ELAPSED_OMIT;
-
                                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                                    if (g_debug_log_path && dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS)
-                                        dbg_scan_el = now_sec() - dir_dbg_t0;
-                                    debug_dir_children_note(dir_path, dirents_seen_in_dir, dbg_scan_el,
-                                                            stat_worker_batches_in_dir);
-                                    counted_closedir(dir);
+                                    {
+                                        double dbg_scan_el = DEBUG_DIR_SCAN_ELAPSED_OMIT;
+
+                                        if (g_debug_log_path && dirents_seen_in_dir > STAT_PENDING_DRAIN_EVERY_READDIRS)
+                                            dbg_scan_el = now_sec() - dir_dbg_t0;
+                                        debug_dir_children_note(dir_path, dirents_seen_in_dir, dbg_scan_el,
+                                                                stat_worker_batches_in_dir);
+                                    }
+                                    ecrawl_io_closedir(dir);
                                     stat_names_builder_free(&nb);
                                     stat_pending_vec_free(&pend);
                                     free(dir_path);
@@ -2695,7 +3275,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             }
                         }
                     } else {
-                        if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                        if (ecrawl_io_fstatat_nf(dir_fd, ent->d_name, &child_st) != 0) {
                             fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name,
                                     strerror(errno));
                             stats_add_error(shared);
@@ -2724,8 +3304,10 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 }
                             }
                         } else {
+                            uint64_t contrib;
+
                             record_ids_from_stat(&child_st);
-                            account_entry_local(shared, stats, perf, &child_st);
+                            contrib = account_entry_local(shared, stats, perf, &child_st);
                             if (!g_no_write) {
                                 char child[PATH_MAX];
                                 size_t child_path_emitted_len = dir_path_len + child_name_len +
@@ -2737,7 +3319,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                     stats_add_error(shared);
                                     continue;
                                 }
-                                if (emit_record(emit, child, child_path_emitted_len, &child_st) != 0) {
+                                if (emit_record(emit, child, child_path_emitted_len, &child_st, contrib) != 0) {
                                     fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                                     stats_add_error(shared);
                                 }
@@ -2756,7 +3338,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                 if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux, &pend,
                                        &stat_worker_batches_in_dir) != 0) {
                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                    counted_closedir(dir);
+                    ecrawl_io_closedir(dir);
                     stat_names_builder_free(&nb);
                     stat_pending_vec_free(&pend);
                     free(dir_path);
@@ -2774,7 +3356,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                 if (g_debug_log_path) dir_dbg_t0 = now_sec();
 
-                while ((ent = counted_readdir(dir)) != NULL) {
+                while ((ent = ecrawl_io_readdir(dir)) != NULL) {
                     size_t child_name_len;
                     struct stat child_st;
 #if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
@@ -2828,7 +3410,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             }
                         }
                     } else {
-                        if (counted_fstatat_nofollow(dir_fd, ent->d_name, &child_st) != 0) {
+                        if (ecrawl_io_fstatat_nf(dir_fd, ent->d_name, &child_st) != 0) {
                             fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
                             stats_add_error(shared);
                             continue;
@@ -2856,8 +3438,10 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 }
                             }
                         } else {
+                            uint64_t contrib;
+
                             record_ids_from_stat(&child_st);
-                            account_entry_local(shared, stats, perf, &child_st);
+                            contrib = account_entry_local(shared, stats, perf, &child_st);
                             if (!g_no_write) {
                                 char child[PATH_MAX];
                                 size_t child_path_len = dir_path_len + child_name_len +
@@ -2869,7 +3453,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                     stats_add_error(shared);
                                     continue;
                                 }
-                                if (emit_record(emit, child, child_path_len, &child_st) != 0) {
+                                if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
                                     fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
                                     stats_add_error(shared);
                                 }
@@ -2887,7 +3471,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             }
         }
 
-        counted_closedir(dir);
+        ecrawl_io_closedir(dir);
         free(dir_path);
     outer_continue:;
     }
@@ -3118,13 +3702,26 @@ static void *stats_thread_main(void *arg) {
         sleep(1);
 
         {
+            int idx_record = atomic_load(&g_bucket_index);
+            unsigned long long io_ls_tick = atomic_load(&g_io_lstat_calls);
+            unsigned long long io_st_tick = atomic_load(&g_io_stat_calls);
+            unsigned long long d_meta =
+                (io_ls_tick - g_progress_prev_lstat) + (io_st_tick - g_progress_prev_stat);
+
+            ATOMIC_ADD_RELAXED(&g_bucket_stat_meta[idx_record], d_meta);
+            ATOMIC_ADD_RELAXED(&g_window_stat_meta, d_meta);
+        }
+
+        {
             int next = (atomic_load(&g_bucket_index) + 1) % WINDOW_SECONDS;
             unsigned long long expired_entries = atomic_exchange(&g_bucket_entries[next], 0);
             unsigned long long expired_files = atomic_exchange(&g_bucket_files[next], 0);
             unsigned long long expired_dirs = atomic_exchange(&g_bucket_dirs[next], 0);
+            unsigned long long expired_stat_meta = atomic_exchange(&g_bucket_stat_meta[next], 0);
             atomic_fetch_sub(&g_window_entries, expired_entries);
             atomic_fetch_sub(&g_window_files, expired_files);
             atomic_fetch_sub(&g_window_dirs, expired_dirs);
+            atomic_fetch_sub(&g_window_stat_meta, expired_stat_meta);
             atomic_store(&g_bucket_index, next);
         }
 
@@ -3141,18 +3738,22 @@ static void *stats_thread_main(void *arg) {
             unsigned long long window_entries = atomic_load(&g_window_entries);
             unsigned long long window_files = atomic_load(&g_window_files);
             unsigned long long window_dirs = atomic_load(&g_window_dirs);
+            unsigned long long window_stat_meta = atomic_load(&g_window_stat_meta);
             unsigned int divisor = atomic_load(&g_seconds_seen);
             double ops_rate;
+            double stat_meta_rate;
             double elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
-            char te[32], tf[32], td[32], ts[32], re[32], elapsed_buf[32];
+            char te[32], tf[32], td[32], ts[32], robj[32], rst[32], elapsed_buf[32];
             unsigned long long io_rd = atomic_load(&g_io_readdir_calls);
             unsigned long long io_ls = atomic_load(&g_io_lstat_calls);
+            unsigned long long io_st = atomic_load(&g_io_stat_calls);
             unsigned long long d_tot = total_entries - g_progress_prev_tot_entries;
             unsigned long long d_rd = io_rd - g_progress_prev_readdir;
             unsigned long long d_ls = io_ls - g_progress_prev_lstat;
 
             if (divisor == 0) divisor = 1;
             ops_rate = (double)window_entries / (double)divisor;
+            stat_meta_rate = (double)window_stat_meta / (double)divisor;
 
             if (g_stall_hint_seconds_cfg > 0 && elapsed_sec >= (double)WINDOW_SECONDS &&
                 divisor >= (unsigned int)WINDOW_SECONDS && window_entries == 0ULL) {
@@ -3170,10 +3771,10 @@ static void *stats_thread_main(void *arg) {
                     fprintf(stderr,
                             "ecrawl: stall hint: rolling-window entries stayed at 0 for %d s "
                             "(elapsed %.1f s; total_entries=%llu; q=%llu wq=%llu active=%d; "
-                            "last_sec delta: entries=%llu readdir=%llu lstat=%llu; "
+                            "last_sec delta: entries=%llu readdir=%llu stat_meta=%llu; "
                             "wait: crawl_q=%llu wr_push=%llu wr_pop=%llu st_pop=%llu st_enq=%llu)\n",
                             stall_zero_secs, elapsed_sec, (unsigned long long)total_entries, qdepth, wqdepth, active,
-                            d_tot, d_rd, d_ls, wcrawl, wwp, wwc, wsp, wse);
+                            d_tot, d_rd, d_ls + (io_st - g_progress_prev_stat), wcrawl, wwp, wwc, wsp, wse);
                     fflush(stderr);
                     stall_announced = 1;
                 }
@@ -3185,6 +3786,7 @@ static void *stats_thread_main(void *arg) {
             g_progress_prev_tot_entries = total_entries;
             g_progress_prev_readdir = io_rd;
             g_progress_prev_lstat = io_ls;
+            g_progress_prev_stat = io_st;
 
             if (g_progress_log_fp) {
                 unsigned long long qdepth = atomic_load(&g_queue_depth);
@@ -3210,7 +3812,7 @@ static void *stats_thread_main(void *arg) {
                 if (!g_progress_log_header_written) {
                     fprintf(g_progress_log_fp,
                             "unix_ts,elapsed_sec,total_entries,total_files,total_dirs,total_bytes,"
-                            "window_entries,window_files,window_dirs,seconds_seen,ops_rate,"
+                            "window_entries,window_files,window_dirs,seconds_seen,ops_rate,stat_meta_rate,"
                             "queue_depth,writer_queue_depth,active_workers,tasks_popped,"
                             "batches_enqueued,batches_dequeued,"
                             "stat_batches_enqueued,stat_batches_completed,stat_batches_dup_fallback,"
@@ -3222,9 +3824,10 @@ static void *stats_thread_main(void *arg) {
                     g_progress_log_header_written = 1;
                 }
                 fprintf(g_progress_log_fp,
-                        "%lld,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%.6f,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
+                        "%lld,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%.6f,%.6f,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
                         (long long)time(NULL), elapsed_sec, total_entries, total_files, total_dirs, total_bytes,
-                        window_entries, window_files, window_dirs, divisor, ops_rate, qdepth, writer_qdepth, active,
+                        window_entries, window_files, window_dirs, divisor, ops_rate, stat_meta_rate, qdepth,
+                        writer_qdepth, active,
                         popped, benq, bdeq, sbenq, sbdone, sbdup, wcrawl, wwp, wwc, wsp, wse, sqmax, d_tot, d_rd,
                         d_ls, io_rd, io_cd, io_od, disk_low, wf);
                 fflush(g_progress_log_fp);
@@ -3249,13 +3852,14 @@ static void *stats_thread_main(void *arg) {
             human_decimal((double)total_files, tf, sizeof(tf));
             human_decimal((double)total_dirs, td, sizeof(td));
             human_decimal((double)total_bytes, ts, sizeof(ts));
-            human_decimal(ops_rate, re, sizeof(re));
+            human_decimal(ops_rate, robj, sizeof(robj));
+            human_decimal(stat_meta_rate, rst, sizeof(rst));
             format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
             if (isatty(STDOUT_FILENO)) {
                 if (!g_verbose) {
-                    printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | el:%s            ",
-                           re, te, tf, td, ts, elapsed_buf);
+                    printf("\rstat/s(10s):%s obj/s(10s):%s | tot:%s f:%s d:%s s:%s | el:%s            ",
+                           rst, robj, te, tf, td, ts, elapsed_buf);
                 } else {
                     unsigned long long qdepth = atomic_load(&g_queue_depth);
                     unsigned long long popped = atomic_load(&g_tasks_popped);
@@ -3264,8 +3868,9 @@ static void *stats_thread_main(void *arg) {
                     char pp[32];
 
                     human_decimal((double)popped, pp, sizeof(pp));
-                    printf("\r%s ops/s(10s) | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s | el:%s            ",
-                           re, te, tf, td, ts, qdepth, writer_qdepth, active, pp, elapsed_buf);
+                    printf("\rstat/s(10s):%s obj/s(10s):%s | tot:%s f:%s d:%s s:%s | q:%llu wq:%llu t:%d p:%s | "
+                           "el:%s            ",
+                           rst, robj, te, tf, td, ts, qdepth, writer_qdepth, active, pp, elapsed_buf);
                 }
                 fflush(stdout);
             }
@@ -3279,7 +3884,7 @@ static void *worker_thread_main(void *arg_void) {
     worker_arg_t *arg = (worker_arg_t *)arg_void;
     emit_context_t emit;
 
-    if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads) != 0) {
+    if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads, &arg->perf) != 0) {
         fprintf(stderr, "ERROR worker %" PRIu64 " failed to initialize emit context\n", arg->worker_index);
         stats_add_error(arg->shared);
         return NULL;
@@ -3325,7 +3930,7 @@ static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_in
         char path[PATH_MAX];
         if (build_shard_path(shard, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(victim, path);
     }
-    counted_fclose(victim->fp);
+    ecrawl_io_fclose(victim->fp);
     victim->fp = NULL;
     if (*open_count > 0) (*open_count)--;
     return 1;
@@ -3340,12 +3945,16 @@ static void writer_trim_shards(shard_file_state_t *shards, uint32_t writer_index
 
 static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
     if (state->bytes_written == 0) {
-        state->fp = counted_fopen(path, "ab+");
+        /*
+         * Avoid "a+" here: append streams may ignore seeks on write, so rewriting the 32-byte
+         * header at offset 0 when finalizing the catalog would corrupt the shard tail instead.
+         */
+        state->fp = ecrawl_io_fopen(path, "wb+");
         if (!state->fp) return -1;
         setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
-        if (write_bin_header(state->fp) != 0 || counted_fflush(state->fp) != 0) {
+        if (write_bin_header(state->fp) != 0 || ecrawl_io_fflush(state->fp) != 0) {
             int saved_errno = errno ? errno : EIO;
-            counted_fclose(state->fp);
+            ecrawl_io_fclose(state->fp);
             state->fp = NULL;
             errno = saved_errno;
             return -1;
@@ -3353,24 +3962,87 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
         state->bytes_written = sizeof(bin_file_header_t);
         if (shard_ckpt_init_new(state) != 0) {
             int saved_errno = errno ? errno : ENOMEM;
-            counted_fclose(state->fp);
+            ecrawl_io_fclose(state->fp);
+            state->fp = NULL;
+            errno = saved_errno;
+            return -1;
+        }
+        if (shard_cat_init_fresh(&state->cat) != 0) {
+            int saved_errno = errno ? errno : ENOMEM;
+            ecrawl_io_fclose(state->fp);
             state->fp = NULL;
             errno = saved_errno;
             return -1;
         }
     } else {
-        state->fp = counted_fopen(path, "ab");
+        struct stat st;
+        bin_file_header_t fh;
+        crawl_bin_catalog_t cat;
+        uint64_t fsz;
+        uint64_t co;
+
+        if (ecrawl_io_stat(path, &st) != 0) return -1;
+        fsz = (uint64_t)st.st_size;
+
+        state->fp = ecrawl_io_fopen(path, "rb+");
         if (!state->fp) return -1;
         setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
-        if (shard_ckpt_load_for_append(state, path, state->bytes_written) != 0) {
+
+        if (fread(&fh, sizeof(fh), 1, state->fp) != 1) goto reopen_fail;
+        if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
+            errno = EINVAL;
+            goto reopen_fail;
+        }
+        co = fh.catalog_offset;
+        if (co == 0ULL || co < sizeof(fh) || co > fsz) {
+            errno = EINVAL;
+            goto reopen_fail;
+        }
+
+        crawl_bin_catalog_init_empty(&cat);
+        if (crawl_bin_catalog_load(state->fp, co, fsz, &cat) != 0) {
+            crawl_bin_catalog_free(&cat);
+            goto reopen_fail;
+        }
+        if (shard_cat_load_from_disk_catalog(&state->cat, &cat) != 0) {
+            crawl_bin_catalog_free(&cat);
+            goto reopen_fail;
+        }
+        crawl_bin_catalog_free(&cat);
+
+        if (ftruncate(fileno(state->fp), (off_t)co) != 0) goto reopen_fail;
+
+        fh.catalog_offset = 0ULL;
+        if (fseeko(state->fp, 0, SEEK_SET) != 0) goto reopen_fail;
+        if (ecrawl_io_fwrite(&fh, sizeof(fh), 1, state->fp) != 1) goto reopen_fail;
+        if (ecrawl_io_fflush(state->fp) != 0) goto reopen_fail;
+        if (fseeko(state->fp, 0, SEEK_END) != 0) goto reopen_fail;
+        if ((uint64_t)ftello(state->fp) != co) {
+            errno = EINVAL;
+            goto reopen_fail;
+        }
+
+        state->bytes_written = co;
+        if (shard_ckpt_load_for_append(state, path, co) != 0) {
             int saved_errno = errno ? errno : EINVAL;
-            counted_fclose(state->fp);
+            ecrawl_io_fclose(state->fp);
             state->fp = NULL;
+            shard_cat_destroy(&state->cat);
             errno = saved_errno;
             return -1;
         }
     }
     return 0;
+
+reopen_fail:
+    {
+        int saved_errno = errno ? errno : EINVAL;
+        ecrawl_io_fclose(state->fp);
+        state->fp = NULL;
+        shard_cat_destroy(&state->cat);
+        errno = saved_errno;
+        return -1;
+    }
 }
 
 static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_index, uint32_t shard,
@@ -3394,7 +4066,7 @@ static int writer_acquire_shard(shard_file_state_t *shards, uint32_t writer_inde
 
     if (build_shard_path(shard, path, sizeof(path)) != 0) return -1;
 
-    if (state->bytes_written != 0 && counted_stat(path, &st) != 0) return -1;
+    if (state->bytes_written != 0 && ecrawl_io_stat(path, &st) != 0) return -1;
 
     if (*open_count >= max_open_shards)
         writer_close_lru_shard(shards, writer_index, uid_shards, open_count);
@@ -3523,7 +4195,68 @@ static int writer_process_batch(uint32_t writer_index,
 
         {
             shard_file_state_t *st = &shards[frame.shard];
+            unsigned char *payload = batch->data + off;
+            bin_record_hdr_t wire;
+            bin_record_hdr_t disk;
+            size_t wire_len = (size_t)frame.data_len;
+            size_t disk_len;
             uint64_t rec_start = st->bytes_written;
+            const char *base = NULL;
+            size_t base_len = 0;
+
+            if (wire_len < sizeof(wire)) {
+                errno = EINVAL;
+                return -1;
+            }
+            memcpy(&wire, payload, sizeof(wire));
+
+            if (wire.parent_dir_id == 0ULL) {
+                char path_z[PATH_MAX];
+                char parent[PATH_MAX];
+                uint64_t pid;
+
+                if (wire.name_len == 0 || wire_len != sizeof(wire) + (size_t)wire.name_len) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                if ((size_t)wire.name_len + 1ULL >= sizeof(path_z)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                memcpy(path_z, payload + sizeof(wire), wire.name_len);
+                path_z[wire.name_len] = '\0';
+
+                if (split_parent_basename(path_z, parent, sizeof(parent), &base, &base_len) != 0) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                if (base_len > (size_t)UINT16_MAX) {
+                    errno = EINVAL;
+                    return -1;
+                }
+
+                pid = shard_cat_ensure_dir(&st->cat, parent);
+                if (pid == 0ULL) {
+                    if (errno == 0) errno = EINVAL;
+                    return -1;
+                }
+
+                disk = wire;
+                disk.parent_dir_id = pid;
+                disk.name_len = (uint16_t)base_len;
+                disk_len = sizeof(disk) + disk.name_len;
+            } else {
+                if (wire_len != crawl_bin_record_total_bytes(&wire)) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                disk = wire;
+                disk_len = wire_len;
+            }
+
+            /* Update per-dir catalog aggregates (immediate-child rollup) using
+             * the byte_credit computed once during the crawl. */
+            shard_cat_update_imm_child_rollup(&st->cat, disk.parent_dir_id, frame.byte_credit, &disk);
 
             if (rec_start - st->seg_start_byte >= CRAWL_CKPT_STRIDE_BYTES) {
                 if (shard_ckpt_push(st, rec_start) != 0) {
@@ -3532,10 +4265,15 @@ static int writer_process_batch(uint32_t writer_index,
                 }
                 st->seg_start_byte = rec_start;
             }
+            if (ecrawl_io_fwrite(&disk, sizeof(disk), 1, fp) != 1) return -1;
+            if (disk.name_len > 0U) {
+                const unsigned char *nm = payload + sizeof(wire);
+                if (wire.parent_dir_id == 0ULL) nm = (const unsigned char *)base;
+                if (ecrawl_io_fwrite(nm, 1, disk.name_len, fp) != disk.name_len) return -1;
+            }
+            st->bytes_written += disk_len;
         }
 
-        if (counted_fwrite(batch->data + off, 1, frame.data_len, fp) != frame.data_len) return -1;
-        shards[frame.shard].bytes_written += frame.data_len;
         shards[frame.shard].last_used = ++(*tick);
         off += frame.data_len;
     }
@@ -3575,12 +4313,13 @@ static void *writer_thread_main(void *arg_void) {
             if (shards[i].fp) {
                 char path[PATH_MAX];
                 if (build_shard_path(i, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(&shards[i], path);
-                counted_fclose(shards[i].fp);
+                ecrawl_io_fclose(shards[i].fp);
                 shards[i].fp = NULL;
             }
         }
     }
     free(shards);
+    tls_flush_thread_batch_counters();
     return NULL;
 }
 
@@ -3592,7 +4331,7 @@ static int enqueue_root_task(const char *path, shared_state_t *shared, task_queu
 
     dir_stack_init(&task);
     memset(&st, 0, sizeof(st));
-    if (counted_lstat(path, &st) != 0) {
+    if (ecrawl_io_lstat(path, &st) != 0) {
         fprintf(stderr, "ERROR main lstat %s: %s\n", path, strerror(errno));
         stats_add_error(shared);
         return -1;
@@ -3635,7 +4374,7 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     time_t end_wall = time(NULL);
 
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", g_output_dir) >= (int)sizeof(manifest_path)) return -1;
-    fp = counted_fopen(manifest_path, "w");
+    fp = ecrawl_io_fopen(manifest_path, "w");
     if (!fp) return -1;
 
     fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
@@ -3655,7 +4394,7 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     fprintf(fp, "crawl_started_epoch=%lld\n", (long long)g_crawl_wall_clock_start);
     fprintf(fp, "crawl_finished_epoch=%lld\n", (long long)end_wall);
     fprintf(fp, "crawl_elapsed_sec=%.3f\n", elapsed_sec);
-    counted_fclose(fp);
+    ecrawl_io_fclose(fp);
     return 0;
 }
 
@@ -3951,6 +4690,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    ecrawl_install_verbose_profile();
+
     if (path_resolve_existing(positionals[0], g_start_path_canon, "ecrawl: start-path ") != 0) return 2;
     start_path = g_start_path_canon;
     if (init_record_path_prefix(start_path) != 0) {
@@ -4075,6 +4816,7 @@ int main(int argc, char **argv) {
         atomic_store(&g_bucket_entries[i], 0);
         atomic_store(&g_bucket_files[i], 0);
         atomic_store(&g_bucket_dirs[i], 0);
+        atomic_store(&g_bucket_stat_meta[i], 0);
     }
     atomic_store(&g_total_entries, 0);
     atomic_store(&g_total_files, 0);
@@ -4083,6 +4825,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_window_entries, 0);
     atomic_store(&g_window_files, 0);
     atomic_store(&g_window_dirs, 0);
+    atomic_store(&g_window_stat_meta, 0);
     atomic_store(&g_bucket_index, 0);
     atomic_store(&g_stop_stats, 0);
     atomic_store(&g_seconds_seen, 0);
@@ -4099,6 +4842,7 @@ int main(int argc, char **argv) {
     g_progress_prev_tot_entries = 0;
     g_progress_prev_readdir = 0;
     g_progress_prev_lstat = 0;
+    g_progress_prev_stat = 0;
     atomic_store(&g_queue_depth, 0);
     atomic_store(&g_active_workers, 0);
     atomic_store(&g_main_done, 0);
@@ -4139,14 +4883,20 @@ int main(int argc, char **argv) {
         const char *plog = getenv("ECRAWL_PROGRESS_LOG");
 
         if (plog && *plog) {
-            g_progress_log_fp = fopen(plog, "a");
-            if (!g_progress_log_fp) {
-                fprintf(stderr, "WARNING: cannot open ECRAWL_PROGRESS_LOG %s: %s\n", plog, strerror(errno));
+            if (!g_verbose) {
+                fprintf(stderr,
+                        "WARNING: ECRAWL_PROGRESS_LOG is set but ignored without --verbose; "
+                        "progress CSV is written only when verbose diagnostics are enabled.\n");
             } else {
-                setvbuf(g_progress_log_fp, NULL, _IOLBF, 0);
-                g_progress_log_header_written = 0;
-                if (!g_progress_log_atexit_registered && atexit(progress_log_close) == 0)
-                    g_progress_log_atexit_registered = 1;
+                g_progress_log_fp = fopen(plog, "a");
+                if (!g_progress_log_fp) {
+                    fprintf(stderr, "WARNING: cannot open ECRAWL_PROGRESS_LOG %s: %s\n", plog, strerror(errno));
+                } else {
+                    setvbuf(g_progress_log_fp, NULL, _IOLBF, 0);
+                    g_progress_log_header_written = 0;
+                    if (!g_progress_log_atexit_registered && atexit(progress_log_close) == 0)
+                        g_progress_log_atexit_registered = 1;
+                }
             }
         }
     }
@@ -4155,11 +4905,17 @@ int main(int argc, char **argv) {
         const char *dlog = getenv("ECRAWL_DEBUG_LOG");
 
         if (dlog && *dlog) {
-            g_debug_log_path = strdup(dlog);
-            if (!g_debug_log_path) {
-                fprintf(stderr, "WARNING: ECRAWL_DEBUG_LOG strdup failed\n");
-            } else if (!g_debug_log_atexit_registered && atexit(debug_dir_children_shutdown) == 0)
-                g_debug_log_atexit_registered = 1;
+            if (!g_verbose) {
+                fprintf(stderr,
+                        "WARNING: ECRAWL_DEBUG_LOG is set but ignored without --verbose; "
+                        "megadir CSV is written only when verbose diagnostics are enabled.\n");
+            } else {
+                g_debug_log_path = strdup(dlog);
+                if (!g_debug_log_path) {
+                    fprintf(stderr, "WARNING: ECRAWL_DEBUG_LOG strdup failed\n");
+                } else if (!g_debug_log_atexit_registered && atexit(debug_dir_children_shutdown) == 0)
+                    g_debug_log_atexit_registered = 1;
+            }
         }
     }
 
@@ -4361,6 +5117,7 @@ int main(int argc, char **argv) {
     }
 
     enqueue_root_task(start_path, &shared, &queue);
+    tls_qdepth_flush();
 
     atomic_store(&g_main_done, 1);
     pthread_mutex_lock(&queue.mutex);

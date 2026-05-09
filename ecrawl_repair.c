@@ -18,7 +18,7 @@
  * Other corrupt uid_shard_*.bin shards are renamed into <crawl-dir>/corrupt_shards/ (and matching
  * .bin.ckpt sidecars when present). Dry-run does not truncate, move, or write.
  *
- * If the 16-byte file header magic/version is not the current v3 (or known ERCBIN02 v2), we still run a full
+ * If the 16-byte file header magic/version is not the current v4 (or known ERCBIN02 v2), we still run a full
  * record-structure scan. When that scan succeeds, the header is rewritten to ERCBIN03 / v3 before writing .ckpt
  * (same reserved field as read from disk). If the header is wrong and the scan fails, the shard is quarantined.
  *
@@ -226,6 +226,7 @@ static int rewrite_shard_header_to_current(const char *path, const bin_file_head
     memcpy(nh.magic, CRAWL_BIN_MAGIC, (size_t)CRAWL_BIN_MAGIC_LEN);
     nh.version = FORMAT_VERSION;
     nh.reserved = old_hdr->reserved;
+    nh.catalog_offset = old_hdr->catalog_offset;
     if (fseeko(fp, (off_t)0, SEEK_SET) != 0 || fwrite(&nh, sizeof(nh), 1, fp) != 1 || fflush(fp) != 0) {
         int e = errno ? errno : EIO;
         fclose(fp);
@@ -252,6 +253,7 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     size_t n, cap;
     uint64_t seg0;
     uint64_t last_good_exclusive;
+    uint64_t scan_end;
     off_t pos;
 
     *offs_out = NULL;
@@ -275,13 +277,31 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     seg0 = sizeof(bin_file_header_t);
     last_good_exclusive = sizeof(bin_file_header_t);
 
+    {
+        bin_file_header_t fh0;
+
+        rewind(fp);
+        if (fread(&fh0, sizeof(fh0), 1, fp) != 1) {
+            if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+            goto corrupt;
+        }
+        scan_end = file_sz;
+        if (fh0.catalog_offset != 0ULL) {
+            if (fh0.catalog_offset < sizeof(fh0) || fh0.catalog_offset > file_sz) {
+                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+                goto corrupt;
+            }
+            scan_end = fh0.catalog_offset;
+        }
+    }
+
     if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) {
         if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
         goto corrupt;
     }
     pos = (off_t)sizeof(bin_file_header_t);
 
-    while ((uint64_t)pos < file_sz) {
+    while ((uint64_t)pos < scan_end) {
         uint64_t rec_start = (uint64_t)pos;
         bin_record_hdr_t rh;
 
@@ -305,12 +325,12 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }
-        if (rh.path_len) {
-            if ((uint64_t)pos + rh.path_len > file_sz) {
+        if (rh.name_len) {
+            if ((uint64_t)pos + rh.name_len > scan_end) {
                 if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
                 goto corrupt;
             }
-            if (fseeko(fp, (off_t)rh.path_len, SEEK_CUR) != 0) {
+            if (fseeko(fp, (off_t)rh.name_len, SEEK_CUR) != 0) {
                 if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
                 goto corrupt;
             }
@@ -322,14 +342,14 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
         }
         last_good_exclusive = (uint64_t)pos;
     }
-    if ((uint64_t)pos != file_sz) {
+    if ((uint64_t)pos != scan_end) {
         fprintf(stderr, "%s: scan did not consume whole file (corrupt or wrong format?)\n", bin_path);
         errno = EINVAL;
         if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
         goto corrupt;
     }
     fclose(fp);
-    if (salvage_exclusive_end_out) *salvage_exclusive_end_out = file_sz;
+    if (salvage_exclusive_end_out) *salvage_exclusive_end_out = scan_end;
     *offs_out = buf;
     *n_out = n;
     return 0;
@@ -392,8 +412,24 @@ static int sidecar_ok_for_ereport(const char *bin_path, uint64_t file_sz) {
     char ckpath[PATH_MAX];
     crawl_ckpt_file_hdr_t ch;
     FILE *fp;
+    FILE *bfp;
+    bin_file_header_t fh;
+    uint64_t record_end = file_sz;
     uint64_t *buf = NULL;
     size_t i;
+
+    bfp = fopen(bin_path, "rb");
+    if (!bfp) return -1;
+    if (fread(&fh, sizeof(fh), 1, bfp) != 1) {
+        fclose(bfp);
+        return -1;
+    }
+    fclose(bfp);
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) return -1;
+    if (fh.catalog_offset != 0ULL) {
+        if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset > file_sz) return -1;
+        record_end = fh.catalog_offset;
+    }
 
     if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
     fp = fopen(ckpath, "rb");
@@ -421,7 +457,7 @@ static int sidecar_ok_for_ereport(const char *bin_path, uint64_t file_sz) {
         return -1;
     }
     for (i = 1; i < (size_t)ch.num_offsets; i++) {
-        if (buf[i] <= buf[i - 1] || buf[i] > file_sz) {
+        if (buf[i] <= buf[i - 1] || buf[i] >= record_end) {
             free(buf);
             return -1;
         }

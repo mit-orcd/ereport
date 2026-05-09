@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Pretty-print ecrawl_progress.csv (ECRAWL_PROGRESS_LOG): rolling ops_rate vs per-second deltas.
+# Pretty-print ecrawl_progress.csv (ECRAWL_PROGRESS_LOG with ecrawl --verbose).
+# Matches live TTY naming: stat/s(10s) ≈ stat_meta_rate, obj/s(10s) ≈ ops_rate (rolling ~10s).
 #
 # Usage:
 #   ./parse-ecrawl-progress.sh ecrawl_progress.csv
@@ -12,9 +13,12 @@
 #   watch -n 1 ./parse-ecrawl-progress.sh --last /path/to/ecrawl_progress.csv
 #   watch -n 1 ./parse-ecrawl-progress.sh --deep --last /path/to/ecrawl_progress.csv
 #
-# Columns from ecrawl (see ecrawl.c): ops_rate = rolling window_entries / seconds_seen (~10s window).
-# delta_total_entries is global total_entries gain over the previous 1s sample (often closer to "work/sec").
-# wait_* columns are lifetime counters; --deep prints per-interval deltas (approx /s when CSV is 1 Hz).
+# Columns from ecrawl (see ecrawl.c):
+#   stat_meta_rate — rolling window_stat_meta / seconds_seen (~10s): stat(2)+lstat(2)+fstatat(...) / sec avg.
+#   ops_rate — rolling window_entries / seconds_seen (~10s): accounted objects / sec (dirs/files/symlinks/other).
+#   delta_total_entries — global total_entries gain over the previous 1s sample (often closer to instant work/sec).
+#   wait_* columns are lifetime counters; --deep prints per-interval deltas (approx /s when CSV is 1 Hz).
+# Older CSVs without stat_meta_rate show "-" in the stat/s column.
 
 set -euo pipefail
 
@@ -26,27 +30,34 @@ NR == 1 {
     gsub(/\r/, "", $i)
     col[$i] = i
   }
+  has_sm = (col["stat_meta_rate"] != "")
   next
 }
 {
   if (!hdr) {
-    printf "%-12s %16s %18s %14s %12s %12s\n",
-      "elapsed_sec", "ops_rate(10s)", "delta_entries/s", "window_ent", "q_depth", "wq_depth"
+    printf "%-12s %16s %16s %18s %14s %12s %12s\n",
+      "elapsed_sec", "stat/s(10s)", "obj/s(10s)", "delta_entries/s", "window_ent", "q_depth", "wq_depth"
     hdr = 1
   }
   es = $(col["elapsed_sec"])
-  opr = $(col["ops_rate"])
+  obj = $(col["ops_rate"])
   dt = $(col["delta_total_entries"])
   we = $(col["window_entries"])
   qd = $(col["queue_depth"])
   wq = $(col["writer_queue_depth"])
   gsub(/\r/, "", es)
-  gsub(/\r/, "", opr)
+  gsub(/\r/, "", obj)
   gsub(/\r/, "", dt)
   gsub(/\r/, "", we)
   gsub(/\r/, "", qd)
   gsub(/\r/, "", wq)
-  printf "%-12s %16s %18s %14s %12s %12s\n", es, opr, dt, we, qd, wq
+  if (has_sm) {
+    st = $(col["stat_meta_rate"])
+    gsub(/\r/, "", st)
+  } else {
+    st = "-"
+  }
+  printf "%-12s %16s %16s %18s %14s %12s %12s\n", es, st, obj, dt, we, qd, wq
 }
 ' "$@"
 }
@@ -66,18 +77,25 @@ NR == 1 {
     gsub(/\r/, "", $i)
     col[$i] = i
   }
+  has_sm = (col["stat_meta_rate"] != "")
   next
 }
 {
   if (!hdr) {
-    printf "%-12s %16s %18s %12s %12s %10s %10s %10s %10s %10s %14s %12s %12s\n",
-      "elapsed_sec", "ops_rate(10s)", "delta_ent/s", "q_depth", "wq_depth",
+    printf "%-12s %16s %16s %18s %12s %12s %10s %10s %10s %10s %10s %14s %12s %12s\n",
+      "elapsed_sec", "stat/s(10s)", "obj/s(10s)", "delta_ent/s", "q_depth", "wq_depth",
       "d_st_enq", "d_st_pop", "d_crawl_q", "d_sb_enq", "d_sb_done",
       "window_dirs", "d_readdir", "d_lstat"
     hdr = 1
   }
   es = $(col["elapsed_sec"]); gsub(/\r/, "", es)
-  opr = $(col["ops_rate"]); gsub(/\r/, "", opr)
+  obj = $(col["ops_rate"]); gsub(/\r/, "", obj)
+  if (has_sm) {
+    st = $(col["stat_meta_rate"])
+    gsub(/\r/, "", st)
+  } else {
+    st = "-"
+  }
   dt   = val($0, "delta_total_entries")
   qd   = val($0, "queue_depth")
   wq   = val($0, "writer_queue_depth")
@@ -102,8 +120,8 @@ NR == 1 {
   }
   pwse = wse; pwsp = wsp; pwcr = wcr; psben = sben; psbdo = sbdo
 
-  printf "%-12s %16s %18s %12s %12s %10s %10s %10s %10s %10s %14s %12s %12s\n",
-    es, opr, dt, qd, wq, dwse, dwsp, dwcr, dsben, dsbdo, wdi, drd, dls
+  printf "%-12s %16s %16s %18s %12s %12s %10s %10s %10s %10s %10s %14s %12s %12s\n",
+    es, st, obj, dt, qd, wq, dwse, dwsp, dwcr, dsben, dsbdo, wdi, drd, dls
 }
 ' "$@"
 }

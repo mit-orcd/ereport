@@ -61,11 +61,14 @@ jemalloc-note:
 path_utils.o: path_utils.c path_utils.h
 	$(CC) $(CFLAGS) -c path_utils.c -o path_utils.o
 
+crawl_bin_catalog.o: crawl_bin_catalog.c crawl_bin_catalog.h crawl_bin_format.h
+	$(CC) $(CFLAGS) -c crawl_bin_catalog.c -o crawl_bin_catalog.o
+
 crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
 
-ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl.c path_utils.o $(JEMALLOC_LIBS)
+ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
@@ -73,14 +76,14 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
-ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o $(JEMALLOC_LIBS)
+ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
 
-ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o $(JEMALLOC_LIBS)
+ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
 
-ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o $(JEMALLOC_LIBS)
+ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
@@ -113,7 +116,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static *.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static *.o crawl_bin_catalog.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
