@@ -1141,8 +1141,39 @@ static void die_usage(const char *argv0) {
             "    EREPORT_INDEX_TRIGRAM_THREADS, max 16384 unless set; range 512…262144)\n"
             "    bounded queue from paths writer to trigram workers; EREPORT_INDEX_WRITE_BATCH_PATHS (default 4096,\n"
             "    512…65536) paths per batch to the writer. Also EREPORT_INDEX_WRITEQ_MAX_BATCHES, EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS.\n"
-            "    Large --make: run `ulimit -n 65535` (or higher) first — see README.\n");
+            "    Large --make: run `ulimit -n 65535` (or higher) first. \"File size limit exceeded\" / SIGXFSZ is\n"
+            "    RLIMIT_FSIZE: use `ulimit -f unlimited` — bash `ulimit -f N` is kilobytes (N×1024 bytes), not like -n.\n"
+            "    See README.\n");
     exit(2);
+}
+
+/* Below this soft RLIMIT_FSIZE, --make / resume-merge are likely to hit SIGXFSZ on real corpora; warn once. */
+#define EREPORT_INDEX_WARN_FSIZE_BELOW_BYTES (64ULL * 1024ULL * 1024ULL * 1024ULL)
+
+static void warn_rlimit_fsize_if_capped_for_index_io(void) {
+    struct rlimit lim;
+    uint64_t cap;
+    double gib, mib;
+
+    if (getrlimit(RLIMIT_FSIZE, &lim) != 0) return;
+    if (lim.rlim_cur == RLIM_INFINITY) return;
+    if (lim.rlim_cur == 0) return;
+    cap = (uint64_t)lim.rlim_cur;
+    if (cap >= EREPORT_INDEX_WARN_FSIZE_BELOW_BYTES) return;
+
+    gib = (double)cap / (double)(1024ULL * 1024ULL * 1024ULL);
+    mib = (double)cap / (double)(1024ULL * 1024ULL);
+    fprintf(stderr,
+            "ereport_index: warning: soft file-size cap (RLIMIT_FSIZE / `ulimit -f`) is %" PRIu64 " bytes",
+            cap);
+    if (gib >= 1.0)
+        fprintf(stderr, " (~%.1f GiB)", gib);
+    else
+        fprintf(stderr, " (~%.0f MiB)", mib);
+    fprintf(stderr,
+            ", not unlimited; large --make can abort with SIGXFSZ. Use `ulimit -f unlimited`. "
+            "In bash, `ulimit -f N` is kilobytes (N×1024 bytes), unlike `ulimit -n`; e.g. 200000 ≈ 195 MiB. "
+            "See README.\n");
 }
 
 static int has_bin_suffix(const char *name) {
@@ -3368,6 +3399,7 @@ static int resume_merge_index_dir(const char *index_dir) {
 
     memset(&ctx, 0, sizeof(ctx));
     atomic_init(&ctx.merge_bucket_ram_peak, 0);
+    warn_rlimit_fsize_if_capped_for_index_io();
     if (path_resolve_existing(index_dir, ctx.index_dir, "ereport_index: ") != 0) return 1;
     if (build_path(paths_p, sizeof(paths_p), ctx.index_dir, "paths.bin") != 0 ||
         build_path(off_p, sizeof(off_p), ctx.index_dir, "path_offsets.bin") != 0) {
@@ -3662,6 +3694,8 @@ static int build_index_dir(const char *user_spec,
     write_queue.run_stats = &run_stats;
     trigram_queue.run_stats = &run_stats;
     memset(&paths_writer_arg, 0, sizeof(paths_writer_arg));
+
+    warn_rlimit_fsize_if_capped_for_index_io();
 
     g_write_batch_paths_base = parse_write_batch_paths();
 

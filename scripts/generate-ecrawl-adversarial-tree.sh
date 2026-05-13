@@ -144,7 +144,7 @@
 #                                   # "0,8,0,15,0,0" nudges mtimes within the same ereport age buckets for broader spread.
 #
 # Heat-map row totals, column totals, and grand corner call the same emit_heat_map_badges() as inner cells (ereport.c):
-#   C-led share ≥ --heat-ctime-led-min-share (default 30%) on slice bytes; Deep share ≥30% of slice bytes from paths with ≥12 '/'
+#   C-led share ≥ EREPORT_HEAT_CTIME_LED_MIN_SHARE (default 30%) on slice bytes; Deep share ≥30% of slice bytes from paths with ≥12 '/'
 #   (and ≥20 files in slice); Dense when max immediate-child count among parents that contribute files to that slice is ≥8192.
 #   Row/col badges aggregate shape_deep_bytes and merged dense-parent maps across that row/column; grand corner merges the whole heat map,
 #   so one crawl-wide megadir (classic single_huge_dir) forces Dense on the corner even when inner cells are sharded.
@@ -182,13 +182,13 @@
 # Time basis (ereport CLI: mtime | atime | ctime | effective):
 #   Fixtures call utime(path, (atime, mtime)) with paired values. On Linux that stamp updates ctime to ~now, so ctime ≫ max(a,m)
 #   and ereport marks most bytes as C-led (≥180d newer). That is expected — not a crawl bug. To quiet purple badges in HTML:
-#   ./ereport --heat-ctime-led-min-share 0.45 …   # or EREPORT_HEAT_CTIME_LED_MIN_SHARE=0.45
+#   EREPORT_HEAT_CTIME_LED_MIN_SHARE=0.45 ./ereport …
 #   — mtime or atime basis: age buckets follow the stamped times (spread across ~5 years via grid + multi-age lanes).
 #   — effective basis: max(a,m,c) is usually dominated by new ctime → most files land in the youngest age column; use mtime/atime
 #     to exercise the heat map and badge drills.
 #
 # Recommended HTML emit (mtime basis, bucket drill-down):
-#   ./ereport --bucket-details 1 --heat-ctime-led-min-share 0.45 <uid|name> mtime '$ROOT'
+#   EREPORT_HEAT_CTIME_LED_MIN_SHARE=0.45 ./ereport --bucket-details 1 <uid|name> mtime '$ROOT'
 #
 # Example stress (still under default budget if ASSUMED_BYTES_PER_FLAT_FILE=4096):
 #   FLAT_FILES=12000000 DEPTH_CHAIN=700 ./scripts/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl_adv
@@ -1939,7 +1939,7 @@ if deep_only_n > 0:
         file=sys.stderr,
     )
 PY
-  echo "ereport hint: Linux updates ctime when utime() sets atime/mtime — broad C-led in HTML is normal for these fixtures; use ./ereport --heat-ctime-led-min-share … or EREPORT_HEAT_CTIME_LED_MIN_SHARE to require a larger share before showing the purple badge." >&2
+  echo "ereport hint: Linux updates ctime when utime() sets atime/mtime — broad C-led in HTML is normal for these fixtures; set EREPORT_HEAT_CTIME_LED_MIN_SHARE to require a larger share before showing the purple badge." >&2
 fi
 
 if [[ "${BADGE_MARGIN_DILUTION_ENABLE:-0}" == "1" ]]; then
@@ -2192,8 +2192,8 @@ Dry-run ecrawl (no write):
   ecrawl --no-write '$ROOT'
 
 Heat-map drill data in ereport (crawl shards + HTML emit):
-  ./ereport --bucket-details 1 --heat-ctime-led-min-share 0.45 <uid|name> mtime '$ROOT'
-  Prefer mtime or atime: fixtures pair atime=mtime for age spread. On Linux, utime() refreshes ctime → most stamped bytes look C-led vs (a,m); raise --heat-ctime-led-min-share if purple badges dominate.
+  EREPORT_HEAT_CTIME_LED_MIN_SHARE=0.45 ./ereport --bucket-details 1 <uid|name> mtime '$ROOT'
+  Prefer mtime or atime: fixtures pair atime=mtime for age spread. On Linux, utime() refreshes ctime → most stamped bytes look C-led vs (a,m); raise EREPORT_HEAT_CTIME_LED_MIN_SHARE if purple badges dominate.
   effective basis collapses most ages to “young” because ctime dominates max(a,m,c).
   Expect Skew under skew_cell/ (+ optional skew_cell_b/): megadir+d deep same slice; heatmap uses subdirs so inner cells are not all Dense; dense_multi_age is sharded (no megadir Dense). **dense_flat_cell/** (default ab05×sb01) is an unsharded shallow megadir — heatmap skips that cell when BADGE_HEATMAP_SKIP_DENSE_FLAT_CELL=1 so Deep-prefix noise does not swallow the amber **Dense-only** slice; skew stays on younger rows.
   **dense_flat_cell_BS/** (BADGE_DENSE_FLAT_EXTRA_PAIRS, default 4 extra slices) drops similar unsharded shallow megadirs in age×size cells outside the skew/deep_only rows; heatmap skips them when BADGE_HEATMAP_SKIP_DENSE_FLAT_EXTRA_CELLS=1 so each lands as a clean Dense-only band on the aggregate heat map.

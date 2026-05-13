@@ -16,7 +16,7 @@ The current toolchain is:
 
 ### Contents
 
-- [Build](#build) · [Testing](#testing) · [Synthetic adversarial trees](#synthetic-adversarial-trees) · [systemd](#systemd-daily-ecrawl-and-binary-sync) · [Why this is fast](#why-this-is-fast) · [Crawl shard binary format](#crawl-shard-binary-format) · [What The Tools Do](#what-the-tools-do) · [Typical Workflow](#typical-workflow) · [Validation / tests](#validation-helpers) · [Output semantics](#output-semantics) · [Environment variables](#environment-variables-quick-reference) · [Source layout](#source-layout) · [License](#license)
+- [Build](#build) · [Testing](#testing) · [Synthetic adversarial trees](#synthetic-adversarial-trees) · [systemd](#systemd-daily-ecrawl-and-binary-sync) · [Why this is fast](#why-this-is-fast) · [Crawl shard binary format](#crawl-shard-binary-format) · [What The Tools Do](#what-the-tools-do) · [Sample HTML fixtures](#sample-html-fixtures-and-screenshots) · [Typical Workflow](#typical-workflow) · [Validation / tests](#validation-helpers) · [Output semantics](#output-semantics) · [Environment variables](#environment-variables-quick-reference) · [Source layout](#source-layout) · [License](#license)
 
 ## Default thread counts (per binary)
 
@@ -439,6 +439,21 @@ Runtime behavior:
 
 Interactive search in `index.html` requires **`ereport_index --make`** (see below), **`eserve`** running with **`ereport_index`** available, and opening the report **over HTTP** (browser `fetch` does not work reliably from `file://`).
 
+### Sample HTML fixtures and screenshots
+
+The checked-in **`all_users/`** tree is a static report generated from a **synthetic** adversarial layout (with **`--bucket-details`**), kept in the repo so you can browse the UI without running a crawl. File paths inside those HTML files use placeholders such as **`demo-volume/example-user/…`** instead of real home directories, volume names, or host-specific prefixes.
+
+- **`all_users/index.html`** — aggregate heat map, search box (needs HTTP + index for live search), and corpus-wide statistics for **all UIDs** in the crawl.
+- **`all_users/bucket_aX_sY.html`** — **Bucket details** for one age×size cell: header metadata, optional **Dense** / **Deep** / **Skew** badges, and directory rollup tables when drill-down was enabled at generation time.
+
+Open the HTML directly in a browser, or serve the tree with **`eserve.py`** / **`make serve`** as described below.
+
+The images below are **illustrative mockups** of the layout (fonts and spacing may differ slightly from the real CSS). For pixel-accurate rendering, use the fixture files above.
+
+![All-users index (heat map and search)](docs/images/ereport-all-users-index.png)
+
+![Bucket details page (per age×size cell)](docs/images/ereport-bucket-details.png)
+
 ### `ereport_index`
 
 `ereport_index` builds and searches an on-disk trigram index over crawl path strings—either for **one resolved Unix user** or for **every UID** when **no user** is selected (see **`--make`** disambiguation below; same idea as `ereport` all-users mode: all uid-shard files, no UID filter on records).
@@ -507,6 +522,12 @@ ulimit -n 65535
 ```
 
 (**65535** or higher.) If **`Too many open files`** persists, raise **`ulimit -n`** further, lower **`EREPORT_INDEX_THREADS`**, or set **`EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`** lower. If **`ulimit -n`** cannot go high enough, raise the **hard** limit (often **`/etc/security/limits.conf`** or **`systemd`** **`LimitNOFILE=`**) and open a new shell.
+
+**File size (`ulimit -f`)** — If **`--make`** dies with **`File size limit exceeded`** / core dump from **`SIGXFSZ`**, the process hit **`RLIMIT_FSIZE`**: the max size of **any single file** this process may grow (not open-file count, and not “free disk”). Use **`ulimit -f unlimited`** before large **`--make`** runs unless you deliberately cap output size.
+
+**Do not mirror `ulimit -n` onto `-f`.** In **bash** on Linux, the number after **`ulimit -f`** is **kilobytes** (each unit is **1024 bytes**). So **`ulimit -f 200000`** is only about **200000 × 1024 ≈ 195 MiB** per file — **`paths.bin`** alone exceeds that quickly at ~1M paths. **`ulimit -n 200000`** raises the descriptor count; it does not remove a file-size cap.
+
+Check the effective limit with **`ulimit -f`** / **`ulimit -a`** (or **`prlimit`**). **`ereport_index`** also prints a one-line **stderr** warning at **`--make`** / **`--resume-merge`** start when the soft limit is finite and below **64 GiB**.
 
 JSON search output is one UTF-8 JSON object per line (fields mirror **`ereport_index --help`**):
 

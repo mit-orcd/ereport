@@ -13,14 +13,13 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--heat-ctime-led-min-share F] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--heat-ctime-led-min-share F] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
- *     --heat-ctime-led-min-share F (optional): purple C-led badge/pill only when C-led bytes are ≥ F of slice (0<F≤1;
- *     default 0.30). Override env EREPORT_HEAT_CTIME_LED_MIN_SHARE; CLI wins when both are set.
+ *     Purple C-led heat-map badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).
  *     Flags must appear first (in any order), before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
  * Parallel thread count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
@@ -2685,7 +2684,7 @@ static void emit_path_summary_table(FILE *out,
                          sizeof(clin_title),
                          "This directory within the open bucket: C-led %% = fraction of bytes where ctime is at least "
                          "180 days newer than both atime and mtime (Linux inode/metadata vs reads or content edits). "
-                         "Purple pill when >= %.0f%% (same as heat map; --heat-ctime-led-min-share).",
+                         "Purple pill when >= %.0f%% (same as heat map; EREPORT_HEAT_CTIME_LED_MIN_SHARE).",
                          g_ctime_led_badge_min_share_frac * 100.0);
                 fprintf(out,
                         "<td class=\"r num\" style=\"background:%s\" data-sort-n=\"%" PRIu64 "\">%s</td>"
@@ -5316,7 +5315,7 @@ static void emit_heat_map_badges(FILE *out,
         snprintf(tbuf,
                  sizeof(tbuf),
                  "%s — %s basis. C-led: %.0f%% of bytes (ctime ≥180d newer than both atime and mtime). "
-                 "Badge if ≥%.0f%% (Heat: --heat-ctime-led-min-share / EREPORT_HEAT_CTIME_LED_MIN_SHARE).",
+                 "Badge if ≥%.0f%% (Heat: EREPORT_HEAT_CTIME_LED_MIN_SHARE).",
                  bucket_scope,
                  basis_str,
                  cl_pct,
@@ -6221,11 +6220,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--heat-ctime-led-min-share F] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--heat-ctime-led-min-share F] "
+                "       %s [--bucket-details N] [--report-dir DIR] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -6236,8 +6235,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Optional --report-dir DIR: write reports under DIR/(user or all_users)/; omit for current directory.\n");
         fprintf(stderr,
-                "Optional --heat-ctime-led-min-share F (0<F≤1): min fraction of bytes for purple C-led badges/pills "
-                "(default 0.30; env EREPORT_HEAT_CTIME_LED_MIN_SHARE).\n");
+                "C-led badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).\n");
         fprintf(stderr, "Flags must appear first (any order). Thread count: EREPORT_THREADS (default %d).\n",
                 DEFAULT_THREADS);
         return 2;
@@ -6246,7 +6244,6 @@ int main(int argc, char **argv) {
     {
         int ac = argc;
         char **av = argv;
-        int heat_ctime_led_share_opt = 0;
 
         for (;;) {
             if (ac > 1 && strcmp(av[1], "--bucket-details") == 0) {
@@ -6298,31 +6295,6 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "ereport: --report-dir path is invalid\n");
                     return 2;
                 }
-                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
-                ac -= 2;
-                argc = ac;
-                continue;
-            }
-            if (ac > 1 && strcmp(av[1], "--heat-ctime-led-min-share") == 0) {
-                char *end;
-                double v;
-
-                if (heat_ctime_led_share_opt) {
-                    fprintf(stderr, "ereport: duplicate --heat-ctime-led-min-share\n");
-                    return 2;
-                }
-                if (ac < 3) {
-                    fprintf(stderr, "ereport: --heat-ctime-led-min-share requires a float in (0,1]\n");
-                    return 2;
-                }
-                errno = 0;
-                v = strtod(av[2], &end);
-                if (errno || end == av[2] || (end && *end) || v <= 0.0 || v > 1.0) {
-                    fprintf(stderr, "ereport: --heat-ctime-led-min-share must be a float in (0,1]\n");
-                    return 2;
-                }
-                g_ctime_led_badge_min_share_frac = v;
-                heat_ctime_led_share_opt = 1;
                 memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
                 ac -= 2;
                 argc = ac;
