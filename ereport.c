@@ -92,12 +92,15 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 #define SUMMARY_REDUCE_MIN_CHUNK 4
 /* Parent-directory map merge: use threads inside each merge when the tournament has few pairs (late rounds). */
 #define DENSE_CELL_MERGE_PARALLEL_MIN_NODES 4096u
-/* Repartition merged narrow fanout (512 buckets) into wide lookup (65k): parallel when huge. */
-#define DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES 8192u
+/* Repartition merged narrow fanout (512 buckets) into wide lookup (65k): parallel when not tiny. */
+#define DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES 2048u
 #define DENSE_CELL_STEAL_FANOUT_MAX_NT 128
-/* dense_cell_max_fanout_among_parents: inner pthreads (called from many outer workers — keep small). */
-#define FANOUT_MAX_INNER_NT 8
-#define FANOUT_MAX_PAR_MIN_NODES 8000u
+/*
+ * dense_cell_max_fanout_among_parents: inner bucket-range workers. Capped so path_shape’s first phase
+ * (up to 36 cell workers) does not multiply into hundreds of simultaneous pthreads.
+ */
+#define FANOUT_MAX_INNER_NT 32
+#define FANOUT_MAX_PAR_MIN_NODES 2048u
 #define PATH_ORD_QSORT_THRESH (65536u)
 /* Deeper merge-sort split → more pthread spawns for huge matched-record corpora (bucket path order). */
 #define PATH_ORD_MAX_MS_DEPTH 12
@@ -6425,16 +6428,78 @@ typedef struct {
     atomic_int next_task;
 } shape_margin_ctx_t;
 
+typedef struct {
+    dense_cell_map_t *out;
+    const dense_cell_map_t *src;
+} shape_margin_one_cell_t;
+
+static void *shape_margin_one_cell_worker(void *vp) {
+    shape_margin_one_cell_t *w = (shape_margin_one_cell_t *)vp;
+
+    memset(w->out, 0, sizeof(*w->out));
+    dense_cell_merge_add(w->out, w->src, NULL);
+    return NULL;
+}
+
+/*
+ * Build one row- or column-aggregate narrow map: copy each slice map in parallel (6 pthreads), then fold partials
+ * into rm on the main thread (order-independent for parent counts).
+ */
+static void shape_margin_parallel_fold_ptrs(dense_cell_map_t *rm, const dense_cell_map_t *const *srcv, int n) {
+    dense_cell_map_t partial[AGE_BUCKETS];
+    shape_margin_one_cell_t w[AGE_BUCKETS];
+    pthread_t th[AGE_BUCKETS];
+    int k, j;
+
+    if (!rm || !srcv || n < 1 || n > AGE_BUCKETS) return;
+
+    for (k = 0; k < n; k++) {
+        memset(&partial[k], 0, sizeof(partial[k]));
+        w[k].out = &partial[k];
+        w[k].src = srcv[k];
+        if (pthread_create(&th[k], NULL, shape_margin_one_cell_worker, &w[k]) != 0) {
+            for (j = 0; j < k; j++) pthread_join(th[j], NULL);
+            for (j = 0; j < k; j++) {
+                dense_cell_merge_add(rm, &partial[j], NULL);
+                dense_cell_free(&partial[j]);
+            }
+            for (; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
+            return;
+        }
+    }
+    for (k = 0; k < n; k++) pthread_join(th[k], NULL);
+    for (k = 0; k < n; k++) {
+        dense_cell_merge_add(rm, &partial[k], NULL);
+        dense_cell_free(&partial[k]);
+    }
+}
+
+static void shape_margin_merge_bucket_strip_parallel(dense_cell_map_t *rm,
+                                                     dense_cell_map_t (*merged_dense)[SIZE_BUCKETS],
+                                                     int strip_idx,
+                                                     int row_strip) {
+    const dense_cell_map_t *srcv[SIZE_BUCKETS];
+    int k;
+
+    for (k = 0; k < SIZE_BUCKETS; k++)
+        srcv[k] = row_strip ? &merged_dense[strip_idx][k] : &merged_dense[k][strip_idx];
+    shape_margin_parallel_fold_ptrs(rm, srcv, SIZE_BUCKETS);
+}
+
 static void shape_margin_run_task(shape_margin_ctx_t *c, int t) {
     if (t < AGE_BUCKETS) {
         int ab = t;
         uint64_t db = 0;
         int sb;
         dense_cell_map_t *rm = &c->row_merged[ab];
+        int nt = parse_ereport_thread_count();
 
-        for (sb = 0; sb < SIZE_BUCKETS; sb++) {
-            db += c->sum->shape_deep_bytes[ab][sb];
-            dense_cell_merge_add(rm, &c->merged_dense[ab][sb], NULL);
+        for (sb = 0; sb < SIZE_BUCKETS; sb++) db += c->sum->shape_deep_bytes[ab][sb];
+
+        if (nt >= SIZE_BUCKETS + 2) {
+            shape_margin_merge_bucket_strip_parallel(rm, c->merged_dense, ab, 1);
+        } else {
+            for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_merge_add(rm, &c->merged_dense[ab][sb], NULL);
         }
         c->path_shape->row[ab].deep_bytes = db;
         c->path_shape->row[ab].dense_fanout_max = dense_cell_max_fanout_among_parents(rm, c->fanout_lookup);
@@ -6443,11 +6508,15 @@ static void shape_margin_run_task(shape_margin_ctx_t *c, int t) {
         dense_cell_map_t col_acc;
         uint64_t db = 0;
         int ab;
+        int nt = parse_ereport_thread_count();
 
         memset(&col_acc, 0, sizeof(col_acc));
-        for (ab = 0; ab < AGE_BUCKETS; ab++) {
-            db += c->sum->shape_deep_bytes[ab][sb];
-            dense_cell_merge_add(&col_acc, &c->merged_dense[ab][sb], NULL);
+        for (ab = 0; ab < AGE_BUCKETS; ab++) db += c->sum->shape_deep_bytes[ab][sb];
+
+        if (nt >= AGE_BUCKETS + 2) {
+            shape_margin_merge_bucket_strip_parallel(&col_acc, c->merged_dense, sb, 0);
+        } else {
+            for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_merge_add(&col_acc, &c->merged_dense[ab][sb], NULL);
         }
         c->path_shape->col[sb].deep_bytes = db;
         c->path_shape->col[sb].dense_fanout_max =
@@ -6575,7 +6644,17 @@ static void path_shape_fill_from_merged_dense(const summary_t *sum,
 
     memset(&all_acc, 0, sizeof(all_acc));
     path_shape->all.deep_bytes = sum->total_shape_deep_bytes;
-    for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_merge_add(&all_acc, &row_merged[ab], NULL);
+    {
+        const dense_cell_map_t *rv[AGE_BUCKETS];
+        int nt = parse_ereport_thread_count();
+
+        for (ab = 0; ab < AGE_BUCKETS; ab++) rv[ab] = &row_merged[ab];
+        if (nt >= AGE_BUCKETS + 2) {
+            shape_margin_parallel_fold_ptrs(&all_acc, rv, AGE_BUCKETS);
+        } else {
+            for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_merge_add(&all_acc, &row_merged[ab], NULL);
+        }
+    }
     path_shape->all.dense_fanout_max = dense_cell_max_fanout_among_parents(&all_acc, fanout_lookup);
     dense_cell_free(&all_acc);
     for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_free(&row_merged[ab]);
