@@ -748,6 +748,198 @@ static int uid_accum_merge_into(uid_accum_t *dst, const uid_accum_t *src) {
     return 0;
 }
 
+/*
+ * Tournament step: fold odd into even (merge uid sets). On OOM mid-merge, even may be partial and odd unchanged;
+ * recover by merging even into odd, move survivor to the even slot (required for the next reduction round).
+ */
+static int uid_accum_merge_pair_fold(uid_accum_t *even, uid_accum_t *odd) {
+    if (!even || !odd) return -1;
+    if (uid_accum_merge_into(even, odd) == 0) {
+        uid_accum_destroy(odd);
+        memset(odd, 0, sizeof(*odd));
+        return 0;
+    }
+    if (uid_accum_merge_into(odd, even) != 0) return -1;
+    uid_accum_destroy(even);
+    *even = *odd;
+    memset(odd, 0, sizeof(*odd));
+    return 0;
+}
+
+typedef struct {
+    uid_accum_t *ubuf;
+    atomic_int *next_pair;
+    atomic_int *fail;
+    int pairs;
+} uid_pair_merge_ctx_t;
+
+static void *uid_pair_merge_worker(void *vp) {
+    uid_pair_merge_ctx_t *c = (uid_pair_merge_ctx_t *)vp;
+
+    for (;;) {
+        int p = atomic_fetch_add_explicit(c->next_pair, 1, memory_order_relaxed);
+
+        if (p >= c->pairs) break;
+        if (atomic_load_explicit(c->fail, memory_order_relaxed)) return NULL;
+        if (uid_accum_merge_pair_fold(&c->ubuf[2 * p], &c->ubuf[2 * p + 1]) != 0) {
+            atomic_store_explicit(c->fail, 1, memory_order_relaxed);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void uid_accum_ubuf_destroy_slots(uid_accum_t *ubuf, int n) {
+    int k;
+
+    if (!ubuf || n < 1) return;
+    for (k = 0; k < n; k++) {
+        uid_accum_destroy(&ubuf[k]);
+        memset(&ubuf[k], 0, sizeof(ubuf[k]));
+    }
+}
+
+/*
+ * Parallel pairwise tournament of per-worker uid_distinct maps (same steal pattern as fanout_shard_summaries_reduce_parallel).
+ * Moves args[0..threads_used).uid_distinct into a temp buffer; on success args slots are cleared; on failure destroys ubuf
+ * and returns -1 (merged left unchanged).
+ */
+static int uid_accum_reduce_workers_into(uid_accum_t *merged, worker_arg_t *args, int threads_used) {
+    uid_accum_t *ubuf = NULL;
+    int n;
+    int pairs;
+    int j;
+    int k;
+    int nw;
+    int ti;
+    int n_join;
+    pthread_t *tids = NULL;
+    uid_pair_merge_ctx_t *targs = NULL;
+    atomic_int next_pair;
+    atomic_int fail;
+    int i;
+
+    if (!merged || !args || threads_used < 1) return -1;
+
+    if (threads_used == 1) {
+        if (uid_accum_merge_into(merged, &args[0].uid_distinct) != 0) return -1;
+        uid_accum_destroy(&args[0].uid_distinct);
+        memset(&args[0].uid_distinct, 0, sizeof(args[0].uid_distinct));
+        return 0;
+    }
+
+    ubuf = (uid_accum_t *)calloc((size_t)threads_used, sizeof(*ubuf));
+    if (!ubuf) return -1;
+
+    for (i = 0; i < threads_used; i++) {
+        ubuf[i] = args[i].uid_distinct;
+        memset(&args[i].uid_distinct, 0, sizeof(args[i].uid_distinct));
+    }
+
+    atomic_init(&fail, 0);
+    n = threads_used;
+    while (n > 1) {
+        pairs = n / 2;
+        if (pairs <= 0) break;
+
+        nw = parse_ereport_thread_count();
+        if (nw < 1) nw = 1;
+        if (nw > pairs) nw = pairs;
+
+        if (pairs < 2 || nw < 2) {
+            for (j = 0; j < pairs; j++) {
+                if (atomic_load_explicit(&fail, memory_order_relaxed)) {
+                    uid_accum_ubuf_destroy_slots(ubuf, n);
+                    free(ubuf);
+                    return -1;
+                }
+                if (uid_accum_merge_pair_fold(&ubuf[2 * j], &ubuf[2 * j + 1]) != 0) {
+                    atomic_store_explicit(&fail, 1, memory_order_relaxed);
+                    uid_accum_ubuf_destroy_slots(ubuf, n);
+                    free(ubuf);
+                    return -1;
+                }
+            }
+        } else {
+            atomic_store_explicit(&next_pair, 0, memory_order_relaxed);
+            tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+            targs = (uid_pair_merge_ctx_t *)calloc((size_t)nw, sizeof(*targs));
+            if (!tids || !targs) {
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+                for (j = 0; j < pairs; j++) {
+                    if (atomic_load_explicit(&fail, memory_order_relaxed)) {
+                        uid_accum_ubuf_destroy_slots(ubuf, n);
+                        free(ubuf);
+                        return -1;
+                    }
+                    if (uid_accum_merge_pair_fold(&ubuf[2 * j], &ubuf[2 * j + 1]) != 0) {
+                        atomic_store_explicit(&fail, 1, memory_order_relaxed);
+                        uid_accum_ubuf_destroy_slots(ubuf, n);
+                        free(ubuf);
+                        return -1;
+                    }
+                }
+            } else {
+                n_join = 0;
+                for (ti = 0; ti < nw; ti++) {
+                    targs[ti].ubuf = ubuf;
+                    targs[ti].next_pair = &next_pair;
+                    targs[ti].fail = &fail;
+                    targs[ti].pairs = pairs;
+                    if (pthread_create(&tids[ti], NULL, uid_pair_merge_worker, &targs[ti]) != 0) break;
+                    n_join++;
+                }
+                for (ti = 0; ti < n_join; ti++) pthread_join(tids[ti], NULL);
+                if (!atomic_load_explicit(&fail, memory_order_relaxed)) {
+                    for (;;) {
+                        int p = atomic_fetch_add_explicit(&next_pair, 1, memory_order_relaxed);
+
+                        if (p >= pairs) break;
+                        if (uid_accum_merge_pair_fold(&ubuf[2 * p], &ubuf[2 * p + 1]) != 0) {
+                            atomic_store_explicit(&fail, 1, memory_order_relaxed);
+                            break;
+                        }
+                    }
+                }
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+            }
+        }
+
+        if (atomic_load_explicit(&fail, memory_order_relaxed)) {
+            uid_accum_ubuf_destroy_slots(ubuf, n);
+            free(ubuf);
+            return -1;
+        }
+
+        k = 0;
+        for (j = 0; j < pairs; j++) {
+            ubuf[k] = ubuf[2 * j];
+            k++;
+        }
+        if (n % 2 == 1) {
+            ubuf[k] = ubuf[n - 1];
+            k++;
+        }
+        n = k;
+    }
+
+    if (uid_accum_merge_into(merged, &ubuf[0]) != 0) {
+        uid_accum_ubuf_destroy_slots(ubuf, 1);
+        free(ubuf);
+        return -1;
+    }
+    uid_accum_destroy(&ubuf[0]);
+    memset(&ubuf[0], 0, sizeof(ubuf[0]));
+    free(ubuf);
+    return 0;
+}
+
 static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t size, int ctime_led) {
     detail_record_t *tmp;
 
@@ -9189,8 +9381,7 @@ int main(int argc, char **argv) {
             if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
             return 1;
         }
-        for (i = 0; i < threads_used; i++) {
-            if (uid_accum_merge_into(&merged_uids, &args[i].uid_distinct) != 0) {
+        if (uid_accum_reduce_workers_into(&merged_uids, args, threads_used) != 0) {
                 int j;
                 fprintf(stderr, "allocation failed merging uid tallies\n");
                 if (bucket_shape_maps_live) {
@@ -9198,7 +9389,7 @@ int main(int argc, char **argv) {
                     bucket_shape_maps_live = 0;
                 }
                 uid_accum_destroy(&merged_uids);
-                for (j = i; j < threads; j++) uid_accum_destroy(&args[j].uid_distinct);
+                for (j = 0; j < threads; j++) uid_accum_destroy(&args[j].uid_distinct);
                 worker_dense_maps_free(args, threads_used);
                 free(tids);
                 free(args);
@@ -9215,10 +9406,8 @@ int main(int argc, char **argv) {
                 }
                 if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
                 return 1;
-            }
-            uid_accum_destroy(&args[i].uid_distinct);
         }
-        for (; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
+        for (i = threads_used; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
         distinct_uid_count = (uint64_t)uid_accum_size(&merged_uids);
         uid_accum_destroy(&merged_uids);
         if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
