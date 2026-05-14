@@ -13,12 +13,16 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
+ *     --verbose [minutes] (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
+ *     no I/O counter atomics on hot paths). Optional integer after --verbose is accepted for compatibility but does not
+ *     enable extra output. While verbose, stderr prints ecrawl-style `key=value` progress about every 30s (idle counters
+ *     omitted). Thread count remains EREPORT_THREADS.
  *     Purple C-led heat-map badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).
  *     Flags must appear first (in any order), before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
@@ -86,8 +90,24 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 /* Wider hash only for merged crawl-wide fanout — shortens chains for path-shape lookups (stack ~512 KiB). */
 #define DENSE_PARENT_BUCKETS_FANOUT_LOOKUP 65536U
 #define SUMMARY_REDUCE_MIN_CHUNK 4
+/* Parent-directory map merge: use threads inside each merge when the tournament has few pairs (late rounds). */
+#define DENSE_CELL_MERGE_PARALLEL_MIN_NODES 4096u
+/* Repartition merged narrow fanout (512 buckets) into wide lookup (65k): parallel when huge. */
+#define DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES 8192u
+#define DENSE_CELL_STEAL_FANOUT_MAX_NT 128
+/* dense_cell_max_fanout_among_parents: inner pthreads (called from many outer workers — keep small). */
+#define FANOUT_MAX_INNER_NT 8
+#define FANOUT_MAX_PAR_MIN_NODES 8000u
 #define PATH_ORD_QSORT_THRESH (65536u)
-#define PATH_ORD_MAX_MS_DEPTH 7
+/* Deeper merge-sort split → more pthread spawns for huge matched-record corpora (bucket path order). */
+#define PATH_ORD_MAX_MS_DEPTH 12
+/*
+ * Bucket HTML: aggregate_totals_for_page_n walks matched records under base_prefix. Parallel path shards the
+ * record range; each worker accumulates per-row partials. Partial matrix size is nw×R×3×uint64 — cap nw by
+ * AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES so large path_row_map tables (big R) still use multiple workers.
+ */
+#define AGG_TOTALS_PAR_MIN_RECORDS (256ULL * 1024ULL)
+#define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (384ULL * 1024ULL * 1024ULL)
 
 static int parse_ereport_thread_count(void);
 
@@ -242,7 +262,27 @@ typedef struct ereport_run_stats {
     atomic_int parse_workers_done;
     /* 1=merging worker summaries, 2=writing bucket_*.html, 3=writing index.html (0=unused). */
     atomic_int finalize_phase;
+    /* Phase 1: 1=fold summaries 2=matched paths 3=directory maps 4=UID merge (all_users). */
+    atomic_int finalize_merge_substep;
+    /* Phase 2: 1=corpus totals + path ordering before workers; 0=emitting bucket_*.html cells. */
+    atomic_int finalize_bucket_prep;
+    /* Phase 3: 1..6 coarse checkpoints while writing index.html (see ereport_index_prog). */
+    atomic_uint finalize_index_step;
+    /* Phase 1 substep 3: parallel dense merge; 0..AGE*SIZE while bucket_dense_cells_finalize_parallel runs. */
+    atomic_uint finalize_dense_cells_done;
     atomic_uint finalize_bucket_done; /* cells written toward 36 */
+    /*
+     * Verbose runtime only: substep 3 prelude — merging each parse worker's parent_fanout (done/total workers).
+     * Cleared when dense cell merge starts.
+     */
+    atomic_int finalize_fanout_workers_total;
+    atomic_int finalize_fanout_workers_done;
+    /*
+     * Verbose runtime only: during finalize_merge_substep==2 parallel matched-record memcpy (slice done/total).
+     * Cleared when matched finalize returns.
+     */
+    atomic_int finalize_matched_slices_total;
+    atomic_int finalize_matched_slices_done;
     uint64_t input_files_total;
     atomic_ullong chunk_prep_files_done;
     uint64_t chunk_prep_files_total;
@@ -254,6 +294,23 @@ typedef struct ereport_run_stats {
     double records_rate_min;
     double records_rate_max;
     uint64_t records_rate_samples;
+    /*
+     * --verbose machine-readable phase timing (emit_run_stats). Wall times are main-thread elapsed where noted;
+     * corpus vs path-index prep may overlap — see phase_bucket_prep_note in emit_run_stats.
+     */
+    double vt_chunk_map_sec;
+    double vt_parse_workers_sec;
+    double vt_fini_summaries_sec;
+    double vt_fini_matched_paths_sec;
+    double vt_fini_directory_maps_dense_sec;
+    double vt_fini_path_shape_sec;
+    double vt_fini_uid_sec;
+    double vt_bucket_prep_wall_sec;
+    double vt_bucket_prep_corpus_sec;
+    double vt_bucket_cells_wall_sec;
+    double vt_index_html_sec;
+    atomic_uint_fast64_t vt_ns_path_sort;
+    atomic_uint_fast64_t vt_ns_bucket_emit_sort;
 } ereport_run_stats_t;
 
 static void ereport_run_stats_reset(ereport_run_stats_t *s) {
@@ -264,7 +321,15 @@ static void ereport_run_stats_reset(ereport_run_stats_t *s) {
     atomic_store(&s->stop_stats, 0);
     atomic_store(&s->parse_workers_done, 0);
     atomic_store(&s->finalize_phase, 0);
+    atomic_store(&s->finalize_merge_substep, 0);
+    atomic_store(&s->finalize_bucket_prep, 0);
+    atomic_store(&s->finalize_index_step, 0);
+    atomic_store(&s->finalize_dense_cells_done, 0);
     atomic_store(&s->finalize_bucket_done, 0);
+    atomic_store(&s->finalize_fanout_workers_total, 0);
+    atomic_store(&s->finalize_fanout_workers_done, 0);
+    atomic_store(&s->finalize_matched_slices_total, 0);
+    atomic_store(&s->finalize_matched_slices_done, 0);
     s->input_files_total = 0;
     atomic_store(&s->chunk_prep_files_done, 0);
     s->chunk_prep_files_total = 0;
@@ -275,6 +340,47 @@ static void ereport_run_stats_reset(ereport_run_stats_t *s) {
     s->records_rate_min = 0.0;
     s->records_rate_max = 0.0;
     s->records_rate_samples = 0;
+    s->vt_chunk_map_sec = 0.0;
+    s->vt_parse_workers_sec = 0.0;
+    s->vt_fini_summaries_sec = 0.0;
+    s->vt_fini_matched_paths_sec = 0.0;
+    s->vt_fini_directory_maps_dense_sec = 0.0;
+    s->vt_fini_path_shape_sec = 0.0;
+    s->vt_fini_uid_sec = 0.0;
+    s->vt_bucket_prep_wall_sec = 0.0;
+    s->vt_bucket_prep_corpus_sec = 0.0;
+    s->vt_bucket_cells_wall_sec = 0.0;
+    s->vt_index_html_sec = 0.0;
+    atomic_init(&s->vt_ns_path_sort, 0);
+    atomic_init(&s->vt_ns_bucket_emit_sort, 0);
+}
+
+#define EREPORT_INDEX_PROGRESS_STEPS 6u
+
+static void ereport_index_prog(ereport_run_stats_t *rs, unsigned step) {
+    if (rs && step >= 1u && step <= EREPORT_INDEX_PROGRESS_STEPS)
+        atomic_store(&rs->finalize_index_step, step);
+}
+
+static const char *ereport_finalize_merge_substep_cstr(int m) {
+    switch (m) {
+        case 1:
+            return "worker summaries";
+        case 2:
+            return "matched paths";
+        case 3:
+            return "directory maps";
+        case 4:
+            return "UID tallies";
+        default:
+            return "";
+    }
+}
+
+static const char *ereport_finalize_index_step_cstr(unsigned step) {
+    static const char *const lab[6] = {"path search", "heatmap", "bucket help", "stats", "drawer", "finishing"};
+    if (step >= 1u && step <= 6u) return lab[step - 1u];
+    return "";
 }
 
 typedef struct dense_node {
@@ -365,6 +471,8 @@ static atomic_ullong g_bucket_records[WINDOW_SECONDS];
 static atomic_ullong g_window_records = 0;
 static atomic_int g_bucket_index = 0;
 static atomic_uint g_seconds_seen = 0;
+/* Like ecrawl: default quiet (no per-read I/O atomics; sparse progress). --verbose enables full accounting + stderr progress. */
+static int g_ereport_verbose = 0;
 
 /* Manifest-driven crawl directory layout: "uid_shards" or "unsharded" (no uid-shard manifest). */
 static const char *g_input_layout = "unsharded";
@@ -664,6 +772,198 @@ static double now_sec(void) {
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
+static uint64_t vt_mono_ns(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void vt_path_sort_commit(ereport_run_stats_t *rs, uint64_t t0_ns) {
+    uint64_t d;
+
+    if (!rs || !g_ereport_verbose || t0_ns == 0ULL) return;
+    d = vt_mono_ns() - t0_ns;
+    if (d > 0ULL)
+        atomic_fetch_add_explicit(&rs->vt_ns_path_sort, (uint_fast64_t)d, memory_order_relaxed);
+}
+
+static void vt_bucket_qsort_ns(ereport_run_stats_t *rs, uint64_t t0_ns) {
+    uint64_t d;
+
+    if (!rs || !g_ereport_verbose || t0_ns == 0ULL) return;
+    d = vt_mono_ns() - t0_ns;
+    if (d > 0ULL)
+        atomic_fetch_add_explicit(&rs->vt_ns_bucket_emit_sort, (uint_fast64_t)d, memory_order_relaxed);
+}
+
+#define VT_QSORT_BUCKET(rs, arr, nmemb, sz, cmp) \
+    do { \
+        if ((rs) && g_ereport_verbose) { \
+            uint64_t _vtq0 = vt_mono_ns(); \
+            qsort((arr), (nmemb), (sz), (cmp)); \
+            vt_bucket_qsort_ns((rs), _vtq0); \
+        } else { \
+            qsort((arr), (nmemb), (sz), (cmp)); \
+        } \
+    } while (0)
+
+/* Key=value lines for --verbose sort vs wall (uses ereport_run_stats_t fields updated during the run). */
+static void ereport_verbose_fprint_timing_kv(const ereport_run_stats_t *rs, int merge_sub, int fft) {
+    double ps, bs, wcells, other;
+
+    ps = (double)atomic_load_explicit(&rs->vt_ns_path_sort, memory_order_relaxed) * 1e-9;
+    bs = (double)atomic_load_explicit(&rs->vt_ns_bucket_emit_sort, memory_order_relaxed) * 1e-9;
+    if (ps > 1e-12) fprintf(stderr, "verbose_sort_path_index_sec=%.6f\n", ps);
+    if (bs > 1e-12) fprintf(stderr, "verbose_sort_bucket_emit_sec=%.6f\n", bs);
+
+#define EREP_VT_WALL(tag, fld) \
+    do { \
+        if ((rs)->fld > 1e-9) fprintf(stderr, "verbose_wall_" tag "=%.6f\n", (rs)->fld); \
+    } while (0)
+
+    EREP_VT_WALL("chunk_map_sec", vt_chunk_map_sec);
+    EREP_VT_WALL("parse_workers_sec", vt_parse_workers_sec);
+    EREP_VT_WALL("fini_summaries_sec", vt_fini_summaries_sec);
+    EREP_VT_WALL("fini_matched_paths_sec", vt_fini_matched_paths_sec);
+    EREP_VT_WALL("fini_directory_maps_dense_sec", vt_fini_directory_maps_dense_sec);
+    EREP_VT_WALL("fini_path_shape_sec", vt_fini_path_shape_sec);
+    EREP_VT_WALL("fini_uid_sec", vt_fini_uid_sec);
+    EREP_VT_WALL("bucket_prep_wall_sec", vt_bucket_prep_wall_sec);
+    EREP_VT_WALL("bucket_prep_corpus_scan_sec", vt_bucket_prep_corpus_sec);
+    EREP_VT_WALL("bucket_html_cells_wall_sec", vt_bucket_cells_wall_sec);
+    EREP_VT_WALL("index_html_sec", vt_index_html_sec);
+#undef EREP_VT_WALL
+
+    wcells = rs->vt_bucket_cells_wall_sec;
+    if (wcells > 1e-9 && bs > 1e-12) {
+        other = wcells > bs ? wcells - bs : 0.0;
+        fprintf(stderr, "verbose_bucket_html_cells_non_sort_est_sec=%.6f\n", other);
+    }
+
+    if (rs->vt_bucket_prep_wall_sec > 1e-9 && rs->vt_bucket_prep_corpus_sec > 1e-9 && ps > 1e-12)
+        fprintf(stderr,
+                "verbose_note=bucket_prep_corpus_scan_and_path_index_sort_can_overlap_parallel_threads\n");
+
+    if (merge_sub == 3 && fft > 0 && ps <= 1e-12 && bs <= 1e-12)
+        fprintf(stderr,
+                "verbose_note=fanout_parent_map_merge_is_not_measured_as_sort_cpu_heavy_hash_merge\n");
+}
+
+/* stderr: --verbose progress (ecrawl-style key=value; omit idle zero counters). */
+static void ereport_verbose_fprint_runtime_peek(const ereport_run_stats_t *rs) {
+    uint64_t prep_tot;
+    unsigned long long prep_done;
+    int fin;
+    double el;
+    int phase;
+    int merge_sub;
+    int mst, msd, fft, ffd, bprep;
+    unsigned int dcells, bdone, idx_step;
+    const int nbucket = AGE_BUCKETS * SIZE_BUCKETS;
+
+    if (!rs || !g_ereport_verbose) return;
+
+    prep_tot = rs->chunk_prep_files_total;
+    prep_done = atomic_load_explicit(&rs->chunk_prep_files_done, memory_order_relaxed);
+    fin = atomic_load_explicit(&rs->parse_workers_done, memory_order_relaxed);
+    el = rs->run_start_sec > 0.0 ? now_sec() - rs->run_start_sec : 0.0;
+
+    fprintf(stderr, "\nereport: verbose progress\n");
+    fprintf(stderr, "elapsed_sec=%.1f\n", el);
+
+    if (prep_tot > 0ULL && prep_done < prep_tot && !fin) {
+        int nslots = rs->chunk_map_path_slots;
+        int active = 0;
+        int si;
+        volatile const char **wpaths = rs->chunk_map_worker_paths;
+
+        if (wpaths && nslots > 0) {
+            for (si = 0; si < nslots; si++) {
+                if (wpaths[si]) active++;
+            }
+        }
+        fprintf(stderr, "stage=chunk_map\n");
+        fprintf(stderr, "chunk_prep_files_done=%llu\n", prep_done);
+        fprintf(stderr, "chunk_prep_files_total=%" PRIu64 "\n", prep_tot);
+        fprintf(stderr, "chunk_map_readers_busy=%d\n", active);
+        fprintf(stderr, "chunk_map_reader_slots=%d\n", nslots > 0 ? nslots : 0);
+        ereport_verbose_fprint_timing_kv(rs, 0, 0);
+        fflush(stderr);
+        return;
+    }
+
+    if (!fin) {
+        fprintf(stderr, "stage=parse\n");
+        fprintf(stderr, "scanned_input_files=%llu\n",
+                (unsigned long long)atomic_load_explicit(&rs->scanned_input_files, memory_order_relaxed));
+        fprintf(stderr, "input_files_total=%" PRIu64 "\n", (uint64_t)rs->input_files_total);
+        fprintf(stderr, "scanned_records=%llu\n",
+                (unsigned long long)atomic_load_explicit(&rs->scanned_records, memory_order_relaxed));
+        fprintf(stderr, "matched_records=%llu\n",
+                (unsigned long long)atomic_load_explicit(&rs->matched_records, memory_order_relaxed));
+        {
+            unsigned long long bad = atomic_load_explicit(&rs->bad_input_files, memory_order_relaxed);
+            if (bad > 0ULL) fprintf(stderr, "bad_input_files=%llu\n", bad);
+        }
+        ereport_verbose_fprint_timing_kv(rs, 0, 0);
+        fflush(stderr);
+        return;
+    }
+
+    phase = atomic_load_explicit(&rs->finalize_phase, memory_order_relaxed);
+    merge_sub = atomic_load_explicit(&rs->finalize_merge_substep, memory_order_relaxed);
+    mst = atomic_load_explicit(&rs->finalize_matched_slices_total, memory_order_relaxed);
+    msd = atomic_load_explicit(&rs->finalize_matched_slices_done, memory_order_relaxed);
+    fft = atomic_load_explicit(&rs->finalize_fanout_workers_total, memory_order_relaxed);
+    ffd = atomic_load_explicit(&rs->finalize_fanout_workers_done, memory_order_relaxed);
+    dcells = atomic_load_explicit(&rs->finalize_dense_cells_done, memory_order_relaxed);
+    bprep = atomic_load_explicit(&rs->finalize_bucket_prep, memory_order_relaxed);
+    bdone = atomic_load_explicit(&rs->finalize_bucket_done, memory_order_relaxed);
+    idx_step = atomic_load_explicit(&rs->finalize_index_step, memory_order_relaxed);
+
+    fprintf(stderr, "stage=post_parse\n");
+    fprintf(stderr, "finalize_phase=%d\n", phase);
+    if (merge_sub != 0) fprintf(stderr, "finalize_merge_substep=%d\n", merge_sub);
+
+    if (mst > 0) {
+        fprintf(stderr, "finalize_matched_copy_slices_done=%d\n", msd);
+        fprintf(stderr, "finalize_matched_copy_slices_total=%d\n", mst);
+    }
+
+    if (fft > 0) {
+        fprintf(stderr, "finalize_fanout_workers_done=%d\n", ffd);
+        fprintf(stderr, "finalize_fanout_workers_total=%d\n", fft);
+    }
+
+    if (dcells > 0U) {
+        fprintf(stderr, "finalize_dense_cells_done=%u\n", dcells);
+        fprintf(stderr, "finalize_dense_cells_total=%d\n", nbucket);
+    }
+
+    if (bprep != 0) fprintf(stderr, "finalize_bucket_prep=%d\n", bprep);
+    if (bdone > 0U) {
+        fprintf(stderr, "finalize_bucket_html_done=%u\n", bdone);
+        fprintf(stderr, "finalize_bucket_html_total=%d\n", nbucket);
+    }
+    if (idx_step > 0U) fprintf(stderr, "finalize_index_step=%u\n", idx_step);
+
+    ereport_verbose_fprint_timing_kv(rs, merge_sub, fft);
+
+    fprintf(stderr, "scanned_input_files=%llu\n",
+            (unsigned long long)atomic_load_explicit(&rs->scanned_input_files, memory_order_relaxed));
+    fprintf(stderr, "input_files_total=%" PRIu64 "\n", (uint64_t)rs->input_files_total);
+    fprintf(stderr, "scanned_records=%llu\n",
+            (unsigned long long)atomic_load_explicit(&rs->scanned_records, memory_order_relaxed));
+    fprintf(stderr, "matched_records=%llu\n",
+            (unsigned long long)atomic_load_explicit(&rs->matched_records, memory_order_relaxed));
+    {
+        unsigned long long bad = atomic_load_explicit(&rs->bad_input_files, memory_order_relaxed);
+        if (bad > 0ULL) fprintf(stderr, "bad_input_files=%llu\n", bad);
+    }
+    fflush(stderr);
+}
+
 static void clear_status_line(void) {
     printf("\r%160s\r", "");
     fflush(stdout);
@@ -799,34 +1099,34 @@ static void progress_maybe_flush(progress_local_t *progress, ereport_run_stats_t
 }
 
 static FILE *counted_fopen(const char *path, const char *mode) {
-    atomic_fetch_add(&g_io_fopen_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fopen_calls, 1, memory_order_relaxed);
     return fopen(path, mode);
 }
 
 static int counted_fclose(FILE *fp) {
-    atomic_fetch_add(&g_io_fclose_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fclose_calls, 1, memory_order_relaxed);
     return fclose(fp);
 }
 
 static size_t counted_fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
-    atomic_fetch_add(&g_io_fread_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fread_calls, 1, memory_order_relaxed);
     return fread(ptr, size, nmemb, fp);
 }
 
 static const crawl_bin_chunk_stdio_t ereport_chunk_io = {counted_fopen, counted_fread, counted_fclose};
 
 static DIR *counted_opendir(const char *path) {
-    atomic_fetch_add(&g_io_opendir_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_opendir_calls, 1, memory_order_relaxed);
     return opendir(path);
 }
 
 static struct dirent *counted_readdir(DIR *dir) {
-    atomic_fetch_add(&g_io_readdir_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_readdir_calls, 1, memory_order_relaxed);
     return readdir(dir);
 }
 
 static int counted_closedir(DIR *dir) {
-    atomic_fetch_add(&g_io_closedir_calls, 1);
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_closedir_calls, 1, memory_order_relaxed);
     return closedir(dir);
 }
 
@@ -1369,6 +1669,98 @@ static int dense_cell_add(dense_cell_map_t *m, const char *parent, uint64_t delt
     return 0;
 }
 
+static size_t dense_cell_total_nodes(const dense_cell_map_t *m) {
+    size_t c = 0, bi;
+
+    if (!m) return 0;
+    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+        const dense_node_t *n;
+
+        for (n = m->buckets[bi]; n; n = n->next) c++;
+    }
+    return c;
+}
+
+typedef struct {
+    atomic_int gate; /* 0 spin, 1 run, 2 abort (pthread_create failure) */
+    pthread_barrier_t mid;
+} dmerge_sync_t;
+
+typedef struct {
+    dmerge_sync_t *sync;
+    dense_cell_map_t *dst;
+    dense_cell_map_t *src;
+    dense_node_t **st;
+    summary_t *sum;
+    int nt;
+    int tid;
+} dmerge_pt_ctx_t;
+
+static void dmerge_do_phase1(dmerge_pt_ctx_t *c) {
+    size_t bi;
+
+    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS; bi += (size_t)c->nt) {
+        dense_node_t *n = c->src->buckets[bi];
+
+        c->src->buckets[bi] = NULL;
+        while (n) {
+            dense_node_t *nx = n->next;
+            uint32_t dbi = dense_parent_bucket(n->parent);
+
+            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi];
+            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi] = n;
+            n = nx;
+        }
+    }
+}
+
+static void dmerge_do_phase2(dmerge_pt_ctx_t *c) {
+    size_t dst_bi;
+    int t;
+
+    for (dst_bi = (size_t)c->tid; dst_bi < DENSE_PARENT_BUCKETS; dst_bi += (size_t)c->nt) {
+        for (t = 0; t < c->nt; t++) {
+            dense_node_t *n = c->st[(size_t)t * DENSE_PARENT_BUCKETS + dst_bi];
+
+            c->st[(size_t)t * DENSE_PARENT_BUCKETS + dst_bi] = NULL;
+            while (n) {
+                dense_node_t *nx = n->next;
+
+                n->next = NULL;
+                if (dense_cell_add(c->dst, n->parent, n->n, c->sum) != 0) {
+                    while (n) {
+                        dense_node_t *rest = n->next;
+
+                        free(n->parent);
+                        free(n);
+                        n = rest;
+                    }
+                    break;
+                }
+                free(n->parent);
+                free(n);
+                n = nx;
+            }
+        }
+    }
+}
+
+static void *dmerge_parallel_worker(void *vp) {
+    dmerge_pt_ctx_t *c = (dmerge_pt_ctx_t *)vp;
+
+    for (;;) {
+        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
+
+        if (g == 1) break;
+        if (g == 2) return NULL;
+        sched_yield();
+    }
+    dmerge_do_phase1(c);
+    pthread_barrier_wait(&c->sync->mid);
+    dmerge_do_phase2(c);
+    return NULL;
+}
+
 static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum, size_t bi_lo, size_t bi_hi) {
     size_t bi;
 
@@ -1400,13 +1792,99 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
 }
 
 /*
- * Merge src into dst (single-threaded over buckets). Parallel bucket slicing was removed after field
- * reports of crashes under high thread counts; dense_cell_add walks singly-linked chains and must not
- * race with peers even when bucket indices partition src.
+ * Merge src into dst. Single-threaded path walks src buckets sequentially.
+ * When merge_threads > 1, use a two-phase merge: partition src buckets across threads into per-thread
+ * per-dst-bucket lists (no shared writes), barrier, then each thread owns a disjoint dst-bucket index range
+ * and runs dense_cell_add for all staged nodes targeting those buckets (safe: no concurrent writers to the
+ * same dst bucket).
  */
-static void dense_cell_merge_into(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum) {
+static void dense_cell_merge_into_ex(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum, int merge_threads) {
+    dense_node_t **st = NULL;
+    dmerge_pt_ctx_t *ctx = NULL;
+    pthread_t *tids = NULL;
+    dmerge_sync_t sync;
+    int nt_want, nthr, n_join, ti, k, brc;
+
     if (!dst || !src) return;
-    dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+    if (merge_threads < 2) {
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+    if (dense_cell_total_nodes(src) < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+
+    nt_want = merge_threads;
+    if (nt_want > (int)DENSE_PARENT_BUCKETS) nt_want = (int)DENSE_PARENT_BUCKETS;
+
+    st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS, sizeof(dense_node_t *));
+    if (!st) {
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+    ctx = (dmerge_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
+    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
+    if (!ctx || (!tids && nt_want > 1)) {
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+
+    atomic_init(&sync.gate, 0);
+    for (ti = 0; ti < nt_want; ti++) {
+        ctx[ti].sync = &sync;
+        ctx[ti].dst = dst;
+        ctx[ti].src = src;
+        ctx[ti].st = st;
+        ctx[ti].sum = sum;
+        ctx[ti].nt = 0;
+        ctx[ti].tid = 0;
+    }
+
+    n_join = 0;
+    for (ti = 1; ti < nt_want; ti++) {
+        if (pthread_create(&tids[ti - 1], NULL, dmerge_parallel_worker, &ctx[ti]) != 0) break;
+        n_join++;
+    }
+    nthr = n_join + 1;
+    if (nthr < 2) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+
+    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
+    if (brc != 0) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
+        return;
+    }
+
+    for (ti = 0; ti < nthr; ti++) {
+        ctx[ti].nt = nthr;
+        ctx[ti].tid = ti;
+    }
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&sync.gate, 1, memory_order_release);
+    dmerge_do_phase1(&ctx[0]);
+    pthread_barrier_wait(&sync.mid);
+    dmerge_do_phase2(&ctx[0]);
+    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+    pthread_barrier_destroy(&sync.mid);
+    free(st);
+    free(ctx);
+    free(tids);
 }
 
 static void dense_cell_merge_add(dense_cell_map_t *dst, const dense_cell_map_t *src, summary_t *sum) {
@@ -1439,6 +1917,158 @@ static void dense_cell_steal_into_fanout_lookup(dense_cell_map_t *narrow, dense_
             n = nx;
         }
     }
+}
+
+typedef struct {
+    dmerge_sync_t *sync;
+    dense_cell_map_t *narrow;
+    dense_cell_fanout_lookup_t *lk;
+    dense_node_t **st;
+    int nt;
+    int tid;
+} fanout_steal_pt_ctx_t;
+
+static void fanout_steal_do_phase1(fanout_steal_pt_ctx_t *c) {
+    size_t bi;
+
+    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS; bi += (size_t)c->nt) {
+        dense_node_t *n = c->narrow->buckets[bi];
+
+        c->narrow->buckets[bi] = NULL;
+        while (n) {
+            dense_node_t *nx = n->next;
+            uint32_t biw = dense_parent_bucket_fanout_lookup(n->parent);
+
+            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw];
+            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw] = n;
+            n = nx;
+        }
+    }
+}
+
+static void fanout_steal_do_phase2(fanout_steal_pt_ctx_t *c) {
+    size_t biw;
+    int t;
+
+    for (biw = (size_t)c->tid; biw < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; biw += (size_t)c->nt) {
+        for (t = 0; t < c->nt; t++) {
+            dense_node_t *head = c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw];
+
+            c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw] = NULL;
+            if (!head) continue;
+            {
+                dense_node_t *tail = head;
+
+                while (tail->next) tail = tail->next;
+                tail->next = c->lk->buckets[biw];
+                c->lk->buckets[biw] = head;
+            }
+        }
+    }
+}
+
+static void *fanout_steal_parallel_worker(void *vp) {
+    fanout_steal_pt_ctx_t *c = (fanout_steal_pt_ctx_t *)vp;
+
+    for (;;) {
+        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
+
+        if (g == 1) break;
+        if (g == 2) return NULL;
+        sched_yield();
+    }
+    fanout_steal_do_phase1(c);
+    pthread_barrier_wait(&c->sync->mid);
+    fanout_steal_do_phase2(c);
+    return NULL;
+}
+
+static void dense_cell_steal_into_fanout_lookup_ex(dense_cell_map_t *narrow, dense_cell_fanout_lookup_t *lk, int merge_threads) {
+    dense_node_t **st = NULL;
+    fanout_steal_pt_ctx_t *ctx = NULL;
+    pthread_t *tids = NULL;
+    dmerge_sync_t sync;
+    int nt_want, nthr, n_join, ti, k, brc;
+
+    if (!narrow || !lk) return;
+    if (merge_threads < 2) {
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+    if (dense_cell_total_nodes(narrow) < DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES) {
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+
+    nt_want = merge_threads;
+    if (nt_want > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_want = DENSE_CELL_STEAL_FANOUT_MAX_NT;
+
+    st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(dense_node_t *));
+    if (!st) {
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+    ctx = (fanout_steal_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
+    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
+    if (!ctx || (!tids && nt_want > 1)) {
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+
+    atomic_init(&sync.gate, 0);
+    for (ti = 0; ti < nt_want; ti++) {
+        ctx[ti].sync = &sync;
+        ctx[ti].narrow = narrow;
+        ctx[ti].lk = lk;
+        ctx[ti].st = st;
+        ctx[ti].nt = 0;
+        ctx[ti].tid = 0;
+    }
+
+    n_join = 0;
+    for (ti = 1; ti < nt_want; ti++) {
+        if (pthread_create(&tids[ti - 1], NULL, fanout_steal_parallel_worker, &ctx[ti]) != 0) break;
+        n_join++;
+    }
+    nthr = n_join + 1;
+    if (nthr < 2) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+
+    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
+    if (brc != 0) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        dense_cell_steal_into_fanout_lookup(narrow, lk);
+        return;
+    }
+
+    for (ti = 0; ti < nthr; ti++) {
+        ctx[ti].nt = nthr;
+        ctx[ti].tid = ti;
+    }
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&sync.gate, 1, memory_order_release);
+    fanout_steal_do_phase1(&ctx[0]);
+    pthread_barrier_wait(&sync.mid);
+    fanout_steal_do_phase2(&ctx[0]);
+    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+    pthread_barrier_destroy(&sync.mid);
+    free(st);
+    free(ctx);
+    free(tids);
 }
 
 static uint64_t dense_cell_fanout_lookup_get_n(const dense_cell_fanout_lookup_t *lk, const char *parent) {
@@ -1488,8 +2118,34 @@ static void dense_cell_fanout_lookup_free(dense_cell_fanout_lookup_t *lk) {
  * fanout_lookup: merged crawl-wide immediate-child counts per parent directory (65k buckets for fast lookup).
  * Returns max global_fanout[P] over parents P appearing in the slice map.
  */
-static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slice_parents,
-                                                    const dense_cell_fanout_lookup_t *fanout_lookup) {
+typedef struct {
+    const dense_cell_map_t *slice;
+    const dense_cell_fanout_lookup_t *lk;
+    size_t bi_lo;
+    size_t bi_hi;
+    uint64_t mx;
+} fanout_max_wctx_t;
+
+static void *fanout_max_worker(void *vp) {
+    fanout_max_wctx_t *c = (fanout_max_wctx_t *)vp;
+    size_t bi;
+    uint64_t mx = 0;
+
+    for (bi = c->bi_lo; bi < c->bi_hi; bi++) {
+        const dense_node_t *n;
+
+        for (n = c->slice->buckets[bi]; n; n = n->next) {
+            uint64_t g = dense_cell_fanout_lookup_get_n(c->lk, n->parent);
+
+            if (g > mx) mx = g;
+        }
+    }
+    c->mx = mx;
+    return NULL;
+}
+
+static uint64_t fanout_max_among_parents_serial(const dense_cell_map_t *slice_parents,
+                                                const dense_cell_fanout_lookup_t *fanout_lookup) {
     size_t bi;
     uint64_t mx = 0;
 
@@ -1503,6 +2159,61 @@ static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slic
             if (g > mx) mx = g;
         }
     }
+    return mx;
+}
+
+static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slice_parents,
+                                                    const dense_cell_fanout_lookup_t *fanout_lookup) {
+    int ninner;
+    int ti;
+    int k;
+    uint64_t mx;
+    fanout_max_wctx_t *ctx = NULL;
+    pthread_t *tp = NULL;
+
+    if (!slice_parents || !fanout_lookup) return 0;
+
+    ninner = parse_ereport_thread_count();
+    if (ninner < 1) ninner = 1;
+    if (ninner > FANOUT_MAX_INNER_NT) ninner = FANOUT_MAX_INNER_NT;
+
+    if (ninner < 2 || dense_cell_total_nodes(slice_parents) < FANOUT_MAX_PAR_MIN_NODES)
+        return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
+
+    ctx = (fanout_max_wctx_t *)calloc((size_t)ninner, sizeof(*ctx));
+    tp = (pthread_t *)calloc((size_t)(ninner - 1), sizeof(*tp));
+    if (!ctx || !tp) {
+        free(ctx);
+        free(tp);
+        return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
+    }
+
+    for (ti = 0; ti < ninner; ti++) {
+        ctx[ti].slice = slice_parents;
+        ctx[ti].lk = fanout_lookup;
+        ctx[ti].bi_lo = (size_t)ti * DENSE_PARENT_BUCKETS / (size_t)ninner;
+        ctx[ti].bi_hi = ((size_t)ti + 1) * DENSE_PARENT_BUCKETS / (size_t)ninner;
+        ctx[ti].mx = 0;
+    }
+
+    for (ti = 1; ti < ninner; ti++) {
+        if (pthread_create(&tp[ti - 1], NULL, fanout_max_worker, &ctx[ti]) != 0) {
+            for (k = 0; k < ti - 1; k++) pthread_join(tp[k], NULL);
+            free(ctx);
+            free(tp);
+            return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
+        }
+    }
+
+    fanout_max_worker(&ctx[0]);
+    for (k = 0; k < ninner - 1; k++) pthread_join(tp[k], NULL);
+
+    mx = ctx[0].mx;
+    for (ti = 1; ti < ninner; ti++) {
+        if (ctx[ti].mx > mx) mx = ctx[ti].mx;
+    }
+    free(ctx);
+    free(tp);
     return mx;
 }
 
@@ -2153,13 +2864,14 @@ static int path_ord_merge_max_depth(void) {
     return d;
 }
 
-static size_t *matched_records_build_path_order(const matched_records_t *rec) {
+static size_t *matched_records_build_path_order(const matched_records_t *rec, ereport_run_stats_t *run_rs) {
     size_t *ord;
     size_t *tmp;
     size_t i;
     size_t n;
     int md;
     int nw;
+    uint64_t t0_ns;
 
     if (!rec || rec->count == 0) return NULL;
     n = rec->count;
@@ -2169,10 +2881,12 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec) {
 
     nw = parse_ereport_thread_count();
     if (nw < 1) nw = 1;
+    t0_ns = (run_rs && g_ereport_verbose) ? vt_mono_ns() : 0ULL;
     if (n <= PATH_ORD_QSORT_THRESH || nw < 2) {
         g_bucket_path_sort_items = rec->items;
         qsort(ord, n, sizeof(size_t), matched_path_ord_cmp);
         g_bucket_path_sort_items = NULL;
+        vt_path_sort_commit(run_rs, t0_ns);
         return ord;
     }
 
@@ -2181,6 +2895,7 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec) {
         g_bucket_path_sort_items = rec->items;
         qsort(ord, n, sizeof(size_t), matched_path_ord_cmp);
         g_bucket_path_sort_items = NULL;
+        vt_path_sort_commit(run_rs, t0_ns);
         return ord;
     }
 
@@ -2190,11 +2905,13 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec) {
         g_bucket_path_sort_items = rec->items;
         qsort(ord, n, sizeof(size_t), matched_path_ord_cmp);
         g_bucket_path_sort_items = NULL;
+        vt_path_sort_commit(run_rs, t0_ns);
         return ord;
     }
 
     matched_records_ms_parallel(rec->items, ord, tmp, 0, n, 0, md);
     free(tmp);
+    vt_path_sort_commit(run_rs, t0_ns);
     return ord;
 }
 
@@ -2277,11 +2994,298 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
     return 0;
 }
 
+static size_t path_row_maps_total_used_rows(const path_row_map_t *maps, int nlevels) {
+    size_t d;
+    size_t t = 0;
+
+    if (!maps || nlevels < 1) return 0;
+    for (d = 0; d < (size_t)nlevels; d++) t += maps[d].count;
+    return t;
+}
+
+static int collect_map_row_pointers(path_row_map_t *maps, int nlevels, path_row_t ***out_list, size_t *out_R) {
+    path_row_t **list;
+    size_t R;
+    size_t d, i, w = 0;
+
+    if (!maps || nlevels < 1 || !out_list || !out_R) return -1;
+    R = path_row_maps_total_used_rows(maps, nlevels);
+    *out_list = NULL;
+    *out_R = 0;
+    if (R == 0) return 0;
+
+    list = (path_row_t **)malloc(R * sizeof(*list));
+    if (!list) return -1;
+
+    for (d = 0; d < (size_t)nlevels; d++) {
+        for (i = 0; i < maps[d].cap; i++) {
+            if (maps[d].used[i]) list[w++] = &maps[d].rows[i];
+        }
+    }
+
+    *out_list = list;
+    *out_R = R;
+    return 0;
+}
+
+static int cmp_path_row_ptr(const void *a, const void *b) {
+    uintptr_t pa = (uintptr_t) * (path_row_t *const *)a;
+    uintptr_t pb = (uintptr_t) * (path_row_t *const *)b;
+
+    if (pa < pb) return -1;
+    if (pa > pb) return 1;
+    return 0;
+}
+
+static int row_index_sorted_ptr(path_row_t **sorted, size_t R, path_row_t *row) {
+    uintptr_t k = (uintptr_t)row;
+    size_t lo = 0;
+    size_t hi = R;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        uintptr_t v = (uintptr_t)sorted[mid];
+
+        if (v < k)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < R && (uintptr_t)sorted[lo] == k) return (int)lo;
+    return -1;
+}
+
+static void zero_map_row_corpus_totals(path_row_map_t *maps, int nlevels) {
+    size_t d, i;
+
+    if (!maps || nlevels < 1) return;
+    for (d = 0; d < (size_t)nlevels; d++) {
+        for (i = 0; i < maps[d].cap; i++) {
+            if (!maps[d].used[i]) continue;
+            maps[d].rows[i].total_files = 0;
+            maps[d].rows[i].total_dirs = 0;
+            maps[d].rows[i].total_bytes = 0;
+        }
+    }
+}
+
+typedef struct {
+    path_row_map_t *maps;
+    int nlevels;
+    const matched_records_t *records;
+    const char *base_prefix;
+    const size_t *path_ord;
+    int use_ord_slice;
+    size_t c_lo;
+    size_t c_hi;
+    path_row_t **sorted_rows;
+    size_t R;
+    uint64_t *part_base;
+    atomic_int *fatal_atom;
+} agg_tot_par_wctx_t;
+
+static void *agg_totals_par_worker(void *vp) {
+    agg_tot_par_wctx_t *w = (agg_tot_par_wctx_t *)vp;
+    uint64_t *my = w->part_base;
+    size_t ii;
+
+    memset(my, 0, w->R * 3 * sizeof(uint64_t));
+
+    for (ii = w->c_lo; ii < w->c_hi; ii++) {
+        size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
+        const matched_record_t *r = &w->records->items[i];
+        char prev[PATH_MAX];
+        char rowpath[PATH_MAX];
+        const char *p;
+        int depth;
+
+        if (atomic_load_explicit(w->fatal_atom, memory_order_relaxed)) break;
+
+        p = path_after_base_prefix(r->path, w->base_prefix);
+        if (!p || *p == '\0') continue;
+
+        prev[0] = '\0';
+        if (w->base_prefix) {
+            if (snprintf(prev, sizeof(prev), "%s", w->base_prefix) >= (int)sizeof(prev)) {
+                atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
+                return NULL;
+            }
+        }
+
+        for (depth = 0; depth < w->nlevels; depth++) {
+            const char *start;
+            size_t comp_len;
+            path_row_t *row;
+            int ri;
+
+            while (*p == '/') p++;
+            if (*p == '\0') break;
+
+            start = p;
+            while (*p && *p != '/') p++;
+            comp_len = (size_t)(p - start);
+            if (comp_len == 0) break;
+
+            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) {
+                atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
+                return NULL;
+            }
+
+            row = path_row_map_find(&w->maps[depth], rowpath);
+            if (row) {
+                ri = row_index_sorted_ptr(w->sorted_rows, w->R, row);
+                if (ri >= 0) {
+                    if (r->type == 'f')
+                        my[(size_t)ri * 3 + 0]++;
+                    else if (r->type == 'd')
+                        my[(size_t)ri * 3 + 1]++;
+                    my[(size_t)ri * 3 + 2] += r->size;
+                }
+            }
+
+            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) {
+                atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
+                return NULL;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
+                                              int nlevels,
+                                              const matched_records_t *records,
+                                              const char *base_prefix,
+                                              const size_t *path_ord,
+                                              int use_ord_slice,
+                                              size_t lo,
+                                              size_t hi,
+                                              ereport_run_stats_t *run_rs) {
+    size_t nscan = hi - lo;
+    size_t R;
+    path_row_t **row_list = NULL;
+    uint64_t *parts = NULL;
+    pthread_t *tp = NULL;
+    agg_tot_par_wctx_t *ctxs = NULL;
+    int nw;
+    int j;
+    int started;
+    size_t per;
+    size_t t;
+    atomic_int shared_fatal;
+
+    size_t row_mat_bytes;
+    size_t max_nw;
+
+    if (!maps || nlevels < 1 || !records || lo >= hi) return -1;
+    if (nscan < AGG_TOTALS_PAR_MIN_RECORDS) return -1;
+
+    R = path_row_maps_total_used_rows(maps, nlevels);
+    if (R == 0) return -1;
+
+    nw = parse_ereport_thread_count();
+    if (nw < 2) return -1;
+
+    row_mat_bytes = R * 3 * sizeof(uint64_t);
+    if (row_mat_bytes > 0) {
+        max_nw = AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES / row_mat_bytes;
+        if (max_nw < 2) return -1;
+        if ((size_t)nw > max_nw) nw = (int)max_nw;
+    }
+    atomic_init(&shared_fatal, 0);
+
+    if (collect_map_row_pointers(maps, nlevels, &row_list, &R) != 0) return -1;
+
+    VT_QSORT_BUCKET(run_rs, row_list, R, sizeof(*row_list), cmp_path_row_ptr);
+
+    parts = (uint64_t *)calloc((size_t)nw * R * 3, sizeof(uint64_t));
+    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
+    ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
+    if (!parts || !tp || !ctxs) {
+        free(row_list);
+        free(parts);
+        free(tp);
+        free(ctxs);
+        return -1;
+    }
+
+    started = 0;
+    per = (nscan + (size_t)nw - 1) / (size_t)nw;
+    for (t = 0; t < (size_t)nw; t++) {
+        size_t clo = lo + t * per;
+        size_t chi = clo + per;
+
+        if (clo >= hi) break;
+        if (chi > hi) chi = hi;
+
+        ctxs[started].maps = maps;
+        ctxs[started].nlevels = nlevels;
+        ctxs[started].records = records;
+        ctxs[started].base_prefix = base_prefix;
+        ctxs[started].path_ord = path_ord;
+        ctxs[started].use_ord_slice = use_ord_slice;
+        ctxs[started].c_lo = clo;
+        ctxs[started].c_hi = chi;
+        ctxs[started].sorted_rows = row_list;
+        ctxs[started].R = R;
+        ctxs[started].part_base = parts + (size_t)started * R * 3;
+        ctxs[started].fatal_atom = &shared_fatal;
+
+        if (pthread_create(&tp[started], NULL, agg_totals_par_worker, &ctxs[started]) != 0) break;
+        started++;
+    }
+
+    if (started < 1) {
+        free(row_list);
+        free(parts);
+        free(tp);
+        free(ctxs);
+        return -1;
+    }
+
+    for (j = 0; j < started; j++) pthread_join(tp[j], NULL);
+
+    if (atomic_load_explicit(&shared_fatal, memory_order_relaxed)) {
+        free(row_list);
+        free(parts);
+        free(tp);
+        free(ctxs);
+        return -1;
+    }
+
+    zero_map_row_corpus_totals(maps, nlevels);
+
+    for (t = 0; t < R; t++) {
+        path_row_t *row = row_list[t];
+        uint64_t tf = 0;
+        uint64_t td = 0;
+        uint64_t tb = 0;
+        int s;
+
+        for (s = 0; s < started; s++) {
+            tf += parts[(size_t)s * R * 3 + t * 3 + 0];
+            td += parts[(size_t)s * R * 3 + t * 3 + 1];
+            tb += parts[(size_t)s * R * 3 + t * 3 + 2];
+        }
+        row->total_files = tf;
+        row->total_dirs = td;
+        row->total_bytes = tb;
+    }
+
+    free(row_list);
+    free(parts);
+    free(tp);
+    free(ctxs);
+    return 0;
+}
+
 static int aggregate_totals_for_page_n(path_row_map_t *maps,
                                        int nlevels,
                                        const matched_records_t *records,
                                        const char *base_prefix,
-                                       const size_t *path_ord) {
+                                       const size_t *path_ord,
+                                       ereport_run_stats_t *run_rs) {
     size_t n = records ? records->count : 0;
     size_t lo = 0;
     size_t hi = n;
@@ -2297,6 +3301,10 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
             hi++;
         }
     }
+
+    if (aggregate_totals_for_page_n_parallel(maps, nlevels, records, base_prefix, path_ord, use_ord_slice, lo, hi,
+                                             run_rs) == 0)
+        return 0;
 
     for (ii = lo; ii < hi; ii++) {
         size_t i = use_ord_slice ? path_ord[ii] : ii;
@@ -2547,7 +3555,8 @@ static void emit_path_summary_table(FILE *out,
                                     uint64_t total_user_files,
                                     uint64_t total_user_bytes,
                                     const char *base_prefix,
-                                    int level_idx) {
+                                    int level_idx,
+                                    ereport_run_stats_t *run_rs) {
     path_row_t **rows = NULL;
     size_t count = 0;
     size_t i;
@@ -2567,7 +3576,7 @@ static void emit_path_summary_table(FILE *out,
         return;
     }
 
-    qsort(rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
+    VT_QSORT_BUCKET(run_rs, rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
 
     {
         size_t shown = count;
@@ -2841,7 +3850,8 @@ static void emit_bucket_shape_drill_section(FILE *out,
                                             const fanout_parent_stat_map_t *fanout_stats,
                                             const summary_t *heat_sum,
                                             const path_shape_view_t *shape,
-                                            const char *basis_str) {
+                                            const char *basis_str,
+                                            ereport_run_stats_t *run_rs) {
     uint64_t cell_bytes = heat_sum->bytes[ab][sb];
     uint64_t cell_files = heat_sum->files[ab][sb];
     uint64_t deep_b = shape->cell[ab][sb].deep_bytes;
@@ -2888,7 +3898,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                         k++;
                     }
                 }
-                qsort(rows, dense_cnt, sizeof(*rows), cmp_dense_drill_desc);
+                VT_QSORT_BUCKET(run_rs, rows, dense_cnt, sizeof(*rows), cmp_dense_drill_desc);
                 show_n = dense_cnt;
                 if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
 
@@ -3011,7 +4021,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                             k++;
                         }
                     }
-                    qsort(rows, deep_cnt, sizeof(*rows), cmp_deep_drill_desc);
+                    VT_QSORT_BUCKET(run_rs, rows, deep_cnt, sizeof(*rows), cmp_deep_drill_desc);
                     show_n = deep_cnt;
                     if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
 
@@ -3092,7 +4102,8 @@ static int emit_bucket_detail_page(const char *filename,
                                    const path_shape_view_t *shape,
                                    const dense_cell_map_t (*merged_dense_matrix)[SIZE_BUCKETS],
                                    const dense_cell_fanout_lookup_t *fanout_lookup_shape,
-                                   const fanout_parent_stat_map_t *fanout_parent_stats) {
+                                   const fanout_parent_stat_map_t *fanout_parent_stats,
+                                   ereport_run_stats_t *run_rs) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
     path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
@@ -3285,7 +4296,8 @@ static int emit_bucket_detail_page(const char *filename,
     }
 
     if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix) != 0 ||
-        aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord) != 0) {
+        aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord, run_rs) !=
+            0) {
         free(base_prefix);
         for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
@@ -3341,7 +4353,7 @@ static int emit_bucket_detail_page(const char *filename,
 
     if (merged_dense_matrix && fanout_lookup_shape && heat_sum && shape && details) {
         emit_bucket_shape_drill_section(out, ab, sb, details, &merged_dense_matrix[ab][sb], fanout_lookup_shape,
-                                        fanout_parent_stats, heat_sum, shape, basis_str);
+                                        fanout_parent_stats, heat_sum, shape, basis_str, run_rs);
     }
 
     for (d = 0; d < detail_levels; d++) {
@@ -3355,7 +4367,8 @@ static int emit_bucket_detail_page(const char *filename,
                                 total_user_files,
                                 total_user_bytes,
                                 base_prefix,
-                                d);
+                                d,
+                                run_rs);
     }
 
     fputs("<script>\n"
@@ -3524,7 +4537,10 @@ static void *corp_scan_worker(void *vp) {
 /*
  * Sum regular-file count and byte total over matched_records (for bucket page corpus lines).
  */
-static void corpus_file_byte_totals_parallel(const matched_records_t *mr, uint64_t *out_files, uint64_t *out_bytes) {
+static void corpus_file_byte_totals_parallel(const matched_records_t *mr,
+                                             uint64_t *out_files,
+                                             uint64_t *out_bytes,
+                                             ereport_run_stats_t *run_rs) {
     size_t n;
     int nw;
     size_t per;
@@ -3533,10 +4549,12 @@ static void corpus_file_byte_totals_parallel(const matched_records_t *mr, uint64
     int j;
     corp_scan_worker_ctx_t *ctxs = NULL;
     pthread_t *tp = NULL;
+    double tc0 = 0.0;
 
     *out_files = 0;
     *out_bytes = 0;
     if (!mr || mr->count == 0) return;
+    if (run_rs && g_ereport_verbose) tc0 = now_sec();
     n = mr->count;
 
     nw = parse_ereport_thread_count();
@@ -3551,6 +4569,7 @@ static void corpus_file_byte_totals_parallel(const matched_records_t *mr, uint64
         corp_scan_worker(&one);
         *out_files = one.files;
         *out_bytes = one.bytes;
+        if (run_rs && g_ereport_verbose && tc0 > 0.0) run_rs->vt_bucket_prep_corpus_sec += now_sec() - tc0;
         return;
     }
 
@@ -3566,6 +4585,7 @@ static void corpus_file_byte_totals_parallel(const matched_records_t *mr, uint64
         corp_scan_worker(&one);
         *out_files = one.files;
         *out_bytes = one.bytes;
+        if (run_rs && g_ereport_verbose && tc0 > 0.0) run_rs->vt_bucket_prep_corpus_sec += now_sec() - tc0;
         return;
     }
 
@@ -3597,6 +4617,20 @@ static void corpus_file_byte_totals_parallel(const matched_records_t *mr, uint64
 
     free(ctxs);
     free(tp);
+    if (run_rs && g_ereport_verbose && tc0 > 0.0) run_rs->vt_bucket_prep_corpus_sec += now_sec() - tc0;
+}
+
+typedef struct {
+    const matched_records_t *mr;
+    size_t **out_ord;
+    ereport_run_stats_t *run_rs;
+} path_ord_async_ctx_t;
+
+static void *path_ord_async_worker(void *vp) {
+    path_ord_async_ctx_t *c = (path_ord_async_ctx_t *)vp;
+
+    *c->out_ord = matched_records_build_path_order(c->mr, c->run_rs);
+    return NULL;
 }
 
 static void *bucket_page_emit_worker(void *arg) {
@@ -3636,7 +4670,7 @@ static void *bucket_page_emit_worker(void *arg) {
                                         c->bucket_detail_levels, &c->details[ab][sb], c->matched_records,
                                         c->matched_path_ord, c->corpus_total_user_files, c->corpus_total_user_bytes,
                                         c->sum_ref, c->path_shape, c->merged_dense_matrix, c->fanout_lookup_shape,
-                                        c->fanout_parent_stats);
+                                        c->fanout_parent_stats, c->run_stats);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
         if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
@@ -3686,17 +4720,43 @@ static int emit_all_bucket_detail_pages(const char *username,
     ctx.stub_mode = (bucket_detail_levels == 0 && sum_ref != NULL) ? 1 : 0;
     ctx.run_stats = run_stats;
 
-    if (!ctx.stub_mode && matched_records && matched_records->count > 0) {
-        corpus_file_byte_totals_parallel(matched_records, &ctx.corpus_total_user_files, &ctx.corpus_total_user_bytes);
-        ctx.matched_path_ord = matched_records_build_path_order(matched_records);
+    if (run_stats) {
+        atomic_store(&run_stats->finalize_merge_substep, 0);
+        atomic_store(&run_stats->finalize_phase, 2);
+        atomic_store(&run_stats->finalize_bucket_prep, 1);
+        atomic_store(&run_stats->finalize_bucket_done, 0);
     }
+
+    if (!ctx.stub_mode && matched_records && matched_records->count > 0) {
+        pthread_t ord_th;
+        path_ord_async_ctx_t pac;
+        size_t *ord_out = NULL;
+        double prep_t0 = 0.0;
+
+        if (run_stats && g_ereport_verbose) prep_t0 = now_sec();
+
+        pac.mr = matched_records;
+        pac.out_ord = &ord_out;
+        pac.run_rs = run_stats;
+        if (pthread_create(&ord_th, NULL, path_ord_async_worker, &pac) != 0) {
+            corpus_file_byte_totals_parallel(matched_records, &ctx.corpus_total_user_files,
+                                             &ctx.corpus_total_user_bytes, run_stats);
+            ctx.matched_path_ord = matched_records_build_path_order(matched_records, run_stats);
+        } else {
+            corpus_file_byte_totals_parallel(matched_records, &ctx.corpus_total_user_files,
+                                             &ctx.corpus_total_user_bytes, run_stats);
+            pthread_join(ord_th, NULL);
+            ctx.matched_path_ord = ord_out;
+        }
+
+        if (run_stats && g_ereport_verbose && prep_t0 > 0.0)
+            run_stats->vt_bucket_prep_wall_sec += now_sec() - prep_t0;
+    }
+
+    if (run_stats) atomic_store(&run_stats->finalize_bucket_prep, 0);
 
     atomic_init(&ctx.next_task, 0);
     atomic_init(&ctx.any_fail, 0);
-    if (run_stats) {
-        atomic_store(&run_stats->finalize_phase, 2);
-        atomic_store(&run_stats->finalize_bucket_done, 0);
-    }
 
     nw = parse_ereport_thread_count();
     if (nw < 1) nw = 1;
@@ -3714,22 +4774,32 @@ static int emit_all_bucket_detail_pages(const char *username,
 
     for (ti = 0; ti < (size_t)nw; ti++) args[ti].ctx = &ctx;
 
-    for (ti = 0; ti < (size_t)nw; ti++) {
-        if (pthread_create(&tids[ti], NULL, bucket_page_emit_worker, &args[ti]) != 0) {
-            size_t j;
-            fprintf(stderr, "ereport: pthread_create failed (bucket page worker); retrying sequentially\n");
-            for (j = 0; j < ti; j++) pthread_join(tids[j], NULL);
-            free(tids);
-            atomic_store(&ctx.next_task, 0);
-            atomic_store(&ctx.any_fail, 0);
-            bucket_page_emit_worker(&args[0]);
-            free(args);
-            free(ctx.matched_path_ord);
-            return atomic_load(&ctx.any_fail) ? -1 : 0;
-        }
-    }
+    {
+        double cell_t0 = 0.0;
 
-    for (ti = 0; ti < (size_t)nw; ti++) pthread_join(tids[ti], NULL);
+        if (run_stats && g_ereport_verbose) cell_t0 = now_sec();
+
+        for (ti = 0; ti < (size_t)nw; ti++) {
+            if (pthread_create(&tids[ti], NULL, bucket_page_emit_worker, &args[ti]) != 0) {
+                size_t j;
+                fprintf(stderr, "ereport: pthread_create failed (bucket page worker); retrying sequentially\n");
+                for (j = 0; j < ti; j++) pthread_join(tids[j], NULL);
+                free(tids);
+                atomic_store(&ctx.next_task, 0);
+                atomic_store(&ctx.any_fail, 0);
+                bucket_page_emit_worker(&args[0]);
+                free(args);
+                free(ctx.matched_path_ord);
+                if (run_stats && g_ereport_verbose && cell_t0 > 0.0)
+                    run_stats->vt_bucket_cells_wall_sec += now_sec() - cell_t0;
+                return atomic_load(&ctx.any_fail) ? -1 : 0;
+            }
+        }
+
+        for (ti = 0; ti < (size_t)nw; ti++) pthread_join(tids[ti], NULL);
+        if (run_stats && g_ereport_verbose && cell_t0 > 0.0)
+            run_stats->vt_bucket_cells_wall_sec += now_sec() - cell_t0;
+    }
     free(tids);
     free(args);
     free(ctx.matched_path_ord);
@@ -3992,6 +5062,7 @@ typedef struct {
     const mr_fin_slice_t *slices;
     int n_slices;
     atomic_int next;
+    ereport_run_stats_t *run_rs;
 } mr_fin_slice_ctx_t;
 
 static void *mr_fin_slice_worker(void *vp) {
@@ -4004,6 +5075,8 @@ static void *mr_fin_slice_worker(void *vp) {
             const mr_fin_slice_t *sl = &c->slices[s];
             if (sl->n) memcpy(sl->dst, sl->src, sl->n * sizeof(matched_record_t));
         }
+        if (c->run_rs)
+            atomic_fetch_add_explicit(&c->run_rs->finalize_matched_slices_done, 1, memory_order_relaxed);
     }
     return NULL;
 }
@@ -4012,7 +5085,10 @@ static void *mr_fin_slice_worker(void *vp) {
  * Single malloc + parallel memcpy into contiguous matched-record array.
  * Splits each parse-worker shard into MR_FIN_RECORDS_PER_TASK slices so imbalanced shards use all cores.
  */
-static int matched_records_finalize_parallel(worker_arg_t *args, int threads_used, matched_records_t *dst) {
+static int matched_records_finalize_parallel(worker_arg_t *args,
+                                             int threads_used,
+                                             matched_records_t *dst,
+                                             ereport_run_stats_t *run_rs) {
     size_t *prefix;
     size_t total;
     int nw, i, nw_started;
@@ -4021,6 +5097,11 @@ static int matched_records_finalize_parallel(worker_arg_t *args, int threads_use
     pthread_t *pool = NULL;
     mr_fin_slice_t *slices = NULL;
     mr_fin_slice_ctx_t sctx;
+
+    if (run_rs) {
+        atomic_store(&run_rs->finalize_matched_slices_total, 0);
+        atomic_store(&run_rs->finalize_matched_slices_done, 0);
+    }
 
     prefix = (size_t *)malloc((size_t)(threads_used + 1) * sizeof(size_t));
     if (!prefix) return -1;
@@ -4114,6 +5195,12 @@ static int matched_records_finalize_parallel(worker_arg_t *args, int threads_use
     sctx.slices = slices;
     sctx.n_slices = ns;
     atomic_init(&sctx.next, 0);
+    sctx.run_rs = run_rs;
+
+    if (run_rs) {
+        atomic_store(&run_rs->finalize_matched_slices_total, ns);
+        atomic_store(&run_rs->finalize_matched_slices_done, 0);
+    }
 
     nw_started = 0;
     for (i = 0; i < nw; i++) {
@@ -4123,10 +5210,13 @@ static int matched_records_finalize_parallel(worker_arg_t *args, int threads_use
 
     if (nw_started > 0) {
         for (i = 0; i < nw_started; i++) pthread_join(pool[i], NULL);
-    }
-    if (nw_started == 0) {
+    } else {
         for (si = 0; si < ns; si++) {
             if (slices[si].n) memcpy(slices[si].dst, slices[si].src, slices[si].n * sizeof(matched_record_t));
+        }
+        if (run_rs) {
+            atomic_store(&run_rs->finalize_matched_slices_total, 0);
+            atomic_store(&run_rs->finalize_matched_slices_done, 0);
         }
     }
 
@@ -4140,32 +5230,68 @@ static int matched_records_finalize_parallel(worker_arg_t *args, int threads_use
         args[i].matched_records.cap = 0;
     }
     free(prefix);
+    if (run_rs) {
+        atomic_store(&run_rs->finalize_matched_slices_total, 0);
+        atomic_store(&run_rs->finalize_matched_slices_done, 0);
+    }
     return 0;
 }
 
 /*
- * Merge parse-worker dense maps for one age×size cell (sequential pairwise rounds;
- * each merge fans out over hash buckets inside dense_cell_merge_into).
+ * Parallel pairwise merge of dense_cell_map_t buffers (same invariants as fanout_pair_merge_worker).
+ */
+typedef struct {
+    dense_cell_map_t *dbuf;
+    atomic_int *next_pair;
+    int pairs;
+    int merge_budget;
+} dense_pair_merge_ctx_t;
+
+static void *dense_pair_merge_worker(void *vp) {
+    dense_pair_merge_ctx_t *c = (dense_pair_merge_ctx_t *)vp;
+
+    for (;;) {
+        int p = atomic_fetch_add_explicit(c->next_pair, 1, memory_order_relaxed);
+        if (p >= c->pairs) break;
+        dense_cell_merge_into_ex(&c->dbuf[2 * p], &c->dbuf[2 * p + 1], NULL, c->merge_budget);
+    }
+    return NULL;
+}
+
+/*
+ * Merge parse-worker dense maps for one age×size cell: parallel pairwise tournament when many workers,
+ * parallel inner merges (dense_cell_merge_into_ex); final fold into dst uses all threads.
  */
 static void dense_cell_reduce_workers_into(dense_cell_map_t *dst,
                                            worker_arg_t *args,
                                            int threads_used,
                                            int ab,
                                            int sb) {
-    dense_cell_map_t *buf;
+    dense_cell_map_t *buf = NULL;
     int n;
     int ti;
+    int pairs;
+    int j;
+    int k;
+    int nw;
+    int n_join;
+    int conc;
+    int merge_budget;
+    pthread_t *tids = NULL;
+    dense_pair_merge_ctx_t *targs = NULL;
+    atomic_int next_pair;
 
     if (!dst || !args || threads_used < 1) return;
 
     if (threads_used == 1) {
-        dense_cell_merge_into(dst, &args[0].dense_maps[ab][sb], NULL);
+        dense_cell_merge_into_ex(dst, &args[0].dense_maps[ab][sb], NULL, parse_ereport_thread_count());
         return;
     }
 
-    buf = (dense_cell_map_t *)malloc((size_t)threads_used * sizeof(*buf));
+    buf = (dense_cell_map_t *)calloc((size_t)threads_used, sizeof(*buf));
     if (!buf) {
-        for (ti = 0; ti < threads_used; ti++) dense_cell_merge_into(dst, &args[ti].dense_maps[ab][sb], NULL);
+        for (ti = 0; ti < threads_used; ti++)
+            dense_cell_merge_into_ex(dst, &args[ti].dense_maps[ab][sb], NULL, parse_ereport_thread_count());
         return;
     }
 
@@ -4176,23 +5302,229 @@ static void dense_cell_reduce_workers_into(dense_cell_map_t *dst,
 
     n = threads_used;
     while (n > 1) {
-        int pairs = n / 2;
-        int ii;
+        pairs = n / 2;
+        if (pairs <= 0) break;
 
-        if (pairs > 0) {
-            for (ii = 0; ii < pairs; ii++) dense_cell_merge_into(&buf[2 * ii], &buf[2 * ii + 1], NULL);
+        nw = parse_ereport_thread_count();
+        if (nw < 1) nw = 1;
+        if (nw > pairs) nw = pairs;
+
+        if (pairs < 2 || nw < 2) {
+            for (j = 0; j < pairs; j++)
+                dense_cell_merge_into_ex(&buf[2 * j], &buf[2 * j + 1], NULL, parse_ereport_thread_count());
+        } else {
+            atomic_store_explicit(&next_pair, 0, memory_order_relaxed);
+            tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+            targs = (dense_pair_merge_ctx_t *)calloc((size_t)nw, sizeof(*targs));
+            if (!tids || !targs) {
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+                for (j = 0; j < pairs; j++)
+                    dense_cell_merge_into_ex(&buf[2 * j], &buf[2 * j + 1], NULL, parse_ereport_thread_count());
+            } else {
+                conc = pairs < nw ? pairs : nw;
+                merge_budget = parse_ereport_thread_count();
+                if (merge_budget < 1) merge_budget = 1;
+                merge_budget = (merge_budget + conc - 1) / conc;
+                if (merge_budget < 1) merge_budget = 1;
+                n_join = 0;
+                for (ti = 0; ti < nw; ti++) {
+                    targs[ti].dbuf = buf;
+                    targs[ti].next_pair = &next_pair;
+                    targs[ti].pairs = pairs;
+                    targs[ti].merge_budget = merge_budget;
+                    if (pthread_create(&tids[ti], NULL, dense_pair_merge_worker, &targs[ti]) != 0) break;
+                    n_join++;
+                }
+                for (ti = 0; ti < n_join; ti++) pthread_join(tids[ti], NULL);
+                for (;;) {
+                    int p = atomic_fetch_add_explicit(&next_pair, 1, memory_order_relaxed);
+                    if (p >= pairs) break;
+                    dense_cell_merge_into_ex(&buf[2 * p], &buf[2 * p + 1], NULL, merge_budget);
+                }
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+            }
         }
 
-        {
-            int k = 0;
-            for (ii = 0; ii < pairs; ii++) buf[k++] = buf[2 * ii];
-            if (n % 2 == 1) buf[k++] = buf[n - 1];
-            n = k;
+        k = 0;
+        for (j = 0; j < pairs; j++) {
+            buf[k] = buf[2 * j];
+            k++;
         }
+        if (n % 2 == 1) {
+            buf[k] = buf[n - 1];
+            k++;
+        }
+        n = k;
     }
 
-    dense_cell_merge_into(dst, &buf[0], NULL);
+    dense_cell_merge_into_ex(dst, &buf[0], NULL, parse_ereport_thread_count());
+    memset(&buf[0], 0, sizeof(buf[0]));
     free(buf);
+}
+
+/*
+ * Parallel tournament merge of per-parse-worker parent_fanout maps into one (disjoint dst per pair).
+ * Each thread merges buf[2p+1] into buf[2p] for distinct p — safe (disjoint dst per pair; see dense_cell_merge_into_ex).
+ */
+typedef struct {
+    dense_cell_map_t *dbuf;
+    fanout_parent_stat_map_t *sbuf;
+    atomic_int *next_pair;
+    int pairs;
+    int merge_budget;
+} fanout_pair_merge_ctx_t;
+
+static void *fanout_pair_merge_worker(void *vp) {
+    fanout_pair_merge_ctx_t *c = (fanout_pair_merge_ctx_t *)vp;
+
+    for (;;) {
+        int p = atomic_fetch_add_explicit(c->next_pair, 1, memory_order_relaxed);
+        if (p >= c->pairs) break;
+        dense_cell_merge_into_ex(&c->dbuf[2 * p], &c->dbuf[2 * p + 1], NULL, c->merge_budget);
+        fanout_parent_stat_merge_into(&c->sbuf[2 * p], &c->sbuf[2 * p + 1], NULL);
+    }
+    return NULL;
+}
+
+/*
+ * Fold args[0..threads_used).parent_fanout (+ stats) into merged_* using parallel pairwise rounds when beneficial.
+ * On failure returns -1 (caller falls back to sequential merge from args — args unchanged on -1).
+ */
+static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanout,
+                                                  fanout_parent_stat_map_t *merged_fanout_stats,
+                                                  worker_arg_t *args,
+                                                  int threads_used,
+                                                  ereport_run_stats_t *run_rs) {
+    dense_cell_map_t *dbuf = NULL;
+    fanout_parent_stat_map_t *sbuf = NULL;
+    int n;
+    int i;
+    int pairs;
+    int j;
+    int k;
+    int nw;
+    int ti;
+    int n_join;
+    int conc;
+    int merge_budget;
+    pthread_t *tids = NULL;
+    fanout_pair_merge_ctx_t *targs = NULL;
+    atomic_int next_pair;
+
+    if (!merged_fanout || !merged_fanout_stats || !args || threads_used < 1) return 0;
+
+    if (threads_used == 1) {
+        dense_cell_merge_into_ex(merged_fanout, &args[0].parent_fanout, NULL, parse_ereport_thread_count());
+        fanout_parent_stat_merge_into(merged_fanout_stats, &args[0].parent_fanout_stats, NULL);
+        memset(&args[0].parent_fanout, 0, sizeof(args[0].parent_fanout));
+        memset(&args[0].parent_fanout_stats, 0, sizeof(args[0].parent_fanout_stats));
+        if (run_rs) atomic_store(&run_rs->finalize_fanout_workers_done, 1);
+        return 0;
+    }
+
+    dbuf = (dense_cell_map_t *)calloc((size_t)threads_used, sizeof(*dbuf));
+    sbuf = (fanout_parent_stat_map_t *)calloc((size_t)threads_used, sizeof(*sbuf));
+    if (!dbuf || !sbuf) {
+        free(dbuf);
+        free(sbuf);
+        return -1;
+    }
+
+    for (i = 0; i < threads_used; i++) {
+        dbuf[i] = args[i].parent_fanout;
+        sbuf[i] = args[i].parent_fanout_stats;
+        memset(&args[i].parent_fanout, 0, sizeof(args[i].parent_fanout));
+        memset(&args[i].parent_fanout_stats, 0, sizeof(args[i].parent_fanout_stats));
+    }
+
+    n = threads_used;
+    while (n > 1) {
+        pairs = n / 2;
+        if (pairs <= 0) break;
+
+        nw = parse_ereport_thread_count();
+        if (nw < 1) nw = 1;
+        if (nw > pairs) nw = pairs;
+
+        if (pairs < 2 || nw < 2) {
+            /* pairs==1 (2 survivors → 1): still merge one huge map; use parallel dense merge, not single-threaded. */
+            for (j = 0; j < pairs; j++) {
+                dense_cell_merge_into_ex(&dbuf[2 * j], &dbuf[2 * j + 1], NULL, parse_ereport_thread_count());
+                fanout_parent_stat_merge_into(&sbuf[2 * j], &sbuf[2 * j + 1], NULL);
+            }
+        } else {
+            atomic_store_explicit(&next_pair, 0, memory_order_relaxed);
+            tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+            targs = (fanout_pair_merge_ctx_t *)calloc((size_t)nw, sizeof(*targs));
+            if (!tids || !targs) {
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+                for (j = 0; j < pairs; j++) {
+                    dense_cell_merge_into_ex(&dbuf[2 * j], &dbuf[2 * j + 1], NULL, parse_ereport_thread_count());
+                    fanout_parent_stat_merge_into(&sbuf[2 * j], &sbuf[2 * j + 1], NULL);
+                }
+            } else {
+                conc = pairs < nw ? pairs : nw;
+                merge_budget = parse_ereport_thread_count();
+                if (merge_budget < 1) merge_budget = 1;
+                merge_budget = (merge_budget + conc - 1) / conc;
+                if (merge_budget < 1) merge_budget = 1;
+                n_join = 0;
+                for (ti = 0; ti < nw; ti++) {
+                    targs[ti].dbuf = dbuf;
+                    targs[ti].sbuf = sbuf;
+                    targs[ti].next_pair = &next_pair;
+                    targs[ti].pairs = pairs;
+                    targs[ti].merge_budget = merge_budget;
+                    if (pthread_create(&tids[ti], NULL, fanout_pair_merge_worker, &targs[ti]) != 0) break;
+                    n_join++;
+                }
+                for (ti = 0; ti < n_join; ti++) pthread_join(tids[ti], NULL);
+                for (;;) {
+                    int p = atomic_fetch_add_explicit(&next_pair, 1, memory_order_relaxed);
+                    if (p >= pairs) break;
+                    dense_cell_merge_into_ex(&dbuf[2 * p], &dbuf[2 * p + 1], NULL, merge_budget);
+                    fanout_parent_stat_merge_into(&sbuf[2 * p], &sbuf[2 * p + 1], NULL);
+                }
+                free(tids);
+                free(targs);
+                tids = NULL;
+                targs = NULL;
+            }
+        }
+
+        k = 0;
+        for (j = 0; j < pairs; j++) {
+            dbuf[k] = dbuf[2 * j];
+            sbuf[k] = sbuf[2 * j];
+            k++;
+        }
+        if (n % 2 == 1) {
+            dbuf[k] = dbuf[n - 1];
+            sbuf[k] = sbuf[n - 1];
+            k++;
+        }
+        n = k;
+        if (run_rs) atomic_store(&run_rs->finalize_fanout_workers_done, threads_used - n);
+    }
+
+    dense_cell_merge_into_ex(merged_fanout, &dbuf[0], NULL, parse_ereport_thread_count());
+    fanout_parent_stat_merge_into(merged_fanout_stats, &sbuf[0], NULL);
+    if (run_rs) atomic_store(&run_rs->finalize_fanout_workers_done, threads_used);
+
+    memset(&dbuf[0], 0, sizeof(dbuf[0]));
+    memset(&sbuf[0], 0, sizeof(sbuf[0]));
+    free(dbuf);
+    free(sbuf);
+    return 0;
 }
 
 typedef struct {
@@ -4202,6 +5534,7 @@ typedef struct {
     dense_cell_map_t (*merged_dense)[SIZE_BUCKETS];
     atomic_int next_cell;
     atomic_int fail;
+    ereport_run_stats_t *run_stats;
 } cell_fin_ctx_t;
 
 static void *cell_fin_worker(void *vp) {
@@ -4224,6 +5557,8 @@ static void *cell_fin_worker(void *vp) {
         }
 
         dense_cell_reduce_workers_into(&c->merged_dense[ab][sb], c->args, c->threads_used, ab, sb);
+        if (c->run_stats)
+            atomic_fetch_add_explicit(&c->run_stats->finalize_dense_cells_done, 1U, memory_order_relaxed);
     }
     return NULL;
 }
@@ -4234,11 +5569,18 @@ static void *cell_fin_worker(void *vp) {
 static int bucket_dense_cells_finalize_parallel(worker_arg_t *args,
                                                 int threads_used,
                                                 bucket_details_t final_details[AGE_BUCKETS][SIZE_BUCKETS],
-                                                dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS]) {
+                                                dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS],
+                                                ereport_run_stats_t *run_rs) {
     const int ncells = AGE_BUCKETS * SIZE_BUCKETS;
     int nw, i, nw_started, task, ab, sb;
     pthread_t *pool = NULL;
     cell_fin_ctx_t ctx;
+
+    if (run_rs) {
+        atomic_store(&run_rs->finalize_fanout_workers_total, 0);
+        atomic_store(&run_rs->finalize_fanout_workers_done, 0);
+        atomic_store(&run_rs->finalize_dense_cells_done, 0U);
+    }
 
     nw = parse_ereport_thread_count();
     if (nw < 1) nw = 1;
@@ -4248,6 +5590,7 @@ static int bucket_dense_cells_finalize_parallel(worker_arg_t *args,
     ctx.threads_used = threads_used;
     ctx.final_details = final_details;
     ctx.merged_dense = merged_dense;
+    ctx.run_stats = run_rs;
     atomic_init(&ctx.fail, 0);
     atomic_init(&ctx.next_cell, 0);
 
@@ -4257,6 +5600,7 @@ static int bucket_dense_cells_finalize_parallel(worker_arg_t *args,
             sb = task % SIZE_BUCKETS;
             if (bucket_details_finalize_cell(args, threads_used, &final_details[ab][sb], ab, sb) != 0) return -1;
             dense_cell_reduce_workers_into(&merged_dense[ab][sb], args, threads_used, ab, sb);
+            if (run_rs) atomic_fetch_add_explicit(&run_rs->finalize_dense_cells_done, 1U, memory_order_relaxed);
         }
         return 0;
     }
@@ -4268,6 +5612,7 @@ static int bucket_dense_cells_finalize_parallel(worker_arg_t *args,
             sb = task % SIZE_BUCKETS;
             if (bucket_details_finalize_cell(args, threads_used, &final_details[ab][sb], ab, sb) != 0) return -1;
             dense_cell_reduce_workers_into(&merged_dense[ab][sb], args, threads_used, ab, sb);
+            if (run_rs) atomic_fetch_add_explicit(&run_rs->finalize_dense_cells_done, 1U, memory_order_relaxed);
         }
         return 0;
     }
@@ -4289,6 +5634,7 @@ static int bucket_dense_cells_finalize_parallel(worker_arg_t *args,
                 return -1;
             }
             dense_cell_reduce_workers_into(&merged_dense[ab][sb], args, threads_used, ab, sb);
+            if (run_rs) atomic_fetch_add_explicit(&run_rs->finalize_dense_cells_done, 1U, memory_order_relaxed);
         }
         free(pool);
         return 0;
@@ -4898,27 +6244,49 @@ static void *stats_thread_main(void *arg) {
         window_records = atomic_load(&g_window_records);
         elapsed_sec = rs->run_start_sec > 0.0 ? now_sec() - rs->run_start_sec : 0.0;
 
+        if (g_ereport_verbose && rs->run_start_sec > 0.0) {
+            static double s_last_verbose_runtime_peek;
+            double npeek = now_sec();
+
+            if (s_last_verbose_runtime_peek == 0.0) s_last_verbose_runtime_peek = rs->run_start_sec;
+            if (npeek - s_last_verbose_runtime_peek >= 30.0) {
+                s_last_verbose_runtime_peek = npeek;
+                fprintf(stderr, "\n");
+                ereport_verbose_fprint_runtime_peek(rs);
+            }
+        }
+
         {
             unsigned int divisor = atomic_load(&g_seconds_seen);
             if (divisor == 0) divisor = 1;
             records_rate = (double)window_records / (double)divisor;
         }
 
-        rs->records_rate_sum += records_rate;
-        if (rs->records_rate_samples == 0 || records_rate < rs->records_rate_min) rs->records_rate_min = records_rate;
-        if (rs->records_rate_samples == 0 || records_rate > rs->records_rate_max) rs->records_rate_max = records_rate;
-        rs->records_rate_samples++;
-
-        human_decimal((double)scanned_files, sf, sizeof(sf));
-        human_decimal((double)rs->input_files_total, tf, sizeof(tf));
-        human_decimal((double)scanned_records, sr, sizeof(sr));
-        human_decimal((double)matched_records, mr, sizeof(mr));
-        human_decimal(records_rate, rr, sizeof(rr));
-        format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
+        if (g_ereport_verbose) {
+            rs->records_rate_sum += records_rate;
+            if (rs->records_rate_samples == 0 || records_rate < rs->records_rate_min) rs->records_rate_min = records_rate;
+            if (rs->records_rate_samples == 0 || records_rate > rs->records_rate_max) rs->records_rate_max = records_rate;
+            rs->records_rate_samples++;
+        }
 
         {
             uint64_t prep_tot_u = rs->chunk_prep_files_total;
             unsigned long long prep_done_u = atomic_load(&rs->chunk_prep_files_done);
+            int fin = atomic_load(&rs->parse_workers_done);
+            static unsigned int s_quiet_line_tick;
+            int do_status_line;
+
+            s_quiet_line_tick++;
+            do_status_line = g_ereport_verbose || fin || (s_quiet_line_tick % 5u == 0u);
+
+            if (!do_status_line) continue;
+
+            human_decimal((double)scanned_files, sf, sizeof(sf));
+            human_decimal((double)rs->input_files_total, tf, sizeof(tf));
+            human_decimal((double)scanned_records, sr, sizeof(sr));
+            human_decimal((double)matched_records, mr, sizeof(mr));
+            human_decimal(records_rate, rr, sizeof(rr));
+            format_duration(elapsed_sec, elapsed_buf, sizeof(elapsed_buf));
 
             if (prep_tot_u > 0ULL && prep_done_u < prep_tot_u) {
                 char pdone[32], ptot[32];
@@ -4927,7 +6295,7 @@ static void *stats_thread_main(void *arg) {
                 printf("\rchunk-map files:%s/%s | scanning bin headers for parallel parse | el:%s            ", pdone, ptot,
                        elapsed_buf);
                 fflush(stdout);
-                {
+                if (g_ereport_verbose) {
                     static double last_chunk_map_path_log;
                     double now_cp = now_sec();
                     volatile const char **wpaths = rs->chunk_map_worker_paths;
@@ -4955,7 +6323,11 @@ static void *stats_thread_main(void *arg) {
             } else if (atomic_load(&rs->parse_workers_done)) {
                 int phase = atomic_load(&rs->finalize_phase);
                 unsigned int bdone = atomic_load(&rs->finalize_bucket_done);
+                int merge_sub = atomic_load(&rs->finalize_merge_substep);
+                int bucket_prep = atomic_load(&rs->finalize_bucket_prep);
+                unsigned int idx_step = atomic_load(&rs->finalize_index_step);
                 const char *step;
+                const char *msub;
 
                 if (phase == 1)
                     step = "merging shard summaries";
@@ -4966,12 +6338,125 @@ static void *stats_thread_main(void *arg) {
                 else
                     step = "finalizing";
 
+                msub = ereport_finalize_merge_substep_cstr(merge_sub);
+
                 if (phase == 2) {
+                    if (bucket_prep) {
+                        printf(
+                            "\rfinalizing: %s (prep: corpus scan + path order) | files:%s/%s rec:%s match:%s bad:%llu | "
+                            "el:%s            ",
+                            step,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else {
+                        printf(
+                            "\rfinalizing: %s (cells %u/%d) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            bdone,
+                            AGE_BUCKETS * SIZE_BUCKETS,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    }
+                } else if (phase == 3) {
+                    const char *ilab = ereport_finalize_index_step_cstr(idx_step);
+                    if (idx_step > 0U && idx_step <= EREPORT_INDEX_PROGRESS_STEPS && ilab[0]) {
+                        printf(
+                            "\rfinalizing: %s (%u/%u %s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            idx_step,
+                            EREPORT_INDEX_PROGRESS_STEPS,
+                            ilab,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else {
+                        printf(
+                            "\rfinalizing: %s | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    }
+                } else if (phase == 1 && merge_sub == 2) {
+                    int mst = atomic_load(&rs->finalize_matched_slices_total);
+                    int msd = atomic_load(&rs->finalize_matched_slices_done);
+
+                    if (mst > 0) {
+                        printf(
+                            "\rfinalizing: %s (matched paths memcpy %d/%d) | files:%s/%s rec:%s match:%s bad:%llu | "
+                            "el:%s            ",
+                            step,
+                            msd,
+                            mst,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else {
+                        printf(
+                            "\rfinalizing: %s (%s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            msub,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    }
+                } else if (phase == 1 && merge_sub == 3) {
+                    unsigned int dcells = atomic_load(&rs->finalize_dense_cells_done);
+                    const int ndc = AGE_BUCKETS * SIZE_BUCKETS;
+                    int fft = atomic_load(&rs->finalize_fanout_workers_total);
+                    int ffd = atomic_load(&rs->finalize_fanout_workers_done);
+
+                    if (fft > 0 && ffd < fft) {
+                        printf(
+                            "\rfinalizing: %s (fanout merge workers %d/%d) | files:%s/%s rec:%s match:%s bad:%llu | "
+                            "el:%s            ",
+                            step,
+                            ffd,
+                            fft,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else {
+                        printf(
+                            "\rfinalizing: %s (dense cells %u/%d) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            dcells,
+                            ndc,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    }
+                } else if (phase == 1 && msub[0]) {
                     printf(
-                        "\rfinalizing: %s (%u/%d) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                        "\rfinalizing: %s (%s) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
                         step,
-                        bdone,
-                        AGE_BUCKETS * SIZE_BUCKETS,
+                        msub,
                         sf,
                         tf,
                         sr,
@@ -5379,7 +6864,8 @@ static int emit_html(const char *report_path,
                      int threads_used,
                      size_t crawl_source_count,
                      const char *crawl_sources_label,
-                     const ereport_crawl_timing_t *crawl_timing) {
+                     const ereport_crawl_timing_t *crawl_timing,
+                     ereport_run_stats_t *prog_rs) {
     FILE *out = counted_fopen(report_path, "w");
     int ab, sb;
     double max_inner_pct_b = 0.0;
@@ -5558,6 +7044,8 @@ static int emit_html(const char *report_path,
     fprintf(out, "<button type=\"button\" id=\"path-search-next\">Next</button>\n");
     fprintf(out, "</div>\n</div>\n</div>\n");
     fprintf(out, "</section>\n");
+
+    ereport_index_prog(prog_rs, 1u);
 
     for (ab = 0; ab < AGE_BUCKETS; ab++) {
         for (sb = 0; sb < SIZE_BUCKETS; sb++) {
@@ -5760,6 +7248,8 @@ static int emit_html(const char *report_path,
 
     fprintf(out, "</table>\n");
 
+    ereport_index_prog(prog_rs, 2u);
+
     fputs("<details class=\"bucket-help\"><summary>How to read this heat map</summary>\n"
           "<div class=\"bucket-help-body\"><ul>\n"
           "<li><strong>Axes.</strong> Rows are file age from the report time basis (<em>atime</em>, <em>mtime</em>, "
@@ -5809,6 +7299,8 @@ static int emit_html(const char *report_path,
           "appear only on inner age&times;size cells, not on these margin totals.</li>\n"
           "</ul></div></details>\n",
           out);
+
+    ereport_index_prog(prog_rs, 3u);
 
     {
         char totalb[32];
@@ -5892,11 +7384,16 @@ static int emit_html(const char *report_path,
         fprintf(out, "</section>\n");
     }
 
+    ereport_index_prog(prog_rs, 4u);
+
     fprintf(out, "<div id=\"drawer-backdrop\" class=\"drawer-backdrop\"></div>\n");
     fprintf(out, "<aside id=\"bucket-drawer\" class=\"drawer\" aria-hidden=\"true\">\n");
     fprintf(out, "<div class=\"drawer-head\"><div><div id=\"bucket-title\" class=\"drawer-title\">Bucket Details</div><div class=\"drawer-sub\">Click a heatmap cell to inspect that bucket.</div></div><div class=\"drawer-actions\"><a id=\"bucket-open\" href=\"#\" target=\"_blank\" rel=\"noopener\">Open page</a><button type=\"button\" id=\"bucket-close\">Close</button></div></div>\n");
     fprintf(out, "<iframe id=\"bucket-frame\" class=\"drawer-frame\" title=\"Bucket details\" loading=\"lazy\"></iframe>\n");
     fprintf(out, "</aside>\n");
+
+    ereport_index_prog(prog_rs, 5u);
+
     fprintf(out, "<script>\n");
     fputs("(function(){\n", out);
     fputs("'use strict';\n", out);
@@ -6054,6 +7551,9 @@ static int emit_html(const char *report_path,
     fputs("})();\n", out);
     emit_heat_badge_tip_install_js(out);
     fprintf(out, "</script>\n");
+
+    ereport_index_prog(prog_rs, 6u);
+
     fprintf(out, "</body>\n</html>\n");
     if (counted_fclose(out) != 0) return -1;
     return 0;
@@ -6108,6 +7608,7 @@ static void emit_run_stats(const char *username,
     human_decimal(min_records, min_records_buf, sizeof(min_records_buf));
 
     printf("report_type=ereport\n");
+    printf("verbose=%d\n", g_ereport_verbose ? 1 : 0);
     printf("user=%s\n", username);
     printf("aggregate_all_users=%d\n", all_users ? 1 : 0);
     printf("bucket_detail_levels=%d\n", bucket_detail_levels);
@@ -6135,16 +7636,78 @@ static void emit_run_stats(const char *username,
     printf("total_capacity_in_others=%" PRIu64 "\n", sum->total_other_bytes);
     printf("total_capacity_in_non_files=%" PRIu64 "\n", (sum->total_capacity_bytes - sum->total_bytes));
     printf("bad_input_files=%" PRIu64 "\n", sum->bad_input_files);
-    printf("io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
-    printf("io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
-    printf("io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
-    printf("io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
-    printf("io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
-    printf("io_fread_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fread_calls));
+    if (g_ereport_verbose) {
+        printf("io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
+        printf("io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
+        printf("io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
+        printf("io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
+        printf("io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
+        printf("io_fread_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fread_calls));
+        printf("mean_records_per_sec=%s\n", mean_records_buf);
+        printf("max_records_per_sec=%s\n", max_records_buf);
+        printf("min_records_per_sec=%s\n", min_records_buf);
+        if (run_rs) {
+            double path_sort_sec =
+                (double)atomic_load_explicit(&run_rs->vt_ns_path_sort, memory_order_relaxed) / 1e9;
+            double bucket_emit_sort_sec =
+                (double)atomic_load_explicit(&run_rs->vt_ns_bucket_emit_sort, memory_order_relaxed) / 1e9;
+            double w;
+            double other;
+
+            w = run_rs->vt_chunk_map_sec;
+            printf("phase_chunk_map_wall_sec=%.6f\n", w);
+            printf("phase_chunk_map_sort_sec=0.000000\n");
+            printf("phase_chunk_map_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_parse_workers_sec;
+            printf("phase_parse_workers_wall_sec=%.6f\n", w);
+            printf("phase_parse_workers_sort_sec=0.000000\n");
+            printf("phase_parse_workers_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_fini_summaries_sec;
+            printf("phase_finalize_summaries_wall_sec=%.6f\n", w);
+            printf("phase_finalize_summaries_sort_sec=0.000000\n");
+            printf("phase_finalize_summaries_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_fini_matched_paths_sec;
+            printf("phase_finalize_matched_paths_wall_sec=%.6f\n", w);
+            printf("phase_finalize_matched_paths_sort_sec=0.000000\n");
+            printf("phase_finalize_matched_paths_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_fini_directory_maps_dense_sec;
+            printf("phase_finalize_directory_maps_dense_wall_sec=%.6f\n", w);
+            printf("phase_finalize_directory_maps_dense_sort_sec=0.000000\n");
+            printf("phase_finalize_directory_maps_dense_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_fini_path_shape_sec;
+            printf("phase_finalize_path_shape_wall_sec=%.6f\n", w);
+            printf("phase_finalize_path_shape_sort_sec=0.000000\n");
+            printf("phase_finalize_path_shape_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_fini_uid_sec;
+            printf("phase_finalize_uid_wall_sec=%.6f\n", w);
+            printf("phase_finalize_uid_sort_sec=0.000000\n");
+            printf("phase_finalize_uid_other_sec=%.6f\n", w);
+
+            w = run_rs->vt_bucket_prep_wall_sec;
+            printf("phase_bucket_prep_wall_sec=%.6f\n", w);
+            printf("phase_bucket_prep_corpus_scan_wall_sec=%.6f\n", run_rs->vt_bucket_prep_corpus_sec);
+            printf("phase_bucket_prep_path_index_sort_sec=%.6f\n", path_sort_sec);
+            printf("phase_bucket_prep_note=corpus_scan_and_path_index_sort_may_overlap_when_path_order_thread_used\n");
+
+            w = run_rs->vt_bucket_cells_wall_sec;
+            other = w > bucket_emit_sort_sec ? w - bucket_emit_sort_sec : 0.0;
+            printf("phase_bucket_html_cells_wall_sec=%.6f\n", w);
+            printf("phase_bucket_html_cells_sort_sec=%.6f\n", bucket_emit_sort_sec);
+            printf("phase_bucket_html_cells_other_sec=%.6f\n", other);
+
+            w = run_rs->vt_index_html_sec;
+            printf("phase_index_html_wall_sec=%.6f\n", w);
+            printf("phase_index_html_sort_sec=0.000000\n");
+            printf("phase_index_html_other_sec=%.6f\n", w);
+        }
+    }
     printf("avg_records_per_sec=%s\n", avg_records_buf);
-    printf("mean_records_per_sec=%s\n", mean_records_buf);
-    printf("max_records_per_sec=%s\n", max_records_buf);
-    printf("min_records_per_sec=%s\n", min_records_buf);
     printf("elapsed_sec=%.3f\n", elapsed_sec);
 }
 
@@ -6220,11 +7783,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -6235,8 +7798,13 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Optional --report-dir DIR: write reports under DIR/(user or all_users)/; omit for current directory.\n");
         fprintf(stderr,
+                "Optional --verbose [minutes]: I/O counters + rolling throughput stats (default quiet: sparse "
+                "progress, no per-read I/O atomics). Optional integer 1…10080 is accepted for compatibility; stderr "
+                "prints ecrawl-style `key=value` progress about every 30s (idle counters omitted).\n");
+        fprintf(stderr,
                 "C-led badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).\n");
-        fprintf(stderr, "Flags must appear first (any order). Thread count: EREPORT_THREADS (default %d).\n",
+        fprintf(stderr,
+                "Flags must appear first (any order). Thread count: EREPORT_THREADS (default %d), not argv.\n",
                 DEFAULT_THREADS);
         return 2;
     }
@@ -6300,6 +7868,29 @@ int main(int argc, char **argv) {
                 argc = ac;
                 continue;
             }
+            if (ac > 1 && strcmp(av[1], "--verbose") == 0) {
+                char *end = NULL;
+                long m;
+
+                if (g_ereport_verbose) {
+                    fprintf(stderr, "ereport: duplicate --verbose\n");
+                    return 2;
+                }
+                g_ereport_verbose = 1;
+                memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                ac -= 1;
+                argc = ac;
+                if (ac > 1) {
+                    errno = 0;
+                    m = strtol(av[1], &end, 10);
+                    if (end != av[1] && *end == '\0' && errno == 0 && m >= 1L && m <= 10080L) {
+                        memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                        ac -= 1;
+                        argc = ac;
+                    }
+                }
+                continue;
+            }
             break;
         }
     }
@@ -6312,6 +7903,13 @@ int main(int argc, char **argv) {
     }
 
     threads = parse_ereport_thread_count();
+
+    if (g_ereport_verbose) {
+        fprintf(stderr,
+                "ereport: verbose on (I/O counters + rolling throughput; ecrawl-style key=value progress ~30s on "
+                "stderr)\n");
+        fflush(stderr);
+    }
 
     if (parse_time_basis(argv[1], &basis) == 0) {
         all_users_mode = 1;
@@ -6328,7 +7926,10 @@ int main(int argc, char **argv) {
             if (!bin_dirs) die("allocation failed");
             while (ai < argc) {
                 if (argv[ai][0] == '-') {
-                    fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                    fprintf(stderr,
+                            "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
+                            "EREPORT_THREADS)\n",
+                            argv[ai]);
                     free((void *)bin_dirs);
                     return 2;
                 }
@@ -6359,7 +7960,10 @@ int main(int argc, char **argv) {
                 if (!bin_dirs) die("allocation failed");
                 while (ai < argc) {
                     if (argv[ai][0] == '-') {
-                        fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n", argv[ai]);
+                        fprintf(stderr,
+                            "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
+                            "EREPORT_THREADS)\n",
+                            argv[ai]);
                         free((void *)bin_dirs);
                         return 2;
                     }
@@ -6385,7 +7989,9 @@ int main(int argc, char **argv) {
                     if (!bin_dirs) die("allocation failed");
                     while (ai < argc) {
                         if (argv[ai][0] == '-') {
-                            fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n",
+                            fprintf(stderr,
+                                    "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
+                                    "EREPORT_THREADS)\n",
                                     argv[ai]);
                             free((void *)bin_dirs);
                             return 2;
@@ -6416,7 +8022,9 @@ int main(int argc, char **argv) {
                     if (!bin_dirs) die("allocation failed");
                     while (ai < argc) {
                         if (argv[ai][0] == '-') {
-                            fprintf(stderr, "unknown option: %s (thread count is set with EREPORT_THREADS)\n",
+                            fprintf(stderr,
+                                    "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
+                                    "EREPORT_THREADS)\n",
                                     argv[ai]);
                             free((void *)bin_dirs);
                             return 2;
@@ -6535,6 +8143,7 @@ int main(int argc, char **argv) {
         volatile const char **chunk_wpaths = NULL;
         int prep_threads;
         size_t merge_off;
+        double vt_chunk0 = 0.0;
 
         if (!chunk_targets || !prep_rc || !prep_chunks || !prep_chunk_counts) {
             fprintf(stderr, "allocation failed\n");
@@ -6635,6 +8244,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        if (g_ereport_verbose) vt_chunk0 = now_sec();
         for (i = 0; i < prep_threads; i++) {
             prep_args[i].pool = &pool;
             prep_args[i].slot = (int)i;
@@ -6726,6 +8336,7 @@ int main(int argc, char **argv) {
         free(prep_rc);
         free(prep_chunks);
         free(prep_chunk_counts);
+        if (g_ereport_verbose && vt_chunk0 > 0.0) run_stats.vt_chunk_map_sec += now_sec() - vt_chunk0;
 
         run_stats.chunk_prep_files_total = 0;
         atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
@@ -6858,13 +8469,24 @@ int main(int argc, char **argv) {
     memset(&final_matched_records, 0, sizeof(final_matched_records));
 
     {
+        double vt_parse0 = 0.0;
+
+        if (g_ereport_verbose) vt_parse0 = now_sec();
         for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
+        if (g_ereport_verbose && vt_parse0 > 0.0) run_stats.vt_parse_workers_sec += now_sec() - vt_parse0;
 
         /* Progress thread: keep parsing status (rec/s line) until workers exit; then finalize banner. */
         atomic_store(&run_stats.parse_workers_done, 1);
+        atomic_store(&run_stats.finalize_merge_substep, 1);
         atomic_store(&run_stats.finalize_phase, 1);
 
-        summary_reduce_from_worker_args(&final_sum, args, threads_used);
+        {
+            double __vt = 0.0;
+
+            if (g_ereport_verbose) __vt = now_sec();
+            summary_reduce_from_worker_args(&final_sum, args, threads_used);
+            if (g_ereport_verbose && __vt > 0.0) run_stats.vt_fini_summaries_sec += now_sec() - __vt;
+        }
     }
 
     memset(&path_shape, 0, sizeof(path_shape));
@@ -6879,50 +8501,13 @@ int main(int argc, char **argv) {
     memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
 
     if (bucket_detail_levels > 0) {
-        if (matched_records_finalize_parallel(args, threads_used, &final_matched_records) != 0) {
-            fprintf(stderr, "allocation failed merging matched records\n");
-            if (stats_thread_started) {
-                atomic_store(&run_stats.stop_stats, 1);
-                pthread_join(stats_thread, NULL);
-                clear_status_line();
-            }
-            matched_records_free(&final_matched_records);
-            for (ab = 0; ab < AGE_BUCKETS; ab++) {
-                for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
-            }
-            worker_dense_maps_free(args, threads_used);
-            free(tids);
-            if (all_users_mode) {
-                for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
-            }
-            free(args);
-            for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
-            free(chunks);
-            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
-            free(paths);
-            ereport_free_file_states(file_states, path_count);
-            pthread_mutex_destroy(&queue.mutex);
-            inode_set_destroy(&seen_inodes);
-            return 1;
-        }
-
+        atomic_store(&run_stats.finalize_merge_substep, 2);
         {
-            dense_cell_map_t merged_fanout;
+            double __vt = 0.0;
 
-            memset(&merged_fanout, 0, sizeof(merged_fanout));
-            for (i = 0; i < threads_used; i++) {
-                dense_cell_merge_into(&merged_fanout, &args[i].parent_fanout, NULL);
-                fanout_parent_stat_merge_into(&merged_fanout_stats, &args[i].parent_fanout_stats, NULL);
-            }
-
-            if (bucket_dense_cells_finalize_parallel(args, threads_used, final_details, merged_dense_shape) != 0) {
-                fprintf(stderr, "allocation failed merging bucket details\n");
-                dense_cell_free(&merged_fanout);
-                fanout_parent_stat_map_free(&merged_fanout_stats);
-                memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
-                for (ab = 0; ab < AGE_BUCKETS; ab++) {
-                    for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense_shape[ab][sb]);
-                }
+            if (g_ereport_verbose) __vt = now_sec();
+            if (matched_records_finalize_parallel(args, threads_used, &final_matched_records, &run_stats) != 0) {
+                fprintf(stderr, "allocation failed merging matched records\n");
                 if (stats_thread_started) {
                     atomic_store(&run_stats.stop_stats, 1);
                     pthread_join(stats_thread, NULL);
@@ -6947,15 +8532,85 @@ int main(int argc, char **argv) {
                 inode_set_destroy(&seen_inodes);
                 return 1;
             }
-            dense_cell_steal_into_fanout_lookup(&merged_fanout, &fanout_lookup_shape);
-            dense_cell_free(&merged_fanout);
+            if (g_ereport_verbose && __vt > 0.0) run_stats.vt_fini_matched_paths_sec += now_sec() - __vt;
+        }
 
-            path_shape_fill_from_merged_dense(&final_sum, merged_dense_shape, &fanout_lookup_shape, &path_shape);
+        {
+            dense_cell_map_t merged_fanout;
+
+            atomic_store(&run_stats.finalize_fanout_workers_total, threads_used);
+            atomic_store(&run_stats.finalize_fanout_workers_done, 0);
+            atomic_store(&run_stats.finalize_merge_substep, 3);
+            {
+                double __vt_dense = 0.0;
+
+                if (g_ereport_verbose) __vt_dense = now_sec();
+                memset(&merged_fanout, 0, sizeof(merged_fanout));
+                if (fanout_shard_summaries_reduce_parallel(&merged_fanout, &merged_fanout_stats, args, threads_used,
+                                                          &run_stats) != 0) {
+                    for (i = 0; i < threads_used; i++) {
+                        dense_cell_merge_into_ex(&merged_fanout, &args[i].parent_fanout, NULL,
+                                                 parse_ereport_thread_count());
+                        fanout_parent_stat_merge_into(&merged_fanout_stats, &args[i].parent_fanout_stats, NULL);
+                        atomic_store(&run_stats.finalize_fanout_workers_done, i + 1);
+                    }
+                }
+
+                if (bucket_dense_cells_finalize_parallel(args, threads_used, final_details, merged_dense_shape,
+                                                         &run_stats) != 0) {
+                    fprintf(stderr, "allocation failed merging bucket details\n");
+                    dense_cell_free(&merged_fanout);
+                    fanout_parent_stat_map_free(&merged_fanout_stats);
+                    memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
+                    for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                        for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense_shape[ab][sb]);
+                    }
+                    if (stats_thread_started) {
+                        atomic_store(&run_stats.stop_stats, 1);
+                        pthread_join(stats_thread, NULL);
+                        clear_status_line();
+                    }
+                    matched_records_free(&final_matched_records);
+                    for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                        for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
+                    }
+                    worker_dense_maps_free(args, threads_used);
+                    free(tids);
+                    if (all_users_mode) {
+                        for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
+                    }
+                    free(args);
+                    for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
+                    free(chunks);
+                    for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+                    free(paths);
+                    ereport_free_file_states(file_states, path_count);
+                    pthread_mutex_destroy(&queue.mutex);
+                    inode_set_destroy(&seen_inodes);
+                    return 1;
+                }
+                dense_cell_steal_into_fanout_lookup_ex(&merged_fanout, &fanout_lookup_shape, parse_ereport_thread_count());
+                dense_cell_free(&merged_fanout);
+                if (g_ereport_verbose && __vt_dense > 0.0)
+                    run_stats.vt_fini_directory_maps_dense_sec += now_sec() - __vt_dense;
+            }
+
+            {
+                double __vt_ps = 0.0;
+
+                if (g_ereport_verbose) __vt_ps = now_sec();
+                path_shape_fill_from_merged_dense(&final_sum, merged_dense_shape, &fanout_lookup_shape, &path_shape);
+                if (g_ereport_verbose && __vt_ps > 0.0) run_stats.vt_fini_path_shape_sec += now_sec() - __vt_ps;
+            }
             bucket_shape_maps_live = 1;
         }
     }
 
     if (all_users_mode) {
+        double __vt_uid = 0.0;
+
+        if (g_ereport_verbose) __vt_uid = now_sec();
+        atomic_store(&run_stats.finalize_merge_substep, 4);
         uid_accum_t merged_uids;
         if (uid_accum_init(&merged_uids, 65536) != 0) {
             fprintf(stderr, "allocation failed merging uid tallies\n");
@@ -6978,6 +8633,7 @@ int main(int argc, char **argv) {
             for (ab = 0; ab < AGE_BUCKETS; ab++) {
                 for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
             }
+            if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
             return 1;
         }
         for (i = 0; i < threads_used; i++) {
@@ -7004,6 +8660,7 @@ int main(int argc, char **argv) {
                 for (ab = 0; ab < AGE_BUCKETS; ab++) {
                     for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_details_free(&final_details[ab][sb]);
                 }
+                if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
                 return 1;
             }
             uid_accum_destroy(&args[i].uid_distinct);
@@ -7011,7 +8668,10 @@ int main(int argc, char **argv) {
         for (; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
         distinct_uid_count = (uint64_t)uid_accum_size(&merged_uids);
         uid_accum_destroy(&merged_uids);
+        if (g_ereport_verbose && __vt_uid > 0.0) run_stats.vt_fini_uid_sec += now_sec() - __vt_uid;
     }
+
+    atomic_store(&run_stats.finalize_merge_substep, 0);
 
     if (ensure_bucket_output_dir_exists() != 0) {
         fprintf(stderr, "failed to create report output directory %s: %s\n", g_bucket_output_dir, strerror(errno));
@@ -7062,12 +8722,19 @@ int main(int argc, char **argv) {
         bucket_shape_maps_live = 0;
     }
 
+    atomic_store(&run_stats.finalize_index_step, 0);
     atomic_store(&run_stats.finalize_phase, 3);
 
-    if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
-                   basis_str, &final_sum, &path_shape, path_count, threads_used, bin_dir_count,
-                   storage_base_paths_label, &crawl_timing) != 0) {
-        fprintf(stderr, "failed to write main report %s\n", report_path);
+    {
+        double __vt_idx = 0.0;
+
+        if (g_ereport_verbose) __vt_idx = now_sec();
+        if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
+                       basis_str, &final_sum, &path_shape, path_count, threads_used, bin_dir_count,
+                       storage_base_paths_label, &crawl_timing, &run_stats) != 0) {
+            fprintf(stderr, "failed to write main report %s\n", report_path);
+        }
+        if (g_ereport_verbose && __vt_idx > 0.0) run_stats.vt_index_html_sec += now_sec() - __vt_idx;
     }
     final_sum.scanned_input_files = (uint64_t)path_count;
     t1 = now_sec();
