@@ -106,8 +106,10 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
  * record range; each worker accumulates per-row partials. Partial matrix size is nw×R×3×uint64 — cap nw by
  * AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES so large path_row_map tables (big R) still use multiple workers.
  */
-#define AGG_TOTALS_PAR_MIN_RECORDS (256ULL * 1024ULL)
+#define AGG_TOTALS_PAR_MIN_RECORDS (64ULL * 1024ULL)
 #define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (384ULL * 1024ULL * 1024ULL)
+#define AGG_BKT_PAR_MIN_DETAILS 4096u
+#define AGG_BKT_PAR_MAX_THREADS 24
 
 static int parse_ereport_thread_count(void);
 
@@ -229,12 +231,18 @@ typedef struct {
     uint64_t inode;
 } inode_key_t;
 
+#define INODE_SET_SHARDS 64
+
 typedef struct {
     inode_key_t *keys;
     unsigned char *used;
     size_t cap;
     size_t count;
     pthread_mutex_t mutex;
+} inode_set_shard_t;
+
+typedef struct {
+    inode_set_shard_t shard[INODE_SET_SHARDS];
 } inode_set_t;
 
 typedef struct {
@@ -509,39 +517,7 @@ static uint64_t inode_key_hash(uint32_t dev_major, uint32_t dev_minor, uint64_t 
     return x;
 }
 
-static int inode_set_init(inode_set_t *s, size_t initial_cap) {
-    size_t cap = 1;
-    while (cap < initial_cap) cap <<= 1;
-
-    s->keys = (inode_key_t *)calloc(cap, sizeof(*s->keys));
-    s->used = (unsigned char *)calloc(cap, sizeof(*s->used));
-    if (!s->keys || !s->used) {
-        free(s->keys);
-        free(s->used);
-        s->keys = NULL;
-        s->used = NULL;
-        s->cap = 0;
-        s->count = 0;
-        return -1;
-    }
-
-    s->cap = cap;
-    s->count = 0;
-    pthread_mutex_init(&s->mutex, NULL);
-    return 0;
-}
-
-static void inode_set_destroy(inode_set_t *s) {
-    free(s->keys);
-    free(s->used);
-    s->keys = NULL;
-    s->used = NULL;
-    s->cap = 0;
-    s->count = 0;
-    pthread_mutex_destroy(&s->mutex);
-}
-
-static int inode_set_rehash_locked(inode_set_t *s, size_t new_cap) {
+static int inode_shard_rehash_locked(inode_set_shard_t *sh, size_t new_cap) {
     inode_key_t *new_keys = (inode_key_t *)calloc(new_cap, sizeof(*new_keys));
     unsigned char *new_used = (unsigned char *)calloc(new_cap, sizeof(*new_used));
     size_t i;
@@ -552,9 +528,9 @@ static int inode_set_rehash_locked(inode_set_t *s, size_t new_cap) {
         return -1;
     }
 
-    for (i = 0; i < s->cap; i++) {
-        if (s->used[i]) {
-            inode_key_t key = s->keys[i];
+    for (i = 0; i < sh->cap; i++) {
+        if (sh->used[i]) {
+            inode_key_t key = sh->keys[i];
             size_t idx = (size_t)(inode_key_hash(key.dev_major, key.dev_minor, key.inode) & (new_cap - 1));
             while (new_used[idx]) idx = (idx + 1) & (new_cap - 1);
             new_keys[idx] = key;
@@ -562,45 +538,107 @@ static int inode_set_rehash_locked(inode_set_t *s, size_t new_cap) {
         }
     }
 
-    free(s->keys);
-    free(s->used);
-    s->keys = new_keys;
-    s->used = new_used;
-    s->cap = new_cap;
+    free(sh->keys);
+    free(sh->used);
+    sh->keys = new_keys;
+    sh->used = new_used;
+    sh->cap = new_cap;
     return 0;
 }
 
+static int inode_set_init(inode_set_t *s, size_t initial_cap) {
+    size_t per_shard_target;
+    size_t cap;
+    int si;
+
+    if (!s) return -1;
+    per_shard_target = (initial_cap + (size_t)INODE_SET_SHARDS) / (size_t)INODE_SET_SHARDS;
+    if (per_shard_target < 32) per_shard_target = 32;
+    cap = 1;
+    while (cap < per_shard_target) cap <<= 1;
+
+    for (si = 0; si < INODE_SET_SHARDS; si++) {
+        inode_set_shard_t *sh = &s->shard[si];
+
+        sh->keys = (inode_key_t *)calloc(cap, sizeof(*sh->keys));
+        sh->used = (unsigned char *)calloc(cap, sizeof(*sh->used));
+        if (!sh->keys || !sh->used) {
+            int j;
+            for (j = 0; j < si; j++) {
+                free(s->shard[j].keys);
+                free(s->shard[j].used);
+                s->shard[j].keys = NULL;
+                s->shard[j].used = NULL;
+                s->shard[j].cap = 0;
+                s->shard[j].count = 0;
+                pthread_mutex_destroy(&s->shard[j].mutex);
+            }
+            free(sh->keys);
+            free(sh->used);
+            return -1;
+        }
+        sh->cap = cap;
+        sh->count = 0;
+        pthread_mutex_init(&sh->mutex, NULL);
+    }
+    return 0;
+}
+
+static void inode_set_destroy(inode_set_t *s) {
+    int si;
+
+    if (!s) return;
+    for (si = 0; si < INODE_SET_SHARDS; si++) {
+        inode_set_shard_t *sh = &s->shard[si];
+
+        free(sh->keys);
+        free(sh->used);
+        sh->keys = NULL;
+        sh->used = NULL;
+        sh->cap = 0;
+        sh->count = 0;
+        pthread_mutex_destroy(&sh->mutex);
+    }
+}
+
 static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t dev_minor, uint64_t inode) {
+    uint64_t hh;
+    size_t si;
+    inode_set_shard_t *sh;
     size_t idx;
 
-    if (inode == 0) return 1;
+    if (!s || inode == 0) return 1;
 
-    pthread_mutex_lock(&s->mutex);
+    hh = inode_key_hash(dev_major, dev_minor, inode);
+    si = (size_t)(hh & ((uint64_t)INODE_SET_SHARDS - 1U));
+    sh = &s->shard[si];
 
-    if ((s->count + 1) * 10 >= s->cap * 7) {
-        if (inode_set_rehash_locked(s, s->cap << 1) != 0) {
-            pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_lock(&sh->mutex);
+
+    if (sh->cap > 0 && (sh->count + 1) * 10 >= sh->cap * 7) {
+        if (inode_shard_rehash_locked(sh, sh->cap << 1) != 0) {
+            pthread_mutex_unlock(&sh->mutex);
             return -1;
         }
     }
 
-    idx = (size_t)(inode_key_hash(dev_major, dev_minor, inode) & (s->cap - 1));
-    while (s->used[idx]) {
-        inode_key_t *k = &s->keys[idx];
+    idx = (size_t)(inode_key_hash(dev_major, dev_minor, inode) & (sh->cap - 1));
+    while (sh->used[idx]) {
+        inode_key_t *k = &sh->keys[idx];
         if (k->dev_major == dev_major && k->dev_minor == dev_minor && k->inode == inode) {
-            pthread_mutex_unlock(&s->mutex);
+            pthread_mutex_unlock(&sh->mutex);
             return 0;
         }
-        idx = (idx + 1) & (s->cap - 1);
+        idx = (idx + 1) & (sh->cap - 1);
     }
 
-    s->used[idx] = 1;
-    s->keys[idx].dev_major = dev_major;
-    s->keys[idx].dev_minor = dev_minor;
-    s->keys[idx].inode = inode;
-    s->count++;
+    sh->used[idx] = 1;
+    sh->keys[idx].dev_major = dev_major;
+    sh->keys[idx].dev_minor = dev_minor;
+    sh->keys[idx].inode = inode;
+    sh->count++;
 
-    pthread_mutex_unlock(&s->mutex);
+    pthread_mutex_unlock(&sh->mutex);
     return 1;
 }
 
@@ -2252,6 +2290,18 @@ static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
     }
 }
 
+static size_t fanout_parent_stat_map_total_nodes(const fanout_parent_stat_map_t *m) {
+    size_t c = 0, bi;
+
+    if (!m) return 0;
+    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+        const fanout_parent_stat_node_t *n;
+
+        for (n = m->buckets[bi]; n; n = n->next) c++;
+    }
+    return c;
+}
+
 static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_parent_stat_node_t *src_node, summary_t *sum) {
     uint32_t biw;
     fanout_parent_stat_node_t **pp;
@@ -2284,7 +2334,7 @@ static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_
     dst->buckets[biw] = src_node;
 }
 
-static void fanout_parent_stat_merge_into(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum) {
+static void fanout_parent_stat_merge_bucket_range_serial(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum) {
     size_t bi;
 
     if (!dst || !src) return;
@@ -2300,6 +2350,168 @@ static void fanout_parent_stat_merge_into(fanout_parent_stat_map_t *dst, fanout_
             n = nx;
         }
     }
+}
+
+typedef struct {
+    atomic_int gate; /* 0 spin, 1 run, 2 abort (pthread_create failure) */
+    pthread_barrier_t mid;
+} fps_merge_sync_t;
+
+typedef struct {
+    fps_merge_sync_t *sync;
+    fanout_parent_stat_map_t *dst;
+    fanout_parent_stat_map_t *src;
+    fanout_parent_stat_node_t **st;
+    summary_t *sum;
+    int nt;
+    int tid;
+} fps_merge_pt_ctx_t;
+
+static void fps_merge_do_phase1(fps_merge_pt_ctx_t *c) {
+    size_t bi;
+
+    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi += (size_t)c->nt) {
+        fanout_parent_stat_node_t *n = c->src->buckets[bi];
+
+        c->src->buckets[bi] = NULL;
+        while (n) {
+            fanout_parent_stat_node_t *nx = n->next;
+
+            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + bi];
+            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + bi] = n;
+            n = nx;
+        }
+    }
+}
+
+static void fps_merge_do_phase2(fps_merge_pt_ctx_t *c) {
+    size_t biw;
+    int t;
+
+    for (biw = (size_t)c->tid; biw < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; biw += (size_t)c->nt) {
+        for (t = 0; t < c->nt; t++) {
+            fanout_parent_stat_node_t *n = c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw];
+
+            c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw] = NULL;
+            while (n) {
+                fanout_parent_stat_node_t *nx = n->next;
+
+                n->next = NULL;
+                fanout_parent_stat_absorb_one(c->dst, n, c->sum);
+                n = nx;
+            }
+        }
+    }
+}
+
+static void *fps_merge_parallel_worker(void *vp) {
+    fps_merge_pt_ctx_t *c = (fps_merge_pt_ctx_t *)vp;
+
+    for (;;) {
+        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
+
+        if (g == 1) break;
+        if (g == 2) return NULL;
+        sched_yield();
+    }
+    fps_merge_do_phase1(c);
+    pthread_barrier_wait(&c->sync->mid);
+    fps_merge_do_phase2(c);
+    return NULL;
+}
+
+/*
+ * Merge src into dst. When merge_threads > 1 and src is large enough, partition src buckets across threads,
+ * barrier, then each thread absorbs staged nodes into a disjoint subset of dst buckets (same pattern as dense_cell_merge_into_ex).
+ */
+static void fanout_parent_stat_merge_into_ex(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum, int merge_threads) {
+    fanout_parent_stat_node_t **st = NULL;
+    fps_merge_pt_ctx_t *ctx = NULL;
+    pthread_t *tids = NULL;
+    fps_merge_sync_t sync;
+    int nt_want, nthr, n_join, ti, k, brc;
+
+    if (!dst || !src) return;
+    if (merge_threads < 2) {
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+    if (fanout_parent_stat_map_total_nodes(src) < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+
+    nt_want = merge_threads;
+    if (nt_want > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_want = DENSE_CELL_STEAL_FANOUT_MAX_NT;
+    if (nt_want > (int)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP) nt_want = (int)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
+
+    st = (fanout_parent_stat_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(fanout_parent_stat_node_t *));
+    if (!st) {
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+    ctx = (fps_merge_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
+    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
+    if (!ctx || (!tids && nt_want > 1)) {
+        free(st);
+        free(ctx);
+        free(tids);
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+
+    atomic_init(&sync.gate, 0);
+    for (ti = 0; ti < nt_want; ti++) {
+        ctx[ti].sync = &sync;
+        ctx[ti].dst = dst;
+        ctx[ti].src = src;
+        ctx[ti].st = st;
+        ctx[ti].sum = sum;
+        ctx[ti].nt = 0;
+        ctx[ti].tid = 0;
+    }
+
+    n_join = 0;
+    for (ti = 1; ti < nt_want; ti++) {
+        if (pthread_create(&tids[ti - 1], NULL, fps_merge_parallel_worker, &ctx[ti]) != 0) break;
+        n_join++;
+    }
+    nthr = n_join + 1;
+    if (nthr < 2) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+
+    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
+    if (brc != 0) {
+        atomic_store_explicit(&sync.gate, 2, memory_order_release);
+        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+        free(st);
+        free(ctx);
+        free(tids);
+        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
+        return;
+    }
+
+    for (ti = 0; ti < nthr; ti++) {
+        ctx[ti].nt = nthr;
+        ctx[ti].tid = ti;
+    }
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&sync.gate, 1, memory_order_release);
+    fps_merge_do_phase1(&ctx[0]);
+    pthread_barrier_wait(&sync.mid);
+    fps_merge_do_phase2(&ctx[0]);
+    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
+    pthread_barrier_destroy(&sync.mid);
+    free(st);
+    free(ctx);
+    free(tids);
 }
 
 static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
@@ -2621,6 +2833,30 @@ static int path_row_map_collect(path_row_map_t *m, path_row_t ***out_rows, size_
     return 0;
 }
 
+/* Add src row bucket counters into dst (same path keys). total_* fields are merged additively for callers that pre-fill them. */
+static int path_row_map_merge_accumulate(path_row_map_t *dst, const path_row_map_t *src) {
+    size_t i;
+
+    if (!dst || !src) return 0;
+    for (i = 0; i < src->cap; i++) {
+        if (!src->used[i]) continue;
+        {
+            const path_row_t *sr = &src->rows[i];
+            path_row_t *dr = path_row_map_get_or_insert(dst, sr->path);
+
+            if (!dr) return -1;
+            dr->bucket_files += sr->bucket_files;
+            dr->bucket_bytes += sr->bucket_bytes;
+            dr->bucket_ctime_led_files += sr->bucket_ctime_led_files;
+            dr->bucket_ctime_led_bytes += sr->bucket_ctime_led_bytes;
+            dr->total_files += sr->total_files;
+            dr->total_dirs += sr->total_dirs;
+            dr->total_bytes += sr->total_bytes;
+        }
+    }
+    return 0;
+}
+
 static int cmp_row_bucket_bytes_desc(const void *a, const void *b) {
     const path_row_t *ra = *(const path_row_t * const *)a;
     const path_row_t *rb = *(const path_row_t * const *)b;
@@ -2629,6 +2865,47 @@ static int cmp_row_bucket_bytes_desc(const void *a, const void *b) {
     if (ra->bucket_files < rb->bucket_files) return 1;
     if (ra->bucket_files > rb->bucket_files) return -1;
     return strcmp(ra->path, rb->path);
+}
+
+/* Max-heap by cmp_row_bucket_bytes_desc "badness" (root = worst among kept rows). Used to pick top BUCKET_PATH_TABLE_MAX_ROWS without sorting millions of paths. */
+static void path_row_topk_heap_sift_down(path_row_t **h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, mx = i;
+
+        if (l < n && cmp_row_bucket_bytes_desc(&h[l], &h[mx]) > 0) mx = l;
+        if (r < n && cmp_row_bucket_bytes_desc(&h[r], &h[mx]) > 0) mx = r;
+        if (mx == i) break;
+        {
+            path_row_t *t = h[i];
+            h[i] = h[mx];
+            h[mx] = t;
+        }
+        i = mx;
+    }
+}
+
+static void path_row_topk_heap_push(path_row_t **h, size_t *hsz, size_t kcap, path_row_t *row) {
+    size_t i;
+
+    if (*hsz < kcap) {
+        i = *hsz;
+        h[*hsz = i + 1] = row;
+        while (i > 0) {
+            size_t p = (i - 1) / 2;
+
+            if (cmp_row_bucket_bytes_desc(&h[i], &h[p]) <= 0) break;
+            {
+                path_row_t *t = h[i];
+                h[i] = h[p];
+                h[p] = t;
+            }
+            i = p;
+        }
+        return;
+    }
+    if (cmp_row_bucket_bytes_desc(&row, &h[0]) >= 0) return;
+    h[0] = row;
+    path_row_topk_heap_sift_down(h, kcap, 0);
 }
 
 static int starts_with_dir_prefix(const char *path, const char *prefix);
@@ -2942,13 +3219,24 @@ static const char *path_after_base_prefix(const char *path, const char *base_pre
     return p;
 }
 
-static int aggregate_bucket_for_page_n(path_row_map_t *maps,
-                                       int nlevels,
-                                       const bucket_details_t *details,
-                                       const char *base_prefix) {
+typedef struct {
+    path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
+    int nlevels;
+    const bucket_details_t *details;
+    const char *base_prefix;
+    size_t lo, hi;
+    int err;
+} agg_bkt_worker_t;
+
+static int aggregate_bucket_for_page_range(path_row_map_t *maps,
+                                           int nlevels,
+                                           const bucket_details_t *details,
+                                           const char *base_prefix,
+                                           size_t lo,
+                                           size_t hi) {
     size_t i;
 
-    for (i = 0; i < details->count; i++) {
+    for (i = lo; i < hi; i++) {
         const detail_record_t *r = &details->items[i];
         char prev[PATH_MAX];
         char rowpath[PATH_MAX];
@@ -2992,6 +3280,119 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
     }
 
     return 0;
+}
+
+static void *agg_bkt_worker_thread(void *vp) {
+    agg_bkt_worker_t *w = (agg_bkt_worker_t *)vp;
+    int d;
+
+    if (!w) return NULL;
+    if (w->lo >= w->hi) return NULL;
+
+    for (d = 0; d < w->nlevels; d++) {
+        if (path_row_map_init(&w->maps[d], 1024u + (size_t)d * 512u) != 0) {
+            w->err = 1;
+            while (d > 0) path_row_map_destroy(&w->maps[--d]);
+            return NULL;
+        }
+    }
+
+    if (aggregate_bucket_for_page_range(w->maps, w->nlevels, w->details, w->base_prefix, w->lo, w->hi) != 0)
+        w->err = 1;
+
+    return NULL;
+}
+
+static void agg_bkt_worker_destroy_maps(agg_bkt_worker_t *w) {
+    int d;
+
+    if (!w || w->lo >= w->hi) return;
+    for (d = 0; d < w->nlevels; d++) path_row_map_destroy(&w->maps[d]);
+}
+
+static int aggregate_bucket_for_page_n(path_row_map_t *maps,
+                                       int nlevels,
+                                       const bucket_details_t *details,
+                                       const char *base_prefix) {
+    unsigned thr;
+    unsigned nw;
+    size_t chunk;
+    size_t i;
+    agg_bkt_worker_t *workers = NULL;
+    pthread_t *tids = NULL;
+    int any_err = 0;
+
+    if (!maps || nlevels < 1 || !details || !base_prefix) return -1;
+    if (nlevels > BUCKET_DETAIL_LEVELS_MAX) return -1;
+
+    thr = parse_ereport_thread_count();
+    if (details->count < AGG_BKT_PAR_MIN_DETAILS || thr < 2)
+        return aggregate_bucket_for_page_range(maps, nlevels, details, base_prefix, 0, details->count);
+
+    nw = thr;
+    if (nw > AGG_BKT_PAR_MAX_THREADS) nw = AGG_BKT_PAR_MAX_THREADS;
+    if (nw > details->count) nw = (unsigned)details->count;
+    if (nw < 2)
+        return aggregate_bucket_for_page_range(maps, nlevels, details, base_prefix, 0, details->count);
+
+    workers = (agg_bkt_worker_t *)calloc((size_t)nw, sizeof(*workers));
+    tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+    if (!workers || !tids) {
+        free(workers);
+        free(tids);
+        return -1;
+    }
+
+    chunk = (details->count + (size_t)nw - 1u) / (size_t)nw;
+    for (i = 0; i < (size_t)nw; i++) {
+        agg_bkt_worker_t *w = &workers[i];
+
+        w->nlevels = nlevels;
+        w->details = details;
+        w->base_prefix = base_prefix;
+        w->lo = i * chunk;
+        w->hi = w->lo + chunk;
+        if (w->lo >= details->count) {
+            w->lo = w->hi = details->count;
+            continue;
+        }
+        if (w->hi > details->count) w->hi = details->count;
+        w->err = 0;
+        if (pthread_create(&tids[i], NULL, agg_bkt_worker_thread, w) != 0) {
+            size_t j;
+
+            for (j = 0; j < i; j++) {
+                (void)pthread_join(tids[j], NULL);
+                agg_bkt_worker_destroy_maps(&workers[j]);
+            }
+            free(workers);
+            free(tids);
+            return -1;
+        }
+    }
+
+    for (i = 0; i < (size_t)nw; i++) {
+        (void)pthread_join(tids[i], NULL);
+        if (workers[i].err) any_err = 1;
+    }
+
+    if (!any_err) {
+        for (i = 0; i < (size_t)nw; i++) {
+            agg_bkt_worker_t *w = &workers[i];
+            int d;
+
+            if (w->lo >= w->hi) continue;
+            for (d = 0; d < nlevels; d++) {
+                if (path_row_map_merge_accumulate(&maps[d], &w->maps[d]) != 0) any_err = 1;
+            }
+        }
+    }
+
+    for (i = 0; i < (size_t)nw; i++) agg_bkt_worker_destroy_maps(&workers[i]);
+    free(workers);
+    free(tids);
+
+    return any_err ? -1 : 0;
 }
 
 static size_t path_row_maps_total_used_rows(const path_row_map_t *maps, int nlevels) {
@@ -3576,28 +3977,49 @@ static void emit_path_summary_table(FILE *out,
         return;
     }
 
-    VT_QSORT_BUCKET(run_rs, rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
-
     {
-        size_t shown = count;
-        if (shown > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) shown = (size_t)BUCKET_PATH_TABLE_MAX_ROWS;
+        size_t full_count = count;
 
-        fprintf(out,
-                "<!-- bucket path table: %zu director%s at this level; %zu rows in HTML (cap %d; default sort bucket "
-                "bytes desc; headers clickable) -->\n",
-                count,
-                count == 1 ? "y" : "ies",
-                shown,
-                BUCKET_PATH_TABLE_MAX_ROWS);
+        if (full_count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) {
+            path_row_t **h =
+                (path_row_t **)malloc((size_t)BUCKET_PATH_TABLE_MAX_ROWS * sizeof(path_row_t *));
+            size_t hsz = 0;
+            size_t j;
 
-        if (count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) {
+            if (!h) {
+                fprintf(out, "<p>Allocation failed while building this view.</p>\n");
+                free(rows);
+                return;
+            }
+            for (j = 0; j < full_count; j++) path_row_topk_heap_push(h, &hsz, (size_t)BUCKET_PATH_TABLE_MAX_ROWS, rows[j]);
+            free(rows);
+            rows = h;
+            count = hsz;
+        }
+
+        VT_QSORT_BUCKET(run_rs, rows, count, sizeof(*rows), cmp_row_bucket_bytes_desc);
+
+        {
+            size_t shown = full_count;
+            if (shown > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) shown = (size_t)BUCKET_PATH_TABLE_MAX_ROWS;
+
             fprintf(out,
-                    "<p class=\"table-trunc-note\">Showing the <strong>top %d</strong> of <strong>%zu</strong> "
-                    "directories at this depth (default sort: bucket bytes, largest first). Omitted rows are lower "
-                    "in that ranking; heat-map and bucket summary totals above still include the full bucket. "
-                    "Use column headers to sort the visible rows.</p>\n",
-                    BUCKET_PATH_TABLE_MAX_ROWS,
-                    count);
+                    "<!-- bucket path table: %zu director%s at this level; %zu rows in HTML (cap %d; default sort bucket "
+                    "bytes desc; headers clickable) -->\n",
+                    full_count,
+                    full_count == 1 ? "y" : "ies",
+                    shown,
+                    BUCKET_PATH_TABLE_MAX_ROWS);
+
+            if (full_count > (size_t)BUCKET_PATH_TABLE_MAX_ROWS) {
+                fprintf(out,
+                        "<p class=\"table-trunc-note\">Showing the <strong>top %d</strong> of <strong>%zu</strong> "
+                        "directories at this depth (default sort: bucket bytes, largest first). Omitted rows are lower "
+                        "in that ranking; heat-map and bucket summary totals above still include the full bucket. "
+                        "Use column headers to sort the visible rows.</p>\n",
+                        BUCKET_PATH_TABLE_MAX_ROWS,
+                        full_count);
+            }
         }
     }
 
@@ -3814,6 +4236,46 @@ static int cmp_dense_drill_desc(const void *a, const void *b) {
     return strcmp(ra->parent, rb->parent);
 }
 
+static void dense_drill_topk_heap_sift_down(dense_drill_row_t *h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, mx = i;
+
+        if (l < n && cmp_dense_drill_desc(&h[l], &h[mx]) > 0) mx = l;
+        if (r < n && cmp_dense_drill_desc(&h[r], &h[mx]) > 0) mx = r;
+        if (mx == i) break;
+        {
+            dense_drill_row_t t = h[i];
+            h[i] = h[mx];
+            h[mx] = t;
+        }
+        i = mx;
+    }
+}
+
+static void dense_drill_topk_heap_push(dense_drill_row_t *h, size_t *hsz, size_t kcap, dense_drill_row_t row) {
+    size_t i;
+
+    if (*hsz < kcap) {
+        i = *hsz;
+        h[*hsz = i + 1] = row;
+        while (i > 0) {
+            size_t p = (i - 1) / 2;
+
+            if (cmp_dense_drill_desc(&h[i], &h[p]) <= 0) break;
+            {
+                dense_drill_row_t t = h[i];
+                h[i] = h[p];
+                h[p] = t;
+            }
+            i = p;
+        }
+        return;
+    }
+    if (cmp_dense_drill_desc(&row, &h[0]) >= 0) return;
+    h[0] = row;
+    dense_drill_topk_heap_sift_down(h, kcap, 0);
+}
+
 static int cmp_deep_drill_desc(const void *a, const void *b) {
     const deep_drill_row_t *ra = (const deep_drill_row_t *)a;
     const deep_drill_row_t *rb = (const deep_drill_row_t *)b;
@@ -3823,6 +4285,46 @@ static int cmp_deep_drill_desc(const void *a, const void *b) {
     if (ra->bytes > rb->bytes) return -1;
     if (ra->bytes < rb->bytes) return 1;
     return strcmp(ra->parent, rb->parent);
+}
+
+static void deep_drill_topk_heap_sift_down(deep_drill_row_t *h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, mx = i;
+
+        if (l < n && cmp_deep_drill_desc(&h[l], &h[mx]) > 0) mx = l;
+        if (r < n && cmp_deep_drill_desc(&h[r], &h[mx]) > 0) mx = r;
+        if (mx == i) break;
+        {
+            deep_drill_row_t t = h[i];
+            h[i] = h[mx];
+            h[mx] = t;
+        }
+        i = mx;
+    }
+}
+
+static void deep_drill_topk_heap_push(deep_drill_row_t *h, size_t *hsz, size_t kcap, deep_drill_row_t row) {
+    size_t i;
+
+    if (*hsz < kcap) {
+        i = *hsz;
+        h[*hsz = i + 1] = row;
+        while (i > 0) {
+            size_t p = (i - 1) / 2;
+
+            if (cmp_deep_drill_desc(&h[i], &h[p]) <= 0) break;
+            {
+                deep_drill_row_t t = h[i];
+                h[i] = h[p];
+                h[p] = t;
+            }
+            i = p;
+        }
+        return;
+    }
+    if (cmp_deep_drill_desc(&row, &h[0]) >= 0) return;
+    h[0] = row;
+    deep_drill_topk_heap_sift_down(h, kcap, 0);
 }
 
 /*
@@ -3880,27 +4382,52 @@ static void emit_bucket_shape_drill_section(FILE *out,
     /* Dense parents: slice grouping × crawl-wide fan-out */
     {
         size_t dense_cnt = 0;
-        dense_drill_row_t *rows = NULL;
         size_t show_n;
 
         for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++)
             for (n = slice_dense_parents->buckets[bi]; n; n = n->next) dense_cnt++;
 
         if (dense_cnt > 0) {
-            rows = (dense_drill_row_t *)calloc(dense_cnt, sizeof(*rows));
-            if (rows) {
-                size_t k = 0;
-                for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
-                    for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
-                        rows[k].parent = n->parent;
-                        rows[k].slice_files = n->n;
-                        rows[k].global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
-                        k++;
+            size_t kcap = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+            dense_drill_row_t *rows = NULL;
+            size_t row_n = 0;
+
+            if (dense_cnt > kcap) {
+                rows = (dense_drill_row_t *)malloc(kcap * sizeof(*rows));
+                if (rows) {
+                    size_t hsz = 0;
+                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                        for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
+                            dense_drill_row_t row;
+
+                            row.parent = n->parent;
+                            row.slice_files = n->n;
+                            row.global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+                            dense_drill_topk_heap_push(rows, &hsz, kcap, row);
+                        }
                     }
+                    row_n = hsz;
                 }
-                VT_QSORT_BUCKET(run_rs, rows, dense_cnt, sizeof(*rows), cmp_dense_drill_desc);
-                show_n = dense_cnt;
-                if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+            } else {
+                rows = (dense_drill_row_t *)calloc(dense_cnt, sizeof(*rows));
+                if (rows) {
+                    size_t k = 0;
+                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                        for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
+                            rows[k].parent = n->parent;
+                            rows[k].slice_files = n->n;
+                            rows[k].global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+                            k++;
+                        }
+                    }
+                    row_n = dense_cnt;
+                }
+            }
+
+            if (rows) {
+                VT_QSORT_BUCKET(run_rs, rows, row_n, sizeof(*rows), cmp_dense_drill_desc);
+                show_n = row_n;
+                if (show_n > kcap) show_n = kcap;
 
                 fprintf(out,
                         "<details class=\"bucket-help shape-drill-details\"><summary>Dense parents &mdash; up to "
@@ -3981,7 +4508,6 @@ static void emit_bucket_shape_drill_section(FILE *out,
     {
         dense_cell_map_t dm_bytes;
         dense_cell_map_t dm_files;
-        deep_drill_row_t *rows = NULL;
         size_t deep_cnt = 0;
         size_t show_n;
         int deep_ok = 1;
@@ -4010,20 +4536,46 @@ static void emit_bucket_shape_drill_section(FILE *out,
                 for (n = dm_bytes.buckets[bi]; n; n = n->next) deep_cnt++;
 
             if (deep_cnt > 0) {
-                rows = (deep_drill_row_t *)calloc(deep_cnt, sizeof(*rows));
-                if (rows) {
-                    size_t k = 0;
-                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
-                        for (n = dm_bytes.buckets[bi]; n; n = n->next) {
-                            rows[k].parent = n->parent;
-                            rows[k].bytes = n->n;
-                            rows[k].files = dense_cell_map_get_n(&dm_files, n->parent);
-                            k++;
+                size_t kcap = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+                deep_drill_row_t *rows = NULL;
+                size_t row_n = 0;
+
+                if (deep_cnt > kcap) {
+                    rows = (deep_drill_row_t *)malloc(kcap * sizeof(*rows));
+                    if (rows) {
+                        size_t hsz = 0;
+                        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                            for (n = dm_bytes.buckets[bi]; n; n = n->next) {
+                                deep_drill_row_t row;
+
+                                row.parent = n->parent;
+                                row.bytes = n->n;
+                                row.files = dense_cell_map_get_n(&dm_files, n->parent);
+                                deep_drill_topk_heap_push(rows, &hsz, kcap, row);
+                            }
                         }
+                        row_n = hsz;
                     }
-                    VT_QSORT_BUCKET(run_rs, rows, deep_cnt, sizeof(*rows), cmp_deep_drill_desc);
-                    show_n = deep_cnt;
-                    if (show_n > (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS) show_n = (size_t)BUCKET_SHAPE_DRILL_MAX_ROWS;
+                } else {
+                    rows = (deep_drill_row_t *)calloc(deep_cnt, sizeof(*rows));
+                    if (rows) {
+                        size_t k = 0;
+                        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                            for (n = dm_bytes.buckets[bi]; n; n = n->next) {
+                                rows[k].parent = n->parent;
+                                rows[k].bytes = n->n;
+                                rows[k].files = dense_cell_map_get_n(&dm_files, n->parent);
+                                k++;
+                            }
+                        }
+                        row_n = deep_cnt;
+                    }
+                }
+
+                if (rows) {
+                    VT_QSORT_BUCKET(run_rs, rows, row_n, sizeof(*rows), cmp_deep_drill_desc);
+                    show_n = row_n;
+                    if (show_n > kcap) show_n = kcap;
 
                     fprintf(out,
                             "<details class=\"bucket-help shape-drill-details\"><summary>Deep parents &mdash; up to "
@@ -5387,7 +5939,7 @@ static void *fanout_pair_merge_worker(void *vp) {
         int p = atomic_fetch_add_explicit(c->next_pair, 1, memory_order_relaxed);
         if (p >= c->pairs) break;
         dense_cell_merge_into_ex(&c->dbuf[2 * p], &c->dbuf[2 * p + 1], NULL, c->merge_budget);
-        fanout_parent_stat_merge_into(&c->sbuf[2 * p], &c->sbuf[2 * p + 1], NULL);
+        fanout_parent_stat_merge_into_ex(&c->sbuf[2 * p], &c->sbuf[2 * p + 1], NULL, c->merge_budget);
     }
     return NULL;
 }
@@ -5421,7 +5973,7 @@ static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanou
 
     if (threads_used == 1) {
         dense_cell_merge_into_ex(merged_fanout, &args[0].parent_fanout, NULL, parse_ereport_thread_count());
-        fanout_parent_stat_merge_into(merged_fanout_stats, &args[0].parent_fanout_stats, NULL);
+        fanout_parent_stat_merge_into_ex(merged_fanout_stats, &args[0].parent_fanout_stats, NULL, parse_ereport_thread_count());
         memset(&args[0].parent_fanout, 0, sizeof(args[0].parent_fanout));
         memset(&args[0].parent_fanout_stats, 0, sizeof(args[0].parent_fanout_stats));
         if (run_rs) atomic_store(&run_rs->finalize_fanout_workers_done, 1);
@@ -5456,7 +6008,7 @@ static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanou
             /* pairs==1 (2 survivors → 1): still merge one huge map; use parallel dense merge, not single-threaded. */
             for (j = 0; j < pairs; j++) {
                 dense_cell_merge_into_ex(&dbuf[2 * j], &dbuf[2 * j + 1], NULL, parse_ereport_thread_count());
-                fanout_parent_stat_merge_into(&sbuf[2 * j], &sbuf[2 * j + 1], NULL);
+                fanout_parent_stat_merge_into_ex(&sbuf[2 * j], &sbuf[2 * j + 1], NULL, parse_ereport_thread_count());
             }
         } else {
             atomic_store_explicit(&next_pair, 0, memory_order_relaxed);
@@ -5469,7 +6021,7 @@ static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanou
                 targs = NULL;
                 for (j = 0; j < pairs; j++) {
                     dense_cell_merge_into_ex(&dbuf[2 * j], &dbuf[2 * j + 1], NULL, parse_ereport_thread_count());
-                    fanout_parent_stat_merge_into(&sbuf[2 * j], &sbuf[2 * j + 1], NULL);
+                    fanout_parent_stat_merge_into_ex(&sbuf[2 * j], &sbuf[2 * j + 1], NULL, parse_ereport_thread_count());
                 }
             } else {
                 conc = pairs < nw ? pairs : nw;
@@ -5492,7 +6044,7 @@ static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanou
                     int p = atomic_fetch_add_explicit(&next_pair, 1, memory_order_relaxed);
                     if (p >= pairs) break;
                     dense_cell_merge_into_ex(&dbuf[2 * p], &dbuf[2 * p + 1], NULL, merge_budget);
-                    fanout_parent_stat_merge_into(&sbuf[2 * p], &sbuf[2 * p + 1], NULL);
+                    fanout_parent_stat_merge_into_ex(&sbuf[2 * p], &sbuf[2 * p + 1], NULL, merge_budget);
                 }
                 free(tids);
                 free(targs);
@@ -5517,7 +6069,7 @@ static int fanout_shard_summaries_reduce_parallel(dense_cell_map_t *merged_fanou
     }
 
     dense_cell_merge_into_ex(merged_fanout, &dbuf[0], NULL, parse_ereport_thread_count());
-    fanout_parent_stat_merge_into(merged_fanout_stats, &sbuf[0], NULL);
+    fanout_parent_stat_merge_into_ex(merged_fanout_stats, &sbuf[0], NULL, parse_ereport_thread_count());
     if (run_rs) atomic_store(&run_rs->finalize_fanout_workers_done, threads_used);
 
     memset(&dbuf[0], 0, sizeof(dbuf[0]));
@@ -8551,7 +9103,8 @@ int main(int argc, char **argv) {
                     for (i = 0; i < threads_used; i++) {
                         dense_cell_merge_into_ex(&merged_fanout, &args[i].parent_fanout, NULL,
                                                  parse_ereport_thread_count());
-                        fanout_parent_stat_merge_into(&merged_fanout_stats, &args[i].parent_fanout_stats, NULL);
+                        fanout_parent_stat_merge_into_ex(&merged_fanout_stats, &args[i].parent_fanout_stats, NULL,
+                                                         parse_ereport_thread_count());
                         atomic_store(&run_stats.finalize_fanout_workers_done, i + 1);
                     }
                 }
