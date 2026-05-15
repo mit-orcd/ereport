@@ -107,10 +107,13 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 /*
  * Bucket HTML: aggregate_totals_for_page_n walks matched records under base_prefix. Parallel path shards the
  * record range; each worker accumulates per-row partials. Partial matrix size is nw×R×3×uint64 — cap nw by
- * AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES so large path_row_map tables (big R) still use multiple workers.
+ * AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES so large path_row_map tables (big R) still use multiple workers. If the
+ * nw×R partial matrix would exceed the budget, nw is capped; if calloc still fails, nw is halved until allocation
+ * succeeds so we avoid falling back to a single-threaded scan over huge path-ordered slices (one slow bucket
+ * otherwise pins ~100% CPU for a long time at "cells 35/36").
  */
-#define AGG_TOTALS_PAR_MIN_RECORDS (64ULL * 1024ULL)
-#define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (384ULL * 1024ULL * 1024ULL)
+#define AGG_TOTALS_PAR_MIN_RECORDS (8192ULL)
+#define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (1536ULL * 1024ULL * 1024ULL)
 #define AGG_BKT_PAR_MIN_DETAILS 4096u
 #define AGG_BKT_PAR_MAX_THREADS 24
 
@@ -159,6 +162,19 @@ typedef struct {
     double elapsed_sec;
     int merged;
 } ereport_crawl_timing_t;
+
+/*
+ * crawl_manifest.txt disk fields (written by ecrawl): summed when multiple bin_dir inputs are merged.
+ * Interpretation: totals describe the full ecrawl run that produced each manifest (all UIDs in that crawl),
+ * unlike heat-map byte totals which honor the report’s UID filter.
+ */
+typedef struct {
+    int valid;
+    uint32_t st_blocks_bytes_unit;
+    uint64_t total_allocated_bytes;
+    uint64_t files_sparse_heuristic;
+    int unit_mismatch;
+} ereport_manifest_disk_t;
 
 typedef struct {
     uint64_t bytes[AGE_BUCKETS][SIZE_BUCKETS];
@@ -281,6 +297,11 @@ typedef struct ereport_run_stats {
     atomic_uint finalize_index_step;
     /* Phase 1 substep 3: parallel dense merge; 0..AGE*SIZE while bucket_dense_cells_finalize_parallel runs. */
     atomic_uint finalize_dense_cells_done;
+    /*
+     * After dense cells reach 36/36: 1=repartition merged crawl-wide fanout into 65k lookup (steal);
+     * 2=path_shape per-cell fanout scan; 3=path_shape row/column/all margins. 0=earlier sub-steps.
+     */
+    atomic_uint finalize_lookup_stage;
     atomic_uint finalize_bucket_done; /* cells written toward 36 */
     /*
      * Verbose runtime only: substep 3 prelude — merging each parse worker's parent_fanout (done/total workers).
@@ -336,6 +357,7 @@ static void ereport_run_stats_reset(ereport_run_stats_t *s) {
     atomic_store(&s->finalize_bucket_prep, 0);
     atomic_store(&s->finalize_index_step, 0);
     atomic_store(&s->finalize_dense_cells_done, 0);
+    atomic_store(&s->finalize_lookup_stage, 0);
     atomic_store(&s->finalize_bucket_done, 0);
     atomic_store(&s->finalize_fanout_workers_total, 0);
     atomic_store(&s->finalize_fanout_workers_done, 0);
@@ -500,6 +522,11 @@ typedef struct {
     uint64_t total_files;
     uint64_t total_dirs;
     uint64_t total_bytes;
+    /*
+     * aggregate_totals_for_page_n_parallel only: index of this row in the sorted row_list (0..R-1).
+     * Filled right before worker threads start; O(1) partial-vector updates instead of binary search per record.
+     */
+    int par_agg_ix;
 } path_row_t;
 
 typedef struct {
@@ -1568,6 +1595,93 @@ static void aggregate_crawl_timing_from_manifests(const char **bin_dirs, size_t 
     }
 }
 
+#define EREPORT_MANIFEST_DEFAULT_ST_BLOCKS_UNIT 512U
+
+static int read_manifest_disk_stats(const char *bin_dir, uint32_t *unit_out, uint64_t *alloc_out, uint64_t *sparse_out) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[4096];
+    int saw_alloc = 0;
+    int saw_sparse = 0;
+    uint32_t u = 0;
+    uint64_t al = 0ULL;
+    uint64_t sp = 0ULL;
+
+    if (!bin_dir || !unit_out || !alloc_out || !sparse_out) return 0;
+    *unit_out = 0;
+    *alloc_out = 0ULL;
+    *sparse_out = 0ULL;
+
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", bin_dir) >= (int)sizeof(manifest_path))
+        return 0;
+
+    fp = counted_fopen(manifest_path, "r");
+    if (!fp) return 0;
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+
+        if (nl) *nl = '\0';
+
+        if (strncmp(line, "st_blocks_bytes_unit=", 21) == 0) {
+            unsigned long v = strtoul(line + 21, NULL, 10);
+
+            if (v > 0UL && v <= (unsigned long)UINT32_MAX) u = (uint32_t)v;
+        } else if (strncmp(line, "total_allocated_bytes=", 22) == 0) {
+            errno = 0;
+            al = strtoull(line + 22, NULL, 10);
+            if (!errno) saw_alloc = 1;
+        } else if (strncmp(line, "files_sparse_heuristic=", 23) == 0) {
+            errno = 0;
+            sp = strtoull(line + 23, NULL, 10);
+            if (!errno) saw_sparse = 1;
+        }
+    }
+
+    counted_fclose(fp);
+
+    if (!saw_alloc) return 0;
+    *unit_out = u;
+    *alloc_out = al;
+    if (saw_sparse) *sparse_out = sp;
+    return 1;
+}
+
+static void aggregate_manifest_disk_from_manifests(const char **bin_dirs, size_t n, ereport_manifest_disk_t *out) {
+    size_t i;
+    int got = 0;
+    uint32_t chosen_unit = 0;
+
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!bin_dirs || n == 0) return;
+
+    for (i = 0; i < n; i++) {
+        uint32_t u;
+        uint64_t al, sp;
+
+        if (!read_manifest_disk_stats(bin_dirs[i], &u, &al, &sp)) continue;
+        got = 1;
+        out->total_allocated_bytes += al;
+        out->files_sparse_heuristic += sp;
+        if (u != 0U) {
+            if (chosen_unit == 0U)
+                chosen_unit = u;
+            else if (u != chosen_unit) {
+                if (!out->unit_mismatch)
+                    fprintf(stderr,
+                            "ereport: warning: mixed st_blocks_bytes_unit= across merged crawl_manifest.txt "
+                            "inputs\n");
+                out->unit_mismatch = 1;
+            }
+        }
+    }
+
+    if (!got) return;
+    out->valid = 1;
+    out->st_blocks_bytes_unit = chosen_unit != 0U ? chosen_unit : EREPORT_MANIFEST_DEFAULT_ST_BLOCKS_UNIT;
+}
+
 static void format_wall_clock_local(time_t t, char *buf, size_t sz) {
     struct tm tm_local;
 
@@ -2221,7 +2335,7 @@ static void dense_cell_steal_into_fanout_lookup_ex(dense_cell_map_t *narrow, den
     fanout_steal_pt_ctx_t *ctx = NULL;
     pthread_t *tids = NULL;
     dmerge_sync_t sync;
-    int nt_want, nthr, n_join, ti, k, brc;
+    int nt_cap, nt_want, nthr, n_join, ti, k, brc;
 
     if (!narrow || !lk) return;
     if (merge_threads < 2) {
@@ -2233,22 +2347,57 @@ static void dense_cell_steal_into_fanout_lookup_ex(dense_cell_map_t *narrow, den
         return;
     }
 
-    nt_want = merge_threads;
-    if (nt_want > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_want = DENSE_CELL_STEAL_FANOUT_MAX_NT;
-
-    st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(dense_node_t *));
-    if (!st) {
+    nt_cap = merge_threads;
+    if (nt_cap > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_cap = DENSE_CELL_STEAL_FANOUT_MAX_NT;
+    if (nt_cap < 2) {
         dense_cell_steal_into_fanout_lookup(narrow, lk);
         return;
     }
-    ctx = (fanout_steal_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
-    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
-    if (!ctx || (!tids && nt_want > 1)) {
+
+    /*
+     * Staging is nt_want * 65536 pointers (~512 KiB per thread at nt_want=128). If calloc fails, halve nt_want
+     * instead of falling back to single-threaded steal on multi-million-node maps (can wall-clock for tens of minutes).
+     */
+    st = NULL;
+    ctx = NULL;
+    tids = NULL;
+    nt_want = nt_cap;
+    for (;;) {
+        if (nt_want < 2) {
+            dense_cell_steal_into_fanout_lookup(narrow, lk);
+            return;
+        }
+        st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(dense_node_t *));
+        if (!st) {
+            if (nt_want <= 2) {
+                dense_cell_steal_into_fanout_lookup(narrow, lk);
+                return;
+            }
+            nt_want /= 2;
+            continue;
+        }
+        ctx = (fanout_steal_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
+        tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
+        if (ctx && (tids || nt_want == 1)) break;
         free(st);
+        st = NULL;
         free(ctx);
+        ctx = NULL;
         free(tids);
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
+        tids = NULL;
+        if (nt_want <= 2) {
+            dense_cell_steal_into_fanout_lookup(narrow, lk);
+            return;
+        }
+        nt_want /= 2;
+    }
+
+    if (g_ereport_verbose && nt_want < nt_cap) {
+        fprintf(stderr,
+                "ereport: fanout lookup steal using %d parallel teams (retry after staging alloc; wanted %d)\n",
+                nt_want,
+                nt_cap);
+        fflush(stderr);
     }
 
     atomic_init(&sync.gate, 0);
@@ -2398,6 +2547,7 @@ static uint64_t fanout_max_among_parents_serial(const dense_cell_map_t *slice_pa
 static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slice_parents,
                                                     const dense_cell_fanout_lookup_t *fanout_lookup) {
     int ninner;
+    int ninner_cap;
     int ti;
     int k;
     uint64_t mx;
@@ -2406,19 +2556,23 @@ static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slic
 
     if (!slice_parents || !fanout_lookup) return 0;
 
-    ninner = parse_ereport_thread_count();
-    if (ninner < 1) ninner = 1;
-    if (ninner > FANOUT_MAX_INNER_NT) ninner = FANOUT_MAX_INNER_NT;
+    ninner_cap = parse_ereport_thread_count();
+    if (ninner_cap < 1) ninner_cap = 1;
+    if (ninner_cap > FANOUT_MAX_INNER_NT) ninner_cap = FANOUT_MAX_INNER_NT;
 
-    if (ninner < 2 || dense_cell_total_nodes(slice_parents) < FANOUT_MAX_PAR_MIN_NODES)
+    if (ninner_cap < 2 || dense_cell_total_nodes(slice_parents) < FANOUT_MAX_PAR_MIN_NODES)
         return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
 
-    ctx = (fanout_max_wctx_t *)calloc((size_t)ninner, sizeof(*ctx));
-    tp = (pthread_t *)calloc((size_t)(ninner - 1), sizeof(*tp));
-    if (!ctx || !tp) {
+    for (ninner = ninner_cap; ninner >= 2;) {
+        ctx = (fanout_max_wctx_t *)calloc((size_t)ninner, sizeof(*ctx));
+        tp = (pthread_t *)calloc((size_t)(ninner - 1), sizeof(*tp));
+        if (ctx && tp) break;
         free(ctx);
+        ctx = NULL;
         free(tp);
-        return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
+        tp = NULL;
+        if (ninner <= 2) return fanout_max_among_parents_serial(slice_parents, fanout_lookup);
+        ninner = (ninner > 4 ? ninner / 2 : ninner - 1);
     }
 
     for (ti = 0; ti < ninner; ti++) {
@@ -2992,6 +3146,7 @@ static path_row_t *path_row_map_get_or_insert(path_row_map_t *m, const char *pat
 
     m->rows[idx].path = strdup(path);
     if (!m->rows[idx].path) return NULL;
+    m->rows[idx].par_agg_ix = 0;
     m->used[idx] = 1;
     m->count++;
     return &m->rows[idx];
@@ -3084,7 +3239,8 @@ static void path_row_topk_heap_push(path_row_t **h, size_t *hsz, size_t kcap, pa
 
     if (*hsz < kcap) {
         i = *hsz;
-        h[*hsz = i + 1] = row;
+        h[i] = row;
+        *hsz = i + 1;
         while (i > 0) {
             size_t p = (i - 1) / 2;
 
@@ -3217,6 +3373,31 @@ static size_t matched_ord_lower_bound_seg(const matched_records_t *rec, const si
     return lo;
 }
 
+/*
+ * Smallest i in [lo, n) where path for ord[i] is not under prefix (directory-aware). Returns n if all
+ * indices in [lo, n) are still under prefix. Replaces O(n) linear extension of hi in aggregate_totals.
+ */
+static size_t matched_ord_first_not_under_prefix(const matched_records_t *rec,
+                                                 const size_t *ord,
+                                                 size_t n,
+                                                 size_t lo,
+                                                 const char *prefix) {
+    size_t a = lo;
+    size_t b = n;
+
+    if (!rec || !ord || lo > n) return n;
+    while (a < b) {
+        size_t mid = a + (b - a) / 2;
+        const char *pp = rec->items[ord[mid]].path ? rec->items[ord[mid]].path : "";
+
+        if (starts_with_dir_prefix(pp, prefix))
+            a = mid + 1;
+        else
+            b = mid;
+    }
+    return a;
+}
+
 /* Set only around qsort of matched-record indices (single-threaded). */
 static const matched_record_t *g_bucket_path_sort_items;
 
@@ -3303,6 +3484,63 @@ static void matched_records_ms_parallel(const matched_record_t *items,
 
     mid = lo + (n >> 1);
     if (depth < max_depth) {
+        ms_heap_t *hl;
+        ms_heap_t *hr;
+        pthread_t thl, thr;
+        int rc_l;
+        int rc_r;
+
+        /*
+         * Sort both halves concurrently when possible. The previous "left in a thread, right on
+         * this stack" pattern kept merge-sort peak concurrency near ~2 even with a large
+         * EREPORT_THREADS — bucket prep then looked "stuck" at low CPU while path order dominated.
+         */
+        hl = (ms_heap_t *)malloc(sizeof(*hl));
+        hr = (ms_heap_t *)malloc(sizeof(*hr));
+        if (hl && hr) {
+            hl->items = items;
+            hl->ord = ord;
+            hl->tmp = tmp;
+            hl->lo = lo;
+            hl->hi = mid;
+            hl->depth = depth + 1;
+            hl->max_depth = max_depth;
+            hr->items = items;
+            hr->ord = ord;
+            hr->tmp = tmp;
+            hr->lo = mid;
+            hr->hi = hi;
+            hr->depth = depth + 1;
+            hr->max_depth = max_depth;
+
+            rc_l = pthread_create(&thl, NULL, ms_par_left_entry, hl);
+            rc_r = pthread_create(&thr, NULL, ms_par_left_entry, hr);
+            if (rc_l == 0 && rc_r == 0) {
+                pthread_join(thl, NULL);
+                pthread_join(thr, NULL);
+                merge_ord_path_slice(items, ord, tmp, lo, mid, hi);
+                return;
+            }
+            if (rc_l == 0) pthread_join(thl, NULL);
+            else free(hl);
+            if (rc_r == 0) pthread_join(thr, NULL);
+            else free(hr);
+            if (rc_l == 0 && rc_r != 0) {
+                matched_records_ms_parallel(items, ord, tmp, mid, hi, depth + 1, max_depth);
+                merge_ord_path_slice(items, ord, tmp, lo, mid, hi);
+                return;
+            }
+            if (rc_l != 0 && rc_r == 0) {
+                matched_records_ms_parallel(items, ord, tmp, lo, mid, depth + 1, max_depth);
+                merge_ord_path_slice(items, ord, tmp, lo, mid, hi);
+                return;
+            }
+            /* both pthread_create failed — fall through to single-helper or full serial */
+        } else {
+            free(hl);
+            free(hr);
+        }
+
         hp = (ms_heap_t *)malloc(sizeof(*hp));
         if (hp) {
             hp->items = items;
@@ -3633,24 +3871,6 @@ static int cmp_path_row_ptr(const void *a, const void *b) {
     return 0;
 }
 
-static int row_index_sorted_ptr(path_row_t **sorted, size_t R, path_row_t *row) {
-    uintptr_t k = (uintptr_t)row;
-    size_t lo = 0;
-    size_t hi = R;
-
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        uintptr_t v = (uintptr_t)sorted[mid];
-
-        if (v < k)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    if (lo < R && (uintptr_t)sorted[lo] == k) return (int)lo;
-    return -1;
-}
-
 static void zero_map_row_corpus_totals(path_row_map_t *maps, int nlevels) {
     size_t d, i;
 
@@ -3674,7 +3894,6 @@ typedef struct {
     int use_ord_slice;
     size_t c_lo;
     size_t c_hi;
-    path_row_t **sorted_rows;
     size_t R;
     uint64_t *part_base;
     atomic_int *fatal_atom;
@@ -3712,7 +3931,6 @@ static void *agg_totals_par_worker(void *vp) {
             const char *start;
             size_t comp_len;
             path_row_t *row;
-            int ri;
 
             while (*p == '/') p++;
             if (*p == '\0') break;
@@ -3729,8 +3947,9 @@ static void *agg_totals_par_worker(void *vp) {
 
             row = path_row_map_find(&w->maps[depth], rowpath);
             if (row) {
-                ri = row_index_sorted_ptr(w->sorted_rows, w->R, row);
-                if (ri >= 0) {
+                int ri = row->par_agg_ix;
+
+                if (ri >= 0 && (size_t)ri < w->R) {
                     if (r->type == 'f')
                         my[(size_t)ri * 3 + 0]++;
                     else if (r->type == 'd')
@@ -3772,7 +3991,6 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     atomic_int shared_fatal;
 
     size_t row_mat_bytes;
-    size_t max_nw;
 
     if (!maps || nlevels < 1 || !records || lo >= hi) return -1;
     if (nscan < AGG_TOTALS_PAR_MIN_RECORDS) return -1;
@@ -3785,20 +4003,44 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
 
     row_mat_bytes = R * 3 * sizeof(uint64_t);
     if (row_mat_bytes > 0) {
-        max_nw = AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES / row_mat_bytes;
-        if (max_nw < 2) return -1;
-        if ((size_t)nw > max_nw) nw = (int)max_nw;
+        size_t cap = AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES / row_mat_bytes;
+
+        if (cap >= 2 && (size_t)nw > cap) nw = (int)cap;
     }
+
     atomic_init(&shared_fatal, 0);
 
     if (collect_map_row_pointers(maps, nlevels, &row_list, &R) != 0) return -1;
 
     VT_QSORT_BUCKET(run_rs, row_list, R, sizeof(*row_list), cmp_path_row_ptr);
 
-    parts = (uint64_t *)calloc((size_t)nw * R * 3, sizeof(uint64_t));
-    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
-    ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
-    if (!parts || !tp || !ctxs) {
+    {
+        size_t ax;
+
+        for (ax = 0; ax < R; ax++) row_list[ax]->par_agg_ix = (int)ax;
+    }
+
+    parts = NULL;
+    tp = NULL;
+    ctxs = NULL;
+    while (nw >= 2) {
+        parts = (uint64_t *)calloc((size_t)nw * R * 3, sizeof(uint64_t));
+        if (!parts) {
+            nw /= 2;
+            continue;
+        }
+        tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
+        ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
+        if (tp && ctxs) break;
+        free(parts);
+        parts = NULL;
+        free(tp);
+        tp = NULL;
+        free(ctxs);
+        ctxs = NULL;
+        nw /= 2;
+    }
+    if (!parts || !tp || !ctxs || nw < 2) {
         free(row_list);
         free(parts);
         free(tp);
@@ -3823,7 +4065,6 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
         ctxs[started].use_ord_slice = use_ord_slice;
         ctxs[started].c_lo = clo;
         ctxs[started].c_hi = chi;
-        ctxs[started].sorted_rows = row_list;
         ctxs[started].R = R;
         ctxs[started].part_base = parts + (size_t)started * R * 3;
         ctxs[started].fatal_atom = &shared_fatal;
@@ -3881,7 +4122,10 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
                                        const matched_records_t *records,
                                        const char *base_prefix,
                                        const size_t *path_ord,
-                                       ereport_run_stats_t *run_rs) {
+                                       ereport_run_stats_t *run_rs,
+                                       size_t pre_lo,
+                                       size_t pre_hi,
+                                       int pre_slice_valid) {
     size_t n = records ? records->count : 0;
     size_t lo = 0;
     size_t hi = n;
@@ -3889,12 +4133,12 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
     int use_ord_slice = (base_prefix && base_prefix[0] != '\0' && path_ord);
 
     if (use_ord_slice) {
-        lo = matched_ord_lower_bound_seg(records, path_ord, n, base_prefix);
-        hi = lo;
-        while (hi < n) {
-            const char *pp = records->items[path_ord[hi]].path ? records->items[path_ord[hi]].path : "";
-            if (!starts_with_dir_prefix(pp, base_prefix)) break;
-            hi++;
+        if (pre_slice_valid) {
+            lo = pre_lo;
+            hi = pre_hi;
+        } else {
+            lo = matched_ord_lower_bound_seg(records, path_ord, n, base_prefix);
+            hi = matched_ord_first_not_under_prefix(records, path_ord, n, lo, base_prefix);
         }
     }
 
@@ -4452,7 +4696,8 @@ static void dense_drill_topk_heap_push(dense_drill_row_t *h, size_t *hsz, size_t
 
     if (*hsz < kcap) {
         i = *hsz;
-        h[*hsz = i + 1] = row;
+        h[i] = row;
+        *hsz = i + 1;
         while (i > 0) {
             size_t p = (i - 1) / 2;
 
@@ -4503,7 +4748,8 @@ static void deep_drill_topk_heap_push(deep_drill_row_t *h, size_t *hsz, size_t k
 
     if (*hsz < kcap) {
         i = *hsz;
-        h[*hsz = i + 1] = row;
+        h[i] = row;
+        *hsz = i + 1;
         while (i > 0) {
             size_t p = (i - 1) / 2;
 
@@ -4832,6 +5078,122 @@ static void emit_bucket_shape_drill_section(FILE *out,
     }
 }
 
+typedef struct {
+    char *base_prefix;
+    size_t ord_lo;
+    size_t ord_hi;
+} bucket_page_slice_t;
+
+typedef struct {
+    bucket_details_t (*details)[SIZE_BUCKETS];
+    const matched_records_t *mr;
+    const size_t *ord;
+    bucket_page_slice_t (*slices)[SIZE_BUCKETS];
+    atomic_int next_cell;
+} bucket_slice_prep_ctx_t;
+
+static void bucket_page_slices_free(bucket_page_slice_t slices[AGE_BUCKETS][SIZE_BUCKETS]);
+
+static void bucket_fill_one_page_slice(bucket_details_t *bd,
+                                       const matched_records_t *mr,
+                                       const size_t *ord,
+                                       bucket_page_slice_t *sl) {
+    size_t n;
+
+    sl->base_prefix = NULL;
+    sl->ord_lo = 0;
+    sl->ord_hi = 0;
+    if (!bd || bd->count == 0 || !mr || !ord) return;
+    n = mr->count;
+    sl->base_prefix = dup_common_dir_prefix(bd);
+    if (!sl->base_prefix) return;
+    if (n > 0 && sl->base_prefix[0] != '\0') {
+        sl->ord_lo = matched_ord_lower_bound_seg(mr, ord, n, sl->base_prefix);
+        sl->ord_hi = matched_ord_first_not_under_prefix(mr, ord, n, sl->ord_lo, sl->base_prefix);
+    } else {
+        sl->ord_lo = 0;
+        sl->ord_hi = n;
+    }
+}
+
+static void *bucket_slice_prep_worker(void *vp) {
+    bucket_slice_prep_ctx_t *c = (bucket_slice_prep_ctx_t *)vp;
+
+    for (;;) {
+        int k = atomic_fetch_add_explicit(&c->next_cell, 1, memory_order_relaxed);
+        int ab;
+        int sb;
+
+        if (k >= AGE_BUCKETS * SIZE_BUCKETS) break;
+        ab = k / SIZE_BUCKETS;
+        sb = k % SIZE_BUCKETS;
+        bucket_fill_one_page_slice(&c->details[ab][sb], c->mr, c->ord, &c->slices[ab][sb]);
+    }
+    return NULL;
+}
+
+static void bucket_prepare_page_slices(bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS],
+                                       const matched_records_t *mr,
+                                       const size_t *ord,
+                                       bucket_page_slice_t slices[AGE_BUCKETS][SIZE_BUCKETS]) {
+    int nw_l;
+    int i;
+    int ab;
+    int sb;
+    pthread_t *tp = NULL;
+    bucket_slice_prep_ctx_t ctx;
+
+    memset(slices, 0, sizeof(bucket_page_slice_t) * (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS);
+    if (!mr || !ord || mr->count == 0) return;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.details = details;
+    ctx.mr = mr;
+    ctx.ord = ord;
+    ctx.slices = slices;
+    atomic_init(&ctx.next_cell, 0);
+
+    nw_l = parse_ereport_thread_count();
+    if (nw_l < 1) nw_l = 1;
+    if (nw_l > AGE_BUCKETS * SIZE_BUCKETS) nw_l = AGE_BUCKETS * SIZE_BUCKETS;
+
+    tp = (pthread_t *)malloc((size_t)nw_l * sizeof(pthread_t));
+    if (!tp) {
+        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+            for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_fill_one_page_slice(&details[ab][sb], mr, ord, &slices[ab][sb]);
+        }
+        return;
+    }
+
+    for (i = 0; i < nw_l; i++) {
+        if (pthread_create(&tp[i], NULL, bucket_slice_prep_worker, &ctx) != 0) {
+            int j;
+            for (j = 0; j < i; j++) pthread_join(tp[j], NULL);
+            free(tp);
+            bucket_page_slices_free(slices);
+            memset(slices, 0, sizeof(bucket_page_slice_t) * (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS);
+            for (ab = 0; ab < AGE_BUCKETS; ab++) {
+                for (sb = 0; sb < SIZE_BUCKETS; sb++) bucket_fill_one_page_slice(&details[ab][sb], mr, ord, &slices[ab][sb]);
+            }
+            return;
+        }
+    }
+    for (i = 0; i < nw_l; i++) pthread_join(tp[i], NULL);
+    free(tp);
+}
+
+static void bucket_page_slices_free(bucket_page_slice_t slices[AGE_BUCKETS][SIZE_BUCKETS]) {
+    int ab;
+    int sb;
+
+    for (ab = 0; ab < AGE_BUCKETS; ab++) {
+        for (sb = 0; sb < SIZE_BUCKETS; sb++) {
+            free(slices[ab][sb].base_prefix);
+            slices[ab][sb].base_prefix = NULL;
+        }
+    }
+}
+
 static int emit_bucket_detail_page(const char *filename,
                                    const char *username,
                                    int all_users,
@@ -4850,9 +5212,11 @@ static int emit_bucket_detail_page(const char *filename,
                                    const dense_cell_map_t (*merged_dense_matrix)[SIZE_BUCKETS],
                                    const dense_cell_fanout_lookup_t *fanout_lookup_shape,
                                    const fanout_parent_stat_map_t *fanout_parent_stats,
-                                   ereport_run_stats_t *run_rs) {
+                                   ereport_run_stats_t *run_rs,
+                                   const bucket_page_slice_t *pre_slice) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
+    int base_prefix_owned = 0;
     path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
     size_t i;
     uint64_t bucket_files = 0;
@@ -5030,7 +5394,13 @@ static int emit_bucket_detail_page(const char *filename,
         return 0;
     }
 
-    base_prefix = dup_common_dir_prefix(details);
+    if (pre_slice && pre_slice->base_prefix) {
+        base_prefix = pre_slice->base_prefix;
+        base_prefix_owned = 0;
+    } else {
+        base_prefix = dup_common_dir_prefix(details);
+        base_prefix_owned = 1;
+    }
     if (!base_prefix) {
         for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
@@ -5042,13 +5412,18 @@ static int emit_bucket_detail_page(const char *filename,
         bucket_bytes += details->items[i].size;
     }
 
-    if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix) != 0 ||
-        aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord, run_rs) !=
-            0) {
-        free(base_prefix);
-        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
-        counted_fclose(out);
-        return -1;
+    {
+        int pre_tot = (pre_slice && pre_slice->base_prefix && pre_slice->base_prefix[0] != '\0' && matched_path_ord);
+
+        if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix) != 0 ||
+            aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord, run_rs,
+                                        pre_tot ? pre_slice->ord_lo : 0, pre_tot ? pre_slice->ord_hi : 0, pre_tot) !=
+                0) {
+            if (base_prefix_owned) free(base_prefix);
+            for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
+            counted_fclose(out);
+            return -1;
+        }
     }
 
     {
@@ -5130,7 +5505,7 @@ static int emit_bucket_detail_page(const char *filename,
     fputs("</script>\n", out);
     fprintf(out, "</body>\n</html>\n");
 
-    free(base_prefix);
+    if (base_prefix_owned) free(base_prefix);
     for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
     counted_fclose(out);
     return 0;
@@ -5253,6 +5628,7 @@ typedef struct {
     atomic_size_t next_task;
     atomic_int any_fail;
     ereport_run_stats_t *run_stats;
+    bucket_page_slice_t (*page_slices)[SIZE_BUCKETS];
 } bucket_emit_ctx_t;
 
 typedef struct {
@@ -5417,7 +5793,8 @@ static void *bucket_page_emit_worker(void *arg) {
                                         c->bucket_detail_levels, &c->details[ab][sb], c->matched_records,
                                         c->matched_path_ord, c->corpus_total_user_files, c->corpus_total_user_bytes,
                                         c->sum_ref, c->path_shape, c->merged_dense_matrix, c->fanout_lookup_shape,
-                                        c->fanout_parent_stats, c->run_stats);
+                                        c->fanout_parent_stats, c->run_stats,
+                                        c->page_slices ? &c->page_slices[ab][sb] : NULL);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
         if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
@@ -5441,6 +5818,7 @@ static int emit_all_bucket_detail_pages(const char *username,
                                         const fanout_parent_stat_map_t *fanout_parent_stats) {
     const size_t ntasks = (size_t)AGE_BUCKETS * (size_t)SIZE_BUCKETS;
     bucket_emit_ctx_t ctx;
+    bucket_page_slice_t page_slices[AGE_BUCKETS][SIZE_BUCKETS];
     pthread_t *tids = NULL;
     bucket_emit_thread_arg_t *args = NULL;
     int nw;
@@ -5448,6 +5826,7 @@ static int emit_all_bucket_detail_pages(const char *username,
 
     if (ensure_bucket_output_dir_exists() != 0) return -1;
 
+    memset(page_slices, 0, sizeof(page_slices));
     memset(&ctx, 0, sizeof(ctx));
     ctx.username = username;
     ctx.all_users = all_users;
@@ -5466,6 +5845,7 @@ static int emit_all_bucket_detail_pages(const char *username,
     ctx.fanout_parent_stats = fanout_parent_stats;
     ctx.stub_mode = (bucket_detail_levels == 0 && sum_ref != NULL) ? 1 : 0;
     ctx.run_stats = run_stats;
+    ctx.page_slices = page_slices;
 
     if (run_stats) {
         atomic_store(&run_stats->finalize_merge_substep, 0);
@@ -5500,6 +5880,10 @@ static int emit_all_bucket_detail_pages(const char *username,
             run_stats->vt_bucket_prep_wall_sec += now_sec() - prep_t0;
     }
 
+    if (!ctx.stub_mode && matched_records && matched_records->count > 0 && ctx.matched_path_ord) {
+        bucket_prepare_page_slices(details, matched_records, ctx.matched_path_ord, page_slices);
+    }
+
     if (run_stats) atomic_store(&run_stats->finalize_bucket_prep, 0);
 
     atomic_init(&ctx.next_task, 0);
@@ -5515,6 +5899,7 @@ static int emit_all_bucket_detail_pages(const char *username,
         fprintf(stderr, "ereport: allocation failed (bucket page emit pool)\n");
         free(tids);
         free(args);
+        bucket_page_slices_free(page_slices);
         free(ctx.matched_path_ord);
         return -1;
     }
@@ -5536,6 +5921,7 @@ static int emit_all_bucket_detail_pages(const char *username,
                 atomic_store(&ctx.any_fail, 0);
                 bucket_page_emit_worker(&args[0]);
                 free(args);
+                bucket_page_slices_free(page_slices);
                 free(ctx.matched_path_ord);
                 if (run_stats && g_ereport_verbose && cell_t0 > 0.0)
                     run_stats->vt_bucket_cells_wall_sec += now_sec() - cell_t0;
@@ -5549,6 +5935,7 @@ static int emit_all_bucket_detail_pages(const char *username,
     }
     free(tids);
     free(args);
+    bucket_page_slices_free(page_slices);
     free(ctx.matched_path_ord);
     return atomic_load(&ctx.any_fail) ? -1 : 0;
 }
@@ -6543,7 +6930,8 @@ static void *shape_margin_worker(void *vp) {
 static void path_shape_fill_from_merged_dense(const summary_t *sum,
                                               dense_cell_map_t merged_dense[AGE_BUCKETS][SIZE_BUCKETS],
                                               const dense_cell_fanout_lookup_t *fanout_lookup,
-                                              path_shape_view_t *path_shape) {
+                                              path_shape_view_t *path_shape,
+                                              ereport_run_stats_t *run_rs) {
     dense_cell_map_t row_merged[AGE_BUCKETS];
     shape_margin_ctx_t ctx;
     ps_cell_ctx_t ps_ctx;
@@ -6552,13 +6940,14 @@ static void path_shape_fill_from_merged_dense(const summary_t *sum,
     pthread_t *ps_pool = NULL;
     const int ntasks = AGE_BUCKETS + SIZE_BUCKETS;
     const int ncells = AGE_BUCKETS * SIZE_BUCKETS;
-    dense_cell_map_t all_acc;
 
     ps_ctx.sum = sum;
     ps_ctx.merged_dense = merged_dense;
     ps_ctx.fanout_lookup = fanout_lookup;
     ps_ctx.path_shape = path_shape;
     atomic_init(&ps_ctx.next_cell, 0);
+
+    if (run_rs) atomic_store(&run_rs->finalize_lookup_stage, 2U);
 
     nw = parse_ereport_thread_count();
     if (nw < 1) nw = 1;
@@ -6607,6 +6996,8 @@ static void path_shape_fill_from_merged_dense(const summary_t *sum,
         }
     }
 
+    if (run_rs) atomic_store(&run_rs->finalize_lookup_stage, 3U);
+
     memset(row_merged, 0, sizeof(row_merged));
 
     ctx.sum = sum;
@@ -6642,22 +7033,26 @@ static void path_shape_fill_from_merged_dense(const summary_t *sum,
         }
     }
 
-    memset(&all_acc, 0, sizeof(all_acc));
+    /*
+     * Overall dense-fanout badge: max global child-count among parents that appear in any heat-map cell.
+     * Each row aggregate already scanned all parents in that age strip across size buckets; taking the max
+     * over rows (and columns, same set) avoids merging six huge maps then re-walking them with fanout lookups
+     * (O(nodes * chain) in the 65k table), which could stall huge crawls for tens of minutes.
+     */
     path_shape->all.deep_bytes = sum->total_shape_deep_bytes;
     {
-        const dense_cell_map_t *rv[AGE_BUCKETS];
-        int nt = parse_ereport_thread_count();
+        uint64_t all_mx = 0;
 
-        for (ab = 0; ab < AGE_BUCKETS; ab++) rv[ab] = &row_merged[ab];
-        if (nt >= AGE_BUCKETS + 2) {
-            shape_margin_parallel_fold_ptrs(&all_acc, rv, AGE_BUCKETS);
-        } else {
-            for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_merge_add(&all_acc, &row_merged[ab], NULL);
+        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+            if (path_shape->row[ab].dense_fanout_max > all_mx) all_mx = path_shape->row[ab].dense_fanout_max;
         }
+        for (ab = 0; ab < SIZE_BUCKETS; ab++) {
+            if (path_shape->col[ab].dense_fanout_max > all_mx) all_mx = path_shape->col[ab].dense_fanout_max;
+        }
+        path_shape->all.dense_fanout_max = all_mx;
     }
-    path_shape->all.dense_fanout_max = dense_cell_max_fanout_among_parents(&all_acc, fanout_lookup);
-    dense_cell_free(&all_acc);
     for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_free(&row_merged[ab]);
+    if (run_rs) atomic_store(&run_rs->finalize_lookup_stage, 0U);
 }
 
 static file_chunk_t *queue_pop(work_queue_t *q) {
@@ -7248,6 +7643,7 @@ static void *stats_thread_main(void *arg) {
                     const int ndc = AGE_BUCKETS * SIZE_BUCKETS;
                     int fft = atomic_load(&rs->finalize_fanout_workers_total);
                     int ffd = atomic_load(&rs->finalize_fanout_workers_done);
+                    unsigned int lk = atomic_load(&rs->finalize_lookup_stage);
 
                     if (fft > 0 && ffd < fft) {
                         printf(
@@ -7256,6 +7652,50 @@ static void *stats_thread_main(void *arg) {
                             step,
                             ffd,
                             fft,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else if (dcells < (unsigned int)ndc) {
+                        printf(
+                            "\rfinalizing: %s (dense cells %u/%d) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
+                            dcells,
+                            ndc,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else if (lk == 1U) {
+                        printf(
+                            "\rfinalizing: %s (fanout lookup repartition) | files:%s/%s rec:%s match:%s bad:%llu | "
+                            "el:%s            ",
+                            step,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else if (lk == 2U) {
+                        printf(
+                            "\rfinalizing: %s (path-shape heatmap cells) | files:%s/%s rec:%s match:%s bad:%llu | "
+                            "el:%s            ",
+                            step,
+                            sf,
+                            tf,
+                            sr,
+                            mr,
+                            bad_input_files,
+                            elapsed_buf);
+                    } else if (lk == 3U) {
+                        printf(
+                            "\rfinalizing: %s (path-shape margins) | files:%s/%s rec:%s match:%s bad:%llu | el:%s            ",
+                            step,
                             sf,
                             tf,
                             sr,
@@ -7688,6 +8128,7 @@ static int emit_html(const char *report_path,
                      size_t crawl_source_count,
                      const char *crawl_sources_label,
                      const ereport_crawl_timing_t *crawl_timing,
+                     const ereport_manifest_disk_t *manifest_disk,
                      ereport_run_stats_t *prog_rs) {
     FILE *out = counted_fopen(report_path, "w");
     int ab, sb;
@@ -7720,8 +8161,12 @@ static int emit_html(const char *report_path,
     fprintf(out, ".report-sources-section h3{font-size:0.95rem;margin:0 0 8px;color:#444;font-weight:600}\n");
     fprintf(out, ".report-sources-section .lead{margin:0 0 10px;font-size:13px;color:#555;line-height:1.45}\n");
     fprintf(out, ".report-sources-list{margin:8px 0 0;padding-left:22px;line-height:1.55;color:#333;font-size:13px}\n");
-    fprintf(out, ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:4px}\n");
-    fprintf(out, ".stats-card{margin:0;padding:14px 16px;background:#fafafa;border:1px solid #e5e5e5;border-radius:8px}\n");
+    fprintf(out,
+            ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%%,220px),1fr));gap:14px;"
+            "margin-top:4px}\n");
+    fprintf(out, ".stats-foot{margin:12px 0 0;font-size:12px;color:#666;line-height:1.45;max-width:920px}\n");
+    fprintf(out, ".stats-card{margin:0;padding:14px 16px;background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;"
+                "min-width:0}\n");
     fprintf(out, ".stats-card h3{font-size:0.92rem;margin:0 0 12px;color:#333;font-weight:600}\n");
     fprintf(out, ".stats-dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 14px;font-size:13px;align-items:baseline}\n");
     fprintf(out, ".stats-dl dt{margin:0;color:#666;font-weight:500}\n");
@@ -7804,7 +8249,21 @@ static int emit_html(const char *report_path,
     fprintf(out, "@media (max-width:900px){body{margin:14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
     fprintf(out, ".path-search{margin:0 0 22px}\n");
     fprintf(out, ".path-search label{display:block;font-weight:600;margin-bottom:6px}\n");
-    fprintf(out, ".path-search input[type=text]{width:min(520px,95vw);padding:8px;font-size:14px;border:1px solid #ccc;border-radius:4px}\n");
+    fprintf(out,
+            ".path-search-field-wrap{position:relative;display:inline-block;width:min(520px,95vw);vertical-align:top}\n");
+    fprintf(out,
+            ".path-search-field-wrap input[type=text]{width:100%%;box-sizing:border-box;padding:8px 36px 8px "
+            "8px;font-size:14px;border-radius:4px;transition:background-color .22s ease,border-color .22s ease}\n");
+    fprintf(out, ".path-search-input--neutral{background:#fff;border:1px solid #ccc}\n");
+    fprintf(out, ".path-search-input--waiting{background:#fffde7;border:1px solid #ffe082}\n");
+    fprintf(out, ".path-search-input--ok{background:#e8f5e9;border:1px solid #a5d6a7}\n");
+    fprintf(out, ".path-search-input--empty,.path-search-input--error{background:#ffebee;border:1px solid #ef9a9a}\n");
+    fprintf(out,
+            ".path-search-spinner{position:absolute;right:8px;top:50%%;width:18px;height:18px;margin-top:-9px;"
+            "display:inline-block;border:2px solid #e0d59a;border-top-color:#c9a227;border-radius:50%%;box-sizing:border-box;"
+            "animation:pathSearchSpin .65s linear infinite;pointer-events:none;vertical-align:middle}\n");
+    fprintf(out, ".path-search-spinner[hidden]{display:none!important}\n");
+    fprintf(out, "@keyframes pathSearchSpin{to{transform:rotate(360deg)}}\n");
     fprintf(out, ".path-search-panel{margin-top:12px;padding:12px 14px;border:1px solid #dadada;border-radius:8px;background:#f9f9f9;max-height:min(55vh,480px);overflow:auto;font-size:13px}\n");
     fprintf(out, ".path-search-panel[hidden]{display:none!important}\n");
     fprintf(out, ".path-search-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}\n");
@@ -7852,8 +8311,10 @@ static int emit_html(const char *report_path,
     fprintf(out, "<label for=\"path-search-input\">Search paths</label>\n");
     fprintf(out, "<p class=\"path-search-hint\">Type at least three characters. Results appear below as you type; press Enter for full pages of matches. Use Hide to close the results panel.</p>\n");
     fprintf(out,
-            "<input type=\"text\" id=\"path-search-input\" autocomplete=\"off\" "
-            "placeholder=\"Example: project name or folder\" />\n");
+            "<div class=\"path-search-field-wrap\" id=\"path-search-field-wrap\">"
+            "<span class=\"path-search-spinner\" id=\"path-search-spinner\" hidden aria-hidden=\"true\"></span>"
+            "<input type=\"text\" id=\"path-search-input\" class=\"path-search-input path-search-input--neutral\" "
+            "autocomplete=\"off\" placeholder=\"Example: project name or folder\" /></div>\n");
     fprintf(out, "<div id=\"path-search-panel\" class=\"path-search-panel\" hidden aria-live=\"polite\">\n");
     fprintf(out, "<div class=\"path-search-panel-head\"><strong id=\"path-search-panel-title\">Search results</strong>\n");
     fprintf(out, "<button type=\"button\" id=\"path-search-panel-hide\" aria-label=\"Hide results\">Hide</button></div>\n");
@@ -8188,6 +8649,8 @@ static int emit_html(const char *report_path,
 
         fprintf(out, "<article class=\"stats-card\"><h3>Filesystem snapshot</h3><dl class=\"stats-dl\">\n");
         emit_stats_count_dd(out, "Regular files", sum->total_files);
+        if (manifest_disk && manifest_disk->valid)
+            emit_stats_count_dd(out, "Sparse regular files (est.)", manifest_disk->files_sparse_heuristic);
         emit_stats_count_dd(out, "Directories", sum->total_dirs);
         emit_stats_count_dd(out, "Symbolic links", sum->total_links);
         emit_stats_count_dd(out, "Other types", other_count);
@@ -8195,8 +8658,22 @@ static int emit_html(const char *report_path,
         fprintf(out, "</dl></article>\n");
 
         fprintf(out, "<article class=\"stats-card\"><h3>Capacity</h3><dl class=\"stats-dl\">\n");
-        fprintf(out, "<dt>In regular files</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
-                totalb, sum->total_bytes);
+        fprintf(out,
+                "<dt>Logical size (regular files)</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64
+                " B)</span></dd>\n",
+                totalb,
+                sum->total_bytes);
+        if (manifest_disk && manifest_disk->valid) {
+            char alloc_h[32];
+
+            human_bytes(manifest_disk->total_allocated_bytes, alloc_h, sizeof(alloc_h));
+            fprintf(out,
+                    "<dt>On disk (regular files)</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64
+                    " B)</span> <span class=\"stats-num-short\">(st_blocks×%" PRIu32 ")</span></dd>\n",
+                    alloc_h,
+                    manifest_disk->total_allocated_bytes,
+                    manifest_disk->st_blocks_bytes_unit);
+        }
         fprintf(out, "<dt>In symlinks / non-files</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
                 total_non_file_b, non_file_bytes);
         fprintf(out, "<dt>Other file types</dt><dd><span class=\"stats-num\">%s</span> <span class=\"stats-num\">(%" PRIu64 " B)</span></dd>\n",
@@ -8204,6 +8681,21 @@ static int emit_html(const char *report_path,
         fprintf(out, "</dl></article>\n");
 
         fprintf(out, "</div>\n");
+        if (manifest_disk && manifest_disk->valid && (!all_users || manifest_disk->unit_mismatch)) {
+            fprintf(out, "<p class=\"stats-foot\">");
+            if (!all_users) {
+                fputs(
+                    "Sparse count and on-disk total are taken from each input directory’s <code>crawl_manifest.txt</code> "
+                    "and describe the <strong>entire ecrawl run</strong> (all UIDs in that crawl). Logical size and regular "
+                    "file counts above follow this report’s matched shard records only. ",
+                    out);
+            }
+            if (manifest_disk->unit_mismatch)
+                fputs("Merged manifests use different <code>st_blocks_bytes_unit</code> values; combined on-disk bytes "
+                      "assume compatible definitions. ",
+                      out);
+            fprintf(out, "</p>\n");
+        }
         fprintf(out, "</section>\n");
     }
 
@@ -8234,6 +8726,7 @@ static int emit_html(const char *report_path,
     fputs("function hideSearchPanel(){\n", out);
     fputs("var p=document.getElementById('path-search-panel');if(p)p.hidden=true;\n", out);
     fputs("var c=document.getElementById('path-search-caption');if(c)c.textContent='';\n", out);
+    fputs("setPathSearchFieldState('neutral');\n", out);
     fputs("}\n", out);
     fputs("function showSearchPanel(){\n", out);
     fputs("var p=document.getElementById('path-search-panel');if(p)p.hidden=false;\n", out);
@@ -8256,6 +8749,20 @@ static int emit_html(const char *report_path,
     fputs("backdrop.addEventListener('click',closeBucketDrawer);\n", out);
     fputs("document.addEventListener('keydown',function(ev){if(ev.key==='Escape')closeBucketDrawer();});\n", out);
     fputs("var PREVIEW_MAX=20;var PAGE_SIZE=50;var fullTerm='';var pageNum=1;var lastTotal=0;var previewFetchCtl=null;\n", out);
+    fputs("var previewGen=0;var pageGen=0;\n", out);
+    fputs("function setPathSearchFieldState(st){\n", out);
+    fputs("var inp=document.getElementById('path-search-input');\n", out);
+    fputs("var sp=document.getElementById('path-search-spinner');\n", out);
+    fputs("if(!inp)return;\n", out);
+    fputs("inp.classList.remove('path-search-input--neutral','path-search-input--waiting','path-search-input--ok','path-search-input--empty','path-search-input--error');\n", out);
+    fputs("if(sp)sp.hidden=true;\n", out);
+    fputs("if(st==='waiting'){inp.classList.add('path-search-input--waiting');if(sp)sp.hidden=false;inp.setAttribute('aria-busy','true');return;}\n", out);
+    fputs("inp.removeAttribute('aria-busy');\n", out);
+    fputs("if(st==='ok')inp.classList.add('path-search-input--ok');\n", out);
+    fputs("else if(st==='empty')inp.classList.add('path-search-input--empty');\n", out);
+    fputs("else if(st==='error')inp.classList.add('path-search-input--error');\n", out);
+    fputs("else inp.classList.add('path-search-input--neutral');\n", out);
+    fputs("}\n", out);
     fputs("function fmtSearchMs(ms){\n", out);
     fputs("if(ms==null||!isFinite(ms))return'';\n", out);
     fputs("ms=Number(ms);if(ms<1000)return Math.round(ms)+'ms';\n", out);
@@ -8315,7 +8822,7 @@ static int emit_html(const char *report_path,
     fputs("var box=document.getElementById('path-search-preview');\n", out);
     fputs("var cap=document.getElementById('path-search-caption');\n", out);
     fputs("var t=raw.trim();\n", out);
-    fputs("if(t.length<3){if(previewFetchCtl)previewFetchCtl.abort();box.innerHTML='';document.getElementById('path-search-results').hidden=true;hideSearchPanel();return;}\n", out);
+    fputs("if(t.length<3){if(previewFetchCtl)previewFetchCtl.abort();box.innerHTML='';document.getElementById('path-search-results').hidden=true;setPathSearchFieldState('neutral');hideSearchPanel();return;}\n", out);
     fputs("showSearchPanel();\n", out);
     fputs("document.getElementById('path-search-panel-title').textContent='Preview';\n", out);
     fputs("if(cap)cap.textContent='Keep typing in the box above—same field—to refine. Press Enter for paged results.';\n", out);
@@ -8323,30 +8830,54 @@ static int emit_html(const char *report_path,
     fputs("if(previewFetchCtl)previewFetchCtl.abort();\n", out);
     fputs("previewFetchCtl=new AbortController();\n", out);
     fputs("var pvSig=previewFetchCtl.signal;\n", out);
+    fputs("previewGen++;var prvG=previewGen;\n", out);
+    fputs("setPathSearchFieldState('neutral');\n", out);
+    fputs("var spinT=setTimeout(function(){\n", out);
+    fputs("if(prvG!==previewGen)return;\n", out);
+    fputs("var ix=document.getElementById('path-search-input');\n", out);
+    fputs("if(ix&&ix.value.trim()===t&&!pvSig.aborted)setPathSearchFieldState('waiting');\n", out);
+    fputs("},1000);\n", out);
     fputs("fetchSearch(t,0,PREVIEW_MAX,pvSig).then(function(j){\n", out);
+    fputs("clearTimeout(spinT);\n", out);
+    fputs("if(prvG!==previewGen)return;\n", out);
     fputs("var inpEl=document.getElementById('path-search-input');\n", out);
     fputs("if(!inpEl||inpEl.value.trim()!==t)return;\n", out);
     fputs("var paths=j.paths||[];\n", out);
-    fputs("if(paths.length===0){box.innerHTML='<span class=\"path-search-muted\">No matches.</span>';return;}\n", out);
+    fputs("if(paths.length===0){setPathSearchFieldState('empty');box.innerHTML='<span class=\"path-search-muted\">No matches.</span>';return;}\n", out);
+    fputs("setPathSearchFieldState('ok');\n", out);
     fputs("var h='<ul>';for(var i=0;i<paths.length;i++){h+='<li>'+highlightPathHtml(paths[i],t)+'</li>';}h+='</ul>';\n", out);
     fputs("var pv=[];if(j.search_ms!=null&&fmtSearchMs(j.search_ms))pv.push(fmtSearchMs(j.search_ms));\n", out);
     fputs("var cm=corpusMeta(j);if(cm)pv.push(cm);\n", out);
     fputs("var pvs=pv.length?' \\u00b7 '+pv.join(' \\u00b7 '):'';\n", out);
     fputs("if((j.total||0)>paths.length){h+='<div class=\"path-search-muted\">Showing '+paths.length+' of '+j.total+pvs+' \\u2014 press Enter for full paging.</div>';}\n", out);
     fputs("box.innerHTML=h;\n}).catch(function(e){\n", out);
-    fputs("if(e&&(e.name==='AbortError'||(pvSig&&pvSig.aborted)))return;\n", out);
-    fputs("var caperr=document.getElementById('path-search-caption');if(caperr)caperr.textContent='';box.innerHTML='<span class=\"path-search-muted\">'+escHtml(e.message)+'</span>';});\n}\n", out);
+    fputs("clearTimeout(spinT);\n", out);
+    fputs("if(prvG!==previewGen)return;\n", out);
+    fputs("if(e&&(e.name==='AbortError'||(pvSig&&pvSig.aborted))){setPathSearchFieldState('neutral');return;}\n", out);
+    fputs("var caperr=document.getElementById('path-search-caption');if(caperr)caperr.textContent='';setPathSearchFieldState('error');box.innerHTML='<span class=\"path-search-muted\">'+escHtml(e.message)+'</span>';});\n}\n", out);
     fputs("function renderFullPage(){\n", out);
     fputs("var meta=document.getElementById('path-search-results-meta');\n", out);
     fputs("var list=document.getElementById('path-search-results-list');\n", out);
     fputs("var prev=document.getElementById('path-search-prev');\n", out);
     fputs("var next=document.getElementById('path-search-next');\n", out);
     fputs("var cap=document.getElementById('path-search-caption');\n", out);
-    fputs("if(!fullTerm){meta.textContent='';list.innerHTML='';if(cap)cap.textContent='';return;}\n", out);
+    fputs("if(!fullTerm){meta.textContent='';list.innerHTML='';if(cap)cap.textContent='';setPathSearchFieldState('neutral');return;}\n", out);
     fputs("showSearchPanel();\n", out);
     fputs("document.getElementById('path-search-panel-title').textContent='Paged results';\n", out);
     fputs("if(cap)cap.textContent='Edit the search box above to change the query; use Prev/Next below.';\n", out);
+    fputs("var ftSnap=fullTerm;\n", out);
+    fputs("pageGen++;var pg=pageGen;\n", out);
+    fputs("setPathSearchFieldState('neutral');\n", out);
+    fputs("var spinF=setTimeout(function(){\n", out);
+    fputs("if(pg!==pageGen)return;\n", out);
+    fputs("var ix=document.getElementById('path-search-input');\n", out);
+    fputs("if(ix&&ix.value.trim()===ftSnap)setPathSearchFieldState('waiting');\n", out);
+    fputs("},1000);\n", out);
     fputs("fetchSearch(fullTerm,(pageNum-1)*PAGE_SIZE,PAGE_SIZE).then(function(j){\n", out);
+    fputs("clearTimeout(spinF);\n", out);
+    fputs("if(pg!==pageGen)return;\n", out);
+    fputs("var ix2=document.getElementById('path-search-input');\n", out);
+    fputs("if(!ix2||ix2.value.trim()!==ftSnap)return;\n", out);
     fputs("lastTotal=j.total||0;var total=lastTotal;var pages=Math.max(1,Math.ceil(total/PAGE_SIZE));\n", out);
     fputs("if(pageNum>pages)pageNum=pages;if(pageNum<1)pageNum=1;\n", out);
     fputs("var pm=[];if(j.search_ms!=null&&fmtSearchMs(j.search_ms))pm.push(fmtSearchMs(j.search_ms));\n", out);
@@ -8354,9 +8885,15 @@ static int emit_html(const char *report_path,
     fputs("var pms=pm.length?' \\u00b7 '+pm.join(' \\u00b7 '):'';\n", out);
     fputs("meta.textContent=total+' match'+(total===1?'':'es')+pms+' \\u2014 page '+pageNum+' of '+pages;\n", out);
     fputs("var paths=j.paths||[];var h='';for(var i=0;i<paths.length;i++){h+='<li>'+highlightPathHtml(paths[i],fullTerm)+'</li>';}list.innerHTML=h;\n", out);
+    fputs("setPathSearchFieldState(total>0?'ok':'empty');\n", out);
     fputs("prev.disabled=pageNum<=1;next.disabled=pageNum>=pages;\n", out);
-    fputs("}).catch(function(e){var capfp=document.getElementById('path-search-caption');if(capfp)capfp.textContent='';meta.textContent='';list.innerHTML='<li class=\"path-search-muted\">'+escHtml(e.message)+'</li>';prev.disabled=true;next.disabled=true;});\n}\n", out);
+    fputs("}).catch(function(e){\n", out);
+    fputs("clearTimeout(spinF);\n", out);
+    fputs("if(pg!==pageGen)return;\n", out);
+    fputs("var capfp=document.getElementById('path-search-caption');if(capfp)capfp.textContent='';setPathSearchFieldState('error');meta.textContent='';list.innerHTML='<li class=\"path-search-muted\">'+escHtml(e.message)+'</li>';prev.disabled=true;next.disabled=true;});\n}\n", out);
     fputs("function runFullSearch(term){\n", out);
+    fputs("if(previewFetchCtl){previewFetchCtl.abort();previewFetchCtl=null;}\n", out);
+    fputs("previewGen++;\n", out);
     fputs("fullTerm=term.trim();if(fullTerm.length<3)return;\n", out);
     fputs("pageNum=1;showSearchPanel();\n", out);
     fputs("document.getElementById('path-search-results').hidden=false;\n", out);
@@ -8417,7 +8954,8 @@ static void emit_run_stats(const char *username,
                            const summary_t *sum,
                            ereport_run_stats_t *run_rs,
                            int bucket_pages_written,
-                           double elapsed_sec) {
+                           double elapsed_sec,
+                           const ereport_manifest_disk_t *manifest_disk) {
     char avg_records_buf[32], mean_records_buf[32], max_records_buf[32], min_records_buf[32];
     double avg_records = elapsed_sec > 0.0 ? (double)sum->scanned_records / elapsed_sec : 0.0;
     double mean_records =
@@ -8459,6 +8997,12 @@ static void emit_run_stats(const char *username,
     printf("total_capacity_in_others=%" PRIu64 "\n", sum->total_other_bytes);
     printf("total_capacity_in_non_files=%" PRIu64 "\n", (sum->total_capacity_bytes - sum->total_bytes));
     printf("bad_input_files=%" PRIu64 "\n", sum->bad_input_files);
+    if (manifest_disk && manifest_disk->valid) {
+        printf("manifest_st_blocks_bytes_unit=%" PRIu32 "\n", manifest_disk->st_blocks_bytes_unit);
+        printf("manifest_total_allocated_bytes=%" PRIu64 "\n", manifest_disk->total_allocated_bytes);
+        printf("manifest_files_sparse_heuristic=%" PRIu64 "\n", manifest_disk->files_sparse_heuristic);
+        printf("manifest_unit_mismatch=%d\n", manifest_disk->unit_mismatch ? 1 : 0);
+    }
     if (g_ereport_verbose) {
         printf("io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
         printf("io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
@@ -8571,6 +9115,7 @@ int main(int argc, char **argv) {
     double t0, t1;
     ereport_run_stats_t run_stats;
     ereport_crawl_timing_t crawl_timing;
+    ereport_manifest_disk_t manifest_disk;
     path_shape_view_t path_shape;
 
     atomic_store(&g_io_opendir_calls, 0);
@@ -8903,6 +9448,8 @@ int main(int argc, char **argv) {
 
     memset(&crawl_timing, 0, sizeof(crawl_timing));
     aggregate_crawl_timing_from_manifests(bin_dirs, bin_dir_count, &crawl_timing);
+    memset(&manifest_disk, 0, sizeof(manifest_disk));
+    aggregate_manifest_disk_from_manifests(bin_dirs, bin_dir_count, &manifest_disk);
 
     set_bucket_output_dir(display_name);
     if (report_dir_opt[0] != '\0') {
@@ -9413,6 +9960,7 @@ int main(int argc, char **argv) {
                     inode_set_destroy(&seen_inodes);
                     return 1;
                 }
+                atomic_store(&run_stats.finalize_lookup_stage, 1U);
                 dense_cell_steal_into_fanout_lookup_ex(&merged_fanout, &fanout_lookup_shape, parse_ereport_thread_count());
                 dense_cell_free(&merged_fanout);
                 if (g_ereport_verbose && __vt_dense > 0.0)
@@ -9423,7 +9971,9 @@ int main(int argc, char **argv) {
                 double __vt_ps = 0.0;
 
                 if (g_ereport_verbose) __vt_ps = now_sec();
-                path_shape_fill_from_merged_dense(&final_sum, merged_dense_shape, &fanout_lookup_shape, &path_shape);
+                path_shape_fill_from_merged_dense(&final_sum, merged_dense_shape, &fanout_lookup_shape, &path_shape,
+                                                  &run_stats);
+                atomic_store(&run_stats.finalize_lookup_stage, 0U);
                 if (g_ereport_verbose && __vt_ps > 0.0) run_stats.vt_fini_path_shape_sec += now_sec() - __vt_ps;
             }
             bucket_shape_maps_live = 1;
@@ -9552,7 +10102,7 @@ int main(int argc, char **argv) {
         if (g_ereport_verbose) __vt_idx = now_sec();
         if (emit_html(report_path, display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid,
                        basis_str, &final_sum, &path_shape, path_count, threads_used, bin_dir_count,
-                       storage_base_paths_label, &crawl_timing, &run_stats) != 0) {
+                       storage_base_paths_label, &crawl_timing, &manifest_disk, &run_stats) != 0) {
             fprintf(stderr, "failed to write main report %s\n", report_path);
         }
         if (g_ereport_verbose && __vt_idx > 0.0) run_stats.vt_index_html_sec += now_sec() - __vt_idx;
@@ -9566,7 +10116,7 @@ int main(int argc, char **argv) {
     }
     emit_run_stats(display_name, all_users_mode, distinct_uid_count, bucket_detail_levels, target_uid, basis_str,
                    input_dirs_label, report_path, path_count, threads, threads_used, &final_sum, &run_stats,
-                   bucket_pages_written, t1 - t0);
+                   bucket_pages_written, t1 - t0, &manifest_disk);
 
     free(tids);
     free(args);
