@@ -71,6 +71,33 @@ kv_last() {
     grep "^${key}=" "$file" 2>/dev/null | tail -n1 | cut -d= -f2-
 }
 
+# Monotonic wall seconds (fractional when date supports %N).
+now_sec() {
+    date +%s.%N 2>/dev/null || awk -v s="$SECONDS" 'BEGIN{printf "%.3f", s + 0}'
+}
+
+# Sets _timed_result and _timed_sec (wall seconds for "$@").
+run_timed() {
+    local t0 t1
+    t0=$(now_sec)
+    _timed_result=$("$@")
+    t1=$(now_sec)
+    _timed_sec=$(LC_ALL=C awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
+}
+
+# Speedup line: my tool vs find/fd baseline (both wall seconds).
+format_speedup() {
+    local my=$1 base=$2
+    LC_ALL=C awk -v my="$my" -v base="$base" '
+    BEGIN {
+        my += 0; base += 0
+        if (my <= 0 || base <= 0) { print "n/a"; exit }
+        if (my < base) printf "%.1fx faster (%.3fs vs %.3fs find/fd total)", base / my, my, base
+        else if (my > base) printf "%.1fx slower (%.3fs vs %.3fs find/fd total)", my / base, my, base
+        else printf "same wall time (%.3fs)", my
+    }'
+}
+
 # For two non-negative integer strings: absolute delta and percent of baseline (want).
 # Percent rounds to integer; if that is 0 but pct > 0, use decimals until the first
 # non-zero digit after the point (same significant-digit intent as "first digit after comma").
@@ -274,19 +301,12 @@ run_fs_correlation() {
     log "note: live trees drift between the find/fd snapshot and ecrawl; expect exact match only on quiescent data."
     log "note: same find/fd snapshot is compared to ecrawl and (all-users) ereport — ecrawl vs ereport should match even when fs baseline drifts."
     log "note: each passing check prints OK: <check> — <why it matters>"
-    log "step: baseline — counting files/dirs/symlinks, then unique regular-file bytes (find | awk dedup; slow = walk + RAM for keys)"
+    log "note: ecrawl runs before find/fd so our tools see a colder cache; find/fd may benefit from warmed metadata."
 
     local fc dc lc crawl_files crawl_dirs crawl_symlinks crawl_bytes entries
     local su_files su_dirs su_links su_cap su_scanned su_matched
     local au_files au_dirs au_links au_cap au_scanned au_matched au_distinct
-
-    fc=$(count_files "$root")
-    dc=$(count_dirs "$root")
-    lc=$(count_symlinks "$root")
-    fs_u_bytes=$(sum_unique_regular_bytes "$root")
-
-    printf '  %sfind/fd:%s files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$M" "$Z" "$fc" "$dc" "$lc" "$fs_u_bytes"
-    printf '%s           (dirs: find -type d incl. crawl root; files/symlinks: fd if installed else find)%s\n' "$D" "$Z"
+    local fc_sec dc_sec lc_sec fs_u_bytes_sec fs_baseline_sec crawl_elapsed
 
     local td crawl_out crawl_log ere_su_out ere_su_err ere_all_out ere_all_log
     td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_fs_test.XXXXXX")
@@ -305,7 +325,7 @@ run_fs_correlation() {
     local root_abs
     root_abs=$(cd "$root" && pwd)
 
-    log "step: ecrawl → ${crawl_out}"
+    log "step: ecrawl → ${crawl_out} (first — cold cache)"
     ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-8}" \
         "$ECRAWL" "$root_abs" "$crawl_out" >"$crawl_log" 2>&1 || {
         tail -n 40 "$crawl_log" >&2 || true
@@ -316,9 +336,35 @@ run_fs_correlation() {
     crawl_dirs=$(kv_last dirs "$crawl_log")
     crawl_symlinks=$(kv_last symlinks "$crawl_log")
     crawl_bytes=$(kv_last total_bytes "$crawl_log")
+    crawl_elapsed=$(kv_last elapsed_sec "$crawl_log")
 
-    printf '  %secrawl:%s  files=%s dirs=%s symlinks=%s total_bytes=%s\n' "$M" "$Z" \
-        "$crawl_files" "$crawl_dirs" "$crawl_symlinks" "$crawl_bytes"
+    printf '  %secrawl:%s  files=%s dirs=%s symlinks=%s total_bytes=%s elapsed_sec=%s\n' "$M" "$Z" \
+        "$crawl_files" "$crawl_dirs" "$crawl_symlinks" "$crawl_bytes" "${crawl_elapsed:-?}"
+
+    log "step: baseline — counting files/dirs/symlinks, then unique regular-file bytes (find | awk dedup; after ecrawl)"
+    run_timed count_files "$root"
+    fc="$_timed_result"
+    fc_sec="$_timed_sec"
+    run_timed count_dirs "$root"
+    dc="$_timed_result"
+    dc_sec="$_timed_sec"
+    run_timed count_symlinks "$root"
+    lc="$_timed_result"
+    lc_sec="$_timed_sec"
+    run_timed sum_unique_regular_bytes "$root"
+    fs_u_bytes="$_timed_result"
+    fs_u_bytes_sec="$_timed_sec"
+    fs_baseline_sec=$(LC_ALL=C awk -v a="$fc_sec" -v b="$dc_sec" -v c="$lc_sec" -v d="$fs_u_bytes_sec" \
+        'BEGIN{printf "%.3f", a + b + c + d}')
+
+    printf '  %sfind/fd:%s files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$M" "$Z" "$fc" "$dc" "$lc" "$fs_u_bytes"
+    printf '%s           (dirs: find -type d incl. crawl root; files/symlinks: fd if installed else find)%s\n' "$D" "$Z"
+    printf '%s           wall_sec: files=%s dirs=%s symlinks=%s unique_regular_bytes=%s total=%s%s\n' \
+        "$D" "$fc_sec" "$dc_sec" "$lc_sec" "$fs_u_bytes_sec" "$fs_baseline_sec" "$Z"
+    if [[ -n "${crawl_elapsed:-}" ]]; then
+        printf '  %sspeed (files+dirs+symlinks+bytes):%s ecrawl — %s%s\n' \
+            "$G" "$Z" "$(format_speedup "$crawl_elapsed" "$fs_baseline_sec")" "$Z"
+    fi
 
     section_fs "[1] Filesystem baseline vs ecrawl — crawl should match the tree as counted above"
     expect_eq_continue "ecrawl.files vs fs file count" "$fc" "$crawl_files" \
