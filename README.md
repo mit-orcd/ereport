@@ -262,7 +262,7 @@ Applies when **`ECRAWL_STAT_THREADS`** > **0** (the default). **`ECRAWL_STAT_THR
 |------|----------------|
 | **1. `readdir`** | One crawl worker reads each directory stream sequentially; skips `.` and `..`. |
 | **2. Obvious subdirectories** | If **`d_type`** is **`DT_DIR`**, the child path is pushed onto that worker’s directory stack (and may be **donated** to other crawl threads). No stat worker involved. |
-| **3. Trusted non-directory types** | If **`d_type`** is one of **`DT_REG`**, **`DT_LNK`**, **`DT_FIFO`**, **`DT_SOCK`**, **`DT_CHR`**, **`DT_BLK`**, **`DT_WHT`**, the name is either **`fstatat`**’d **inline** on the crawl thread or **queued for stat workers**, depending on how many such entries were already seen **in this directory** (see **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`**, default **4096**). **`0`** means **always** send these names to stat workers (no inline prefix). |
+| **3. Trusted non-directory types** | If **`d_type`** is one of **`DT_REG`**, **`DT_LNK`**, **`DT_FIFO`**, **`DT_SOCK`**, **`DT_CHR`**, **`DT_BLK`**, **`DT_WHT`**, the name is either **`fstatat`**’d **inline** on the crawl thread or **queued for stat workers**, depending on how many such entries were already seen **in this directory** (see **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`**, default **`0`**). **`0`** means **always** send these names to stat workers (no inline prefix). A positive value **`N`** handles the first **`N`** trusted non-dirs inline per directory, then batches the rest. |
 | **4. Everything else (`DT_UNKNOWN`, etc.)** | **`fstatat`** on the crawl thread; if it is a directory, behave like step **2**; otherwise emit like a file. These names are **never** placed in stat-worker batches (the batch path assumes the dentry already looked like a non-directory). |
 | **5. Workers + flush points** | Stat threads **`fstatat`** batched names against a **`dup`'d** directory fd. Pending batches are capped globally (**`ECRAWL_STAT_QUEUE_BATCHES`**). When **`readdir`** finishes that directory, the crawl thread **waits for** its pending batches for that folder, then continues. |
 
@@ -279,10 +279,14 @@ Optional environment variables (no CLI flags for these; see also **[quick refere
 | **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
 | **`ECRAWL_STAT_THREADS`** | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables the pool). |
 | **`ECRAWL_STAT_BATCH_ENTRIES`** | Directory names per stat batch (default **1024**, range **64…65536**). |
-| **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | Per directory, trusted non-dir **`d_type`** entries handled **inline** before stat batching (default **4096**; **`0`** = batch from the first entry). Max **2097152**. |
+| **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | Per directory, trusted non-dir **`d_type`** entries handled **inline** before stat batching (default **`0`** = batch from the first entry; set **`N`** > **0** for an inline prefix of **`N`** names). Max **2097152**. |
+| **`ECRAWL_STAT_BATCH_MIN_OFFLOAD`** | End-of-directory stat batches with fewer than this many names run **inline** on the crawl thread (default **32**; **`0`** = always enqueue tail batches to the stat pool). Mid-directory flushes at **`ECRAWL_STAT_BATCH_ENTRIES`** always offload when the stat pool is enabled. |
 | **`ECRAWL_STAT_QUEUE_BATCHES`** | Max pending stat batches **globally** (default **64**, range **4…4096**); bounds **`dup(dirfd)`** backlog and crawl-thread blocking when the pool is full. |
 | **`ECRAWL_STAT_RANDOM_QUEUE`** | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random dequeue among pending batches. |
-| **`ECRAWL_PROGRESS_LOG`** | Append **one CSV row per second** from the stats thread (live **`total_*`**, rolling-window **`window_*`** / **`ops_rate`**, queue depths, **`wait_*`**, **`stat_batches_*`**, per-second **`delta_*`** vs **`g_total_entries`** / **`io_*`**, etc.). Opens with **`"a"`**; first row is a header. Use a fresh path per run if you want a self-contained file. |
+| **`ECRAWL_DONATE_CHECK_EVERY`** | During **`readdir`**, check whether to donate local directory-stack work every **`N`** **`DT_DIR`** pushes (default **64**; **`1`** = check after every directory child). |
+| **`ECRAWL_DONATE_CHUNK_FORCE_MAX`** | When the local stack exceeds **`ECRAWL_FORCE_DONATE_AT`**, donate up to this many directories per queue push (default **2048**). |
+| **`ECRAWL_FORCE_DONATE_AT`** | Spill local directory stack to the global task queue when it holds more than this many pending dirs (default **4096**). |
+| **`ECRAWL_PROGRESS_LOG`** | Append **one CSV row per second** from the stats thread (live **`total_*`**, rolling-window **`window_*`** / **`ops_rate`**, queue depths, **`wait_*`**, **`stat_batches_*`**, per-second **`delta_*`** vs **`g_total_entries`** / **`io_*`**, **`task_queue_pushes`**, **`queue_lock_waits`**, **`donate_calls`**, **`writer_queue_wait_ns`**, etc.). Opens with **`"a"`**; first row is a header. Use a fresh path per run if you want a self-contained file. Requires **`--verbose`**. |
 | **`ECRAWL_STALL_HINT_SECONDS`** | After the rolling window is **warm** (~**10** seconds), emit **one stderr line** if **`window_entries`** stays **0** for this many consecutive seconds (**default `5`**; **`0`** disables). Another hint is allowed only after **`window_entries`** goes non-zero again. |
 
 Examples:
@@ -312,7 +316,8 @@ watch -n 1 -t -d ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.
 Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
-- `--verbose` enables the full end-of-run diagnostics.
+- `--verbose` enables the full end-of-run diagnostics and is required for **`ECRAWL_PROGRESS_LOG`**.
+- **`ECRAWL_DEBUG_LOG`** (megadir CSV) was removed — it caused severe slowdowns on wide trees; use **`ECRAWL_PROGRESS_LOG`** and the built-in contention counters instead.
 - **`--record-root <path>`** rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks **`start-path`** on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with **`realpath(3)`**.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
@@ -320,6 +325,10 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `uid_shards`: uid shard count used for the output layout.
 - `max_open_shards`: effective per-writer shard file cache after any open-file-limit auto-cap.
 - `writer_failed`: `1` means at least one writer batch failed; the process exits nonzero in this case.
+- `task_queue_pushes`: crawl threads pushing donated directory tasks onto the global queue.
+- `queue_lock_waits`: blocking episodes waiting for the task-queue mutex.
+- `donate_calls`: directory-stack donation attempts (TLS-batched; may read **0** in live snapshots until threads exit).
+- `writer_queue_wait_ns`: cumulative nanoseconds crawl threads spent blocked on full writer queues.
 - `wait_crawl_tasks`: crawl-thread wakeups waiting on the crawl task queue (idle crawl threads).
 - `wait_writer_push`: crawl-thread wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (crawl threads not feeding writers fast enough).
@@ -807,10 +816,14 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
 | **`ECRAWL_STAT_THREADS`** | `ecrawl` | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables). |
 | **`ECRAWL_STAT_BATCH_ENTRIES`** | `ecrawl` | Names per stat batch (default **1024**, range **64…65536**). |
-| **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | `ecrawl` | Trusted non-dir **`d_type`** entries per directory handled inline before batching (default **4096**; **`0`** = always batch). |
+| **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | `ecrawl` | Trusted non-dir **`d_type`** entries per directory handled inline before batching (default **`0`** = always batch; **`N`** > **0** = inline prefix of **`N`**). |
+| **`ECRAWL_STAT_BATCH_MIN_OFFLOAD`** | `ecrawl` | Min names in an end-of-directory stat batch before offloading to stat workers (default **32**; **`0`** = always enqueue). |
 | **`ECRAWL_STAT_QUEUE_BATCHES`** | `ecrawl` | Max pending stat batches (default **64**, range **4…4096**). |
 | **`ECRAWL_STAT_RANDOM_QUEUE`** | `ecrawl` | **`0`** = FIFO stat-batch dequeue; non-zero (**default `1`**) = pseudo-random. |
-| **`ECRAWL_PROGRESS_LOG`** | `ecrawl` | Append **1 Hz** CSV of live counters for post-run plots (see detailed **`ecrawl`** env table). |
+| **`ECRAWL_DONATE_CHECK_EVERY`** | `ecrawl` | Donate-check period during **`readdir`** in **`DT_DIR`** pushes (default **64**). |
+| **`ECRAWL_DONATE_CHUNK_FORCE_MAX`** | `ecrawl` | Max dirs donated per queue push on force spill (default **2048**). |
+| **`ECRAWL_FORCE_DONATE_AT`** | `ecrawl` | Local stack size that triggers force donation (default **4096**). |
+| **`ECRAWL_PROGRESS_LOG`** | `ecrawl` | Append **1 Hz** CSV of live counters for post-run plots (requires **`--verbose`**; see detailed **`ecrawl`** env table). |
 | **`ECRAWL_STALL_HINT_SECONDS`** | `ecrawl` | Stderr hint when the rolling **`window_entries`** stays at **0** for **N** consecutive seconds after warmup (**default `5`**; **`0`** = off). |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
 | **`ECRAWL_ANALYZE_THREADS`** | `ecrawl_analyze` | Parallel shard scan for **stats only** (default **16**, minimum **1**, maximum **4096**). If unset, **`ECRAWL_REPAIR_THREADS`** is used when set. |
