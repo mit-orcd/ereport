@@ -171,7 +171,7 @@ Final stdout summary includes **`delete_all`** (**`1`** when the one-argument fo
 
 - **Parallel chunk mapping** — Uses **`*.ckpt`** to build **chunk lists** (byte ranges that align with record starts). Chunk count scales with file size, so **`EREPORT_THREADS`** has enough units of work.
 - **Parallel chunk parsing** — Workers consume disjoint chunks; summaries and bucket histograms merge after workers finish (merge step is **not** on the per-record hot path across all threads).
-- **Parallel bucket HTML** — The **36** heat-map cells map to **36** independent output files; emission fans out across threads up to that cap.
+- **Parallel bucket HTML** — The **36** heat-map cells map to **36** independent output files; emission fans out across threads up to that cap. Per-page **`aggregate_totals_for_page_n`** uses a **RAM-budgeted** worker matrix; if the worker×row partial matrix cannot be allocated, worker count is reduced until **`calloc`** succeeds (avoids a single-threaded fallback that pins one CPU on huge path-row maps).
 - **Cheap mode by default** — Without **`--bucket-details`**, the parser **seeks past** path strings for histogram-only passes, keeping I/O and CPU down when you only need aggregates.
 
 ### `ereport_index`: trigram index build (`--make`)
@@ -235,7 +235,8 @@ SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
 - optional `--no-write` benchmarking mode
 - live status output
 - separate accounting for:
-  - unique regular-file bytes
+  - unique regular-file logical bytes (`st_size`, hardlink-deduped)
+  - allocated regular-file bytes from **`st_blocks`** (POSIX/Linux **512-byte** units, same dedup policy), plus a **sparse heuristic** file count when allocated < logical
   - directory apparent bytes
   - symlink apparent bytes
   - other apparent bytes
@@ -286,6 +287,9 @@ Optional environment variables (no CLI flags for these; see also **[quick refere
 | **`ECRAWL_DONATE_CHECK_EVERY`** | During **`readdir`**, check whether to donate local directory-stack work every **`N`** **`DT_DIR`** pushes (default **64**; **`1`** = check after every directory child). |
 | **`ECRAWL_DONATE_CHUNK_FORCE_MAX`** | When the local stack exceeds **`ECRAWL_FORCE_DONATE_AT`**, donate up to this many directories per queue push (default **2048**). |
 | **`ECRAWL_FORCE_DONATE_AT`** | Spill local directory stack to the global task queue when it holds more than this many pending dirs (default **4096**). |
+| **`ECRAWL_DONATE_ALL_BUSY_MIN_STACK`** | When **every** crawl thread already holds a popped task, still allow proactive donation if the local stack is at least this deep and the global queue is below **`started × ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT`** (default **64** dirs; range **`donate_floor`…65536**). |
+| **`ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT`** | Caps global task-queue depth for that “all busy” donation path (default **4**; range **1…256**). |
+| **`ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH`** | Coalesce **`fstatat`**-discovered subdir enqueues into fewer global queue pushes (default **48** paths per flush; range **1…4096**). |
 | **`ECRAWL_PROGRESS_LOG`** | Append **one CSV row per second** from the stats thread (live **`total_*`**, rolling-window **`window_*`** / **`ops_rate`**, queue depths, **`wait_*`**, **`stat_batches_*`**, per-second **`delta_*`** vs **`g_total_entries`** / **`io_*`**, **`task_queue_pushes`**, **`queue_lock_waits`**, **`donate_calls`**, **`writer_queue_wait_ns`**, etc.). Opens with **`"a"`**; first row is a header. Use a fresh path per run if you want a self-contained file. Requires **`--verbose`**. |
 | **`ECRAWL_STALL_HINT_SECONDS`** | After the rolling window is **warm** (~**10** seconds), emit **one stderr line** if **`window_entries`** stays **0** for this many consecutive seconds (**default `5`**; **`0`** disables). Another hint is allowed only after **`window_entries`** goes non-zero again. |
 
@@ -325,15 +329,15 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `uid_shards`: uid shard count used for the output layout.
 - `max_open_shards`: effective per-writer shard file cache after any open-file-limit auto-cap.
 - `writer_failed`: `1` means at least one writer batch failed; the process exits nonzero in this case.
-- `task_queue_pushes`: crawl threads pushing donated directory tasks onto the global queue.
-- `queue_lock_waits`: blocking episodes waiting for the task-queue mutex.
+- `task_queue_pushes`: crawl threads pushing directory tasks onto the global task queue (donations + batched discovered subdirs).
+- `queue_lock_waits` / `wait_crawl_tasks`: **same underlying counter** — increments once per **`pthread_cond_wait`** episode when a crawl thread waits on an **empty** global task queue (TLS-batched to the global atomics). **Not** “mutex acquire count” on push.
 - `donate_calls`: directory-stack donation attempts (TLS-batched; may read **0** in live snapshots until threads exit).
 - `writer_queue_wait_ns`: cumulative nanoseconds crawl threads spent blocked on full writer queues.
-- `wait_crawl_tasks`: crawl-thread wakeups waiting on the crawl task queue (idle crawl threads).
+- `wait_crawl_tasks`: duplicate of the crawl-queue wait counter above (printed under both names for CSV / human readers).
 - `wait_writer_push`: crawl-thread wakeups waiting on a **full** uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an **empty** queue (crawl threads not feeding writers fast enough).
 
-With **`--verbose`**, full metrics also include **`wait_stat_pop`** / **`wait_stat_enqueue`** (same idea for the stat batch pool), **`stat_queue_depth_max`**, **`stat_batches_*`**, and **`stat_batch_unexpected_dir_total`**.
+With **`--verbose`**, full metrics also include **`wait_stat_pop`** / **`wait_stat_enqueue`** (same idea for the stat batch pool), **`stat_queue_depth_max`**, **`stat_batches_*`**, **`stat_batch_unexpected_dir_total`**, **`donate_all_busy_*`**, **`discovered_dir_enqueue_batch`**, and crawl **`manifest=`** path plus **`st_blocks_bytes_unit`**, **`total_allocated_bytes`**, **`files_sparse_heuristic`** (same keys as **`crawl_manifest.txt`**).
 
 Interpret these as **counts of blocking episodes**, not wall-clock time. Summary **`WARN`** lines for unexpected batched directories always go to **stderr**, even when stdout is concise.
 
@@ -443,8 +447,8 @@ Parse chunks scale with input `.bin` size so parallel workers are not capped by 
 Runtime behavior:
 
 - **`ereport` scans crawl directories**, then **maps chunk boundaries** inside each `.bin` shard (reading record headers only). That mapping runs with **`EREPORT_THREADS` parallel scanners**; stdout shows **`chunk-map files:X/Y`** until every shard has been scanned, then the usual records/sec line appears while workers parse chunks. If mapping is slow, an occasional **stderr** advisory may print after a completed progress line so it does not glue to the **`chunk-map`** status text.
-- After parsing finishes, the status line switches to **finalizing** with sub-steps: **merging shard summaries** (in-process merges of per-thread summaries and bucket-detail maps), **writing bucket HTML (n/36)** while **`bucket_*.html`** files are emitted, then **writing index.html**.
-- Final run stats go to **stdout**; warnings/errors to **stderr**. Progress uses local counters with chunked flushes to avoid per-record atomics on the hot path.
+- After parsing finishes, the status line switches to **finalizing** with sub-steps: **merging shard summaries** (in-process merges of per-thread summaries and bucket-detail maps), **writing bucket HTML (n/36)** while **`bucket_*.html`** files are emitted, then **writing index.html**. Verbose mode can surface **lookup** substeps (**repartition → path_shape scan → margins**) via atomic **`finalize_lookup_stage`**.
+- Final run stats go to **stdout**; warnings/errors to **stderr**. Progress uses local counters with chunked flushes to avoid per-record atomics on the hot path. When **`crawl_manifest.txt`** in the input **`bin_dir`** set lists **`total_allocated_bytes`** / **`files_sparse_heuristic`**, **`ereport`** aggregates those across merged crawls and prints **`manifest_*`** lines plus HTML/drilldown copy for **allocated** space and the **sparse** estimate (full-corpus crawl totals, not UID-filtered heat-map bytes).
 
 Interactive search in `index.html` requires **`ereport_index --make`** (see below), **`eserve`** running with **`ereport_index`** available, and opening the report **over HTTP** (browser `fetch` does not work reliably from `file://`).
 
@@ -783,7 +787,10 @@ Used during development and benchmarking; not part of the normal end-user workfl
 
 `ecrawl` reports:
 
-- `total_bytes`: unique regular-file bytes
+- `total_bytes`: unique regular-file **logical** bytes (**`st_size`**, hardlink-deduped)
+- `st_blocks_bytes_unit`: multiplier for **`st_blocks`** (**512** on typical Linux/glibc builds)
+- `total_allocated_bytes`: unique regular-file **on-disk** bytes (**`st_blocks × st_blocks_bytes_unit`**, same inode dedup as **`total_bytes`**)
+- `files_sparse_heuristic`: count of deduped regular files where allocated bytes < logical size (heuristic for sparse / preallocated files)
 - `dir_apparent_bytes`: apparent size of directories
 - `symlink_apparent_bytes`: apparent size of symlinks
 - `other_apparent_bytes`: apparent size of other matched types
@@ -791,8 +798,9 @@ Used during development and benchmarking; not part of the normal end-user workfl
 
 This means:
 
-- `total_bytes` is closer to deduped regular-file data volume
-- `apparent_bytes_total` is closer to `du --apparent-size`
+- `total_bytes` is closer to deduped **logical** file size (what you read if you read every byte; sparse files can look huge)
+- `total_allocated_bytes` is closer to **`du`**-style **block** usage for regular files (still crawl-wide, not per-mount **quota** semantics)
+- `apparent_bytes_total` is closer to `du --apparent-size` over **all** entry types in the sum
 
 ### `ereport` capacity totals
 
@@ -823,6 +831,9 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_DONATE_CHECK_EVERY`** | `ecrawl` | Donate-check period during **`readdir`** in **`DT_DIR`** pushes (default **64**). |
 | **`ECRAWL_DONATE_CHUNK_FORCE_MAX`** | `ecrawl` | Max dirs donated per queue push on force spill (default **2048**). |
 | **`ECRAWL_FORCE_DONATE_AT`** | `ecrawl` | Local stack size that triggers force donation (default **4096**). |
+| **`ECRAWL_DONATE_ALL_BUSY_MIN_STACK`** | `ecrawl` | Min local stack depth before donating when every crawl thread holds a task (default **64**). |
+| **`ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT`** | `ecrawl` | Skip “all busy” donation when **`g_queue_depth ≥ crawl_threads × mult`** (default **4**). |
+| **`ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH`** | `ecrawl` | Batch size for enqueueing **`fstatat`**-discovered subdirs to the global queue (default **48**). |
 | **`ECRAWL_PROGRESS_LOG`** | `ecrawl` | Append **1 Hz** CSV of live counters for post-run plots (requires **`--verbose`**; see detailed **`ecrawl`** env table). |
 | **`ECRAWL_STALL_HINT_SECONDS`** | `ecrawl` | Stderr hint when the rolling **`window_entries`** stays at **0** for **N** consecutive seconds after warmup (**default `5`**; **`0`** = off). |
 | **`ECRAWL_REPAIR_THREADS`** | `ecrawl_repair` | Parallel shard rescans, tail salvage **`truncate`**, checkpoint rebuild (default **16**, minimum **1**). |
