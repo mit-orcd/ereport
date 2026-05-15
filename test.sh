@@ -85,16 +85,16 @@ run_timed() {
     _timed_sec=$(LC_ALL=C awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
 }
 
-# Speedup line: my tool vs find/fd baseline (both wall seconds).
+# Speedup line: ecrawl wall vs summed baseline walk steps (both wall seconds).
 format_speedup() {
     local my=$1 base=$2
     LC_ALL=C awk -v my="$my" -v base="$base" '
     BEGIN {
         my += 0; base += 0
         if (my <= 0 || base <= 0) { print "n/a"; exit }
-        if (my < base) printf "%.1fx faster (%.3fs vs %.3fs find/fd total)", base / my, my, base
-        else if (my > base) printf "%.1fx slower (%.3fs vs %.3fs find/fd total)", my / base, my, base
-        else printf "same wall time (%.3fs)", my
+        if (my < base) printf "%.1fx faster (ecrawl %.3fs vs baseline %.3fs)", base / my, my, base
+        else if (my > base) printf "%.1fx slower (ecrawl %.3fs vs baseline %.3fs)", my / base, my, base
+        else printf "same wall time (ecrawl %.3fs)", my
     }'
 }
 
@@ -307,6 +307,12 @@ run_fs_correlation() {
     local su_files su_dirs su_links su_cap su_scanned su_matched
     local au_files au_dirs au_links au_cap au_scanned au_matched au_distinct
     local fc_sec dc_sec lc_sec fs_u_bytes_sec fs_baseline_sec crawl_elapsed
+    local fs_walk_files
+    if command -v fd >/dev/null 2>&1; then
+        fs_walk_files=fd
+    else
+        fs_walk_files=find
+    fi
 
     local td crawl_out crawl_log ere_su_out ere_su_err ere_all_out ere_all_log
     td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_fs_test.XXXXXX")
@@ -357,8 +363,12 @@ run_fs_correlation() {
     fs_baseline_sec=$(LC_ALL=C awk -v a="$fc_sec" -v b="$dc_sec" -v c="$lc_sec" -v d="$fs_u_bytes_sec" \
         'BEGIN{printf "%.3f", a + b + c + d}')
 
-    printf '  %sfind/fd:%s files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$M" "$Z" "$fc" "$dc" "$lc" "$fs_u_bytes"
-    printf '%s           (dirs: find -type d incl. crawl root; files/symlinks: fd if installed else find)%s\n' "$D" "$Z"
+    printf '  %sfs baseline:%s files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$M" "$Z" "$fc" "$dc" "$lc" "$fs_u_bytes"
+    if [[ "$fs_walk_files" == fd ]]; then
+        printf '%s           walk: files=fd dirs=find symlinks=fd unique_regular_bytes=find (dirs incl. crawl root; fd: --hidden --no-ignore)%s\n' "$D" "$Z"
+    else
+        printf '%s           walk: files=find dirs=find symlinks=find unique_regular_bytes=find (dirs incl. crawl root)%s\n' "$D" "$Z"
+    fi
     printf '%s           wall_sec: files=%s dirs=%s symlinks=%s unique_regular_bytes=%s total=%s%s\n' \
         "$D" "$fc_sec" "$dc_sec" "$lc_sec" "$fs_u_bytes_sec" "$fs_baseline_sec" "$Z"
     if [[ -n "${crawl_elapsed:-}" ]]; then
