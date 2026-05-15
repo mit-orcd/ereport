@@ -163,8 +163,21 @@
 /* During readdir, check whether to donate local stack every N DT_DIR pushes (not every push). */
 #define DEFAULT_DONATE_CHECK_EVERY 64U
 #define DONATE_QUEUE_TARGET_PER_IDLE 4
+/* When every crawl thread holds a popped task (active == started), legacy policy refused all proactive
+ * donation until force_donate_at — uneven local stacks could not rebalance. Spill anyway if the local
+ * stack is this deep and the global queue is not already deep (per-thread qdepth cap below). */
+#define DEFAULT_DONATE_ALL_BUSY_MIN_STACK 64U
+#define DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT 4U
+#define DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH 48U
+#define TASK_NODE_FREE_MAX 65536U
 #define HARDLINK_REGISTRY_SHARDS 256U
 #define STAT_BATCH_UNEXPECTED_DIR_SAMPLES 100
+
+/*
+ * POSIX and Linux document st_blocks in 512-byte units (not necessarily the volume's
+ * physical sector size). Crawl totals convert with this constant: allocated_bytes = st_blocks * unit.
+ */
+#define ST_BLOCKS_BYTES_UNIT 512U
 
 typedef struct task_node task_node_t;
 
@@ -173,6 +186,8 @@ typedef struct {
     pthread_cond_t cond;
     task_node_t *head;
     task_node_t *tail;
+    task_node_t *node_free;
+    size_t node_free_count;
     int closed;
     uint64_t queued_tasks;
 } task_queue_t;
@@ -185,6 +200,8 @@ typedef struct {
     uint64_t total_symlinks;
     uint64_t total_other;
     uint64_t total_bytes;
+    uint64_t total_allocated_bytes;
+    uint64_t files_sparse_heuristic;
     uint64_t dir_apparent_bytes;
     uint64_t symlink_apparent_bytes;
     uint64_t other_apparent_bytes;
@@ -195,6 +212,8 @@ typedef struct {
     uint64_t files;
     uint64_t dirs;
     uint64_t bytes;
+    uint64_t allocated_bytes;
+    uint64_t files_sparse_heuristic;
 } perf_local_t;
 
 typedef struct {
@@ -213,6 +232,8 @@ typedef struct {
     uint64_t total_other;
     uint64_t total_errors;
     uint64_t total_bytes;
+    uint64_t total_allocated_bytes;
+    uint64_t files_sparse_heuristic;
     uint64_t dir_apparent_bytes;
     uint64_t symlink_apparent_bytes;
     uint64_t other_apparent_bytes;
@@ -315,6 +336,13 @@ typedef struct {
     pthread_mutex_t emit_stats_lock;
 } worker_arg_t;
 
+/* Coalesce global-queue subdirectory tasks into fewer queue pushes (see discovered_dir_batch_*). */
+typedef struct {
+    task_queue_t *queue;
+    shared_state_t *shared;
+    dir_stack_t pending;
+} discovered_dir_batch_t;
+
 typedef struct stat_batch stat_batch_t;
 
 typedef struct {
@@ -400,6 +428,8 @@ static atomic_ullong g_total_entries = 0;
 static atomic_ullong g_total_files   = 0;
 static atomic_ullong g_total_dirs    = 0;
 static atomic_ullong g_total_bytes   = 0;
+static atomic_ullong g_total_allocated_bytes = 0;
+static atomic_ullong g_files_sparse_heuristic = 0;
 
 static atomic_ullong g_window_entries = 0;
 static atomic_ullong g_window_files   = 0;
@@ -446,6 +476,11 @@ static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len
 static void stats_add_error(shared_state_t *s);
 static void perf_flush_local(perf_local_t *perf);
 static int build_default_output_dir(char *out, size_t out_sz);
+static void discovered_dir_batch_init(discovered_dir_batch_t *b, task_queue_t *queue, shared_state_t *shared);
+static int discovered_dir_batch_flush(discovered_dir_batch_t *b);
+static void discovered_dir_batch_fini(discovered_dir_batch_t *b);
+static int discovered_dir_batch_push(discovered_dir_batch_t *b, char *path_owned, size_t path_len,
+                                     const struct stat *st_opt, int pre_accounted_emit);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -631,6 +666,9 @@ static size_t g_stat_queue_max_batches_cfg = DEFAULT_STAT_QUEUE_BATCHES;
 static size_t g_donate_check_every_cfg     = DEFAULT_DONATE_CHECK_EVERY;
 static size_t g_donate_chunk_force_max_cfg = DONATE_CHUNK_FORCE_MAX;
 static size_t g_force_donate_count_cfg     = LOCAL_STACK_FORCE_DONATE_COUNT;
+static size_t g_donate_all_busy_min_stack_cfg              = DEFAULT_DONATE_ALL_BUSY_MIN_STACK;
+static unsigned g_donate_all_busy_max_qdepth_mult_cfg = DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT;
+static size_t g_discovered_dir_enqueue_batch_cfg = DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH;
 static int g_stat_random_queue_dequeue = 0;
 static stat_pool_t g_stat_pool;
 static int g_stat_pool_ready = 0;
@@ -911,6 +949,49 @@ static size_t parse_ecrawl_force_donate_at(void) {
     errno = 0;
     v = strtoul(e, &end, 10);
     if (errno || end == e || *end || v < 64UL || v > 1048576UL) return LOCAL_STACK_FORCE_DONATE_COUNT;
+    return (size_t)v;
+}
+
+/* Min local dir_stack depth before proactive donation when every crawl thread already holds a task.
+ * Env: ECRAWL_DONATE_ALL_BUSY_MIN_STACK (default DEFAULT_DONATE_ALL_BUSY_MIN_STACK). */
+static size_t parse_ecrawl_donate_all_busy_min_stack(void) {
+    const char *e = getenv("ECRAWL_DONATE_ALL_BUSY_MIN_STACK");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_DONATE_ALL_BUSY_MIN_STACK;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < (unsigned long)LOCAL_STACK_DONATE_FLOOR || v > 65536UL)
+        return DEFAULT_DONATE_ALL_BUSY_MIN_STACK;
+    return (size_t)v;
+}
+
+/* When all crawl threads are busy, skip donation if global queue depth >= started * mult.
+ * Env: ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT (default DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT, range 1..256). */
+static unsigned parse_ecrawl_donate_all_busy_max_qdepth_mult(void) {
+    const char *e = getenv("ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 1UL || v > 256UL) return DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT;
+    return (unsigned)v;
+}
+
+/* Batch this many discovered subdirs into one global task_queue push (fewer mutex ops). Env:
+ * ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH (default DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH, range 1..4096). */
+static size_t parse_ecrawl_discovered_dir_enqueue_batch(void) {
+    const char *e = getenv("ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 1UL || v > 4096UL) return DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH;
     return (size_t)v;
 }
 
@@ -1285,19 +1366,61 @@ static void inode_registry_destroy(inode_registry_t *r) {
     }
 }
 
-static uint64_t regular_file_byte_credit(shared_state_t *shared, crawl_stats_t *stats, const struct stat *st) {
-    int seen_result;
+typedef struct {
+    uint64_t byte_credit;
+    uint64_t allocated_bytes;
+    uint64_t sparse_heuristic_inc; /* 0 or 1 */
+} regular_file_accounting_t;
 
-    if (!S_ISREG(st->st_mode)) return 0;
-    if (st->st_nlink <= 1) return (uint64_t)st->st_size;
+/*
+ * Per-regular-file stats sharing one inode_registry_mark_seen() result:
+ *   - byte_credit: unique logical bytes (same rules as historical regular_file_byte_credit).
+ *   - allocated_bytes: st_blocks * ST_BLOCKS_BYTES_UNIT on the same visits that credit logical bytes
+ *     (st_nlink<=1 always; st_nlink>1 only when the inode is newly inserted in g_hardlink_registry).
+ *   - sparse_heuristic_inc: 1 iff this visit credits logical bytes, st_size>0, and allocated_bytes < st_size.
+ *     Hardlink aliases (byte_credit==0) do not increment — counts align with logical-byte credits, not raw stat paths.
+ */
+static void regular_file_accounting(shared_state_t *shared, crawl_stats_t *stats, const struct stat *st,
+                                    regular_file_accounting_t *out) {
+    uint64_t apparent;
+    uint64_t from_blocks;
+    blkcnt_t blocks;
+
+    out->byte_credit = 0;
+    out->allocated_bytes = 0;
+    out->sparse_heuristic_inc = 0;
+
+    if (!S_ISREG(st->st_mode)) return;
+
+    apparent = (uint64_t)st->st_size;
+    blocks = st->st_blocks;
+    from_blocks = (blocks > 0) ? (uint64_t)blocks * (uint64_t)ST_BLOCKS_BYTES_UNIT : 0ULL;
+
+    if (st->st_nlink <= 1) {
+        out->byte_credit = apparent;
+        out->allocated_bytes = from_blocks;
+        if (apparent > 0ULL && from_blocks < apparent) out->sparse_heuristic_inc = 1ULL;
+        return;
+    }
 
     stats->total_hardlink_files++;
-    seen_result = inode_registry_mark_seen(&g_hardlink_registry, (uint64_t)st->st_dev, (uint64_t)st->st_ino);
-    if (seen_result < 0) {
-        stats_add_error(shared);
-        return (uint64_t)st->st_size;
+    {
+        int seen_result =
+            inode_registry_mark_seen(&g_hardlink_registry, (uint64_t)st->st_dev, (uint64_t)st->st_ino);
+
+        if (seen_result < 0) {
+            stats_add_error(shared);
+            out->byte_credit = apparent;
+            out->allocated_bytes = from_blocks;
+            if (apparent > 0ULL && from_blocks < apparent) out->sparse_heuristic_inc = 1ULL;
+            return;
+        }
+        if (!seen_result) return;
+
+        out->byte_credit = apparent;
+        out->allocated_bytes = from_blocks;
+        if (apparent > 0ULL && from_blocks < apparent) out->sparse_heuristic_inc = 1ULL;
     }
-    return seen_result ? (uint64_t)st->st_size : 0;
 }
 
 /*
@@ -1314,9 +1437,11 @@ static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats
     uint64_t byte_credit = 0;
     uint64_t apparent_size;
     uint64_t contrib = 0;
+    regular_file_accounting_t rf;
 
     if (!shared || !stats || !perf || !st) return 0;
 
+    memset(&rf, 0, sizeof(rf));
     apparent_size = (uint64_t)st->st_size;
     stats->total_entries++;
     perf->entries++;
@@ -1329,9 +1454,14 @@ static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats
     } else if (S_ISREG(st->st_mode)) {
         stats->total_files++;
         perf->files++;
-        byte_credit = regular_file_byte_credit(shared, stats, st);
+        regular_file_accounting(shared, stats, st, &rf);
+        byte_credit = rf.byte_credit;
         stats->total_bytes += byte_credit;
         perf->bytes += byte_credit;
+        stats->total_allocated_bytes += rf.allocated_bytes;
+        perf->allocated_bytes += rf.allocated_bytes;
+        stats->files_sparse_heuristic += rf.sparse_heuristic_inc;
+        perf->files_sparse_heuristic += rf.sparse_heuristic_inc;
         contrib = byte_credit;
     } else if (S_ISLNK(st->st_mode)) {
         stats->total_symlinks++;
@@ -1360,6 +1490,8 @@ static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats
             ATOMIC_ADD_RELAXED(&g_window_files, 1);
             ATOMIC_ADD_RELAXED(&g_bucket_files[idx], 1ULL);
             ATOMIC_ADD_RELAXED(&g_total_bytes, byte_credit);
+            ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, rf.allocated_bytes);
+            ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, rf.sparse_heuristic_inc);
         }
     }
 
@@ -1376,6 +1508,8 @@ static void stats_merge(shared_state_t *shared, const crawl_stats_t *local) {
     shared->total_symlinks += local->total_symlinks;
     shared->total_other += local->total_other;
     shared->total_bytes += local->total_bytes;
+    shared->total_allocated_bytes += local->total_allocated_bytes;
+    shared->files_sparse_heuristic += local->files_sparse_heuristic;
     shared->dir_apparent_bytes += local->dir_apparent_bytes;
     shared->symlink_apparent_bytes += local->symlink_apparent_bytes;
     shared->other_apparent_bytes += local->other_apparent_bytes;
@@ -1428,6 +1562,8 @@ static void perf_flush_local(perf_local_t *perf) {
             ATOMIC_ADD_RELAXED(&g_window_files, perf->files);
             ATOMIC_ADD_RELAXED(&g_bucket_files[idx], perf->files);
             ATOMIC_ADD_RELAXED(&g_total_bytes, perf->bytes);
+            ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, perf->allocated_bytes);
+            ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, perf->files_sparse_heuristic);
         }
     }
     /* Write mode: g_total_* / window_* already updated in account_entry_local; only reset perf here. */
@@ -1467,7 +1603,11 @@ static void print_usage(const char *prog) {
             "Donation (reduce task-queue mutex traffic): ECRAWL_DONATE_CHECK_EVERY (default %u: donate check every N "
             "DT_DIR pushes during readdir), ECRAWL_DONATE_CHUNK_FORCE_MAX (default %u: max dirs per queue push when "
             "stack exceeds force threshold), ECRAWL_FORCE_DONATE_AT (default %u: spill stack to global queue above "
-            "this depth).\n",
+            "this depth), ECRAWL_DONATE_ALL_BUSY_MIN_STACK (default %u: when all crawl threads hold a task, still "
+            "donate if local stack is at least this deep and queue is below started*MULT), "
+            "ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT (default %u: MULT in that cap), "
+            "ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH (default %u: coalesce discovered subdir enqueues into one queue push "
+            "per batch).\n",
             DEFAULT_CRAWL_THREADS,
             DEFAULT_WRITER_THREADS,
             (unsigned)DEFAULT_WRITER_QUEUE_BATCHES,
@@ -1480,7 +1620,10 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_STAT_QUEUE_BATCHES,
             (unsigned)DEFAULT_DONATE_CHECK_EVERY,
             (unsigned)DONATE_CHUNK_FORCE_MAX,
-            (unsigned)LOCAL_STACK_FORCE_DONATE_COUNT);
+            (unsigned)LOCAL_STACK_FORCE_DONATE_COUNT,
+            (unsigned)DEFAULT_DONATE_ALL_BUSY_MIN_STACK,
+            (unsigned)DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT,
+            (unsigned)DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH);
     fprintf(stderr,
             "Diagnostics (with --verbose): ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
             "ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive seconds with "
@@ -2162,6 +2305,31 @@ static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_
     return r;
 }
 
+static task_node_t *task_node_take_alloc(task_queue_t *q) {
+    task_node_t *node;
+
+    if (q->node_free) {
+        node = q->node_free;
+        q->node_free = node->next;
+        if (q->node_free_count > 0) q->node_free_count--;
+        return node;
+    }
+    return (task_node_t *)malloc(sizeof(*node));
+}
+
+static void task_node_recycle(task_queue_t *q, task_node_t *node) {
+    if (!node) return;
+    pthread_mutex_lock(&q->mutex);
+    if (q->node_free_count < (size_t)TASK_NODE_FREE_MAX) {
+        node->next = q->node_free;
+        q->node_free = node;
+        q->node_free_count++;
+    } else {
+        free(node);
+    }
+    pthread_mutex_unlock(&q->mutex);
+}
+
 static void queue_init(task_queue_t *q) {
     memset(q, 0, sizeof(*q));
     pthread_mutex_init(&q->mutex, NULL);
@@ -2180,6 +2348,14 @@ static void queue_destroy(task_queue_t *q) {
         free(cur);
         cur = next;
     }
+    cur = q->node_free;
+    while (cur) {
+        next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    q->node_free = NULL;
+    q->node_free_count = 0;
     pthread_mutex_unlock(&q->mutex);
 
     pthread_mutex_destroy(&q->mutex);
@@ -2191,26 +2367,30 @@ static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
 
     if (!task || task->count == 0) return 0;
 
-    node = (task_node_t *)malloc(sizeof(*node));
-    if (!node) return -1;
-
-    node->items = task->items;
-    node->count = task->count;
-    node->cap = task->cap;
-    node->next = NULL;
-
     pthread_mutex_lock(&q->mutex);
     if (q->closed) {
         pthread_mutex_unlock(&q->mutex);
-        free(node);
         return -1;
     }
-    if (q->tail) q->tail->next = node;
-    else q->head = node;
-    q->tail = node;
-    q->queued_tasks++;
-    ATOMIC_ADD_RELAXED(&g_queue_depth, 1);
-    pthread_cond_signal(&q->cond);
+    {
+        node = task_node_take_alloc(q);
+        if (!node) {
+            pthread_mutex_unlock(&q->mutex);
+            return -1;
+        }
+        node->items = task->items;
+        node->count = task->count;
+        node->cap = task->cap;
+        node->next = NULL;
+
+        if (q->tail) q->tail->next = node;
+        else q->head = node;
+        q->tail = node;
+        q->queued_tasks++;
+        ATOMIC_ADD_RELAXED(&g_queue_depth, 1);
+        /* One task_node per push: a single waiter can consume the head; broadcast would thundering-herd. */
+        pthread_cond_signal(&q->cond);
+    }
     pthread_mutex_unlock(&q->mutex);
 
     ATOMIC_ADD_RELAXED(&g_task_queue_pushes, 1);
@@ -2240,6 +2420,40 @@ static int enqueue_discovered_dir_task(task_queue_t *queue, char *path_owned, si
         stats_add_error(shared);
         return -1;
     }
+    return 0;
+}
+
+static void discovered_dir_batch_init(discovered_dir_batch_t *b, task_queue_t *queue, shared_state_t *shared) {
+    b->queue = queue;
+    b->shared = shared;
+    dir_stack_init(&b->pending);
+}
+
+static int discovered_dir_batch_flush(discovered_dir_batch_t *b) {
+    if (b->pending.count == 0) return 0;
+    if (queue_push_stack_take(b->queue, &b->pending) != 0) {
+        fprintf(stderr, "ERROR worker failed to flush discovered-directory batch to global queue: %s\n",
+                strerror(errno));
+        dir_stack_destroy(&b->pending);
+        stats_add_error(b->shared);
+        return -1;
+    }
+    return 0;
+}
+
+static void discovered_dir_batch_fini(discovered_dir_batch_t *b) {
+    if (b->pending.count > 0) (void)discovered_dir_batch_flush(b);
+}
+
+static int discovered_dir_batch_push(discovered_dir_batch_t *b, char *path_owned, size_t path_len,
+                                     const struct stat *st_opt, int pre_accounted_emit) {
+    if (dir_stack_push_take(&b->pending, path_owned, path_len, st_opt, pre_accounted_emit) != 0) {
+        fprintf(stderr, "ERROR worker discovered-dir batch push %s: %s\n", path_owned, strerror(errno));
+        free(path_owned);
+        stats_add_error(b->shared);
+        return -1;
+    }
+    if (b->pending.count >= g_discovered_dir_enqueue_batch_cfg) return discovered_dir_batch_flush(b);
     return 0;
 }
 
@@ -2276,7 +2490,7 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
     task->items = node->items;
     task->count = node->count;
     task->cap = node->cap;
-    free(node);
+    task_node_recycle(q, node);
     return 0;
 }
 
@@ -2630,12 +2844,24 @@ static int should_donate_work(const shared_state_t *shared, const dir_stack_t *l
     int active = atomic_load(&g_active_workers);
     int started = (int)shared->crawl_threads_started;
     int idle = started - active;
+    uint64_t max_q_idle;
+    uint64_t max_q_all_busy;
 
     if (started <= 1) return 0;
     if (local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
     if (local_stack->count >= g_force_donate_count_cfg) return 1;
-    if (active >= started) return 0;
-    if (qdepth >= (uint64_t)(idle * DONATE_QUEUE_TARGET_PER_IDLE)) return 0;
+
+    if (active >= started) {
+        if (local_stack->count < g_donate_all_busy_min_stack_cfg) return 0;
+        max_q_all_busy = (uint64_t)started * (uint64_t)g_donate_all_busy_max_qdepth_mult_cfg;
+        if (qdepth >= max_q_all_busy) return 0;
+        return 1;
+    }
+
+    if (idle > 0) {
+        max_q_idle = (uint64_t)idle * (uint64_t)DONATE_QUEUE_TARGET_PER_IDLE;
+        if (qdepth >= max_q_idle) return 0;
+    }
     return 1;
 }
 
@@ -2718,7 +2944,7 @@ static void donate_spill_periodic(shared_state_t *shared, dir_stack_t *stack, ta
 static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t dir_path_len, const char *name,
                                        size_t name_len, shared_state_t *shared, crawl_stats_t *stats, perf_local_t *perf,
                                        emit_context_t *emit, dir_stack_t *stack, task_queue_t *queue,
-                                       worker_aux_stats_t *aux) {
+                                       worker_aux_stats_t *aux, discovered_dir_batch_t *disc_batch) {
     struct stat st;
     char *owned;
     size_t owned_len;
@@ -2758,7 +2984,9 @@ static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t 
     if (dir_stack_push_take(stack, owned, owned_len, &st, 0) != 0) {
         fprintf(stderr, "ERROR worker stack push %s: %s\n", owned, strerror(errno));
         stats_add_error(shared);
-        if (enqueue_discovered_dir_task(queue, owned, owned_len, &st, shared, 0) != 0) {
+        if (disc_batch) {
+            (void)discovered_dir_batch_push(disc_batch, owned, owned_len, &st, 0);
+        } else if (enqueue_discovered_dir_task(queue, owned, owned_len, &st, shared, 0) != 0) {
             fprintf(stderr, "ERROR worker failed to enqueue subdirectory task: %s\n", strerror(errno));
             free(owned);
         }
@@ -2830,12 +3058,15 @@ static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, siz
     shared_state_t *shared = wa->shared;
 
     (void)stack;
-    (void)queue;
     (void)aux;
     if (!nb || nb->count == 0) return 0;
-    p = nb->buf;
-    end = nb->buf + nb->len;
-    while (p < end) {
+    {
+        discovered_dir_batch_t db;
+
+        discovered_dir_batch_init(&db, queue, shared);
+        p = nb->buf;
+        end = nb->buf + nb->len;
+        while (p < end) {
         const char *name = (const char *)p;
         size_t nl = strlen(name);
         struct stat child_st;
@@ -2857,7 +3088,7 @@ static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, siz
                 stats_add_error(shared);
                 continue;
             }
-            if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, &child_st, shared, 0) != 0)
+            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0) != 0)
                 continue;
             stat_batch_record_unexpected_dir(parent_path, parent_len, name, nl);
         } else {
@@ -2881,6 +3112,8 @@ static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, siz
                 }
             }
         }
+        }
+        discovered_dir_batch_fini(&db);
     }
     stat_names_builder_clear(nb);
     return 0;
@@ -3008,6 +3241,9 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
     unsigned char *end = batch->names_blob + batch->names_blob_len;
     worker_arg_t *wa = batch->owner;
     emit_context_t *emit = batch->emit_ctx;
+    discovered_dir_batch_t db;
+
+    discovered_dir_batch_init(&db, wa->queue, wa->shared);
 
     while (p < end) {
         const char *name = (const char *)p;
@@ -3032,7 +3268,7 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
                 stats_add_error(wa->shared);
                 continue;
             }
-            if (enqueue_discovered_dir_task(wa->queue, child_path_owned, child_path_len, &child_st, wa->shared, 0) != 0)
+            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0) != 0)
                 continue;
             stat_batch_record_unexpected_dir(batch->parent_path, batch->parent_len, name, nl);
         } else {
@@ -3060,6 +3296,8 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
             pthread_mutex_unlock(&wa->emit_stats_lock);
         }
     }
+
+    discovered_dir_batch_fini(&db);
 
     if (batch->dirfd_dup >= 0) {
         close(batch->dirfd_dup);
@@ -3312,6 +3550,9 @@ static int process_directory_iterative(dir_stack_t *stack,
     crawl_stats_t *stats = &wa->stats;
     perf_local_t *perf = &wa->perf;
     worker_aux_stats_t *aux = &wa->aux;
+    discovered_dir_batch_t disc_b;
+
+    discovered_dir_batch_init(&disc_b, queue, shared);
 
     while (stack->count > 0) {
         dir_work_t work;
@@ -3369,6 +3610,7 @@ static int process_directory_iterative(dir_stack_t *stack,
         if (!dir) {
             fprintf(stderr, "ERROR worker opendir %s: %s\n", dir_path, strerror(errno));
             stats_add_error(shared);
+            (void)discovered_dir_batch_flush(&disc_b);
             free(dir_path);
             continue;
         }
@@ -3378,6 +3620,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             if (dir_fd < 0) {
                 fprintf(stderr, "ERROR worker dirfd %s: %s\n", dir_path, strerror(errno));
                 stats_add_error(shared);
+                (void)discovered_dir_batch_flush(&disc_b);
                 ecrawl_io_closedir(dir);
                 free(dir_path);
                 continue;
@@ -3419,7 +3662,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     child_name_len = strlen(ent->d_name);
                     if (child_d_type == DT_DIR) {
                         crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent->d_name, child_name_len,
-                                                   shared, stats, perf, emit, stack, queue, aux);
+                                                   shared, stats, perf, emit, stack, queue, aux, &disc_b);
                         dirs_since_donate_check++;
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
@@ -3446,8 +3689,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                                     stats_add_error(shared);
                                     continue;
                                 }
-                                if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, &child_st,
-                                                                shared, 0) != 0)
+                                if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
+                                                              0) != 0)
                                     continue;
                                 stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent->d_name, child_name_len);
                                 dirs_since_donate_check++;
@@ -3488,6 +3731,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             if (nb.count >= g_stat_batch_entries_cfg) {
                                 if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
                                                        &pend) != 0) {
+                                    (void)discovered_dir_batch_flush(&disc_b);
                                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
                                     ecrawl_io_closedir(dir);
                                     stat_names_builder_free(&nb);
@@ -3515,6 +3759,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             atomic_fetch_add_explicit(&g_stat_batches_tail_inlined, 1ULL, memory_order_relaxed);
                     }
                     if (tail_rc != 0) {
+                        (void)discovered_dir_batch_flush(&disc_b);
                         stat_pending_drain_all(&pend, stack, queue, aux, shared);
                         ecrawl_io_closedir(dir);
                         stat_names_builder_free(&nb);
@@ -3544,7 +3789,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     child_name_len = strlen(ent->d_name);
                     if (child_d_type == DT_DIR) {
                         crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent->d_name, child_name_len,
-                                                   shared, stats, perf, emit, stack, queue, aux);
+                                                   shared, stats, perf, emit, stack, queue, aux, &disc_b);
                         dirs_since_donate_check++;
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
@@ -3564,8 +3809,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 stats_add_error(shared);
                                 continue;
                             }
-                            if (enqueue_discovered_dir_task(queue, child_path_owned, child_path_len, &child_st,
-                                                            shared, 0) != 0)
+                            if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
+                                                          0) != 0)
                                 continue;
                             dirs_since_donate_check++;
                             donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
@@ -3597,11 +3842,13 @@ static int process_directory_iterative(dir_stack_t *stack,
             }
         }
 
+        (void)discovered_dir_batch_flush(&disc_b);
         ecrawl_io_closedir(dir);
         free(dir_path);
     outer_continue:;
     }
 
+    discovered_dir_batch_fini(&disc_b);
     return 0;
 }
 
@@ -4430,7 +4677,8 @@ static double now_sec(void) {
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
-static int write_crawl_manifest(const char *start_path, int worker_count_started, double elapsed_sec) {
+static int write_crawl_manifest(const char *start_path, int worker_count_started, double elapsed_sec,
+                                const shared_state_t *totals) {
     FILE *fp;
     char manifest_path[PATH_MAX];
     time_t end_wall = time(NULL);
@@ -4446,6 +4694,9 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     if (g_record_root && g_record_root[0] != '\0') fprintf(fp, "record_root=%s\n", g_record_root);
     fprintf(fp, "split_depth=%d\n", g_split_depth);
     fprintf(fp, "byte_accounting=unique_regular_files\n");
+    fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
+    fprintf(fp, "total_allocated_bytes=%" PRIu64 "\n", totals->total_allocated_bytes);
+    fprintf(fp, "files_sparse_heuristic=%" PRIu64 "\n", totals->files_sparse_heuristic);
     fprintf(fp, "crawl_threads=%d\n", worker_count_started);
     fprintf(fp, "writer_threads=%d\n", g_writer_threads);
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
@@ -4486,6 +4737,8 @@ static void merge_live_snapshot(shared_state_t *out, shared_state_t *shared, wor
         out->total_symlinks += w[i].stats.total_symlinks;
         out->total_other += w[i].stats.total_other;
         out->total_bytes += w[i].stats.total_bytes;
+        out->total_allocated_bytes += w[i].stats.total_allocated_bytes;
+        out->files_sparse_heuristic += w[i].stats.files_sparse_heuristic;
         out->dir_apparent_bytes += w[i].stats.dir_apparent_bytes;
         out->symlink_apparent_bytes += w[i].stats.symlink_apparent_bytes;
         out->other_apparent_bytes += w[i].stats.other_apparent_bytes;
@@ -4566,6 +4819,9 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "symlinks=%" PRIu64 "\n", shared->total_symlinks);
     fprintf(fp, "other=%" PRIu64 "\n", shared->total_other);
     fprintf(fp, "total_bytes=%" PRIu64 "\n", shared->total_bytes);
+    fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
+    fprintf(fp, "total_allocated_bytes=%" PRIu64 "\n", shared->total_allocated_bytes);
+    fprintf(fp, "files_sparse_heuristic=%" PRIu64 "\n", shared->files_sparse_heuristic);
     fprintf(fp, "dir_apparent_bytes=%" PRIu64 "\n", shared->dir_apparent_bytes);
     fprintf(fp, "symlink_apparent_bytes=%" PRIu64 "\n", shared->symlink_apparent_bytes);
     fprintf(fp, "other_apparent_bytes=%" PRIu64 "\n", shared->other_apparent_bytes);
@@ -4593,6 +4849,9 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "donate_check_every=%zu\n", g_donate_check_every_cfg);
     fprintf(fp, "force_donate_at=%zu\n", g_force_donate_count_cfg);
     fprintf(fp, "donate_chunk_force_max=%zu\n", g_donate_chunk_force_max_cfg);
+    fprintf(fp, "donate_all_busy_min_stack=%zu\n", g_donate_all_busy_min_stack_cfg);
+    fprintf(fp, "donate_all_busy_max_qdepth_mult=%u\n", g_donate_all_busy_max_qdepth_mult_cfg);
+    fprintf(fp, "discovered_dir_enqueue_batch=%zu\n", g_discovered_dir_enqueue_batch_cfg);
     fprintf(fp, "donate_floor=%d\n", LOCAL_STACK_DONATE_FLOOR);
     fprintf(fp, "avg_active_workers=%.2f\n",
             g_active_workers_samples ? (double)g_active_workers_sum / (double)g_active_workers_samples : 0.0);
@@ -4791,6 +5050,9 @@ int main(int argc, char **argv) {
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
     g_force_donate_count_cfg     = parse_ecrawl_force_donate_at();
+    g_donate_all_busy_min_stack_cfg              = parse_ecrawl_donate_all_busy_min_stack();
+    g_donate_all_busy_max_qdepth_mult_cfg = parse_ecrawl_donate_all_busy_max_qdepth_mult();
+    g_discovered_dir_enqueue_batch_cfg    = parse_ecrawl_discovered_dir_enqueue_batch();
     g_uid_shards = parse_ecrawl_uid_shards_env();
     g_writer_threads = parse_ecrawl_writer_threads_env();
     g_writer_queue_batches = parse_ecrawl_writer_queue_batches_env();
@@ -4898,6 +5160,8 @@ int main(int argc, char **argv) {
     atomic_store(&g_total_files, 0);
     atomic_store(&g_total_dirs, 0);
     atomic_store(&g_total_bytes, 0);
+    atomic_store(&g_total_allocated_bytes, 0);
+    atomic_store(&g_files_sparse_heuristic, 0);
     atomic_store(&g_window_entries, 0);
     atomic_store(&g_window_files, 0);
     atomic_store(&g_window_dirs, 0);
@@ -5219,7 +5483,7 @@ int main(int argc, char **argv) {
     {
         double elapsed = t1 - t0;
 
-        if (!g_no_write && write_crawl_manifest(start_path, worker_count_started, elapsed) != 0) {
+        if (!g_no_write && write_crawl_manifest(start_path, worker_count_started, elapsed, &shared) != 0) {
             fprintf(stderr, "ERROR failed to write crawl manifest: %s\n", strerror(errno));
         }
 
@@ -5253,6 +5517,9 @@ int main(int argc, char **argv) {
             printf("symlinks=%" PRIu64 "\n", shared.total_symlinks);
             printf("other=%" PRIu64 "\n", shared.total_other);
             printf("total_bytes=%" PRIu64 "\n", shared.total_bytes);
+            printf("st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
+            printf("total_allocated_bytes=%" PRIu64 "\n", shared.total_allocated_bytes);
+            printf("files_sparse_heuristic=%" PRIu64 "\n", shared.files_sparse_heuristic);
             printf("dir_apparent_bytes=%" PRIu64 "\n", shared.dir_apparent_bytes);
             printf("symlink_apparent_bytes=%" PRIu64 "\n", shared.symlink_apparent_bytes);
             printf("other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
