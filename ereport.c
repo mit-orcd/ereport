@@ -3722,14 +3722,30 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec, er
     return ord;
 }
 
-static int join_path_component(char *dst, size_t dst_sz, const char *base, const char *comp, size_t comp_len) {
-    int n;
+/*
+ * Append one path component in place to a buffer that already holds `len`
+ * NUL-terminated bytes, using the same separator rules the old
+ * join_path_component used (empty prefix -> "comp"; root "/" -> "/comp";
+ * otherwise "prefix/comp"). Produces byte-identical strings to the previous
+ * join+recopy approach but only touches the new tail, turning the per-level
+ * cost from O(path_len) into O(comp_len). Returns the new length, or
+ * (size_t)-1 on overflow.
+ */
+static size_t path_append_component(char *buf, size_t bufsz, size_t len, const char *comp, size_t comp_len) {
+    size_t base;
+    int need_sep = 0;
 
-    if (base[0] == '\0') n = snprintf(dst, dst_sz, "%.*s", (int)comp_len, comp);
-    else if (strcmp(base, "/") == 0) n = snprintf(dst, dst_sz, "/%.*s", (int)comp_len, comp);
-    else n = snprintf(dst, dst_sz, "%s/%.*s", base, (int)comp_len, comp);
-
-    return n >= 0 && (size_t)n < dst_sz;
+    if (len == 0) base = 0;
+    else if (len == 1 && buf[0] == '/') base = 1;
+    else {
+        base = len + 1;
+        need_sep = 1;
+    }
+    if (base + comp_len + 1 > bufsz) return (size_t)-1;
+    if (need_sep) buf[len] = '/';
+    memcpy(buf + base, comp, comp_len);
+    buf[base + comp_len] = '\0';
+    return base + comp_len;
 }
 
 static const char *path_after_base_prefix(const char *path, const char *base_prefix) {
@@ -3768,17 +3784,19 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
 
     for (i = lo; i < hi; i++) {
         const detail_record_t *r = &details->items[i];
-        char prev[PATH_MAX];
         char rowpath[PATH_MAX];
+        size_t rowlen = 0;
         const char *p;
         int depth;
 
         p = path_after_base_prefix(r->path, base_prefix);
         if (!p || *p == '\0') continue;
 
-        prev[0] = '\0';
+        rowpath[0] = '\0';
         if (base_prefix) {
-            if (snprintf(prev, sizeof(prev), "%s", base_prefix) >= (int)sizeof(prev)) return -1;
+            rowlen = strlen(base_prefix);
+            if (rowlen >= sizeof(rowpath)) return -1;
+            memcpy(rowpath, base_prefix, rowlen + 1);
         }
 
         for (depth = 0; depth < nlevels; depth++) {
@@ -3794,7 +3812,8 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
             comp_len = (size_t)(p - start);
             if (comp_len == 0) break;
 
-            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) return -1;
+            rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
+            if (rowlen == (size_t)-1) return -1;
 
             row = path_row_map_get_or_insert(&maps[depth], rowpath);
             if (!row) return -1;
@@ -3804,8 +3823,6 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
                 row->bucket_ctime_led_files++;
                 row->bucket_ctime_led_bytes += r->size;
             }
-
-            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) return -1;
         }
     }
 
@@ -4007,8 +4024,8 @@ static void *agg_totals_par_worker(void *vp) {
     for (ii = w->c_lo; ii < w->c_hi; ii++) {
         size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
         const matched_record_t *r = &w->records->items[i];
-        char prev[PATH_MAX];
         char rowpath[PATH_MAX];
+        size_t rowlen = 0;
         const char *p;
         int depth;
 
@@ -4017,12 +4034,14 @@ static void *agg_totals_par_worker(void *vp) {
         p = path_after_base_prefix(r->path, w->base_prefix);
         if (!p || *p == '\0') continue;
 
-        prev[0] = '\0';
+        rowpath[0] = '\0';
         if (w->base_prefix) {
-            if (snprintf(prev, sizeof(prev), "%s", w->base_prefix) >= (int)sizeof(prev)) {
+            rowlen = strlen(w->base_prefix);
+            if (rowlen >= sizeof(rowpath)) {
                 atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
                 return NULL;
             }
+            memcpy(rowpath, w->base_prefix, rowlen + 1);
         }
 
         for (depth = 0; depth < w->nlevels; depth++) {
@@ -4038,7 +4057,8 @@ static void *agg_totals_par_worker(void *vp) {
             comp_len = (size_t)(p - start);
             if (comp_len == 0) break;
 
-            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) {
+            rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
+            if (rowlen == (size_t)-1) {
                 atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
                 return NULL;
             }
@@ -4062,11 +4082,6 @@ static void *agg_totals_par_worker(void *vp) {
                         my[(size_t)ri * 3 + 2] += r->size;
                     }
                 }
-            }
-
-            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) {
-                atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
-                return NULL;
             }
         }
     }
@@ -4343,17 +4358,19 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
     for (ii = lo; ii < hi; ii++) {
         size_t i = use_ord_slice ? path_ord[ii] : ii;
         const matched_record_t *r = &records->items[i];
-        char prev[PATH_MAX];
         char rowpath[PATH_MAX];
+        size_t rowlen = 0;
         const char *p;
         int depth;
 
         p = path_after_base_prefix(r->path, base_prefix);
         if (!p || *p == '\0') continue;
 
-        prev[0] = '\0';
+        rowpath[0] = '\0';
         if (base_prefix) {
-            if (snprintf(prev, sizeof(prev), "%s", base_prefix) >= (int)sizeof(prev)) return -1;
+            rowlen = strlen(base_prefix);
+            if (rowlen >= sizeof(rowpath)) return -1;
+            memcpy(rowpath, base_prefix, rowlen + 1);
         }
 
         for (depth = 0; depth < nlevels; depth++) {
@@ -4369,7 +4386,8 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
             comp_len = (size_t)(p - start);
             if (comp_len == 0) break;
 
-            if (!join_path_component(rowpath, sizeof(rowpath), prev, start, comp_len)) return -1;
+            rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
+            if (rowlen == (size_t)-1) return -1;
 
             row = path_row_map_find(&maps[depth], rowpath);
             if (row) {
@@ -4377,8 +4395,6 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
                 else if (r->type == 'd') row->total_dirs++;
                 row->total_bytes += r->size;
             }
-
-            if (snprintf(prev, sizeof(prev), "%s", rowpath) >= (int)sizeof(prev)) return -1;
         }
     }
 
