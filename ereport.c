@@ -7304,6 +7304,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
                           ereport_run_stats_t *run_stats) {
     FILE *fp = NULL;
     int rc = -1;
+    /* Reused across every record in this chunk to avoid per-record malloc/free
+     * of a 4 KiB path buffer and a name buffer (name_len is uint16). */
+    char *pathbuf_store = NULL;
+    unsigned char *name_store = NULL;
 
     fp = counted_fopen(chunk->path, "rb");
     if (!fp) {
@@ -7316,6 +7320,15 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
     if (fseeko(fp, (off_t)chunk->start_offset, SEEK_SET) != 0) {
         fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
+        sum->bad_input_files++;
+        if (progress) progress->bad_input_files++;
+        goto out;
+    }
+
+    pathbuf_store = (char *)malloc(PATH_MAX);
+    name_store = (unsigned char *)malloc(65536); /* >= max uint16 name_len */
+    if (!pathbuf_store || !name_store) {
+        fprintf(stderr, "warn: scratch alloc failed in %s\n", chunk->path);
         sum->bad_input_files++;
         if (progress) progress->bad_input_files++;
         goto out;
@@ -7405,28 +7418,13 @@ static int read_one_chunk(const file_chunk_t *chunk,
         } else {
             unsigned char *name_bytes = NULL;
 
-            pathbuf = (char *)malloc(PATH_MAX);
-            if (!pathbuf) {
-                fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
-            }
+            pathbuf = pathbuf_store;
             if (r.name_len > 0) {
-                name_bytes = (unsigned char *)malloc((size_t)r.name_len);
-                if (!name_bytes) {
-                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                    sum->bad_input_files++;
-                    if (progress) progress->bad_input_files++;
-                    free(pathbuf);
-                    break;
-                }
+                name_bytes = name_store;
                 if (counted_fread(name_bytes, 1, r.name_len, fp) != r.name_len) {
                     fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
-                    free(name_bytes);
-                    free(pathbuf);
                     break;
                 }
             }
@@ -7435,18 +7433,14 @@ static int read_one_chunk(const file_chunk_t *chunk,
                 fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
-                free(name_bytes);
-                free(pathbuf);
                 break;
             }
-            free(name_bytes);
         }
 
         if (all_users && uid_distinct && uid_accum_insert_if_new(uid_distinct, r.uid) < 0) {
             fprintf(stderr, "warn: uid set error in %s\n", chunk->path);
             sum->bad_input_files++;
             if (progress) progress->bad_input_files++;
-            if (pathbuf) free(pathbuf);
             break;
         }
 
@@ -7465,7 +7459,6 @@ static int read_one_chunk(const file_chunk_t *chunk,
                     fprintf(stderr, "warn: inode dedup set error in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
-                    if (pathbuf) free(pathbuf);
                     break;
                 }
                 if (ins == 0) count_bytes = 0;
@@ -7499,7 +7492,6 @@ static int read_one_chunk(const file_chunk_t *chunk,
                     fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
-                    if (pathbuf) free(pathbuf);
                     break;
                 }
             }
@@ -7526,7 +7518,6 @@ static int read_one_chunk(const file_chunk_t *chunk,
                 fprintf(stderr, "warn: matched record append failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
-                if (pathbuf) free(pathbuf);
                 break;
             }
         }
@@ -7536,11 +7527,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
             if (parent_fanout_stats)
                 fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.type, pick_time(&r, basis), sum);
         }
-
-        if (pathbuf) free(pathbuf);
     }
 
 out:
+    free(pathbuf_store);
+    free(name_store);
     counted_fclose(fp);
     finalize_chunk_file_progress(file_states, chunk->file_index, progress);
     progress_flush_local(progress, run_stats);
