@@ -213,6 +213,61 @@ typedef struct {
 
 static void summary_merge(summary_t *dst, const summary_t *src);
 
+/*
+ * Per-thread bump arena for matched-record / bucket-detail path strings.
+ * Replaces hundreds of millions of per-string strdup()/free() pairs with a
+ * handful of block allocations and one bulk free per worker, removing the
+ * cross-thread allocator (malloc-arena) contention this used to generate.
+ * Strings handed out stay valid until path_arena_destroy().
+ */
+#define PATH_ARENA_BLOCK_BYTES (1u << 20)
+
+typedef struct path_arena_block {
+    struct path_arena_block *next;
+    size_t used;
+    size_t cap;
+    char data[];
+} path_arena_block_t;
+
+typedef struct {
+    path_arena_block_t *head;
+} path_arena_t;
+
+static char *path_arena_dup(path_arena_t *a, const char *s) {
+    size_t len = s ? strlen(s) : 0;
+    size_t need = len + 1;
+    path_arena_block_t *b = a->head;
+    char *out;
+
+    if (!b || (b->cap - b->used) < need) {
+        size_t cap = (need > PATH_ARENA_BLOCK_BYTES) ? need : PATH_ARENA_BLOCK_BYTES;
+        path_arena_block_t *nb = (path_arena_block_t *)malloc(sizeof(path_arena_block_t) + cap);
+        if (!nb) return NULL;
+        nb->next = a->head;
+        nb->used = 0;
+        nb->cap = cap;
+        a->head = nb;
+        b = nb;
+    }
+    out = b->data + b->used;
+    if (len) memcpy(out, s, len);
+    out[len] = '\0';
+    b->used += need;
+    return out;
+}
+
+static void path_arena_destroy(path_arena_t *a) {
+    path_arena_block_t *b;
+    if (!a) return;
+    b = a->head;
+    while (b) {
+        path_arena_block_t *n = b->next;
+        free(b);
+        b = n;
+    }
+    a->head = NULL;
+}
+
 typedef struct {
     char *path;
     uint64_t size;
@@ -223,6 +278,10 @@ typedef struct {
     detail_record_t *items;
     size_t count;
     size_t cap;
+    /* When set, path strings are owned by an external per-thread arena and must
+     * not be individually freed by bucket_details_free. */
+    path_arena_t *arena;     /* non-NULL: append copies into this arena */
+    int paths_external;      /* non-zero: free() must not touch item paths */
 } bucket_details_t;
 
 typedef struct {
@@ -235,6 +294,8 @@ typedef struct {
     matched_record_t *items;
     size_t count;
     size_t cap;
+    path_arena_t *arena;     /* non-NULL: append copies into this arena */
+    int paths_external;      /* non-zero: free() must not touch item paths */
 } matched_records_t;
 
 typedef crawl_bin_file_chunk_t file_chunk_t;
@@ -494,6 +555,9 @@ typedef struct {
     summary_t summary;
     bucket_details_t details[AGE_BUCKETS][SIZE_BUCKETS];
     matched_records_t matched_records;
+    /* Backing storage for all path strings appended by this worker (matched
+     * records + bucket details). Bulk-freed once via path_arena_destroy. */
+    path_arena_t path_arena;
     ereport_run_stats_t *run_stats;
     dense_cell_map_t dense_maps[AGE_BUCKETS][SIZE_BUCKETS];
     /* Crawl-wide: immediate children per parent dir (all matched types with paths). */
@@ -988,7 +1052,7 @@ static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t
         b->cap = new_cap;
     }
 
-    b->items[b->count].path = strdup(path ? path : "");
+    b->items[b->count].path = b->arena ? path_arena_dup(b->arena, path ? path : "") : strdup(path ? path : "");
     if (!b->items[b->count].path) return -1;
     b->items[b->count].size = size;
     b->items[b->count].ctime_led = (uint8_t)(ctime_led ? 1 : 0);
@@ -998,7 +1062,9 @@ static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t
 
 static void bucket_details_free(bucket_details_t *b) {
     size_t i;
-    for (i = 0; i < b->count; i++) free(b->items[i].path);
+    if (!b->paths_external) {
+        for (i = 0; i < b->count; i++) free(b->items[i].path);
+    }
     free(b->items);
     b->items = NULL;
     b->count = 0;
@@ -1016,7 +1082,7 @@ static int matched_records_append(matched_records_t *m, const char *path, uint8_
         m->cap = new_cap;
     }
 
-    m->items[m->count].path = strdup(path ? path : "");
+    m->items[m->count].path = m->arena ? path_arena_dup(m->arena, path ? path : "") : strdup(path ? path : "");
     if (!m->items[m->count].path) return -1;
     m->items[m->count].type = type;
     m->items[m->count].size = size;
@@ -1026,7 +1092,9 @@ static int matched_records_append(matched_records_t *m, const char *path, uint8_
 
 static void matched_records_free(matched_records_t *m) {
     size_t i;
-    for (i = 0; i < m->count; i++) free(m->items[i].path);
+    if (!m->paths_external) {
+        for (i = 0; i < m->count; i++) free(m->items[i].path);
+    }
     free(m->items);
     m->items = NULL;
     m->count = 0;
@@ -2977,6 +3045,18 @@ static void worker_dense_maps_free(worker_arg_t *args, int nthreads) {
             for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&args[ti].dense_maps[ab][sb]);
         }
     }
+}
+
+/*
+ * Release every worker's path arena. Safe to call only after all consumers of
+ * the matched-record / bucket-detail path strings (report emission) are done.
+ * Arenas are zero-initialized by calloc, so calling on unused slots is a no-op.
+ */
+static void worker_path_arenas_destroy(worker_arg_t *args, int nthreads) {
+    int ti;
+
+    if (!args || nthreads < 1) return;
+    for (ti = 0; ti < nthreads; ti++) path_arena_destroy(&args[ti].path_arena);
 }
 
 /* Count one immediate child under its parent (used for crawl-wide megadir / Dense badge). */
@@ -9941,6 +10021,7 @@ int main(int argc, char **argv) {
         size_t k;
         fprintf(stderr, "allocation failed\n");
         free(tids);
+        worker_path_arenas_destroy(args, threads);
         free(args);
         for (k = 0; k < path_count; k++) free(paths[k]);
         free(paths);
@@ -9962,6 +10043,20 @@ int main(int argc, char **argv) {
         args[i].seen_inodes = &seen_inodes;
         args[i].run_stats = &run_stats;
 
+        /* Route this worker's path strings into its own arena; its append-side
+         * structures must never individually free arena-owned strings. */
+        args[i].matched_records.arena = &args[i].path_arena;
+        args[i].matched_records.paths_external = 1;
+        {
+            int ab2, sb2;
+            for (ab2 = 0; ab2 < AGE_BUCKETS; ab2++) {
+                for (sb2 = 0; sb2 < SIZE_BUCKETS; sb2++) {
+                    args[i].details[ab2][sb2].arena = &args[i].path_arena;
+                    args[i].details[ab2][sb2].paths_external = 1;
+                }
+            }
+        }
+
         if (all_users_mode) {
             if (uid_accum_init(&args[i].uid_distinct, 8192) != 0) {
                 int j;
@@ -9976,6 +10071,7 @@ int main(int argc, char **argv) {
                 }
                 worker_dense_maps_free(args, i);
                 free(tids);
+                worker_path_arenas_destroy(args, threads);
                 free(args);
                 for (j = 0; j < (int)chunk_count; j++) free(chunks[j].path);
                 free(chunks);
@@ -9998,6 +10094,15 @@ int main(int argc, char **argv) {
     memset(&final_sum, 0, sizeof(final_sum));
     memset(final_details, 0, sizeof(final_details));
     memset(&final_matched_records, 0, sizeof(final_matched_records));
+    /* Final structures only ever receive path pointers transferred out of the
+     * per-worker arenas, so they must never individually free those strings. */
+    final_matched_records.paths_external = 1;
+    {
+        int ab2, sb2;
+        for (ab2 = 0; ab2 < AGE_BUCKETS; ab2++) {
+            for (sb2 = 0; sb2 < SIZE_BUCKETS; sb2++) final_details[ab2][sb2].paths_external = 1;
+        }
+    }
 
     {
         double vt_parse0 = 0.0;
@@ -10053,6 +10158,7 @@ int main(int argc, char **argv) {
                 if (all_users_mode) {
                     for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
                 }
+                worker_path_arenas_destroy(args, threads);
                 free(args);
                 for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
                 free(chunks);
@@ -10111,6 +10217,7 @@ int main(int argc, char **argv) {
                     if (all_users_mode) {
                         for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
                     }
+                    worker_path_arenas_destroy(args, threads);
                     free(args);
                     for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
                     free(chunks);
@@ -10156,6 +10263,7 @@ int main(int argc, char **argv) {
             for (i = 0; i < threads; i++) uid_accum_destroy(&args[i].uid_distinct);
             worker_dense_maps_free(args, threads_used);
             free(tids);
+            worker_path_arenas_destroy(args, threads);
             free(args);
             for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
             free(chunks);
@@ -10182,6 +10290,7 @@ int main(int argc, char **argv) {
                 for (j = 0; j < threads; j++) uid_accum_destroy(&args[j].uid_distinct);
                 worker_dense_maps_free(args, threads_used);
                 free(tids);
+                worker_path_arenas_destroy(args, threads);
                 free(args);
                 for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
                 free(chunks);
@@ -10218,6 +10327,7 @@ int main(int argc, char **argv) {
         }
         worker_dense_maps_free(args, threads_used);
         free(tids);
+        worker_path_arenas_destroy(args, threads);
         free(args);
         for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
         free(chunks);
@@ -10280,6 +10390,9 @@ int main(int argc, char **argv) {
                    bucket_pages_written, t1 - t0, &manifest_disk);
 
     free(tids);
+    /* Report emission is complete; the final structures no longer dereference
+     * arena-backed path strings (their frees below are path-external no-ops). */
+    worker_path_arenas_destroy(args, threads);
     free(args);
     for (i = 0; i < (int)chunk_count; i++) free(chunks[i].path);
     free(chunks);
