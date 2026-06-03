@@ -50,6 +50,9 @@
 static pthread_mutex_t g_verbose_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int g_verbose;
 static unsigned g_top_n = 32U;
+/* Top-list dimensions (selected via --top[,dim...]): dense = most regular files; deep = deepest directories. */
+static int g_top_dense = 1;
+static int g_top_deep = 0;
 
 /* Larger table → shorter collision chains; merge does many strcmp walks per insert. */
 #define ANALYZE_HASH_BUCKETS 262144U
@@ -225,13 +228,63 @@ static int is_uid_shard_bin_name(const char *name) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--verbose] [--top N] <crawl-output-dir>\n"
+            "Usage: %s [--verbose] [--top[,dim...] N] <crawl-output-dir>\n"
             "  Read-only parallel scan of uid_shard_*.bin shards; directory-shape stats on stdout.\n"
             "  Uses .ckpt segment boundaries when sidecars are valid; else one range per shard.\n"
             "  Parallel threads: ECRAWL_ANALYZE_THREADS (default %u), or ECRAWL_REPAIR_THREADS if unset.\n"
             "  Live bytes/chunks/records + ETA on stderr when stderr is a terminal.\n"
-            "  --top N: list top N parents by regular-file count (default %u).\n",
+            "  --top N: list top N parents by regular-file count (default %u). Same as --top,dense N.\n"
+            "  --top,DIM[,DIM] N: choose one or more top lists (order-independent):\n"
+            "      dense = top N parents by regular-file count\n"
+            "      deep  = top N deepest parent directories (by path slash count)\n"
+            "    e.g. --top,deep N (deepest only) or --top,dense,deep N (both lists).\n",
             prog, DEFAULT_ANALYZE_THREADS, g_top_n);
+}
+
+/*
+ * Parse the dimension suffix of a --top flag. spec is the text after "--top": "" selects the default
+ * (dense), otherwise it begins with ',' followed by a comma-separated list of dense/deep. Returns 0 on
+ * success (and sets g_top_dense/g_top_deep), -1 on a malformed or unknown dimension.
+ */
+static int parse_top_dims(const char *spec, const char *prog) {
+    char buf[64];
+    char *tok;
+    char *save = NULL;
+    int dense = 0;
+    int deep = 0;
+
+    if (spec[0] == '\0') {
+        g_top_dense = 1;
+        g_top_deep = 0;
+        return 0;
+    }
+    spec++; /* skip leading ',' */
+    if (spec[0] == '\0') {
+        fprintf(stderr, "%s: --top, requires at least one dimension (dense,deep)\n", prog);
+        return -1;
+    }
+    if (strlen(spec) >= sizeof(buf)) {
+        fprintf(stderr, "%s: --top dimension list too long\n", prog);
+        return -1;
+    }
+    strcpy(buf, spec);
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (strcmp(tok, "dense") == 0)
+            dense = 1;
+        else if (strcmp(tok, "deep") == 0)
+            deep = 1;
+        else {
+            fprintf(stderr, "%s: unknown --top dimension '%s' (expected dense or deep)\n", prog, tok);
+            return -1;
+        }
+    }
+    if (!dense && !deep) {
+        fprintf(stderr, "%s: --top needs a dimension (dense,deep)\n", prog);
+        return -1;
+    }
+    g_top_dense = dense;
+    g_top_deep = deep;
+    return 0;
 }
 
 static unsigned parse_analyze_threads_env(void) {
@@ -963,27 +1016,35 @@ static void *analyze_worker_main(void *arg) {
 
 typedef struct {
     parent_node_t *node;
+    uint64_t key; /* ranking key: nfile for the dense list, slash-count depth for the deep list */
 } analyze_sort_wrap_t;
 
-static int cmp_analyze_nfile_desc(const void *a, const void *b) {
+static uint64_t analyze_count_slashes(const char *s) {
+    uint64_t c = 0;
+
+    for (; *s; s++)
+        if (*s == '/') c++;
+    return c;
+}
+
+/* Final ordering for a top list: key descending, ties broken by path ascending. */
+static int cmp_analyze_key_desc(const void *a, const void *b) {
     const analyze_sort_wrap_t *wa = (const analyze_sort_wrap_t *)a;
     const analyze_sort_wrap_t *wb = (const analyze_sort_wrap_t *)b;
-    uint64_t af = wa->node->nfile;
-    uint64_t bf = wb->node->nfile;
 
-    if (af < bf) return 1;
-    if (af > bf) return -1;
+    if (wa->key < wb->key) return 1;
+    if (wa->key > wb->key) return -1;
     return strcmp(wa->node->path, wb->node->path);
 }
 
 /*
- * "Worse" = ranked later in the desired top order (nfile desc, then path asc), i.e. the element that
+ * "Worse" = ranked later in the desired top order (key desc, then path asc), i.e. the element that
  * should be evicted first. Used to keep a bounded min-heap of the top-N parents so the report does not
  * sort every distinct parent (O(M log N) time, O(N) memory instead of a full O(M log M) sort).
  */
-static int analyze_topn_worse(const parent_node_t *a, const parent_node_t *b) {
-    if (a->nfile != b->nfile) return a->nfile < b->nfile;
-    return strcmp(a->path, b->path) > 0;
+static int analyze_topn_worse(const analyze_sort_wrap_t *a, const analyze_sort_wrap_t *b) {
+    if (a->key != b->key) return a->key < b->key;
+    return strcmp(a->node->path, b->node->path) > 0;
 }
 
 static void analyze_topn_sift_down(analyze_sort_wrap_t *h, size_t n, size_t i) {
@@ -993,8 +1054,8 @@ static void analyze_topn_sift_down(analyze_sort_wrap_t *h, size_t n, size_t i) {
         size_t s = i;
         analyze_sort_wrap_t tmp;
 
-        if (l < n && analyze_topn_worse(h[l].node, h[s].node)) s = l;
-        if (r < n && analyze_topn_worse(h[r].node, h[s].node)) s = r;
+        if (l < n && analyze_topn_worse(&h[l], &h[s])) s = l;
+        if (r < n && analyze_topn_worse(&h[r], &h[s])) s = r;
         if (s == i) break;
         tmp = h[i];
         h[i] = h[s];
@@ -1008,7 +1069,7 @@ static void analyze_topn_sift_up(analyze_sort_wrap_t *h, size_t i) {
         size_t p = (i - 1U) / 2U;
         analyze_sort_wrap_t tmp;
 
-        if (!analyze_topn_worse(h[i].node, h[p].node)) break;
+        if (!analyze_topn_worse(&h[i], &h[p])) break;
         tmp = h[i];
         h[i] = h[p];
         h[p] = tmp;
@@ -1016,15 +1077,20 @@ static void analyze_topn_sift_up(analyze_sort_wrap_t *h, size_t i) {
     }
 }
 
-/* Offer one node to the bounded min-heap (root = current worst kept). */
-static void analyze_topn_offer(analyze_sort_wrap_t *heap, size_t *heap_n, size_t cap, parent_node_t *node) {
+/* Offer one (node, key) to the bounded min-heap (root = current worst kept). */
+static void analyze_topn_offer(analyze_sort_wrap_t *heap, size_t *heap_n, size_t cap, parent_node_t *node,
+                               uint64_t key) {
+    analyze_sort_wrap_t cand;
+
     if (cap == 0U) return;
+    cand.node = node;
+    cand.key = key;
     if (*heap_n < cap) {
-        heap[*heap_n].node = node;
+        heap[*heap_n] = cand;
         analyze_topn_sift_up(heap, *heap_n);
         (*heap_n)++;
-    } else if (analyze_topn_worse(heap[0].node, node)) {
-        heap[0].node = node;
+    } else if (analyze_topn_worse(&heap[0], &cand)) {
+        heap[0] = cand;
         analyze_topn_sift_down(heap, *heap_n, 0U);
     }
 }
@@ -1060,18 +1126,30 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
     uint64_t max_nfile = 0;
     uint64_t hb1 = 0, hb2 = 0, hb3 = 0, hb4 = 0, hb5 = 0, hb6 = 0, hb7 = 0, hb8 = 0;
     uint64_t megadir_100k = 0;
-    analyze_sort_wrap_t *heap = NULL;
-    size_t heap_cap = (size_t)g_top_n;
-    size_t heap_n = 0;
+    analyze_sort_wrap_t *dense_heap = NULL;
+    analyze_sort_wrap_t *deep_heap = NULL;
+    size_t dense_cap = g_top_dense ? (size_t)g_top_n : 0U;
+    size_t deep_cap = g_top_deep ? (size_t)g_top_n : 0U;
+    size_t dense_n = 0;
+    size_t deep_n = 0;
     unsigned di;
     uint64_t depth_records = 0;
     unsigned max_depth_bin = 0;
 
-    heap = (analyze_sort_wrap_t *)malloc((heap_cap ? heap_cap : 1U) * sizeof(*heap));
-    if (!heap) {
-        /* Stats below are still emitted; only the top-N listing is dropped on OOM. */
-        fprintf(stderr, "ecrawl_analyze: alloc failed for top-N heap; skipping top list\n");
-        heap_cap = 0;
+    if (dense_cap > 0U) {
+        dense_heap = (analyze_sort_wrap_t *)malloc(dense_cap * sizeof(*dense_heap));
+        if (!dense_heap) {
+            /* Stats below are still emitted; only the top-N listing is dropped on OOM. */
+            fprintf(stderr, "ecrawl_analyze: alloc failed for dense top-N heap; skipping list\n");
+            dense_cap = 0;
+        }
+    }
+    if (deep_cap > 0U) {
+        deep_heap = (analyze_sort_wrap_t *)malloc(deep_cap * sizeof(*deep_heap));
+        if (!deep_heap) {
+            fprintf(stderr, "ecrawl_analyze: alloc failed for deep top-N heap; skipping list\n");
+            deep_cap = 0;
+        }
     }
 
     for (bi = 0; bi < ANALYZE_HASH_BUCKETS; bi++) {
@@ -1088,13 +1166,15 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
                 if (n->nfile > max_nfile) max_nfile = n->nfile;
             }
 
-            analyze_topn_offer(heap, &heap_n, heap_cap, n);
+            if (dense_cap > 0U) analyze_topn_offer(dense_heap, &dense_n, dense_cap, n, n->nfile);
+            if (deep_cap > 0U) analyze_topn_offer(deep_heap, &deep_n, deep_cap, n, analyze_count_slashes(n->path));
 
             n = n->next;
         }
     }
 
-    if (heap_n > 0U) qsort(heap, heap_n, sizeof(heap[0]), cmp_analyze_nfile_desc);
+    if (dense_n > 0U) qsort(dense_heap, dense_n, sizeof(dense_heap[0]), cmp_analyze_key_desc);
+    if (deep_n > 0U) qsort(deep_heap, deep_n, sizeof(deep_heap[0]), cmp_analyze_key_desc);
 
     printf("ecrawl_analyze\n");
     printf("uid_shard_bin_files=%zu\n", shard_files);
@@ -1128,19 +1208,33 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
     }
     printf("\n");
 
-    printf("top_parents_by_regular_file_count (N=%u)\n", g_top_n);
-    printf("# nfile ndir nsym nother path\n");
-    {
+    if (g_top_dense) {
         size_t k;
 
-        for (k = 0; k < heap_n; k++) {
-            parent_node_t *no = heap[k].node;
+        printf("top_parents_by_regular_file_count (N=%u)\n", g_top_n);
+        printf("# nfile ndir nsym nother path\n");
+        for (k = 0; k < dense_n; k++) {
+            parent_node_t *no = dense_heap[k].node;
             printf("%zu %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n", k + 1U, no->nfile, no->ndir, no->nsym,
                    no->nother, no->path);
         }
     }
 
-    free(heap);
+    if (g_top_deep) {
+        size_t k;
+
+        if (g_top_dense) printf("\n");
+        printf("top_parents_by_depth (N=%u)\n", g_top_n);
+        printf("# depth nfile ndir nsym nother path\n");
+        for (k = 0; k < deep_n; k++) {
+            parent_node_t *no = deep_heap[k].node;
+            printf("%zu %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n", k + 1U, deep_heap[k].key,
+                   no->nfile, no->ndir, no->nsym, no->nother, no->path);
+        }
+    }
+
+    free(dense_heap);
+    free(deep_heap);
 }
 
 static int run_analyze(const char *dir_path, char **names, size_t name_count, unsigned nthreads) {
@@ -1317,12 +1411,16 @@ int main(int argc, char **argv) {
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0)
             g_verbose = 1;
-        else if (strcmp(argv[i], "--top") == 0) {
+        else if (strncmp(argv[i], "--top", 5) == 0 && (argv[i][5] == '\0' || argv[i][5] == ',')) {
             char *end;
             unsigned long v;
 
+            if (parse_top_dims(argv[i] + 5, argv[0]) != 0) {
+                usage(argv[0]);
+                return 2;
+            }
             if (i + 1 >= argc) {
-                fprintf(stderr, "%s: --top requires N\n", argv[0]);
+                fprintf(stderr, "%s: %s requires N\n", argv[0], argv[i]);
                 usage(argv[0]);
                 return 2;
             }
