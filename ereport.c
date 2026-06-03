@@ -659,7 +659,7 @@ static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t 
         }
     }
 
-    idx = (size_t)(inode_key_hash(dev_major, dev_minor, inode) & (sh->cap - 1));
+    idx = (size_t)(hh & (sh->cap - 1));
     while (sh->used[idx]) {
         inode_key_t *k = &sh->keys[idx];
         if (k->dev_major == dev_major && k->dev_minor == dev_minor && k->inode == inode) {
@@ -1379,6 +1379,16 @@ static size_t counted_fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
     if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fread_calls, 1, memory_order_relaxed);
     return fread(ptr, size, nmemb, fp);
 }
+
+/* Unlocked variant for streams owned by a single thread (the parse path: each
+ * worker opens its own chunk FILE*). Avoids the per-call stdio lock taken
+ * twice per record (header + name). */
+static size_t counted_fread_unlocked(void *ptr, size_t size, size_t nmemb, FILE *fp) {
+    if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fread_calls, 1, memory_order_relaxed);
+    return fread_unlocked(ptr, size, nmemb, fp);
+}
+
+#define EREPORT_PARSE_STDIO_BUFSZ (1u << 20) /* 1 MiB explicit read buffer per chunk FILE* */
 
 static const crawl_bin_chunk_stdio_t ereport_chunk_io = {counted_fopen, counted_fread, counted_fclose};
 
@@ -7308,6 +7318,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
      * of a 4 KiB path buffer and a name buffer (name_len is uint16). */
     char *pathbuf_store = NULL;
     unsigned char *name_store = NULL;
+    char *stdio_buf = NULL;
 
     fp = counted_fopen(chunk->path, "rb");
     if (!fp) {
@@ -7317,6 +7328,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
         finalize_chunk_file_progress(file_states, chunk->file_index, progress);
         return -1;
     }
+
+    /* Larger fully-buffered stdio reduces read() syscalls across the many small
+     * header/name reads. Buffer is owned by this thread for the FILE*'s lifetime. */
+    stdio_buf = (char *)malloc(EREPORT_PARSE_STDIO_BUFSZ);
+    if (stdio_buf) setvbuf(fp, stdio_buf, _IOFBF, EREPORT_PARSE_STDIO_BUFSZ);
 
     if (fseeko(fp, (off_t)chunk->start_offset, SEEK_SET) != 0) {
         fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
@@ -7350,7 +7366,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
         memset(&r, 0, sizeof(r));
 
-        n = counted_fread(&r, sizeof(r), 1, fp);
+        n = counted_fread_unlocked(&r, sizeof(r), 1, fp);
         if (n != 1) {
             if (feof(fp)) rc = 0;
             else {
@@ -7421,7 +7437,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             pathbuf = pathbuf_store;
             if (r.name_len > 0) {
                 name_bytes = name_store;
-                if (counted_fread(name_bytes, 1, r.name_len, fp) != r.name_len) {
+                if (counted_fread_unlocked(name_bytes, 1, r.name_len, fp) != r.name_len) {
                     fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
@@ -7533,6 +7549,7 @@ out:
     free(pathbuf_store);
     free(name_store);
     counted_fclose(fp);
+    free(stdio_buf); /* safe only after the stream using it is closed */
     finalize_chunk_file_progress(file_states, chunk->file_index, progress);
     progress_flush_local(progress, run_stats);
     return rc;
