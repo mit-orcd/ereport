@@ -494,10 +494,17 @@ typedef struct dense_node {
     struct dense_node *next;
     char *parent;
     uint64_t n;
+    uint32_t hash; /* full 32-bit FNV of parent; bucket = hash % DENSE_PARENT_BUCKETS */
 } dense_node_t;
 
 typedef struct {
     dense_node_t *buckets[DENSE_PARENT_BUCKETS];
+    /* Last-hit cache keyed by parent_dir_id: consecutive records under the same
+     * directory (the common crawl-bin layout, esp. mega-dirs) then skip hashing
+     * and strcmp entirely. Only used by the *_cached accumulate path; merge/insert
+     * helpers leave it NULL. */
+    dense_node_t *last;
+    uint64_t last_id;
 } dense_cell_map_t;
 
 typedef struct {
@@ -516,11 +523,14 @@ typedef struct fanout_parent_stat_node {
     uint64_t n_others;
     uint64_t t_min;
     uint64_t t_max;
+    uint32_t hash; /* full 32-bit FNV of parent */
     unsigned char have_time;
 } fanout_parent_stat_node_t;
 
 typedef struct {
     fanout_parent_stat_node_t *buckets[DENSE_PARENT_BUCKETS_FANOUT_LOOKUP];
+    fanout_parent_stat_node_t *last; /* last-hit cache keyed by parent_dir_id */
+    uint64_t last_id;
 } fanout_parent_stat_map_t;
 
 typedef struct {
@@ -2058,33 +2068,34 @@ static int parent_dir_to_buf(const char *path, char *parent, size_t parent_sz) {
     }
 }
 
-static uint32_t dense_parent_bucket(const char *parent) {
+static uint32_t dense_hash_full(const char *parent) {
     uint32_t h = 2166136261u;
 
     for (; *parent; parent++) {
         h ^= (uint32_t)(unsigned char)*parent;
         h *= 16777619u;
     }
-    return h % (uint32_t)DENSE_PARENT_BUCKETS;
+    return h;
+}
+
+static uint32_t dense_parent_bucket(const char *parent) {
+    return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS;
 }
 
 static uint32_t dense_parent_bucket_fanout_lookup(const char *parent) {
-    uint32_t h = 2166136261u;
-
-    for (; *parent; parent++) {
-        h ^= (uint32_t)(unsigned char)*parent;
-        h *= 16777619u;
-    }
-    return h % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
+    return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
 }
 
-static int dense_cell_add(dense_cell_map_t *m, const char *parent, uint64_t delta, summary_t *sum) {
-    uint32_t bi = dense_parent_bucket(parent);
+/* Insert/accumulate with a precomputed full hash; compares hash before strcmp so
+ * collision-chain walks skip the (expensive) full path strcmp on hash mismatches. */
+static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h, uint64_t delta,
+                            summary_t *sum) {
+    uint32_t bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
     dense_node_t **pp = &m->buckets[bi];
     dense_node_t *node;
 
     while (*pp) {
-        if (strcmp((*pp)->parent, parent) == 0) {
+        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
             (*pp)->n += delta;
             return 0;
         }
@@ -2102,8 +2113,59 @@ static int dense_cell_add(dense_cell_map_t *m, const char *parent, uint64_t delt
         return -1;
     }
     node->n = delta;
+    node->hash = h;
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
+    return 0;
+}
+
+static int dense_cell_add(dense_cell_map_t *m, const char *parent, uint64_t delta, summary_t *sum) {
+    return dense_cell_add_h(m, parent, dense_hash_full(parent), delta, sum);
+}
+
+/* Accumulate keyed by parent_dir_id with a last-hit fast path. parent_id must be a
+ * stable identifier for the directory whose path is *parent (here: the crawl-bin
+ * parent_dir_id, which is bijective with the parent path). Repeated records under the
+ * same directory then increment the cached node directly, skipping hash + strcmp. */
+static int dense_cell_add_cached(dense_cell_map_t *m, const char *parent, uint64_t parent_id,
+                                 uint64_t delta, summary_t *sum) {
+    uint32_t h, bi;
+    dense_node_t **pp;
+    dense_node_t *node;
+
+    if (m->last && m->last_id == parent_id) {
+        m->last->n += delta;
+        return 0;
+    }
+    h = dense_hash_full(parent);
+    bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
+    pp = &m->buckets[bi];
+    while (*pp) {
+        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
+            (*pp)->n += delta;
+            m->last = *pp;
+            m->last_id = parent_id;
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    node = (dense_node_t *)malloc(sizeof(*node));
+    if (!node) {
+        if (sum) sum->bad_input_files++;
+        return -1;
+    }
+    node->parent = strdup(parent);
+    if (!node->parent) {
+        free(node);
+        if (sum) sum->bad_input_files++;
+        return -1;
+    }
+    node->n = delta;
+    node->hash = h;
+    node->next = m->buckets[bi];
+    m->buckets[bi] = node;
+    m->last = node;
+    m->last_id = parent_id;
     return 0;
 }
 
@@ -2143,7 +2205,7 @@ static void dmerge_do_phase1(dmerge_pt_ctx_t *c) {
         c->src->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            uint32_t dbi = dense_parent_bucket(n->parent);
+            uint32_t dbi = n->hash % (uint32_t)DENSE_PARENT_BUCKETS;
 
             n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi];
             c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi] = n;
@@ -2348,7 +2410,7 @@ static void dense_cell_steal_into_fanout_lookup(dense_cell_map_t *narrow, dense_
         narrow->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            uint32_t biw = dense_parent_bucket_fanout_lookup(n->parent);
+            uint32_t biw = n->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
 
             n->next = lk->buckets[biw];
             lk->buckets[biw] = n;
@@ -2375,7 +2437,7 @@ static void fanout_steal_do_phase1(fanout_steal_pt_ctx_t *c) {
         c->narrow->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            uint32_t biw = dense_parent_bucket_fanout_lookup(n->parent);
+            uint32_t biw = n->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
 
             n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw];
             c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw] = n;
@@ -2954,13 +3016,32 @@ static void fanout_parent_stat_merge_into_ex(fanout_parent_stat_map_t *dst, fano
     free(tids);
 }
 
+static void fanout_parent_stat_node_apply(fanout_parent_stat_node_t *node,
+                                          uint64_t nf, uint64_t nd, uint64_t no,
+                                          uint64_t pick_ts) {
+    node->n_files += nf;
+    node->n_dirs += nd;
+    node->n_others += no;
+    if (!node->have_time) {
+        node->t_min = pick_ts;
+        node->t_max = pick_ts;
+        node->have_time = 1;
+    } else {
+        if (pick_ts < node->t_min) node->t_min = pick_ts;
+        if (pick_ts > node->t_max) node->t_max = pick_ts;
+    }
+}
+
+/* parent_id is a stable, path-bijective identifier (crawl-bin parent_dir_id) used for
+ * the last-hit fast path; the parent string is still derived for insertion/strcmp. */
 static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
                                           const char *child_path,
+                                          uint64_t parent_id,
                                           uint8_t type,
                                           uint64_t pick_ts,
                                           summary_t *sum) {
     char parent[PATH_MAX];
-    uint32_t biw;
+    uint32_t h, biw;
     fanout_parent_stat_node_t **pp;
     fanout_parent_stat_node_t *node;
     uint64_t nf = 0;
@@ -2968,7 +3049,6 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
     uint64_t no = 0;
 
     if (!m || !child_path) return;
-    if (parent_dir_to_buf(child_path, parent, sizeof(parent)) != 0) return;
     if (type == 'f')
         nf = 1;
     else if (type == 'd')
@@ -2976,21 +3056,20 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
     else
         no = 1;
 
-    biw = dense_parent_bucket_fanout_lookup(parent);
+    if (m->last && m->last_id == parent_id) {
+        fanout_parent_stat_node_apply(m->last, nf, nd, no, pick_ts);
+        return;
+    }
+    if (parent_dir_to_buf(child_path, parent, sizeof(parent)) != 0) return;
+
+    h = dense_hash_full(parent);
+    biw = h % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
     pp = &m->buckets[biw];
     while (*pp) {
-        if (strcmp((*pp)->parent, parent) == 0) {
-            (*pp)->n_files += nf;
-            (*pp)->n_dirs += nd;
-            (*pp)->n_others += no;
-            if (!(*pp)->have_time) {
-                (*pp)->t_min = pick_ts;
-                (*pp)->t_max = pick_ts;
-                (*pp)->have_time = 1;
-            } else {
-                if (pick_ts < (*pp)->t_min) (*pp)->t_min = pick_ts;
-                if (pick_ts > (*pp)->t_max) (*pp)->t_max = pick_ts;
-            }
+        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
+            fanout_parent_stat_node_apply(*pp, nf, nd, no, pick_ts);
+            m->last = *pp;
+            m->last_id = parent_id;
             return;
         }
         pp = &(*pp)->next;
@@ -3012,6 +3091,7 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
     node->t_min = pick_ts;
     node->t_max = pick_ts;
     node->have_time = 1;
+    node->hash = h;
     node->next = m->buckets[biw];
     m->buckets[biw] = node;
 }
@@ -3065,13 +3145,18 @@ static void worker_path_arenas_destroy(worker_arg_t *args, int nthreads) {
     for (ti = 0; ti < nthreads; ti++) path_arena_destroy(&args[ti].path_arena);
 }
 
-/* Count one immediate child under its parent (used for crawl-wide megadir / Dense badge). */
-static void path_fanout_accumulate(dense_cell_map_t *fanout, const char *child_path) {
+/* Count one immediate child under its parent (used for crawl-wide megadir / Dense badge).
+ * parent_id is a stable path-bijective key (crawl-bin parent_dir_id) for the last-hit cache. */
+static void path_fanout_accumulate(dense_cell_map_t *fanout, const char *child_path, uint64_t parent_id) {
     char parent[PATH_MAX];
 
     if (!fanout || !child_path) return;
+    if (fanout->last && fanout->last_id == parent_id) {
+        fanout->last->n += 1ULL;
+        return;
+    }
     if (parent_dir_to_buf(child_path, parent, sizeof(parent)) != 0) return;
-    (void)dense_cell_add(fanout, parent, 1ULL, NULL);
+    (void)dense_cell_add_cached(fanout, parent, parent_id, 1ULL, NULL);
 }
 
 static void path_shape_accumulate_file(summary_t *sum,
@@ -3079,6 +3164,7 @@ static void path_shape_accumulate_file(summary_t *sum,
                                        int ab,
                                        int sb,
                                        const char *path,
+                                       uint64_t parent_id,
                                        uint64_t accounted_bytes) {
     char parent[PATH_MAX];
     unsigned slashes;
@@ -3089,8 +3175,12 @@ static void path_shape_accumulate_file(summary_t *sum,
         sum->shape_deep_bytes[ab][sb] += accounted_bytes;
         sum->total_shape_deep_bytes += accounted_bytes;
     }
+    if (cell_dense->last && cell_dense->last_id == parent_id) {
+        cell_dense->last->n += 1ULL;
+        return;
+    }
     if (parent_dir_to_buf(path, parent, sizeof(parent)) != 0) return;
-    if (dense_cell_add(cell_dense, parent, 1ULL, sum) != 0) return;
+    if (dense_cell_add_cached(cell_dense, parent, parent_id, 1ULL, sum) != 0) return;
 }
 
 static int size_bucket_for(uint64_t size) {
@@ -7599,6 +7689,61 @@ fail:
     return -1;
 }
 
+/*
+ * Per-chunk cache of the most recently resolved parent directory path. Records under
+ * the same directory are contiguous in crawl-bin output, so caching by parent_dir_id
+ * lets the common case skip the O(depth) catalog chain walk in
+ * crawl_bin_catalog_dir_path() and just append the entry name.
+ */
+typedef struct {
+    uint64_t id; /* cached parent_dir_id (>1); 0 = empty */
+    size_t len;
+    char dir[PATH_MAX];
+} catalog_dir_cache_t;
+
+static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_dir_id,
+                                     const char *name, size_t name_len, char *out, size_t out_sz,
+                                     catalog_dir_cache_t *cache) {
+    size_t plen;
+
+    if (!cat || !out || out_sz == 0) return -1;
+    if (parent_dir_id == 0ULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (parent_dir_id == 1ULL) {
+        if (name_len + 2 > out_sz) return -1;
+        if (name_len > 0 && name) {
+            memcpy(out, name, name_len);
+            out[name_len] = '\0';
+        } else {
+            out[0] = '\0';
+        }
+        return 0;
+    }
+
+    if (cache->id != parent_dir_id) {
+        if (crawl_bin_catalog_dir_path(cat, parent_dir_id, cache->dir, sizeof(cache->dir)) != 0) {
+            cache->id = 0;
+            return -1;
+        }
+        cache->len = strlen(cache->dir);
+        cache->id = parent_dir_id;
+    }
+
+    plen = cache->len;
+    if (plen + 1 + name_len + 1 > out_sz) return -1;
+    memcpy(out, cache->dir, plen);
+    if (plen > 0) {
+        out[plen] = '/';
+        plen++;
+    }
+    if (name_len > 0 && name) memcpy(out + plen, name, name_len);
+    out[plen + name_len] = '\0';
+    return 0;
+}
+
 static int read_one_chunk(const file_chunk_t *chunk,
                           file_state_t *file_states,
                           uid_t target_uid,
@@ -7660,6 +7805,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
      * cur_offset mirrors the FILE position; every non-error path below consumes
      * exactly header + name bytes (rec_total), so it stays in sync. */
     uint64_t cur_offset = (uint64_t)chunk->start_offset;
+
+    /* Memoizes the last parent directory path so contiguous same-directory records
+     * skip the catalog parent-chain walk. */
+    catalog_dir_cache_t dir_cache;
+    dir_cache.id = 0;
+    dir_cache.len = 0;
 
     for (;;) {
         bin_record_hdr_t r;
@@ -7755,8 +7906,9 @@ static int read_one_chunk(const file_chunk_t *chunk,
                     break;
                 }
             }
-            if (crawl_bin_catalog_entry_path(file_states[chunk->file_index].catalog, r.parent_dir_id,
-                                             (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
+            if (catalog_entry_path_cached(file_states[chunk->file_index].catalog, r.parent_dir_id,
+                                          (char *)name_bytes, r.name_len, pathbuf, PATH_MAX,
+                                          &dir_cache) != 0) {
                 fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
@@ -7811,7 +7963,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
 
             if (pathbuf && bucket_detail_levels > 0) {
-                path_shape_accumulate_file(sum, &dense_maps[ab][sb], ab, sb, pathbuf, accounted_size);
+                path_shape_accumulate_file(sum, &dense_maps[ab][sb], ab, sb, pathbuf,
+                                           r.parent_dir_id, accounted_size);
             }
 
             if (!skip_paths) {
@@ -7850,9 +8003,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (pathbuf && bucket_detail_levels > 0 && parent_fanout) {
-            path_fanout_accumulate(parent_fanout, pathbuf);
+            path_fanout_accumulate(parent_fanout, pathbuf, r.parent_dir_id);
             if (parent_fanout_stats)
-                fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.type, pick_time(&r, basis), sum);
+                fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.parent_dir_id, r.type,
+                                              pick_time(&r, basis), sum);
         }
     }
 
