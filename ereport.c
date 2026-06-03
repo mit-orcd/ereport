@@ -3857,6 +3857,31 @@ static void agg_bkt_worker_destroy_maps(agg_bkt_worker_t *w) {
     for (d = 0; d < w->nlevels; d++) path_row_map_destroy(&w->maps[d]);
 }
 
+/*
+ * Merge every parse-worker's level-`level` map into dst. Distinct levels write to
+ * distinct destination maps, so one worker per level runs without locking.
+ */
+typedef struct {
+    path_row_map_t *dst;
+    agg_bkt_worker_t *workers;
+    int nw;
+    int level;
+    int err;
+} agg_bkt_merge_ctx_t;
+
+static void *agg_bkt_merge_level_worker(void *vp) {
+    agg_bkt_merge_ctx_t *c = (agg_bkt_merge_ctx_t *)vp;
+    int i;
+
+    for (i = 0; i < c->nw; i++) {
+        agg_bkt_worker_t *w = &c->workers[i];
+
+        if (w->lo >= w->hi) continue;
+        if (path_row_map_merge_accumulate(c->dst, &w->maps[c->level]) != 0) c->err = 1;
+    }
+    return NULL;
+}
+
 static int aggregate_bucket_for_page_n(path_row_map_t *maps,
                                        int nlevels,
                                        const bucket_details_t *details,
@@ -3924,14 +3949,43 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
     }
 
     if (!any_err) {
-        for (i = 0; i < (size_t)nw; i++) {
-            agg_bkt_worker_t *w = &workers[i];
-            int d;
+        /* Merge per-level (each level -> its own dst map), one thread per level. */
+        agg_bkt_merge_ctx_t *mctx = (agg_bkt_merge_ctx_t *)calloc((size_t)nlevels, sizeof(*mctx));
+        pthread_t *mtids = (pthread_t *)calloc((size_t)nlevels, sizeof(*mtids));
 
-            if (w->lo >= w->hi) continue;
-            for (d = 0; d < nlevels; d++) {
-                if (path_row_map_merge_accumulate(&maps[d], &w->maps[d]) != 0) any_err = 1;
+        if (!mctx || !mtids) {
+            int d;
+            free(mctx);
+            free(mtids);
+            for (i = 0; i < (size_t)nw; i++) {
+                agg_bkt_worker_t *w = &workers[i];
+
+                if (w->lo >= w->hi) continue;
+                for (d = 0; d < nlevels; d++) {
+                    if (path_row_map_merge_accumulate(&maps[d], &w->maps[d]) != 0) any_err = 1;
+                }
             }
+        } else {
+            int d;
+            int mspawn = 0;
+
+            for (d = 0; d < nlevels; d++) {
+                mctx[d].dst = &maps[d];
+                mctx[d].workers = workers;
+                mctx[d].nw = (int)nw;
+                mctx[d].level = d;
+                mctx[d].err = 0;
+                if (pthread_create(&mtids[mspawn], NULL, agg_bkt_merge_level_worker, &mctx[d]) != 0)
+                    agg_bkt_merge_level_worker(&mctx[d]); /* inline this level */
+                else
+                    mspawn++;
+            }
+            for (d = 0; d < mspawn; d++) pthread_join(mtids[d], NULL);
+            for (d = 0; d < nlevels; d++) {
+                if (mctx[d].err) any_err = 1;
+            }
+            free(mctx);
+            free(mtids);
         }
     }
 
@@ -4170,6 +4224,113 @@ static int aggregate_totals_for_page_n_atomic(path_row_map_t *maps,
     return 0;
 }
 
+/*
+ * Parallel reduction of the nw partial vectors into the per-row totals.
+ * Rows are independent, so each worker owns a disjoint [r_lo,r_hi) slice of row_list.
+ * Output is identical to the serial sum-then-assign.
+ */
+typedef struct {
+    path_row_t **row_list;
+    const uint64_t *parts;
+    size_t R;
+    int started;
+    size_t r_lo;
+    size_t r_hi;
+} agg_tot_reduce_ctx_t;
+
+static void *agg_tot_reduce_worker(void *vp) {
+    agg_tot_reduce_ctx_t *c = (agg_tot_reduce_ctx_t *)vp;
+    size_t t;
+
+    for (t = c->r_lo; t < c->r_hi; t++) {
+        path_row_t *row = c->row_list[t];
+        uint64_t tf = 0;
+        uint64_t td = 0;
+        uint64_t tb = 0;
+        int s;
+
+        for (s = 0; s < c->started; s++) {
+            tf += c->parts[(size_t)s * c->R * 3 + t * 3 + 0];
+            td += c->parts[(size_t)s * c->R * 3 + t * 3 + 1];
+            tb += c->parts[(size_t)s * c->R * 3 + t * 3 + 2];
+        }
+        row->total_files = tf;
+        row->total_dirs = td;
+        row->total_bytes = tb;
+    }
+    return NULL;
+}
+
+/* Reduce parts[0..started)·R·3 into row_list[0..R) totals, parallelized across rows when worth it. */
+static void agg_totals_reduce_parts(path_row_t **row_list, const uint64_t *parts, size_t R, int started) {
+    int nw;
+    pthread_t *tp = NULL;
+    agg_tot_reduce_ctx_t *ctxs = NULL;
+    size_t per;
+    int t;
+    int spawned;
+
+    if (R == 0 || started < 1) return;
+
+    nw = parse_ereport_thread_count();
+    if (nw < 1) nw = 1;
+    /* Serial unless there is enough work: cost is ~R*started adds. */
+    if (nw < 2 || R < 4096 || (R * (size_t)started) < (size_t)(1u << 16)) {
+        agg_tot_reduce_ctx_t one;
+        one.row_list = row_list;
+        one.parts = parts;
+        one.R = R;
+        one.started = started;
+        one.r_lo = 0;
+        one.r_hi = R;
+        agg_tot_reduce_worker(&one);
+        return;
+    }
+    if ((size_t)nw > R) nw = (int)R;
+
+    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
+    ctxs = (agg_tot_reduce_ctx_t *)calloc((size_t)nw, sizeof(*ctxs));
+    if (!tp || !ctxs) {
+        agg_tot_reduce_ctx_t one;
+        free(tp);
+        free(ctxs);
+        one.row_list = row_list;
+        one.parts = parts;
+        one.R = R;
+        one.started = started;
+        one.r_lo = 0;
+        one.r_hi = R;
+        agg_tot_reduce_worker(&one);
+        return;
+    }
+
+    per = (R + (size_t)nw - 1) / (size_t)nw;
+    spawned = 0;
+    for (t = 0; t < nw; t++) {
+        size_t rlo = (size_t)t * per;
+        size_t rhi = rlo + per;
+
+        if (rlo >= R) break;
+        if (rhi > R) rhi = R;
+        ctxs[spawned].row_list = row_list;
+        ctxs[spawned].parts = parts;
+        ctxs[spawned].R = R;
+        ctxs[spawned].started = started;
+        ctxs[spawned].r_lo = rlo;
+        ctxs[spawned].r_hi = rhi;
+        if (pthread_create(&tp[spawned], NULL, agg_tot_reduce_worker, &ctxs[spawned]) != 0) {
+            /* Run this slice inline rather than dropping it. */
+            agg_tot_reduce_worker(&ctxs[spawned]);
+        } else {
+            spawned++;
+        }
+    }
+    for (t = 0; t < spawned; t++) pthread_join(tp[t], NULL);
+
+    free(tp);
+    free(ctxs);
+}
+
 static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
                                               int nlevels,
                                               const matched_records_t *records,
@@ -4302,22 +4463,7 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
 
     zero_map_row_corpus_totals(maps, nlevels);
 
-    for (t = 0; t < R; t++) {
-        path_row_t *row = row_list[t];
-        uint64_t tf = 0;
-        uint64_t td = 0;
-        uint64_t tb = 0;
-        int s;
-
-        for (s = 0; s < started; s++) {
-            tf += parts[(size_t)s * R * 3 + t * 3 + 0];
-            td += parts[(size_t)s * R * 3 + t * 3 + 1];
-            tb += parts[(size_t)s * R * 3 + t * 3 + 2];
-        }
-        row->total_files = tf;
-        row->total_dirs = td;
-        row->total_bytes = tb;
-    }
+    agg_totals_reduce_parts(row_list, parts, R, started);
 
     free(row_list);
     free(parts);
