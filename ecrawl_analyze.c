@@ -69,6 +69,19 @@ typedef struct {
     size_t node_count; /* distinct parents inserted; maintained incrementally to avoid full bucket walks */
 } parent_map_t;
 
+/*
+ * Per-catalog memo indexed by on-disk parent_dir_id: maps a directory id to its resolved parent node and
+ * depth bin. Within one shard catalog, parent_dir_id uniquely identifies a directory (and thus a fixed
+ * parent path and slash-count), so repeated child records reuse the result instead of rebuilding the path,
+ * hashing it, and walking the bucket chain. Allocation is skipped when a shard's dir-id space is very large.
+ */
+#define ANALYZE_DIR_CACHE_MAX_ENTRIES (4U * 1000U * 1000U)
+typedef struct {
+    parent_node_t *node; /* resolved parent node; NULL if parent could not be derived */
+    unsigned depth_bin;  /* cached depth-histogram bin for entries under this directory */
+    unsigned char state; /* 0=unseen, 1=seen with depth, 2=seen without depth */
+} analyze_dir_cache_ent_t;
+
 typedef struct {
     const char *dir_path;
     char **names;
@@ -270,46 +283,40 @@ static void parent_map_free(parent_map_t *m) {
     free(m);
 }
 
-static void parent_map_add_record(parent_map_t *m, const char *parent, uint8_t typ) {
+static inline void parent_node_bump(parent_node_t *n, uint8_t typ) {
+    if (typ == (uint8_t)'f')
+        n->nfile++;
+    else if (typ == (uint8_t)'d')
+        n->ndir++;
+    else if (typ == (uint8_t)'l')
+        n->nsym++;
+    else
+        n->nother++;
+}
+
+/* Find the node for parent, creating it (counters zeroed) if absent. Returns NULL only on allocation failure. */
+static parent_node_t *parent_map_get_or_add(parent_map_t *m, const char *parent) {
     uint32_t hx = analyze_hash_parent(parent);
     size_t bi = (size_t)(hx % ANALYZE_HASH_BUCKETS);
     parent_node_t **pp = &m->buckets[bi];
+    parent_node_t *node;
 
     while (*pp) {
-        if (strcmp((*pp)->path, parent) == 0) {
-            if (typ == (uint8_t)'f')
-                (*pp)->nfile++;
-            else if (typ == (uint8_t)'d')
-                (*pp)->ndir++;
-            else if (typ == (uint8_t)'l')
-                (*pp)->nsym++;
-            else
-                (*pp)->nother++;
-            return;
-        }
+        if (strcmp((*pp)->path, parent) == 0) return *pp;
         pp = &(*pp)->next;
     }
-    {
-        parent_node_t *node = (parent_node_t *)malloc(sizeof(*node));
-        if (!node) return;
-        node->path = strdup(parent);
-        if (!node->path) {
-            free(node);
-            return;
-        }
-        node->next = m->buckets[bi];
-        m->buckets[bi] = node;
-        m->node_count++;
-        node->nfile = node->ndir = node->nsym = node->nother = 0;
-        if (typ == (uint8_t)'f')
-            node->nfile = 1;
-        else if (typ == (uint8_t)'d')
-            node->ndir = 1;
-        else if (typ == (uint8_t)'l')
-            node->nsym = 1;
-        else
-            node->nother = 1;
+    node = (parent_node_t *)malloc(sizeof(*node));
+    if (!node) return NULL;
+    node->path = strdup(parent);
+    if (!node->path) {
+        free(node);
+        return NULL;
     }
+    node->next = m->buckets[bi];
+    m->buckets[bi] = node;
+    m->node_count++;
+    node->nfile = node->ndir = node->nsym = node->nother = 0;
+    return node;
 }
 
 static void parent_map_add_totals(parent_map_t *m, const char *parent, uint64_t nf, uint64_t nd, uint64_t ns,
@@ -761,7 +768,7 @@ fail:
 static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_exclusive, uint64_t file_sz,
                                  const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
                                  char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
-                                 uint64_t *nrec_out) {
+                                 analyze_dir_cache_ent_t *dir_cache, uint64_t dir_cache_max, uint64_t *nrec_out) {
     uint64_t nrec = 0;
     uint64_t cur = start_off; /* track position arithmetically instead of ftello() per record */
 
@@ -770,6 +777,7 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
     for (;;) {
         bin_record_hdr_t rh;
         size_t rec_tot;
+        uint64_t pid;
 
         if (cur >= scan_end_exclusive) break;
 
@@ -779,24 +787,46 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
         if (cur + rec_tot > scan_end_exclusive) return -1;
         if (cur + rec_tot > file_sz) return -1;
 
-        if (rh.parent_dir_id == 0ULL) return -1;
+        pid = rh.parent_dir_id;
+        if (pid == 0ULL) return -1;
 
+        /* Name bytes must always be consumed to keep the stream aligned, even on a cache hit. */
         if (rh.name_len) {
             if (fread_unlocked(pathbuf, rh.name_len, 1, fp) != 1) return -1;
         }
 
-        if (crawl_bin_catalog_entry_path(cat, rh.parent_dir_id, (char *)pathbuf, rh.name_len, fullpath_buf,
-                                         fullpath_sz) != 0)
-            return -1;
-        {
-            size_t flen = strlen(fullpath_buf);
-            uint16_t pl = flen > 65535U ? 65535U : (uint16_t)flen;
+        if (dir_cache && pid <= dir_cache_max && dir_cache[pid].state != 0) {
+            analyze_dir_cache_ent_t *ce = &dir_cache[pid];
 
-            if (flen > 0) {
-                unsigned db = analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl);
-                depth_hist[db]++;
-                if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, 65536U) == 0)
-                    parent_map_add_record(map, parentbuf, rh.type);
+            if (ce->state == 1) {
+                depth_hist[ce->depth_bin]++;
+                if (ce->node) parent_node_bump(ce->node, rh.type);
+            }
+        } else {
+            parent_node_t *node = NULL;
+            unsigned db = 0;
+            unsigned char st = 2; /* default: no depth recorded */
+
+            if (crawl_bin_catalog_entry_path(cat, pid, (char *)pathbuf, rh.name_len, fullpath_buf, fullpath_sz) != 0)
+                return -1;
+            {
+                size_t flen = strlen(fullpath_buf);
+                uint16_t pl = flen > 65535U ? 65535U : (uint16_t)flen;
+
+                if (flen > 0) {
+                    db = analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl);
+                    depth_hist[db]++;
+                    st = 1;
+                    if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, 65536U) == 0) {
+                        node = parent_map_get_or_add(map, parentbuf);
+                        if (node) parent_node_bump(node, rh.type);
+                    }
+                }
+            }
+            if (dir_cache && pid <= dir_cache_max) {
+                dir_cache[pid].node = node;
+                dir_cache[pid].depth_bin = db;
+                dir_cache[pid].state = st;
             }
         }
         cur += rec_tot;
@@ -848,8 +878,18 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
         fclose(fp);
         return -1;
     }
-    rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf, fullpath_sz,
-                               map, depth_hist, nrec_out);
+    {
+        analyze_dir_cache_ent_t *dir_cache = NULL;
+        uint64_t dir_cache_max = cat.max_dir_id;
+
+        /* Memo for repeated parent_dir_id within this chunk; skip when the dir-id space is too large to be worth it. */
+        if (dir_cache_max > 0ULL && dir_cache_max < (uint64_t)ANALYZE_DIR_CACHE_MAX_ENTRIES)
+            dir_cache = (analyze_dir_cache_ent_t *)calloc((size_t)dir_cache_max + 1U, sizeof(*dir_cache));
+
+        rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf,
+                                   fullpath_sz, map, depth_hist, dir_cache, dir_cache_max, nrec_out);
+        free(dir_cache);
+    }
     crawl_bin_catalog_free(&cat);
     fclose(fp);
     return rc;
