@@ -27,6 +27,11 @@
  *     Flags must appear first (in any order), before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
  * Parallel thread count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
+ * EREPORT_BUCKET_CELL_CONCURRENCY (optional 1..1024): how many bucket cells emit at once in the
+ *   bucket-HTML phase. Each cell aggregates with its own inner thread pool, so with a large
+ *   EREPORT_THREADS, running all 36 cells at once oversubscribes early and starves the slow-cell
+ *   tail. Default: ~EREPORT_THREADS/16 (min 4) when EREPORT_THREADS>=64, else unchanged. Lower it
+ *   (e.g. 4 or 8) to give the heaviest cells more inner threads; raise it for many small cells.
  * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
  * or every shard when aggregating all users).
  *
@@ -125,6 +130,7 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 #define AGG_BKT_PAR_MAX_THREADS 24
 
 static int parse_ereport_thread_count(void);
+static int parse_bucket_cell_concurrency(void);
 
 static void ereport_free_bin_dirs_list(const char **dirs, size_t n) {
     size_t k;
@@ -6298,6 +6304,31 @@ static int emit_all_bucket_detail_pages(const char *username,
     if (nw < 1) nw = 1;
     if ((size_t)nw > ntasks) nw = (int)ntasks;
 
+    /*
+     * Cap how many cells run concurrently. Each running cell launches its own
+     * internally-parallel aggregation, so emitting all cells at once with a large
+     * thread count oversubscribes the machine early and leaves the slow-cell tail
+     * with idle cores. Capping the outer pool (cells are dispatched largest-first)
+     * hands the heaviest cells a real share of inner threads. An explicit
+     * EREPORT_BUCKET_CELL_CONCURRENCY overrides; otherwise, when EREPORT_THREADS is
+     * large relative to the cell count, give each concurrent cell ~16 inner threads.
+     */
+    {
+        int cell_conc = parse_bucket_cell_concurrency();
+
+        if (cell_conc <= 0) {
+            int threads_now = parse_ereport_thread_count();
+            if (threads_now >= 64) {
+                cell_conc = threads_now / 16; /* e.g. 128 threads -> 8 concurrent cells */
+                if (cell_conc < 4) cell_conc = 4;
+            } else {
+                cell_conc = nw; /* small machines: keep existing behavior */
+            }
+        }
+        if (cell_conc < 1) cell_conc = 1;
+        if (cell_conc < nw) nw = cell_conc;
+    }
+
     tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
     args = (bucket_emit_thread_arg_t *)calloc((size_t)nw, sizeof(*args));
     if (!tids || !args) {
@@ -8290,6 +8321,26 @@ static int parse_ereport_thread_count(void) {
     errno = 0;
     t = strtol(e, &end, 10);
     if (errno || end == e || *end || t < 1 || t > 4096) return DEFAULT_THREADS;
+    return (int)t;
+}
+
+/*
+ * How many bucket cells (age×size pages) to emit concurrently in the bucket-HTML phase.
+ * Each concurrent cell runs its own internally-parallel aggregation, so running all 36 at
+ * once with a large EREPORT_THREADS oversubscribes the machine early and starves the
+ * slow-cell tail. EREPORT_BUCKET_CELL_CONCURRENCY caps the outer pool so the heaviest
+ * cells (scheduled largest-first) get a real share of inner threads. Returns 0 when unset
+ * (caller picks a default). Valid override range: 1..1024.
+ */
+static int parse_bucket_cell_concurrency(void) {
+    const char *e = getenv("EREPORT_BUCKET_CELL_CONCURRENCY");
+    long t;
+    char *end;
+
+    if (!e || !*e) return 0;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > 1024) return 0;
     return (int)t;
 }
 
