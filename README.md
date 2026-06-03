@@ -277,7 +277,7 @@ Optional environment variables (no CLI flags for these; see also **[quick refere
 | **`ECRAWL_WRITER_THREADS`** | Writer threads for uid-sharded `.bin` output (default **8**). |
 | **`ECRAWL_WRITER_QUEUE_BATCHES`** | Max pending **record** batches **per uid-shard writer queue** when writing output (default **64**, range **4…4096**); larger values buffer more ~1 MiB batches in RAM. Ignored with **`--no-write`**. |
 | **`ECRAWL_UID_SHARDS`** | Number of uid shards; must be a **power of two** (default **8192**). |
-| **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **256**); automatically capped against the process open-file limit. |
+| **`ECRAWL_MAX_OPEN_SHARDS`** | Per-writer shard file cache target (default **1024** = every shard a writer owns at the default **8192** shards / **8** writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
 | **`ECRAWL_STAT_THREADS`** | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables the pool). |
 | **`ECRAWL_STAT_BATCH_ENTRIES`** | Directory names per stat batch (default **1024**, range **64…65536**). |
 | **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | Per directory, trusted non-dir **`d_type`** entries handled **inline** before stat batching (default **`0`** = batch from the first entry; set **`N`** > **0** for an inline prefix of **`N`** names). Max **2097152**. |
@@ -821,7 +821,7 @@ Defaults below are the **built-in** values when the variable is **unset**—each
 | **`ECRAWL_WRITER_THREADS`** | `ecrawl` | Uid-shard writer threads (default **8**). |
 | **`ECRAWL_WRITER_QUEUE_BATCHES`** | `ecrawl` | Pending record batches **per writer queue** when writing shards (default **64**, range **4…4096**). |
 | **`ECRAWL_UID_SHARDS`** | `ecrawl` | Uid shard count, power of two (default 8192). |
-| **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 256). |
+| **`ECRAWL_MAX_OPEN_SHARDS`** | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 1024). |
 | **`ECRAWL_STAT_THREADS`** | `ecrawl` | Stat worker threads for batched **`fstatat`** (default **8**; **`0`** disables). |
 | **`ECRAWL_STAT_BATCH_ENTRIES`** | `ecrawl` | Names per stat batch (default **1024**, range **64…65536**). |
 | **`ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`** | `ecrawl` | Trusted non-dir **`d_type`** entries per directory handled inline before batching (default **`0`** = always batch; **`N`** > **0** = inline prefix of **`N`**). |

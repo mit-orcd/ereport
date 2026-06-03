@@ -123,7 +123,10 @@
 #define DEFAULT_CRAWL_THREADS 16
 #define DEFAULT_WRITER_THREADS 8
 #define DEFAULT_UID_SHARDS 8192U
-#define DEFAULT_MAX_OPEN_SHARDS 256U
+/* Per-writer open-shard LRU target. 1024 = ceil(DEFAULT_UID_SHARDS / DEFAULT_WRITER_THREADS), i.e. a writer can
+ * hold every shard it owns open at once, eliminating LRU thrash (fopen/fclose churn) on many-UID workloads.
+ * Always auto-capped against RLIMIT_NOFILE and the actual per-writer shard count in configure_max_open_shards(). */
+#define DEFAULT_MAX_OPEN_SHARDS 1024U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
 #define FD_RESERVE_BASE 128U
 #define FD_RESERVE_PER_CRAWL_THREAD 4U
@@ -268,10 +271,12 @@ typedef struct {
     size_t cap;
 } dir_stack_t;
 
+#define ID_SLOT_EMPTY 0xFFFFFFFFu
 typedef struct {
-    uint32_t *items;
-    size_t count;
-    size_t cap;
+    uint32_t *slots;      /* open-addressing hash set; ID_SLOT_EMPTY marks empty */
+    size_t cap;           /* power of two, 0 until first insert */
+    size_t count;         /* number of distinct ids stored */
+    int has_sentinel;     /* whether the literal ID_SLOT_EMPTY id value was inserted */
     pthread_mutex_t mutex;
     FILE *fp;
     char path[PATH_MAX];
@@ -1155,25 +1160,62 @@ static void clear_status_line(void) {
     fflush(stdout);
 }
 
-static int id_registry_contains_locked(const id_registry_t *r, uint32_t id) {
-    size_t i;
-    for (i = 0; i < r->count; i++) {
-        if (r->items[i] == id) return 1;
+static inline size_t id_registry_hash(uint32_t id) {
+    uint32_t x = id;
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return (size_t)x;
+}
+
+static int id_registry_grow_locked(id_registry_t *r) {
+    size_t new_cap = (r->cap == 0) ? 256 : (r->cap * 2);
+    uint32_t *new_slots = (uint32_t *)malloc(new_cap * sizeof(*new_slots));
+    size_t i, new_mask;
+    if (!new_slots) return -1;
+    for (i = 0; i < new_cap; i++) new_slots[i] = ID_SLOT_EMPTY;
+    new_mask = new_cap - 1;
+    for (i = 0; i < r->cap; i++) {
+        uint32_t v = r->slots[i];
+        size_t j;
+        if (v == ID_SLOT_EMPTY) continue;
+        j = id_registry_hash(v) & new_mask;
+        while (new_slots[j] != ID_SLOT_EMPTY) j = (j + 1) & new_mask;
+        new_slots[j] = v;
     }
+    free(r->slots);
+    r->slots = new_slots;
+    r->cap = new_cap;
     return 0;
 }
 
-static int id_registry_append_locked(id_registry_t *r, uint32_t id) {
-    if (r->count == r->cap) {
-        size_t new_cap = (r->cap == 0) ? 64 : (r->cap * 2);
-        uint32_t *new_items = (uint32_t *)realloc(r->items, new_cap * sizeof(*new_items));
-        if (!new_items) return -1;
-        r->items = new_items;
-        r->cap = new_cap;
+/* Returns 1 if newly inserted, 0 if already present, -1 on allocation failure. */
+static int id_registry_insert_locked(id_registry_t *r, uint32_t id) {
+    size_t mask, i;
+
+    if (id == ID_SLOT_EMPTY) {
+        if (r->has_sentinel) return 0;
+        r->has_sentinel = 1;
+        r->count++;
+        return 1;
     }
 
-    r->items[r->count++] = id;
-    return 0;
+    /* Grow while load factor would exceed ~0.7 (keep probe chains short). */
+    if (r->cap == 0 || (r->count + 1) * 10 >= r->cap * 7) {
+        if (id_registry_grow_locked(r) != 0) return -1;
+    }
+
+    mask = r->cap - 1;
+    i = id_registry_hash(id) & mask;
+    while (r->slots[i] != ID_SLOT_EMPTY) {
+        if (r->slots[i] == id) return 0;
+        i = (i + 1) & mask;
+    }
+    r->slots[i] = id;
+    r->count++;
+    return 1;
 }
 
 static int id_registry_init(id_registry_t *r, const char *path) {
@@ -1199,12 +1241,13 @@ static int id_registry_init(id_registry_t *r, const char *path) {
 }
 
 static void id_registry_destroy(id_registry_t *r) {
-    if (r->fp) ecrawl_io_fclose(r->fp);
-    free(r->items);
+    if (r->fp) ecrawl_io_fclose(r->fp);  /* fclose flushes the buffered id->name lines */
+    free(r->slots);
     r->fp = NULL;
-    r->items = NULL;
+    r->slots = NULL;
     r->count = 0;
     r->cap = 0;
+    r->has_sentinel = 0;
     pthread_mutex_destroy(&r->mutex);
 }
 
@@ -1213,22 +1256,21 @@ static void write_uid_if_new(uid_t uid) {
     struct passwd pwd;
     struct passwd *result = NULL;
     const char *name;
+    int is_new;
 
+    /* Dedup under the lock only; the slow NSS lookup runs unlocked so that
+     * distinct ids resolve concurrently instead of serializing on the mutex. */
     pthread_mutex_lock(&g_uid_registry.mutex);
-    if (id_registry_contains_locked(&g_uid_registry, (uint32_t)uid)) {
-        pthread_mutex_unlock(&g_uid_registry.mutex);
-        return;
-    }
-    if (id_registry_append_locked(&g_uid_registry, (uint32_t)uid) != 0) {
-        pthread_mutex_unlock(&g_uid_registry.mutex);
-        return;
-    }
+    is_new = id_registry_insert_locked(&g_uid_registry, (uint32_t)uid);
+    pthread_mutex_unlock(&g_uid_registry.mutex);
+    if (is_new <= 0) return;
 
     if (getpwuid_r(uid, &pwd, namebuf, sizeof(namebuf), &result) == 0 && result && result->pw_name) name = result->pw_name;
     else name = "UNKNOWN";
 
+    /* Buffered append under a short lock; flushed once at registry teardown. */
+    pthread_mutex_lock(&g_uid_registry.mutex);
     fprintf(g_uid_registry.fp, "%u %s\n", (unsigned int)uid, name);
-    ecrawl_io_fflush(g_uid_registry.fp);
     pthread_mutex_unlock(&g_uid_registry.mutex);
 }
 
@@ -1237,22 +1279,18 @@ static void write_gid_if_new(gid_t gid) {
     struct group grp;
     struct group *result = NULL;
     const char *name;
+    int is_new;
 
     pthread_mutex_lock(&g_gid_registry.mutex);
-    if (id_registry_contains_locked(&g_gid_registry, (uint32_t)gid)) {
-        pthread_mutex_unlock(&g_gid_registry.mutex);
-        return;
-    }
-    if (id_registry_append_locked(&g_gid_registry, (uint32_t)gid) != 0) {
-        pthread_mutex_unlock(&g_gid_registry.mutex);
-        return;
-    }
+    is_new = id_registry_insert_locked(&g_gid_registry, (uint32_t)gid);
+    pthread_mutex_unlock(&g_gid_registry.mutex);
+    if (is_new <= 0) return;
 
     if (getgrgid_r(gid, &grp, namebuf, sizeof(namebuf), &result) == 0 && result && result->gr_name) name = result->gr_name;
     else name = "UNKNOWN";
 
+    pthread_mutex_lock(&g_gid_registry.mutex);
     fprintf(g_gid_registry.fp, "%u %s\n", (unsigned int)gid, name);
-    ecrawl_io_fflush(g_gid_registry.fp);
     pthread_mutex_unlock(&g_gid_registry.mutex);
 }
 
