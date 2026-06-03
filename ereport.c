@@ -7654,16 +7654,24 @@ static int read_one_chunk(const file_chunk_t *chunk,
         goto out;
     }
 
+    /* Track the read offset manually instead of calling ftello() per record:
+     * ftello() -> _IO_file_seekoff issues an lseek syscall every record, which
+     * defeats the 1 MiB stdio buffer and dominates CPU/syscalls on large shards.
+     * cur_offset mirrors the FILE position; every non-error path below consumes
+     * exactly header + name bytes (rec_total), so it stays in sync. */
+    uint64_t cur_offset = (uint64_t)chunk->start_offset;
+
     for (;;) {
         bin_record_hdr_t r;
         size_t n;
         char *pathbuf = NULL;
         uint64_t accounted_size = 0;
-        off_t record_offset = ftello(fp);
+        uint64_t record_offset = cur_offset;
+        size_t rec_total;
         int record_match;
         int skip_paths;
 
-        if (record_offset < 0 || (uint64_t)record_offset >= chunk->end_offset) {
+        if (record_offset >= chunk->end_offset) {
             rc = 0;
             break;
         }
@@ -7680,15 +7688,14 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
-        {
-            size_t rec_total = crawl_bin_record_total_bytes(&r);
-            if ((uint64_t)record_offset + rec_total > chunk->end_offset) {
-                fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
-            }
+        rec_total = crawl_bin_record_total_bytes(&r);
+        if (record_offset + rec_total > chunk->end_offset) {
+            fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
+            sum->bad_input_files++;
+            if (progress) progress->bad_input_files++;
+            break;
         }
+        cur_offset += rec_total;
 
         sum->scanned_records++;
         if (progress) {
@@ -7707,13 +7714,14 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (!record_match) {
-            if (r.name_len > 0) {
-                if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
-                    fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
-                    sum->bad_input_files++;
-                    if (progress) progress->bad_input_files++;
-                    break;
-                }
+            /* Skip the name by reading it sequentially (keeps the stdio buffer
+             * intact) rather than fseeko(SEEK_CUR), which would force an lseek. */
+            if (r.name_len > 0 &&
+                counted_fread_unlocked(name_store, 1, r.name_len, fp) != r.name_len) {
+                fprintf(stderr, "warn: name skip failed in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                break;
             }
             continue;
         }
@@ -7726,13 +7734,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (skip_paths) {
-            if (r.name_len > 0) {
-                if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
-                    fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
-                    sum->bad_input_files++;
-                    if (progress) progress->bad_input_files++;
-                    break;
-                }
+            if (r.name_len > 0 &&
+                counted_fread_unlocked(name_store, 1, r.name_len, fp) != r.name_len) {
+                fprintf(stderr, "warn: name skip failed in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                break;
             }
             pathbuf = NULL;
         } else {
