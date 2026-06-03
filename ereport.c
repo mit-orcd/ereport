@@ -7251,50 +7251,91 @@ typedef struct {
     atomic_int next_task;
 } shape_margin_ctx_t;
 
+/*
+ * Merge n source maps into rm over a disjoint range of hash buckets. A parent always hashes to the
+ * same bucket index in every map, so threads owning distinct bucket ranges write distinct rm buckets
+ * with no locking. This replaces the old "parallel-copy then serial-fold" path whose final fold ran
+ * single-threaded and dominated the heaviest row/column strip (the "one thread" path-shape stall).
+ */
 typedef struct {
-    dense_cell_map_t *out;
-    const dense_cell_map_t *src;
-} shape_margin_one_cell_t;
+    dense_cell_map_t *dst;
+    const dense_cell_map_t *const *srcv;
+    int n;
+    size_t b_lo;
+    size_t b_hi;
+} shape_strip_merge_ctx_t;
 
-static void *shape_margin_one_cell_worker(void *vp) {
-    shape_margin_one_cell_t *w = (shape_margin_one_cell_t *)vp;
+static void *shape_strip_merge_worker(void *vp) {
+    shape_strip_merge_ctx_t *c = (shape_strip_merge_ctx_t *)vp;
+    size_t bi;
+    int k;
 
-    memset(w->out, 0, sizeof(*w->out));
-    dense_cell_merge_add(w->out, w->src, NULL);
+    for (bi = c->b_lo; bi < c->b_hi; bi++) {
+        for (k = 0; k < c->n; k++) {
+            const dense_node_t *nd;
+
+            for (nd = c->srcv[k]->buckets[bi]; nd; nd = nd->next) {
+                if (dense_cell_add(c->dst, nd->parent, nd->n, NULL) != 0) return NULL;
+            }
+        }
+    }
     return NULL;
 }
 
-/*
- * Build one row- or column-aggregate narrow map: copy each slice map in parallel (6 pthreads), then fold partials
- * into rm on the main thread (order-independent for parent counts).
- */
-static void shape_margin_parallel_fold_ptrs(dense_cell_map_t *rm, const dense_cell_map_t *const *srcv, int n) {
-    dense_cell_map_t partial[AGE_BUCKETS];
-    shape_margin_one_cell_t w[AGE_BUCKETS];
-    pthread_t th[AGE_BUCKETS];
-    int k, j;
+static void shape_margin_merge_strip(dense_cell_map_t *rm, const dense_cell_map_t *const *srcv, int n) {
+    int nt;
+    size_t total = 0;
+    int k;
+    pthread_t *tp = NULL;
+    shape_strip_merge_ctx_t *ctxs = NULL;
+    size_t per;
+    int spawned;
+    int t;
 
-    if (!rm || !srcv || n < 1 || n > AGE_BUCKETS) return;
+    if (!rm || !srcv || n < 1) return;
 
-    for (k = 0; k < n; k++) {
-        memset(&partial[k], 0, sizeof(partial[k]));
-        w[k].out = &partial[k];
-        w[k].src = srcv[k];
-        if (pthread_create(&th[k], NULL, shape_margin_one_cell_worker, &w[k]) != 0) {
-            for (j = 0; j < k; j++) pthread_join(th[j], NULL);
-            for (j = 0; j < k; j++) {
-                dense_cell_merge_add(rm, &partial[j], NULL);
-                dense_cell_free(&partial[j]);
-            }
-            for (; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
-            return;
-        }
+    nt = parse_ereport_thread_count();
+    if (nt < 1) nt = 1;
+    for (k = 0; k < n; k++) total += dense_cell_total_nodes(srcv[k]);
+
+    /* Serial merge when the work is small or threads are unavailable. */
+    if (nt < 2 || total < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
+        for (k = 0; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
+        return;
     }
-    for (k = 0; k < n; k++) pthread_join(th[k], NULL);
-    for (k = 0; k < n; k++) {
-        dense_cell_merge_add(rm, &partial[k], NULL);
-        dense_cell_free(&partial[k]);
+    if ((size_t)nt > DENSE_PARENT_BUCKETS) nt = (int)DENSE_PARENT_BUCKETS;
+
+    tp = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+    ctxs = (shape_strip_merge_ctx_t *)calloc((size_t)nt, sizeof(*ctxs));
+    if (!tp || !ctxs) {
+        free(tp);
+        free(ctxs);
+        for (k = 0; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
+        return;
     }
+
+    per = ((size_t)DENSE_PARENT_BUCKETS + (size_t)nt - 1) / (size_t)nt;
+    spawned = 0;
+    for (t = 0; t < nt; t++) {
+        size_t blo = (size_t)t * per;
+        size_t bhi = blo + per;
+
+        if (blo >= DENSE_PARENT_BUCKETS) break;
+        if (bhi > DENSE_PARENT_BUCKETS) bhi = DENSE_PARENT_BUCKETS;
+        ctxs[spawned].dst = rm;
+        ctxs[spawned].srcv = srcv;
+        ctxs[spawned].n = n;
+        ctxs[spawned].b_lo = blo;
+        ctxs[spawned].b_hi = bhi;
+        if (pthread_create(&tp[spawned], NULL, shape_strip_merge_worker, &ctxs[spawned]) != 0)
+            shape_strip_merge_worker(&ctxs[spawned]); /* run this range inline */
+        else
+            spawned++;
+    }
+    for (t = 0; t < spawned; t++) pthread_join(tp[t], NULL);
+
+    free(tp);
+    free(ctxs);
 }
 
 static void shape_margin_merge_bucket_strip_parallel(dense_cell_map_t *rm,
@@ -7306,7 +7347,7 @@ static void shape_margin_merge_bucket_strip_parallel(dense_cell_map_t *rm,
 
     for (k = 0; k < SIZE_BUCKETS; k++)
         srcv[k] = row_strip ? &merged_dense[strip_idx][k] : &merged_dense[k][strip_idx];
-    shape_margin_parallel_fold_ptrs(rm, srcv, SIZE_BUCKETS);
+    shape_margin_merge_strip(rm, srcv, SIZE_BUCKETS);
 }
 
 static void shape_margin_run_task(shape_margin_ctx_t *c, int t) {
@@ -7315,15 +7356,10 @@ static void shape_margin_run_task(shape_margin_ctx_t *c, int t) {
         uint64_t db = 0;
         int sb;
         dense_cell_map_t *rm = &c->row_merged[ab];
-        int nt = parse_ereport_thread_count();
 
         for (sb = 0; sb < SIZE_BUCKETS; sb++) db += c->sum->shape_deep_bytes[ab][sb];
 
-        if (nt >= SIZE_BUCKETS + 2) {
-            shape_margin_merge_bucket_strip_parallel(rm, c->merged_dense, ab, 1);
-        } else {
-            for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_merge_add(rm, &c->merged_dense[ab][sb], NULL);
-        }
+        shape_margin_merge_bucket_strip_parallel(rm, c->merged_dense, ab, 1);
         c->path_shape->row[ab].deep_bytes = db;
         c->path_shape->row[ab].dense_fanout_max = dense_cell_max_fanout_among_parents(rm, c->fanout_lookup);
     } else {
@@ -7331,16 +7367,11 @@ static void shape_margin_run_task(shape_margin_ctx_t *c, int t) {
         dense_cell_map_t col_acc;
         uint64_t db = 0;
         int ab;
-        int nt = parse_ereport_thread_count();
 
         memset(&col_acc, 0, sizeof(col_acc));
         for (ab = 0; ab < AGE_BUCKETS; ab++) db += c->sum->shape_deep_bytes[ab][sb];
 
-        if (nt >= AGE_BUCKETS + 2) {
-            shape_margin_merge_bucket_strip_parallel(&col_acc, c->merged_dense, sb, 0);
-        } else {
-            for (ab = 0; ab < AGE_BUCKETS; ab++) dense_cell_merge_add(&col_acc, &c->merged_dense[ab][sb], NULL);
-        }
+        shape_margin_merge_bucket_strip_parallel(&col_acc, c->merged_dense, sb, 0);
         c->path_shape->col[sb].deep_bytes = db;
         c->path_shape->col[sb].dense_fanout_max =
             dense_cell_max_fanout_among_parents(&col_acc, c->fanout_lookup);
