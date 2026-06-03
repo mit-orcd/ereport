@@ -111,9 +111,16 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
  * nw×R partial matrix would exceed the budget, nw is capped; if calloc still fails, nw is halved until allocation
  * succeeds so we avoid falling back to a single-threaded scan over huge path-ordered slices (one slow bucket
  * otherwise pins ~100% CPU for a long time at "cells 35/36").
+ *
+ * When R is so large that the budget affords fewer than AGG_TOTALS_MATRIX_MIN_THREADS partial vectors, the
+ * partial-matrix approach would collapse to ~1 thread (its memory is O(nw·R)). In that case we instead shard
+ * records across the full requested thread count and accumulate directly into the shared row totals with
+ * relaxed atomic adds (memory O(R), contention only on the hottest rows) — this is what keeps the largest
+ * bucket from running single-threaded for hours at "cells 35/36".
  */
 #define AGG_TOTALS_PAR_MIN_RECORDS (8192ULL)
 #define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (1536ULL * 1024ULL * 1024ULL)
+#define AGG_TOTALS_MATRIX_MIN_THREADS 4
 #define AGG_BKT_PAR_MIN_DETAILS 4096u
 #define AGG_BKT_PAR_MAX_THREADS 24
 
@@ -3896,6 +3903,7 @@ typedef struct {
     size_t c_hi;
     size_t R;
     uint64_t *part_base;
+    int atomic_mode; /* 1: accumulate directly into shared row totals via relaxed atomics (no part_base) */
     atomic_int *fatal_atom;
 } agg_tot_par_wctx_t;
 
@@ -3904,7 +3912,7 @@ static void *agg_totals_par_worker(void *vp) {
     uint64_t *my = w->part_base;
     size_t ii;
 
-    memset(my, 0, w->R * 3 * sizeof(uint64_t));
+    if (!w->atomic_mode) memset(my, 0, w->R * 3 * sizeof(uint64_t));
 
     for (ii = w->c_lo; ii < w->c_hi; ii++) {
         size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
@@ -3947,14 +3955,22 @@ static void *agg_totals_par_worker(void *vp) {
 
             row = path_row_map_find(&w->maps[depth], rowpath);
             if (row) {
-                int ri = row->par_agg_ix;
-
-                if (ri >= 0 && (size_t)ri < w->R) {
+                if (w->atomic_mode) {
                     if (r->type == 'f')
-                        my[(size_t)ri * 3 + 0]++;
+                        __atomic_fetch_add(&row->total_files, 1ULL, __ATOMIC_RELAXED);
                     else if (r->type == 'd')
-                        my[(size_t)ri * 3 + 1]++;
-                    my[(size_t)ri * 3 + 2] += r->size;
+                        __atomic_fetch_add(&row->total_dirs, 1ULL, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&row->total_bytes, r->size, __ATOMIC_RELAXED);
+                } else {
+                    int ri = row->par_agg_ix;
+
+                    if (ri >= 0 && (size_t)ri < w->R) {
+                        if (r->type == 'f')
+                            my[(size_t)ri * 3 + 0]++;
+                        else if (r->type == 'd')
+                            my[(size_t)ri * 3 + 1]++;
+                        my[(size_t)ri * 3 + 2] += r->size;
+                    }
                 }
             }
 
@@ -3966,6 +3982,87 @@ static void *agg_totals_par_worker(void *vp) {
     }
 
     return NULL;
+}
+
+/*
+ * Atomic-accumulation variant: shard records across all nw threads and add straight into the shared row
+ * totals (relaxed atomics). Used when the per-thread partial matrix (O(nw·R)) cannot afford enough threads
+ * within the memory budget for a very large R. Memory is O(R); the only contention is on the hottest rows.
+ * On any worker fatal we re-zero the row totals so the caller's serial fallback recomputes from a clean state.
+ */
+static int aggregate_totals_for_page_n_atomic(path_row_map_t *maps,
+                                               int nlevels,
+                                               const matched_records_t *records,
+                                               const char *base_prefix,
+                                               const size_t *path_ord,
+                                               int use_ord_slice,
+                                               size_t lo,
+                                               size_t hi,
+                                               int nw) {
+    size_t nscan = hi - lo;
+    pthread_t *tp = NULL;
+    agg_tot_par_wctx_t *ctxs = NULL;
+    int j;
+    int started;
+    size_t per;
+    size_t t;
+    atomic_int shared_fatal;
+
+    if (nw < 1) return -1;
+    atomic_init(&shared_fatal, 0);
+
+    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
+    ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
+    if (!tp || !ctxs) {
+        free(tp);
+        free(ctxs);
+        return -1;
+    }
+
+    zero_map_row_corpus_totals(maps, nlevels);
+
+    started = 0;
+    per = (nscan + (size_t)nw - 1) / (size_t)nw;
+    for (t = 0; t < (size_t)nw; t++) {
+        size_t clo = lo + t * per;
+        size_t chi = clo + per;
+
+        if (clo >= hi) break;
+        if (chi > hi) chi = hi;
+
+        ctxs[started].maps = maps;
+        ctxs[started].nlevels = nlevels;
+        ctxs[started].records = records;
+        ctxs[started].base_prefix = base_prefix;
+        ctxs[started].path_ord = path_ord;
+        ctxs[started].use_ord_slice = use_ord_slice;
+        ctxs[started].c_lo = clo;
+        ctxs[started].c_hi = chi;
+        ctxs[started].R = 0;
+        ctxs[started].part_base = NULL;
+        ctxs[started].atomic_mode = 1;
+        ctxs[started].fatal_atom = &shared_fatal;
+
+        if (pthread_create(&tp[started], NULL, agg_totals_par_worker, &ctxs[started]) != 0) break;
+        started++;
+    }
+
+    if (started < 1) {
+        free(tp);
+        free(ctxs);
+        return -1;
+    }
+
+    for (j = 0; j < started; j++) pthread_join(tp[j], NULL);
+
+    free(tp);
+    free(ctxs);
+
+    if (atomic_load_explicit(&shared_fatal, memory_order_relaxed)) {
+        zero_map_row_corpus_totals(maps, nlevels);
+        return -1;
+    }
+    return 0;
 }
 
 static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
@@ -4005,6 +4102,13 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     if (row_mat_bytes > 0) {
         size_t cap = AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES / row_mat_bytes;
 
+        /*
+         * If the budget cannot afford even AGG_TOTALS_MATRIX_MIN_THREADS partial vectors, the matrix path
+         * would collapse toward a single thread; accumulate atomically with the full thread count instead.
+         */
+        if (cap < (size_t)AGG_TOTALS_MATRIX_MIN_THREADS)
+            return aggregate_totals_for_page_n_atomic(maps, nlevels, records, base_prefix, path_ord, use_ord_slice,
+                                                      lo, hi, nw);
         if (cap >= 2 && (size_t)nw > cap) nw = (int)cap;
     }
 
@@ -5629,6 +5733,8 @@ typedef struct {
     atomic_int any_fail;
     ereport_run_stats_t *run_stats;
     bucket_page_slice_t (*page_slices)[SIZE_BUCKETS];
+    /* Cell dispatch order (indices into the 36 AGE×SIZE cells), heaviest first, to minimize the tail. */
+    int order[AGE_BUCKETS * SIZE_BUCKETS];
 } bucket_emit_ctx_t;
 
 typedef struct {
@@ -5756,6 +5862,47 @@ static void *path_ord_async_worker(void *vp) {
     return NULL;
 }
 
+typedef struct {
+    int cell;
+    uint64_t cost;
+} bucket_cell_cost_t;
+
+static int cmp_bucket_cell_cost_desc(const void *a, const void *b) {
+    const bucket_cell_cost_t *xa = (const bucket_cell_cost_t *)a;
+    const bucket_cell_cost_t *xb = (const bucket_cell_cost_t *)b;
+
+    if (xa->cost > xb->cost) return -1;
+    if (xa->cost < xb->cost) return 1;
+    return (xa->cell > xb->cell) - (xa->cell < xb->cell); /* stable-ish: ascending cell index on ties */
+}
+
+/*
+ * Order the 36 AGE×SIZE cells heaviest-first so the work-stealing pool starts the most expensive bucket
+ * immediately; this shrinks the single-cell tail that otherwise leaves one thread finishing for a long time.
+ * Cost is the per-cell matched-record slice span when page slices are available, else 0 (identity order).
+ */
+static void bucket_compute_cell_order(bucket_emit_ctx_t *ctx) {
+    const int ntasks = AGE_BUCKETS * SIZE_BUCKETS;
+    bucket_cell_cost_t cc[AGE_BUCKETS * SIZE_BUCKETS];
+    int k;
+
+    for (k = 0; k < ntasks; k++) {
+        int ab = k / SIZE_BUCKETS;
+        int sb = k % SIZE_BUCKETS;
+
+        cc[k].cell = k;
+        cc[k].cost = 0;
+        if (ctx->page_slices) {
+            const bucket_page_slice_t *sl = &ctx->page_slices[ab][sb];
+
+            if (sl->ord_hi > sl->ord_lo) cc[k].cost = (uint64_t)(sl->ord_hi - sl->ord_lo);
+        }
+    }
+
+    qsort(cc, (size_t)ntasks, sizeof(cc[0]), cmp_bucket_cell_cost_desc);
+    for (k = 0; k < ntasks; k++) ctx->order[k] = cc[k].cell;
+}
+
 static void *bucket_page_emit_worker(void *arg) {
     bucket_emit_thread_arg_t *ta = (bucket_emit_thread_arg_t *)arg;
     bucket_emit_ctx_t *c = ta->ctx;
@@ -5770,8 +5917,12 @@ static void *bucket_page_emit_worker(void *arg) {
 
         if (k >= ntasks) break;
 
-        ab = (int)(k / (size_t)SIZE_BUCKETS);
-        sb = (int)(k % (size_t)SIZE_BUCKETS);
+        {
+            int cell = c->order[k];
+
+            ab = cell / SIZE_BUCKETS;
+            sb = cell % SIZE_BUCKETS;
+        }
 
         if (build_bucket_page_path(fn, sizeof(fn), ab, sb) != 0) {
             atomic_store(&c->any_fail, 1);
@@ -5885,6 +6036,8 @@ static int emit_all_bucket_detail_pages(const char *username,
     }
 
     if (run_stats) atomic_store(&run_stats->finalize_bucket_prep, 0);
+
+    bucket_compute_cell_order(&ctx);
 
     atomic_init(&ctx.next_task, 0);
     atomic_init(&ctx.any_fail, 0);
