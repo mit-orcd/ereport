@@ -66,6 +66,7 @@ typedef struct parent_node {
 
 typedef struct {
     parent_node_t *buckets[ANALYZE_HASH_BUCKETS];
+    size_t node_count; /* distinct parents inserted; maintained incrementally to avoid full bucket walks */
 } parent_map_t;
 
 typedef struct {
@@ -253,21 +254,6 @@ static parent_map_t *parent_map_new(void) {
     return m;
 }
 
-static size_t parent_map_count_nodes(const parent_map_t *m) {
-    size_t c = 0;
-    size_t bi;
-
-    if (!m) return 0;
-    for (bi = 0; bi < ANALYZE_HASH_BUCKETS; bi++) {
-        const parent_node_t *n = m->buckets[bi];
-        while (n) {
-            c++;
-            n = n->next;
-        }
-    }
-    return c;
-}
-
 static void parent_map_free(parent_map_t *m) {
     size_t bi;
 
@@ -313,6 +299,7 @@ static void parent_map_add_record(parent_map_t *m, const char *parent, uint8_t t
         }
         node->next = m->buckets[bi];
         m->buckets[bi] = node;
+        m->node_count++;
         node->nfile = node->ndir = node->nsym = node->nother = 0;
         if (typ == (uint8_t)'f')
             node->nfile = 1;
@@ -351,6 +338,7 @@ static void parent_map_add_totals(parent_map_t *m, const char *parent, uint64_t 
         }
         node->next = m->buckets[bi];
         m->buckets[bi] = node;
+        m->node_count++;
         node->nfile = nf;
         node->ndir = nd;
         node->nsym = ns;
@@ -571,7 +559,7 @@ static void analyze_sort_maps_by_node_count(parent_map_t **maps, unsigned n) {
     if (!rows) return;
     for (i = 0; i < n; i++) {
         rows[i].m = maps[i];
-        rows[i].cnt = parent_map_count_nodes(maps[i]);
+        rows[i].cnt = maps[i]->node_count;
     }
     qsort(rows, (size_t)n, sizeof(*rows), cmp_analyze_map_sz_asc);
     for (i = 0; i < n; i++) maps[i] = rows[i].m;
@@ -770,31 +758,31 @@ fail:
     return -1;
 }
 
-static int analyze_scan_fp_until(FILE *fp, uint64_t scan_end_exclusive, uint64_t file_sz,
+static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_exclusive, uint64_t file_sz,
                                  const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
                                  char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
                                  uint64_t *nrec_out) {
     uint64_t nrec = 0;
+    uint64_t cur = start_off; /* track position arithmetically instead of ftello() per record */
 
     if (nrec_out) *nrec_out = 0;
 
     for (;;) {
-        off_t rec0 = ftello(fp);
         bin_record_hdr_t rh;
         size_t rec_tot;
 
-        if (rec0 < 0) return -1;
-        if ((uint64_t)rec0 >= scan_end_exclusive) break;
+        if (cur >= scan_end_exclusive) break;
 
-        if (fread(&rh, sizeof(rh), 1, fp) != 1) return -1;
+        /* fp is owned by exactly one thread, so the unlocked stdio variants are safe and avoid per-call locking. */
+        if (fread_unlocked(&rh, sizeof(rh), 1, fp) != 1) return -1;
         rec_tot = crawl_bin_record_total_bytes(&rh);
-        if ((uint64_t)rec0 + rec_tot > scan_end_exclusive) return -1;
-        if ((uint64_t)rec0 + rec_tot > file_sz) return -1;
+        if (cur + rec_tot > scan_end_exclusive) return -1;
+        if (cur + rec_tot > file_sz) return -1;
 
         if (rh.parent_dir_id == 0ULL) return -1;
 
         if (rh.name_len) {
-            if (fread(pathbuf, rh.name_len, 1, fp) != 1) return -1;
+            if (fread_unlocked(pathbuf, rh.name_len, 1, fp) != 1) return -1;
         }
 
         if (crawl_bin_catalog_entry_path(cat, rh.parent_dir_id, (char *)pathbuf, rh.name_len, fullpath_buf,
@@ -811,21 +799,19 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t scan_end_exclusive, uint64_t
                     parent_map_add_record(map, parentbuf, rh.type);
             }
         }
+        cur += rec_tot;
         nrec++;
     }
 
-    {
-        off_t pos = ftello(fp);
-        if (pos < 0) return -1;
-        if ((uint64_t)pos != scan_end_exclusive) return -1;
-    }
+    if (cur != scan_end_exclusive) return -1;
     if (nrec_out) *nrec_out = nrec;
     return 0;
 }
 
 static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
                                  unsigned char *pathbuf, char *parentbuf, char *fullpath_buf, size_t fullpath_sz,
-                                 parent_map_t *map, uint64_t *depth_hist, uint64_t *nrec_out) {
+                                 parent_map_t *map, uint64_t *depth_hist, char *iobuf, size_t iobuf_sz,
+                                 uint64_t *nrec_out) {
     FILE *fp;
     int rc;
     bin_file_header_t fh;
@@ -837,7 +823,9 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
         perror(full_path);
         return -1;
     }
-    if (fread(&fh, sizeof(fh), 1, fp) != 1) {
+    /* Large fully-buffered stdio buffer cuts read() syscalls on big shards / NFS. Must precede any I/O. */
+    if (iobuf && iobuf_sz > 0U) setvbuf(fp, iobuf, _IOFBF, iobuf_sz);
+    if (fread_unlocked(&fh, sizeof(fh), 1, fp) != 1) {
         fclose(fp);
         return -1;
     }
@@ -860,8 +848,8 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
         fclose(fp);
         return -1;
     }
-    rc = analyze_scan_fp_until(fp, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf, fullpath_sz, map,
-                               depth_hist, nrec_out);
+    rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf, fullpath_sz,
+                               map, depth_hist, nrec_out);
     crawl_bin_catalog_free(&cat);
     fclose(fp);
     return rc;
@@ -875,8 +863,11 @@ static void *analyze_worker_main(void *arg) {
     unsigned char *pathbuf = (unsigned char *)malloc(65536);
     char *parentbuf = (char *)malloc(65536);
     char *fullpath_buf = (char *)malloc(PATH_MAX);
+    size_t iobuf_sz = (size_t)1 << 20;
+    char *iobuf = (char *)malloc(iobuf_sz);
 
-    if (!map || !dh || !pathbuf || !parentbuf || !fullpath_buf) {
+    if (!map || !dh || !pathbuf || !parentbuf || !fullpath_buf || !iobuf) {
+        free(iobuf);
         free(fullpath_buf);
         free(pathbuf);
         free(parentbuf);
@@ -902,7 +893,7 @@ static void *analyze_worker_main(void *arg) {
         chunk_bytes = c->end_offset - c->start_offset;
 
         ar = analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, pathbuf, parentbuf, fullpath_buf,
-                                   PATH_MAX, map, dh, &nrec);
+                                   PATH_MAX, map, dh, iobuf, iobuf_sz, &nrec);
 
         atomic_fetch_add_explicit(&p->analyze_bytes_done, chunk_bytes, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->analyze_chunks_done, 1ULL, memory_order_relaxed);
@@ -923,6 +914,7 @@ static void *analyze_worker_main(void *arg) {
         }
     }
 
+    free(iobuf);
     free(pathbuf);
     free(parentbuf);
     free(fullpath_buf);
@@ -942,6 +934,59 @@ static int cmp_analyze_nfile_desc(const void *a, const void *b) {
     if (af < bf) return 1;
     if (af > bf) return -1;
     return strcmp(wa->node->path, wb->node->path);
+}
+
+/*
+ * "Worse" = ranked later in the desired top order (nfile desc, then path asc), i.e. the element that
+ * should be evicted first. Used to keep a bounded min-heap of the top-N parents so the report does not
+ * sort every distinct parent (O(M log N) time, O(N) memory instead of a full O(M log M) sort).
+ */
+static int analyze_topn_worse(const parent_node_t *a, const parent_node_t *b) {
+    if (a->nfile != b->nfile) return a->nfile < b->nfile;
+    return strcmp(a->path, b->path) > 0;
+}
+
+static void analyze_topn_sift_down(analyze_sort_wrap_t *h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2U * i + 1U;
+        size_t r = 2U * i + 2U;
+        size_t s = i;
+        analyze_sort_wrap_t tmp;
+
+        if (l < n && analyze_topn_worse(h[l].node, h[s].node)) s = l;
+        if (r < n && analyze_topn_worse(h[r].node, h[s].node)) s = r;
+        if (s == i) break;
+        tmp = h[i];
+        h[i] = h[s];
+        h[s] = tmp;
+        i = s;
+    }
+}
+
+static void analyze_topn_sift_up(analyze_sort_wrap_t *h, size_t i) {
+    while (i > 0U) {
+        size_t p = (i - 1U) / 2U;
+        analyze_sort_wrap_t tmp;
+
+        if (!analyze_topn_worse(h[i].node, h[p].node)) break;
+        tmp = h[i];
+        h[i] = h[p];
+        h[p] = tmp;
+        i = p;
+    }
+}
+
+/* Offer one node to the bounded min-heap (root = current worst kept). */
+static void analyze_topn_offer(analyze_sort_wrap_t *heap, size_t *heap_n, size_t cap, parent_node_t *node) {
+    if (cap == 0U) return;
+    if (*heap_n < cap) {
+        heap[*heap_n].node = node;
+        analyze_topn_sift_up(heap, *heap_n);
+        (*heap_n)++;
+    } else if (analyze_topn_worse(heap[0].node, node)) {
+        heap[0].node = node;
+        analyze_topn_sift_down(heap, *heap_n, 0U);
+    }
 }
 
 static void analyze_hist_files_per_parent(uint64_t nfile, uint64_t *b1, uint64_t *b2_10, uint64_t *b11_100,
@@ -975,12 +1020,19 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
     uint64_t max_nfile = 0;
     uint64_t hb1 = 0, hb2 = 0, hb3 = 0, hb4 = 0, hb5 = 0, hb6 = 0, hb7 = 0, hb8 = 0;
     uint64_t megadir_100k = 0;
-    analyze_sort_wrap_t *sort_arr = NULL;
-    size_t sort_n = 0;
-    size_t sort_cap = 0;
+    analyze_sort_wrap_t *heap = NULL;
+    size_t heap_cap = (size_t)g_top_n;
+    size_t heap_n = 0;
     unsigned di;
     uint64_t depth_records = 0;
     unsigned max_depth_bin = 0;
+
+    heap = (analyze_sort_wrap_t *)malloc((heap_cap ? heap_cap : 1U) * sizeof(*heap));
+    if (!heap) {
+        /* Stats below are still emitted; only the top-N listing is dropped on OOM. */
+        fprintf(stderr, "ecrawl_analyze: alloc failed for top-N heap; skipping top list\n");
+        heap_cap = 0;
+    }
 
     for (bi = 0; bi < ANALYZE_HASH_BUCKETS; bi++) {
         parent_node_t *n = map->buckets[bi];
@@ -996,25 +1048,13 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
                 if (n->nfile > max_nfile) max_nfile = n->nfile;
             }
 
-            if (sort_n == sort_cap) {
-                size_t nc = sort_cap ? sort_cap * 2 : 4096;
-                analyze_sort_wrap_t *na = (analyze_sort_wrap_t *)realloc(sort_arr, nc * sizeof(*na));
-                if (!na) {
-                    free(sort_arr);
-                    fprintf(stderr, "ecrawl_analyze: realloc failed for sort buffer\n");
-                    return;
-                }
-                sort_arr = na;
-                sort_cap = nc;
-            }
-            sort_arr[sort_n].node = n;
-            sort_n++;
+            analyze_topn_offer(heap, &heap_n, heap_cap, n);
 
             n = n->next;
         }
     }
 
-    if (sort_n > 0U && sort_arr) qsort(sort_arr, sort_n, sizeof(sort_arr[0]), cmp_analyze_nfile_desc);
+    if (heap_n > 0U) qsort(heap, heap_n, sizeof(heap[0]), cmp_analyze_nfile_desc);
 
     printf("ecrawl_analyze\n");
     printf("uid_shard_bin_files=%zu\n", shard_files);
@@ -1051,18 +1091,16 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
     printf("top_parents_by_regular_file_count (N=%u)\n", g_top_n);
     printf("# nfile ndir nsym nother path\n");
     {
-        size_t lim = (size_t)g_top_n;
         size_t k;
 
-        if (lim > sort_n) lim = sort_n;
-        for (k = 0; k < lim; k++) {
-            parent_node_t *no = sort_arr[k].node;
+        for (k = 0; k < heap_n; k++) {
+            parent_node_t *no = heap[k].node;
             printf("%zu %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %s\n", k + 1U, no->nfile, no->ndir, no->nsym,
                    no->nother, no->path);
         }
     }
 
-    free(sort_arr);
+    free(heap);
 }
 
 static int run_analyze(const char *dir_path, char **names, size_t name_count, unsigned nthreads) {
