@@ -40,6 +40,62 @@ _init_colors() {
 }
 _init_colors
 
+# --- summary mode (--summary): collect results into copy/paste-friendly tables ---
+SUMMARY=0
+SUMMARY_FAILS=0
+SUMMARY_RENDERED=0
+CUR_GROUP="general"
+declare -a SUM_ROWS=()
+declare -a SUM_METRICS=()
+exec 3>&1   # fd 3 = original stdout; the summary table goes here even when test chatter is muted
+
+summary_add()    { SUM_ROWS+=("${1}"$'\037'"${CUR_GROUP}"$'\037'"${2}"$'\037'"${3:-}"); }
+summary_metric() { SUM_METRICS+=("${1}"$'\037'"${2:-}"); }
+
+# Box-table renderer (plain text, no ANSI): a Metrics table + a Checks table on fd 3.
+render_summary() {
+    [[ "$SUMMARY" == 1 ]] || return 0
+    [[ "$SUMMARY_RENDERED" == 0 ]] || return 0
+    SUMMARY_RENDERED=1
+    {
+        printf '\n===== test.sh summary (%s) =====\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        if [[ ${#SUM_METRICS[@]} -gt 0 ]]; then
+            printf '%s\n' "${SUM_METRICS[@]}" | awk -F'\037' '
+            function rep(c,n,  s,i){s="";for(i=0;i<n;i++)s=s c;return s}
+            { k[NR]=$1; v[NR]=$2; if(length($1)>w1)w1=length($1); if(length($2)>w2)w2=length($2) }
+            BEGIN{h1="Metric";h2="Value"}
+            END{
+              if(length(h1)>w1)w1=length(h1); if(length(h2)>w2)w2=length(h2);
+              printf "+%s+%s+\n",rep("-",w1+2),rep("-",w2+2);
+              printf "| %-*s | %-*s |\n",w1,h1,w2,h2;
+              printf "+%s+%s+\n",rep("-",w1+2),rep("-",w2+2);
+              for(i=1;i<=NR;i++) printf "| %-*s | %-*s |\n",w1,k[i],w2,v[i];
+              printf "+%s+%s+\n",rep("-",w1+2),rep("-",w2+2);
+            }'
+            printf '\n'
+        fi
+        if [[ ${#SUM_ROWS[@]} -gt 0 ]]; then
+            printf '%s\n' "${SUM_ROWS[@]}" | awk -F'\037' '
+            function rep(c,n,  s,i){s="";for(i=0;i<n;i++)s=s c;return s}
+            { r[NR]=$1; g[NR]=$2; c[NR]=$3; d[NR]=$4;
+              if(length($1)>w1)w1=length($1); if(length($2)>w2)w2=length($2);
+              if(length($3)>w3)w3=length($3); if(length($4)>w4)w4=length($4);
+              if($1=="PASS")np++; else if($1=="SKIP")ns++; else nf++ }
+            BEGIN{h1="Result";h2="Phase";h3="Check";h4="Detail"}
+            END{
+              if(length(h1)>w1)w1=length(h1); if(length(h2)>w2)w2=length(h2);
+              if(length(h3)>w3)w3=length(h3); if(length(h4)>w4)w4=length(h4);
+              printf "+%s+%s+%s+%s+\n",rep("-",w1+2),rep("-",w2+2),rep("-",w3+2),rep("-",w4+2);
+              printf "| %-*s | %-*s | %-*s | %-*s |\n",w1,h1,w2,h2,w3,h3,w4,h4;
+              printf "+%s+%s+%s+%s+\n",rep("-",w1+2),rep("-",w2+2),rep("-",w3+2),rep("-",w4+2);
+              for(i=1;i<=NR;i++) printf "| %-*s | %-*s | %-*s | %-*s |\n",w1,r[i],w2,g[i],w3,c[i],w4,d[i];
+              printf "+%s+%s+%s+%s+\n",rep("-",w1+2),rep("-",w2+2),rep("-",w3+2),rep("-",w4+2);
+              printf "\nPassed: %d   Failed: %d   Skipped: %d   Total: %d\n", np+0, nf+0, ns+0, NR;
+            }'
+        fi
+    } >&3
+}
+
 log() {
     local ts msg
     ts="$(date +%H:%M:%S)"
@@ -57,13 +113,28 @@ log() {
     esac
 }
 
-die() { printf '%sFAIL:%s %s%s\n' "$R" "$Z" "$*" "$Z" >&2; exit 1; }
-pass() { printf '%sOK:%s %s%s\n' "$G" "$Z" "$*" "$Z"; }
+die() {
+    printf '%sFAIL:%s %s%s\n' "$R" "$Z" "$*" "$Z" >&2
+    if [[ "${SUMMARY:-0}" == 1 ]]; then
+        summary_add FAIL "FATAL: $*" "aborted"
+        render_summary
+    fi
+    exit 1
+}
+pass() { summary_add PASS "$*" "passed"; printf '%sOK:%s %s%s\n' "$G" "$Z" "$*" "$Z"; }
 
 # Section titles: cyan bold for filesystem correlation groups [1]–[4]
-section_fs() { printf '\n  %s%s%s%s\n' "$C" "$BD" "$1" "$Z"; }
+section_fs() {
+    local n
+    n=$(printf '%s' "$1" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+    CUR_GROUP="fs[${n:-?}]"
+    [[ "$SUMMARY" == 1 ]] || printf '\n  %s%s%s%s\n' "$C" "$BD" "$1" "$Z"
+}
 # Yellow bold for integration subsection titles
-section_int() { printf '\n  %s%s%s%s\n' "$Y" "$BD" "$1" "$Z"; }
+section_int() {
+    CUR_GROUP="integration"
+    [[ "$SUMMARY" == 1 ]] || printf '\n  %s%s%s%s\n' "$Y" "$BD" "$1" "$Z"
+}
 
 # Last line wins (tools may print stats blocks more than once in verbose modes).
 kv_last() {
@@ -133,10 +204,20 @@ fs_fail_delta() {
 expect_eq() {
     local label=$1 want=$2 got=$3
     local ok_note=${4:-}
-    [[ "$got" == "$want" ]] || die "${label}: want '${want}' got '${got}'"
-    if [[ -n "$ok_note" ]]; then
-        printf '  %sOK:%s %s — %s%s\n' "$G" "$Z" "$label" "$ok_note" "$Z"
+    if [[ "$got" == "$want" ]]; then
+        summary_add PASS "$label" "want=$want got=$got"
+        if [[ -n "$ok_note" ]]; then
+            printf '  %sOK:%s %s — %s%s\n' "$G" "$Z" "$label" "$ok_note" "$Z"
+        fi
+        return 0
     fi
+    summary_add FAIL "$label" "want=$want got=$got"
+    if [[ "$SUMMARY" == 1 ]]; then
+        printf '  %sFAIL:%s %s: want %s got %s%s\n' "$R" "$Z" "$label" "$want" "$got" "$Z" >&2
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+        return 0
+    fi
+    die "${label}: want '${want}' got '${got}'"
 }
 
 # Like expect_eq but records failure and continues (for fs correlation so every check is printed).
@@ -144,6 +225,8 @@ expect_eq_continue() {
     local label=$1 want=$2 got=$3
     local ok_note=${4:-}
     if [[ "$got" != "$want" ]]; then
+        summary_add FAIL "$label" "want=$want got=$got"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
         if [[ "$want" =~ ^[0-9]+$ ]] && [[ "$got" =~ ^[0-9]+$ ]]; then
             printf '  %sFAIL:%s %s: want %s got %s (%s)%s\n' "$R" "$Z" "$label" "$want" "$got" "$(fs_fail_delta "$want" "$got")" "$Z" >&2
         else
@@ -151,6 +234,7 @@ expect_eq_continue() {
         fi
         return 1
     fi
+    summary_add PASS "$label" "want=$want got=$got"
     if [[ -n "$ok_note" ]]; then
         printf '  %sOK:%s %s — %s%s\n' "$G" "$Z" "$label" "$ok_note" "$Z"
     fi
@@ -162,9 +246,12 @@ expect_le_continue() {
     local label=$1 ceiling=$2 got=$3
     local ok_note=${4:-}
     if [[ "$got" -gt "$ceiling" ]]; then
+        summary_add FAIL "$label" "want<=$ceiling got=$got"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
         printf '  %sFAIL:%s %s: want <= %s got %s%s\n' "$R" "$Z" "$label" "$ceiling" "$got" "$Z" >&2
         return 1
     fi
+    summary_add PASS "$label" "want<=$ceiling got=$got"
     if [[ -n "$ok_note" ]]; then
         printf '  %sOK:%s %s — %s%s\n' "$G" "$Z" "$label" "$ok_note" "$Z"
     fi
@@ -346,6 +433,9 @@ run_fs_correlation() {
 
     printf '  %secrawl:%s  files=%s dirs=%s symlinks=%s total_bytes=%s elapsed_sec=%s\n' "$M" "$Z" \
         "$crawl_files" "$crawl_dirs" "$crawl_symlinks" "$crawl_bytes" "${crawl_elapsed:-?}"
+    summary_metric "fs root" "$root_abs"
+    summary_metric "fs ecrawl: files/dirs/symlinks" "${crawl_files}/${crawl_dirs}/${crawl_symlinks}"
+    summary_metric "fs ecrawl: total_bytes / elapsed_sec" "${crawl_bytes} / ${crawl_elapsed:-?}"
 
     log "step: baseline — counting files/dirs/symlinks, then unique regular-file bytes (find | awk dedup; after ecrawl)"
     run_timed count_files "$root"
@@ -364,6 +454,7 @@ run_fs_correlation() {
         'BEGIN{printf "%.3f", a + b + c + d}')
 
     printf '  %sfs baseline:%s files=%s dirs=%s symlinks=%s unique_regular_bytes=%s\n' "$M" "$Z" "$fc" "$dc" "$lc" "$fs_u_bytes"
+    summary_metric "fs baseline (${fs_walk_files}): files/dirs/symlinks" "${fc}/${dc}/${lc}"
     if [[ "$fs_walk_files" == fd ]]; then
         printf '%s           walk: files=fd dirs=find symlinks=fd unique_regular_bytes=find (dirs incl. crawl root; fd: --hidden --no-ignore)%s\n' "$D" "$Z"
     else
@@ -442,6 +533,9 @@ run_fs_correlation() {
     fi
     printf '  %sereport all_users:%s files=%s dirs=%s links=%s scanned=%s matched=%s total_capacity_in_files=%s distinct_uids=%s\n' \
         "$M" "$Z" "$au_files" "$au_dirs" "$au_links" "$au_scanned" "$au_matched" "$au_cap" "$au_distinct"
+    summary_metric "fs ereport all-users: scanned/matched" "${au_scanned}/${au_matched}"
+    summary_metric "fs ereport all-users: distinct_uids" "$au_distinct"
+    summary_metric "fs ereport single-user" "$([[ "$skip_single" -eq 0 ]] && echo "ran ($(id -un))" || echo "skipped (no shard)")"
     if [[ "$skip_single" -eq 0 ]]; then
         printf '%s  records:%s ecrawl entries=%s ereport single scanned=%s all-users scanned=%s\n' \
             "$D" "$Z" "$entries" "$su_scanned" "$au_scanned"
@@ -496,7 +590,12 @@ run_fs_correlation() {
 
     trap - EXIT
     cleanup_fs
-    [[ "$fs_fail" -eq 0 ]] || die "filesystem correlation had mismatches for $root (see FAIL lines above)"
+    if [[ "$fs_fail" -ne 0 ]]; then
+        # In summary mode the per-check FAILs are already recorded and counted;
+        # let main render the table and set the exit code instead of dying here.
+        [[ "$SUMMARY" == 1 ]] && return 0
+        die "filesystem correlation had mismatches for $root (see FAIL lines above)"
+    fi
     pass "filesystem correlation for $root"
 }
 
@@ -541,6 +640,8 @@ run_integration() {
     co=$(kv_last other "$crawl_log")
     printf '  %secrawl summary:%s entries=%s files=%s dirs=%s symlinks=%s other=%s errors=%s\n' \
         "$M" "$Z" "$ce" "$cf" "$cd" "$cs" "$co" "$(kv_last errors "$crawl_log")"
+    summary_metric "synthetic ecrawl: entries" "$ce"
+    summary_metric "synthetic ecrawl: files/dirs/symlinks" "${cf}/${cd}/${cs}"
 
     [[ "${co:-0}" == "0" ]] || die "ecrawl.other expected 0 on synthetic tree (got ${co})"
 
@@ -603,6 +704,8 @@ run_integration() {
     smat=$(kv_last matched_records "$au_out")
     sscan=$(kv_last scanned_records "$au_out")
     printf '  %sereport all_users:%s distinct_uids=%s scanned=%s matched=%s\n' "$M" "$Z" "$dist" "$sscan" "$smat"
+    summary_metric "synthetic ereport all-users: distinct_uids" "$dist"
+    summary_metric "synthetic ereport all-users: scanned/matched" "${sscan}/${smat}"
 
     section_int "[integration] ereport all-users vs ecrawl"
     expect_eq "all_users: distinct_uids (single uid in crawl)" "1" "$dist" \
@@ -619,6 +722,7 @@ run_integration() {
         tail -n 40 "${td}/repair.stderr" >&2 || true
         die "ecrawl_repair --dry-run failed"
     }
+    summary_add PASS "ecrawl_repair --dry-run" "ran ok"
 
     log "ecrawl_analyze (shard scan / parent histogram smoke)"
     "$ECRAWL_ANALYZE" --top 5 "$crawl_out" >"${td}/analyze.stdout" 2>"${td}/analyze.stderr" || {
@@ -628,12 +732,14 @@ run_integration() {
     grep -q '^ecrawl_analyze$' "${td}/analyze.stdout" || die "ecrawl_analyze missing banner line"
     grep -q '^records_total=' "${td}/analyze.stdout" || die "ecrawl_analyze missing records_total"
     grep -q '^parse_chunk_jobs=' "${td}/analyze.stdout" || die "ecrawl_analyze missing parse_chunk_jobs"
+    summary_add PASS "ecrawl_analyze smoke" "banner+records_total+parse_chunk_jobs"
 
     log "edelete dry-run (synthetic walk tree)"
     "$EDELETE" "$root_abs" >"${td}/edelete.stdout" 2>"${td}/edelete.stderr" || {
         tail -n 40 "${td}/edelete.stderr" >&2 || true
         die "edelete dry-run failed"
     }
+    summary_add PASS "edelete --dry-run" "ran ok"
 
     section_int "[integration] edelete — synthetic . / .. path probes (--delete)"
     edelete_synthetic_dot_dotdot_tests "$td"
@@ -647,6 +753,7 @@ run_integration() {
     }
     [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" ]] ||
         die "ereport_index did not write tri_keys.bin / paths.bin under ${idx_make}"
+    summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin written"
 
     trap - EXIT
     cleanup_int
@@ -654,7 +761,28 @@ run_integration() {
 }
 
 # --- main ---
-ROOT="${1:-}"
+ROOT=""
+for arg in "$@"; do
+    case "$arg" in
+        --summary) SUMMARY=1 ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [--summary] [/path/to/tree]
+  --summary   collect results into copy/paste-friendly box tables (Metrics + Checks)
+              printed at the end (no ANSI; pastes into slides / screenshots cleanly).
+  /path/...   optional crawl root for filesystem correlation (SKIP_FS=1 to skip).
+EOF
+            exit 0
+            ;;
+        *) ROOT="$arg" ;;
+    esac
+done
+
+# In --summary mode, mute the per-check chatter on stdout (the table is emitted
+# to fd 3 at the end); FAIL lines and fatal errors still go to stderr.
+run_phase() {
+    if [[ "$SUMMARY" == 1 ]]; then "$@" >/dev/null; else "$@"; fi
+}
 
 need_exe "$ECRAWL"
 need_exe "$EREPORT"
@@ -662,17 +790,18 @@ need_exe "$ECRAWL_REPAIR"
 need_exe "$EDELETE"
 need_exe "$EREPORT_INDEX"
 
-run_integration
+run_phase run_integration
 
 if [[ -n "${SKIP_FS:-}" ]] || [[ -z "${ROOT}" ]] || [[ ! -d "${ROOT}" ]]; then
     if [[ -n "${ROOT}" ]] && [[ ! -d "${ROOT}" ]]; then
         die "not a directory: ${ROOT}"
     fi
-    if [[ -z "${SKIP_FS:-}" ]] && [[ -z "${ROOT}" ]]; then
+    if [[ -z "${SKIP_FS:-}" ]] && [[ -z "${ROOT}" ]] && [[ "$SUMMARY" != 1 ]]; then
         log "tip: pass a crawl root directory as \$1 to run filesystem correlation (SKIP_FS=1 to skip)"
     fi
-    exit 0
+else
+    run_phase run_fs_correlation "$ROOT"
 fi
 
-run_fs_correlation "$ROOT"
-exit 0
+render_summary
+exit $(( SUMMARY_FAILS > 0 ? 1 : 0 ))
