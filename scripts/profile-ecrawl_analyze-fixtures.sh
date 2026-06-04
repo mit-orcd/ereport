@@ -1,50 +1,62 @@
 #!/usr/bin/env bash
 #
-# profile-ereport-fixtures.sh
+# profile-ecrawl_analyze-fixtures.sh
 #
 # SPDX-License-Identifier: MIT
 #
-# Per synthetic adversarial sub-directory (see generate-ecrawl-adversarial-tree.sh):
-#   1. CRAWL phase  — run ecrawl to produce that fixture's uid_shard_*.bin set
-#                     (skipped if the bin dir already has shards; FORCE_CRAWL=1
-#                     to recrawl). Timed so per-subdir crawl speed is tracked.
-#   2. REPORT phase — run ereport over that bin dir (all-users form,
-#                     --bucket-details 4) and capture a full profile.
+# Profile `ecrawl_analyze` (read-only directory-shape stats over crawl shards)
+# over each synthetic adversarial sub-directory's crawl output, the same way
+# profile-ereport-fixtures.sh profiles `ereport`.
 #
-# The REPORT phase runs up to three instrumented passes, mirroring
-# profile-ecrawl-fixtures.sh:
-#   clean   — /usr/bin/time -v + ereport --verbose key=value phase timings
-#             (elapsed_sec, finalize_*, verbose_sort_*). Only trustworthy timing.
+# Per fixture (see generate-ecrawl-adversarial-tree.sh):
+#   1. CRAWL phase   — run ecrawl to produce that fixture's uid_shard_*.bin set
+#                      (skipped if the bin dir already has shards; FORCE_CRAWL=1
+#                      to recrawl). Timed so per-subdir crawl speed is tracked.
+#   2. ANALYZE phase — run `ecrawl_analyze --verbose` over that bin dir and
+#                      capture a full profile.
+#
+# The ANALYZE phase runs up to four instrumented passes:
+#   clean   — /usr/bin/time -v + ecrawl_analyze key=value stats on stdout
+#             (records_total, distinct_parent_directories, ...) + our own wall
+#             timer. Only trustworthy timing.
 #   strace  — strace -f -c syscall histogram (timing NOT representative).
-#   perf    — perf record --call-graph dwarf + perf report (CPU profile; build
-#             ereport with `make debug` for best symbols).
+#   perf    — perf record --call-graph dwarf + perf report (CPU profile, plus a
+#             per-thread CPU split; build ecrawl_analyze with `make debug` for
+#             best symbols).
+#   sched   — optional `perf sched` pass (per-thread runtime / switch / delay)
+#             for the big fixtures, to confirm per-section thread concurrency.
+#
+# NOTE on thread use: ecrawl_analyze parallelises per shard file — it caps its
+# worker count at the number of uid_shard_*.bin files. Single-shard fixtures
+# therefore run effectively single-threaded; the per-thread perf views below
+# make that visible. Production crawls with many shards spread across threads.
 #
 # Usage:
-#   scripts/profile-ereport-fixtures.sh <synth-root> <out-parent> [results-dir]
+#   scripts/profile-ecrawl_analyze-fixtures.sh <synth-root> <out-parent> [results-dir]
 #
 # Required:
 #   <synth-root>   dir containing the fixtures (single_huge_dir/, mega_dir1/, ...).
 #   <out-parent>   parent dir for per-fixture data; for each fixture this script
 #                  creates and keeps:
-#                      <out-parent>/<fixture>/bin/        ecrawl uid_shard_*.bin
-#                      <out-parent>/<fixture>/all_users/  ereport HTML (clean pass)
+#                      <out-parent>/<fixture>/bin/   ecrawl uid_shard_*.bin
 #                  Bins are reused across runs (FORCE_CRAWL=1 to recrawl).
+#                  ecrawl_analyze is read-only, so it produces no kept output.
 #
 # Optional positional:
 #   [results-dir]  where profiling logs/tarball go (default:
-#                  ./ereport-profile-<timestamp>); kept separate from the data.
+#                  ./ecrawl_analyze-profile-<timestamp>); kept separate from data.
 #
 # Environment knobs (all optional):
-#   EREPORT_BIN=./ereport      ereport binary (auto: ./ereport, /tmp/ereport, PATH).
-#   ECRAWL_BIN=./ecrawl        ecrawl binary  (auto: ./ecrawl, /tmp/ecrawl, PATH).
-#   FORCE_CRAWL=0              if 1, recrawl every fixture even if shards exist.
-#   KEEP_REPORTS=1            keep <out-parent>/<fixture>/all_users (default 1);
-#                              set 0 to delete the HTML after recording its size.
-#   BUCKET_DETAILS=4           --bucket-details N for ereport (1..32).
-#   EREPORT_THREADS=32         worker threads (passed through to ereport).
+#   ECRAWL_ANALYZE_BIN=./ecrawl_analyze  analyzer binary (auto: ./, /tmp/, PATH).
+#   ECRAWL_BIN=./ecrawl                  ecrawl binary  (auto: ./, /tmp/, PATH).
+#   FORCE_CRAWL=0             if 1, recrawl every fixture even if shards exist.
+#   ECRAWL_ANALYZE_THREADS=32  worker threads (passed through; tool caps at the
+#                              shard count, and falls back to ECRAWL_REPAIR_THREADS
+#                              if ECRAWL_ANALYZE_THREADS is unset).
+#   ANALYZE_TOP=               if set to N, pass `--top N` to ecrawl_analyze.
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).
-#   INCLUDE_ROOT=0             also crawl+report the whole <synth-root> as one.
+#   INCLUDE_ROOT=0             also crawl+analyze the whole <synth-root> as one.
 #   DO_STRACE=1                run the strace pass.
 #   DO_PERF=1                  run the perf pass.
 #   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
@@ -55,29 +67,27 @@
 #                              for a meaningful perf sched trace.
 #   PERF_FREQ=997              perf sampling frequency (Hz).
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
-#   REPS=1                     repetitions of the clean report pass per fixture.
-#   EREPORT_VERBOSE_ARGS=...   extra args appended to ereport.
+#   REPS=1                     repetitions of the clean analyze pass per fixture.
+#   ECRAWL_ANALYZE_VERBOSE_ARGS=...  extra args appended to ecrawl_analyze.
 #
 # Data layout (under <out-parent>, persistent):
 #   <fixture>/bin/             ecrawl uid_shard_*.bin for that fixture
-#   <fixture>/all_users/       ereport HTML from the clean pass
 #
 # Profiling-log layout (under <results-dir>):
-#   env.txt                                 host/build/env snapshot
-#   <fixture>/crawl.time.txt|summary.txt    ecrawl /usr/bin/time + --verbose
-#   <fixture>/report/clean.verbose.txt      ereport --verbose key=value (stderr)
-#   <fixture>/report/clean.time.txt         /usr/bin/time -v
-#   <fixture>/report/clean.stdout.txt       ereport stdout
-#   <fixture>/report/report_size.txt        du of emitted HTML
-#   <fixture>/report/strace.txt             strace -f -c histogram
-#   <fixture>/report/perf.report.txt        perf report --stdio
-#   <fixture>/report/perf.report.caller.txt perf report caller view
-#   <fixture>/report/perf.report.bythread.txt per-thread CPU split (thread use)
-#   <fixture>/report/perf.sched.latency.txt per-thread sched runtime/delay (DO_SCHED)
-#   <fixture>/report/perf.sched.summary.txt perf sched timehist summary (DO_SCHED)
-#   SUMMARY_TABLE.txt                       at-a-glance table
-#   COMBINED_REPORT.txt                     everything concatenated
-#   ereport-profile-<timestamp>.tar.gz      tarball (upload this)
+#   env.txt                                    host/build/env snapshot
+#   <fixture>/crawl.summary.txt|crawl.*.txt    ecrawl /usr/bin/time + --verbose
+#   <fixture>/analyze/clean.stats.txt          ecrawl_analyze key=value (stdout)
+#   <fixture>/analyze/clean.progress.txt       ecrawl_analyze progress (stderr)
+#   <fixture>/analyze/clean.time.txt           /usr/bin/time -v
+#   <fixture>/analyze/strace.txt               strace -f -c histogram
+#   <fixture>/analyze/perf.report.txt          perf report --stdio
+#   <fixture>/analyze/perf.report.caller.txt   perf report caller view
+#   <fixture>/analyze/perf.report.bythread.txt per-thread CPU split (thread use)
+#   <fixture>/analyze/perf.sched.latency.txt   per-thread sched runtime/delay (DO_SCHED)
+#   <fixture>/analyze/perf.sched.summary.txt   perf sched timehist summary (DO_SCHED)
+#   SUMMARY_TABLE.txt                          at-a-glance table
+#   COMBINED_REPORT.txt                        everything concatenated
+#   ecrawl_analyze-profile-<timestamp>.tar.gz  tarball (upload this)
 #
 set -uo pipefail
 
@@ -97,7 +107,7 @@ mkdir -p "$OUT_PARENT" || { echo "ERROR: cannot create out-parent '$OUT_PARENT'"
 OUT_PARENT=$(cd "$OUT_PARENT" && pwd)
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${3:-"./ereport-profile-$TS"}
+RESULTS_DIR=${3:-"./ecrawl_analyze-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
@@ -115,17 +125,14 @@ find_bin() {
   else echo "ERROR: cannot find $name; set $var=/path/to/$name" >&2; exit 1
   fi
 }
-EREPORT_BIN=$(find_bin ereport EREPORT_BIN)
+ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN)
 ECRAWL_BIN=$(find_bin ecrawl ECRAWL_BIN)
 
 # ---- config ----------------------------------------------------------------
-# Instrumentation passes (strace/perf) regenerate the report into a throwaway
-# dir so they never disturb the canonical clean-pass HTML; this is their home.
-INSTR_BASE="$RESULTS_DIR/_instr_report"
 FORCE_CRAWL=${FORCE_CRAWL:-0}
-BUCKET_DETAILS=${BUCKET_DETAILS:-4}
-EREPORT_THREADS=${EREPORT_THREADS:-32}
-export EREPORT_THREADS
+ECRAWL_ANALYZE_THREADS=${ECRAWL_ANALYZE_THREADS:-32}
+export ECRAWL_ANALYZE_THREADS
+ANALYZE_TOP=${ANALYZE_TOP:-}
 DO_STRACE=${DO_STRACE:-1}
 DO_PERF=${DO_PERF:-1}
 DO_SCHED=${DO_SCHED:-0}
@@ -134,8 +141,7 @@ PERF_FREQ=${PERF_FREQ:-997}
 PERF_CALLGRAPH=${PERF_CALLGRAPH:-dwarf}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
-KEEP_REPORTS=${KEEP_REPORTS:-1}
-EREPORT_VERBOSE_ARGS=${EREPORT_VERBOSE_ARGS:-}
+ECRAWL_ANALYZE_VERBOSE_ARGS=${ECRAWL_ANALYZE_VERBOSE_ARGS:-}
 
 KNOWN_FIXTURES=(
   deep_skinny_chain
@@ -214,65 +220,52 @@ ensure_bins() {
   echo "    crawl: produced $n shard(s) (rc=$rc)"
 }
 
-# Build ereport argv (all-users form) into RUN_ARGV.
+# Build ecrawl_analyze argv into RUN_ARGV.
 build_argv() {
-  local bindir=$1 reportdir=$2
-  RUN_ARGV=("$EREPORT_BIN" --bucket-details "$BUCKET_DETAILS" --report-dir "$reportdir" --verbose)
+  local bindir=$1
+  RUN_ARGV=("$ECRAWL_ANALYZE_BIN" --verbose)
+  [[ -n "$ANALYZE_TOP" ]] && RUN_ARGV+=(--top "$ANALYZE_TOP")
   # shellcheck disable=SC2206
-  [[ -n "$EREPORT_VERBOSE_ARGS" ]] && RUN_ARGV+=($EREPORT_VERBOSE_ARGS)
+  [[ -n "$ECRAWL_ANALYZE_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_ANALYZE_VERBOSE_ARGS)
   RUN_ARGV+=("$bindir")
 }
 
 run_clean() {
-  local dest=$1 bindir=$2 reportparent=$3 rep=$4
+  local dest=$1 bindir=$2 rep=$3
   local sfx=""; [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
-  # ereport --report-dir <reportparent> writes the all-users HTML into
-  # <reportparent>/all_users/ ; that is the canonical, kept output.
-  mkdir -p "$reportparent"
-  build_argv "$bindir" "$reportparent"
-  echo "    report clean${sfx}: ${RUN_ARGV[*]}"
-  # Own monotonic wall timer: /usr/bin/time may be absent, and ereport only
-  # prints elapsed_sec on its ~30s verbose peek (missing for sub-30s reports).
+  build_argv "$bindir"
+  echo "    analyze clean${sfx}: ${RUN_ARGV[*]}"
+  # Own monotonic wall timer: /usr/bin/time may be absent, and ecrawl_analyze
+  # does not print its own elapsed_sec.
   local t0 t1
   t0=$(date +%s.%N)
   if [[ "$HAVE_TIME" == "1" ]]; then
     "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
-      "${RUN_ARGV[@]}" >"$dest/clean.stdout${sfx}.txt" 2>"$dest/clean.verbose${sfx}.txt"
+      "${RUN_ARGV[@]}" >"$dest/clean.stats${sfx}.txt" 2>"$dest/clean.progress${sfx}.txt"
   else
-    "${RUN_ARGV[@]}" >"$dest/clean.stdout${sfx}.txt" 2>"$dest/clean.verbose${sfx}.txt"
+    "${RUN_ARGV[@]}" >"$dest/clean.stats${sfx}.txt" 2>"$dest/clean.progress${sfx}.txt"
   fi
   local rc=$?
   t1=$(date +%s.%N)
   awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/clean.wall${sfx}.txt"
-  echo "rc=$rc" >>"$dest/clean.verbose${sfx}.txt"
-  echo "    report clean${sfx}: rc=$rc wall=$(cut -d= -f2 "$dest/clean.wall${sfx}.txt")s"
-  local html="$reportparent/all_users"
-  { echo "report_dir=$html"
-    echo "report_dir_size=$(du -sh "$html" 2>/dev/null | cut -f1)"
-    echo "report_html_files=$(find "$html" -type f 2>/dev/null | wc -l)"
-  } >"$dest/report_size${sfx}.txt"
-  [[ "$KEEP_REPORTS" == "1" ]] || rm -rf "$html"
+  echo "rc=$rc" >>"$dest/clean.progress${sfx}.txt"
+  echo "    analyze clean${sfx}: rc=$rc wall=$(cut -d= -f2 "$dest/clean.wall${sfx}.txt")s"
 }
 
 run_strace() {
   local dest=$1 bindir=$2
   [[ "$DO_STRACE" == "1" ]] || return 0
-  local reportdir="$INSTR_BASE/strace"
-  rm -rf "$reportdir"; mkdir -p "$reportdir"
-  build_argv "$bindir" "$reportdir"
-  echo "    report strace: strace -f -c (timing not representative)"
+  build_argv "$bindir"
+  echo "    analyze strace: strace -f -c (timing not representative)"
   strace -f -c -o "$dest/strace.txt" \
-    "${RUN_ARGV[@]}" >/dev/null 2>"$dest/strace.ereport-stderr.txt"
-  rm -rf "$reportdir"
+    "${RUN_ARGV[@]}" >/dev/null 2>"$dest/strace.analyze-stderr.txt"
 }
 
 run_perf() {
   local dest=$1 bindir=$2
   [[ "$DO_PERF" == "1" ]] || return 0
-  local reportdir="$INSTR_BASE/perf"
-  rm -rf "$reportdir"; mkdir -p "$reportdir"
-  build_argv "$bindir" "$reportdir"
-  echo "    report perf: perf record --call-graph $PERF_CALLGRAPH -F $PERF_FREQ"
+  build_argv "$bindir"
+  echo "    analyze perf: perf record --call-graph $PERF_CALLGRAPH -F $PERF_FREQ"
   local data="$dest/perf.data"
   if perf record --call-graph "$PERF_CALLGRAPH" -F "$PERF_FREQ" -o "$data" \
        "${RUN_ARGV[@]}" >/dev/null 2>"$dest/perf.record-stderr.txt"; then
@@ -291,7 +284,6 @@ run_perf() {
       >"$dest/perf.report.txt"
   fi
   rm -f "$data"
-  rm -rf "$reportdir"
 }
 
 # Per-thread scheduling view (runtime / switches / delay) for big fixtures only.
@@ -302,10 +294,8 @@ run_sched() {
   [[ "$DO_SCHED" == "1" ]] || return 0
   case " $SCHED_FIXTURES " in *" $fixture "*) ;; *) return 0 ;; esac
   command -v perf >/dev/null 2>&1 || return 0
-  local reportdir="$INSTR_BASE/sched"
-  rm -rf "$reportdir"; mkdir -p "$reportdir"
-  build_argv "$bindir" "$reportdir"
-  echo "    report sched: perf sched record (per-thread concurrency; data not kept)"
+  build_argv "$bindir"
+  echo "    analyze sched: perf sched record (per-thread concurrency; data not kept)"
   local data="$dest/perf.sched.data"
   if perf sched record -o "$data" \
        "${RUN_ARGV[@]}" >/dev/null 2>"$dest/perf.sched.record-stderr.txt"; then
@@ -319,7 +309,6 @@ run_sched() {
       >"$dest/perf.sched.latency.txt"
   fi
   rm -f "$data"
-  rm -rf "$reportdir"
 }
 
 profile_one() {
@@ -328,33 +317,33 @@ profile_one() {
   local fxout="$OUT_PARENT/$fixture"
   local bindir="$fxout/bin"
   local dest="$RESULTS_DIR/$fixture"
-  local rdest="$dest/report"
-  mkdir -p "$fxout" "$dest" "$rdest"
+  local adest="$dest/analyze"
+  mkdir -p "$fxout" "$dest" "$adest"
   ensure_bins "$fixture" "$start" "$bindir" "$dest"
   if [[ "$(shard_count "$bindir")" -eq 0 ]]; then
-    echo "    (no shards; skipping report passes)"; return
+    echo "    (no shards; skipping analyze passes)"; return
   fi
   local r
   for ((r = 1; r <= REPS; r++)); do
-    run_clean "$rdest" "$bindir" "$fxout" "$r"
+    run_clean "$adest" "$bindir" "$r"
   done
-  run_strace "$rdest" "$bindir"
-  run_perf   "$rdest" "$bindir"
-  run_sched  "$rdest" "$bindir" "$fixture"
+  run_strace "$adest" "$bindir"
+  run_perf   "$adest" "$bindir"
+  run_sched  "$adest" "$bindir" "$fixture"
 }
 
 # ---- env snapshot ----------------------------------------------------------
 {
-  echo "# ereport fixture profile"
+  echo "# ecrawl_analyze fixture profile"
   echo "timestamp=$TS"
   echo "synth_root=$SYNTH_ROOT"
   echo "synth_root_fstype=$(fs_type "$SYNTH_ROOT")"
   echo "results_dir=$RESULTS_DIR"
   echo "out_parent=$OUT_PARENT"
-  echo "ereport_bin=$EREPORT_BIN"
+  echo "ecrawl_analyze_bin=$ECRAWL_ANALYZE_BIN"
   echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "config: bucket_details=$BUCKET_DETAILS ereport_threads=$EREPORT_THREADS force_crawl=$FORCE_CRAWL"
-  echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_reports=$KEEP_REPORTS"
+  echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off} force_crawl=$FORCE_CRAWL"
+  echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -372,11 +361,11 @@ profile_one() {
   [[ "$HAVE_STRACE" == "1" ]] && echo "strace_version=$(strace -V 2>&1 | head -n1)"
   [[ "$HAVE_PERF"   == "1" ]] && echo "perf_version=$(perf --version 2>&1 | head -n1)"
   echo
-  echo "## ereport-related env"
-  env | grep -E '^EREPORT_' | sort || true
+  echo "## ecrawl_analyze-related env"
+  env | grep -E '^ECRAWL_ANALYZE_|^ECRAWL_REPAIR_' | sort || true
 } >"$RESULTS_DIR/env.txt"
 
-echo "ereport profile starting; results -> $RESULTS_DIR"
+echo "ecrawl_analyze profile starting; results -> $RESULTS_DIR"
 sed 's/^/  /' "$RESULTS_DIR/env.txt"
 echo
 
@@ -388,7 +377,6 @@ if [[ "$DO_PERF" == "1" ]]; then
 fi
 
 # ---- run -------------------------------------------------------------------
-mkdir -p "$INSTR_BASE"
 for f in "${FIXLIST[@]}"; do
   if [[ ! -d "$SYNTH_ROOT/$f" ]]; then
     echo "==> $f  (MISSING under $SYNTH_ROOT; skipped)"; continue
@@ -398,13 +386,12 @@ done
 if [[ "$INCLUDE_ROOT" == "1" ]]; then
   profile_one "_ALL_ROOT_" "$SYNTH_ROOT"
 fi
-rm -rf "$INSTR_BASE"
 
 # ---- combined report -------------------------------------------------------
 COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
 {
   echo "########################################################################"
-  echo "# ereport fixture profile — combined report"
+  echo "# ecrawl_analyze fixture profile — combined report"
   echo "########################################################################"
   echo
   cat "$RESULTS_DIR/env.txt"
@@ -418,9 +405,9 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
       [[ -e "$file" ]] || continue
       echo "----- $(basename "$file") -----"; cat "$file"; echo
     done
-    d="$RESULTS_DIR/$f/report"
+    d="$RESULTS_DIR/$f/analyze"
     [[ -d "$d" ]] || continue
-    for part in clean.verbose clean.time report_size; do
+    for part in clean.stats clean.time; do
       for file in "$d/$part"*.txt; do
         [[ -e "$file" ]] || continue
         echo "----- $(basename "$file") -----"; cat "$file"; echo
@@ -480,27 +467,26 @@ def kv(p):
     return d
 
 
-def report_kv(fx, rep=1, reps=False):
-    for cand in ((f"clean.verbose.rep{rep}.txt",) if reps else
-                 ("clean.verbose.rep1.txt", "clean.verbose.txt")):
-        p = root / fx / "report" / cand
+def analyze_kv(fx):
+    for cand in ("clean.stats.rep1.txt", "clean.stats.txt"):
+        p = root / fx / "analyze" / cand
         if p.exists():
             return kv(p)
     return {}
 
 
 def reps_elapsed(fx):
-    """Report wall time from our own timer (clean.wall*), per rep."""
+    """Analyze wall time from our own timer (clean.wall*), per rep."""
     out = []
     for r in range(1, 100):
-        p = root / fx / "report" / f"clean.wall.rep{r}.txt"
+        p = root / fx / "analyze" / f"clean.wall.rep{r}.txt"
         if not p.exists():
             break
         v = num(kv(p).get("wall_seconds", ""))
         if v is not None:
             out.append(v)
     if not out:
-        p = root / fx / "report" / "clean.wall.txt"
+        p = root / fx / "analyze" / "clean.wall.txt"
         if p.exists():
             v = num(kv(p).get("wall_seconds", ""))
             if v is not None:
@@ -509,7 +495,7 @@ def reps_elapsed(fx):
 
 
 def strace_top(fx, k=6):
-    p = root / fx / "report" / "strace.txt"
+    p = root / fx / "analyze" / "strace.txt"
     if not p.exists():
         return []
     rows = []
@@ -524,11 +510,12 @@ def strace_top(fx, k=6):
 def perf_threads(fx, min_pct=1.0, top=5):
     """Per-thread on-CPU spread from perf.report.bythread.txt.
 
-    Returns (n_threads_ge_min, top_pcts) where top_pcts is the largest
-    per-thread overhead percentages. Lets you see whether a phase that should
-    use N workers actually spread CPU across N threads or collapsed onto a few.
+    Returns (n_threads_ge_min, top_pcts): how many distinct threads carried
+    >=min_pct of CPU samples, and the busiest per-thread percentages. Because
+    ecrawl_analyze caps workers at the shard count, single-shard fixtures show
+    threads>=1%=1 here.
     """
-    p = root / fx / "report" / "perf.report.bythread.txt"
+    p = root / fx / "analyze" / "perf.report.bythread.txt"
     if not p.exists():
         return None
     pcts = []
@@ -560,7 +547,7 @@ def fmt(v, kind="int"):
 
 lines = []
 hdr = kv(root / "env.txt")
-lines.append("ereport profile — SUMMARY TABLE")
+lines.append("ecrawl_analyze profile — SUMMARY TABLE")
 lines.append(f"  timestamp={hdr.get('timestamp','?')}  synth_root={hdr.get('synth_root','?')}")
 lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('synth_root_fstype','?')}")
 for key in ("config:", "modes:"):
@@ -573,57 +560,56 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "crawl(s)", "report(s)", "report_html",
-        "parse(s)", "bucketHTML(s)", "sortIdx(s)", "indexHTML(s)"]
-w = [22, 8, 9, 10, 12, 9, 13, 11, 12]
+cols = ["fixture", "shards", "crawl(s)", "analyze(s)", "records",
+        "parents", "maxNfile", "chunks"]
+w = [22, 8, 9, 11, 14, 14, 12, 11]
 
 
 def row(vals):
     return "  ".join(str(v).ljust(w[i]) for i, v in enumerate(vals))
 
 
-lines.append("== CRAWL + REPORT WALL TIME ==")
+lines.append("== CRAWL + ANALYZE WALL TIME ==")
 lines.append(row(cols))
 lines.append(row(["-" * x for x in w]))
 for fx in fixtures:
-    rv = report_kv(fx)
-    if not rv and not (root / fx / "crawl.summary.txt").exists():
+    av = analyze_kv(fx)
+    if not av and not (root / fx / "crawl.summary.txt").exists():
         continue
     csum = kv(root / fx / "crawl.summary.txt")
     el = reps_elapsed(fx)
     el_avg = (sum(el) / len(el)) if el else None
-    rsz = kv(root / fx / "report" / "report_size.txt").get("report_dir_size") \
-        or kv(root / fx / "report" / "report_size.rep1.txt").get("report_dir_size")
     cw = num(kv(root / fx / "crawl.wall.txt").get("wall_seconds", ""))
     lines.append(row([
         fx,
         csum.get("uid_shard_files", "-"),
         fmt(cw, "f1") if cw is not None else ("reuse" if csum.get("reused") == "1" else "-"),
         fmt(el_avg, "f2") if el_avg is not None else "-",
-        rsz or "-",
-        fmt(num(rv.get("verbose_wall_parse_workers_sec")), "f2"),
-        fmt(num(rv.get("verbose_wall_bucket_html_cells_wall_sec")), "f2"),
-        fmt(num(rv.get("verbose_sort_path_index_sec")), "f2"),
-        fmt(num(rv.get("verbose_wall_index_html_sec")), "f2"),
+        fmt(num(av.get("records_total"))),
+        fmt(num(av.get("distinct_parent_directories"))),
+        fmt(num(av.get("max_regular_files_under_single_parent"))),
+        fmt(num(av.get("parse_chunk_jobs"))),
     ]))
 lines.append("")
 
 # --- per-thread on-CPU spread (perf) --------------------------------------
-# threads_>=1% = how many distinct threads each carried >=1% of CPU samples;
-# compare against ereport_threads to spot phases that collapse onto few threads.
+# threads_>=1% = how many distinct threads each carried >=1% of CPU samples.
+# ecrawl_analyze caps workers at the shard count, so single-shard fixtures
+# show 1; many-shard corpora should approach analyze_threads.
 lines.append("== PER-THREAD ON-CPU SPREAD (perf; whole run) ==")
-lines.append("   threads>=1% vs configured ereport_threads; top% = busiest threads")
+lines.append("   threads>=1% (tool caps workers at shard count); top% = busiest threads")
 for fx in fixtures:
     pt = perf_threads(fx)
     if not pt:
         continue
     n_ge, tops = pt
     tops_s = " ".join(f"{x:.1f}%" for x in tops)
-    lines.append(f"  {fx}: threads>=1%={n_ge}  top={tops_s}")
+    shards = kv(root / fx / "crawl.summary.txt").get("uid_shard_files", "?")
+    lines.append(f"  {fx}: threads>=1%={n_ge} (shards={shards})  top={tops_s}")
 lines.append("")
 
-# --- strace top syscalls (report pass) ------------------------------------
-lines.append("== STRACE TOP SYSCALLS (report pass; %time, count) ==")
+# --- strace top syscalls (analyze pass) -----------------------------------
+lines.append("== STRACE TOP SYSCALLS (analyze pass; %time, count) ==")
 for fx in fixtures:
     top = strace_top(fx)
     if not top:
@@ -633,7 +619,7 @@ for fx in fixtures:
 lines.append("")
 
 # --- elapsed per rep ------------------------------------------------------
-lines.append("== REPORT ELAPSED PER REP ==")
+lines.append("== ANALYZE ELAPSED PER REP ==")
 for fx in fixtures:
     el = reps_elapsed(fx)
     if el:
@@ -657,7 +643,7 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "DONE."
   echo "  Summary table:   $SUMMARY_TABLE"
   echo "  Combined report: $COMBINED"
-  echo "  Data (bins+HTML kept): $OUT_PARENT/<fixture>/{bin,all_users}  (bins reused; FORCE_CRAWL=1 to recrawl)"
+  echo "  Data (bins kept): $OUT_PARENT/<fixture>/bin  (bins reused; FORCE_CRAWL=1 to recrawl)"
   echo "  Tarball (upload this): $TARBALL"
   echo
   echo "----- SUMMARY_TABLE.txt -----"

@@ -45,6 +45,12 @@
 #   DO_WRITE=1                 run the write pass (default 1).
 #   DO_STRACE=1                run the strace -f -c pass (default 1).
 #   DO_PERF=0                  run the perf record pass (default 0; set 1 to enable).
+#   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
+#                              switch / delay) — only for fixtures listed in
+#                              SCHED_FIXTURES, since the trace is large. Use it
+#                              to confirm per-section thread concurrency.
+#   SCHED_FIXTURES="single_huge_dir mega_dir1 mega_dir2"  fixtures big enough
+#                              for a meaningful perf sched trace.
 #   PERF_FREQ=997              perf sampling frequency (Hz).
 #   DROP_CACHES=0              if 1 and running as root, drop page cache before
 #                              each clean pass (sync; echo 3 > drop_caches) so
@@ -64,6 +70,9 @@
 #   <fixture>/<mode>/shards.txt          uid_shard_*.bin count (write mode only)
 #   <fixture>/<mode>/strace.txt          strace -f -c histogram
 #   <fixture>/<mode>/perf.report.txt     perf report --stdio (if DO_PERF=1)
+#   <fixture>/<mode>/perf.<mode>.report.bythread.txt per-thread CPU split (thread use)
+#   <fixture>/<mode>/perf.<mode>.sched.latency.txt   per-thread sched runtime/delay (DO_SCHED)
+#   <fixture>/<mode>/perf.<mode>.sched.summary.txt   perf sched timehist summary (DO_SCHED)
 #   COMBINED_REPORT.txt                  everything concatenated for easy upload
 #   ecrawl-profile-<timestamp>.tar.gz    tarball of the whole results dir
 #
@@ -104,6 +113,8 @@ DO_NOWRITE=${DO_NOWRITE:-1}
 DO_WRITE=${DO_WRITE:-1}
 DO_STRACE=${DO_STRACE:-1}
 DO_PERF=${DO_PERF:-0}
+DO_SCHED=${DO_SCHED:-0}
+SCHED_FIXTURES=${SCHED_FIXTURES:-"single_huge_dir mega_dir1 mega_dir2"}
 PERF_FREQ=${PERF_FREQ:-997}
 DROP_CACHES=${DROP_CACHES:-0}
 REPS=${REPS:-1}
@@ -263,9 +274,42 @@ run_perf() {
     # Caller/callee + a futex/lock-focused view to pinpoint the contended critical section.
     perf report -i "$data" --stdio -g graph,0.5,caller 2>/dev/null \
       >"$dest/perf.${mode}.report.caller.txt" || true
+    # Per-thread CPU split from the same data (free): how evenly did the crawl /
+    # writer threads actually burn CPU? Bare TIDs unless threads are named.
+    # perf's per-thread sort key is `pid` (shows PID:TID); `tid` isn't accepted
+    # on all builds. Keep stderr so an empty report stays diagnosable.
+    perf report -i "$data" --stdio --no-children --sort comm,pid \
+      >"$dest/perf.${mode}.report.bythread.txt" 2>"$dest/perf.${mode}.report.bythread-stderr.txt" || true
   else
     echo "perf record failed; check kernel.perf_event_paranoid and permissions." \
       >"$dest/perf.${mode}.report.txt"
+  fi
+  rm -f "$data"
+  [[ "$mode" == "write" ]] && rm -rf "$outdir"
+}
+
+# Per-thread scheduling view (runtime / switches / delay) for big fixtures only.
+# Confirms how many threads were genuinely on-CPU per section vs. waiting. The
+# raw trace is large, so only the text summaries are kept.
+run_sched() {
+  local fixture=$1 mode=$2 start=$3 dest=$4 outdir=$5
+  [[ "$DO_SCHED" == "1" ]] || return 0
+  case " $SCHED_FIXTURES " in *" $fixture "*) ;; *) return 0 ;; esac
+  command -v perf >/dev/null 2>&1 || return 0
+  if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
+  build_argv "$mode" "$start" "$outdir"
+  echo "    sched/$mode: perf sched record (per-thread concurrency; data not kept)"
+  local data="$dest/perf.${mode}.sched.data"
+  if perf sched record -o "$data" \
+       "${RUN_ARGV[@]}" >/dev/null 2>"$dest/perf.${mode}.sched.record-stderr.txt"; then
+    perf sched latency -i "$data" 2>/dev/null >"$dest/perf.${mode}.sched.latency.txt" || true
+    perf sched timehist -i "$data" --summary-only 2>/dev/null \
+      >"$dest/perf.${mode}.sched.summary.txt" \
+      || perf sched timehist -i "$data" -s 2>/dev/null | tail -n 80 \
+         >"$dest/perf.${mode}.sched.summary.txt" || true
+  else
+    echo "perf sched record failed; needs sched tracepoints (perf_event_paranoid<=1 or root)." \
+      >"$dest/perf.${mode}.sched.latency.txt"
   fi
   rm -f "$data"
   [[ "$mode" == "write" ]] && rm -rf "$outdir"
@@ -291,6 +335,7 @@ profile_one() {
     done
     run_strace "$mode" "$start" "$dest" "$outdir"
     run_perf   "$mode" "$start" "$dest" "$outdir"
+    run_sched  "$fixture" "$mode" "$start" "$dest" "$outdir"
   done
 }
 
@@ -304,7 +349,8 @@ profile_one() {
   echo "output_base=$OUTPUT_BASE"
   echo "output_base_fstype=$(fs_type "$(dirname "$OUTPUT_BASE")")"
   echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF  reps=$REPS drop_caches=$DROP_CACHES"
+  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED  reps=$REPS drop_caches=$DROP_CACHES"
+  echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
   echo "## host"
@@ -384,6 +430,16 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
       if [[ -s "$d/perf.${mode}.report.txt" ]]; then
         echo "----- perf.${mode}.report.txt (top 40 lines) -----"
         head -n 40 "$d/perf.${mode}.report.txt"
+        echo
+      fi
+      if [[ -s "$d/perf.${mode}.report.bythread.txt" ]]; then
+        echo "----- perf.${mode}.report.bythread.txt (top 40 lines) -----"
+        head -n 40 "$d/perf.${mode}.report.bythread.txt"
+        echo
+      fi
+      if [[ -s "$d/perf.${mode}.sched.latency.txt" ]]; then
+        echo "----- perf.${mode}.sched.latency.txt -----"
+        cat "$d/perf.${mode}.sched.latency.txt"
         echo
       fi
     done
@@ -484,6 +540,31 @@ def strace_counts(fx, mode):
             out[name] = int(m.group(2))
             out[name + "_pct"] = float(m.group(1))
     return out
+
+
+def perf_threads(fx, mode, min_pct=1.0, top=5):
+    """Per-thread on-CPU spread from perf.<mode>.report.bythread.txt.
+
+    Returns (n_threads_ge_min, top_pcts): how many distinct threads carried
+    >=min_pct of CPU samples, and the busiest per-thread percentages. Shows
+    whether crawl/writer work actually spread across threads or collapsed.
+    """
+    p = root / fx / mode / f"perf.{mode}.report.bythread.txt"
+    if not p.exists():
+        return None
+    pcts = []
+    for line in p.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"([\d.]+)%\s+\S+\s+\d+", line)
+        if m:
+            pcts.append(float(m.group(1)))
+    if not pcts:
+        return None
+    pcts.sort(reverse=True)
+    n_ge = sum(1 for x in pcts if x >= min_pct)
+    return (n_ge, pcts[:top])
 
 
 def fmt(v, kind="int"):
@@ -612,6 +693,21 @@ for fx in fixtures:
             fmt(sc.get("close")),
             fmt(sc.get("futex_pct"), "f1") if "futex_pct" in sc else "-",
         ]))
+lines.append("")
+
+# --- per-thread on-CPU spread (perf) --------------------------------------
+# threads_>=1% = how many distinct threads each carried >=1% of CPU samples;
+# compare against avg_active_workers / crawl thread count to spot collapse.
+lines.append("== PER-THREAD ON-CPU SPREAD (perf; per fixture/mode) ==")
+lines.append("   threads>=1% = busy thread count; top% = busiest threads (needs DO_PERF=1)")
+for fx in fixtures:
+    for mode in ("nowrite", "write"):
+        pt = perf_threads(fx, mode)
+        if not pt:
+            continue
+        n_ge, tops = pt
+        tops_s = " ".join(f"{x:.1f}%" for x in tops)
+        lines.append(f"  {fx}/{mode}: threads>=1%={n_ge}  top={tops_s}")
 lines.append("")
 
 # --- elapsed stability (per rep) ------------------------------------------
