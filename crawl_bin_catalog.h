@@ -11,7 +11,8 @@
 #include <stdio.h>
 
 typedef struct crawl_bin_catalog {
-    uint64_t max_dir_id;
+    uint64_t max_dir_id; /* highest dir_id with valid data (arrays valid for 1..max_dir_id) */
+    uint64_t cap;        /* allocated slots: arrays sized cap+1 (cap >= max_dir_id) */
     uint64_t *parent_dir_id; /* index by dir_id; 0 unused */
     uint32_t *depth;
     uint16_t *name_len;

@@ -37,28 +37,41 @@ void crawl_bin_catalog_free(crawl_bin_catalog_t *c) {
 
 static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
     uint64_t new_cap;
-    uint64_t old_cap;
     uint64_t i;
 
     if (dir_id <= c->max_dir_id) return 0;
-    old_cap = c->max_dir_id;
-    new_cap = dir_id;
-    c->parent_dir_id = (uint64_t *)realloc(c->parent_dir_id, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    c->depth = (uint32_t *)realloc(c->depth, (size_t)(new_cap + 1ULL) * sizeof(uint32_t));
-    c->name_len = (uint16_t *)realloc(c->name_len, (size_t)(new_cap + 1ULL) * sizeof(uint16_t));
-    c->name_comp = (char **)realloc(c->name_comp, (size_t)(new_cap + 1ULL) * sizeof(char *));
-    c->imm_child_bytes = (uint64_t *)realloc(c->imm_child_bytes, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    c->imm_child_count = (uint64_t *)realloc(c->imm_child_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    c->imm_child_ctime_led_count =
-        (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    c->imm_child_min_eff_time =
-        (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    c->imm_child_max_eff_time =
-        (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-    if (!c->parent_dir_id || !c->depth || !c->name_len || !c->name_comp ||
-        !c->imm_child_bytes || !c->imm_child_count || !c->imm_child_ctime_led_count ||
-        !c->imm_child_min_eff_time || !c->imm_child_max_eff_time) return -1;
-    for (i = old_cap + 1; i <= new_cap; i++) {
+
+    if (dir_id > c->cap) {
+        /*
+         * Grow geometrically. Catalog entries arrive with roughly sequential
+         * dir_ids, so growing to exactly dir_id (the old behaviour) reallocated
+         * all nine arrays on nearly every entry -> O(n^2) copying (~27% of CPU
+         * in realloc/memmove/page-faults on a 1M-parent shard). Double, bounded
+         * to the request, with a small floor, to amortize realloc to O(n).
+         */
+        new_cap = c->cap * 2ULL;
+        if (new_cap < dir_id) new_cap = dir_id;
+        if (new_cap < 256ULL) new_cap = 256ULL;
+
+        c->parent_dir_id = (uint64_t *)realloc(c->parent_dir_id, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        c->depth = (uint32_t *)realloc(c->depth, (size_t)(new_cap + 1ULL) * sizeof(uint32_t));
+        c->name_len = (uint16_t *)realloc(c->name_len, (size_t)(new_cap + 1ULL) * sizeof(uint16_t));
+        c->name_comp = (char **)realloc(c->name_comp, (size_t)(new_cap + 1ULL) * sizeof(char *));
+        c->imm_child_bytes = (uint64_t *)realloc(c->imm_child_bytes, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        c->imm_child_count = (uint64_t *)realloc(c->imm_child_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        c->imm_child_ctime_led_count =
+            (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        c->imm_child_min_eff_time =
+            (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        c->imm_child_max_eff_time =
+            (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
+        if (!c->parent_dir_id || !c->depth || !c->name_len || !c->name_comp ||
+            !c->imm_child_bytes || !c->imm_child_count || !c->imm_child_ctime_led_count ||
+            !c->imm_child_min_eff_time || !c->imm_child_max_eff_time) return -1;
+        c->cap = new_cap;
+    }
+
+    for (i = c->max_dir_id + 1; i <= dir_id; i++) {
         c->parent_dir_id[i] = 0;
         c->depth[i] = 0;
         c->name_len[i] = 0;
@@ -69,7 +82,7 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
         c->imm_child_min_eff_time[i] = UINT64_MAX;
         c->imm_child_max_eff_time[i] = 0;
     }
-    c->max_dir_id = new_cap;
+    c->max_dir_id = dir_id;
     return 0;
 }
 
