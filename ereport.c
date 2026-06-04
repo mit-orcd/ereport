@@ -499,7 +499,7 @@ static const char *ereport_finalize_index_step_cstr(unsigned step) {
 
 typedef struct dense_node {
     struct dense_node *next;
-    char *parent;
+    char *parent;  /* points into the trailing bytes of this same malloc block (see dense_node_new); never freed separately */
     uint64_t n;
     uint32_t hash; /* full 32-bit FNV of parent; bucket = hash % DENSE_PARENT_BUCKETS */
 } dense_node_t;
@@ -2090,6 +2090,23 @@ static uint32_t dense_parent_bucket_fanout_lookup(const char *parent) {
     return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
 }
 
+/* Single allocation: node header immediately followed by the NUL-terminated parent
+ * string. node->parent points into the same block, so it is never freed separately
+ * (all free sites just free(node)) and it shares cache lines with the node header,
+ * which speeds the collision-chain strcmp walks that dominate flat/many-parent corpora. */
+static dense_node_t *dense_node_new(const char *parent, uint32_t h, uint64_t n) {
+    size_t len = strlen(parent);
+    dense_node_t *node = (dense_node_t *)malloc(sizeof(*node) + len + 1U);
+
+    if (!node) return NULL;
+    node->parent = (char *)(node + 1);
+    memcpy(node->parent, parent, len + 1U);
+    node->n = n;
+    node->hash = h;
+    node->next = NULL;
+    return node;
+}
+
 /* Insert/accumulate with a precomputed full hash; compares hash before strcmp so
  * collision-chain walks skip the (expensive) full path strcmp on hash mismatches. */
 static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h, uint64_t delta,
@@ -2105,19 +2122,11 @@ static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h,
         }
         pp = &(*pp)->next;
     }
-    node = (dense_node_t *)malloc(sizeof(*node));
+    node = dense_node_new(parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
     }
-    node->parent = strdup(parent);
-    if (!node->parent) {
-        free(node);
-        if (sum) sum->bad_input_files++;
-        return -1;
-    }
-    node->n = delta;
-    node->hash = h;
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
     return 0;
@@ -2148,19 +2157,11 @@ static int dense_cell_add_cached_h(dense_cell_map_t *m, const char *parent, uint
         }
         pp = &(*pp)->next;
     }
-    node = (dense_node_t *)malloc(sizeof(*node));
+    node = dense_node_new(parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
     }
-    node->parent = strdup(parent);
-    if (!node->parent) {
-        free(node);
-        if (sum) sum->bad_input_files++;
-        return -1;
-    }
-    node->n = delta;
-    node->hash = h;
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
     m->last = node;
@@ -2239,13 +2240,11 @@ static void dmerge_do_phase2(dmerge_pt_ctx_t *c) {
                     while (n) {
                         dense_node_t *rest = n->next;
 
-                        free(n->parent);
                         free(n);
                         n = rest;
                     }
                     break;
                 }
-                free(n->parent);
                 free(n);
                 n = nx;
             }
@@ -2281,18 +2280,15 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
             dense_node_t *nx = n->next;
             if (dense_cell_add_h(dst, n->parent, n->hash, n->n, sum) != 0) {
                 /* Leak avoidance on OOM: drop remaining src chain. */
-                free(n->parent);
                 free(n);
                 n = nx;
                 while (n) {
                     nx = n->next;
-                    free(n->parent);
                     free(n);
                     n = nx;
                 }
                 break;
             }
-            free(n->parent);
             free(n);
             n = nx;
         }
@@ -2652,7 +2648,6 @@ static void dense_cell_fanout_lookup_free(dense_cell_fanout_lookup_t *lk) {
         while (n) {
             dense_node_t *nx = n->next;
 
-            free(n->parent);
             free(n);
             n = nx;
         }
@@ -2778,7 +2773,6 @@ static void dense_cell_free(dense_cell_map_t *m) {
         m->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            free(n->parent);
             free(n);
             n = nx;
         }
