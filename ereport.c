@@ -2123,10 +2123,6 @@ static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h,
     return 0;
 }
 
-static int dense_cell_add(dense_cell_map_t *m, const char *parent, uint64_t delta, summary_t *sum) {
-    return dense_cell_add_h(m, parent, dense_hash_full(parent), delta, sum);
-}
-
 /* Accumulate keyed by parent_dir_id with a last-hit fast path. parent_id must be a
  * stable identifier for the directory whose path is *parent (here: the crawl-bin
  * parent_dir_id, which is bijective with the parent path). Repeated records under the
@@ -2239,7 +2235,7 @@ static void dmerge_do_phase2(dmerge_pt_ctx_t *c) {
                 dense_node_t *nx = n->next;
 
                 n->next = NULL;
-                if (dense_cell_add(c->dst, n->parent, n->n, c->sum) != 0) {
+                if (dense_cell_add_h(c->dst, n->parent, n->hash, n->n, c->sum) != 0) {
                     while (n) {
                         dense_node_t *rest = n->next;
 
@@ -2283,7 +2279,7 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
         src->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            if (dense_cell_add(dst, n->parent, n->n, sum) != 0) {
+            if (dense_cell_add_h(dst, n->parent, n->hash, n->n, sum) != 0) {
                 /* Leak avoidance on OOM: drop remaining src chain. */
                 free(n->parent);
                 free(n);
@@ -2407,7 +2403,7 @@ static void dense_cell_merge_add(dense_cell_map_t *dst, const dense_cell_map_t *
         const dense_node_t *n;
 
         for (n = src->buckets[bi]; n; n = n->next) {
-            if (dense_cell_add(dst, n->parent, n->n, sum) != 0) return;
+            if (dense_cell_add_h(dst, n->parent, n->hash, n->n, sum) != 0) return;
         }
     }
 }
@@ -5690,9 +5686,11 @@ static void emit_bucket_shape_drill_section(FILE *out,
 
                 if (!rec->path) continue;
                 if (path_slash_count_str(rec->path) < PATH_SHAPE_DEEP_MIN_SLASHES) continue;
+                uint32_t ph;
                 if (parent_dir_to_buf(rec->path, parent, sizeof(parent)) != 0) continue;
-                if (dense_cell_add(&dm_bytes, parent, rec->size, NULL) != 0 ||
-                    dense_cell_add(&dm_files, parent, 1ULL, NULL) != 0) {
+                ph = dense_hash_full(parent);
+                if (dense_cell_add_h(&dm_bytes, parent, ph, rec->size, NULL) != 0 ||
+                    dense_cell_add_h(&dm_files, parent, ph, 1ULL, NULL) != 0) {
                     deep_ok = 0;
                     break;
                 }
@@ -7640,7 +7638,7 @@ static void *shape_strip_merge_worker(void *vp) {
             const dense_node_t *nd;
 
             for (nd = c->srcv[k]->buckets[bi]; nd; nd = nd->next) {
-                if (dense_cell_add(c->dst, nd->parent, nd->n, NULL) != 0) return NULL;
+                if (dense_cell_add_h(c->dst, nd->parent, nd->hash, nd->n, NULL) != 0) return NULL;
             }
         }
     }
