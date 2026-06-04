@@ -229,14 +229,14 @@ SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
 
 ## Profiling and performance work
 
-Companion scripts profile the tools per fixture and capture a full performance picture — wall-clock timings, `strace -f -c` syscall histograms, and `perf record --call-graph dwarf` CPU profiles — into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or otherwise ensure `-g`) for the best `perf` symbols.
+Companion scripts profile the tools per fixture and capture a full performance picture — wall-clock timings, `strace -f -c` syscall histograms, `perf record --call-graph dwarf` CPU profiles, and optional `perf sched` thread-concurrency traces (`DO_SCHED`, gated to `SCHED_FIXTURES`) — into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or otherwise ensure `-g`) for the best `perf` symbols.
 
 They share one set of crawl outputs. `profile-ecrawl-fixtures.sh` is the producer: it crawls each fixture and keeps the reusable shards at `<bin-root>/<fixture>/bin/`. The other three are consumers — they read that same `<bin-root>`, never crawl, and hard-error if a fixture's bins are missing. So always run the `ecrawl` profiler first, then point the others at the same `<bin-root>`.
 
-- `scripts/profile-ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]` — runs `ecrawl` against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. The write-mode pass keeps each fixture's shards at `<bin-root>/<fixture>/bin/` for the consumers below (needs `DO_WRITE=1`, the default). Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
-- `scripts/profile-ereport-fixtures.sh <bin-root> [results-dir]` — profiles `ereport` (all-users, `--bucket-details 4`) over `<bin-root>/<fixture>/bin/`, writing HTML to `<bin-root>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_REPORTS`.
-- `scripts/profile-ereport_index-fixtures.sh <bin-root> [results-dir]` — profiles `ereport_index --make` (all-users) over `<bin-root>/<fixture>/bin/`, writing the index to `<bin-root>/<fixture>/index/`. The summary splits time into `chunk_prep` / `index_phase` / `merge_phase` and tabulates the `make_f{open,read,write}` I/O counters that usually drive index-build cost. Knobs: `EREPORT_INDEX_THREADS`, `EREPORT_INDEX_TRIGRAM_THREADS`, `RAISE_ULIMIT`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_INDEX`.
-- `scripts/profile-ecrawl_analyze-fixtures.sh <bin-root> [results-dir]` — profiles the read-only `ecrawl_analyze` directory-shape stats over `<bin-root>/<fixture>/bin/` (produces no kept output). Knobs: `ECRAWL_ANALYZE_THREADS`, `ANALYZE_TOP`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`.
+- `scripts/profile-ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]` — runs `ecrawl` against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. The write-mode pass keeps each fixture's shards at `<bin-root>/<fixture>/bin/` for the consumers below (needs `DO_WRITE=1`, the default). Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
+- `scripts/profile-ereport-fixtures.sh <bin-root> [results-dir]` — profiles `ereport` (all-users, `--bucket-details 4`) over `<bin-root>/<fixture>/bin/`, writing HTML to `<bin-root>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, `KEEP_REPORTS`.
+- `scripts/profile-ereport_index-fixtures.sh <bin-root> [results-dir]` — profiles `ereport_index --make` (all-users) over `<bin-root>/<fixture>/bin/`, writing the index to `<bin-root>/<fixture>/index/`. The summary splits time into `chunk_prep` / `index_phase` / `merge_phase` and tabulates the `make_f{open,read,write}` I/O counters that usually drive index-build cost. Knobs: `EREPORT_INDEX_THREADS`, `EREPORT_INDEX_TRIGRAM_THREADS`, `RAISE_ULIMIT`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, `KEEP_INDEX`.
+- `scripts/profile-ecrawl_analyze-fixtures.sh <bin-root> [results-dir]` — profiles the read-only `ecrawl_analyze` directory-shape stats over `<bin-root>/<fixture>/bin/` (produces no kept output). Knobs: `ECRAWL_ANALYZE_THREADS`, `ANALYZE_TOP`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`.
 
 ```bash
 # 1) ecrawl (producer): profile every fixture, both modes, with perf — keeps bins under <bin-root>
@@ -420,15 +420,15 @@ Behavior highlights:
 - Chunk boundaries — Parse jobs follow `*.bin.ckpt` segment boundaries when sidecars are valid (same spirit as `ereport` / `ereport_index` chunk mapping). If a checkpoint is missing or unusable, that shard is scanned as a single range from after the file header through EOF.
 - Parallelism — Worker count comes from `ECRAWL_ANALYZE_THREADS` (default 16, range 1…4096). If `ECRAWL_ANALYZE_THREADS` is unset, `ECRAWL_REPAIR_THREADS` is used when set, so existing repair-tuning scripts can drive analyze without a second variable.
 - Progress — When stderr is a TTY, a one-line status (bytes scanned, chunk and record rates, elapsed time, ETA) updates about once per second; the final report is always plain text on stdout.
-- `--top N` — List the `N` parent directories with the most regular files (1…100000; default 32). The table includes `nfile`, `ndir`, `nsym`, `nother`, and the parent path.
+- `--top N` — List the top `N` parent directories (1…100000; default 32). The default dimension is `dense` (most regular files); each row shows `nfile`, `ndir`, `nsym`, `nother`, and the parent path. Select dimensions with `--top,DIM[,DIM] N` (order-independent): `dense` = top parents by regular-file count, `deep` = deepest parent directories by path slash count. For example `--top,deep 20` lists only the deepest directories, `--top,dense,deep 20` prints both lists. The `deep` table adds a leading `depth` column.
 - `--verbose` / `-v` — While scanning, prints one line per successfully parsed chunk (shard path, byte range, record count), mutex-serialized so lines are not interleaved mid-line; chunk failures are reported on stderr (often corrupt data or checkpoint mismatch).
 
-Stdout summary (stable `key=value` / section headers) includes: shard and chunk job counts, `records_total`, distinct-parent counts, a histogram of regular files per parent (bucketed counts among parents that have at least one file), a slash-count (depth) histogram over stored paths, and `top_parents_by_regular_file_count`.
+Stdout summary (stable `key=value` / section headers) includes: shard and chunk job counts, `records_total`, distinct-parent counts, a histogram of regular files per parent (bucketed counts among parents that have at least one file), a slash-count (depth) histogram over stored paths, and the selected top lists (`top_parents_by_regular_file_count` for `dense`, `top_parents_by_depth` for `deep`).
 
 Usage:
 
 ```bash
-./ecrawl_analyze [--verbose] [--top N] <crawl-output-dir>
+./ecrawl_analyze [--verbose] [--top[,dim...] N] <crawl-output-dir>
 ```
 
 Examples:
@@ -436,6 +436,8 @@ Examples:
 ```bash
 ./ecrawl_analyze /path/to/crawl-out
 ./ecrawl_analyze --top 100 /path/to/crawl-out
+./ecrawl_analyze --top,deep 50 /path/to/crawl-out          # deepest directories only
+./ecrawl_analyze --top,dense,deep 50 /path/to/crawl-out    # both top lists
 ECRAWL_ANALYZE_THREADS=32 ./ecrawl_analyze -v /path/to/crawl-out
 ```
 
