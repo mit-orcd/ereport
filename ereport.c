@@ -609,6 +609,7 @@ static char g_bucket_output_dir[PATH_MAX];
 
 typedef struct {
     char *path;
+    uint64_t hash; /* cached full-path FNV-1a; reused by rehash + map merge so paths aren't re-hashed */
     uint64_t bucket_files;
     uint64_t bucket_bytes;
     uint64_t bucket_ctime_led_files;
@@ -3331,7 +3332,7 @@ static int path_row_map_rehash(path_row_map_t *m, size_t new_cap) {
     for (i = 0; i < m->cap; i++) {
         if (m->used[i]) {
             path_row_t row = m->rows[i];
-            size_t idx = (size_t)(path_hash(row.path) & (new_cap - 1));
+            size_t idx = (size_t)(row.hash & (new_cap - 1));
             while (new_used[idx]) idx = (idx + 1) & (new_cap - 1);
             new_rows[idx] = row;
             new_used[idx] = 1;
@@ -3363,14 +3364,11 @@ static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *p
 
     m->rows[idx].path = strdup(path);
     if (!m->rows[idx].path) return NULL;
+    m->rows[idx].hash = hash;
     m->rows[idx].par_agg_ix = 0;
     m->used[idx] = 1;
     m->count++;
     return &m->rows[idx];
-}
-
-static path_row_t *path_row_map_get_or_insert(path_row_map_t *m, const char *path) {
-    return path_row_map_get_or_insert_h(m, path, path_hash(path));
 }
 
 static path_row_t *path_row_map_find_h(path_row_map_t *m, const char *path, uint64_t hash) {
@@ -3413,7 +3411,7 @@ static int path_row_map_merge_accumulate(path_row_map_t *dst, const path_row_map
         if (!src->used[i]) continue;
         {
             const path_row_t *sr = &src->rows[i];
-            path_row_t *dr = path_row_map_get_or_insert(dst, sr->path);
+            path_row_t *dr = path_row_map_get_or_insert_h(dst, sr->path, sr->hash);
 
             if (!dr) return -1;
             dr->bucket_files += sr->bucket_files;
