@@ -91,7 +91,14 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 /* Dense heat-map badge: parent dir must have at least this many immediate children (all types) in the crawl. */
 #define PATH_SHAPE_DENSE_MIN_CHILDREN (8u * 1024u)
 #define PATH_SHAPE_MIN_BUCKET_FILES 20ULL
-#define DENSE_PARENT_BUCKETS 512U
+/*
+ * Per-(age,size)-cell parent map buckets. Sized to keep collision chains short for
+ * flat/many-distinct-parent corpora (dense_cell_add walks the chain per record).
+ * Each map is an array of pointers (8 KiB at 1024-wide... here 32 KiB at 4096), held
+ * per worker x 36 cells, so this trades a few hundred MiB at high thread counts for
+ * far less time in dense_cell_add_h on flat inputs. Lookups/merges are unaffected.
+ */
+#define DENSE_PARENT_BUCKETS 4096U
 /* Wider hash only for merged crawl-wide fanout — shortens chains for path-shape lookups (stack ~512 KiB). */
 #define DENSE_PARENT_BUCKETS_FANOUT_LOOKUP 65536U
 #define SUMMARY_REDUCE_MIN_CHUNK 4
