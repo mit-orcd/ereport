@@ -19,6 +19,10 @@
 #include "crawl_bin_format.h"
 #include "crawl_ckpt.h"
 
+/* Large fully-buffered stdio buffer for the boundary scan so sequential record
+ * walks issue few read() syscalls and no per-record lseek. */
+#define CRAWL_BIN_CHUNK_SCAN_STDIO_BUFSZ (1u << 20) /* 1 MiB */
+
 static int bin_ckpt_sidecar_path(const char *bin_path, char *out, size_t out_sz) {
     int n = snprintf(out, out_sz, "%s.ckpt", bin_path);
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
@@ -115,6 +119,9 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
     size_t chunk_cap = 0;
     unsigned int fc = 0;
     int rc = -1;
+    unsigned char *skip = NULL;
+    char *stdio_buf = NULL;
+    uint64_t cur;
 
     *chunks_out = NULL;
     *chunk_count_out = 0;
@@ -128,23 +135,31 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
         return -1;
     }
 
+    /* Boundary scan reads sequentially; a big buffer + arithmetic offset tracking
+     * replaces the previous per-record ftello/fseeko/ftello (one lseek per record,
+     * the dominant syscall/CPU cost on large single-shard inputs). */
+    stdio_buf = (char *)malloc(CRAWL_BIN_CHUNK_SCAN_STDIO_BUFSZ);
+    if (stdio_buf) setvbuf(fp, stdio_buf, _IOFBF, CRAWL_BIN_CHUNK_SCAN_STDIO_BUFSZ);
+
+    skip = (unsigned char *)malloc(65536); /* >= max uint16 name_len */
+    if (!skip) goto out;
+
     if (fseeko(fp, (off_t)seg_start, SEEK_SET) != 0) goto out;
 
     if (chunk_target_bytes == 0) chunk_target_bytes = CRAWL_BIN_PARSE_CHUNK_BYTES;
     chunk_start = seg_start;
     next_target = chunk_start + chunk_target_bytes;
+    cur = seg_start;
 
     for (;;) {
         bin_record_hdr_t r;
-        off_t record_start = ftello(fp);
-        off_t record_end;
+        uint64_t record_start = cur;
+        uint64_t record_end;
 
-        if (record_start < 0) goto out;
-
-        if ((uint64_t)record_start >= seg_end) {
-            if ((uint64_t)record_start > seg_end) goto out;
-            if ((uint64_t)record_start > chunk_start) {
-                if (crawl_bin_append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_start,
+        if (record_start >= seg_end) {
+            if (record_start > seg_end) goto out;
+            if (record_start > chunk_start) {
+                if (crawl_bin_append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, record_start,
                                            file_index) != 0)
                     goto out;
                 fc++;
@@ -158,25 +173,33 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
             goto out;
         }
 
-        if (fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) goto out;
-        record_end = ftello(fp);
-        if (record_end < 0) goto out;
-        if ((uint64_t)record_end > seg_end) goto out;
+        /* Skip the name by reading it sequentially (keeps the stdio buffer intact)
+         * instead of fseeko(SEEK_CUR), which would force a per-record lseek. */
+        if (r.name_len > 0 && io->fread(skip, 1, (size_t)r.name_len, fp) != (size_t)r.name_len) {
+            if (feof(fp)) fprintf(stderr, "warn: unexpected EOF in segment of %s\n", path);
+            goto out;
+        }
 
-        while ((uint64_t)record_end >= next_target) {
-            if ((uint64_t)record_end > chunk_start) {
-                if (crawl_bin_append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, (uint64_t)record_end,
+        record_end = record_start + crawl_bin_record_total_bytes(&r);
+        if (record_end > seg_end) goto out;
+        cur = record_end;
+
+        while (record_end >= next_target) {
+            if (record_end > chunk_start) {
+                if (crawl_bin_append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, record_end,
                                            file_index) != 0)
                     goto out;
                 fc++;
             }
-            chunk_start = (uint64_t)record_end;
+            chunk_start = record_end;
             next_target = chunk_start + chunk_target_bytes;
         }
     }
 
 out:
     if (fp) io->fclose(fp);
+    free(skip);
+    free(stdio_buf); /* safe only after the stream using it is closed */
     if (rc != 0) {
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
         return -1;
