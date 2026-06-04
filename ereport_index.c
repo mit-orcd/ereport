@@ -947,6 +947,23 @@ static void memlog_shutdown(memlog_shared_t *ml, pthread_t *tid, int *started) {
     *started = 0;
 }
 
+/* Sleep up to MEMLOG_INTERVAL_SEC in 100ms slices so a stop request is seen
+ * within ~100ms instead of blocking memlog_shutdown()'s join for a whole
+ * interval. A single sleep(MEMLOG_INTERVAL_SEC) added 0..MEMLOG_INTERVAL_SEC
+ * of pure idle wall time to every --make run (the whole runtime for small
+ * indexes). */
+static void memlog_wait_interval(memlog_shared_t *ml) {
+    int i;
+    struct timespec sl;
+
+    sl.tv_sec = 0;
+    sl.tv_nsec = 100000000L; /* 100ms */
+    for (i = 0; i < MEMLOG_INTERVAL_SEC * 10; i++) {
+        if (atomic_load_explicit(&ml->stop, memory_order_acquire)) return;
+        (void)nanosleep(&sl, NULL);
+    }
+}
+
 static void *memlog_thread_main(void *arg) {
     memlog_shared_t *ml = (memlog_shared_t *)arg;
 
@@ -962,7 +979,7 @@ static void *memlog_thread_main(void *arg) {
 
         if (atomic_load_explicit(&ml->stop, memory_order_acquire)) break;
         if (!ml->fp || !ml->ctx) {
-            sleep(MEMLOG_INTERVAL_SEC);
+            memlog_wait_interval(ml);
             continue;
         }
 
@@ -992,7 +1009,7 @@ static void *memlog_thread_main(void *arg) {
         fprintf(ml->fp, "%s wb=%s tj=%s cq=%s mp=%s | top:%s>%s>%s\n", ts, hw, ht, hc, hm, nm1, nm2, nm3);
         fflush(ml->fp);
 
-        sleep(MEMLOG_INTERVAL_SEC);
+        memlog_wait_interval(ml);
     }
     return NULL;
 }
