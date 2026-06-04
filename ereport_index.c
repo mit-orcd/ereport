@@ -841,15 +841,30 @@ static int trigram_job_queue_push_chain_slices(trigram_job_queue_t *q, trigram_j
             q->tail = seg_t;
             q->depth += take_n;
             q->queued_body_bytes += seg_body;
-            pthread_cond_broadcast(&q->has_job);
+            /* Wake one worker, not all 32. A batch-popping worker drains many
+             * jobs per lock and cascades a wake while work remains, so the
+             * awake-worker count tracks available work without a thundering
+             * herd (broadcast here was ~40% of all CPU under contention). */
+            pthread_cond_signal(&q->has_job);
         }
         pthread_mutex_unlock(&q->mutex);
     }
     return 0;
 }
 
-static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
-    trigram_job_t *job;
+/* Jobs drained per lock acquisition. Larger batches amortize the queue mutex
+ * (one lock/unlock + one signal pair per ~256 jobs instead of per job), which
+ * is the dominant cost on large indexes (millions of one-path jobs). */
+#define TRIGRAM_POP_BATCH_MAX 256
+
+/* Pop a chain of up to TRIGRAM_POP_BATCH_MAX jobs (caller iterates head->next,
+ * detaching/freeing each). Returns NULL only when the queue is closed and
+ * drained. Cascades a single has_job wake when work remains so concurrency
+ * scales with the backlog without broadcasting to every worker. */
+static trigram_job_t *trigram_job_queue_pop_batch_wait(trigram_job_queue_t *q) {
+    trigram_job_t *head, *tail;
+    size_t taken;
+    uint64_t body;
 
     pthread_mutex_lock(&q->mutex);
     while (!q->head && !q->closed) {
@@ -857,17 +872,30 @@ static trigram_job_t *trigram_job_queue_pop_wait(trigram_job_queue_t *q) {
             atomic_fetch_add_explicit(&q->run_stats->trigramq_worker_waits, 1ULL, memory_order_relaxed);
         pthread_cond_wait(&q->has_job, &q->mutex);
     }
-    job = q->head;
-    if (job) {
-        q->head = job->next;
-        if (!q->head) q->tail = NULL;
-        q->depth--;
-        q->queued_body_bytes -= (uint64_t)job->approx_body_bytes;
-        /* One slot freed; wake one blocked producer (broadcast is unnecessary and costly at depth). */
-        pthread_cond_signal(&q->has_space);
+    head = q->head;
+    if (!head) {
+        pthread_mutex_unlock(&q->mutex);
+        return NULL; /* closed and empty */
     }
+    tail = head;
+    taken = 1;
+    body = (uint64_t)tail->approx_body_bytes;
+    while (taken < TRIGRAM_POP_BATCH_MAX && tail->next) {
+        tail = tail->next;
+        body += (uint64_t)tail->approx_body_bytes;
+        taken++;
+    }
+    q->head = tail->next;
+    if (!q->head) q->tail = NULL;
+    tail->next = NULL;
+    q->depth -= taken;
+    q->queued_body_bytes -= body;
+    /* More work left: wake one more worker (cascade, not herd). */
+    if (q->head) pthread_cond_signal(&q->has_job);
+    /* Freed `taken` slots; wake one blocked producer (queue is rarely full). */
+    pthread_cond_signal(&q->has_space);
     pthread_mutex_unlock(&q->mutex);
-    return job;
+    return head;
 }
 
 static void trigram_job_queue_close(trigram_job_queue_t *q) {
@@ -2202,62 +2230,78 @@ static void *paths_writer_main(void *arg_void) {
     return NULL;
 }
 
+/* Process and free one trigram job. Returns 0 on success, -1 on a hard failure
+ * (writer_failed is set on the run before returning -1). */
+static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_t *rs, trigram_job_t *job) {
+    if (atomic_load(&rs->writer_failed)) {
+        free(job->codes);
+        free(job);
+        return 0; /* drain quietly once the run is failing */
+    }
+
+    if (job->code_count > 0) {
+        trigram_record_t *buf = tw_ensure_sort_buf(job->code_count);
+        size_t i;
+        size_t run_i;
+
+        if (!buf) {
+            fprintf(stderr, "ereport_index: realloc trigram batch buf (%zu): %s\n", job->code_count, strerror(errno));
+            atomic_store(&rs->writer_failed, 1);
+            free(job->codes);
+            free(job);
+            return -1;
+        }
+        for (i = 0; i < job->code_count; i++) {
+            buf[i].trigram = job->codes[i];
+            buf[i].path_id = job->path_id;
+        }
+        if (job->code_count > 1) qsort(buf, job->code_count, sizeof(*buf), trigram_rec_cmp_bucket);
+
+        run_i = 0;
+        while (run_i < job->code_count) {
+            uint32_t b = buf[run_i].trigram >> (24 - TRIGRAM_BUCKET_BITS);
+            size_t run_j = run_i + 1;
+            while (run_j < job->code_count) {
+                uint32_t bj = buf[run_j].trigram >> (24 - TRIGRAM_BUCKET_BITS);
+                if (bj != b) break;
+                run_j++;
+            }
+            if (append_trigram_records_batch_parallel(tw->ctx, tw->worker_index, b, buf + run_i, run_j - run_i) != 0) {
+                atomic_store(&rs->writer_failed, 1);
+                free(job->codes);
+                free(job);
+                return -1;
+            }
+            run_i = run_j;
+        }
+    }
+
+    atomic_fetch_add(&rs->trigram_records, (unsigned long long)job->code_count);
+    free(job->codes);
+    free(job);
+    return 0;
+}
+
 static void *trigram_worker_main(void *arg_void) {
     trigram_worker_arg_t *tw = (trigram_worker_arg_t *)arg_void;
     index_run_stats_t *rs = tw->ctx->run_stats;
 
     for (;;) {
-        trigram_job_t *job = trigram_job_queue_pop_wait(tw->trigram_queue);
-        if (!job) break;
+        trigram_job_t *chain = trigram_job_queue_pop_batch_wait(tw->trigram_queue);
 
-        if (atomic_load(&rs->writer_failed)) {
-            free(job->codes);
-            free(job);
-            continue;
-        }
+        if (!chain) break;
 
-        if (job->code_count > 0) {
-            trigram_record_t *buf = tw_ensure_sort_buf(job->code_count);
-            size_t i;
-            size_t run_i;
+        while (chain) {
+            trigram_job_t *job = chain;
 
-            if (!buf) {
-                fprintf(stderr, "ereport_index: realloc trigram batch buf (%zu): %s\n", job->code_count, strerror(errno));
-                atomic_store(&rs->writer_failed, 1);
-                free(job->codes);
-                free(job);
+            chain = chain->next;
+            job->next = NULL;
+            if (trigram_worker_process_job(tw, rs, job) != 0) {
+                trigram_job_chain_free(chain); /* drop the rest of this batch */
                 mk_io_tls_flush();
                 return NULL;
             }
-            for (i = 0; i < job->code_count; i++) {
-                buf[i].trigram = job->codes[i];
-                buf[i].path_id = job->path_id;
-            }
-            if (job->code_count > 1) qsort(buf, job->code_count, sizeof(*buf), trigram_rec_cmp_bucket);
-
-            run_i = 0;
-            while (run_i < job->code_count) {
-                uint32_t b = buf[run_i].trigram >> (24 - TRIGRAM_BUCKET_BITS);
-                size_t run_j = run_i + 1;
-                while (run_j < job->code_count) {
-                    uint32_t bj = buf[run_j].trigram >> (24 - TRIGRAM_BUCKET_BITS);
-                    if (bj != b) break;
-                    run_j++;
-                }
-                if (append_trigram_records_batch_parallel(tw->ctx, tw->worker_index, b, buf + run_i, run_j - run_i) != 0) {
-                    atomic_store(&rs->writer_failed, 1);
-                    free(job->codes);
-                    free(job);
-                    mk_io_tls_flush();
-                    return NULL;
-                }
-                run_i = run_j;
-            }
         }
-
-        atomic_fetch_add(&rs->trigram_records, (unsigned long long)job->code_count);
-        free(job->codes);
-        free(job);
     }
 
     mk_io_tls_flush();
