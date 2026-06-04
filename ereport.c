@@ -3259,11 +3259,26 @@ static void html_escape_segment(FILE *out, const char *s, size_t len) {
 static void emit_heat_badge_tip_shell_css(FILE *out);
 static void emit_heat_badge_tip_install_js(FILE *out);
 
+#define PATH_HASH_FNV_OFFSET 1469598103934665603ULL
+#define PATH_HASH_FNV_PRIME 1099511628211ULL
+
+/* FNV-1a is a left-to-right fold with no finalization, so the hash of a path
+ * built up component-by-component can be carried forward: fold only the newly
+ * appended bytes instead of re-hashing the whole prefix each depth level. */
+static inline uint64_t path_hash_fold(uint64_t h, const char *s, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= PATH_HASH_FNV_PRIME;
+    }
+    return h;
+}
+
 static uint64_t path_hash(const char *s) {
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t h = PATH_HASH_FNV_OFFSET;
     while (*s) {
         h ^= (unsigned char)*s++;
-        h *= 1099511628211ULL;
+        h *= PATH_HASH_FNV_PRIME;
     }
     return h;
 }
@@ -3331,14 +3346,16 @@ static int path_row_map_rehash(path_row_map_t *m, size_t new_cap) {
     return 0;
 }
 
-static path_row_t *path_row_map_get_or_insert(path_row_map_t *m, const char *path) {
+/* _h variants take the full-path FNV hash precomputed by the caller (built
+ * incrementally across depth levels); the plain wrappers preserve old callers. */
+static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *path, uint64_t hash) {
     size_t idx;
 
     if ((m->count + 1) * 10 >= m->cap * 7) {
         if (path_row_map_rehash(m, m->cap << 1) != 0) return NULL;
     }
 
-    idx = (size_t)(path_hash(path) & (m->cap - 1));
+    idx = (size_t)(hash & (m->cap - 1));
     while (m->used[idx]) {
         if (strcmp(m->rows[idx].path, path) == 0) return &m->rows[idx];
         idx = (idx + 1) & (m->cap - 1);
@@ -3352,12 +3369,16 @@ static path_row_t *path_row_map_get_or_insert(path_row_map_t *m, const char *pat
     return &m->rows[idx];
 }
 
-static path_row_t *path_row_map_find(path_row_map_t *m, const char *path) {
+static path_row_t *path_row_map_get_or_insert(path_row_map_t *m, const char *path) {
+    return path_row_map_get_or_insert_h(m, path, path_hash(path));
+}
+
+static path_row_t *path_row_map_find_h(path_row_map_t *m, const char *path, uint64_t hash) {
     size_t idx;
 
     if (m->cap == 0) return NULL;
 
-    idx = (size_t)(path_hash(path) & (m->cap - 1));
+    idx = (size_t)(hash & (m->cap - 1));
     while (m->used[idx]) {
         if (strcmp(m->rows[idx].path, path) == 0) return &m->rows[idx];
         idx = (idx + 1) & (m->cap - 1);
@@ -4092,11 +4113,13 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
                                            size_t lo,
                                            size_t hi) {
     size_t i;
+    uint64_t base_hash = base_prefix ? path_hash(base_prefix) : PATH_HASH_FNV_OFFSET;
 
     for (i = lo; i < hi; i++) {
         const detail_record_t *r = &details->items[i];
         char rowpath[PATH_MAX];
         size_t rowlen = 0;
+        uint64_t h = base_hash;
         const char *p;
         int depth;
 
@@ -4113,6 +4136,7 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
         for (depth = 0; depth < nlevels; depth++) {
             const char *start;
             size_t comp_len;
+            size_t prev_len = rowlen;
             path_row_t *row;
 
             while (*p == '/') p++;
@@ -4125,8 +4149,9 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
 
             rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
             if (rowlen == (size_t)-1) return -1;
+            h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_get_or_insert(&maps[depth], rowpath);
+            row = path_row_map_get_or_insert_h(&maps[depth], rowpath, h);
             if (!row) return -1;
             row->bucket_files++;
             row->bucket_bytes += r->size;
@@ -4383,6 +4408,7 @@ static void *agg_totals_par_worker(void *vp) {
     agg_tot_par_wctx_t *w = (agg_tot_par_wctx_t *)vp;
     uint64_t *my = w->part_base;
     size_t ii;
+    uint64_t base_hash = w->base_prefix ? path_hash(w->base_prefix) : PATH_HASH_FNV_OFFSET;
 
     if (!w->atomic_mode) memset(my, 0, w->R * 3 * sizeof(uint64_t));
 
@@ -4391,6 +4417,7 @@ static void *agg_totals_par_worker(void *vp) {
         const matched_record_t *r = &w->records->items[i];
         char rowpath[PATH_MAX];
         size_t rowlen = 0;
+        uint64_t h = base_hash;
         const char *p;
         int depth;
 
@@ -4412,6 +4439,7 @@ static void *agg_totals_par_worker(void *vp) {
         for (depth = 0; depth < w->nlevels; depth++) {
             const char *start;
             size_t comp_len;
+            size_t prev_len = rowlen;
             path_row_t *row;
 
             while (*p == '/') p++;
@@ -4427,8 +4455,9 @@ static void *agg_totals_par_worker(void *vp) {
                 atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
                 return NULL;
             }
+            h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_find(&w->maps[depth], rowpath);
+            row = path_row_map_find_h(&w->maps[depth], rowpath, h);
             if (row) {
                 if (w->atomic_mode) {
                     if (r->type == 'f')
@@ -4812,11 +4841,14 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
                                              run_rs) == 0)
         return 0;
 
+    {
+    uint64_t base_hash = base_prefix ? path_hash(base_prefix) : PATH_HASH_FNV_OFFSET;
     for (ii = lo; ii < hi; ii++) {
         size_t i = use_ord_slice ? path_ord[ii] : ii;
         const matched_record_t *r = &records->items[i];
         char rowpath[PATH_MAX];
         size_t rowlen = 0;
+        uint64_t h = base_hash;
         const char *p;
         int depth;
 
@@ -4833,6 +4865,7 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
         for (depth = 0; depth < nlevels; depth++) {
             const char *start;
             size_t comp_len;
+            size_t prev_len = rowlen;
             path_row_t *row;
 
             while (*p == '/') p++;
@@ -4845,14 +4878,16 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
 
             rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
             if (rowlen == (size_t)-1) return -1;
+            h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_find(&maps[depth], rowpath);
+            row = path_row_map_find_h(&maps[depth], rowpath, h);
             if (row) {
                 if (r->type == 'f') row->total_files++;
                 else if (r->type == 'd') row->total_dirs++;
                 row->total_bytes += r->size;
             }
         }
+    }
     }
 
     return 0;
@@ -8042,8 +8077,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
-        memset(&r, 0, sizeof(r));
-
+        /* fread below overwrites the whole fixed-size header, so no per-record memset. */
         n = counted_fread_unlocked(&r, sizeof(r), 1, fp);
         if (n != 1) {
             if (feof(fp)) rc = 0;
@@ -8141,9 +8175,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
         sum->matched_records++;
         if (progress) progress->matched_records++;
 
+        time_t rec_time = pick_time(&r, basis); /* computed once; reused for age bucket + fanout stats */
+
         if (r.type == 'f') {
             int sb = size_bucket_for(r.size);
-            int ab = age_bucket_for(pick_time(&r, basis), now);
+            int ab = age_bucket_for(rec_time, now);
             int count_bytes = 1;
             int ctime_led = (bucket_detail_levels > 0) ? record_ctime_led(&r) : 0;
 
@@ -8221,7 +8257,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             path_fanout_accumulate(parent_fanout, pathbuf, r.parent_dir_id);
             if (parent_fanout_stats)
                 fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.parent_dir_id, r.type,
-                                              pick_time(&r, basis), sum);
+                                              rec_time, sum);
         }
     }
 
