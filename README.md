@@ -229,21 +229,23 @@ SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
 
 ## Profiling and performance work
 
-Three companion scripts profile the tools per fixture and capture a full performance picture — wall-clock timings, `strace -f -c` syscall histograms, and `perf record --call-graph dwarf` CPU profiles — into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or otherwise ensure `-g`) for the best `perf` symbols.
+Companion scripts profile the tools per fixture and capture a full performance picture — wall-clock timings, `strace -f -c` syscall histograms, and `perf record --call-graph dwarf` CPU profiles — into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or otherwise ensure `-g`) for the best `perf` symbols.
 
-- `scripts/profile-ecrawl-fixtures.sh <synth-root> [results-dir]` — runs `ecrawl` against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
-- `scripts/profile-ereport-fixtures.sh <synth-root> <out-parent> [results-dir]` — crawls each fixture into `<out-parent>/<fixture>/bin/` (reused unless `FORCE_CRAWL=1`) then profiles `ereport` (all-users, `--bucket-details 4`) into `<out-parent>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_REPORTS`.
-- `scripts/profile-ereport_index-fixtures.sh <synth-root> <out-parent> [results-dir]` — crawls each fixture (reused bins) then profiles `ereport_index --make` (all-users) into `<out-parent>/<fixture>/index/`. The summary splits time into `chunk_prep` / `index_phase` / `merge_phase` and tabulates the `make_f{open,read,write}` I/O counters that usually drive index-build cost. Knobs: `EREPORT_INDEX_THREADS`, `EREPORT_INDEX_TRIGRAM_THREADS`, `RAISE_ULIMIT`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_INDEX`.
+They share one set of crawl outputs. `profile-ecrawl-fixtures.sh` is the producer: it crawls each fixture and keeps the reusable shards at `<bin-root>/<fixture>/bin/`. The other three are consumers — they read that same `<bin-root>`, never crawl, and hard-error if a fixture's bins are missing. So always run the `ecrawl` profiler first, then point the others at the same `<bin-root>`.
+
+- `scripts/profile-ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]` — runs `ecrawl` against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. The write-mode pass keeps each fixture's shards at `<bin-root>/<fixture>/bin/` for the consumers below (needs `DO_WRITE=1`, the default). Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
+- `scripts/profile-ereport-fixtures.sh <bin-root> [results-dir]` — profiles `ereport` (all-users, `--bucket-details 4`) over `<bin-root>/<fixture>/bin/`, writing HTML to `<bin-root>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_REPORTS`.
+- `scripts/profile-ereport_index-fixtures.sh <bin-root> [results-dir]` — profiles `ereport_index --make` (all-users) over `<bin-root>/<fixture>/bin/`, writing the index to `<bin-root>/<fixture>/index/`. The summary splits time into `chunk_prep` / `index_phase` / `merge_phase` and tabulates the `make_f{open,read,write}` I/O counters that usually drive index-build cost. Knobs: `EREPORT_INDEX_THREADS`, `EREPORT_INDEX_TRIGRAM_THREADS`, `RAISE_ULIMIT`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_INDEX`.
+- `scripts/profile-ecrawl_analyze-fixtures.sh <bin-root> [results-dir]` — profiles the read-only `ecrawl_analyze` directory-shape stats over `<bin-root>/<fixture>/bin/` (produces no kept output). Knobs: `ECRAWL_ANALYZE_THREADS`, `ANALYZE_TOP`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`.
 
 ```bash
-# ecrawl: profile every fixture, both modes, with perf
-DO_PERF=1 ./scripts/profile-ecrawl-fixtures.sh /tmp/ecrawl-adversarial
+# 1) ecrawl (producer): profile every fixture, both modes, with perf — keeps bins under <bin-root>
+DO_PERF=1 ./scripts/profile-ecrawl-fixtures.sh /tmp/ecrawl-adversarial /data1/ecrawl-bins
 
-# ereport: crawl-if-needed then profile reports under a shared parent
-./scripts/profile-ereport-fixtures.sh /tmp/ecrawl-adversarial /data1/ereport/parent
-
-# ereport_index: crawl-if-needed then profile index builds under a shared parent
-./scripts/profile-ereport_index-fixtures.sh /tmp/ecrawl-adversarial /data1/ereport_index/parent
+# 2) consumers: reuse the same <bin-root>; no recrawl
+./scripts/profile-ereport-fixtures.sh        /data1/ecrawl-bins
+./scripts/profile-ereport_index-fixtures.sh  /data1/ecrawl-bins
+./scripts/profile-ecrawl_analyze-fixtures.sh /data1/ecrawl-bins
 ```
 
 Each run prints the results dir and a `…tar.gz` to upload; full options are in each script's comment header. For `perf`, run as root or lower `kernel.perf_event_paranoid`.
@@ -263,7 +265,7 @@ This loop turned several hunches into measured fixes — raising the writer's op
 
 Most of this cycle is mechanical and detail-heavy, which is exactly where an AI coding assistant compresses the turnaround:
 
-- Scaffolding the harness — the three profiling scripts (consistent flags, strace/perf passes, throwaway vs. kept output dirs, a Python summary parser) are tedious boilerplate an assistant can draft in one pass and keep consistent across all three tools.
+- Scaffolding the harness — the profiling scripts (consistent flags, strace/perf passes, a shared producer/consumer bin layout, throwaway vs. kept output dirs, a Python summary parser) are tedious boilerplate an assistant can draft in one pass and keep consistent across every tool.
 - Reading the evidence — pasting a `perf report` head or a `strace -c` histogram and asking "what's the hot path and why" turns raw counters into a ranked hypothesis fast, often down to the source line behind a symbol.
 - Implementing the fix — once a bottleneck is named (an O(N) registry scan, a per-record seek), the assistant can apply the change, preserve the surrounding invariants, and update tests and docs in the same edit.
 - Closing the loop — it can re-run profiles and diff the before/after `SUMMARY_TABLE.txt` to confirm the change actually helped.

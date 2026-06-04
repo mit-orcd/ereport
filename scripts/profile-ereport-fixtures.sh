@@ -4,12 +4,16 @@
 #
 # SPDX-License-Identifier: MIT
 #
-# Per synthetic adversarial sub-directory (see generate-ecrawl-adversarial-tree.sh):
-#   1. CRAWL phase  — run ecrawl to produce that fixture's uid_shard_*.bin set
-#                     (skipped if the bin dir already has shards; FORCE_CRAWL=1
-#                     to recrawl). Timed so per-subdir crawl speed is tracked.
-#   2. REPORT phase — run ereport over that bin dir (all-users form,
-#                     --bucket-details 4) and capture a full profile.
+# Profile `ereport` over the shared per-fixture crawl output produced by
+# profile-ecrawl-fixtures.sh.
+#
+# This profiler does NOT crawl. Run profile-ecrawl-fixtures.sh first with the
+# same <bin-root> to populate <bin-root>/<fixture>/bin/; this script consumes
+# those shards and hard-errors if a selected fixture has none.
+#
+# Per fixture (see generate-ecrawl-adversarial-tree.sh):
+#   REPORT phase — run ereport over <bin-root>/<fixture>/bin (all-users form,
+#                  --bucket-details 4) and capture a full profile.
 #
 # The REPORT phase runs up to three instrumented passes, mirroring
 # profile-ecrawl-fixtures.sh:
@@ -20,15 +24,13 @@
 #             ereport with `make debug` for best symbols).
 #
 # Usage:
-#   scripts/profile-ereport-fixtures.sh <synth-root> <out-parent> [results-dir]
+#   scripts/profile-ereport-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
-#   <synth-root>   dir containing the fixtures (single_huge_dir/, mega_dir1/, ...).
-#   <out-parent>   parent dir for per-fixture data; for each fixture this script
-#                  creates and keeps:
-#                      <out-parent>/<fixture>/bin/        ecrawl uid_shard_*.bin
-#                      <out-parent>/<fixture>/all_users/  ereport HTML (clean pass)
-#                  Bins are reused across runs (FORCE_CRAWL=1 to recrawl).
+#   <bin-root>     dir produced by profile-ecrawl-fixtures.sh; for each fixture
+#                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
+#                  The emitted HTML is written alongside, and kept, at:
+#                      <bin-root>/<fixture>/all_users/  ereport HTML (clean pass)
 #
 # Optional positional:
 #   [results-dir]  where profiling logs/tarball go (default:
@@ -36,15 +38,14 @@
 #
 # Environment knobs (all optional):
 #   EREPORT_BIN=./ereport      ereport binary (auto: ./ereport, /tmp/ereport, PATH).
-#   ECRAWL_BIN=./ecrawl        ecrawl binary  (auto: ./ecrawl, /tmp/ecrawl, PATH).
-#   FORCE_CRAWL=0              if 1, recrawl every fixture even if shards exist.
-#   KEEP_REPORTS=1            keep <out-parent>/<fixture>/all_users (default 1);
+#   KEEP_REPORTS=1            keep <bin-root>/<fixture>/all_users (default 1);
 #                              set 0 to delete the HTML after recording its size.
 #   BUCKET_DETAILS=4           --bucket-details N for ereport (1..32).
 #   EREPORT_THREADS=32         worker threads (passed through to ereport).
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).
-#   INCLUDE_ROOT=0             also crawl+report the whole <synth-root> as one.
+#   INCLUDE_ROOT=0             also report the whole-tree _ALL_ROOT_ bin set if
+#                              the ecrawl profiler produced it (INCLUDE_ROOT=1).
 #   DO_STRACE=1                run the strace pass.
 #   DO_PERF=1                  run the perf pass.
 #   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
@@ -58,13 +59,12 @@
 #   REPS=1                     repetitions of the clean report pass per fixture.
 #   EREPORT_VERBOSE_ARGS=...   extra args appended to ereport.
 #
-# Data layout (under <out-parent>, persistent):
-#   <fixture>/bin/             ecrawl uid_shard_*.bin for that fixture
+# Data layout (under <bin-root>, persistent):
+#   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
 #   <fixture>/all_users/       ereport HTML from the clean pass
 #
 # Profiling-log layout (under <results-dir>):
 #   env.txt                                 host/build/env snapshot
-#   <fixture>/crawl.time.txt|summary.txt    ecrawl /usr/bin/time + --verbose
 #   <fixture>/report/clean.verbose.txt      ereport --verbose key=value (stderr)
 #   <fixture>/report/clean.time.txt         /usr/bin/time -v
 #   <fixture>/report/clean.stdout.txt       ereport stdout
@@ -82,22 +82,21 @@
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
-if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <synth-root> <out-parent> [results-dir]" >&2
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <bin-root> [results-dir]" >&2
   exit 2
 fi
-SYNTH_ROOT=${1%/}
-if [[ ! -d "$SYNTH_ROOT" ]]; then
-  echo "ERROR: synth-root '$SYNTH_ROOT' is not a directory" >&2
+# Shared shard sets produced by profile-ecrawl-fixtures.sh; this profiler only
+# consumes <bin-root>/<fixture>/bin and never crawls.
+BIN_ROOT=${1%/}
+if [[ ! -d "$BIN_ROOT" ]]; then
+  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile-ecrawl-fixtures.sh first)" >&2
   exit 2
 fi
-
-OUT_PARENT=${2%/}
-mkdir -p "$OUT_PARENT" || { echo "ERROR: cannot create out-parent '$OUT_PARENT'" >&2; exit 1; }
-OUT_PARENT=$(cd "$OUT_PARENT" && pwd)
+BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${3:-"./ereport-profile-$TS"}
+RESULTS_DIR=${2:-"./ereport-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
@@ -116,13 +115,11 @@ find_bin() {
   fi
 }
 EREPORT_BIN=$(find_bin ereport EREPORT_BIN)
-ECRAWL_BIN=$(find_bin ecrawl ECRAWL_BIN)
 
 # ---- config ----------------------------------------------------------------
 # Instrumentation passes (strace/perf) regenerate the report into a throwaway
 # dir so they never disturb the canonical clean-pass HTML; this is their home.
 INSTR_BASE="$RESULTS_DIR/_instr_report"
-FORCE_CRAWL=${FORCE_CRAWL:-0}
 BUCKET_DETAILS=${BUCKET_DETAILS:-4}
 EREPORT_THREADS=${EREPORT_THREADS:-32}
 export EREPORT_THREADS
@@ -153,15 +150,15 @@ if [[ -n "${FIXTURES:-}" ]]; then
 else
   FIXLIST=()
   for f in "${KNOWN_FIXTURES[@]}"; do
-    [[ -d "$SYNTH_ROOT/$f" ]] && FIXLIST+=("$f")
+    [[ -d "$BIN_ROOT/$f/bin" ]] && FIXLIST+=("$f")
   done
   if [[ ${#FIXLIST[@]} -eq 0 ]]; then
     while IFS= read -r d; do FIXLIST+=("$(basename "$d")"); done \
-      < <(find "$SYNTH_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+      < <(find "$BIN_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
   fi
 fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
-  echo "ERROR: no fixtures found under '$SYNTH_ROOT'" >&2
+  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile-ecrawl-fixtures.sh first)" >&2
   exit 1
 fi
 
@@ -183,36 +180,6 @@ fi
 # ---- helpers ---------------------------------------------------------------
 fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
 shard_count() { find "$1" -maxdepth 1 -name 'uid_shard_*.bin' 2>/dev/null | wc -l; }
-
-# Crawl one fixture into its persistent bin dir (unless shards already exist).
-ensure_bins() {
-  local fixture=$1 start=$2 bindir=$3 dest=$4
-  local n
-  n=$(shard_count "$bindir")
-  if [[ "$FORCE_CRAWL" != "1" && "$n" -gt 0 ]]; then
-    echo "    crawl: reuse $n shard(s) in $bindir"
-    { echo "reused=1"; echo "uid_shard_files=$n"; } >"$dest/crawl.summary.txt"
-    return 0
-  fi
-  rm -rf "$bindir"; mkdir -p "$bindir"
-  echo "    crawl: $ECRAWL_BIN --verbose $start $bindir"
-  local t0 t1
-  t0=$(date +%s.%N)
-  if [[ "$HAVE_TIME" == "1" ]]; then
-    "$TIME_BIN" -v -o "$dest/crawl.time.txt" \
-      "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  else
-    "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  fi
-  local rc=$?
-  t1=$(date +%s.%N)
-  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/crawl.wall.txt"
-  n=$(shard_count "$bindir")
-  { echo "reused=0"; echo "crawl_rc=$rc"; echo "uid_shard_files=$n"; } >>"$dest/crawl.summary.txt"
-  echo "    crawl: produced $n shard(s) (rc=$rc)"
-}
 
 # Build ereport argv (all-users form) into RUN_ARGV.
 build_argv() {
@@ -323,17 +290,21 @@ run_sched() {
 }
 
 profile_one() {
-  local fixture=$1 start=$2
-  echo "==> $fixture  ($start)"
-  local fxout="$OUT_PARENT/$fixture"
+  local fixture=$1
+  local fxout="$BIN_ROOT/$fixture"
   local bindir="$fxout/bin"
   local dest="$RESULTS_DIR/$fixture"
   local rdest="$dest/report"
-  mkdir -p "$fxout" "$dest" "$rdest"
-  ensure_bins "$fixture" "$start" "$bindir" "$dest"
-  if [[ "$(shard_count "$bindir")" -eq 0 ]]; then
-    echo "    (no shards; skipping report passes)"; return
+  echo "==> $fixture  ($bindir)"
+  local nsh
+  nsh=$(shard_count "$bindir")
+  if [[ "$nsh" -eq 0 ]]; then
+    echo "ERROR: no uid_shard_*.bin under '$bindir' for fixture '$fixture'." >&2
+    echo "       Run profile-ecrawl-fixtures.sh with the same <bin-root> first." >&2
+    exit 1
   fi
+  mkdir -p "$dest" "$rdest"
+  echo "uid_shard_files=$nsh" >"$dest/bins.txt"
   local r
   for ((r = 1; r <= REPS; r++)); do
     run_clean "$rdest" "$bindir" "$fxout" "$r"
@@ -347,13 +318,11 @@ profile_one() {
 {
   echo "# ereport fixture profile"
   echo "timestamp=$TS"
-  echo "synth_root=$SYNTH_ROOT"
-  echo "synth_root_fstype=$(fs_type "$SYNTH_ROOT")"
+  echo "bin_root=$BIN_ROOT"
+  echo "bin_root_fstype=$(fs_type "$BIN_ROOT")"
   echo "results_dir=$RESULTS_DIR"
-  echo "out_parent=$OUT_PARENT"
   echo "ereport_bin=$EREPORT_BIN"
-  echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "config: bucket_details=$BUCKET_DETAILS ereport_threads=$EREPORT_THREADS force_crawl=$FORCE_CRAWL"
+  echo "config: bucket_details=$BUCKET_DETAILS ereport_threads=$EREPORT_THREADS"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_reports=$KEEP_REPORTS"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
@@ -390,13 +359,10 @@ fi
 # ---- run -------------------------------------------------------------------
 mkdir -p "$INSTR_BASE"
 for f in "${FIXLIST[@]}"; do
-  if [[ ! -d "$SYNTH_ROOT/$f" ]]; then
-    echo "==> $f  (MISSING under $SYNTH_ROOT; skipped)"; continue
-  fi
-  profile_one "$f" "$SYNTH_ROOT/$f"
+  profile_one "$f"
 done
-if [[ "$INCLUDE_ROOT" == "1" ]]; then
-  profile_one "_ALL_ROOT_" "$SYNTH_ROOT"
+if [[ "$INCLUDE_ROOT" == "1" && -d "$BIN_ROOT/_ALL_ROOT_/bin" ]]; then
+  profile_one "_ALL_ROOT_"
 fi
 rm -rf "$INSTR_BASE"
 
@@ -414,10 +380,6 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
     echo "========================================================================"
     echo "FIXTURE: $f"
     echo "========================================================================"
-    for file in "$RESULTS_DIR/$f/crawl.summary.txt" "$RESULTS_DIR/$f/crawl.time.txt"; do
-      [[ -e "$file" ]] || continue
-      echo "----- $(basename "$file") -----"; cat "$file"; echo
-    done
     d="$RESULTS_DIR/$f/report"
     [[ -d "$d" ]] || continue
     for part in clean.verbose clean.time report_size; do
@@ -561,8 +523,8 @@ def fmt(v, kind="int"):
 lines = []
 hdr = kv(root / "env.txt")
 lines.append("ereport profile — SUMMARY TABLE")
-lines.append(f"  timestamp={hdr.get('timestamp','?')}  synth_root={hdr.get('synth_root','?')}")
-lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('synth_root_fstype','?')}")
+lines.append(f"  timestamp={hdr.get('timestamp','?')}  bin_root={hdr.get('bin_root','?')}")
+lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('bin_root_fstype','?')}")
 for key in ("config:", "modes:"):
     envf = root / "env.txt"
     if envf.exists():
@@ -573,32 +535,29 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "crawl(s)", "report(s)", "report_html",
+cols = ["fixture", "shards", "report(s)", "report_html",
         "parse(s)", "bucketHTML(s)", "sortIdx(s)", "indexHTML(s)"]
-w = [22, 8, 9, 10, 12, 9, 13, 11, 12]
+w = [22, 8, 10, 12, 9, 13, 11, 12]
 
 
 def row(vals):
     return "  ".join(str(v).ljust(w[i]) for i, v in enumerate(vals))
 
 
-lines.append("== CRAWL + REPORT WALL TIME ==")
+lines.append("== REPORT WALL TIME ==")
 lines.append(row(cols))
 lines.append(row(["-" * x for x in w]))
 for fx in fixtures:
     rv = report_kv(fx)
-    if not rv and not (root / fx / "crawl.summary.txt").exists():
+    if not rv:
         continue
-    csum = kv(root / fx / "crawl.summary.txt")
     el = reps_elapsed(fx)
     el_avg = (sum(el) / len(el)) if el else None
     rsz = kv(root / fx / "report" / "report_size.txt").get("report_dir_size") \
         or kv(root / fx / "report" / "report_size.rep1.txt").get("report_dir_size")
-    cw = num(kv(root / fx / "crawl.wall.txt").get("wall_seconds", ""))
     lines.append(row([
         fx,
-        csum.get("uid_shard_files", "-"),
-        fmt(cw, "f1") if cw is not None else ("reuse" if csum.get("reused") == "1" else "-"),
+        kv(root / fx / "bins.txt").get("uid_shard_files", "-"),
         fmt(el_avg, "f2") if el_avg is not None else "-",
         rsz or "-",
         fmt(num(rv.get("verbose_wall_parse_workers_sec")), "f2"),
@@ -657,7 +616,7 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "DONE."
   echo "  Summary table:   $SUMMARY_TABLE"
   echo "  Combined report: $COMBINED"
-  echo "  Data (bins+HTML kept): $OUT_PARENT/<fixture>/{bin,all_users}  (bins reused; FORCE_CRAWL=1 to recrawl)"
+  echo "  Data (HTML kept): $BIN_ROOT/<fixture>/all_users  (bins consumed from $BIN_ROOT/<fixture>/bin)"
   echo "  Tarball (upload this): $TARBALL"
   echo
   echo "----- SUMMARY_TABLE.txt -----"

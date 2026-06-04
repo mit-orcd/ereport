@@ -21,12 +21,23 @@
 # Each pass runs in both --no-write mode (isolates crawl/readdir/donation cost)
 # and write mode (exposes uid-shard writer churn) unless disabled.
 #
+# This is also the PRODUCER of the shared per-fixture shard sets reused by the
+# follow-up profilers (profile-ereport*, profile-ecrawl_analyze). The write-mode
+# clean pass (rep 1) crawls each fixture into a persistent, kept bin dir:
+#       <bin-root>/<fixture>/bin/uid_shard_*.bin
+# Point those follow-up scripts at the same <bin-root>; they consume these bins
+# and never crawl themselves. (Needs DO_WRITE=1, the default, to populate bins.)
+#
 # Usage:
-#   scripts/profile-ecrawl-fixtures.sh <synth-root> [results-dir]
+#   scripts/profile-ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]
 #
 # Required:
 #   <synth-root>   path passed to generate-ecrawl-adversarial-tree.sh
 #                  (the dir containing single_huge_dir/, mega_dir1/, ...).
+#   <bin-root>     parent dir where the kept, reusable shard sets are written:
+#                  for each fixture, <bin-root>/<fixture>/bin/uid_shard_*.bin.
+#                  Pass the SAME path to the follow-up profilers. Overwritten
+#                  (re-crawled fresh) on every write-mode run.
 #
 # Optional positional:
 #   [results-dir]  where to write logs (default: ./ecrawl-profile-<timestamp>).
@@ -34,9 +45,11 @@
 # Environment knobs (all optional):
 #   ECRAWL_BIN=./ecrawl        path to the ecrawl binary (auto-detects ./ecrawl,
 #                              /tmp/ecrawl, or $PATH).
-#   OUTPUT_BASE=<dir>          where write-mode shard output goes (needs space;
-#                              default: <results-dir>/_shard_output). Cleared
-#                              between runs. Ignored for --no-write.
+#   OUTPUT_BASE=<dir>          where THROWAWAY write-mode shard output goes for
+#                              extra reps and the strace/perf/sched passes (needs
+#                              space; default: <results-dir>/_shard_output).
+#                              Cleared between runs. The kept bins go to
+#                              <bin-root> instead. Ignored for --no-write.
 #   FIXTURES="a b c"           space-separated fixture names to run (default:
 #                              auto-detect the known set, else all immediate
 #                              subdirs of <synth-root>).
@@ -68,6 +81,7 @@
 #   <fixture>/<mode>/clean.progress.csv  per-second progress (ECRAWL_PROGRESS_LOG)
 #   <fixture>/<mode>/clean.debug.csv     megadir debug (ECRAWL_DEBUG_LOG)
 #   <fixture>/<mode>/shards.txt          uid_shard_*.bin count (write mode only)
+#   <bin-root>/<fixture>/bin/            kept, reusable uid_shard_*.bin (write mode)
 #   <fixture>/<mode>/strace.txt          strace -f -c histogram
 #   <fixture>/<mode>/perf.report.txt     perf report --stdio (if DO_PERF=1)
 #   <fixture>/<mode>/perf.<mode>.report.bythread.txt per-thread CPU split (thread use)
@@ -79,8 +93,8 @@
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
-if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <synth-root> [results-dir]" >&2
+if [[ $# -lt 2 ]]; then
+  echo "usage: $0 <synth-root> <bin-root> [results-dir]" >&2
   exit 2
 fi
 SYNTH_ROOT=${1%/}
@@ -89,8 +103,14 @@ if [[ ! -d "$SYNTH_ROOT" ]]; then
   exit 2
 fi
 
+# Persistent home for the kept, reusable per-fixture shard sets that the
+# follow-up profilers consume: <bin-root>/<fixture>/bin/uid_shard_*.bin.
+BIN_ROOT=${2%/}
+mkdir -p "$BIN_ROOT" || { echo "ERROR: cannot create bin-root '$BIN_ROOT'" >&2; exit 1; }
+BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
+
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${2:-"./ecrawl-profile-$TS"}
+RESULTS_DIR=${3:-"./ecrawl-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
@@ -202,8 +222,10 @@ build_argv() {
 }
 
 # clean pass: honest timing + verbose summary + CSVs.
+# keep=1 (write-mode rep 1) persists the crawl into <bin-root>/<fixture>/bin so
+# the follow-up profilers can reuse it; keep=0 uses a throwaway dir.
 run_clean() {
-  local fixture=$1 mode=$2 start=$3 dest=$4 outdir=$5 rep=$6
+  local fixture=$1 mode=$2 start=$3 dest=$4 outdir=$5 rep=$6 keep=${7:-0}
   local sfx=""
   [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
 
@@ -238,9 +260,14 @@ run_clean() {
     {
       echo "uid_shard_files_created=$nsh"
       echo "output_dir_size=$(du -sh "$outdir" 2>/dev/null | cut -f1)"
+      [[ "$keep" == "1" ]] && echo "kept_bin_dir=$outdir"
     } >"$dest/shards${sfx}.txt"
-    # Reclaim space immediately; shards can be large for mega dirs.
-    rm -rf "$outdir"
+    if [[ "$keep" == "1" ]]; then
+      echo "    kept bins: $nsh shard(s) -> $outdir"
+    else
+      # Reclaim space immediately; throwaway shards can be large for mega dirs.
+      rm -rf "$outdir"
+    fi
   fi
 }
 
@@ -328,14 +355,23 @@ profile_one() {
   for mode in "${modes[@]}"; do
     local dest="$RESULTS_DIR/$fixture/$mode"
     mkdir -p "$dest"
-    local outdir="$OUTPUT_BASE/$fixture-$mode"
+    local throwaway="$OUTPUT_BASE/$fixture-$mode"
+    local persist="$BIN_ROOT/$fixture/bin"
     local r
     for ((r = 1; r <= REPS; r++)); do
-      run_clean "$fixture" "$mode" "$start" "$dest" "$outdir" "$r"
+      # write-mode rep 1 produces the kept, reusable bin set; everything else
+      # (nowrite, extra reps) crawls into the throwaway dir.
+      if [[ "$mode" == "write" && "$r" -eq 1 ]]; then
+        run_clean "$fixture" "$mode" "$start" "$dest" "$persist" "$r" 1
+      else
+        run_clean "$fixture" "$mode" "$start" "$dest" "$throwaway" "$r" 0
+      fi
     done
-    run_strace "$mode" "$start" "$dest" "$outdir"
-    run_perf   "$mode" "$start" "$dest" "$outdir"
-    run_sched  "$fixture" "$mode" "$start" "$dest" "$outdir"
+    # Instrumented passes always use throwaway output so they never clobber the
+    # kept bins (and strace/perf shards are never reused).
+    run_strace "$mode" "$start" "$dest" "$throwaway"
+    run_perf   "$mode" "$start" "$dest" "$throwaway"
+    run_sched  "$fixture" "$mode" "$start" "$dest" "$throwaway"
   done
 }
 
@@ -346,6 +382,7 @@ profile_one() {
   echo "synth_root=$SYNTH_ROOT"
   echo "synth_root_fstype=$(fs_type "$SYNTH_ROOT")"
   echo "results_dir=$RESULTS_DIR"
+  echo "bin_root=$BIN_ROOT"
   echo "output_base=$OUTPUT_BASE"
   echo "output_base_fstype=$(fs_type "$(dirname "$OUTPUT_BASE")")"
   echo "ecrawl_bin=$ECRAWL_BIN"
@@ -737,6 +774,11 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "DONE."
   echo "  Summary table:   $SUMMARY_TABLE"
   echo "  Combined report: $COMBINED"
+  if [[ "$DO_WRITE" == "1" ]]; then
+    echo "  Reusable bins:   $BIN_ROOT/<fixture>/bin/  (feed this <bin-root> to the follow-up profilers)"
+  else
+    echo "  Reusable bins:   (none; DO_WRITE=0 so no shards were kept)"
+  fi
   echo "  Tarball (upload this): $TARBALL"
   echo
   echo "----- SUMMARY_TABLE.txt -----"

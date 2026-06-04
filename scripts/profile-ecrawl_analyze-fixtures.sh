@@ -5,15 +5,17 @@
 # SPDX-License-Identifier: MIT
 #
 # Profile `ecrawl_analyze` (read-only directory-shape stats over crawl shards)
-# over each synthetic adversarial sub-directory's crawl output, the same way
-# profile-ereport-fixtures.sh profiles `ereport`.
+# over the shared per-fixture crawl output produced by
+# profile-ecrawl-fixtures.sh, the same way profile-ereport-fixtures.sh profiles
+# `ereport`.
+#
+# This profiler does NOT crawl. Run profile-ecrawl-fixtures.sh first with the
+# same <bin-root> to populate <bin-root>/<fixture>/bin/; this script consumes
+# those shards and hard-errors if a selected fixture has none.
 #
 # Per fixture (see generate-ecrawl-adversarial-tree.sh):
-#   1. CRAWL phase   — run ecrawl to produce that fixture's uid_shard_*.bin set
-#                      (skipped if the bin dir already has shards; FORCE_CRAWL=1
-#                      to recrawl). Timed so per-subdir crawl speed is tracked.
-#   2. ANALYZE phase — run `ecrawl_analyze --verbose` over that bin dir and
-#                      capture a full profile.
+#   ANALYZE phase — run `ecrawl_analyze --verbose` over <bin-root>/<fixture>/bin
+#                   and capture a full profile.
 #
 # The ANALYZE phase runs up to four instrumented passes:
 #   clean   — /usr/bin/time -v + ecrawl_analyze key=value stats on stdout
@@ -26,20 +28,19 @@
 #   sched   — optional `perf sched` pass (per-thread runtime / switch / delay)
 #             for the big fixtures, to confirm per-section thread concurrency.
 #
-# NOTE on thread use: ecrawl_analyze parallelises per shard file — it caps its
-# worker count at the number of uid_shard_*.bin files. Single-shard fixtures
-# therefore run effectively single-threaded; the per-thread perf views below
-# make that visible. Production crawls with many shards spread across threads.
+# NOTE on thread use: ecrawl_analyze parallelises per parse chunk (a .ckpt
+# segment), not per shard file — it caps its worker count at the number of
+# chunks. A single big single-UID shard is split into multiple chunks, so it
+# now spreads across cores (each shard's catalog is loaded once and shared by
+# all its chunks). Only a small single-chunk shard runs single-threaded; the
+# per-thread perf views below make the actual spread visible.
 #
 # Usage:
-#   scripts/profile-ecrawl_analyze-fixtures.sh <synth-root> <out-parent> [results-dir]
+#   scripts/profile-ecrawl_analyze-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
-#   <synth-root>   dir containing the fixtures (single_huge_dir/, mega_dir1/, ...).
-#   <out-parent>   parent dir for per-fixture data; for each fixture this script
-#                  creates and keeps:
-#                      <out-parent>/<fixture>/bin/   ecrawl uid_shard_*.bin
-#                  Bins are reused across runs (FORCE_CRAWL=1 to recrawl).
+#   <bin-root>     dir produced by profile-ecrawl-fixtures.sh; for each fixture
+#                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
 #                  ecrawl_analyze is read-only, so it produces no kept output.
 #
 # Optional positional:
@@ -48,15 +49,14 @@
 #
 # Environment knobs (all optional):
 #   ECRAWL_ANALYZE_BIN=./ecrawl_analyze  analyzer binary (auto: ./, /tmp/, PATH).
-#   ECRAWL_BIN=./ecrawl                  ecrawl binary  (auto: ./, /tmp/, PATH).
-#   FORCE_CRAWL=0             if 1, recrawl every fixture even if shards exist.
 #   ECRAWL_ANALYZE_THREADS=32  worker threads (passed through; tool caps at the
 #                              shard count, and falls back to ECRAWL_REPAIR_THREADS
 #                              if ECRAWL_ANALYZE_THREADS is unset).
 #   ANALYZE_TOP=               if set to N, pass `--top N` to ecrawl_analyze.
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).
-#   INCLUDE_ROOT=0             also crawl+analyze the whole <synth-root> as one.
+#   INCLUDE_ROOT=0             also analyze the whole-tree _ALL_ROOT_ bin set if
+#                              the ecrawl profiler produced it (INCLUDE_ROOT=1).
 #   DO_STRACE=1                run the strace pass.
 #   DO_PERF=1                  run the perf pass.
 #   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
@@ -70,12 +70,11 @@
 #   REPS=1                     repetitions of the clean analyze pass per fixture.
 #   ECRAWL_ANALYZE_VERBOSE_ARGS=...  extra args appended to ecrawl_analyze.
 #
-# Data layout (under <out-parent>, persistent):
-#   <fixture>/bin/             ecrawl uid_shard_*.bin for that fixture
+# Data layout (under <bin-root>, persistent):
+#   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
 #
 # Profiling-log layout (under <results-dir>):
 #   env.txt                                    host/build/env snapshot
-#   <fixture>/crawl.summary.txt|crawl.*.txt    ecrawl /usr/bin/time + --verbose
 #   <fixture>/analyze/clean.stats.txt          ecrawl_analyze key=value (stdout)
 #   <fixture>/analyze/clean.progress.txt       ecrawl_analyze progress (stderr)
 #   <fixture>/analyze/clean.time.txt           /usr/bin/time -v
@@ -92,22 +91,21 @@
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
-if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <synth-root> <out-parent> [results-dir]" >&2
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <bin-root> [results-dir]" >&2
   exit 2
 fi
-SYNTH_ROOT=${1%/}
-if [[ ! -d "$SYNTH_ROOT" ]]; then
-  echo "ERROR: synth-root '$SYNTH_ROOT' is not a directory" >&2
+# Shared shard sets produced by profile-ecrawl-fixtures.sh; this profiler only
+# consumes <bin-root>/<fixture>/bin and never crawls.
+BIN_ROOT=${1%/}
+if [[ ! -d "$BIN_ROOT" ]]; then
+  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile-ecrawl-fixtures.sh first)" >&2
   exit 2
 fi
-
-OUT_PARENT=${2%/}
-mkdir -p "$OUT_PARENT" || { echo "ERROR: cannot create out-parent '$OUT_PARENT'" >&2; exit 1; }
-OUT_PARENT=$(cd "$OUT_PARENT" && pwd)
+BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${3:-"./ecrawl_analyze-profile-$TS"}
+RESULTS_DIR=${2:-"./ecrawl_analyze-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
@@ -126,10 +124,8 @@ find_bin() {
   fi
 }
 ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN)
-ECRAWL_BIN=$(find_bin ecrawl ECRAWL_BIN)
 
 # ---- config ----------------------------------------------------------------
-FORCE_CRAWL=${FORCE_CRAWL:-0}
 ECRAWL_ANALYZE_THREADS=${ECRAWL_ANALYZE_THREADS:-32}
 export ECRAWL_ANALYZE_THREADS
 ANALYZE_TOP=${ANALYZE_TOP:-}
@@ -159,15 +155,15 @@ if [[ -n "${FIXTURES:-}" ]]; then
 else
   FIXLIST=()
   for f in "${KNOWN_FIXTURES[@]}"; do
-    [[ -d "$SYNTH_ROOT/$f" ]] && FIXLIST+=("$f")
+    [[ -d "$BIN_ROOT/$f/bin" ]] && FIXLIST+=("$f")
   done
   if [[ ${#FIXLIST[@]} -eq 0 ]]; then
     while IFS= read -r d; do FIXLIST+=("$(basename "$d")"); done \
-      < <(find "$SYNTH_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+      < <(find "$BIN_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
   fi
 fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
-  echo "ERROR: no fixtures found under '$SYNTH_ROOT'" >&2
+  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile-ecrawl-fixtures.sh first)" >&2
   exit 1
 fi
 
@@ -189,36 +185,6 @@ fi
 # ---- helpers ---------------------------------------------------------------
 fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
 shard_count() { find "$1" -maxdepth 1 -name 'uid_shard_*.bin' 2>/dev/null | wc -l; }
-
-# Crawl one fixture into its persistent bin dir (unless shards already exist).
-ensure_bins() {
-  local fixture=$1 start=$2 bindir=$3 dest=$4
-  local n
-  n=$(shard_count "$bindir")
-  if [[ "$FORCE_CRAWL" != "1" && "$n" -gt 0 ]]; then
-    echo "    crawl: reuse $n shard(s) in $bindir"
-    { echo "reused=1"; echo "uid_shard_files=$n"; } >"$dest/crawl.summary.txt"
-    return 0
-  fi
-  rm -rf "$bindir"; mkdir -p "$bindir"
-  echo "    crawl: $ECRAWL_BIN --verbose $start $bindir"
-  local t0 t1
-  t0=$(date +%s.%N)
-  if [[ "$HAVE_TIME" == "1" ]]; then
-    "$TIME_BIN" -v -o "$dest/crawl.time.txt" \
-      "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  else
-    "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  fi
-  local rc=$?
-  t1=$(date +%s.%N)
-  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/crawl.wall.txt"
-  n=$(shard_count "$bindir")
-  { echo "reused=0"; echo "crawl_rc=$rc"; echo "uid_shard_files=$n"; } >>"$dest/crawl.summary.txt"
-  echo "    crawl: produced $n shard(s) (rc=$rc)"
-}
 
 # Build ecrawl_analyze argv into RUN_ARGV.
 build_argv() {
@@ -312,17 +278,21 @@ run_sched() {
 }
 
 profile_one() {
-  local fixture=$1 start=$2
-  echo "==> $fixture  ($start)"
-  local fxout="$OUT_PARENT/$fixture"
+  local fixture=$1
+  local fxout="$BIN_ROOT/$fixture"
   local bindir="$fxout/bin"
   local dest="$RESULTS_DIR/$fixture"
   local adest="$dest/analyze"
-  mkdir -p "$fxout" "$dest" "$adest"
-  ensure_bins "$fixture" "$start" "$bindir" "$dest"
-  if [[ "$(shard_count "$bindir")" -eq 0 ]]; then
-    echo "    (no shards; skipping analyze passes)"; return
+  echo "==> $fixture  ($bindir)"
+  local nsh
+  nsh=$(shard_count "$bindir")
+  if [[ "$nsh" -eq 0 ]]; then
+    echo "ERROR: no uid_shard_*.bin under '$bindir' for fixture '$fixture'." >&2
+    echo "       Run profile-ecrawl-fixtures.sh with the same <bin-root> first." >&2
+    exit 1
   fi
+  mkdir -p "$dest" "$adest"
+  echo "uid_shard_files=$nsh" >"$dest/bins.txt"
   local r
   for ((r = 1; r <= REPS; r++)); do
     run_clean "$adest" "$bindir" "$r"
@@ -336,13 +306,11 @@ profile_one() {
 {
   echo "# ecrawl_analyze fixture profile"
   echo "timestamp=$TS"
-  echo "synth_root=$SYNTH_ROOT"
-  echo "synth_root_fstype=$(fs_type "$SYNTH_ROOT")"
+  echo "bin_root=$BIN_ROOT"
+  echo "bin_root_fstype=$(fs_type "$BIN_ROOT")"
   echo "results_dir=$RESULTS_DIR"
-  echo "out_parent=$OUT_PARENT"
   echo "ecrawl_analyze_bin=$ECRAWL_ANALYZE_BIN"
-  echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off} force_crawl=$FORCE_CRAWL"
+  echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
@@ -378,13 +346,10 @@ fi
 
 # ---- run -------------------------------------------------------------------
 for f in "${FIXLIST[@]}"; do
-  if [[ ! -d "$SYNTH_ROOT/$f" ]]; then
-    echo "==> $f  (MISSING under $SYNTH_ROOT; skipped)"; continue
-  fi
-  profile_one "$f" "$SYNTH_ROOT/$f"
+  profile_one "$f"
 done
-if [[ "$INCLUDE_ROOT" == "1" ]]; then
-  profile_one "_ALL_ROOT_" "$SYNTH_ROOT"
+if [[ "$INCLUDE_ROOT" == "1" && -d "$BIN_ROOT/_ALL_ROOT_/bin" ]]; then
+  profile_one "_ALL_ROOT_"
 fi
 
 # ---- combined report -------------------------------------------------------
@@ -401,10 +366,6 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
     echo "========================================================================"
     echo "FIXTURE: $f"
     echo "========================================================================"
-    for file in "$RESULTS_DIR/$f/crawl.summary.txt" "$RESULTS_DIR/$f/crawl.time.txt"; do
-      [[ -e "$file" ]] || continue
-      echo "----- $(basename "$file") -----"; cat "$file"; echo
-    done
     d="$RESULTS_DIR/$f/analyze"
     [[ -d "$d" ]] || continue
     for part in clean.stats clean.time; do
@@ -511,9 +472,9 @@ def perf_threads(fx, min_pct=1.0, top=5):
     """Per-thread on-CPU spread from perf.report.bythread.txt.
 
     Returns (n_threads_ge_min, top_pcts): how many distinct threads carried
-    >=min_pct of CPU samples, and the busiest per-thread percentages. Because
-    ecrawl_analyze caps workers at the shard count, single-shard fixtures show
-    threads>=1%=1 here.
+    >=min_pct of CPU samples, and the busiest per-thread percentages. Workers
+    are capped at the parse-chunk count, so a single big shard (many .ckpt
+    chunks) still spreads across threads; only a single-chunk shard shows 1.
     """
     p = root / fx / "analyze" / "perf.report.bythread.txt"
     if not p.exists():
@@ -548,8 +509,8 @@ def fmt(v, kind="int"):
 lines = []
 hdr = kv(root / "env.txt")
 lines.append("ecrawl_analyze profile — SUMMARY TABLE")
-lines.append(f"  timestamp={hdr.get('timestamp','?')}  synth_root={hdr.get('synth_root','?')}")
-lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('synth_root_fstype','?')}")
+lines.append(f"  timestamp={hdr.get('timestamp','?')}  bin_root={hdr.get('bin_root','?')}")
+lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('bin_root_fstype','?')}")
 for key in ("config:", "modes:"):
     envf = root / "env.txt"
     if envf.exists():
@@ -560,30 +521,27 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "crawl(s)", "analyze(s)", "records",
+cols = ["fixture", "shards", "analyze(s)", "records",
         "parents", "maxNfile", "chunks"]
-w = [22, 8, 9, 11, 14, 14, 12, 11]
+w = [22, 8, 11, 14, 14, 12, 11]
 
 
 def row(vals):
     return "  ".join(str(v).ljust(w[i]) for i, v in enumerate(vals))
 
 
-lines.append("== CRAWL + ANALYZE WALL TIME ==")
+lines.append("== ANALYZE WALL TIME ==")
 lines.append(row(cols))
 lines.append(row(["-" * x for x in w]))
 for fx in fixtures:
     av = analyze_kv(fx)
-    if not av and not (root / fx / "crawl.summary.txt").exists():
+    if not av:
         continue
-    csum = kv(root / fx / "crawl.summary.txt")
     el = reps_elapsed(fx)
     el_avg = (sum(el) / len(el)) if el else None
-    cw = num(kv(root / fx / "crawl.wall.txt").get("wall_seconds", ""))
     lines.append(row([
         fx,
-        csum.get("uid_shard_files", "-"),
-        fmt(cw, "f1") if cw is not None else ("reuse" if csum.get("reused") == "1" else "-"),
+        kv(root / fx / "bins.txt").get("uid_shard_files", "-"),
         fmt(el_avg, "f2") if el_avg is not None else "-",
         fmt(num(av.get("records_total"))),
         fmt(num(av.get("distinct_parent_directories"))),
@@ -594,17 +552,17 @@ lines.append("")
 
 # --- per-thread on-CPU spread (perf) --------------------------------------
 # threads_>=1% = how many distinct threads each carried >=1% of CPU samples.
-# ecrawl_analyze caps workers at the shard count, so single-shard fixtures
-# show 1; many-shard corpora should approach analyze_threads.
+# ecrawl_analyze caps workers at the parse-chunk count, so a single big shard
+# (many .ckpt chunks) still spreads across threads; a single-chunk shard shows 1.
 lines.append("== PER-THREAD ON-CPU SPREAD (perf; whole run) ==")
-lines.append("   threads>=1% (tool caps workers at shard count); top% = busiest threads")
+lines.append("   threads>=1% (workers capped at parse-chunk count); top% = busiest threads")
 for fx in fixtures:
     pt = perf_threads(fx)
     if not pt:
         continue
     n_ge, tops = pt
     tops_s = " ".join(f"{x:.1f}%" for x in tops)
-    shards = kv(root / fx / "crawl.summary.txt").get("uid_shard_files", "?")
+    shards = kv(root / fx / "bins.txt").get("uid_shard_files", "?")
     lines.append(f"  {fx}: threads>=1%={n_ge} (shards={shards})  top={tops_s}")
 lines.append("")
 
@@ -643,7 +601,7 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "DONE."
   echo "  Summary table:   $SUMMARY_TABLE"
   echo "  Combined report: $COMBINED"
-  echo "  Data (bins kept): $OUT_PARENT/<fixture>/bin  (bins reused; FORCE_CRAWL=1 to recrawl)"
+  echo "  Data (read-only): bins consumed from $BIN_ROOT/<fixture>/bin"
   echo "  Tarball (upload this): $TARBALL"
   echo
   echo "----- SUMMARY_TABLE.txt -----"

@@ -5,15 +5,17 @@
 # SPDX-License-Identifier: MIT
 #
 # Profile `ereport_index --make` (the trigram index builder used for path
-# search) over each synthetic adversarial sub-directory's crawl output, the
-# same way profile-ereport-fixtures.sh profiles `ereport`.
+# search) over the shared per-fixture crawl output produced by
+# profile-ecrawl-fixtures.sh, the same way profile-ereport-fixtures.sh profiles
+# `ereport`.
+#
+# This profiler does NOT crawl. Run profile-ecrawl-fixtures.sh first with the
+# same <bin-root> to populate <bin-root>/<fixture>/bin/; this script consumes
+# those shards and hard-errors if a selected fixture has none.
 #
 # Per fixture (see generate-ecrawl-adversarial-tree.sh):
-#   1. CRAWL phase  — run ecrawl to produce that fixture's uid_shard_*.bin set
-#                     (skipped if the bin dir already has shards; FORCE_CRAWL=1
-#                     to recrawl). Timed so per-subdir crawl speed is tracked.
-#   2. INDEX phase  — run `ereport_index --make` over that bin dir (all-users
-#                     form) and capture a full profile.
+#   INDEX phase  — run `ereport_index --make` over <bin-root>/<fixture>/bin
+#                  (all-users form) and capture a full profile.
 #
 # The INDEX phase runs up to three instrumented passes:
 #   clean   — /usr/bin/time -v + ereport_index --verbose key=value stats on
@@ -24,15 +26,13 @@
 #             ereport_index with `make debug` for best symbols).
 #
 # Usage:
-#   scripts/profile-ereport_index-fixtures.sh <synth-root> <out-parent> [results-dir]
+#   scripts/profile-ereport_index-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
-#   <synth-root>   dir containing the fixtures (single_huge_dir/, mega_dir1/, ...).
-#   <out-parent>   parent dir for per-fixture data; for each fixture this script
-#                  creates and keeps:
-#                      <out-parent>/<fixture>/bin/      ecrawl uid_shard_*.bin
-#                      <out-parent>/<fixture>/index/    ereport_index output
-#                  Bins are reused across runs (FORCE_CRAWL=1 to recrawl).
+#   <bin-root>     dir produced by profile-ecrawl-fixtures.sh; for each fixture
+#                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
+#                  The emitted index is written alongside, and kept, at:
+#                      <bin-root>/<fixture>/index/   ereport_index output
 #
 # Optional positional:
 #   [results-dir]  where profiling logs/tarball go (default:
@@ -40,9 +40,7 @@
 #
 # Environment knobs (all optional):
 #   EREPORT_INDEX_BIN=./ereport_index  builder binary (auto: ./, /tmp/, PATH).
-#   ECRAWL_BIN=./ecrawl                ecrawl binary  (auto: ./, /tmp/, PATH).
-#   FORCE_CRAWL=0              if 1, recrawl every fixture even if shards exist.
-#   KEEP_INDEX=1              keep <out-parent>/<fixture>/index (default 1);
+#   KEEP_INDEX=1              keep <bin-root>/<fixture>/index (default 1);
 #                              set 0 to delete the index after recording its size.
 #   EREPORT_INDEX_THREADS=32   parse/trigram worker threads (passed through).
 #   EREPORT_INDEX_TRIGRAM_THREADS=...  optional; passed through if set.
@@ -51,7 +49,8 @@
 #                              fd- and file-size-hungry). Set 0 to leave as-is.
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).
-#   INCLUDE_ROOT=0             also crawl+index the whole <synth-root> as one.
+#   INCLUDE_ROOT=0             also index the whole-tree _ALL_ROOT_ bin set if
+#                              the ecrawl profiler produced it (INCLUDE_ROOT=1).
 #   DO_STRACE=1                run the strace pass.
 #   DO_PERF=1                  run the perf pass.
 #   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
@@ -65,13 +64,12 @@
 #   REPS=1                     repetitions of the clean index pass per fixture.
 #   EREPORT_INDEX_VERBOSE_ARGS=...  extra args appended to ereport_index.
 #
-# Data layout (under <out-parent>, persistent):
-#   <fixture>/bin/             ecrawl uid_shard_*.bin for that fixture
+# Data layout (under <bin-root>, persistent):
+#   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
 #   <fixture>/index/           ereport_index output from the clean pass
 #
 # Profiling-log layout (under <results-dir>):
 #   env.txt                                   host/build/env snapshot
-#   <fixture>/crawl.summary.txt|crawl.*.txt   ecrawl /usr/bin/time + --verbose
 #   <fixture>/index/clean.stats.txt           ereport_index key=value (stdout)
 #   <fixture>/index/clean.progress.txt        ereport_index progress (stderr)
 #   <fixture>/index/clean.time.txt            /usr/bin/time -v
@@ -86,22 +84,21 @@
 set -uo pipefail
 
 # ---- args ------------------------------------------------------------------
-if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <synth-root> <out-parent> [results-dir]" >&2
+if [[ $# -lt 1 ]]; then
+  echo "usage: $0 <bin-root> [results-dir]" >&2
   exit 2
 fi
-SYNTH_ROOT=${1%/}
-if [[ ! -d "$SYNTH_ROOT" ]]; then
-  echo "ERROR: synth-root '$SYNTH_ROOT' is not a directory" >&2
+# Shared shard sets produced by profile-ecrawl-fixtures.sh; this profiler only
+# consumes <bin-root>/<fixture>/bin and never crawls.
+BIN_ROOT=${1%/}
+if [[ ! -d "$BIN_ROOT" ]]; then
+  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile-ecrawl-fixtures.sh first)" >&2
   exit 2
 fi
-
-OUT_PARENT=${2%/}
-mkdir -p "$OUT_PARENT" || { echo "ERROR: cannot create out-parent '$OUT_PARENT'" >&2; exit 1; }
-OUT_PARENT=$(cd "$OUT_PARENT" && pwd)
+BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${3:-"./ereport_index-profile-$TS"}
+RESULTS_DIR=${2:-"./ereport_index-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
@@ -120,13 +117,11 @@ find_bin() {
   fi
 }
 EREPORT_INDEX_BIN=$(find_bin ereport_index EREPORT_INDEX_BIN)
-ECRAWL_BIN=$(find_bin ecrawl ECRAWL_BIN)
 
 # ---- config ----------------------------------------------------------------
 # Instrumentation passes (strace/perf) rebuild the index into a throwaway dir
 # so they never disturb the canonical clean-pass index; this is their home.
 INSTR_BASE="$RESULTS_DIR/_instr_index"
-FORCE_CRAWL=${FORCE_CRAWL:-0}
 EREPORT_INDEX_THREADS=${EREPORT_INDEX_THREADS:-32}
 export EREPORT_INDEX_THREADS
 [[ -n "${EREPORT_INDEX_TRIGRAM_THREADS:-}" ]] && export EREPORT_INDEX_TRIGRAM_THREADS
@@ -172,15 +167,15 @@ if [[ -n "${FIXTURES:-}" ]]; then
 else
   FIXLIST=()
   for f in "${KNOWN_FIXTURES[@]}"; do
-    [[ -d "$SYNTH_ROOT/$f" ]] && FIXLIST+=("$f")
+    [[ -d "$BIN_ROOT/$f/bin" ]] && FIXLIST+=("$f")
   done
   if [[ ${#FIXLIST[@]} -eq 0 ]]; then
     while IFS= read -r d; do FIXLIST+=("$(basename "$d")"); done \
-      < <(find "$SYNTH_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+      < <(find "$BIN_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
   fi
 fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
-  echo "ERROR: no fixtures found under '$SYNTH_ROOT'" >&2
+  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile-ecrawl-fixtures.sh first)" >&2
   exit 1
 fi
 
@@ -202,36 +197,6 @@ fi
 # ---- helpers ---------------------------------------------------------------
 fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
 shard_count() { find "$1" -maxdepth 1 -name 'uid_shard_*.bin' 2>/dev/null | wc -l; }
-
-# Crawl one fixture into its persistent bin dir (unless shards already exist).
-ensure_bins() {
-  local fixture=$1 start=$2 bindir=$3 dest=$4
-  local n
-  n=$(shard_count "$bindir")
-  if [[ "$FORCE_CRAWL" != "1" && "$n" -gt 0 ]]; then
-    echo "    crawl: reuse $n shard(s) in $bindir"
-    { echo "reused=1"; echo "uid_shard_files=$n"; } >"$dest/crawl.summary.txt"
-    return 0
-  fi
-  rm -rf "$bindir"; mkdir -p "$bindir"
-  echo "    crawl: $ECRAWL_BIN --verbose $start $bindir"
-  local t0 t1
-  t0=$(date +%s.%N)
-  if [[ "$HAVE_TIME" == "1" ]]; then
-    "$TIME_BIN" -v -o "$dest/crawl.time.txt" \
-      "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  else
-    "$ECRAWL_BIN" --verbose "$start" "$bindir" \
-      >"$dest/crawl.summary.txt" 2>"$dest/crawl.stderr.txt"
-  fi
-  local rc=$?
-  t1=$(date +%s.%N)
-  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/crawl.wall.txt"
-  n=$(shard_count "$bindir")
-  { echo "reused=0"; echo "crawl_rc=$rc"; echo "uid_shard_files=$n"; } >>"$dest/crawl.summary.txt"
-  echo "    crawl: produced $n shard(s) (rc=$rc)"
-}
 
 # Build ereport_index argv (all-users --make form) into RUN_ARGV.
 # With a bin-dir path (not a system user) as the first positional, --make
@@ -345,18 +310,22 @@ run_sched() {
 }
 
 profile_one() {
-  local fixture=$1 start=$2
-  echo "==> $fixture  ($start)"
-  local fxout="$OUT_PARENT/$fixture"
+  local fixture=$1
+  local fxout="$BIN_ROOT/$fixture"
   local bindir="$fxout/bin"
   local indexdir="$fxout/index"
   local dest="$RESULTS_DIR/$fixture"
   local idest="$dest/index"
-  mkdir -p "$fxout" "$dest" "$idest"
-  ensure_bins "$fixture" "$start" "$bindir" "$dest"
-  if [[ "$(shard_count "$bindir")" -eq 0 ]]; then
-    echo "    (no shards; skipping index passes)"; return
+  echo "==> $fixture  ($bindir)"
+  local nsh
+  nsh=$(shard_count "$bindir")
+  if [[ "$nsh" -eq 0 ]]; then
+    echo "ERROR: no uid_shard_*.bin under '$bindir' for fixture '$fixture'." >&2
+    echo "       Run profile-ecrawl-fixtures.sh with the same <bin-root> first." >&2
+    exit 1
   fi
+  mkdir -p "$dest" "$idest"
+  echo "uid_shard_files=$nsh" >"$dest/bins.txt"
   local r
   for ((r = 1; r <= REPS; r++)); do
     run_clean "$idest" "$bindir" "$indexdir" "$r"
@@ -370,13 +339,11 @@ profile_one() {
 {
   echo "# ereport_index fixture profile"
   echo "timestamp=$TS"
-  echo "synth_root=$SYNTH_ROOT"
-  echo "synth_root_fstype=$(fs_type "$SYNTH_ROOT")"
+  echo "bin_root=$BIN_ROOT"
+  echo "bin_root_fstype=$(fs_type "$BIN_ROOT")"
   echo "results_dir=$RESULTS_DIR"
-  echo "out_parent=$OUT_PARENT"
   echo "ereport_index_bin=$EREPORT_INDEX_BIN"
-  echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "config: index_threads=$EREPORT_INDEX_THREADS trigram_threads=${EREPORT_INDEX_TRIGRAM_THREADS:-default} force_crawl=$FORCE_CRAWL"
+  echo "config: index_threads=$EREPORT_INDEX_THREADS trigram_threads=${EREPORT_INDEX_TRIGRAM_THREADS:-default}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_index=$KEEP_INDEX"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
@@ -415,13 +382,10 @@ fi
 # ---- run -------------------------------------------------------------------
 mkdir -p "$INSTR_BASE"
 for f in "${FIXLIST[@]}"; do
-  if [[ ! -d "$SYNTH_ROOT/$f" ]]; then
-    echo "==> $f  (MISSING under $SYNTH_ROOT; skipped)"; continue
-  fi
-  profile_one "$f" "$SYNTH_ROOT/$f"
+  profile_one "$f"
 done
-if [[ "$INCLUDE_ROOT" == "1" ]]; then
-  profile_one "_ALL_ROOT_" "$SYNTH_ROOT"
+if [[ "$INCLUDE_ROOT" == "1" && -d "$BIN_ROOT/_ALL_ROOT_/bin" ]]; then
+  profile_one "_ALL_ROOT_"
 fi
 rm -rf "$INSTR_BASE"
 
@@ -439,10 +403,6 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
     echo "========================================================================"
     echo "FIXTURE: $f"
     echo "========================================================================"
-    for file in "$RESULTS_DIR/$f/crawl.summary.txt" "$RESULTS_DIR/$f/crawl.time.txt"; do
-      [[ -e "$file" ]] || continue
-      echo "----- $(basename "$file") -----"; cat "$file"; echo
-    done
     d="$RESULTS_DIR/$f/index"
     [[ -d "$d" ]] || continue
     for part in clean.stats clean.time index_size; do
@@ -565,8 +525,8 @@ def fmt(v, kind="int"):
 lines = []
 hdr = kv(root / "env.txt")
 lines.append("ereport_index profile — SUMMARY TABLE")
-lines.append(f"  timestamp={hdr.get('timestamp','?')}  synth_root={hdr.get('synth_root','?')}")
-lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n_now={hdr.get('ulimit_n_now','?')} fstype={hdr.get('synth_root_fstype','?')}")
+lines.append(f"  timestamp={hdr.get('timestamp','?')}  bin_root={hdr.get('bin_root','?')}")
+lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n_now={hdr.get('ulimit_n_now','?')} fstype={hdr.get('bin_root_fstype','?')}")
 for key in ("config:", "modes:"):
     envf = root / "env.txt"
     if envf.exists():
@@ -577,32 +537,29 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "crawl(s)", "index(s)", "idx_size", "paths",
+cols = ["fixture", "shards", "index(s)", "idx_size", "paths",
         "trigrams", "chunkprep", "indexph", "mergeph"]
-w = [22, 7, 9, 9, 9, 12, 11, 10, 9, 9]
+w = [22, 7, 9, 9, 12, 11, 10, 9, 9]
 
 
 def row(vals):
     return "  ".join(str(v).ljust(w[i]) for i, v in enumerate(vals))
 
 
-lines.append("== CRAWL + INDEX WALL TIME ==")
+lines.append("== INDEX WALL TIME ==")
 lines.append(row(cols))
 lines.append(row(["-" * x for x in w]))
 for fx in fixtures:
     iv = index_kv(fx)
-    if not iv and not (root / fx / "crawl.summary.txt").exists():
+    if not iv:
         continue
-    csum = kv(root / fx / "crawl.summary.txt")
     el = reps_elapsed(fx)
     el_avg = (sum(el) / len(el)) if el else None
     isz = kv(root / fx / "index" / "index_size.txt").get("index_dir_size") \
         or kv(root / fx / "index" / "index_size.rep1.txt").get("index_dir_size")
-    cw = num(kv(root / fx / "crawl.wall.txt").get("wall_seconds", ""))
     lines.append(row([
         fx,
-        csum.get("uid_shard_files", "-"),
-        fmt(cw, "f1") if cw is not None else ("reuse" if csum.get("reused") == "1" else "-"),
+        kv(root / fx / "bins.txt").get("uid_shard_files", "-"),
         fmt(el_avg, "f2") if el_avg is not None else "-",
         isz or "-",
         fmt(num(iv.get("indexed_paths"))),
@@ -740,7 +697,7 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "DONE."
   echo "  Summary table:   $SUMMARY_TABLE"
   echo "  Combined report: $COMBINED"
-  echo "  Data (bins+index kept): $OUT_PARENT/<fixture>/{bin,index}  (bins reused; FORCE_CRAWL=1 to recrawl)"
+  echo "  Data (index kept): $BIN_ROOT/<fixture>/index  (bins consumed from $BIN_ROOT/<fixture>/bin)"
   echo "  Tarball (upload this): $TARBALL"
   echo
   echo "----- SUMMARY_TABLE.txt -----"
