@@ -13,7 +13,10 @@
  * on stderr when stderr is a TTY.
  *
  * Parallelism: ECRAWL_ANALYZE_THREADS (default 16, minimum 1, maximum 4096). If unset,
- * ECRAWL_REPAIR_THREADS is used for compatibility with older workflows.
+ * ECRAWL_REPAIR_THREADS is used for compatibility with older workflows. Work is split
+ * by chunk (a .ckpt segment), not by shard, so a single huge single-UID shard still
+ * scales across cores; each shard's catalog is loaded once and shared read-only by all
+ * of its chunks.
  */
 
 #define _FILE_OFFSET_BITS 64
@@ -31,6 +34,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include <limits.h>
 
@@ -92,6 +96,19 @@ typedef struct {
     crawl_bin_file_chunk_t *chunks;
     size_t chunk_count;
     uint64_t *shard_file_sizes;
+    /*
+     * One catalog per shard file, loaded once and shared read-only across every
+     * chunk of that shard. Previously each chunk reloaded the catalog from the
+     * file (nine arrays plus a strdup per directory name) — for a single-UID
+     * shard split into many ckpt segments that repeated the full, expensive
+     * catalog build for every segment. Loaded lazily under shard_cat_lock and
+     * freed as soon as a shard's last chunk completes (shard_chunks_left==0) so
+     * peak memory stays bounded for many-shard corpora.
+     */
+    crawl_bin_catalog_t *shard_cat;       /* array[name_count] */
+    unsigned char *shard_cat_state;       /* 0=unloaded 1=ready 2=failed 3=freed */
+    _Atomic uint64_t *shard_chunks_left;  /* per shard; catalog freed when it reaches 0 */
+    pthread_mutex_t shard_cat_lock;
     _Atomic size_t chunk_cursor;
     _Atomic int failures;
     _Atomic unsigned slot_assign;
@@ -205,7 +222,20 @@ static void *analyze_stats_thread_main(void *arg) {
             fflush(stderr);
         }
 
-        sleep(1);
+        /*
+         * ~1s cadence, but wake promptly when asked to stop. A single sleep(1)
+         * here made shutdown block up to a full second on the join, which
+         * dominated the wall time of fast (sub-second) analyses and hid the
+         * per-shard parallelism win. Poll the stop flag in short slices instead.
+         */
+        {
+            int k;
+            for (k = 0; k < 20; k++) {
+                struct timespec ts = { 0, 50 * 1000 * 1000L }; /* 50 ms */
+                if (atomic_load_explicit(&p->analyze_stop_stats, memory_order_relaxed)) break;
+                nanosleep(&ts, NULL);
+            }
+        }
     }
 
     return NULL;
@@ -891,15 +921,80 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
     return 0;
 }
 
+/*
+ * Return shard fi's catalog, loading it once on first use (read-only thereafter,
+ * shared by every chunk of the shard). Double-checked under shard_cat_lock so the
+ * nine catalog arrays and per-directory name strdups are built a single time per
+ * shard instead of once per ckpt chunk. Returns NULL if the catalog is missing or
+ * fails to load.
+ */
+static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, size_t fi, const char *full_path) {
+    const crawl_bin_catalog_t *res = NULL;
+
+    pthread_mutex_lock(&p->shard_cat_lock);
+    if (p->shard_cat_state[fi] == 0) {
+        FILE *fp = fopen(full_path, "rb");
+        unsigned char st = 2; /* failed unless proven otherwise */
+
+        if (fp) {
+            bin_file_header_t fh;
+            uint64_t fsz = p->shard_file_sizes[fi];
+
+            if (fread(&fh, sizeof(fh), 1, fp) == 1 && crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION) &&
+                fh.catalog_offset != 0ULL && fh.catalog_offset <= fsz) {
+                if (crawl_bin_catalog_load(fp, fh.catalog_offset, fsz, &p->shard_cat[fi]) == 0) st = 1;
+                /* crawl_bin_catalog_load already frees + re-inits the struct on failure. */
+            }
+            fclose(fp);
+        }
+        p->shard_cat_state[fi] = st;
+    }
+    if (p->shard_cat_state[fi] == 1) res = &p->shard_cat[fi];
+    pthread_mutex_unlock(&p->shard_cat_lock);
+    return res;
+}
+
+/*
+ * Mark one chunk of shard fi done; when the shard's last chunk completes, drop its
+ * catalog so peak memory tracks the shards in flight rather than all shards at once.
+ * Safe to free here: the count only reaches 0 after the final chunk has finished
+ * using the catalog, so no reader is active.
+ */
+static void analyze_release_shard_chunk(analyze_pool_t *p, size_t fi) {
+    if (atomic_fetch_sub_explicit(&p->shard_chunks_left[fi], 1ULL, memory_order_acq_rel) == 1ULL) {
+        pthread_mutex_lock(&p->shard_cat_lock);
+        if (p->shard_cat_state[fi] == 1) {
+            crawl_bin_catalog_free(&p->shard_cat[fi]);
+            p->shard_cat_state[fi] = 3;
+        }
+        pthread_mutex_unlock(&p->shard_cat_lock);
+    }
+}
+
+/* Free any catalogs still loaded (e.g. on the early-exit path) and the per-shard arrays. */
+static void analyze_free_shard_catalogs(analyze_pool_t *p, size_t name_count) {
+    size_t fi;
+
+    if (p->shard_cat && p->shard_cat_state) {
+        for (fi = 0; fi < name_count; fi++)
+            if (p->shard_cat_state[fi] == 1) crawl_bin_catalog_free(&p->shard_cat[fi]);
+    }
+    free(p->shard_cat);
+    free(p->shard_cat_state);
+    free((void *)p->shard_chunks_left);
+    p->shard_cat = NULL;
+    p->shard_cat_state = NULL;
+    p->shard_chunks_left = NULL;
+}
+
 static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
-                                 unsigned char *pathbuf, char *parentbuf, char *fullpath_buf, size_t fullpath_sz,
-                                 parent_map_t *map, uint64_t *depth_hist, char *iobuf, size_t iobuf_sz,
-                                 uint64_t *nrec_out) {
+                                 const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
+                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
+                                 char *iobuf, size_t iobuf_sz, uint64_t *nrec_out) {
     FILE *fp;
     int rc;
-    bin_file_header_t fh;
-    crawl_bin_catalog_t cat;
 
+    if (!cat) return -1;
     if (start_off > file_sz || end_off > file_sz || start_off >= end_off) return -1;
     fp = fopen(full_path, "rb");
     if (!fp) {
@@ -908,42 +1003,23 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
     }
     /* Large fully-buffered stdio buffer cuts read() syscalls on big shards / NFS. Must precede any I/O. */
     if (iobuf && iobuf_sz > 0U) setvbuf(fp, iobuf, _IOFBF, iobuf_sz);
-    if (fread_unlocked(&fh, sizeof(fh), 1, fp) != 1) {
-        fclose(fp);
-        return -1;
-    }
-    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
-        fclose(fp);
-        return -1;
-    }
-    if (fh.catalog_offset == 0ULL || fh.catalog_offset > file_sz) {
-        fclose(fp);
-        return -1;
-    }
-    crawl_bin_catalog_init_empty(&cat);
-    if (crawl_bin_catalog_load(fp, fh.catalog_offset, file_sz, &cat) != 0) {
-        crawl_bin_catalog_free(&cat);
-        fclose(fp);
-        return -1;
-    }
+    /* Catalog is preloaded and shared; the per-chunk FILE* only walks records. */
     if (fseeko(fp, (off_t)start_off, SEEK_SET) != 0) {
-        crawl_bin_catalog_free(&cat);
         fclose(fp);
         return -1;
     }
     {
         analyze_dir_cache_ent_t *dir_cache = NULL;
-        uint64_t dir_cache_max = cat.max_dir_id;
+        uint64_t dir_cache_max = cat->max_dir_id;
 
         /* Memo for repeated parent_dir_id within this chunk; skip when the dir-id space is too large to be worth it. */
         if (dir_cache_max > 0ULL && dir_cache_max < (uint64_t)ANALYZE_DIR_CACHE_MAX_ENTRIES)
             dir_cache = (analyze_dir_cache_ent_t *)calloc((size_t)dir_cache_max + 1U, sizeof(*dir_cache));
 
-        rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, &cat, pathbuf, parentbuf, fullpath_buf,
+        rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, cat, pathbuf, parentbuf, fullpath_buf,
                                    fullpath_sz, map, depth_hist, dir_cache, dir_cache_max, nrec_out);
         free(dir_cache);
     }
-    crawl_bin_catalog_free(&cat);
     fclose(fp);
     return rc;
 }
@@ -985,8 +1061,14 @@ static void *analyze_worker_main(void *arg) {
         fsz = p->shard_file_sizes[c->file_index];
         chunk_bytes = c->end_offset - c->start_offset;
 
-        ar = analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, pathbuf, parentbuf, fullpath_buf,
-                                   PATH_MAX, map, dh, iobuf, iobuf_sz, &nrec);
+        {
+            const crawl_bin_catalog_t *cat = analyze_get_shard_catalog(p, c->file_index, c->path);
+
+            ar = cat ? analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, cat, pathbuf, parentbuf,
+                                             fullpath_buf, PATH_MAX, map, dh, iobuf, iobuf_sz, &nrec)
+                     : -1;
+            analyze_release_shard_chunk(p, c->file_index);
+        }
 
         atomic_fetch_add_explicit(&p->analyze_bytes_done, chunk_bytes, memory_order_relaxed);
         atomic_fetch_add_explicit(&p->analyze_chunks_done, 1ULL, memory_order_relaxed);
@@ -1264,6 +1346,15 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         return 1;
     }
 
+    /*
+     * The unit of parallel work is a chunk (ckpt segment), not a shard. A single
+     * huge single-UID shard is split into many chunks, so cap workers by chunk
+     * count rather than shard count — otherwise a one-shard crawl ran on a single
+     * core no matter how many chunks (and cores) were available.
+     */
+    if ((uint64_t)nthreads > (uint64_t)chunk_count) nthreads = (unsigned)chunk_count;
+    if (nthreads < 1U) nthreads = 1U;
+
     memset(&pool, 0, sizeof(pool));
     memset(merged_depth, 0, sizeof(merged_depth));
     pool.dir_path = dir_path;
@@ -1280,6 +1371,31 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     atomic_init(&pool.analyze_records_done, 0);
     atomic_init(&pool.analyze_chunks_done, 0);
     atomic_init(&pool.analyze_stop_stats, 0);
+    pthread_mutex_init(&pool.shard_cat_lock, NULL);
+
+    /* Shared per-shard catalogs (loaded once on demand) + remaining-chunk counts. */
+    pool.shard_cat = (crawl_bin_catalog_t *)calloc(name_count, sizeof(*pool.shard_cat));
+    pool.shard_cat_state = (unsigned char *)calloc(name_count, sizeof(*pool.shard_cat_state));
+    pool.shard_chunks_left = (_Atomic uint64_t *)calloc(name_count, sizeof(*pool.shard_chunks_left));
+    if (!pool.shard_cat || !pool.shard_cat_state || !pool.shard_chunks_left) {
+        perror("ecrawl_analyze: alloc");
+        free(pool.shard_cat);
+        free(pool.shard_cat_state);
+        free(pool.shard_chunks_left);
+        pthread_mutex_destroy(&pool.shard_cat_lock);
+        crawl_bin_free_chunk_array_rows(chunks, chunk_count);
+        free(shard_sizes);
+        return 1;
+    }
+    {
+        size_t ci;
+        for (ci = 0; ci < name_count; ci++) atomic_init(&pool.shard_chunks_left[ci], 0ULL);
+        for (ci = 0; ci < chunk_count; ci++) {
+            size_t fi = chunks[ci].file_index;
+            if (fi < name_count)
+                atomic_fetch_add_explicit(&pool.shard_chunks_left[fi], 1ULL, memory_order_relaxed);
+        }
+    }
 
     pool.maps = (parent_map_t **)calloc((size_t)nthreads, sizeof(*pool.maps));
     pool.depth_hist = (uint64_t **)calloc((size_t)nthreads, sizeof(*pool.depth_hist));
@@ -1289,6 +1405,10 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         free(pool.maps);
         free(pool.depth_hist);
         free(threads);
+        free(pool.shard_cat);
+        free(pool.shard_cat_state);
+        free(pool.shard_chunks_left);
+        pthread_mutex_destroy(&pool.shard_cat_lock);
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
         free(shard_sizes);
         return 1;
@@ -1325,6 +1445,8 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             free(pool.maps);
             free(pool.depth_hist);
             free(threads);
+            analyze_free_shard_catalogs(&pool, name_count);
+            pthread_mutex_destroy(&pool.shard_cat_lock);
             crawl_bin_free_chunk_array_rows(pool.chunks, pool.chunk_count);
             free(pool.shard_file_sizes);
             pool.chunks = NULL;
@@ -1386,6 +1508,9 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         print_analyze_report(merged, merged_depth, name_count, chunk_count);
         parent_map_free(merged);
     }
+
+    analyze_free_shard_catalogs(&pool, name_count);
+    pthread_mutex_destroy(&pool.shard_cat_lock);
 
     crawl_bin_free_chunk_array_rows(pool.chunks, pool.chunk_count);
     free(pool.shard_file_sizes);
@@ -1496,7 +1621,8 @@ int main(int argc, char **argv) {
 
     qsort(names, name_count, sizeof(names[0]), cmp_strptr);
 
-    if ((size_t)nthreads > name_count) nthreads = (unsigned)name_count;
+    /* Worker count is clamped to the chunk count inside run_analyze (chunks, not
+     * shards, are the unit of parallel work), so a single big shard still scales. */
     if (nthreads < 1) nthreads = 1;
 
     {
