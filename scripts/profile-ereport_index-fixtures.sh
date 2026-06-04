@@ -54,6 +54,12 @@
 #   INCLUDE_ROOT=0             also crawl+index the whole <synth-root> as one.
 #   DO_STRACE=1                run the strace pass.
 #   DO_PERF=1                  run the perf pass.
+#   DO_SCHED=0                 run a `perf sched` pass (per-thread runtime /
+#                              switch / delay) — only for fixtures listed in
+#                              SCHED_FIXTURES, since the trace is large. Use it
+#                              to confirm per-section thread concurrency.
+#   SCHED_FIXTURES="single_huge_dir mega_dir1 mega_dir2"  fixtures big enough
+#                              for a meaningful perf sched trace.
 #   PERF_FREQ=997              perf sampling frequency (Hz).
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
 #   REPS=1                     repetitions of the clean index pass per fixture.
@@ -126,6 +132,8 @@ export EREPORT_INDEX_THREADS
 [[ -n "${EREPORT_INDEX_TRIGRAM_THREADS:-}" ]] && export EREPORT_INDEX_TRIGRAM_THREADS
 DO_STRACE=${DO_STRACE:-1}
 DO_PERF=${DO_PERF:-1}
+DO_SCHED=${DO_SCHED:-0}
+SCHED_FIXTURES=${SCHED_FIXTURES:-"single_huge_dir mega_dir1 mega_dir2"}
 PERF_FREQ=${PERF_FREQ:-997}
 PERF_CALLGRAPH=${PERF_CALLGRAPH:-dwarf}
 REPS=${REPS:-1}
@@ -294,9 +302,43 @@ run_perf() {
       echo "perf report failed (see perf.record-stderr.txt)" >"$dest/perf.report.txt"
     perf report -i "$data" --stdio -g graph,0.5,caller 2>/dev/null \
       >"$dest/perf.report.caller.txt" || true
+    # Per-thread CPU split from the same data (free): how evenly did the
+    # configured workers actually burn CPU? Bare TIDs unless threads are named.
+    # perf's per-thread sort key is `pid` (shows PID:TID); `tid` isn't accepted
+    # on all builds. Keep stderr so an empty report stays diagnosable.
+    perf report -i "$data" --stdio --no-children --sort comm,pid \
+      >"$dest/perf.report.bythread.txt" 2>"$dest/perf.report.bythread-stderr.txt" || true
   else
     echo "perf record failed; check kernel.perf_event_paranoid and permissions." \
       >"$dest/perf.report.txt"
+  fi
+  rm -f "$data"
+  rm -rf "$indexdir"
+}
+
+# Per-thread scheduling view (runtime / switches / delay) for big fixtures only.
+# Confirms how many threads were genuinely on-CPU per section vs. waiting. The
+# raw trace is large, so only the text summaries are kept.
+run_sched() {
+  local dest=$1 bindir=$2 fixture=$3
+  [[ "$DO_SCHED" == "1" ]] || return 0
+  case " $SCHED_FIXTURES " in *" $fixture "*) ;; *) return 0 ;; esac
+  command -v perf >/dev/null 2>&1 || return 0
+  local indexdir="$INSTR_BASE/sched"
+  rm -rf "$indexdir"; mkdir -p "$indexdir"
+  build_argv "$bindir" "$indexdir"
+  echo "    index sched: perf sched record (per-thread concurrency; data not kept)"
+  local data="$dest/perf.sched.data"
+  if perf sched record -o "$data" \
+       "${RUN_ARGV[@]}" >/dev/null 2>"$dest/perf.sched.record-stderr.txt"; then
+    perf sched latency -i "$data" 2>/dev/null >"$dest/perf.sched.latency.txt" || true
+    perf sched timehist -i "$data" --summary-only 2>/dev/null \
+      >"$dest/perf.sched.summary.txt" \
+      || perf sched timehist -i "$data" -s 2>/dev/null | tail -n 80 \
+         >"$dest/perf.sched.summary.txt" || true
+  else
+    echo "perf sched record failed; needs sched tracepoints (perf_event_paranoid<=1 or root)." \
+      >"$dest/perf.sched.latency.txt"
   fi
   rm -f "$data"
   rm -rf "$indexdir"
@@ -321,6 +363,7 @@ profile_one() {
   done
   run_strace "$idest" "$bindir"
   run_perf   "$idest" "$bindir"
+  run_sched  "$idest" "$bindir" "$fixture"
 }
 
 # ---- env snapshot ----------------------------------------------------------
@@ -334,7 +377,8 @@ profile_one() {
   echo "ereport_index_bin=$EREPORT_INDEX_BIN"
   echo "ecrawl_bin=$ECRAWL_BIN"
   echo "config: index_threads=$EREPORT_INDEX_THREADS trigram_threads=${EREPORT_INDEX_TRIGRAM_THREADS:-default} force_crawl=$FORCE_CRAWL"
-  echo "modes: strace=$DO_STRACE perf=$DO_PERF reps=$REPS keep_index=$KEEP_INDEX"
+  echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_index=$KEEP_INDEX"
+  echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
   echo "## host"
@@ -412,6 +456,12 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
     fi
     if [[ -s "$d/perf.report.txt" ]]; then
       echo "----- perf.report.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.txt"; echo
+    fi
+    if [[ -s "$d/perf.report.bythread.txt" ]]; then
+      echo "----- perf.report.bythread.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.bythread.txt"; echo
+    fi
+    if [[ -s "$d/perf.sched.latency.txt" ]]; then
+      echo "----- perf.sched.latency.txt -----"; cat "$d/perf.sched.latency.txt"; echo
     fi
   done
 } >"$COMBINED"
@@ -589,6 +639,69 @@ for fx in fixtures:
         fmt(frb / (1024 * 1024), "f1") if frb is not None else "-",
         fmt(num(iv.get("make_fwrite_calls"))),
         fmt(fwb / (1024 * 1024), "f1") if fwb is not None else "-",
+    ]))
+lines.append("")
+
+# --- per-phase average concurrency ----------------------------------------
+# avg threads busy in a phase = phase_cpu_time / phase_wall. Compare against
+# the configured worker counts to spot starvation (e.g. lock contention).
+def time_pct_cpu(fx):
+    for cand in ("clean.time.rep1.txt", "clean.time.txt"):
+        p = root / fx / "index" / cand
+        if p.exists():
+            m = re.search(r"Percent of CPU this job got:\s*([\d.]+)%",
+                          p.read_text(errors="replace"))
+            if m:
+                return float(m.group(1)) / 100.0
+    return None
+
+
+idx_threads_cfg = "?"
+for l in (root / "env.txt").read_text(errors="replace").splitlines() \
+        if (root / "env.txt").exists() else []:
+    m = re.search(r"index_threads=(\d+)", l)
+    if m:
+        idx_threads_cfg = m.group(1)
+        break
+
+lines.append("== PER-PHASE AVG CONCURRENCY (cpu_time / wall; ~threads busy) ==")
+lines.append(f"   expected: prep/index ~ index_threads={idx_threads_cfg} (parse+trigram), merge <= 16")
+ccols = ["fixture", "prep", "index", "merge", "whole", "time%CPU"]
+cw2 = [22, 8, 8, 8, 8, 9]
+
+
+def crow(vals):
+    return "  ".join(str(v).ljust(cw2[i]) for i, v in enumerate(vals))
+
+
+def conc(uk, sk, wall):
+    u = num(iv.get(uk))
+    s = num(iv.get(sk))
+    if u is None or s is None or wall is None or wall <= 0:
+        return "-"
+    return f"{(u + s) / wall:.1f}"
+
+
+lines.append(crow(ccols))
+lines.append(crow(["-" * x for x in cw2]))
+for fx in fixtures:
+    iv = index_kv(fx)
+    if not iv:
+        continue
+    prep_wall = num(iv.get("chunk_prep_sec"))
+    ip_wall = num(iv.get("index_phase_sec"))
+    mrg_wall = num(iv.get("merge_phase_sec"))
+    el = num(iv.get("elapsed_sec"))
+    # index_phase_sec spans start->end of indexing (includes prep); subtract it.
+    idx_only = (ip_wall - prep_wall) if (ip_wall is not None and prep_wall is not None) else None
+    pc = time_pct_cpu(fx)
+    lines.append(crow([
+        fx,
+        conc("cpu_prep_cpu_user_sec", "cpu_prep_cpu_sys_sec", prep_wall),
+        conc("cpu_idx_cpu_user_sec", "cpu_idx_cpu_sys_sec", idx_only),
+        conc("cpu_mrg_cpu_user_sec", "cpu_mrg_cpu_sys_sec", mrg_wall),
+        conc("cpu_make_cpu_user_sec", "cpu_make_cpu_sys_sec", el),
+        f"{pc:.1f}x" if pc is not None else "-",
     ]))
 lines.append("")
 
