@@ -3774,6 +3774,192 @@ static int path_ord_merge_max_depth(void) {
     return d;
 }
 
+/*
+ * MSD radix path-order sort. Produces exactly the same permutation as a
+ * path_cmp_seg comparison sort (validated byte-identical over deep/flat/
+ * duplicate/tricky-byte corpora) but touches each path byte O(1) times instead
+ * of re-scanning shared prefixes on every comparison — the dominant cost of the
+ * old merge sort on large single-shard inputs (mega-dir path index).
+ *
+ * Each path is treated as the byte sequence T(path): every '/'-delimited
+ * component's bytes followed by a 0x00 separator, with leading/duplicate/
+ * trailing slashes collapsed. memcmp over T() with shorter-first equals
+ * path_cmp_seg (the separator 0x00 sorts below any component byte, which never
+ * contains NUL). A per-record cursor walks one transform "class" per radix
+ * level so the prefix is never re-read.
+ *
+ * class: 0 = ENDED (key exhausted, sorts first), 1 = SEP (the 0x00 after a
+ * component), 2..257 = component byte value + 1 (byte >= 1, no NUL in names).
+ */
+#define PATH_RADIX_NCLASS 258
+#define PATH_RADIX_SEP 1
+#ifndef PATH_RADIX_LEAF
+#define PATH_RADIX_LEAF 64u
+#endif
+#ifndef PATH_RADIX_SPAWN_MIN
+#define PATH_RADIX_SPAWN_MIN (1u << 18) /* only hand a sub-bucket to a thread above this size */
+#endif
+
+typedef struct {
+    const char *p;
+    uint8_t st; /* 0 = reading component, 1 = owe SEP, 2 = ended */
+} path_tcur_t;
+
+static inline void path_tcur_init(path_tcur_t *c, const char *s) {
+    if (!s) s = "";
+    while (*s == '/') s++;
+    c->p = s;
+    c->st = (*s == '\0') ? 2u : 0u;
+}
+
+static inline int path_tcur_next(path_tcur_t *c) {
+    if (c->st == 2u) return 0;
+    if (c->st == 1u) {
+        c->st = 0u;
+        while (*c->p == '/') c->p++;
+        if (*c->p == '\0') c->st = 2u;
+        return PATH_RADIX_SEP;
+    }
+    {
+        unsigned char ch = (unsigned char)*c->p;
+        c->p++;
+        if (*c->p == '/' || *c->p == '\0') c->st = 1u;
+        return (int)ch + 1;
+    }
+}
+
+/* Small-bucket leaf: comparator-sort, stable by original index for tie safety. */
+static int matched_path_radix_leaf_cmp(const void *aa, const void *bb, void *ctx) {
+    const matched_record_t *items = (const matched_record_t *)ctx;
+    size_t ia = *(const size_t *)aa;
+    size_t ib = *(const size_t *)bb;
+    const char *pa = items[ia].path ? items[ia].path : "";
+    const char *pb = items[ib].path ? items[ib].path : "";
+    int c = path_cmp_seg(pa, pb);
+    if (c) return c;
+    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+}
+
+static atomic_int g_path_radix_active;
+static int g_path_radix_max;
+static __thread unsigned short *g_path_radix_cls;
+static __thread size_t g_path_radix_cls_cap;
+
+static void path_radix_sort(const matched_record_t *items, size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n);
+
+typedef struct {
+    const matched_record_t *items;
+    size_t *idx;
+    size_t *tmp;
+    path_tcur_t *curs;
+    size_t n;
+} path_radix_task_t;
+
+static void *path_radix_entry(void *vp) {
+    path_radix_task_t *t = (path_radix_task_t *)vp;
+    path_radix_sort(t->items, t->idx, t->tmp, t->curs, t->n);
+    free(t);
+    /* release this worker's class scratch (thread-local; not auto-freed on join) */
+    free(g_path_radix_cls);
+    g_path_radix_cls = NULL;
+    g_path_radix_cls_cap = 0;
+    return NULL;
+}
+
+static void path_radix_sort(const matched_record_t *items, size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n) {
+    size_t count[PATH_RADIX_NCLASS];
+    size_t off[PATH_RADIX_NCLASS];
+    size_t cur[PATH_RADIX_NCLASS];
+
+descend:
+    if (n <= 1) return;
+    if (n <= PATH_RADIX_LEAF) {
+        qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)items);
+        return;
+    }
+    if (g_path_radix_cls_cap < n) {
+        unsigned short *nb = (unsigned short *)realloc(g_path_radix_cls, n * sizeof(*nb));
+        if (!nb) { /* no scratch: fall back to comparator sort for this bucket */
+            qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)items);
+            return;
+        }
+        g_path_radix_cls = nb;
+        g_path_radix_cls_cap = n;
+    }
+
+    memset(count, 0, sizeof(count));
+    {
+        size_t i;
+        for (i = 0; i < n; i++) {
+            int c = path_tcur_next(&curs[idx[i]]);
+            g_path_radix_cls[i] = (unsigned short)c;
+            count[c]++;
+        }
+    }
+
+    /*
+     * Shared-prefix fast path: if every key has the same class at this level the
+     * permutation is unchanged, so skip the distribute + memcpy and descend in
+     * place. This is what keeps deep common prefixes cheap (no per-level shuffle).
+     */
+    {
+        int nonempty = 0;
+        int single = -1;
+        int c;
+        for (c = 0; c < PATH_RADIX_NCLASS && nonempty < 2; c++)
+            if (count[c]) { nonempty++; single = c; }
+        if (nonempty == 1) {
+            if (single == 0) return; /* all keys ended here: fully sorted */
+            goto descend;            /* same idx range, cursors already advanced */
+        }
+    }
+
+    {
+        size_t acc = 0;
+        int c;
+        for (c = 0; c < PATH_RADIX_NCLASS; c++) { off[c] = acc; cur[c] = acc; acc += count[c]; }
+    }
+    {
+        size_t i;
+        for (i = 0; i < n; i++) { int c = g_path_radix_cls[i]; tmp[cur[c]++] = idx[i]; }
+    }
+    memcpy(idx, tmp, n * sizeof(size_t));
+
+    /* Class 0 (ENDED) is fully placed (all equal). Recurse on 1..257; hand large
+     * sub-buckets to worker threads while a global budget (g_path_radix_max) lasts. */
+    {
+        pthread_t th[PATH_RADIX_NCLASS];
+        int nth = 0;
+        int c;
+        for (c = 1; c < PATH_RADIX_NCLASS; c++) {
+            if (count[c] <= 1) continue;
+            if (count[c] > PATH_RADIX_SPAWN_MIN) {
+                int prev = atomic_fetch_add(&g_path_radix_active, 1);
+                if (prev < g_path_radix_max) {
+                    path_radix_task_t *t = (path_radix_task_t *)malloc(sizeof(*t));
+                    if (t) {
+                        t->items = items;
+                        t->idx = idx + off[c];
+                        t->tmp = tmp + off[c];
+                        t->curs = curs;
+                        t->n = count[c];
+                        if (pthread_create(&th[nth], NULL, path_radix_entry, t) == 0) { nth++; continue; }
+                        free(t);
+                    }
+                    atomic_fetch_sub(&g_path_radix_active, 1);
+                } else {
+                    atomic_fetch_sub(&g_path_radix_active, 1);
+                }
+            }
+            path_radix_sort(items, idx + off[c], tmp + off[c], curs, count[c]);
+        }
+        {
+            int i;
+            for (i = 0; i < nth; i++) { pthread_join(th[i], NULL); atomic_fetch_sub(&g_path_radix_active, 1); }
+        }
+    }
+}
+
 static size_t *matched_records_build_path_order(const matched_records_t *rec, ereport_run_stats_t *run_rs) {
     size_t *ord;
     size_t *tmp;
@@ -3807,6 +3993,28 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec, er
         g_bucket_path_sort_items = NULL;
         vt_path_sort_commit(run_rs, t0_ns);
         return ord;
+    }
+
+    /*
+     * Primary path: MSD radix (no shared-prefix re-comparison). Needs an n-entry
+     * cursor array; if that allocation fails, fall back to the parallel merge sort
+     * below (which only needs tmp). Both produce identical path order.
+     */
+    {
+        path_tcur_t *curs = (path_tcur_t *)malloc(n * sizeof(*curs));
+        if (curs) {
+            for (i = 0; i < n; i++) path_tcur_init(&curs[i], rec->items[i].path);
+            g_path_radix_max = nw;
+            atomic_store(&g_path_radix_active, 1);
+            path_radix_sort(rec->items, ord, tmp, curs, n);
+            free(g_path_radix_cls);
+            g_path_radix_cls = NULL;
+            g_path_radix_cls_cap = 0;
+            free(curs);
+            free(tmp);
+            vt_path_sort_commit(run_rs, t0_ns);
+            return ord;
+        }
     }
 
     md = path_ord_merge_max_depth();
