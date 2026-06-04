@@ -3543,16 +3543,24 @@ static int path_cmp_seg(const char *a, const char *b) {
         if (*a == '\0' && *b == '\0') return 0;
         if (*a == '\0') return -1;
         if (*b == '\0') return 1;
-        {
-            const char *na = strchr(a, '/');
-            const char *nb = strchr(b, '/');
-            size_t la = na ? (size_t)(na - a) : strlen(a);
-            size_t lb = nb ? (size_t)(nb - b) : strlen(b);
-            int c = memcmp(a, b, la < lb ? la : lb);
-            if (c != 0) return c;
-            if (la != lb) return la < lb ? -1 : 1;
-            a = na ? na + 1 : a + la;
-            b = nb ? nb + 1 : b + lb;
+        /*
+         * Compare one path component in a single pass, stopping at the first byte
+         * that differs or the first segment boundary. A segment that ends sooner
+         * (its next byte is '/' or '\0') sorts first, matching the previous
+         * strchr+memcmp form but without rescanning each full segment.
+         */
+        for (;;) {
+            unsigned char ca = (unsigned char)*a;
+            unsigned char cb = (unsigned char)*b;
+            int aend = (ca == '\0' || ca == '/');
+            int bend = (cb == '\0' || cb == '/');
+            if (aend || bend) {
+                if (aend && bend) break; /* segments equal; advance to next */
+                return aend ? -1 : 1;
+            }
+            if (ca != cb) return ca < cb ? -1 : 1;
+            a++;
+            b++;
         }
     }
 }
