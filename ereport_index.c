@@ -1977,16 +1977,6 @@ static trigram_record_t *tw_ensure_sort_buf(size_t n) {
     return tw_sort_buf;
 }
 
-static int trigram_rec_cmp_bucket(const void *aa, const void *bb) {
-    const trigram_record_t *a = (const trigram_record_t *)aa;
-    const trigram_record_t *b = (const trigram_record_t *)bb;
-    uint32_t ba = a->trigram >> (24 - TRIGRAM_BUCKET_BITS);
-    uint32_t bbk = b->trigram >> (24 - TRIGRAM_BUCKET_BITS);
-    if (ba < bbk) return -1;
-    if (ba > bbk) return 1;
-    return 0;
-}
-
 static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     uint32_t wid, b;
 
@@ -2230,8 +2220,23 @@ static void *paths_writer_main(void *arg_void) {
     return NULL;
 }
 
-/* Process and free one trigram job. Returns 0 on success, -1 on a hard failure
- * (writer_failed is set on the run before returning -1). */
+/*
+ * Process and free one trigram job, appending its records to the per-(worker,
+ * bucket) tmp files.
+ *
+ * The job's trigram codes arrive pre-sorted and de-duplicated (from
+ * sort_codes_unique), and bucket = trigram >> (24 - TRIGRAM_BUCKET_BITS) is
+ * monotonic in the trigram, so the records are *already* grouped by bucket in
+ * ascending order. We split them straight into contiguous per-bucket runs and
+ * append each run with one write — no sort. Profiling showed the previous
+ * sort here (whether per-job qsort or a per-batch re-sort) was pure redundant
+ * work that cost ~24% of index-phase CPU on mega_dir1 for zero benefit.
+ *
+ * Note: correctness does not depend on the input being sorted — each emitted
+ * run is a maximal same-bucket span, so every record lands in its own bucket
+ * file regardless; pre-sorting just minimises the number of runs/appends.
+ * Returns 0 on success, -1 on hard failure (writer_failed set before -1).
+ */
 static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_t *rs, trigram_job_t *job) {
     if (atomic_load(&rs->writer_failed)) {
         free(job->codes);
@@ -2255,7 +2260,6 @@ static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_
             buf[i].trigram = job->codes[i];
             buf[i].path_id = job->path_id;
         }
-        if (job->code_count > 1) qsort(buf, job->code_count, sizeof(*buf), trigram_rec_cmp_bucket);
 
         run_i = 0;
         while (run_i < job->code_count) {
@@ -3265,6 +3269,46 @@ static int merge_list_segment_bucket_ids(const build_ctx_t *ctx, uint32_t *out, 
     return 0;
 }
 
+typedef struct {
+    uint32_t bucket;
+    uint64_t bytes;
+} merge_bucket_size_t;
+
+static int merge_bucket_size_cmp_desc(const void *a, const void *b) {
+    const merge_bucket_size_t *x = (const merge_bucket_size_t *)a;
+    const merge_bucket_size_t *y = (const merge_bucket_size_t *)b;
+
+    if (x->bytes > y->bytes) return -1;
+    if (x->bytes < y->bytes) return 1;
+    if (x->bucket < y->bucket) return -1;
+    if (x->bucket > y->bucket) return 1;
+    return 0;
+}
+
+/*
+ * Reorder a merge dispatch list largest-bucket-first (longest-processing-time
+ * scheduling). Merge workers pull buckets off a shared cursor, so starting the
+ * biggest radix sorts first stops one huge bucket from being grabbed last and
+ * forming a single-worker tail. This only affects the order buckets are
+ * processed; per-bucket segment files and the canonical stitch order are
+ * unchanged. On alloc failure the original order is kept (correct, just slower).
+ */
+static void merge_sort_buckets_lpt(build_ctx_t *ctx, uint32_t *buckets, size_t n) {
+    merge_bucket_size_t *sz;
+    size_t i;
+
+    if (n < 2) return;
+    sz = (merge_bucket_size_t *)malloc(n * sizeof(*sz));
+    if (!sz) return;
+    for (i = 0; i < n; i++) {
+        sz[i].bucket = buckets[i];
+        sz[i].bytes = bucket_tmp_files_total_bytes(ctx, buckets[i]);
+    }
+    qsort(sz, n, sizeof(*sz), merge_bucket_size_cmp_desc);
+    for (i = 0; i < n; i++) buckets[i] = sz[i].bucket;
+    free(sz);
+}
+
 /*
  * Finish merge after OOM/interrupt: paths.bin + path_offsets.bin must exist.
  * Deletes tri_keys.bin / tri_postings.bin and rebuilds them from tmp_trigrams_*.bin (if any)
@@ -3386,6 +3430,7 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
             parallel_list = (uint32_t *)malloc(n_need * sizeof(uint32_t));
             if (!parallel_list) goto out;
             memcpy(parallel_list, need_merge, n_need * sizeof(uint32_t));
+            merge_sort_buckets_lpt(ctx, parallel_list, n_need);
 
             memset(&mp, 0, sizeof(mp));
             mp.ctx = ctx;
@@ -3653,11 +3698,19 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     } else {
         merge_parallel_arg_t mp;
         pthread_t *threads = NULL;
+        uint32_t *dispatch_list;
         int ti;
+
+        /* Dispatch biggest-first; bucket_list stays canonical for the stitch. */
+        dispatch_list = (uint32_t *)malloc(nbuckets * sizeof(uint32_t));
+        if (dispatch_list) {
+            memcpy(dispatch_list, bucket_list, nbuckets * sizeof(uint32_t));
+            merge_sort_buckets_lpt(ctx, dispatch_list, nbuckets);
+        }
 
         memset(&mp, 0, sizeof(mp));
         mp.ctx = ctx;
-        mp.buckets = bucket_list;
+        mp.buckets = dispatch_list ? dispatch_list : bucket_list;
         mp.bucket_count = nbuckets;
         atomic_init(&mp.next, 0);
         atomic_init(&mp.failed, 0);
@@ -3665,7 +3718,10 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         atomic_init(&mp.records_in, 0);
 
         threads = (pthread_t *)calloc((size_t)merge_workers, sizeof(*threads));
-        if (!threads) goto out;
+        if (!threads) {
+            free(dispatch_list);
+            goto out;
+        }
         for (ti = 0; ti < merge_workers; ti++) {
             if (pthread_create(&threads[ti], NULL, merge_parallel_worker, &mp) != 0) {
                 atomic_store(&mp.failed, 1);
@@ -3675,6 +3731,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         ctx->merge_workers_used = ti;
         for (ti = 0; ti < ctx->merge_workers_used; ti++) pthread_join(threads[ti], NULL);
         free(threads);
+        free(dispatch_list);
 
         if (atomic_load(&mp.failed)) {
             for (bi = 0; bi < nbuckets; bi++) merge_unlink_segment_pair(ctx, bucket_list[bi]);
