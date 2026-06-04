@@ -224,6 +224,23 @@ SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
   ./scripts/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl-adversarial
 ```
 
+### Profiling against the adversarial trees
+
+Two companion scripts profile the tools per fixture and capture a full performance picture (timings, `strace -f -c` syscall histograms, and `perf record --call-graph dwarf` CPU profiles) into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or ensure `-g`) for the best `perf` symbols.
+
+- **`scripts/profile-ecrawl-fixtures.sh <synth-root> [results-dir]`** — runs **`ecrawl`** against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
+- **`scripts/profile-ereport-fixtures.sh <synth-root> <out-parent> [results-dir]`** — for each fixture, crawls into `<out-parent>/<fixture>/bin/` (reused across runs unless `FORCE_CRAWL=1`) then profiles **`ereport`** (all-users, `--bucket-details 4` by default) writing HTML to `<out-parent>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF`, `REPS`, `FIXTURES`, `KEEP_REPORTS`.
+
+```bash
+# ecrawl: profile every fixture, both modes, with perf
+DO_PERF=1 ./scripts/profile-ecrawl-fixtures.sh /tmp/ecrawl-adversarial
+
+# ereport: crawl-if-needed then profile reports under a shared parent
+./scripts/profile-ereport-fixtures.sh /tmp/ecrawl-adversarial /data1/ereport/parent
+```
+
+Each run prints the results dir and a `…tar.gz` to upload; full options are in each script's comment header. (For `perf`, run as root or lower `kernel.perf_event_paranoid`.)
+
 ## What The Tools Do
 
 ### `ecrawl`
