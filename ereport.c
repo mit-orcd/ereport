@@ -512,6 +512,11 @@ typedef struct {
      * helpers leave it NULL. */
     dense_node_t *last;
     uint64_t last_id;
+    /* Live count of distinct nodes (parents) in this map. Maintained by the add
+     * helpers (incremented only when a brand-new node is created). Node moves during
+     * merge/steal never create nodes, so this stays exact for any populated map; the
+     * parallel-vs-serial decisions read it (O(1)) instead of walking every chain. */
+    size_t count;
 } dense_cell_map_t;
 
 typedef struct {
@@ -2129,6 +2134,7 @@ static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h,
     }
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
+    m->count++;
     return 0;
 }
 
@@ -2164,6 +2170,7 @@ static int dense_cell_add_cached_h(dense_cell_map_t *m, const char *parent, uint
     }
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
+    m->count++;
     m->last = node;
     m->last_id = parent_id;
     return 0;
@@ -2179,15 +2186,8 @@ static int dense_cell_add_cached(dense_cell_map_t *m, const char *parent, uint64
 }
 
 static size_t dense_cell_total_nodes(const dense_cell_map_t *m) {
-    size_t c = 0, bi;
-
     if (!m) return 0;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
-        const dense_node_t *n;
-
-        for (n = m->buckets[bi]; n; n = n->next) c++;
-    }
-    return c;
+    return m->count;
 }
 
 typedef struct {
