@@ -2086,10 +2086,6 @@ static uint32_t dense_hash_full(const char *parent) {
     return h;
 }
 
-static uint32_t dense_parent_bucket(const char *parent) {
-    return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS;
-}
-
 static uint32_t dense_parent_bucket_fanout_lookup(const char *parent) {
     return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
 }
@@ -2622,26 +2618,29 @@ static void dense_cell_steal_into_fanout_lookup_ex(dense_cell_map_t *narrow, den
     free(tids);
 }
 
-static uint64_t dense_cell_fanout_lookup_get_n(const dense_cell_fanout_lookup_t *lk, const char *parent) {
+/* _h variants take the parent's full dense hash (callers iterate dense nodes that
+ * already carry ->hash), so emission lookups don't re-run dense_hash_full per row.
+ * All dense_node_t are created with ->hash set, so the hash pre-check is exact. */
+static uint64_t dense_cell_fanout_lookup_get_n_h(const dense_cell_fanout_lookup_t *lk, const char *parent, uint32_t h) {
     uint32_t biw;
     const dense_node_t *n;
 
     if (!lk || !parent) return 0;
-    biw = dense_parent_bucket_fanout_lookup(parent);
+    biw = h % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
     for (n = lk->buckets[biw]; n; n = n->next) {
-        if (strcmp(n->parent, parent) == 0) return n->n;
+        if (n->hash == h && strcmp(n->parent, parent) == 0) return n->n;
     }
     return 0;
 }
 
-static uint64_t dense_cell_map_get_n(const dense_cell_map_t *m, const char *parent) {
+static uint64_t dense_cell_map_get_n_h(const dense_cell_map_t *m, const char *parent, uint32_t h) {
     uint32_t bi;
     const dense_node_t *n;
 
     if (!m || !parent) return 0;
-    bi = dense_parent_bucket(parent);
+    bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
     for (n = m->buckets[bi]; n; n = n->next) {
-        if (strcmp(n->parent, parent) == 0) return n->n;
+        if (n->hash == h && strcmp(n->parent, parent) == 0) return n->n;
     }
     return 0;
 }
@@ -2686,7 +2685,7 @@ static void *fanout_max_worker(void *vp) {
         const dense_node_t *n;
 
         for (n = c->slice->buckets[bi]; n; n = n->next) {
-            uint64_t g = dense_cell_fanout_lookup_get_n(c->lk, n->parent);
+            uint64_t g = dense_cell_fanout_lookup_get_n_h(c->lk, n->parent, n->hash);
 
             if (g > mx) mx = g;
         }
@@ -2705,7 +2704,7 @@ static uint64_t fanout_max_among_parents_serial(const dense_cell_map_t *slice_pa
         const dense_node_t *n;
 
         for (n = slice_parents->buckets[bi]; n; n = n->next) {
-            uint64_t g = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+            uint64_t g = dense_cell_fanout_lookup_get_n_h(fanout_lookup, n->parent, n->hash);
 
             if (g > mx) mx = g;
         }
@@ -2825,10 +2824,10 @@ static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_
     fanout_parent_stat_node_t **pp;
 
     (void)sum;
-    biw = dense_parent_bucket_fanout_lookup(src_node->parent);
+    biw = src_node->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; /* node carries its full hash */
     pp = &dst->buckets[biw];
     while (*pp) {
-        if (strcmp((*pp)->parent, src_node->parent) == 0) {
+        if ((*pp)->hash == src_node->hash && strcmp((*pp)->parent, src_node->parent) == 0) {
             (*pp)->n_files += src_node->n_files;
             (*pp)->n_dirs += src_node->n_dirs;
             (*pp)->n_others += src_node->n_others;
@@ -5571,7 +5570,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
 
                             row.parent = n->parent;
                             row.slice_files = n->n;
-                            row.global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+                            row.global_fanout = dense_cell_fanout_lookup_get_n_h(fanout_lookup, n->parent, n->hash);
                             dense_drill_topk_heap_push(rows, &hsz, kcap, row);
                         }
                     }
@@ -5585,7 +5584,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                         for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
                             rows[k].parent = n->parent;
                             rows[k].slice_files = n->n;
-                            rows[k].global_fanout = dense_cell_fanout_lookup_get_n(fanout_lookup, n->parent);
+                            rows[k].global_fanout = dense_cell_fanout_lookup_get_n_h(fanout_lookup, n->parent, n->hash);
                             k++;
                         }
                     }
@@ -5719,7 +5718,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
 
                                 row.parent = n->parent;
                                 row.bytes = n->n;
-                                row.files = dense_cell_map_get_n(&dm_files, n->parent);
+                                row.files = dense_cell_map_get_n_h(&dm_files, n->parent, n->hash);
                                 deep_drill_topk_heap_push(rows, &hsz, kcap, row);
                             }
                         }
@@ -5733,7 +5732,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                             for (n = dm_bytes.buckets[bi]; n; n = n->next) {
                                 rows[k].parent = n->parent;
                                 rows[k].bytes = n->n;
-                                rows[k].files = dense_cell_map_get_n(&dm_files, n->parent);
+                                rows[k].files = dense_cell_map_get_n_h(&dm_files, n->parent, n->hash);
                                 k++;
                             }
                         }
