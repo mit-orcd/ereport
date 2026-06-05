@@ -7981,13 +7981,11 @@ static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t pa
     }
 
     if (parent_dir_id == 1ULL) {
+        /* Direct child of the synthetic root: path is /<name> (paths are absolute). */
         if (name_len + 2 > out_sz) return -1;
-        if (name_len > 0 && name) {
-            memcpy(out, name, name_len);
-            out[name_len] = '\0';
-        } else {
-            out[0] = '\0';
-        }
+        out[0] = '/';
+        if (name_len > 0 && name) memcpy(out + 1, name, name_len);
+        out[1 + name_len] = '\0';
         return 0;
     }
 

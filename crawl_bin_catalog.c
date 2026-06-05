@@ -174,20 +174,21 @@ int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, ch
         parts_len[nparts] = (size_t)c->name_len[cur];
         parts_ptr[nparts] = c->name_comp[cur];
         if (parts_len[nparts] > 0 && !parts_ptr[nparts]) return -1;
-        tot += parts_len[nparts] + (nparts > 0 ? 1 : 0);
+        tot += parts_len[nparts] + 1; /* one leading '/' per component (paths are absolute) */
         nparts++;
         cur = c->parent_dir_id[cur];
     }
 
     if (tot + 1 > out_sz) return -1;
     {
+        /* Emit a '/' before every component so absolute paths keep their leading
+         * slash (e.g. /orcd/data/...). nparts == 0 means dir_id == 1 (the synthetic
+         * root); it stays "" so it matches the empty root key used during build. */
         size_t pos = 0;
         for (pi = nparts; pi > 0; pi--) {
             size_t idx = pi - 1;
-            if (pos > 0) {
-                if (pos + 1 >= out_sz) return -1;
-                out[pos++] = '/';
-            }
+            if (pos + 1 >= out_sz) return -1;
+            out[pos++] = '/';
             if (parts_len[idx] > 0) {
                 if (pos + parts_len[idx] >= out_sz) return -1;
                 memcpy(out + pos, parts_ptr[idx], parts_len[idx]);
@@ -211,13 +212,11 @@ int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_d
     }
 
     if (parent_dir_id == 1ULL) {
+        /* Direct child of the synthetic root: path is /<name> (paths are absolute). */
         if (name_len + 2 > out_sz) return -1;
-        if (name_len > 0 && name) {
-            memcpy(out, name, name_len);
-            out[name_len] = '\0';
-        } else {
-            out[0] = '\0';
-        }
+        out[0] = '/';
+        if (name_len > 0 && name) memcpy(out + 1, name, name_len);
+        out[1 + name_len] = '\0';
         return 0;
     }
 
