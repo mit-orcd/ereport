@@ -553,12 +553,14 @@ Queries must be at least three characters (trigram filtering).
 Usage:
 
 ```bash
-./ereport_index --make [--index-dir <path>] [username|uid] [bin_dir ...]
+./ereport_index --make [--index-dir <path>] [--subtree <abs-path>] [username|uid] [bin_dir ...]
 ./ereport_index --resume-merge --index-dir <path>
 ./ereport_index --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]
 ```
 
 `--make` user vs all-users: If the first argument after optional `--index-dir` is a valid login name or numeric uid on this system, it names the report user and any further arguments are crawl directories (default `./`). If that first token is not a known user (for example it is a crawl output directory name), every argument—including the first—is treated as a `bin_dir`, and the index is built for all UIDs under `./all_users/index/` unless `--index-dir` overrides the location (same merge semantics as `ereport` aggregate output). `./ereport_index --make` with nothing after `--make` indexes `./` for all users.
+
+`--subtree <abs-path>` (may precede or follow `--index-dir`, must come before the username/`bin_dir` arguments) indexes only records whose reconstructed full path is at or under that absolute directory, mirroring `ereport --subtree`. Full absolute paths are kept in the index, so a search over a subtree index returns the same paths as the full index would, just restricted to that directory. Matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
 
 You can pass multiple `bin_dir` paths (same merged crawl directories as for `ereport`); they are merged into one index.
 
@@ -569,6 +571,7 @@ Examples:
 ./ereport_index --make /path/to/crawl-out
 ./ereport_index --make crawl_srv01 crawl_srv02
 ./ereport_index --make --index-dir /var/lib/example-search alice crawl_a crawl_b
+./ereport_index --make --subtree /orcd/data/ki/001/lab/jones /path/to/crawl-out   # index only that subtree
 ./ereport_index --resume-merge --index-dir /var/lib/example-search
 ./ereport_index --search --index-dir alice/index doc
 ./ereport_index --search --index-dir all_users/index doc

@@ -62,6 +62,47 @@
 static size_t g_write_batch_paths_base = WRITE_BATCH_PATHS;
 /* Like ecrawl/ereport: default output is a concise key=value summary; --verbose enables live detail and extra metrics. */
 static int g_verbose = 0;
+
+/* --subtree <abs-path>: when non-NULL, only records whose reconstructed full path is at or under this
+ * directory are indexed (full absolute paths kept), so the index mirrors an ereport --subtree report. */
+static char g_subtree_buf[PATH_MAX];
+static const char *g_subtree_prefix = NULL;
+
+/* Directory-boundary prefix test: matches `prefix` itself and `prefix/...` but not `prefixfoo`.
+ * (Mirrors ereport.c's starts_with_dir_prefix.) */
+static int subtree_path_under_prefix(const char *path) {
+    size_t plen;
+
+    if (!g_subtree_prefix || g_subtree_prefix[0] == '\0') return 1;
+    if (!path) return 0;
+    if (strcmp(g_subtree_prefix, "/") == 0) return path[0] == '/';
+    plen = strlen(g_subtree_prefix);
+    if (strncmp(path, g_subtree_prefix, plen) != 0) return 0;
+    return path[plen] == '\0' || path[plen] == '/';
+}
+
+/* Validate + normalize a --subtree argument into g_subtree_buf and point g_subtree_prefix at it.
+ * Returns 0 on success, non-zero (with a message on stderr) on error. */
+static int set_subtree_prefix(const char *arg) {
+    size_t sl;
+
+    if (g_subtree_prefix != NULL) {
+        fprintf(stderr, "ereport_index: duplicate --subtree\n");
+        return -1;
+    }
+    if (!arg || arg[0] != '/') {
+        fprintf(stderr, "ereport_index: --subtree path must be absolute (got '%s')\n", arg ? arg : "");
+        return -1;
+    }
+    if (snprintf(g_subtree_buf, sizeof(g_subtree_buf), "%s", arg) >= (int)sizeof(g_subtree_buf)) {
+        fprintf(stderr, "ereport_index: --subtree path too long\n");
+        return -1;
+    }
+    sl = strlen(g_subtree_buf);
+    while (sl > 1 && g_subtree_buf[sl - 1] == '/') g_subtree_buf[--sl] = '\0';
+    g_subtree_prefix = g_subtree_buf;
+    return 0;
+}
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
 #define MERGE_MAX_WORKERS 16
@@ -1158,7 +1199,7 @@ static int argv_skip_verbose_prefix(int argc, char **argv) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make [--index-dir <path>] [username|uid] [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
             "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
             "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
@@ -1173,6 +1214,8 @@ static void die_usage(const char *argv0) {
             "    login or numeric uid, it selects that user; remaining arguments are crawl directories (default .).\n"
             "    If that token is not a known user, every argument is a crawl directory (all-users index).\n"
             "    With no user/bin arguments after flags, the index is all-users for ./\n"
+            "    Optional --subtree <abs-path> (may precede or follow --index-dir): index only records at or under\n"
+            "    that directory (full absolute paths kept), mirroring `ereport --subtree` so search covers just that subtree.\n"
             "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
             "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
             "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
@@ -2466,6 +2509,13 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
                 free(pathbuf);
                 break;
             }
+        }
+
+        /* --subtree: only index records at or under the requested directory (full absolute path kept). */
+        if (g_subtree_prefix && !subtree_path_under_prefix(pathbuf)) {
+            free(pathbuf);
+            pathbuf = NULL;
+            continue;
         }
 
         {
@@ -5401,18 +5451,32 @@ int main(int argc, char **argv) {
         uid_t probe_uid;
         char probe_disp[256];
 
-        while (ai < argc && arg_is_verbose(argv[ai])) ai++;
-
-        if (ai < argc && strcmp(argv[ai], "--index-dir") == 0) {
-            if (ai + 2 > argc) {
-                fprintf(stderr, "ereport_index: --index-dir requires a path\n");
-                return 2;
+        /* Consume leading options (--index-dir, --subtree) in any order, skipping verbose tokens. */
+        while (ai < argc) {
+            if (arg_is_verbose(argv[ai])) {
+                ai++;
+                continue;
             }
-            index_dir_override = argv[ai + 1];
-            ai += 2;
+            if (strcmp(argv[ai], "--index-dir") == 0) {
+                if (ai + 2 > argc) {
+                    fprintf(stderr, "ereport_index: --index-dir requires a path\n");
+                    return 2;
+                }
+                index_dir_override = argv[ai + 1];
+                ai += 2;
+                continue;
+            }
+            if (strcmp(argv[ai], "--subtree") == 0) {
+                if (ai + 2 > argc) {
+                    fprintf(stderr, "ereport_index: --subtree requires an absolute directory path\n");
+                    return 2;
+                }
+                if (set_subtree_prefix(argv[ai + 1]) != 0) return 2;
+                ai += 2;
+                continue;
+            }
+            break;
         }
-
-        while (ai < argc && arg_is_verbose(argv[ai])) ai++;
 
         if (argc == ai) {
             static const char *dot = ".";
