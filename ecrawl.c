@@ -69,6 +69,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
+#include <sys/syscall.h>
 #include <stdatomic.h>
 #include <dirent.h>
 #include <limits.h>
@@ -139,6 +140,13 @@
 /* During one directory's readdir, periodically drain pending stat batches so megadirs do not hold an
  * unbounded number of completed batches until EOF (see stat_pending_drain_all). */
 #define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
+
+/* Per-crawl-thread buffer (bytes) for raw getdents64 directory reads. A larger buffer returns more
+ * dirents per getdents64 syscall, cutting syscall count (and its mitigation/seccomp/trace overhead)
+ * on large directories. 0 = fall back to libc opendir/readdir. Env: ECRAWL_GETDENTS_BUF. */
+#define DEFAULT_GETDENTS_BUF (256U * 1024U)
+#define MIN_GETDENTS_BUF 4096U
+#define MAX_GETDENTS_BUF (64U * 1024U * 1024U)
 
 /* --no-write skips emit_record's writer batches, so perf would not reach perf_flush_local() until thread exit.
  * Fold thread-local perf into globals every N entries so TTY obj/s and totals stay live. */
@@ -535,6 +543,7 @@ static atomic_ullong g_io_stat_calls       = 0;
 static atomic_ullong g_io_mkdir_calls      = 0;
 static atomic_ullong g_io_opendir_calls    = 0;
 static atomic_ullong g_io_readdir_calls    = 0;
+static atomic_ullong g_io_getdents_calls   = 0;
 static atomic_ullong g_io_closedir_calls   = 0;
 static atomic_ullong g_io_fopen_calls      = 0;
 static atomic_ullong g_io_fclose_calls     = 0;
@@ -675,6 +684,7 @@ static int g_no_write = 0;
 static int g_verbose = 0;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static int g_stat_threads_configured = 0;
+static size_t g_getdents_buf_bytes = DEFAULT_GETDENTS_BUF;
 static size_t g_stat_batch_entries_cfg = DEFAULT_STAT_BATCH_ENTRIES;
 static size_t g_stat_batch_after_reliable_nondirs_cfg = DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS;
 static size_t g_stat_batch_min_offload_cfg          = DEFAULT_STAT_BATCH_MIN_OFFLOAD;
@@ -876,6 +886,23 @@ static int parse_ecrawl_stat_threads(void) {
     t = strtol(e, &end, 10);
     if (errno || end == e || *end || t < 0 || t > (long)INT_MAX) return DEFAULT_STAT_THREADS;
     return (int)t;
+}
+
+/* Raw getdents64 read-buffer size in bytes (0 = use libc opendir/readdir). Env: ECRAWL_GETDENTS_BUF.
+ * Out-of-range values clamp to [MIN_GETDENTS_BUF, MAX_GETDENTS_BUF]; an explicit 0 disables the raw path. */
+static size_t parse_ecrawl_getdents_buf(void) {
+    const char *e = getenv("ECRAWL_GETDENTS_BUF");
+    unsigned long long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_GETDENTS_BUF;
+    errno = 0;
+    v = strtoull(e, &end, 10);
+    if (errno || end == e || *end) return DEFAULT_GETDENTS_BUF;
+    if (v == 0ULL) return 0;
+    if (v < MIN_GETDENTS_BUF) return MIN_GETDENTS_BUF;
+    if (v > MAX_GETDENTS_BUF) return MAX_GETDENTS_BUF;
+    return (size_t)v;
 }
 
 static size_t parse_ecrawl_stat_batch_entries(void) {
@@ -1643,6 +1670,8 @@ static void print_usage(const char *prog) {
             "ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE), "
             "ECRAWL_STAT_THREADS (parallel stat workers, default %d; 0=off), "
+            "ECRAWL_GETDENTS_BUF (raw getdents64 read-buffer bytes per crawl thread, default %u, "
+            "range %u..%u; 0=use libc opendir/readdir), "
             "ECRAWL_STAT_BATCH_ENTRIES (default %u, range 64..65536), "
             "ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS (inline trusted non-dirs per dir before batching, default %u; 0=always append), "
             "ECRAWL_STAT_BATCH_MIN_OFFLOAD (tail batches smaller than this many names use crawl-thread fstatat; "
@@ -1663,6 +1692,9 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS,
             DEFAULT_STAT_THREADS,
+            (unsigned)DEFAULT_GETDENTS_BUF,
+            (unsigned)MIN_GETDENTS_BUF,
+            (unsigned)MAX_GETDENTS_BUF,
             (unsigned)DEFAULT_STAT_BATCH_ENTRIES,
             (unsigned)DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS,
             (unsigned)DEFAULT_STAT_BATCH_MIN_OFFLOAD,
@@ -3648,10 +3680,111 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
     return 0;
 }
 
+/* ----- raw getdents64 directory reader (with libc readdir fallback) ------------------------------
+ * When g_getdents_buf_bytes > 0 a directory is read with raw getdents64(2) into a per-crawl-thread
+ * reusable buffer, returning many dirents per syscall (far fewer syscalls than libc readdir on large
+ * directories, and less syscall-entry / seccomp / ptrace overhead). When 0 (or buffer allocation
+ * failed) it falls back to opendir/readdir, leaving behaviour and portability unchanged. Either way
+ * the same dir fd is reused for the per-child fstatat calls. */
+struct ecrawl_linux_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
+typedef struct {
+    int         fd;       /* dir fd (raw path); also used for child fstatat. -1 => libc fallback */
+    char       *buf;      /* caller-owned reusable buffer (raw path only) */
+    size_t      buf_cap;
+    size_t      buf_len;  /* valid bytes returned by the last getdents64 */
+    size_t      buf_off;  /* parse cursor into buf */
+    DIR        *dirp;     /* non-NULL => libc opendir/readdir fallback */
+    const char *path;     /* for diagnostics on getdents errors */
+} ecrawl_dir_reader_t;
+
+/* Open `path` for iteration. Uses raw getdents64 when buf/buf_cap are usable, else libc opendir.
+ * Returns 0 on success; on failure returns -1 with errno set (caller keeps its EMFILE retry). */
+static int ecrawl_dir_reader_open(ecrawl_dir_reader_t *r, const char *path, char *buf, size_t buf_cap) {
+    r->fd = -1;
+    r->buf = buf;
+    r->buf_cap = buf_cap;
+    r->buf_len = 0;
+    r->buf_off = 0;
+    r->dirp = NULL;
+    r->path = path;
+    if (buf && buf_cap >= MIN_GETDENTS_BUF) {
+        int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) return -1;
+        r->fd = fd;
+        if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_opendir_calls, 1);
+        return 0;
+    }
+    r->dirp = ecrawl_io_opendir(path); /* counts opendir in verbose via the fn pointer */
+    if (!r->dirp) return -1;
+    return 0;
+}
+
+/* Directory fd usable for fstatat(dirfd, name, ...). */
+static int ecrawl_dir_reader_fd(ecrawl_dir_reader_t *r) {
+    return (r->fd >= 0) ? r->fd : dirfd(r->dirp);
+}
+
+/* Fetch the next entry's name + d_type. Returns 1 = got entry, 0 = end-of-directory, -1 = read error.
+ * "." / ".." are not filtered here (callers already skip them), matching readdir semantics. */
+static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out, unsigned char *type_out) {
+    if (r->fd < 0) {
+        struct dirent *de = ecrawl_io_readdir(r->dirp);
+        if (!de) return 0;
+        *name_out = de->d_name;
+#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_UNKNOWN)
+        *type_out = de->d_type;
+#else
+        *type_out = DT_UNKNOWN;
+#endif
+        return 1;
+    }
+    for (;;) {
+        struct ecrawl_linux_dirent64 *d;
+        if (r->buf_off >= r->buf_len) {
+            long n = syscall(SYS_getdents64, r->fd, r->buf, r->buf_cap);
+            if (n < 0) {
+                fprintf(stderr, "ERROR worker getdents64 %s: %s\n",
+                        r->path ? r->path : "(dir)", strerror(errno));
+                return -1;
+            }
+            if (n == 0) return 0;
+            r->buf_len = (size_t)n;
+            r->buf_off = 0;
+            if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_getdents_calls, 1);
+        }
+        d = (struct ecrawl_linux_dirent64 *)(void *)(r->buf + r->buf_off);
+        r->buf_off += d->d_reclen;
+        *name_out = d->d_name;
+        *type_out = d->d_type;
+        if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_readdir_calls, 1);
+        return 1;
+    }
+}
+
+static void ecrawl_dir_reader_close(ecrawl_dir_reader_t *r) {
+    if (r->fd >= 0) {
+        close(r->fd);
+        r->fd = -1;
+        if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_closedir_calls, 1);
+    } else if (r->dirp) {
+        ecrawl_io_closedir(r->dirp);
+        r->dirp = NULL;
+    }
+}
+
 static int process_directory_iterative(dir_stack_t *stack,
                                        worker_arg_t *wa,
                                        emit_context_t *emit,
-                                       task_queue_t *queue) {
+                                       task_queue_t *queue,
+                                       char *dirbuf,
+                                       size_t dirbuf_cap) {
     shared_state_t *shared = wa->shared;
     crawl_stats_t *stats = &wa->stats;
     perf_local_t *perf = &wa->perf;
@@ -3665,8 +3798,9 @@ static int process_directory_iterative(dir_stack_t *stack,
         char *dir_path;
         size_t dir_path_len;
         struct stat st;
-        DIR *dir = NULL;
-        struct dirent *ent;
+        ecrawl_dir_reader_t rd;
+        const char *ent_name;
+        unsigned char ent_dtype;
 
         if (dir_stack_pop(stack, &work) != 0) break;
 
@@ -3706,28 +3840,29 @@ static int process_directory_iterative(dir_stack_t *stack,
 
         {
             unsigned retry;
+            int oprc = -1;
             for (retry = 0; retry <= EMFILE_RETRY_LIMIT; retry++) {
-                dir = ecrawl_io_opendir(dir_path);
-                if (dir || errno != EMFILE || retry == EMFILE_RETRY_LIMIT) break;
+                oprc = ecrawl_dir_reader_open(&rd, dir_path, dirbuf, dirbuf_cap);
+                if (oprc == 0 || errno != EMFILE || retry == EMFILE_RETRY_LIMIT) break;
                 atomic_store(&g_fd_pressure, 1U);
                 emfile_retry_pause(retry);
             }
-        }
-        if (!dir) {
-            fprintf(stderr, "ERROR worker opendir %s: %s\n", dir_path, strerror(errno));
-            stats_add_error(shared);
-            (void)discovered_dir_batch_flush(&disc_b);
-            free(dir_path);
-            continue;
+            if (oprc != 0) {
+                fprintf(stderr, "ERROR worker opendir %s: %s\n", dir_path, strerror(errno));
+                stats_add_error(shared);
+                (void)discovered_dir_batch_flush(&disc_b);
+                free(dir_path);
+                continue;
+            }
         }
 
         {
-            int dir_fd = dirfd(dir);
+            int dir_fd = ecrawl_dir_reader_fd(&rd);
             if (dir_fd < 0) {
                 fprintf(stderr, "ERROR worker dirfd %s: %s\n", dir_path, strerror(errno));
                 stats_add_error(shared);
                 (void)discovered_dir_batch_flush(&disc_b);
-                ecrawl_io_closedir(dir);
+                ecrawl_dir_reader_close(&rd);
                 free(dir_path);
                 continue;
             }
@@ -3748,7 +3883,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     size_t readdir_drain_counter       = 0;
                     size_t dirs_since_donate_check     = 0;
 
-                while ((ent = ecrawl_io_readdir(dir)) != NULL) {
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
                     readdir_drain_counter++;
                     if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
                         readdir_drain_counter = 0;
@@ -3757,17 +3892,13 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     size_t child_name_len;
                     struct stat child_st;
-#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
-                    unsigned char child_d_type = ent->d_type;
-#else
-                    unsigned char child_d_type = DT_UNKNOWN;
-#endif
+                    unsigned char child_d_type = ent_dtype;
 
-                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                    if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
 
-                    child_name_len = strlen(ent->d_name);
+                    child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
-                        crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent->d_name, child_name_len,
+                        crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent_name, child_name_len,
                                                    shared, stats, perf, emit, stack, queue, aux, &disc_b);
                         dirs_since_donate_check++;
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
@@ -3778,8 +3909,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                             reliable_nondir_seen_in_dir < g_stat_batch_after_reliable_nondirs_cfg;
 
                         if (use_reliable_nondir_inline) {
-                            if (ecrawl_io_fstatat_nf(dir_fd, ent->d_name, &child_st) != 0) {
-                                fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name,
+                            if (ecrawl_io_fstatat_nf(dir_fd, ent_name, &child_st) != 0) {
+                                fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent_name,
                                         strerror(errno));
                                 stats_add_error(shared);
                                 continue;
@@ -3788,9 +3919,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 char *child_path_owned;
                                 size_t child_path_len;
 
-                                if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                if (path_join_alloc(dir_path, dir_path_len, ent_name, child_name_len,
                                                     &child_path_owned, &child_path_len) != 0) {
-                                    fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name,
+                                    fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent_name,
                                             strerror(errno));
                                     stats_add_error(shared);
                                     continue;
@@ -3798,7 +3929,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
                                                               0) != 0)
                                     continue;
-                                stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent->d_name, child_name_len);
+                                stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent_name, child_name_len);
                                 dirs_since_donate_check++;
                                 donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                             } else {
@@ -3812,9 +3943,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                                                                    ((dir_path_len == 1 && dir_path[0] == '/') ? 0U
                                                                                                              : 1U);
 
-                                    if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child,
+                                    if (path_join_fast(dir_path, dir_path_len, ent_name, child_name_len, child,
                                                        sizeof(child)) != 0) {
-                                        fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                                        fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent_name);
                                         stats_add_error(shared);
                                         continue;
                                     }
@@ -3828,8 +3959,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                         } else {
                             /* Batched fstatat: trusted non-dirs past inline cap, DT_UNKNOWN, etc. Stat workers
                              * enqueue discovered directories (same as crawl-thread inline path). */
-                            if (stat_names_builder_append(&nb, ent->d_name, child_name_len) != 0) {
-                                fprintf(stderr, "ERROR worker stat batch append %s/%s: %s\n", dir_path, ent->d_name,
+                            if (stat_names_builder_append(&nb, ent_name, child_name_len) != 0) {
+                                fprintf(stderr, "ERROR worker stat batch append %s/%s: %s\n", dir_path, ent_name,
                                         strerror(errno));
                                 stats_add_error(shared);
                                 continue;
@@ -3839,7 +3970,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                                        &pend) != 0) {
                                     (void)discovered_dir_batch_flush(&disc_b);
                                     stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                                    ecrawl_io_closedir(dir);
+                                    ecrawl_dir_reader_close(&rd);
                                     stat_names_builder_free(&nb);
                                     stat_pending_vec_free(&pend);
                                     free(dir_path);
@@ -3867,7 +3998,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     if (tail_rc != 0) {
                         (void)discovered_dir_batch_flush(&disc_b);
                         stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                        ecrawl_io_closedir(dir);
+                        ecrawl_dir_reader_close(&rd);
                         stat_names_builder_free(&nb);
                         stat_pending_vec_free(&pend);
                         free(dir_path);
@@ -3881,26 +4012,22 @@ static int process_directory_iterative(dir_stack_t *stack,
             } else {
                 size_t dirs_since_donate_check = 0;
 
-                while ((ent = ecrawl_io_readdir(dir)) != NULL) {
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
                     size_t child_name_len;
                     struct stat child_st;
-#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
-                    unsigned char child_d_type = ent->d_type;
-#else
-                    unsigned char child_d_type = DT_UNKNOWN;
-#endif
+                    unsigned char child_d_type = ent_dtype;
 
-                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                    if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
 
-                    child_name_len = strlen(ent->d_name);
+                    child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
-                        crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent->d_name, child_name_len,
+                        crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent_name, child_name_len,
                                                    shared, stats, perf, emit, stack, queue, aux, &disc_b);
                         dirs_since_donate_check++;
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
-                        if (ecrawl_io_fstatat_nf(dir_fd, ent->d_name, &child_st) != 0) {
-                            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent->d_name, strerror(errno));
+                        if (ecrawl_io_fstatat_nf(dir_fd, ent_name, &child_st) != 0) {
+                            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent_name, strerror(errno));
                             stats_add_error(shared);
                             continue;
                         }
@@ -3908,9 +4035,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                             char *child_path_owned;
                             size_t child_path_len;
 
-                            if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                            if (path_join_alloc(dir_path, dir_path_len, ent_name, child_name_len,
                                                 &child_path_owned, &child_path_len) != 0) {
-                                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent->d_name,
+                                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent_name,
                                         strerror(errno));
                                 stats_add_error(shared);
                                 continue;
@@ -3930,9 +4057,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 size_t child_path_len = dir_path_len + child_name_len +
                                                         ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
 
-                                if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child,
+                                if (path_join_fast(dir_path, dir_path_len, ent_name, child_name_len, child,
                                                    sizeof(child)) != 0) {
-                                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent->d_name);
+                                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent_name);
                                     stats_add_error(shared);
                                     continue;
                                 }
@@ -3949,7 +4076,7 @@ static int process_directory_iterative(dir_stack_t *stack,
         }
 
         (void)discovered_dir_batch_flush(&disc_b);
-        ecrawl_io_closedir(dir);
+        ecrawl_dir_reader_close(&rd);
         free(dir_path);
     outer_continue:;
     }
@@ -4101,6 +4228,10 @@ static void *stats_thread_main(void *arg) {
 static void *worker_thread_main(void *arg_void) {
     worker_arg_t *arg = (worker_arg_t *)arg_void;
     emit_context_t emit;
+    /* One reusable getdents64 buffer per crawl thread (a worker iterates one directory at a time, so a
+     * single buffer suffices). NULL/0 => process_directory_iterative falls back to libc readdir. */
+    size_t dirbuf_cap = g_getdents_buf_bytes;
+    char *dirbuf = NULL;
 
     if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads, &arg->perf) != 0) {
         fprintf(stderr, "ERROR worker %" PRIu64 " failed to initialize emit context\n", arg->worker_index);
@@ -4108,12 +4239,17 @@ static void *worker_thread_main(void *arg_void) {
         return NULL;
     }
 
+    if (dirbuf_cap > 0) {
+        dirbuf = malloc(dirbuf_cap);
+        if (!dirbuf) dirbuf_cap = 0; /* fall back to libc readdir on OOM */
+    }
+
     for (;;) {
         dir_stack_t task;
 
         if (queue_pop_wait(arg->queue, &task) != 0) break;
 
-        process_directory_iterative(&task, arg, &emit, arg->queue);
+        process_directory_iterative(&task, arg, &emit, arg->queue, dirbuf, dirbuf_cap);
         atomic_fetch_sub(&g_active_workers, 1);
 
         if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
@@ -4129,6 +4265,7 @@ static void *worker_thread_main(void *arg_void) {
     if (emit_context_flush_all(&emit) != 0) stats_add_error(arg->shared);
     emit_context_destroy(&emit);
     tls_flush_thread_batch_counters();
+    free(dirbuf);
     return NULL;
 }
 
@@ -4896,6 +5033,8 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "io_mkdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_mkdir_calls));
     fprintf(fp, "io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
     fprintf(fp, "io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
+    fprintf(fp, "io_getdents_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_getdents_calls));
+    fprintf(fp, "getdents_buf_bytes=%zu\n", g_getdents_buf_bytes);
     fprintf(fp, "io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
     fprintf(fp, "io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
     fprintf(fp, "io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
@@ -5053,6 +5192,7 @@ int main(int argc, char **argv) {
     g_crawl_threads = parse_ecrawl_crawl_threads();
     g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
     g_stat_threads_configured = parse_ecrawl_stat_threads();
+    g_getdents_buf_bytes = parse_ecrawl_getdents_buf();
     g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
     g_stat_batch_after_reliable_nondirs_cfg = parse_ecrawl_stat_batch_after_reliable_nondirs();
     g_stat_batch_min_offload_cfg          = parse_ecrawl_stat_batch_min_offload();
@@ -5225,6 +5365,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_io_mkdir_calls, 0);
     atomic_store(&g_io_opendir_calls, 0);
     atomic_store(&g_io_readdir_calls, 0);
+    atomic_store(&g_io_getdents_calls, 0);
     atomic_store(&g_io_closedir_calls, 0);
     atomic_store(&g_io_fopen_calls, 0);
     atomic_store(&g_io_fclose_calls, 0);
