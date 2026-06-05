@@ -26,10 +26,10 @@
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
- *   - With --no-write, global progress counters (TTY tot/obj/s, ECRAWL_PROGRESS_LOG) are folded from thread-local
+ *   - With --no-write, global progress counters (TTY tot/obj/s) are folded from thread-local
  *     perf every NO_WRITE_GLOBAL_PERF_FLUSH_EVERY entries (no writer batches to trigger perf_flush_local).
- *     With writers, TTY rolling obj/s and ECRAWL_PROGRESS_LOG window_* rates are updated per accounted entry
- *     (tot/f/d/s globals are updated the same way so progress CSV and tot: do not freeze between MiB batches).
+ *     With writers, TTY rolling obj/s rates are updated per accounted entry
+ *     (tot/f/d/s globals are updated the same way so tot: does not freeze between MiB batches).
  *   - Each run clears prior crawl outputs in the chosen output-dir: uid_shard_*.bin, matching *.bin.ckpt,
  *     and crawl_manifest.txt (uid.txt/gid.txt are reopened truncated). An interrupted crawl has nothing to
  *     resume across runs; only in-process shard reopen (LRU) reloads checkpoints for shards written this run.
@@ -41,14 +41,12 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]
- *   --verbose: full metrics to stderr every N minutes (default 5); optional integer sets N.
- *              Also required for ECRAWL_PROGRESS_LOG (path in env).
+ *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ *   --verbose: full metrics to stdout at exit.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
  *
- * Diagnostics (optional env, require --verbose): ECRAWL_PROGRESS_LOG=<path> appends one CSV line per second
- * from the stats thread.
+ * Diagnostics (optional env, require --verbose):
  * ECRAWL_STALL_HINT_SECONDS=N (default 5; 0 disables): after the rolling window is warm, emit one stderr line if
  * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
  */
@@ -79,6 +77,7 @@
 #include <grp.h>
 #include <stdarg.h>
 
+#include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_ckpt.h"
 #include "path_canon.h"
@@ -122,11 +121,11 @@
 
 #define DEFAULT_CRAWL_THREADS 16
 #define DEFAULT_WRITER_THREADS 8
-#define DEFAULT_UID_SHARDS 8192U
-/* Per-writer open-shard LRU target. 1024 = ceil(DEFAULT_UID_SHARDS / DEFAULT_WRITER_THREADS), i.e. a writer can
+#define DEFAULT_UID_SHARDS 1024U
+/* Per-writer open-shard LRU target. 128 = ceil(DEFAULT_UID_SHARDS / DEFAULT_WRITER_THREADS), i.e. a writer can
  * hold every shard it owns open at once, eliminating LRU thrash (fopen/fclose churn) on many-UID workloads.
  * Always auto-capped against RLIMIT_NOFILE and the actual per-writer shard count in configure_max_open_shards(). */
-#define DEFAULT_MAX_OPEN_SHARDS 1024U
+#define DEFAULT_MAX_OPEN_SHARDS 128U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
 #define FD_RESERVE_BASE 128U
 #define FD_RESERVE_PER_CRAWL_THREAD 4U
@@ -142,7 +141,7 @@
 #define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
 
 /* --no-write skips emit_record's writer batches, so perf would not reach perf_flush_local() until thread exit.
- * Fold thread-local perf into globals every N entries so TTY/ECRAWL_PROGRESS_LOG obj/s and totals stay live. */
+ * Fold thread-local perf into globals every N entries so TTY obj/s and totals stay live. */
 #define NO_WRITE_GLOBAL_PERF_FLUSH_EVERY 8192U
 #define DEFAULT_STAT_THREADS 8
 #define DEFAULT_STAT_RANDOM_QUEUE 1
@@ -433,6 +432,12 @@ typedef struct {
     size_t ckpt_cap;
     uint64_t seg_start_byte;
     shard_cat_t cat;
+    /* v6: pending records are buffered here and flushed as zstd blocks. The
+     * buffer is reset (raw_len=0) per open; partial blocks are flushed before
+     * the catalog is written and on LRU eviction, so on-disk blocks are always
+     * complete. */
+    crawl_bin_block_writer_t blk;
+    unsigned char blk_inited;
 } shard_file_state_t;
 
 /* Rolling 10-second stats */
@@ -471,9 +476,6 @@ static uint64_t g_seconds_queue_empty_single_worker = 0;
 static double g_run_start_sec = 0.0;
 static time_t g_crawl_wall_clock_start;
 
-static FILE *g_progress_log_fp = NULL;
-static int g_progress_log_header_written = 0;
-static int g_progress_log_atexit_registered = 0;
 static unsigned long long g_progress_prev_tot_entries = 0;
 static unsigned long long g_progress_prev_readdir = 0;
 static unsigned long long g_progress_prev_lstat = 0;
@@ -668,7 +670,6 @@ static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
 static int g_verbose = 0;
-static int g_verbose_interval_minutes = 5;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static int g_stat_threads_configured = 0;
 static size_t g_stat_batch_entries_cfg = DEFAULT_STAT_BATCH_ENTRIES;
@@ -1627,7 +1628,7 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--verbose [minutes]] [--record-root <abs-path>] <start-path> [output-dir]\n",
+            "Usage: %s [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
@@ -1670,15 +1671,12 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT,
             (unsigned)DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH);
     fprintf(stderr,
-            "Diagnostics (with --verbose): ECRAWL_PROGRESS_LOG=<path> appends 1 Hz CSV (live counters); "
-            "ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive seconds with "
-            "zero rolling-window entries once the window is warm (default 5; 0=off).\n");
+            "Diagnostics (with --verbose): ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive "
+            "seconds with zero rolling-window entries once the window is warm (default 5; 0=off).\n");
     fprintf(stderr,
             "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
-            "Default output is a concise summary. --verbose prints full metrics to stdout at exit, and the same "
-            "metrics to stderr every N minutes (default N=5; optional integer 1..10080 after --verbose); "
-            "ECRAWL_PROGRESS_LOG is honored only with --verbose.\n");
+            "Default output is a concise summary. --verbose prints full metrics to stdout at exit.\n");
 }
 
 static int ensure_output_dir_exists(const char *path) {
@@ -2260,11 +2258,14 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
     if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto fail;
     pos = (off_t)sizeof(bin_file_header_t);
 
+    /* v6: walk the self-describing compressed blocks (bin_block_hdr_t + frame),
+     * recording block-start offsets at stride boundaries. */
     while ((uint64_t)pos < scan_end) {
-        uint64_t rec_start = (uint64_t)pos;
-        bin_record_hdr_t rh;
+        uint64_t blk_start = (uint64_t)pos;
+        bin_block_hdr_t bh;
+        uint64_t block_end;
 
-        if (rec_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
+        if (blk_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
             if (n == cap) {
                 size_t ncap = cap * 2;
                 uint64_t *p = (uint64_t *)realloc(buf, ncap * sizeof(*p));
@@ -2272,18 +2273,15 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
                 buf = p;
                 cap = ncap;
             }
-            buf[n++] = rec_start;
-            seg0 = rec_start;
+            buf[n++] = blk_start;
+            seg0 = blk_start;
         }
-        if (fread(&rh, sizeof(rh), 1, fp) != 1) goto fail;
-        pos = ftello(fp);
-        if (pos < 0) goto fail;
-        if (rh.name_len) {
-            if ((uint64_t)pos + rh.name_len > scan_end) goto fail;
-            if (fseeko(fp, (off_t)rh.name_len, SEEK_CUR) != 0) goto fail;
-            pos = ftello(fp);
-            if (pos < 0) goto fail;
-        }
+        if (scan_end - blk_start < sizeof(bh)) goto fail;
+        if (fread(&bh, sizeof(bh), 1, fp) != 1) goto fail;
+        block_end = blk_start + (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        if (block_end > scan_end) goto fail;
+        if (bh.comp_size && fseeko(fp, (off_t)bh.comp_size, SEEK_CUR) != 0) goto fail;
+        pos = (off_t)block_end;
     }
     if ((uint64_t)pos != scan_end) {
         errno = EINVAL;
@@ -2338,12 +2336,18 @@ static int shard_ckpt_init_new(shard_file_state_t *s) {
     return 0;
 }
 
+static int shard_block_flush(shard_file_state_t *s);
+
 static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_path) {
     uint64_t cat_off;
     int r;
 
     if (!s->fp) return 0;
     if (!s->ckpt_offs || s->ckpt_n == 0) return -1;
+
+    /* v6: flush the pending compressed block so bytes_written == EOF and the
+     * catalog is written immediately after the last block. */
+    if (shard_block_flush(s) != 0) return -1;
 
     if (ecrawl_io_fflush(s->fp) != 0) return -1;
     if (fseeko(s->fp, 0, SEEK_END) != 0) return -1;
@@ -2803,13 +2807,11 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     path_write = path_buf;
 
     memset(&hdr, 0, sizeof(hdr));
-    /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to on-disk v5. */
+    /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to on-disk v6. */
     hdr.parent_dir_id = 0;
     hdr.name_len = (uint16_t)path_len_write;
     hdr.type = (uint8_t)file_type_char(st->st_mode);
-    hdr.mode = (uint32_t)st->st_mode;
     hdr.uid = (uint64_t)st->st_uid;
-    hdr.gid = (uint64_t)st->st_gid;
     hdr.size = (uint64_t)st->st_size;
     hdr.inode = (uint64_t)st->st_ino;
     hdr.dev_major = (uint32_t)major(st->st_dev);
@@ -3922,13 +3924,6 @@ static int process_directory_iterative(dir_stack_t *stack,
     return 0;
 }
 
-static void progress_log_close(void) {
-    if (g_progress_log_fp) {
-        fclose(g_progress_log_fp);
-        g_progress_log_fp = NULL;
-    }
-}
-
 static void *stats_thread_main(void *arg) {
     static int stall_zero_secs = 0;
     static int stall_announced = 0;
@@ -3972,8 +3967,6 @@ static void *stats_thread_main(void *arg) {
             unsigned long long total_dirs = atomic_load(&g_total_dirs);
             unsigned long long total_bytes = atomic_load(&g_total_bytes);
             unsigned long long window_entries = atomic_load(&g_window_entries);
-            unsigned long long window_files = atomic_load(&g_window_files);
-            unsigned long long window_dirs = atomic_load(&g_window_dirs);
             unsigned long long window_stat_meta = atomic_load(&g_window_stat_meta);
             unsigned int divisor = atomic_load(&g_seconds_seen);
             double ops_rate;
@@ -4023,56 +4016,6 @@ static void *stats_thread_main(void *arg) {
             g_progress_prev_readdir = io_rd;
             g_progress_prev_lstat = io_ls;
             g_progress_prev_stat = io_st;
-
-            if (g_progress_log_fp) {
-                unsigned long long qdepth = atomic_load(&g_queue_depth);
-                unsigned long long writer_qdepth = atomic_load(&g_writer_queue_depth);
-                int active = atomic_load(&g_active_workers);
-                unsigned long long popped = atomic_load(&g_tasks_popped);
-                unsigned long long benq = atomic_load(&g_batches_enqueued);
-                unsigned long long bdeq = atomic_load(&g_batches_dequeued);
-                unsigned long long sbenq = atomic_load(&g_stat_batches_enqueued);
-                unsigned long long sbdone = atomic_load(&g_stat_batches_completed);
-                unsigned long long sbdup = atomic_load(&g_stat_batches_dup_fallback);
-                unsigned long long wcrawl = atomic_load(&g_wait_crawl_tasks);
-                unsigned long long wwp = atomic_load(&g_wait_writer_push);
-                unsigned long long wwc = atomic_load(&g_wait_writer_pop);
-                unsigned long long wsp = atomic_load(&g_wait_stat_pop);
-                unsigned long long wse = atomic_load(&g_wait_stat_enqueue);
-                unsigned long long sqmax = atomic_load(&g_stat_queue_depth_max);
-                unsigned long long tqp = atomic_load(&g_task_queue_pushes);
-                unsigned long long qlw = atomic_load(&g_queue_lock_waits);
-                unsigned long long dcalls = atomic_load(&g_donate_calls);
-                unsigned long long wqwns = atomic_load(&g_writer_queue_wait_ns);
-                unsigned long long io_cd = atomic_load(&g_io_closedir_calls);
-                unsigned long long io_od = atomic_load(&g_io_opendir_calls);
-                unsigned int disk_low = atomic_load(&g_disk_low);
-                unsigned int wf = atomic_load(&g_writer_failed);
-
-                if (!g_progress_log_header_written) {
-                    fprintf(g_progress_log_fp,
-                            "unix_ts,elapsed_sec,total_entries,total_files,total_dirs,total_bytes,"
-                            "window_entries,window_files,window_dirs,seconds_seen,ops_rate,stat_meta_rate,"
-                            "queue_depth,writer_queue_depth,active_workers,tasks_popped,"
-                            "batches_enqueued,batches_dequeued,"
-                            "stat_batches_enqueued,stat_batches_completed,stat_batches_dup_fallback,"
-                            "wait_crawl_tasks,wait_writer_push,wait_writer_pop,wait_stat_pop,wait_stat_enqueue,"
-                            "stat_queue_depth_max,"
-                            "delta_total_entries,delta_readdir_calls,delta_lstat_calls,"
-                            "io_readdir_calls,io_closedir_calls,io_opendir_calls,"
-                            "task_queue_pushes,queue_lock_waits,donate_calls,writer_queue_wait_ns,"
-                            "disk_low,writer_failed\n");
-                    g_progress_log_header_written = 1;
-                }
-                fprintf(g_progress_log_fp,
-                        "%lld,%.3f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%.6f,%.6f,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u\n",
-                        (long long)time(NULL), elapsed_sec, total_entries, total_files, total_dirs, total_bytes,
-                        window_entries, window_files, window_dirs, divisor, ops_rate, stat_meta_rate, qdepth,
-                        writer_qdepth, active,
-                        popped, benq, bdeq, sbenq, sbdone, sbdup, wcrawl, wwp, wwc, wsp, wse, sqmax, d_tot, d_rd,
-                        d_ls, io_rd, io_cd, io_od, tqp, qlw, dcalls, wqwns, disk_low, wf);
-                fflush(g_progress_log_fp);
-            }
 
             if (g_verbose) {
                 unsigned long long qdepth = atomic_load(&g_queue_depth);
@@ -4174,6 +4117,12 @@ static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_in
     }
     ecrawl_io_fclose(victim->fp);
     victim->fp = NULL;
+    /* Release the block writer's buffers while evicted to bound writer memory to
+     * ~max_open_shards blocks; reopen re-inits a fresh (empty) block writer. */
+    if (victim->blk_inited) {
+        crawl_bin_block_writer_free(&victim->blk);
+        victim->blk_inited = 0;
+    }
     if (*open_count > 0) (*open_count)--;
     return 1;
 }
@@ -4186,6 +4135,10 @@ static void writer_trim_shards(shard_file_state_t *shards, uint32_t writer_index
 }
 
 static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
+    if (!state->blk_inited) {
+        if (crawl_bin_block_writer_init(&state->blk) != 0) return -1;
+        state->blk_inited = 1;
+    }
     if (state->bytes_written == 0) {
         /*
          * Avoid "a+" here: append streams may ignore seeks on write, so rewriting the 32-byte
@@ -4449,6 +4402,27 @@ static int cmp_writer_batch_frame(const void *a, const void *b) {
  * Records whose on-disk wire size is <= WRITER_ONESHOT_RECORD_BYTES are written with one fwrite
  * (header + name) instead of two.
  */
+/* v6: compress and append the shard's pending record block to its file, pushing
+ * a checkpoint offset at the block boundary once a stride's worth of file data
+ * has accumulated (ckpt offsets are block starts, so segments align to blocks).
+ * No-op when nothing is buffered. */
+static int shard_block_flush(shard_file_state_t *st) {
+    uint64_t block_start = st->bytes_written;
+    uint64_t written = 0;
+
+    if (crawl_bin_block_writer_pending(&st->blk) == 0) return 0;
+    if (block_start - st->seg_start_byte >= CRAWL_CKPT_STRIDE_BYTES) {
+        if (shard_ckpt_push(st, block_start) != 0) {
+            if (errno == 0) errno = ENOMEM;
+            return -1;
+        }
+        st->seg_start_byte = block_start;
+    }
+    if (crawl_bin_block_writer_flush(&st->blk, st->fp, ecrawl_io_fwrite, &written) != 0) return -1;
+    st->bytes_written += written;
+    return 0;
+}
+
 static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t *shards, unsigned *open_count,
                                       uint64_t *tick, const record_batch_t *batch, size_t frame_off,
                                       size_t *next_off_out) {
@@ -4471,6 +4445,7 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
                              &fp) != 0) {
         return -1;
     }
+    (void)fp; /* records now flow through the per-shard block writer (st->blk -> st->fp) */
 
     {
         shard_file_state_t *st = &shards[frame.shard];
@@ -4479,7 +4454,6 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
         bin_record_hdr_t disk;
         size_t wire_len = (size_t)frame.data_len;
         size_t disk_len;
-        uint64_t rec_start = st->bytes_written;
         const char *base = NULL;
         size_t base_len = 0;
         /* path_z holds the record's full path while parent_dir_id == 0; `base` points into it and is
@@ -4563,31 +4537,25 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
          * the byte_credit computed once during the crawl. */
         shard_cat_update_imm_child_rollup(&st->cat, disk.parent_dir_id, frame.byte_credit, &disk);
 
-        if (rec_start - st->seg_start_byte >= CRAWL_CKPT_STRIDE_BYTES) {
-            if (shard_ckpt_push(st, rec_start) != 0) {
-                if (errno == 0) errno = ENOMEM;
-                return -1;
-            }
-            st->seg_start_byte = rec_start;
+        /* v6: serialize the record into the pending block buffer; flush a
+         * compressed block once it reaches the raw target. (void)disk_len. */
+        (void)disk_len;
+        if (crawl_bin_block_writer_append(&st->blk, &disk, sizeof(disk)) != 0) {
+            if (errno == 0) errno = ENOMEM;
+            return -1;
         }
-        if (disk.name_len == 0U) {
-            if (ecrawl_io_fwrite(&disk, sizeof(disk), 1, fp) != 1) return -1;
-        } else {
+        if (disk.name_len > 0U) {
             const unsigned char *nm = payload + sizeof(wire);
 
             if (wire.parent_dir_id == 0ULL) nm = (const unsigned char *)base;
-            if (disk_len <= WRITER_ONESHOT_RECORD_BYTES) {
-                unsigned char blob[WRITER_ONESHOT_RECORD_BYTES];
-
-                memcpy(blob, &disk, sizeof(disk));
-                memcpy(blob + sizeof(disk), nm, disk.name_len);
-                if (ecrawl_io_fwrite(blob, disk_len, 1, fp) != 1) return -1;
-            } else {
-                if (ecrawl_io_fwrite(&disk, sizeof(disk), 1, fp) != 1) return -1;
-                if (ecrawl_io_fwrite(nm, 1, disk.name_len, fp) != disk.name_len) return -1;
+            if (crawl_bin_block_writer_append(&st->blk, nm, disk.name_len) != 0) {
+                if (errno == 0) errno = ENOMEM;
+                return -1;
             }
         }
-        st->bytes_written += disk_len;
+        if (crawl_bin_block_writer_pending(&st->blk) >= CRAWL_BIN_BLOCK_RAW_TARGET) {
+            if (shard_block_flush(st) != 0) return -1;
+        }
     }
 
     shards[frame.shard].last_used = ++(*tick);
@@ -4710,6 +4678,10 @@ static void *writer_thread_main(void *arg_void) {
             }
             /* Free in-memory catalog/ckpt retained across eviction (now persisted on disk). */
             if (shards[i].cat_live) shard_state_release(&shards[i]);
+            if (shards[i].blk_inited) {
+                crawl_bin_block_writer_free(&shards[i].blk);
+                shards[i].blk_inited = 0;
+            }
         }
     }
     free(shards);
@@ -4809,34 +4781,6 @@ static void print_queue_wait_metrics_to(FILE *fp) {
 }
 
 static void print_queue_wait_metrics(void) { print_queue_wait_metrics_to(stdout); }
-
-static void merge_live_snapshot(shared_state_t *out, shared_state_t *shared, worker_arg_t *w, int nworkers) {
-    int i;
-
-    memset(out, 0, sizeof(*out));
-    for (i = 0; i < nworkers; i++) {
-        out->total_entries += w[i].stats.total_entries;
-        out->total_dirs += w[i].stats.total_dirs;
-        out->total_files += w[i].stats.total_files;
-        out->total_hardlink_files += w[i].stats.total_hardlink_files;
-        out->total_symlinks += w[i].stats.total_symlinks;
-        out->total_other += w[i].stats.total_other;
-        out->total_bytes += w[i].stats.total_bytes;
-        out->total_allocated_bytes += w[i].stats.total_allocated_bytes;
-        out->files_sparse_heuristic += w[i].stats.files_sparse_heuristic;
-        out->dir_apparent_bytes += w[i].stats.dir_apparent_bytes;
-        out->symlink_apparent_bytes += w[i].stats.symlink_apparent_bytes;
-        out->other_apparent_bytes += w[i].stats.other_apparent_bytes;
-        out->donated_dirs += w[i].aux.donated_dirs;
-        out->donation_attempts += w[i].aux.donation_attempts;
-        out->donation_successes += w[i].aux.donation_successes;
-    }
-    pthread_mutex_lock(&shared->stats_mutex);
-    out->total_errors = shared->total_errors;
-    out->crawl_threads_started = shared->crawl_threads_started;
-    pthread_mutex_unlock(&shared->stats_mutex);
-    out->split_dirs_enqueued = shared->split_dirs_enqueued;
-}
 
 static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, double elapsed_sec,
                                       int writer_threads_used, const char *start_path) {
@@ -4950,44 +4894,6 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     print_queue_wait_metrics_to(fp);
 }
 
-typedef struct {
-    shared_state_t *shared;
-    worker_arg_t *worker_args;
-    int worker_count;
-    const char *start_path;
-    int writer_threads_used;
-    double t0;
-} verbose_periodic_arg_t;
-
-static void *verbose_periodic_main(void *arg) {
-    verbose_periodic_arg_t *p = (verbose_periodic_arg_t *)arg;
-    int interval_sec = g_verbose_interval_minutes * 60;
-
-    if (interval_sec < 60) interval_sec = 300;
-
-    for (;;) {
-        int s;
-        for (s = 0; s < interval_sec; s++) {
-            if (atomic_load(&g_stop_stats)) goto out;
-            sleep(1);
-        }
-        if (atomic_load(&g_stop_stats)) break;
-        {
-            shared_state_t snap;
-            double el = now_sec() - p->t0;
-
-            merge_live_snapshot(&snap, p->shared, p->worker_args, p->worker_count);
-            fprintf(stderr, "\necrawl: verbose snapshot (interval %d min, elapsed %.3f s)\n",
-                    g_verbose_interval_minutes, el);
-            print_verbose_full_stats(stderr, &snap, el, p->writer_threads_used, p->start_path);
-            fflush(stderr);
-        }
-    }
-out:
-    free(p);
-    return NULL;
-}
-
 int main(int argc, char **argv) {
     const char *start_path;
     const char *positionals[2];
@@ -5000,8 +4906,6 @@ int main(int argc, char **argv) {
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
     pthread_t disk_monitor_thread;
-    pthread_t verbose_periodic_thread;
-    int verbose_periodic_started = 0;
     int disk_monitor_started = 0;
     double t0, t1;
     int worker_count_started = 0;
@@ -5023,18 +4927,6 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--verbose") == 0) {
             g_verbose = 1;
-            g_verbose_interval_minutes = 5;
-            if (i + 1 < argc) {
-                char *end = NULL;
-                long m;
-
-                errno = 0;
-                m = strtol(argv[i + 1], &end, 10);
-                if (end != argv[i + 1] && *end == '\0' && errno == 0 && m >= 1L && m <= 10080L) {
-                    g_verbose_interval_minutes = (int)m;
-                    i++;
-                }
-            }
             continue;
         }
         if (strcmp(argv[i], "--record-root") == 0) {
@@ -5309,28 +5201,6 @@ int main(int argc, char **argv) {
     g_run_start_sec = t0;
     g_crawl_wall_clock_start = time(NULL);
 
-    {
-        const char *plog = getenv("ECRAWL_PROGRESS_LOG");
-
-        if (plog && *plog) {
-            if (!g_verbose) {
-                fprintf(stderr,
-                        "WARNING: ECRAWL_PROGRESS_LOG is set but ignored without --verbose; "
-                        "progress CSV is written only when verbose diagnostics are enabled.\n");
-            } else {
-                g_progress_log_fp = fopen(plog, "a");
-                if (!g_progress_log_fp) {
-                    fprintf(stderr, "WARNING: cannot open ECRAWL_PROGRESS_LOG %s: %s\n", plog, strerror(errno));
-                } else {
-                    setvbuf(g_progress_log_fp, NULL, _IOLBF, 0);
-                    g_progress_log_header_written = 0;
-                    if (!g_progress_log_atexit_registered && atexit(progress_log_close) == 0)
-                        g_progress_log_atexit_registered = 1;
-                }
-            }
-        }
-    }
-
     if (!g_no_write) {
         writer_threads_used = 0;
         for (i = 0; i < writer_slots; i++) {
@@ -5512,22 +5382,6 @@ int main(int argc, char **argv) {
         stats_add_crawl_thread_started(&shared);
     }
 
-    if (g_verbose && g_verbose_interval_minutes > 0 && worker_count_started > 0) {
-        verbose_periodic_arg_t *vpa = (verbose_periodic_arg_t *)malloc(sizeof(*vpa));
-
-        if (vpa) {
-            vpa->shared = &shared;
-            vpa->worker_args = worker_args;
-            vpa->worker_count = worker_count_started;
-            vpa->start_path = start_path;
-            vpa->writer_threads_used = writer_threads_used;
-            vpa->t0 = t0;
-            if (pthread_create(&verbose_periodic_thread, NULL, verbose_periodic_main, vpa) != 0) free(vpa);
-            else
-                verbose_periodic_started = 1;
-        }
-    }
-
     enqueue_root_task(start_path, &shared, &queue);
 
     atomic_store(&g_main_done, 1);
@@ -5559,7 +5413,6 @@ int main(int argc, char **argv) {
 
     if (stats_thread_started) {
         atomic_store(&g_stop_stats, 1);
-        if (verbose_periodic_started) pthread_join(verbose_periodic_thread, NULL);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }

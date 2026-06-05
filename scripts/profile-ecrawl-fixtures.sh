@@ -9,9 +9,8 @@
 # profile per fixture, so the fast/slow behaviour can be analysed offline.
 #
 # For each fixture it can run up to three instrumented passes:
-#   1. clean   — /usr/bin/time -v + ecrawl --verbose summary + per-second
-#                progress CSV + megadir debug CSV. This is the ONLY pass whose
-#                timing is trustworthy.
+#   1. clean   — /usr/bin/time -v + ecrawl --verbose summary. This is the ONLY
+#                pass whose timing is trustworthy.
 #   2. strace  — strace -f -c (syscall histogram; getdents/openat/close/
 #                newfstatat counts). Heavy instrumentation: timing is NOT
 #                representative, only the syscall mix is.
@@ -83,8 +82,6 @@
 #   <fixture>/<mode>/clean.summary.txt   ecrawl --verbose stdout (key=value)
 #   <fixture>/<mode>/clean.stderr.txt    stderr (stall hints, warnings)
 #   <fixture>/<mode>/clean.time.txt      /usr/bin/time -v
-#   <fixture>/<mode>/clean.progress.csv  per-second progress (ECRAWL_PROGRESS_LOG)
-#   <fixture>/<mode>/clean.debug.csv     megadir debug (ECRAWL_DEBUG_LOG)
 #   <fixture>/<mode>/shards.txt          uid_shard_*.bin count (write mode only)
 #   <bin-root>/<fixture>/bin/            kept, reusable uid_shard_*.bin (write mode)
 #   <fixture>/<mode>/strace.txt          strace -f -c histogram
@@ -241,21 +238,15 @@ run_clean() {
   if [[ "$mode" == "write" ]]; then
     rm -rf "$outdir"; mkdir -p "$outdir"
   fi
-  : >"$dest/clean.progress${sfx}.csv"
-  : >"$dest/clean.debug${sfx}.csv"
-
   build_argv "$mode" "$start" "$outdir"
   maybe_drop_caches
 
-  local prog="$dest/clean.progress${sfx}.csv"
-  local dbg="$dest/clean.debug${sfx}.csv"
   echo "    clean/$mode${sfx}: ${RUN_ARGV[*]}"
   if [[ "$HAVE_TIME" == "1" ]]; then
-    ECRAWL_PROGRESS_LOG="$prog" ECRAWL_DEBUG_LOG="$dbg" \
-      "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
+    "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
       "${RUN_ARGV[@]}" >"$dest/clean.summary${sfx}.txt" 2>"$dest/clean.stderr${sfx}.txt"
   else
-    { ECRAWL_PROGRESS_LOG="$prog" ECRAWL_DEBUG_LOG="$dbg" \
+    { \
       /usr/bin/env bash -c 'st=$(date +%s.%N); "$@"; rc=$?; en=$(date +%s.%N); \
         echo "wall_seconds=$(awk -v a=$st -v b=$en "BEGIN{printf \"%.3f\", b-a}")" >&2; exit $rc' \
       _ "${RUN_ARGV[@]}" >"$dest/clean.summary${sfx}.txt" 2>"$dest/clean.stderr${sfx}.txt"; }

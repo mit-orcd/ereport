@@ -117,7 +117,11 @@ int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, 
 
         nl = (size_t)ent.name_len;
         if ((uint64_t)ftello(fp) + nl > file_sz) goto fail;
-        if (nl > tmp_cap) {
+        /* Need nl+1 bytes (name + NUL); grow whenever capacity can't hold the
+         * terminator, not only when nl strictly exceeds it (tmp_cap already
+         * includes the +1, so `nl > tmp_cap` left tmp_name[nl] one byte short
+         * when a later name length equalled an earlier capacity). */
+        if (nl + 1 > tmp_cap) {
             unsigned char *nx = (unsigned char *)realloc(tmp_name, nl + 1);
             if (!nx) goto fail;
             tmp_name = nx;

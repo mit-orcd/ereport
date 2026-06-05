@@ -39,6 +39,7 @@
 #include <limits.h>
 
 #include "crawl_bin_format.h"
+#include "crawl_bin_block.h"
 #include "crawl_ckpt.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_bin_catalog.h"
@@ -853,29 +854,34 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
                                  char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
                                  analyze_dir_cache_ent_t *dir_cache, uint64_t dir_cache_max, uint64_t *nrec_out) {
     uint64_t nrec = 0;
-    uint64_t cur = start_off; /* track position arithmetically instead of ftello() per record */
+    crawl_bin_block_reader_t br;
+    crawl_bin_chunk_stdio_t bio;
 
+    (void)pathbuf; /* names now come from the block reader's decompression buffer */
+    (void)file_sz;
     if (nrec_out) *nrec_out = 0;
+
+    bio.fopen = NULL;
+    bio.fread = fread_unlocked; /* fp is owned by one thread; unlocked is safe */
+    bio.fclose = NULL;
+    if (crawl_bin_block_reader_init(&br, &bio, fp, start_off, scan_end_exclusive) != 0) return -1;
 
     for (;;) {
         bin_record_hdr_t rh;
-        size_t rec_tot;
+        const unsigned char *rec_name = NULL;
         uint64_t pid;
+        int got = crawl_bin_block_reader_next(&br, &rh, &rec_name);
 
-        if (cur >= scan_end_exclusive) break;
-
-        /* fp is owned by exactly one thread, so the unlocked stdio variants are safe and avoid per-call locking. */
-        if (fread_unlocked(&rh, sizeof(rh), 1, fp) != 1) return -1;
-        rec_tot = crawl_bin_record_total_bytes(&rh);
-        if (cur + rec_tot > scan_end_exclusive) return -1;
-        if (cur + rec_tot > file_sz) return -1;
+        if (got == 0) break;
+        if (got < 0) {
+            crawl_bin_block_reader_free(&br);
+            return -1;
+        }
 
         pid = rh.parent_dir_id;
-        if (pid == 0ULL) return -1;
-
-        /* Name bytes must always be consumed to keep the stream aligned, even on a cache hit. */
-        if (rh.name_len) {
-            if (fread_unlocked(pathbuf, rh.name_len, 1, fp) != 1) return -1;
+        if (pid == 0ULL) {
+            crawl_bin_block_reader_free(&br);
+            return -1;
         }
 
         if (dir_cache && pid <= dir_cache_max && dir_cache[pid].state != 0) {
@@ -890,8 +896,10 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
             unsigned db = 0;
             unsigned char st = 2; /* default: no depth recorded */
 
-            if (crawl_bin_catalog_entry_path(cat, pid, (char *)pathbuf, rh.name_len, fullpath_buf, fullpath_sz) != 0)
+            if (crawl_bin_catalog_entry_path(cat, pid, (char *)rec_name, rh.name_len, fullpath_buf, fullpath_sz) != 0) {
+                crawl_bin_block_reader_free(&br);
                 return -1;
+            }
             {
                 size_t flen = strlen(fullpath_buf);
                 uint16_t pl = flen > 65535U ? 65535U : (uint16_t)flen;
@@ -912,11 +920,10 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
                 dir_cache[pid].state = st;
             }
         }
-        cur += rec_tot;
         nrec++;
     }
 
-    if (cur != scan_end_exclusive) return -1;
+    crawl_bin_block_reader_free(&br);
     if (nrec_out) *nrec_out = nrec;
     return 0;
 }

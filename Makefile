@@ -13,6 +13,16 @@ SERVE_INDEX_DIR ?=
 # Targets
 TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_analyze edelete
 
+# zstd: required for the v6 uid_shard_*.bin block-compressed record format.
+# Auto-detected via pkg-config; falls back to a bare -lzstd link (libzstd.so is a
+# base-system library on RHEL). If libzstd is truly absent the link fails, which
+# is the intended hard requirement.
+ZSTD_CFLAGS ?= $(shell pkg-config --cflags libzstd 2>/dev/null)
+ZSTD_LIBS ?= $(shell pkg-config --libs libzstd 2>/dev/null)
+ifeq ($(strip $(ZSTD_LIBS)),)
+ZSTD_LIBS := -lzstd
+endif
+
 # Optional NFS probe (needs libnfs, e.g. dnf install libnfs-devel)
 LIBNFS_CFLAGS ?= $(shell pkg-config --cflags libnfs 2>/dev/null)
 LIBNFS_LIBS ?= $(shell pkg-config --libs libnfs 2>/dev/null)
@@ -67,8 +77,11 @@ crawl_bin_catalog.o: crawl_bin_catalog.c crawl_bin_catalog.h crawl_bin_format.h
 crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
 
-ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
+crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_format.h crawl_bin_chunks.h
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_bin_block.c -o crawl_bin_block.o
+
+ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
@@ -76,14 +89,14 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
-ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
+ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
+ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o $(JEMALLOC_LIBS)
+ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
@@ -116,7 +129,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static *.o crawl_bin_catalog.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static *.o crawl_bin_catalog.o crawl_bin_block.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).

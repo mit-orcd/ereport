@@ -324,8 +324,8 @@ Optional environment variables (no CLI flags for these; see also [quick referenc
 | `ECRAWL_CRAWL_THREADS` | Crawl threads (minimum 1, default 16; no fixed maximum—practical limits are RAM and OS thread capacity). |
 | `ECRAWL_WRITER_THREADS` | Writer threads for uid-sharded `.bin` output (default 8). |
 | `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
-| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 8192). |
-| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 1024 = every shard a writer owns at the default 8192 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
+| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 1024). |
+| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 128 = every shard a writer owns at the default 1024 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
 | `ECRAWL_STAT_THREADS` | Stat worker threads for batched `fstatat` (default 8; `0` disables the pool). |
 | `ECRAWL_STAT_BATCH_ENTRIES` | Directory names per stat batch (default 1024, range 64…65536). |
 | `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS` | Per directory, trusted non-dir `d_type` entries handled inline before stat batching (default `0` = batch from the first entry; set `N` > 0 for an inline prefix of `N` names). Max 2097152. |
@@ -338,7 +338,6 @@ Optional environment variables (no CLI flags for these; see also [quick referenc
 | `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | When every crawl thread already holds a popped task, still allow proactive donation if the local stack is at least this deep and the global queue is below `started × ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` (default 64 dirs; range `donate_floor`…65536). |
 | `ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` | Caps global task-queue depth for that “all busy” donation path (default 4; range 1…256). |
 | `ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH` | Coalesce `fstatat`-discovered subdir enqueues into fewer global queue pushes (default 48 paths per flush; range 1…4096). |
-| `ECRAWL_PROGRESS_LOG` | Append one CSV row per second from the stats thread (live `total_*`, rolling-window `window_*` / `ops_rate`, queue depths, `wait_*`, `stat_batches_*`, per-second `delta_*` vs `g_total_entries` / `io_*`, `task_queue_pushes`, `queue_lock_waits`, `donate_calls`, `writer_queue_wait_ns`, etc.). Opens with `"a"`; first row is a header. Use a fresh path per run if you want a self-contained file. Requires `--verbose`. |
 | `ECRAWL_STALL_HINT_SECONDS` | After the rolling window is warm (~10 seconds), emit one stderr line if `window_entries` stays 0 for this many consecutive seconds (default `5`; `0` disables). Another hint is allowed only after `window_entries` goes non-zero again. |
 
 Examples:
@@ -355,21 +354,13 @@ ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_STAT_THREADS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
-ECRAWL_PROGRESS_LOG=/tmp/ecrawl_progress.csv ./ecrawl --verbose /path/to/filesystem-tree /tmp/crawl-out 2>stderr.log >stdout.log
-```
-
-Parsing `ECRAWL_PROGRESS_LOG`: `scripts/parse-ecrawl-progress.sh` reads the CSV (by path or stdin `-`) and prints `elapsed_sec`, rolling `ops_rate`, per-second `delta_total_entries`, `window_entries`, and crawl/writer queue depths. The CSV path is whatever you pass to `ECRAWL_PROGRESS_LOG` (for example `/tmp/ecrawl_progress.csv` or `scripts/ecrawl_progress.csv`); there is no standard `scripts/scripts/` layout under this repo unless you create it yourself. `--last` feeds only the header plus the newest row—use with `watch` when stdout is redirected and you still want a live snapshot:
-
-```bash
-watch -n 1 ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.csv
-watch -n 1 -t -d ./scripts/parse-ecrawl-progress.sh --last /tmp/ecrawl_progress.csv   # no banner; highlight changes
 ```
 
 Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
-- `--verbose` enables the full end-of-run diagnostics and is required for `ECRAWL_PROGRESS_LOG`.
-- `ECRAWL_DEBUG_LOG` (megadir CSV) was removed — it caused severe slowdowns on wide trees; use `ECRAWL_PROGRESS_LOG` and the built-in contention counters instead.
+- `--verbose` enables the full end-of-run diagnostics.
+- `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--verbose` end-of-run metrics and the built-in contention counters instead.
 - `--record-root <path>` rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks `start-path` on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with `realpath(3)`.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
@@ -379,7 +370,7 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `writer_failed`: `1` means at least one writer batch failed; the process exits nonzero in this case.
 - `task_queue_pushes`: crawl threads pushing directory tasks onto the global task queue (donations + batched discovered subdirs).
 - `queue_lock_waits` / `wait_crawl_tasks`: same underlying counter — increments once per `pthread_cond_wait` episode when a crawl thread waits on an empty global task queue (TLS-batched to the global atomics). Not “mutex acquire count” on push.
-- `donate_calls`: directory-stack donation attempts (TLS-batched; may read 0 in live snapshots until threads exit).
+- `donate_calls`: directory-stack donation attempts (TLS-batched; folded into the global counter when threads exit).
 - `writer_queue_wait_ns`: cumulative nanoseconds crawl threads spent blocked on full writer queues.
 - `wait_crawl_tasks`: duplicate of the crawl-queue wait counter above (printed under both names for CSV / human readers).
 - `wait_writer_push`: crawl-thread wakeups waiting on a full uid-shard writer queue (writers falling behind).
@@ -885,7 +876,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_CRAWL_THREADS` | `ecrawl` | Crawl threads (minimum 1, default 16; no fixed maximum). |
 | `ECRAWL_WRITER_THREADS` | `ecrawl` | Uid-shard writer threads (default 8). |
 | `ECRAWL_WRITER_QUEUE_BATCHES` | `ecrawl` | Pending record batches per writer queue when writing shards (default 64, range 4…4096). |
-| `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 8192). |
+| `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 1024). |
 | `ECRAWL_MAX_OPEN_SHARDS` | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 1024). |
 | `ECRAWL_STAT_THREADS` | `ecrawl` | Stat worker threads for batched `fstatat` (default 8; `0` disables). |
 | `ECRAWL_STAT_BATCH_ENTRIES` | `ecrawl` | Names per stat batch (default 1024, range 64…65536). |
@@ -899,7 +890,6 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | `ecrawl` | Min local stack depth before donating when every crawl thread holds a task (default 64). |
 | `ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` | `ecrawl` | Skip “all busy” donation when `g_queue_depth ≥ crawl_threads × mult` (default 4). |
 | `ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH` | `ecrawl` | Batch size for enqueueing `fstatat`-discovered subdirs to the global queue (default 48). |
-| `ECRAWL_PROGRESS_LOG` | `ecrawl` | Append 1 Hz CSV of live counters for post-run plots (requires `--verbose`; see detailed `ecrawl` env table). |
 | `ECRAWL_STALL_HINT_SECONDS` | `ecrawl` | Stderr hint when the rolling `window_entries` stays at 0 for N consecutive seconds after warmup (default `5`; `0` = off). |
 | `ECRAWL_REPAIR_THREADS` | `ecrawl_repair` | Parallel shard rescans, tail salvage `truncate`, checkpoint rebuild (default 16, minimum 1). |
 | `ECRAWL_ANALYZE_THREADS` | `ecrawl_analyze` | Parallel shard scan for stats only (default 16, minimum 1, maximum 4096). If unset, `ECRAWL_REPAIR_THREADS` is used when set. |

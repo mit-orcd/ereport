@@ -59,6 +59,7 @@
 #include <stdatomic.h>
 #include <sys/time.h>
 
+#include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
@@ -8033,8 +8034,9 @@ static int read_one_chunk(const file_chunk_t *chunk,
     /* Reused across every record in this chunk to avoid per-record malloc/free
      * of a 4 KiB path buffer and a name buffer (name_len is uint16). */
     char *pathbuf_store = NULL;
-    unsigned char *name_store = NULL;
     char *stdio_buf = NULL;
+    crawl_bin_block_reader_t br;
+    memset(&br, 0, sizeof(br));
 
     fp = counted_fopen(chunk->path, "rb");
     if (!fp) {
@@ -8045,33 +8047,34 @@ static int read_one_chunk(const file_chunk_t *chunk,
         return -1;
     }
 
-    /* Larger fully-buffered stdio reduces read() syscalls across the many small
-     * header/name reads. Buffer is owned by this thread for the FILE*'s lifetime. */
+    /* Larger fully-buffered stdio reduces read() syscalls across the block reads.
+     * Buffer is owned by this thread for the FILE*'s lifetime. */
     stdio_buf = (char *)malloc(EREPORT_PARSE_STDIO_BUFSZ);
     if (stdio_buf) setvbuf(fp, stdio_buf, _IOFBF, EREPORT_PARSE_STDIO_BUFSZ);
 
-    if (fseeko(fp, (off_t)chunk->start_offset, SEEK_SET) != 0) {
-        fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
-        sum->bad_input_files++;
-        if (progress) progress->bad_input_files++;
-        goto out;
-    }
-
     pathbuf_store = (char *)malloc(PATH_MAX);
-    name_store = (unsigned char *)malloc(65536); /* >= max uint16 name_len */
-    if (!pathbuf_store || !name_store) {
+    if (!pathbuf_store) {
         fprintf(stderr, "warn: scratch alloc failed in %s\n", chunk->path);
         sum->bad_input_files++;
         if (progress) progress->bad_input_files++;
         goto out;
     }
 
-    /* Track the read offset manually instead of calling ftello() per record:
-     * ftello() -> _IO_file_seekoff issues an lseek syscall every record, which
-     * defeats the 1 MiB stdio buffer and dominates CPU/syscalls on large shards.
-     * cur_offset mirrors the FILE position; every non-error path below consumes
-     * exactly header + name bytes (rec_total), so it stays in sync. */
-    uint64_t cur_offset = (uint64_t)chunk->start_offset;
+    /* v6: records live in compressed blocks; the shared block reader seeks to the
+     * chunk start and decompresses block-by-block, returning each record header
+     * plus a pointer to its name bytes (valid until the next call). */
+    {
+        crawl_bin_chunk_stdio_t bio;
+        bio.fopen = NULL;
+        bio.fread = counted_fread_unlocked;
+        bio.fclose = NULL;
+        if (crawl_bin_block_reader_init(&br, &bio, fp, chunk->start_offset, chunk->end_offset) != 0) {
+            fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
+            sum->bad_input_files++;
+            if (progress) progress->bad_input_files++;
+            goto out;
+        }
+    }
 
     /* Memoizes the last parent directory path so contiguous same-directory records
      * skip the catalog parent-chain walk. */
@@ -8089,38 +8092,23 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
     for (;;) {
         bin_record_hdr_t r;
-        size_t n;
+        const unsigned char *rec_name = NULL;
         char *pathbuf = NULL;
         uint64_t accounted_size = 0;
-        uint64_t record_offset = cur_offset;
-        size_t rec_total;
         int record_match;
         int skip_paths;
+        int got = crawl_bin_block_reader_next(&br, &r, &rec_name);
 
-        if (record_offset >= chunk->end_offset) {
+        if (got == 0) {
             rc = 0;
             break;
         }
-
-        /* fread below overwrites the whole fixed-size header, so no per-record memset. */
-        n = counted_fread_unlocked(&r, sizeof(r), 1, fp);
-        if (n != 1) {
-            if (feof(fp)) rc = 0;
-            else {
-                fprintf(stderr, "warn: read error in %s\n", chunk->path);
-                sum->bad_input_files++;
-            }
-            break;
-        }
-
-        rec_total = crawl_bin_record_total_bytes(&r);
-        if (record_offset + rec_total > chunk->end_offset) {
-            fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
+        if (got < 0) {
+            fprintf(stderr, "warn: read error in %s\n", chunk->path);
             sum->bad_input_files++;
             if (progress) progress->bad_input_files++;
             break;
         }
-        cur_offset += rec_total;
 
         sum->scanned_records++;
         if (progress) {
@@ -8139,15 +8127,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (!record_match) {
-            /* Skip the name by reading it sequentially (keeps the stdio buffer
-             * intact) rather than fseeko(SEEK_CUR), which would force an lseek. */
-            if (r.name_len > 0 &&
-                counted_fread_unlocked(name_store, 1, r.name_len, fp) != r.name_len) {
-                fprintf(stderr, "warn: name skip failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
-            }
+            /* Name bytes were already decompressed with the record; nothing to skip. */
             continue;
         }
 
@@ -8159,27 +8139,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (skip_paths) {
-            if (r.name_len > 0 &&
-                counted_fread_unlocked(name_store, 1, r.name_len, fp) != r.name_len) {
-                fprintf(stderr, "warn: name skip failed in %s\n", chunk->path);
-                sum->bad_input_files++;
-                if (progress) progress->bad_input_files++;
-                break;
-            }
             pathbuf = NULL;
         } else {
-            unsigned char *name_bytes = NULL;
+            const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
 
             pathbuf = pathbuf_store;
-            if (r.name_len > 0) {
-                name_bytes = name_store;
-                if (counted_fread_unlocked(name_bytes, 1, r.name_len, fp) != r.name_len) {
-                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
-                    sum->bad_input_files++;
-                    if (progress) progress->bad_input_files++;
-                    break;
-                }
-            }
             if (catalog_entry_path_cached(file_states[chunk->file_index].catalog, r.parent_dir_id,
                                           (char *)name_bytes, r.name_len, pathbuf, PATH_MAX,
                                           &dir_cache) != 0) {
@@ -8304,8 +8268,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
     }
 
 out:
+    crawl_bin_block_reader_free(&br);
     free(pathbuf_store);
-    free(name_store);
     counted_fclose(fp);
     free(stdio_buf); /* safe only after the stream using it is closed */
     finalize_chunk_file_progress(file_states, chunk->file_index, progress);

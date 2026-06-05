@@ -301,11 +301,15 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     }
     pos = (off_t)sizeof(bin_file_header_t);
 
+    /* v6: walk the self-describing compressed blocks; a crash leaves at most a
+     * truncated trailing block, which fails the bounds/read check below and is
+     * salvaged by truncating to last_good_exclusive (the last whole block end). */
     while ((uint64_t)pos < scan_end) {
-        uint64_t rec_start = (uint64_t)pos;
-        bin_record_hdr_t rh;
+        uint64_t blk_start = (uint64_t)pos;
+        bin_block_hdr_t bh;
+        uint64_t block_end;
 
-        if (rec_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
+        if (blk_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
             if (n == cap) {
                 size_t ncap = cap * 2;
                 uint64_t *p = (uint64_t *)realloc(buf, ncap * sizeof(*p));
@@ -313,33 +317,23 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
                 buf = p;
                 cap = ncap;
             }
-            buf[n++] = rec_start;
-            seg0 = rec_start;
+            buf[n++] = blk_start;
+            seg0 = blk_start;
         }
-        if (fread(&rh, sizeof(rh), 1, fp) != 1) {
+        if (scan_end - blk_start < sizeof(bh) || fread(&bh, sizeof(bh), 1, fp) != 1) {
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }
-        pos = ftello(fp);
-        if (pos < 0) {
+        block_end = blk_start + (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        if (block_end > scan_end) {
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }
-        if (rh.name_len) {
-            if ((uint64_t)pos + rh.name_len > scan_end) {
-                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
-                goto corrupt;
-            }
-            if (fseeko(fp, (off_t)rh.name_len, SEEK_CUR) != 0) {
-                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
-                goto corrupt;
-            }
-            pos = ftello(fp);
-            if (pos < 0) {
-                if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
-                goto corrupt;
-            }
+        if (bh.comp_size && fseeko(fp, (off_t)bh.comp_size, SEEK_CUR) != 0) {
+            if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
+            goto corrupt;
         }
+        pos = (off_t)block_end;
         last_good_exclusive = (uint64_t)pos;
     }
     if ((uint64_t)pos != scan_end) {

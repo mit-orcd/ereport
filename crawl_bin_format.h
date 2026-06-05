@@ -9,9 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CRAWL_BIN_MAGIC "ERCBIN05"
+#define CRAWL_BIN_MAGIC "ERCBIN06"
 #define CRAWL_BIN_MAGIC_LEN 8
-#define CRAWL_BIN_FORMAT_VERSION 5u
+#define CRAWL_BIN_FORMAT_VERSION 6u
 
 /* Aliases used by ecrawl / readers */
 #define FILE_MAGIC_LEN CRAWL_BIN_MAGIC_LEN
@@ -25,8 +25,11 @@
 #define CTIME_LED_MIN_DELTA_SEC (180ULL * 86400ULL)
 
 /*
- * Fixed file header (32 bytes). Records occupy [sizeof(bin_file_header_t), catalog_offset).
- * Catalog blob is [catalog_offset, EOF): uint64_t n_entries then packed bin_dir_catalog_entry_t rows.
+ * Fixed file header (32 bytes). The record region occupies
+ * [sizeof(bin_file_header_t), catalog_offset) and, since format v6, holds a
+ * sequence of independently zstd-compressed blocks (see bin_block_hdr_t below)
+ * rather than raw records. Catalog blob is [catalog_offset, EOF): uint64_t
+ * n_entries then packed bin_dir_catalog_entry_t rows.
  * catalog_offset == 0 means an incomplete shard (still being written); readers must reject.
  */
 typedef struct __attribute__((packed)) {
@@ -36,6 +39,25 @@ typedef struct __attribute__((packed)) {
     uint64_t catalog_offset;
     uint64_t reserved64;
 } bin_file_header_t;
+
+/*
+ * v6 record-region block frame. The record region is a back-to-back sequence of
+ * blocks; each block is this 8-byte header followed by comp_size bytes of a zstd
+ * frame that decompresses to raw_size bytes. The decompressed payload is a
+ * concatenation of whole records (bin_record_hdr_t + name_len name bytes); a
+ * record never spans a block boundary. Blocks are self-describing and
+ * contiguous, so a reader walks them with header reads alone (no side index),
+ * and chunk boundaries for parallel workers are always block boundaries.
+ */
+typedef struct __attribute__((packed)) {
+    uint32_t raw_size;
+    uint32_t comp_size;
+} bin_block_hdr_t;
+
+/* Target uncompressed bytes accumulated per block before it is flushed. 256 KiB
+ * keeps per-open-shard writer memory modest (raw + compressed scratch) while
+ * still giving metadata excellent compression. */
+#define CRAWL_BIN_BLOCK_RAW_TARGET (1u << 18)
 
 /*
  * Per-directory row in the catalog (directory identity is unique per shard).
@@ -72,14 +94,18 @@ typedef struct __attribute__((packed)) {
     /* Followed by name_len UTF-8 bytes (component only). */
 } bin_dir_catalog_entry_t;
 
+/*
+ * v6 lean record header (75 bytes packed). Compared with v5 this drops the
+ * never-read gid (8) and mode (4) fields and the unused reserved8 pad (1):
+ * readers derive file kind from `type`, and no reader consumed gid/mode. The
+ * remaining fields are all still consumed (path, uid filter, size/time rollups,
+ * and inode/dev/nlink for hardlink-aware byte credit).
+ */
 typedef struct __attribute__((packed)) {
     uint64_t parent_dir_id;
     uint16_t name_len;
     uint8_t type;
-    uint8_t reserved8;
-    uint32_t mode;
     uint64_t uid;
-    uint64_t gid;
     uint64_t size;
     uint64_t inode;
     uint32_t dev_major;

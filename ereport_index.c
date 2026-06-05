@@ -29,6 +29,7 @@
 #include <sys/resource.h>
 #include <time.h>
 
+#include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
@@ -2382,6 +2383,8 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     write_batch_t *batch = NULL;
     uint64_t scanned_local = 0;
     uint64_t scanned_published = 0;
+    crawl_bin_block_reader_t br;
+    memset(&br, 0, sizeof(br));
 
     fp = mk_fopen(chunk->path, "rb");
     if (!fp) {
@@ -2393,41 +2396,32 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    if (fseeko(fp, (off_t)chunk->start_offset, SEEK_SET) != 0) {
-        fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
-        atomic_fetch_add(&rs->bad_input_files, 1U);
-        goto out;
+    {
+        crawl_bin_chunk_stdio_t bio;
+        bio.fopen = NULL;
+        bio.fread = ei_fread;
+        bio.fclose = NULL;
+        if (crawl_bin_block_reader_init(&br, &bio, fp, chunk->start_offset, chunk->end_offset) != 0) {
+            fprintf(stderr, "warn: seek failed in %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            goto out;
+        }
     }
 
     for (;;) {
         bin_record_hdr_t r;
+        const unsigned char *rec_name = NULL;
         char *pathbuf = NULL;
-        size_t n;
-        off_t record_offset = ftello(fp);
+        int got = crawl_bin_block_reader_next(&br, &r, &rec_name);
 
-        if (record_offset < 0 || (uint64_t)record_offset >= chunk->end_offset) {
+        if (got == 0) {
             rc = 0;
             break;
         }
-
-        memset(&r, 0, sizeof(r));
-        n = mk_fread(&r, sizeof(r), 1, fp);
-        if (n != 1) {
-            if (feof(fp)) rc = 0;
-            else {
-                fprintf(stderr, "warn: read error in %s\n", chunk->path);
-                atomic_fetch_add(&rs->bad_input_files, 1U);
-            }
+        if (got < 0) {
+            fprintf(stderr, "warn: read error in %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
-        }
-
-        {
-            size_t rec_total = crawl_bin_record_total_bytes(&r);
-            if ((uint64_t)record_offset + rec_total > chunk->end_offset) {
-                fprintf(stderr, "warn: truncated record in %s\n", chunk->path);
-                atomic_fetch_add(&rs->bad_input_files, 1U);
-                break;
-            }
         }
 
         scanned_local++;
@@ -2446,11 +2440,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         }
 
         if (!ctx->aggregate_all_users && (uid_t)r.uid != ctx->target_uid) {
-            if (r.name_len > 0 && fseeko(fp, (off_t)r.name_len, SEEK_CUR) != 0) {
-                fprintf(stderr, "warn: seek failed skipping path in %s\n", chunk->path);
-                atomic_fetch_add(&rs->bad_input_files, 1U);
-                break;
-            }
+            /* Name bytes were decompressed with the record; nothing to skip. */
             continue;
         }
 
@@ -2467,33 +2457,15 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             break;
         }
         {
-            unsigned char *name_bytes = NULL;
+            const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
 
-            if (r.name_len > 0) {
-                name_bytes = (unsigned char *)malloc((size_t)r.name_len);
-                if (!name_bytes) {
-                    fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-                    atomic_fetch_add(&rs->bad_input_files, 1U);
-                    free(pathbuf);
-                    break;
-                }
-                if (mk_fread(name_bytes, 1, r.name_len, fp) != r.name_len) {
-                    fprintf(stderr, "warn: path read failed in %s\n", chunk->path);
-                    atomic_fetch_add(&rs->bad_input_files, 1U);
-                    free(name_bytes);
-                    free(pathbuf);
-                    break;
-                }
-            }
             if (crawl_bin_catalog_entry_path(file_states[chunk->file_index].catalog, r.parent_dir_id,
                                              (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
                 fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
-                free(name_bytes);
                 free(pathbuf);
                 break;
             }
-            free(name_bytes);
         }
 
         {
@@ -2542,6 +2514,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     }
 
 out:
+    crawl_bin_block_reader_free(&br);
     if (scanned_local > scanned_published)
         atomic_fetch_add_explicit(&rs->scanned_records, scanned_local - scanned_published, memory_order_relaxed);
     mk_fclose(fp);
