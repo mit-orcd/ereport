@@ -13,8 +13,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
@@ -606,6 +606,13 @@ static atomic_int g_bucket_index = 0;
 static atomic_uint g_seconds_seen = 0;
 /* Like ecrawl: default quiet (no per-read I/O atomics; sparse progress). --verbose enables full accounting + stderr progress. */
 static int g_ereport_verbose = 0;
+
+/* --subtree <abs-path>: when non-NULL, restrict the whole analysis to records whose reconstructed full
+ * path is at or under this directory, as if only that subtree had been crawled. Full absolute paths are
+ * retained in the report (records are filtered, not rewritten). Forces per-record path reconstruction
+ * even when --bucket-details is off (the skip_paths fast path needs the path to test the prefix). */
+static const char *g_subtree_prefix = NULL;
+static size_t g_subtree_prefix_len = 0;
 
 /* Manifest-driven crawl directory layout: "uid_shards" or "unsharded" (no uid-shard manifest). */
 static const char *g_input_layout = "unsharded";
@@ -8136,9 +8143,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
-        if (skip_paths) {
+        if (skip_paths && !g_subtree_prefix) {
             pathbuf = NULL;
         } else {
+            /* --subtree forces reconstruction even on the skip_paths fast path: we need the full path to
+             * test the prefix. skip_paths still gates the heavier per-record appends below. */
             const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
 
             pathbuf = pathbuf_store;
@@ -8150,6 +8159,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
                 if (progress) progress->bad_input_files++;
                 break;
             }
+        }
+
+        /* --subtree: keep only records at or under the requested directory (full absolute path retained).
+         * Filter before any accounting so totals/heat-map/distinct-uids reflect just the subtree. */
+        if (g_subtree_prefix && !(pathbuf && starts_with_dir_prefix(pathbuf, g_subtree_prefix))) {
+            continue;
         }
 
         if (all_users && uid_distinct && uid_accum_insert_if_new(uid_distinct, r.uid) < 0) {
@@ -10012,6 +10027,7 @@ int main(int argc, char **argv) {
     int all_users_mode = 0;
     int bucket_detail_levels = 0;
     char report_dir_opt[PATH_MAX];
+    static char subtree_buf[PATH_MAX]; /* backs g_subtree_prefix; static so it outlives main()'s frame for worker threads */
     uint64_t distinct_uid_count = 0;
     double t0, t1;
     ereport_run_stats_t run_stats;
@@ -10052,11 +10068,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--verbose [minutes]]] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10066,6 +10082,9 @@ int main(int argc, char **argv) {
                 BUCKET_DETAIL_LEVELS_MAX);
         fprintf(stderr,
                 "Optional --report-dir DIR: write reports under DIR/(user or all_users)/; omit for current directory.\n");
+        fprintf(stderr,
+                "Optional --subtree PATH (absolute): analyze only records at or under PATH, as if just that "
+                "directory had been crawled (full absolute paths kept; totals/heat-map/badges scoped to the subtree).\n");
         fprintf(stderr,
                 "Optional --verbose [minutes]: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics). Optional integer 1…10080 is accepted for compatibility; stderr "
@@ -10158,6 +10177,35 @@ int main(int argc, char **argv) {
                         argc = ac;
                     }
                 }
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--subtree") == 0) {
+                if (g_subtree_prefix != NULL) {
+                    fprintf(stderr, "ereport: duplicate --subtree\n");
+                    return 2;
+                }
+                if (ac < 3) {
+                    fprintf(stderr, "ereport: --subtree requires an absolute directory path\n");
+                    return 2;
+                }
+                if (av[2][0] != '/') {
+                    fprintf(stderr, "ereport: --subtree path must be absolute (got '%s')\n", av[2]);
+                    return 2;
+                }
+                if (snprintf(subtree_buf, sizeof(subtree_buf), "%s", av[2]) >= (int)sizeof(subtree_buf)) {
+                    fprintf(stderr, "ereport: --subtree path too long\n");
+                    return 2;
+                }
+                /* Strip trailing '/' (but keep a lone "/") so prefix matching is on a directory boundary. */
+                {
+                    size_t sl = strlen(subtree_buf);
+                    while (sl > 1 && subtree_buf[sl - 1] == '/') subtree_buf[--sl] = '\0';
+                    g_subtree_prefix = subtree_buf;
+                    g_subtree_prefix_len = sl;
+                }
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
+                argc = ac;
                 continue;
             }
             break;

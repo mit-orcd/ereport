@@ -461,8 +461,8 @@ Heat map (`index.html`):
 Usage:
 
 ```bash
-./ereport [--bucket-details N] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
-./ereport [--bucket-details N] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
+./ereport [--bucket-details N] [--subtree PATH] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+./ereport [--bucket-details N] [--subtree PATH] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
 ```
 
 If you omit every `bin_dir`, `ereport` reads crawl `.bin` files from the current working directory (`./`).
@@ -489,6 +489,7 @@ EREPORT_THREADS=64 ./ereport ctime /path/to/crawl
 ./ereport alice /tmp/crawl-out                               # single-user, effective time (default)
 ./ereport effective /tmp/crawl-out                          # all-users, explicit effective
 ./ereport /tmp/crawl-out                                    # all-users effective if path is not a user name
+./ereport --subtree /orcd/data/ki/001/lab/jones mtime crawl_out   # analyze only that subtree of an existing crawl
 ```
 
 Parse chunks scale with input `.bin` size so parallel workers are not capped by a tiny chunk count.
@@ -499,6 +500,12 @@ Bucket drill-down:
 - `--bucket-details N` (N = 1–32) makes it read paths and emit N directory-level rollup tables per bucket page; applies to single- and all-users runs (larger N and all-users cost more I/O and memory).
 - Each level lists directories sorted by bucket bytes (largest first); past 200 directories at a depth, only the top 200 rows are written (heat-map and bucket-header totals still reflect the full bucket).
 - With `--bucket-details`, pages also include a path-shape drill-down (Dense / Deep / Skew) with collapsible, sortable, slice-first sections.
+
+Subtree scoping:
+
+- `--subtree PATH` (absolute) restricts the whole analysis to records at or under `PATH`, as if only that directory had been crawled — useful for zooming into one lab/group inside a larger `--record-root` crawl without re-crawling. Place it before the username (if any) and time basis. The subtree directory itself is included, and matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
+- Full absolute paths are kept in the report (records are filtered, not rewritten); all heat-map totals, badges, distinct-user counts, and bucket-detail tables are scoped to the subtree. It forces per-record path reconstruction, so it is a bit slower than the default histogram-only fast path even without `--bucket-details`.
+- `manifest_*` lines (e.g. `total_allocated_bytes`) come from `crawl_manifest.txt` and still describe the whole crawl, not the subtree.
 
 Runtime behavior:
 
