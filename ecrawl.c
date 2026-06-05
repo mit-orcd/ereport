@@ -392,7 +392,9 @@ typedef struct {
 typedef struct shard_cat_path_entry {
     char *path_key;
     uint64_t dir_id;
-    struct shard_cat_path_entry *next;
+    struct shard_cat_path_entry *next;     /* per-bucket chain */
+    struct shard_cat_path_entry *all_next; /* global insertion chain (for O(entries) destroy) */
+    uint32_t bucket;                       /* owning ht[] index, so destroy clears only used buckets */
 } shard_cat_path_entry_t;
 
 #define SHARD_CAT_HT_BITS 16
@@ -400,6 +402,7 @@ typedef struct shard_cat_path_entry {
 
 typedef struct {
     shard_cat_path_entry_t *ht[SHARD_CAT_HT_BUCKETS];
+    shard_cat_path_entry_t *all_head; /* head of the global entry chain threaded through all buckets */
     uint64_t next_dir_id;
     uint64_t *parent_dir_id;
     uint32_t *depth;
@@ -421,6 +424,10 @@ typedef struct {
     uint64_t bytes_written;
     uint64_t last_used;
     unsigned char initialized;
+    /* When set, `cat`/`ckpt_*` hold this shard's live in-memory catalog and are kept across LRU
+     * eviction (fp closed, state retained). Reopen then skips the on-disk catalog round-trip and the
+     * full SHARD_CAT_HT_BUCKETS destroy/rebuild that otherwise dominate many-shard writer workloads. */
+    unsigned char cat_live;
     uint64_t *ckpt_offs;
     size_t ckpt_n;
     size_t ckpt_cap;
@@ -1799,18 +1806,22 @@ static uint32_t shard_cat_hash_str(const char *s) {
 }
 
 static void shard_cat_destroy(shard_cat_t *c) {
-    size_t bi;
+    shard_cat_path_entry_t *e;
     if (!c) return;
-    for (bi = 0; bi < SHARD_CAT_HT_BUCKETS; bi++) {
-        shard_cat_path_entry_t *e = c->ht[bi];
-        while (e) {
-            shard_cat_path_entry_t *nx = e->next;
-            free(e->path_key);
-            free(e);
-            e = nx;
-        }
-        c->ht[bi] = NULL;
+    /* Walk the global insertion chain — O(entries) — and clear only the buckets we actually used.
+     * The previous full SHARD_CAT_HT_BUCKETS (65536) sweep + sizeof(*c) memset (which zeroes the
+     * 512 KiB ht[] array) ran on every shard close/reopen and dominated many-shard writer workloads.
+     * Buckets not on the chain are already NULL (calloc / shard_cat_init_fresh), so the table is left
+     * fully NULL and the struct is reset to its freshly-zeroed state without touching ht[] wholesale. */
+    e = c->all_head;
+    while (e) {
+        shard_cat_path_entry_t *nx = e->all_next;
+        c->ht[e->bucket] = NULL;
+        free(e->path_key);
+        free(e);
+        e = nx;
     }
+    c->all_head = NULL;
     free(c->parent_dir_id);
     free(c->depth);
     free(c->name_len);
@@ -1824,7 +1835,17 @@ static void shard_cat_destroy(shard_cat_t *c) {
     free(c->imm_child_ctime_led_count);
     free(c->imm_child_min_eff_time);
     free(c->imm_child_max_eff_time);
-    memset(c, 0, sizeof(*c));
+    c->next_dir_id = 0;
+    c->parent_dir_id = NULL;
+    c->depth = NULL;
+    c->name_len = NULL;
+    c->name_comp = NULL;
+    c->imm_child_bytes = NULL;
+    c->imm_child_count = NULL;
+    c->imm_child_ctime_led_count = NULL;
+    c->imm_child_min_eff_time = NULL;
+    c->imm_child_max_eff_time = NULL;
+    c->arr_cap = 0;
 }
 
 static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
@@ -1886,8 +1907,11 @@ static int shard_cat_ht_insert(shard_cat_t *c, char *path_owned, uint64_t dir_id
     }
     e->path_key = path_owned;
     e->dir_id = dir_id;
+    e->bucket = h;
     e->next = c->ht[h];
     c->ht[h] = e;
+    e->all_next = c->all_head;
+    c->all_head = e;
     return 0;
 }
 
@@ -2336,11 +2360,19 @@ static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_
     if (patch_bin_header_catalog_offset(s->fp, cat_off) != 0) return -1;
     if (ecrawl_io_fflush(s->fp) != 0) return -1;
 
+    /* Persist the catalog + ckpt sidecar so the on-disk shard stays complete/recoverable, but keep
+     * the in-memory cat/ckpt resident: a later reopen (LRU re-acquire) reuses them instead of
+     * reloading from disk. Final teardown frees them via shard_state_release(). */
     r = shard_ckpt_write_sidecar(bin_path, s->ckpt_offs, s->ckpt_n);
+    return r;
+}
+
+/* Release a shard's retained in-memory catalog/ckpt (call once the shard will not be reopened). */
+static void shard_state_release(shard_file_state_t *s) {
     shard_ckpt_free(s);
     shard_cat_destroy(&s->cat);
     s->seg_start_byte = 0;
-    return r;
+    s->cat_live = 0;
 }
 
 static task_node_t *task_node_take_alloc(task_queue_t *q) {
@@ -4184,6 +4216,7 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
             errno = saved_errno;
             return -1;
         }
+        state->cat_live = 1;
     } else {
         struct stat st;
         bin_file_header_t fh;
@@ -4209,16 +4242,21 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
             goto reopen_fail;
         }
 
-        crawl_bin_catalog_init_empty(&cat);
-        if (crawl_bin_catalog_load(state->fp, co, fsz, &cat) != 0) {
+        /* Hot path for many-shard workloads: the in-memory catalog survived eviction, so reuse it
+         * and skip the disk read + full hash-table rebuild. Otherwise (defensive / not retained)
+         * reconstruct it from the on-disk catalog. */
+        if (!state->cat_live) {
+            crawl_bin_catalog_init_empty(&cat);
+            if (crawl_bin_catalog_load(state->fp, co, fsz, &cat) != 0) {
+                crawl_bin_catalog_free(&cat);
+                goto reopen_fail;
+            }
+            if (shard_cat_load_from_disk_catalog(&state->cat, &cat) != 0) {
+                crawl_bin_catalog_free(&cat);
+                goto reopen_fail;
+            }
             crawl_bin_catalog_free(&cat);
-            goto reopen_fail;
         }
-        if (shard_cat_load_from_disk_catalog(&state->cat, &cat) != 0) {
-            crawl_bin_catalog_free(&cat);
-            goto reopen_fail;
-        }
-        crawl_bin_catalog_free(&cat);
 
         if (ftruncate(fileno(state->fp), (off_t)co) != 0) goto reopen_fail;
 
@@ -4233,13 +4271,18 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
         }
 
         state->bytes_written = co;
-        if (shard_ckpt_load_for_append(state, path, co) != 0) {
-            int saved_errno = errno ? errno : EINVAL;
-            ecrawl_io_fclose(state->fp);
-            state->fp = NULL;
-            shard_cat_destroy(&state->cat);
-            errno = saved_errno;
-            return -1;
+        /* ckpt offsets are retained alongside a live catalog; only reload them from the sidecar when
+         * the in-memory state was not kept (cat_live == 0). */
+        if (!state->cat_live) {
+            if (shard_ckpt_load_for_append(state, path, co) != 0) {
+                int saved_errno = errno ? errno : EINVAL;
+                ecrawl_io_fclose(state->fp);
+                state->fp = NULL;
+                shard_state_release(state);
+                errno = saved_errno;
+                return -1;
+            }
+            state->cat_live = 1;
         }
     }
     return 0;
@@ -4249,7 +4292,7 @@ reopen_fail:
         int saved_errno = errno ? errno : EINVAL;
         ecrawl_io_fclose(state->fp);
         state->fp = NULL;
-        shard_cat_destroy(&state->cat);
+        shard_state_release(state);
         errno = saved_errno;
         return -1;
     }
@@ -4439,6 +4482,9 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
         uint64_t rec_start = st->bytes_written;
         const char *base = NULL;
         size_t base_len = 0;
+        /* path_z holds the record's full path while parent_dir_id == 0; `base` points into it and is
+         * read again below when the record name is written, so path_z must outlive that inner block. */
+        char path_z[PATH_MAX];
 
         if (wire_len < sizeof(wire)) {
             errno = EINVAL;
@@ -4447,7 +4493,6 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
         memcpy(&wire, payload, sizeof(wire));
 
         if (wire.parent_dir_id == 0ULL) {
-            char path_z[PATH_MAX];
             char parent[PATH_MAX];
             uint64_t pid;
 
@@ -4663,6 +4708,8 @@ static void *writer_thread_main(void *arg_void) {
                 ecrawl_io_fclose(shards[i].fp);
                 shards[i].fp = NULL;
             }
+            /* Free in-memory catalog/ckpt retained across eviction (now persisted on disk). */
+            if (shards[i].cat_live) shard_state_release(&shards[i]);
         }
     }
     free(shards);
