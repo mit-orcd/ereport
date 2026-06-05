@@ -65,9 +65,14 @@
 #   SCHED_FIXTURES="single_huge_dir mega_dir1 mega_dir2"  fixtures big enough
 #                              for a meaningful perf sched trace.
 #   PERF_FREQ=997              perf sampling frequency (Hz).
-#   DROP_CACHES=0              if 1 and running as root, drop page cache before
-#                              each clean pass (sync; echo 3 > drop_caches) so
-#                              readdir-bound fixtures are measured cold.
+#   DROP_CACHES=1              when running as root, drop the page cache before
+#                              every ecrawl invocation (clean, strace, perf,
+#                              sched) via `sync; echo 3 > drop_caches`, so each
+#                              run is measured cold — crawl speed is dominated by
+#                              readdir/stat metadata fetch, which is meaningless
+#                              against a warm cache. Default 1. Set 0 for warm
+#                              (in-cache) runs. If not root, the script warns once
+#                              and proceeds warm.
 #   REPS=1                     repetitions of the clean pass per fixture/mode.
 #   ECRAWL_VERBOSE_ARGS=...    extra args appended to ecrawl (e.g. extra flags).
 #   Any ECRAWL_* env (ECRAWL_MAX_OPEN_SHARDS, ECRAWL_CRAWL_THREADS, ...) is
@@ -136,7 +141,7 @@ DO_PERF=${DO_PERF:-0}
 DO_SCHED=${DO_SCHED:-0}
 SCHED_FIXTURES=${SCHED_FIXTURES:-"single_huge_dir mega_dir1 mega_dir2"}
 PERF_FREQ=${PERF_FREQ:-997}
-DROP_CACHES=${DROP_CACHES:-0}
+DROP_CACHES=${DROP_CACHES:-1}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 ECRAWL_VERBOSE_ARGS=${ECRAWL_VERBOSE_ARGS:-}
@@ -194,6 +199,7 @@ fi
 # ---- helpers ---------------------------------------------------------------
 fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
 
+g_warned_no_drop=0
 maybe_drop_caches() {
   [[ "$DROP_CACHES" == "1" ]] || return 0
   if [[ "$(id -u)" == "0" ]]; then
@@ -203,8 +209,11 @@ maybe_drop_caches() {
     else
       echo "    [WARN: could not drop caches]"
     fi
-  else
-    echo "    [WARN: DROP_CACHES=1 but not root; cache left warm]"
+  elif [[ "$g_warned_no_drop" == "0" ]]; then
+    # Warn once, not on every pass: with DROP_CACHES on by default this would
+    # otherwise print for each fixture/mode/pass.
+    echo "    [WARN: DROP_CACHES=1 but not root; caches left warm — crawl timings are in-cache]"
+    g_warned_no_drop=1
   fi
 }
 
@@ -277,6 +286,7 @@ run_strace() {
   [[ "$DO_STRACE" == "1" ]] || return 0
   if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
   build_argv "$mode" "$start" "$outdir"
+  maybe_drop_caches
   echo "    strace/$mode: strace -f -c (timing not representative)"
   strace -f -c -o "$dest/strace.${mode}.txt" \
     "${RUN_ARGV[@]}" >/dev/null 2>"$dest/strace.${mode}.ecrawl-stderr.txt"
@@ -292,6 +302,7 @@ run_perf() {
   # DWARF call graphs so stacks resolve even when ecrawl is built -O2 without frame pointers.
   # Set PERF_CALLGRAPH=fp if the binary is built with -fno-omit-frame-pointer (cheaper, smaller).
   local cg=${PERF_CALLGRAPH:-dwarf}
+  maybe_drop_caches
   echo "    perf/$mode: perf record --call-graph $cg -F $PERF_FREQ"
   local data="$dest/perf.${mode}.data"
   if perf record --call-graph "$cg" -F "$PERF_FREQ" -o "$data" \
@@ -325,6 +336,7 @@ run_sched() {
   command -v perf >/dev/null 2>&1 || return 0
   if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
   build_argv "$mode" "$start" "$outdir"
+  maybe_drop_caches
   echo "    sched/$mode: perf sched record (per-thread concurrency; data not kept)"
   local data="$dest/perf.${mode}.sched.data"
   if perf sched record -o "$data" \
