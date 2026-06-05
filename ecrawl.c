@@ -144,7 +144,7 @@
 /* Per-crawl-thread buffer (bytes) for raw getdents64 directory reads. A larger buffer returns more
  * dirents per getdents64 syscall, cutting syscall count (and its mitigation/seccomp/trace overhead)
  * on large directories. 0 = fall back to libc opendir/readdir. Env: ECRAWL_GETDENTS_BUF. */
-#define DEFAULT_GETDENTS_BUF (256U * 1024U)
+#define DEFAULT_GETDENTS_BUF (1024U * 1024U)
 #define MIN_GETDENTS_BUF 4096U
 #define MAX_GETDENTS_BUF (64U * 1024U * 1024U)
 
