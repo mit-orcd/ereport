@@ -391,16 +391,19 @@ typedef struct {
 typedef struct shard_cat_path_entry {
     char *path_key;
     uint64_t dir_id;
+    uint32_t hash;                         /* full (unmasked) path hash; cached for cheap rehash on grow */
     struct shard_cat_path_entry *next;     /* per-bucket chain */
-    struct shard_cat_path_entry *all_next; /* global insertion chain (for O(entries) destroy) */
-    uint32_t bucket;                       /* owning ht[] index, so destroy clears only used buckets */
+    struct shard_cat_path_entry *all_next; /* global insertion chain (for O(entries) destroy / rehash) */
 } shard_cat_path_entry_t;
 
-#define SHARD_CAT_HT_BITS 16
-#define SHARD_CAT_HT_BUCKETS (1U << SHARD_CAT_HT_BITS)
+/* Initial bucket count (power of two). The table is heap-allocated per shard and doubles on load
+ * factor, so shards holding a handful of dirs stay tiny instead of carrying a fixed 512 KiB array. */
+#define SHARD_CAT_HT_INIT_BUCKETS 64U
 
 typedef struct {
-    shard_cat_path_entry_t *ht[SHARD_CAT_HT_BUCKETS];
+    shard_cat_path_entry_t **ht; /* heap bucket array; NULL until first insert */
+    size_t ht_mask;              /* bucket count - 1 (bucket count is a power of two) */
+    size_t ht_count;             /* number of entries, for load-factor growth */
     shard_cat_path_entry_t *all_head; /* head of the global entry chain threaded through all buckets */
     uint64_t next_dir_id;
     uint64_t *parent_dir_id;
@@ -425,7 +428,7 @@ typedef struct {
     unsigned char initialized;
     /* When set, `cat`/`ckpt_*` hold this shard's live in-memory catalog and are kept across LRU
      * eviction (fp closed, state retained). Reopen then skips the on-disk catalog round-trip and the
-     * full SHARD_CAT_HT_BUCKETS destroy/rebuild that otherwise dominate many-shard writer workloads. */
+     * catalog destroy/rebuild that otherwise dominate many-shard writer workloads. */
     unsigned char cat_live;
     uint64_t *ckpt_offs;
     size_t ckpt_n;
@@ -1800,26 +1803,23 @@ static uint32_t shard_cat_hash_str(const char *s) {
         h ^= (uint32_t)(unsigned char)*s++;
         h *= 16777619u;
     }
-    return h & (SHARD_CAT_HT_BUCKETS - 1U);
+    return h; /* full hash; callers mask with c->ht_mask */
 }
 
 static void shard_cat_destroy(shard_cat_t *c) {
     shard_cat_path_entry_t *e;
     if (!c) return;
-    /* Walk the global insertion chain — O(entries) — and clear only the buckets we actually used.
-     * The previous full SHARD_CAT_HT_BUCKETS (65536) sweep + sizeof(*c) memset (which zeroes the
-     * 512 KiB ht[] array) ran on every shard close/reopen and dominated many-shard writer workloads.
-     * Buckets not on the chain are already NULL (calloc / shard_cat_init_fresh), so the table is left
-     * fully NULL and the struct is reset to its freshly-zeroed state without touching ht[] wholesale. */
+    /* Free entries via the global insertion chain (O(entries)), then the bucket array and the parallel
+     * dir arrays. The struct is small now (ht is a heap pointer, not a fixed 512 KiB array), so a final
+     * memset is cheap and leaves the catalog in its freshly-zeroed state for reuse. */
     e = c->all_head;
     while (e) {
         shard_cat_path_entry_t *nx = e->all_next;
-        c->ht[e->bucket] = NULL;
         free(e->path_key);
         free(e);
         e = nx;
     }
-    c->all_head = NULL;
+    free(c->ht);
     free(c->parent_dir_id);
     free(c->depth);
     free(c->name_len);
@@ -1833,17 +1833,7 @@ static void shard_cat_destroy(shard_cat_t *c) {
     free(c->imm_child_ctime_led_count);
     free(c->imm_child_min_eff_time);
     free(c->imm_child_max_eff_time);
-    c->next_dir_id = 0;
-    c->parent_dir_id = NULL;
-    c->depth = NULL;
-    c->name_len = NULL;
-    c->name_comp = NULL;
-    c->imm_child_bytes = NULL;
-    c->imm_child_count = NULL;
-    c->imm_child_ctime_led_count = NULL;
-    c->imm_child_min_eff_time = NULL;
-    c->imm_child_max_eff_time = NULL;
-    c->arr_cap = 0;
+    memset(c, 0, sizeof(*c));
 }
 
 static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
@@ -1896,28 +1886,72 @@ static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
     return 0;
 }
 
+static int shard_cat_ht_alloc(shard_cat_t *c, size_t nbuckets) {
+    shard_cat_path_entry_t **t = (shard_cat_path_entry_t **)calloc(nbuckets, sizeof(*t));
+    if (!t) return -1;
+    c->ht = t;
+    c->ht_mask = nbuckets - 1U;
+    return 0;
+}
+
+/* Double the bucket array and re-link every entry into its new bucket (O(entries), no re-hashing of
+ * strings since each entry caches its full hash). Single-threaded per shard, so no locking. */
+static int shard_cat_ht_grow(shard_cat_t *c) {
+    size_t new_buckets = (c->ht_mask + 1U) << 1;
+    shard_cat_path_entry_t **t = (shard_cat_path_entry_t **)calloc(new_buckets, sizeof(*t));
+    shard_cat_path_entry_t *e;
+
+    if (!t) return -1;
+    for (e = c->all_head; e; e = e->all_next) {
+        size_t b = (size_t)(e->hash & (uint32_t)(new_buckets - 1U));
+        e->next = t[b];
+        t[b] = e;
+    }
+    free(c->ht);
+    c->ht = t;
+    c->ht_mask = new_buckets - 1U;
+    return 0;
+}
+
 static int shard_cat_ht_insert(shard_cat_t *c, char *path_owned, uint64_t dir_id) {
-    uint32_t h = shard_cat_hash_str(path_owned);
-    shard_cat_path_entry_t *e = (shard_cat_path_entry_t *)malloc(sizeof(*e));
+    uint32_t h;
+    size_t b;
+    shard_cat_path_entry_t *e;
+
+    if (!c->ht && shard_cat_ht_alloc(c, SHARD_CAT_HT_INIT_BUCKETS) != 0) {
+        free(path_owned);
+        return -1;
+    }
+    /* Keep load factor below 0.75; a failed grow is non-fatal (chains just get longer). */
+    if (c->ht_count >= ((c->ht_mask + 1U) * 3U) / 4U) (void)shard_cat_ht_grow(c);
+
+    h = shard_cat_hash_str(path_owned);
+    e = (shard_cat_path_entry_t *)malloc(sizeof(*e));
     if (!e) {
         free(path_owned);
         return -1;
     }
+    b = (size_t)(h & (uint32_t)c->ht_mask);
     e->path_key = path_owned;
     e->dir_id = dir_id;
-    e->bucket = h;
-    e->next = c->ht[h];
-    c->ht[h] = e;
+    e->hash = h;
+    e->next = c->ht[b];
+    c->ht[b] = e;
     e->all_next = c->all_head;
     c->all_head = e;
+    c->ht_count++;
     return 0;
 }
 
 static uint64_t shard_cat_lookup_dir_id(const shard_cat_t *c, const char *path_z) {
-    uint32_t h = shard_cat_hash_str(path_z);
-    shard_cat_path_entry_t *e = c->ht[h];
+    uint32_t h;
+    shard_cat_path_entry_t *e;
+
+    if (!c->ht) return 0;
+    h = shard_cat_hash_str(path_z);
+    e = c->ht[h & (uint32_t)c->ht_mask];
     while (e) {
-        if (strcmp(e->path_key, path_z) == 0) return e->dir_id;
+        if (e->hash == h && strcmp(e->path_key, path_z) == 0) return e->dir_id;
         e = e->next;
     }
     return 0;
