@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <zstd.h>
 
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
@@ -62,6 +63,7 @@
 static size_t g_write_batch_paths_base = WRITE_BATCH_PATHS;
 /* Like ecrawl/ereport: default output is a concise key=value summary; --verbose enables live detail and extra metrics. */
 static int g_verbose = 0;
+static int g_tmp_trigram_zstd_level = -1; /* -1 = parse EREPORT_INDEX_TMP_ZSTD_LEVEL on first use */
 
 /* --subtree <abs-path>: when non-NULL, only records whose reconstructed full path is at or under this
  * directory are indexed (full absolute paths kept), so the index mirrors an ereport --subtree report. */
@@ -101,6 +103,72 @@ static int set_subtree_prefix(const char *arg) {
     sl = strlen(g_subtree_buf);
     while (sl > 1 && g_subtree_buf[sl - 1] == '/') g_subtree_buf[--sl] = '\0';
     g_subtree_prefix = g_subtree_buf;
+    return 0;
+}
+
+/* --path-rewrite OLD=NEW: when set, every reconstructed path at or under OLD has its OLD prefix replaced
+ * with NEW (directory boundary) at read time, so the index stores the rewritten paths (bins untouched).
+ * Applied before the --subtree filter, so --subtree is given in NEW terms. Mirrors ereport's --path-rewrite. */
+static char g_rewrite_from_buf[PATH_MAX];
+static char g_rewrite_to_buf[PATH_MAX];
+static const char *g_rewrite_from = NULL;
+static size_t g_rewrite_from_len = 0;
+static const char *g_rewrite_to = NULL;
+static size_t g_rewrite_to_len = 0;
+
+/* In-place prefix rewrite. Returns 0 (no-op when unset or no match), -1 if the result would not fit. */
+static int rewrite_path_prefix(char *path, size_t bufsz) {
+    size_t plen, suffix_len, newlen;
+
+    if (!g_rewrite_from || !path) return 0;
+    if (strncmp(path, g_rewrite_from, g_rewrite_from_len) != 0) return 0;
+    if (path[g_rewrite_from_len] != '\0' && path[g_rewrite_from_len] != '/') return 0;
+    plen = strlen(path);
+    suffix_len = plen - g_rewrite_from_len; /* "" or "/..." (g_rewrite_from has no trailing slash) */
+    newlen = g_rewrite_to_len + suffix_len;
+    if (newlen + 1 > bufsz) return -1;
+    memmove(path + g_rewrite_to_len, path + g_rewrite_from_len, suffix_len + 1); /* include NUL */
+    memcpy(path, g_rewrite_to, g_rewrite_to_len);
+    return 0;
+}
+
+/* Validate + normalize a "--path-rewrite OLD=NEW" argument. Returns 0 on success, non-zero on error. */
+static int set_path_rewrite(const char *arg) {
+    const char *eq;
+    size_t fl, tl;
+
+    if (g_rewrite_from != NULL) {
+        fprintf(stderr, "ereport_index: duplicate --path-rewrite\n");
+        return -1;
+    }
+    eq = arg ? strchr(arg, '=') : NULL;
+    if (!arg || !eq || eq == arg || eq[1] == '\0') {
+        fprintf(stderr, "ereport_index: --path-rewrite must be OLD=NEW (got '%s')\n", arg ? arg : "");
+        return -1;
+    }
+    fl = (size_t)(eq - arg);
+    if (arg[0] != '/' || eq[1] != '/') {
+        fprintf(stderr, "ereport_index: --path-rewrite OLD and NEW must both be absolute\n");
+        return -1;
+    }
+    if (fl >= sizeof(g_rewrite_from_buf) ||
+        snprintf(g_rewrite_to_buf, sizeof(g_rewrite_to_buf), "%s", eq + 1) >= (int)sizeof(g_rewrite_to_buf)) {
+        fprintf(stderr, "ereport_index: --path-rewrite path too long\n");
+        return -1;
+    }
+    memcpy(g_rewrite_from_buf, arg, fl);
+    g_rewrite_from_buf[fl] = '\0';
+    while (fl > 1 && g_rewrite_from_buf[fl - 1] == '/') g_rewrite_from_buf[--fl] = '\0';
+    tl = strlen(g_rewrite_to_buf);
+    while (tl > 1 && g_rewrite_to_buf[tl - 1] == '/') g_rewrite_to_buf[--tl] = '\0';
+    if (fl < 2 || tl < 2) {
+        fprintf(stderr, "ereport_index: --path-rewrite OLD and NEW must name a directory below root (not '/')\n");
+        return -1;
+    }
+    g_rewrite_from = g_rewrite_from_buf;
+    g_rewrite_from_len = fl;
+    g_rewrite_to = g_rewrite_to_buf;
+    g_rewrite_to_len = tl;
     return 0;
 }
 #define MEMLOG_INTERVAL_SEC 8
@@ -268,6 +336,7 @@ typedef struct {
     /* Parallel trigram writers use disjoint tmp files per (bucket, worker) — no cross-thread FILE/mutex. */
     uint32_t trigram_tmp_shard_count;
     FILE **tw_worker_fp; /* [trigram_tmp_shard_count * TRIGRAM_BUCKET_COUNT] */
+    uint8_t *tw_worker_fp_magic; /* 1 if EITG0001 header already on disk for this open fp */
     uint64_t *tw_worker_lru_age;
     uint32_t *tw_worker_open_count; /* [trigram_tmp_shard_count] */
     uint32_t tw_worker_max_open;
@@ -554,6 +623,221 @@ static void ereport_index_install_verbose_io(void) {
 #define mk_read(fd, buf, count) ((*ei_read)((fd), (buf), (count)))
 #define mk_mmap(addr, length, prot, flags, fd, offset) ((*ei_mmap)((addr), (length), (prot), (flags), (fd), (offset)))
 #define mk_munmap(addr, length) ((*ei_munmap)((addr), (length)))
+
+/* tmp_trigrams_*.bin are always zstd-framed: 8-byte magic, then [u32 n_recs][u32 comp_size][zstd frame]* */
+static const unsigned char TRIGRAM_TMP_MAGIC[8] = {'E', 'I', 'T', 'G', '0', '0', '0', '1'};
+
+/* Compression level for tmp_trigrams. EREPORT_INDEX_TMP_ZSTD_LEVEL selects 1..ZSTD_maxCLevel();
+ * out-of-range / unparsable values fall back to the default. Uncompressed temp files are not supported. */
+static int tmp_trigram_zstd_level(void) {
+    if (g_tmp_trigram_zstd_level >= 0) return g_tmp_trigram_zstd_level;
+    {
+        const char *env = getenv("EREPORT_INDEX_TMP_ZSTD_LEVEL");
+        int level = 3;
+
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+
+            if (end != env && *end == '\0' && v >= 1 && v <= ZSTD_maxCLevel())
+                level = (int)v;
+        }
+        g_tmp_trigram_zstd_level = level;
+    }
+    return g_tmp_trigram_zstd_level;
+}
+
+static int tmp_trigram_read_exact_fd(int fd, void *buf, size_t n) {
+    unsigned char *p = (unsigned char *)buf;
+    size_t left = n;
+
+    while (left > 0) {
+        ssize_t r = mk_read(fd, p, left);
+
+        if (r <= 0) return -1;
+        p += (size_t)r;
+        left -= (size_t)r;
+    }
+    return 0;
+}
+
+static int tmp_trigram_write_compressed_frame(FILE *fp, const trigram_record_t *recs, size_t n) {
+    size_t src_bytes = n * sizeof(*recs);
+    size_t bound = ZSTD_compressBound(src_bytes);
+    unsigned char *comp = NULL;
+    uint32_t n32;
+    uint32_t clen32;
+    size_t comp_len;
+    int rc = -1;
+
+    if (n == 0) return 0;
+    if (n > UINT32_MAX) return -1;
+    comp = (unsigned char *)malloc(bound);
+    if (!comp) return -1;
+    comp_len = ZSTD_compress(comp, bound, recs, src_bytes, tmp_trigram_zstd_level());
+    if (ZSTD_isError(comp_len)) goto out;
+    if (comp_len > UINT32_MAX) goto out;
+    n32 = (uint32_t)n;
+    clen32 = (uint32_t)comp_len;
+    if (mk_fwrite(&n32, 1, 4, fp) != 4) goto out;
+    if (mk_fwrite(&clen32, 1, 4, fp) != 4) goto out;
+    if (mk_fwrite(comp, 1, comp_len, fp) != comp_len) goto out;
+    rc = 0;
+out:
+    free(comp);
+    return rc;
+}
+
+static int tmp_trigram_fp_write_batch(FILE *fp, uint8_t *magic_on_disk, const trigram_record_t *recs, size_t n) {
+    if (n == 0) return 0;
+    if (!magic_on_disk || !*magic_on_disk) {
+        if (mk_fwrite(TRIGRAM_TMP_MAGIC, 1, 8, fp) != 8) return -1;
+        if (magic_on_disk) *magic_on_disk = 1;
+    }
+    return tmp_trigram_write_compressed_frame(fp, recs, n);
+}
+
+/* 1 if an existing tmp_trigrams shard already holds the EITG header (i.e. is non-empty); 0 for new/empty. */
+static int tmp_trigram_file_has_magic(const char *path) {
+    struct stat st;
+
+    return stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static int tmp_trigram_count_file_records(const char *path, size_t *n_out, uint64_t *bytes_out) {
+    struct stat st;
+    int fd;
+    unsigned char hdr[8];
+    ssize_t hr;
+
+    if (n_out) *n_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return -1;
+
+    fd = mk_open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    hr = mk_read(fd, hdr, 8);
+    if (hr != 8 || memcmp(hdr, TRIGRAM_TMP_MAGIC, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    {
+        size_t n = 0;
+
+        for (;;) {
+            uint32_t frame_n;
+            uint32_t clen;
+            ssize_t r = mk_read(fd, &frame_n, 4);
+
+            if (r == 0) break;
+            if (r != 4 || tmp_trigram_read_exact_fd(fd, &clen, 4) != 0) {
+                close(fd);
+                return -1;
+            }
+            if (clen > 0 && lseek(fd, (off_t)clen, SEEK_CUR) < 0) {
+                close(fd);
+                return -1;
+            }
+            n += (size_t)frame_n;
+        }
+        close(fd);
+        if (n_out) *n_out = n;
+        if (bytes_out) *bytes_out = n * sizeof(trigram_record_t);
+        return 0;
+    }
+}
+
+static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, size_t *n_out, uint64_t *bytes_out) {
+    struct stat st;
+    int fd = -1;
+    unsigned char hdr[8];
+    ssize_t hr;
+
+    if (recs_out) *recs_out = NULL;
+    if (n_out) *n_out = 0;
+    if (bytes_out) *bytes_out = 0;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return -1;
+
+    fd = mk_open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    hr = mk_read(fd, hdr, 8);
+    if (hr != 8 || memcmp(hdr, TRIGRAM_TMP_MAGIC, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    {
+        size_t cap = 4096;
+        size_t n = 0;
+        trigram_record_t *recs = (trigram_record_t *)malloc(cap * sizeof(*recs));
+
+        if (!recs) {
+            close(fd);
+            return -1;
+        }
+        for (;;) {
+            uint32_t frame_n;
+            uint32_t clen;
+            ssize_t r = mk_read(fd, &frame_n, 4);
+
+            if (r == 0) break;
+            if (r != 4 || tmp_trigram_read_exact_fd(fd, &clen, 4) != 0) {
+                free(recs);
+                close(fd);
+                return -1;
+            }
+            if (frame_n == 0) continue;
+            {
+                size_t src_bytes = (size_t)frame_n * sizeof(trigram_record_t);
+                unsigned char *comp = (unsigned char *)malloc((size_t)clen);
+                size_t dec;
+
+                if (!comp) {
+                    free(recs);
+                    close(fd);
+                    return -1;
+                }
+                if (tmp_trigram_read_exact_fd(fd, comp, (size_t)clen) != 0) {
+                    free(comp);
+                    free(recs);
+                    close(fd);
+                    return -1;
+                }
+                if (n + (size_t)frame_n > cap) {
+                    size_t need = n + (size_t)frame_n;
+                    size_t new_cap = cap;
+
+                    while (new_cap < need) new_cap *= 2;
+                    {
+                        trigram_record_t *np = (trigram_record_t *)realloc(recs, new_cap * sizeof(*recs));
+
+                        if (!np) {
+                            free(comp);
+                            free(recs);
+                            close(fd);
+                            return -1;
+                        }
+                        recs = np;
+                        cap = new_cap;
+                    }
+                }
+                dec = ZSTD_decompress(recs + n, src_bytes, comp, (size_t)clen);
+                free(comp);
+                if (ZSTD_isError(dec) || dec != src_bytes) {
+                    free(recs);
+                    close(fd);
+                    return -1;
+                }
+                n += (size_t)frame_n;
+            }
+        }
+        close(fd);
+        if (recs_out) *recs_out = recs;
+        else free(recs);
+        if (n_out) *n_out = n;
+        if (bytes_out) *bytes_out = n * sizeof(trigram_record_t);
+        return 0;
+    }
+}
 
 static double now_sec(void) {
     struct timeval tv;
@@ -1199,7 +1483,7 @@ static int argv_skip_verbose_prefix(int argc, char **argv) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [username|uid] [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
             "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
             "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
@@ -1216,6 +1500,8 @@ static void die_usage(const char *argv0) {
             "    With no user/bin arguments after flags, the index is all-users for ./\n"
             "    Optional --subtree <abs-path> (may precede or follow --index-dir): index only records at or under\n"
             "    that directory (full absolute paths kept), mirroring `ereport --subtree` so search covers just that subtree.\n"
+            "    Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW while indexing\n"
+            "    (bins unchanged), e.g. /data1/group=/orcd/data; applied before --subtree.\n"
             "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
             "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
             "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
@@ -1980,15 +2266,19 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
     ctx->trigram_tmp_shard_count = shard_count;
 
     ctx->tw_worker_fp = (FILE **)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(FILE *));
+    ctx->tw_worker_fp_magic = (uint8_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint8_t));
     ctx->tw_worker_lru_age = (uint64_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint64_t));
     ctx->tw_worker_open_count = (uint32_t *)calloc((size_t)shard_count, sizeof(uint32_t));
     ctx->tw_worker_lru_next_tick = (uint64_t *)calloc((size_t)shard_count, sizeof(uint64_t));
-    if (!ctx->tw_worker_fp || !ctx->tw_worker_lru_age || !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick) {
+    if (!ctx->tw_worker_fp || !ctx->tw_worker_fp_magic || !ctx->tw_worker_lru_age ||
+        !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick) {
         free(ctx->tw_worker_fp);
+        free(ctx->tw_worker_fp_magic);
         free(ctx->tw_worker_lru_age);
         free(ctx->tw_worker_open_count);
         free(ctx->tw_worker_lru_next_tick);
         ctx->tw_worker_fp = NULL;
+        ctx->tw_worker_fp_magic = NULL;
         ctx->tw_worker_lru_age = NULL;
         ctx->tw_worker_open_count = NULL;
         ctx->tw_worker_lru_next_tick = NULL;
@@ -2032,12 +2322,15 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
             if (ctx->tw_worker_fp[ix]) {
                 mk_fclose(ctx->tw_worker_fp[ix]);
                 ctx->tw_worker_fp[ix] = NULL;
+                ctx->tw_worker_fp_magic[ix] = 0;
             }
         }
         if (ctx->tw_worker_open_count) ctx->tw_worker_open_count[wid] = 0;
     }
     free(ctx->tw_worker_fp);
     ctx->tw_worker_fp = NULL;
+    free(ctx->tw_worker_fp_magic);
+    ctx->tw_worker_fp_magic = NULL;
     free(ctx->tw_worker_lru_age);
     ctx->tw_worker_lru_age = NULL;
     free(ctx->tw_worker_open_count);
@@ -2067,7 +2360,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     if (fp) {
         tick = ++ctx->tw_worker_lru_next_tick[worker_id];
         ctx->tw_worker_lru_age[ix] = tick;
-        if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
+        if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
             fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
                     strerror(errno));
             return -1;
@@ -2092,13 +2385,14 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
                         strerror(errno));
             }
             ctx->tw_worker_fp[vix] = NULL;
+            ctx->tw_worker_fp_magic[vix] = 0;
             ctx->tw_worker_open_count[worker_id]--;
         }
         fp = ctx->tw_worker_fp[ix];
         if (fp) {
             tick = ++ctx->tw_worker_lru_next_tick[worker_id];
             ctx->tw_worker_lru_age[ix] = tick;
-            if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
+            if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
                 fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
                         strerror(errno));
                 return -1;
@@ -2111,7 +2405,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     if (fp) {
         tick = ++ctx->tw_worker_lru_next_tick[worker_id];
         ctx->tw_worker_lru_age[ix] = tick;
-        if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
+        if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
             fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
                     strerror(errno));
             return -1;
@@ -2124,6 +2418,8 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
         fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u worker %u)\n", bucket, worker_id);
         return -1;
     }
+    /* Reopened-after-eviction shards already carry the EITG header; brand-new (empty) files do not. */
+    ctx->tw_worker_fp_magic[ix] = (uint8_t)tmp_trigram_file_has_magic(path);
     fp = mk_fopen(path, "ab");
     if (!fp) {
         fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
@@ -2136,7 +2432,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     ctx->tw_worker_open_count[worker_id]++;
     tick = ++ctx->tw_worker_lru_next_tick[worker_id];
     ctx->tw_worker_lru_age[ix] = tick;
-    if (mk_fwrite(recs, sizeof(*recs), n, fp) != n) {
+    if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
         fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id, strerror(errno));
         return -1;
     }
@@ -2511,6 +2807,12 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             }
         }
 
+        /* --path-rewrite: relabel the stored prefix before indexing, so the index (and the --subtree filter)
+         * use the rewritten namespace. */
+        if (g_rewrite_from) {
+            (void)rewrite_path_prefix(pathbuf, PATH_MAX);
+        }
+
         /* --subtree: only index records at or under the requested directory (full absolute path kept). */
         if (g_subtree_prefix && !subtree_path_under_prefix(pathbuf)) {
             free(pathbuf);
@@ -2685,8 +2987,9 @@ shards:
 }
 
 /*
- * Load legacy tmp_trigrams_%04u.bin (if present) plus all tmp_trigrams_%04u_w%04u.bin shards into one buffer.
- * Record order is preserved per file; radix sort fixes global order.
+ * Load legacy single-file tmp_trigrams_%04u.bin (if present) plus all tmp_trigrams_%04u_w%04u.bin shards into
+ * one buffer. Every tmp file is EITG0001 zstd-framed; records are decompressed and concatenated, then the
+ * caller's radix sort fixes global order.
  */
 static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_loaded_bucket_t *out) {
     char path[PATH_MAX], leg[PATH_MAX];
@@ -2696,9 +2999,6 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
     uint32_t w, max_w;
     unsigned char *buf = NULL;
     size_t pos = 0;
-    int n_nonempty = 0;
-    int leg_nonempty = 0;
-    uint32_t lone_shard_w = 0;
 
     memset(out, 0, sizeof(*out));
     merge_ctx_ensure_trigram_shard_count(ctx);
@@ -2706,109 +3006,58 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
 
     if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(leg)) return -1;
     if (stat(leg, &st) == 0 && st.st_size > 0) {
-        if ((st.st_size % (off_t)sizeof(trigram_record_t)) != 0) return -1;
-        total_bytes += (uint64_t)st.st_size;
-        total_n += (size_t)((uint64_t)st.st_size / sizeof(trigram_record_t));
-        leg_nonempty = 1;
-        n_nonempty++;
+        size_t nrec = 0;
+        uint64_t ubytes = 0;
+
+        if (tmp_trigram_count_file_records(leg, &nrec, &ubytes) != 0) return -1;
+        total_bytes += ubytes;
+        total_n += nrec;
     }
     for (w = 0; w < max_w; w++) {
+        size_t nrec = 0;
+        uint64_t ubytes = 0;
+
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))
             return -1;
         if (stat(path, &st) != 0 || st.st_size == 0) continue;
-        if ((st.st_size % (off_t)sizeof(trigram_record_t)) != 0) return -1;
-        total_bytes += (uint64_t)st.st_size;
-        total_n += (size_t)((uint64_t)st.st_size / sizeof(trigram_record_t));
-        lone_shard_w = w;
-        n_nonempty++;
+        if (tmp_trigram_count_file_records(path, &nrec, &ubytes) != 0) return -1;
+        total_bytes += ubytes;
+        total_n += nrec;
     }
 
     if (total_n == 0) return -1;
 
-    /* Single-file mmap (legacy-only or one shard only). */
-    if (n_nonempty == 1 && leg_nonempty) {
-        int fd;
-        void *p;
-
-        fd = mk_open(leg, O_RDONLY);
-        if (fd < 0) return -1;
-        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-            close(fd);
-            return -1;
-        }
-        p = mk_mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (p != MAP_FAILED) {
-            out->mmap_base = p;
-            out->mmap_len = (size_t)st.st_size;
-            out->records = (trigram_record_t *)p;
-            out->n = total_n;
-            out->bytes = total_bytes;
-            return 0;
-        }
-    } else if (n_nonempty == 1 && !leg_nonempty) {
-        int fd;
-        void *p;
-
-        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, lone_shard_w) >=
-            (int)sizeof(path))
-            return -1;
-        fd = mk_open(path, O_RDONLY);
-        if (fd < 0) return -1;
-        if (fstat(fd, &st) != 0 || st.st_size <= 0) {
-            close(fd);
-            return -1;
-        }
-        p = mk_mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (p != MAP_FAILED) {
-            out->mmap_base = p;
-            out->mmap_len = (size_t)st.st_size;
-            out->records = (trigram_record_t *)p;
-            out->n = total_n;
-            out->bytes = total_bytes;
-            return 0;
-        }
-    }
-
-    buf = (unsigned char *)malloc((size_t)total_bytes);
+    buf = (unsigned char *)malloc(total_n * sizeof(trigram_record_t));
     if (!buf) return -1;
 
     if (stat(leg, &st) == 0 && st.st_size > 0) {
-        int fd = mk_open(leg, O_RDONLY);
+        trigram_record_t *recs = NULL;
+        size_t nrec = 0;
 
-        if (fd < 0) {
+        if (tmp_trigram_load_file(leg, &recs, &nrec, NULL) != 0) {
             free(buf);
             return -1;
         }
-        if (mk_read(fd, buf + pos, (size_t)st.st_size) != (ssize_t)st.st_size) {
-            close(fd);
-            free(buf);
-            return -1;
-        }
-        close(fd);
-        pos += (size_t)st.st_size;
+        memcpy(buf + pos, recs, nrec * sizeof(trigram_record_t));
+        pos += nrec * sizeof(trigram_record_t);
+        free(recs);
     }
     for (w = 0; w < max_w; w++) {
-        int fd;
+        trigram_record_t *recs = NULL;
+        size_t nrec = 0;
 
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path)) {
             free(buf);
             return -1;
         }
         if (stat(path, &st) != 0 || st.st_size == 0) continue;
-        fd = mk_open(path, O_RDONLY);
-        if (fd < 0) {
+        if (tmp_trigram_load_file(path, &recs, &nrec, NULL) != 0) {
             free(buf);
             return -1;
         }
-        if (mk_read(fd, buf + pos, (size_t)st.st_size) != (ssize_t)st.st_size) {
-            close(fd);
-            free(buf);
-            return -1;
-        }
-        close(fd);
-        pos += (size_t)st.st_size;
+        memcpy(buf + pos, recs, nrec * sizeof(trigram_record_t));
+        pos += nrec * sizeof(trigram_record_t);
+        free(recs);
     }
 
     out->records = (trigram_record_t *)buf;
@@ -5472,6 +5721,15 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 if (set_subtree_prefix(argv[ai + 1]) != 0) return 2;
+                ai += 2;
+                continue;
+            }
+            if (strcmp(argv[ai], "--path-rewrite") == 0) {
+                if (ai + 2 > argc) {
+                    fprintf(stderr, "ereport_index: --path-rewrite requires OLD=NEW\n");
+                    return 2;
+                }
+                if (set_path_rewrite(argv[ai + 1]) != 0) return 2;
                 ai += 2;
                 continue;
             }

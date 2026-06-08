@@ -13,8 +13,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
@@ -93,13 +93,15 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 #define PATH_SHAPE_DENSE_MIN_CHILDREN (8u * 1024u)
 #define PATH_SHAPE_MIN_BUCKET_FILES 20ULL
 /*
- * Per-(age,size)-cell parent map buckets. Sized to keep collision chains short for
- * flat/many-distinct-parent corpora (dense_cell_add walks the chain per record).
- * Each map is an array of pointers (8 KiB at 1024-wide... here 32 KiB at 4096), held
- * per worker x 36 cells, so this trades a few hundred MiB at high thread counts for
- * far less time in dense_cell_add_h on flat inputs. Lookups/merges are unaffected.
+ * Per-(age,size)-cell parent map buckets. The bucket array is now per-map dynamic
+ * (see dense_cell_map_t / dense_cell_reserve): it starts tiny and doubles as the map
+ * fills, keeping the average collision chain ~<=1 regardless of how many distinct
+ * parents land in the map. This is critical at scale — on a whole-corpus all-users run
+ * the crawl-wide parent_fanout map holds tens of millions of distinct directories; a
+ * fixed 4096-bucket table degraded to ~10k-long chains and ~80% of CPU in the strcmp
+ * walk (measured). Sparse per-cell maps stay small instead of each pre-allocating 32 KiB.
  */
-#define DENSE_PARENT_BUCKETS 4096U
+#define DENSE_PARENT_BUCKETS_INIT 64U   /* initial bucket count for a freshly-populated map (power of two) */
 /* Wider hash only for merged crawl-wide fanout — shortens chains for path-shape lookups (stack ~512 KiB). */
 #define DENSE_PARENT_BUCKETS_FANOUT_LOOKUP 65536U
 #define SUMMARY_REDUCE_MIN_CHUNK 4
@@ -502,11 +504,15 @@ typedef struct dense_node {
     struct dense_node *next;
     char *parent;  /* points into the trailing bytes of this same malloc block (see dense_node_new); never freed separately */
     uint64_t n;
-    uint32_t hash; /* full 32-bit FNV of parent; bucket = hash % DENSE_PARENT_BUCKETS */
+    uint32_t hash; /* full 32-bit FNV of parent; bucket = hash & (nbuckets-1) */
 } dense_node_t;
 
 typedef struct {
-    dense_node_t *buckets[DENSE_PARENT_BUCKETS];
+    /* Dynamically grown bucket array (power-of-two size in nbuckets; NULL/0 until the
+     * first insert). Index is hash & (nbuckets-1). dense_cell_reserve doubles + rehashes
+     * when the load factor reaches ~1 so chains stay short on huge many-parent maps. */
+    dense_node_t **buckets;
+    size_t nbuckets;
     /* Last-hit cache keyed by parent_dir_id: consecutive records under the same
      * directory (the common crawl-bin layout, esp. mega-dirs) then skip hashing
      * and strcmp entirely. Only used by the *_cached accumulate path; merge/insert
@@ -613,6 +619,34 @@ static int g_ereport_verbose = 0;
  * even when --bucket-details is off (the skip_paths fast path needs the path to test the prefix). */
 static const char *g_subtree_prefix = NULL;
 static size_t g_subtree_prefix_len = 0;
+
+/* --path-rewrite OLD=NEW: when g_rewrite_from is non-NULL, every reconstructed path at or under OLD has its
+ * OLD prefix replaced with NEW (directory-boundary match), purely at read time — the on-disk bins are never
+ * modified. Lets a crawl stored under one record-root be reported/heat-mapped as if it lived elsewhere
+ * (e.g. relabel /data1/group as /orcd/data). Applied before --subtree, so --subtree is given in NEW terms. */
+static const char *g_rewrite_from = NULL;
+static size_t g_rewrite_from_len = 0;
+static const char *g_rewrite_to = NULL;
+static size_t g_rewrite_to_len = 0;
+
+/* If path is at/under g_rewrite_from (directory boundary), rewrite that prefix to g_rewrite_to in place.
+ * Both prefixes are normalized absolute dirs without trailing '/'. Returns 0 (no-op when no rewrite is set
+ * or the path doesn't match); -1 if the result would not fit in bufsz (path left unchanged). */
+static int starts_with_dir_prefix(const char *path, const char *prefix);
+static int rewrite_path_prefix(char *path, size_t bufsz) {
+    size_t plen, suffix_len, newlen;
+
+    if (!g_rewrite_from || !path) return 0;
+    if (!starts_with_dir_prefix(path, g_rewrite_from)) return 0;
+    plen = strlen(path);
+    /* g_rewrite_from has no trailing slash, so the remainder is "" (exact match) or "/...". */
+    suffix_len = plen - g_rewrite_from_len;
+    newlen = g_rewrite_to_len + suffix_len;
+    if (newlen + 1 > bufsz) return -1;
+    memmove(path + g_rewrite_to_len, path + g_rewrite_from_len, suffix_len + 1); /* include NUL */
+    memcpy(path, g_rewrite_to, g_rewrite_to_len);
+    return 0;
+}
 
 /* Manifest-driven crawl directory layout: "uid_shards" or "unsharded" (no uid-shard manifest). */
 static const char *g_input_layout = "unsharded";
@@ -1097,6 +1131,26 @@ static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t
     return 0;
 }
 
+/* Append a detail record whose path string is already owned by a shared arena (e.g. the same string
+ * the matched_records entry points at). No copy is made; caller must guarantee paths_external so the
+ * shared pointer is never individually freed. Lets one arena-dup back both lists, halving path bytes. */
+static int bucket_details_append_ptr(bucket_details_t *b, char *path, uint64_t size, int ctime_led) {
+    detail_record_t *tmp;
+
+    if (b->count == b->cap) {
+        size_t new_cap = (b->cap == 0) ? 256 : b->cap * 2;
+        tmp = (detail_record_t *)realloc(b->items, new_cap * sizeof(*tmp));
+        if (!tmp) return -1;
+        b->items = tmp;
+        b->cap = new_cap;
+    }
+    b->items[b->count].path = path;
+    b->items[b->count].size = size;
+    b->items[b->count].ctime_led = (uint8_t)(ctime_led ? 1 : 0);
+    b->count++;
+    return 0;
+}
+
 static void bucket_details_free(bucket_details_t *b) {
     size_t i;
     if (!b->paths_external) {
@@ -1121,6 +1175,25 @@ static int matched_records_append(matched_records_t *m, const char *path, uint8_
 
     m->items[m->count].path = m->arena ? path_arena_dup(m->arena, path ? path : "") : strdup(path ? path : "");
     if (!m->items[m->count].path) return -1;
+    m->items[m->count].type = type;
+    m->items[m->count].size = size;
+    m->count++;
+    return 0;
+}
+
+/* Append a matched record whose path string is already owned by a shared arena. No copy is made;
+ * caller must guarantee paths_external so the shared pointer is never individually freed. */
+static int matched_records_append_ptr(matched_records_t *m, char *path, uint8_t type, uint64_t size) {
+    matched_record_t *tmp;
+
+    if (m->count == m->cap) {
+        size_t new_cap = (m->cap == 0) ? 1024 : m->cap * 2;
+        tmp = (matched_record_t *)realloc(m->items, new_cap * sizeof(*tmp));
+        if (!tmp) return -1;
+        m->items = tmp;
+        m->cap = new_cap;
+    }
+    m->items[m->count].path = path;
     m->items[m->count].type = type;
     m->items[m->count].size = size;
     m->count++;
@@ -2120,26 +2193,66 @@ static dense_node_t *dense_node_new(const char *parent, uint32_t h, uint64_t n) 
     return node;
 }
 
+/* Ensure m->buckets exists and has room (load factor < 1). On growth, doubles the table
+ * and rehashes every node by its stored full hash. Nodes keep their addresses (only relinked),
+ * so m->last stays valid across a grow. Single-threaded use only (per-worker accumulation and
+ * post-join merges; never called while other threads touch this map). Returns -1 on OOM. */
+static int dense_cell_reserve(dense_cell_map_t *m) {
+    size_t newn;
+    dense_node_t **nb;
+    size_t i;
+
+    if (m->buckets && m->count < m->nbuckets) return 0;
+    newn = m->nbuckets ? (m->nbuckets << 1) : (size_t)DENSE_PARENT_BUCKETS_INIT;
+    nb = (dense_node_t **)calloc(newn, sizeof(*nb));
+    if (!nb) return -1;
+    for (i = 0; i < m->nbuckets; i++) {
+        dense_node_t *n = m->buckets[i];
+
+        while (n) {
+            dense_node_t *nx = n->next;
+            size_t bi = (size_t)n->hash & (newn - 1);
+
+            n->next = nb[bi];
+            nb[bi] = n;
+            n = nx;
+        }
+    }
+    free(m->buckets);
+    m->buckets = nb;
+    m->nbuckets = newn;
+    return 0;
+}
+
 /* Insert/accumulate with a precomputed full hash; compares hash before strcmp so
  * collision-chain walks skip the (expensive) full path strcmp on hash mismatches. */
 static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h, uint64_t delta,
                             summary_t *sum) {
-    uint32_t bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
-    dense_node_t **pp = &m->buckets[bi];
+    size_t bi;
+    dense_node_t **pp;
     dense_node_t *node;
 
-    while (*pp) {
-        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
-            (*pp)->n += delta;
-            return 0;
+    if (m->nbuckets) {
+        bi = (size_t)h & (m->nbuckets - 1);
+        pp = &m->buckets[bi];
+        while (*pp) {
+            if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
+                (*pp)->n += delta;
+                return 0;
+            }
+            pp = &(*pp)->next;
         }
-        pp = &(*pp)->next;
+    }
+    if (dense_cell_reserve(m) != 0) {
+        if (sum) sum->bad_input_files++;
+        return -1;
     }
     node = dense_node_new(parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
     }
+    bi = (size_t)h & (m->nbuckets - 1);
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
     m->count++;
@@ -2152,7 +2265,7 @@ static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h,
  * same directory then increment the cached node directly, skipping hash + strcmp. */
 static int dense_cell_add_cached_h(dense_cell_map_t *m, const char *parent, uint64_t parent_id,
                                    uint32_t h, uint64_t delta, summary_t *sum) {
-    uint32_t bi;
+    size_t bi;
     dense_node_t **pp;
     dense_node_t *node;
 
@@ -2160,22 +2273,29 @@ static int dense_cell_add_cached_h(dense_cell_map_t *m, const char *parent, uint
         m->last->n += delta;
         return 0;
     }
-    bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
-    pp = &m->buckets[bi];
-    while (*pp) {
-        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
-            (*pp)->n += delta;
-            m->last = *pp;
-            m->last_id = parent_id;
-            return 0;
+    if (m->nbuckets) {
+        bi = (size_t)h & (m->nbuckets - 1);
+        pp = &m->buckets[bi];
+        while (*pp) {
+            if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
+                (*pp)->n += delta;
+                m->last = *pp;
+                m->last_id = parent_id;
+                return 0;
+            }
+            pp = &(*pp)->next;
         }
-        pp = &(*pp)->next;
+    }
+    if (dense_cell_reserve(m) != 0) {
+        if (sum) sum->bad_input_files++;
+        return -1;
     }
     node = dense_node_new(parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
     }
+    bi = (size_t)h & (m->nbuckets - 1);
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
     m->count++;
@@ -2202,79 +2322,6 @@ typedef struct {
     atomic_int gate; /* 0 spin, 1 run, 2 abort (pthread_create failure) */
     pthread_barrier_t mid;
 } dmerge_sync_t;
-
-typedef struct {
-    dmerge_sync_t *sync;
-    dense_cell_map_t *dst;
-    dense_cell_map_t *src;
-    dense_node_t **st;
-    summary_t *sum;
-    int nt;
-    int tid;
-} dmerge_pt_ctx_t;
-
-static void dmerge_do_phase1(dmerge_pt_ctx_t *c) {
-    size_t bi;
-
-    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS; bi += (size_t)c->nt) {
-        dense_node_t *n = c->src->buckets[bi];
-
-        c->src->buckets[bi] = NULL;
-        while (n) {
-            dense_node_t *nx = n->next;
-            uint32_t dbi = n->hash % (uint32_t)DENSE_PARENT_BUCKETS;
-
-            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi];
-            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS + dbi] = n;
-            n = nx;
-        }
-    }
-}
-
-static void dmerge_do_phase2(dmerge_pt_ctx_t *c) {
-    size_t dst_bi;
-    int t;
-
-    for (dst_bi = (size_t)c->tid; dst_bi < DENSE_PARENT_BUCKETS; dst_bi += (size_t)c->nt) {
-        for (t = 0; t < c->nt; t++) {
-            dense_node_t *n = c->st[(size_t)t * DENSE_PARENT_BUCKETS + dst_bi];
-
-            c->st[(size_t)t * DENSE_PARENT_BUCKETS + dst_bi] = NULL;
-            while (n) {
-                dense_node_t *nx = n->next;
-
-                n->next = NULL;
-                if (dense_cell_add_h(c->dst, n->parent, n->hash, n->n, c->sum) != 0) {
-                    while (n) {
-                        dense_node_t *rest = n->next;
-
-                        free(n);
-                        n = rest;
-                    }
-                    break;
-                }
-                free(n);
-                n = nx;
-            }
-        }
-    }
-}
-
-static void *dmerge_parallel_worker(void *vp) {
-    dmerge_pt_ctx_t *c = (dmerge_pt_ctx_t *)vp;
-
-    for (;;) {
-        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
-
-        if (g == 1) break;
-        if (g == 2) return NULL;
-        sched_yield();
-    }
-    dmerge_do_phase1(c);
-    pthread_barrier_wait(&c->sync->mid);
-    dmerge_do_phase2(c);
-    return NULL;
-}
 
 static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum, size_t bi_lo, size_t bi_hi) {
     size_t bi;
@@ -2304,106 +2351,23 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
 }
 
 /*
- * Merge src into dst. Single-threaded path walks src buckets sequentially.
- * When merge_threads > 1, use a two-phase merge: partition src buckets across threads into per-thread
- * per-dst-bucket lists (no shared writes), barrier, then each thread owns a disjoint dst-bucket index range
- * and runs dense_cell_add for all staged nodes targeting those buckets (safe: no concurrent writers to the
- * same dst bucket).
+ * Merge src into dst by re-inserting every src node (dst grows its own dynamic hash as needed).
+ * Sequential: with per-map dynamic bucket counts the old bucket-index-parallel two-phase merge no
+ * longer holds (a parent need not map to the same bucket index in src and dst), so we use the
+ * hash-based re-insert path. This runs post-join (no concurrent writers); coarser parallelism is
+ * preserved by the caller's tournament (distinct cells/pairs merged on distinct threads).
  */
 static void dense_cell_merge_into_ex(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum, int merge_threads) {
-    dense_node_t **st = NULL;
-    dmerge_pt_ctx_t *ctx = NULL;
-    pthread_t *tids = NULL;
-    dmerge_sync_t sync;
-    int nt_want, nthr, n_join, ti, k, brc;
-
+    (void)merge_threads;
     if (!dst || !src) return;
-    if (merge_threads < 2) {
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-    if (dense_cell_total_nodes(src) < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-
-    nt_want = merge_threads;
-    if (nt_want > (int)DENSE_PARENT_BUCKETS) nt_want = (int)DENSE_PARENT_BUCKETS;
-
-    st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS, sizeof(dense_node_t *));
-    if (!st) {
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-    ctx = (dmerge_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
-    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
-    if (!ctx || (!tids && nt_want > 1)) {
-        free(st);
-        free(ctx);
-        free(tids);
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-
-    atomic_init(&sync.gate, 0);
-    for (ti = 0; ti < nt_want; ti++) {
-        ctx[ti].sync = &sync;
-        ctx[ti].dst = dst;
-        ctx[ti].src = src;
-        ctx[ti].st = st;
-        ctx[ti].sum = sum;
-        ctx[ti].nt = 0;
-        ctx[ti].tid = 0;
-    }
-
-    n_join = 0;
-    for (ti = 1; ti < nt_want; ti++) {
-        if (pthread_create(&tids[ti - 1], NULL, dmerge_parallel_worker, &ctx[ti]) != 0) break;
-        n_join++;
-    }
-    nthr = n_join + 1;
-    if (nthr < 2) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-
-    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
-    if (brc != 0) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        dense_cell_merge_bucket_range(dst, src, sum, 0, DENSE_PARENT_BUCKETS);
-        return;
-    }
-
-    for (ti = 0; ti < nthr; ti++) {
-        ctx[ti].nt = nthr;
-        ctx[ti].tid = ti;
-    }
-    atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&sync.gate, 1, memory_order_release);
-    dmerge_do_phase1(&ctx[0]);
-    pthread_barrier_wait(&sync.mid);
-    dmerge_do_phase2(&ctx[0]);
-    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-    pthread_barrier_destroy(&sync.mid);
-    free(st);
-    free(ctx);
-    free(tids);
+    dense_cell_merge_bucket_range(dst, src, sum, 0, src->nbuckets);
 }
 
 static void dense_cell_merge_add(dense_cell_map_t *dst, const dense_cell_map_t *src, summary_t *sum) {
     size_t bi;
 
     if (!dst || !src) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+    for (bi = 0; bi < src->nbuckets; bi++) {
         const dense_node_t *n;
 
         for (n = src->buckets[bi]; n; n = n->next) {
@@ -2416,7 +2380,7 @@ static void dense_cell_steal_into_fanout_lookup(dense_cell_map_t *narrow, dense_
     size_t bi;
 
     if (!narrow || !lk) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+    for (bi = 0; bi < narrow->nbuckets; bi++) {
         dense_node_t *n = narrow->buckets[bi];
 
         narrow->buckets[bi] = NULL;
@@ -2443,7 +2407,7 @@ typedef struct {
 static void fanout_steal_do_phase1(fanout_steal_pt_ctx_t *c) {
     size_t bi;
 
-    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS; bi += (size_t)c->nt) {
+    for (bi = (size_t)c->tid; bi < c->narrow->nbuckets; bi += (size_t)c->nt) {
         dense_node_t *n = c->narrow->buckets[bi];
 
         c->narrow->buckets[bi] = NULL;
@@ -2634,11 +2598,11 @@ static uint64_t dense_cell_fanout_lookup_get_n_h(const dense_cell_fanout_lookup_
 }
 
 static uint64_t dense_cell_map_get_n_h(const dense_cell_map_t *m, const char *parent, uint32_t h) {
-    uint32_t bi;
+    size_t bi;
     const dense_node_t *n;
 
-    if (!m || !parent) return 0;
-    bi = h % (uint32_t)DENSE_PARENT_BUCKETS;
+    if (!m || !parent || m->nbuckets == 0) return 0;
+    bi = (size_t)h & (m->nbuckets - 1);
     for (n = m->buckets[bi]; n; n = n->next) {
         if (n->hash == h && strcmp(n->parent, parent) == 0) return n->n;
     }
@@ -2699,7 +2663,7 @@ static uint64_t fanout_max_among_parents_serial(const dense_cell_map_t *slice_pa
     uint64_t mx = 0;
 
     if (!slice_parents || !fanout_lookup) return 0;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+    for (bi = 0; bi < slice_parents->nbuckets; bi++) {
         const dense_node_t *n;
 
         for (n = slice_parents->buckets[bi]; n; n = n->next) {
@@ -2745,8 +2709,8 @@ static uint64_t dense_cell_max_fanout_among_parents(const dense_cell_map_t *slic
     for (ti = 0; ti < ninner; ti++) {
         ctx[ti].slice = slice_parents;
         ctx[ti].lk = fanout_lookup;
-        ctx[ti].bi_lo = (size_t)ti * DENSE_PARENT_BUCKETS / (size_t)ninner;
-        ctx[ti].bi_hi = ((size_t)ti + 1) * DENSE_PARENT_BUCKETS / (size_t)ninner;
+        ctx[ti].bi_lo = (size_t)ti * slice_parents->nbuckets / (size_t)ninner;
+        ctx[ti].bi_hi = ((size_t)ti + 1) * slice_parents->nbuckets / (size_t)ninner;
         ctx[ti].mx = 0;
     }
 
@@ -2775,7 +2739,7 @@ static void dense_cell_free(dense_cell_map_t *m) {
     size_t bi;
 
     if (!m) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+    for (bi = 0; bi < m->nbuckets; bi++) {
         dense_node_t *n = m->buckets[bi];
 
         m->buckets[bi] = NULL;
@@ -2785,6 +2749,12 @@ static void dense_cell_free(dense_cell_map_t *m) {
             n = nx;
         }
     }
+    free(m->buckets);
+    m->buckets = NULL;
+    m->nbuckets = 0;
+    m->count = 0;
+    m->last = NULL;
+    m->last_id = 0;
 }
 
 static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
@@ -3307,6 +3277,25 @@ static uint64_t path_hash(const char *s) {
         h *= PATH_HASH_FNV_PRIME;
     }
     return h;
+}
+
+/* Open-hash capacity for `record_count` inserts at trie depth `depth` (0 = first path
+ * component after base_prefix). Reduces rehash + page-fault churn during bucket-detail
+ * aggregation; capped so flat megadirs do not allocate huge tables for few unique keys. */
+static size_t path_row_map_est_initial_cap(size_t record_count, int depth) {
+    size_t est;
+
+    if (record_count == 0) return 4096;
+    est = 65536;
+    if (depth >= 1) {
+        size_t shifted = record_count >> (unsigned)depth;
+        if (shifted > est) est = shifted;
+    }
+    if (est < 4096) est = 4096;
+    if (est > record_count) est = record_count;
+    if (est > (1u << 20)) est = (1u << 20); /* 1M slots (~ load 0.7 → ~700k distinct keys) */
+    /* Match get_or_insert_h load factor 7/10 so the first growth rehash is avoided. */
+    return (est * 10 + 6) / 7;
 }
 
 static int path_row_map_init(path_row_map_t *m, size_t initial_cap) {
@@ -4196,7 +4185,8 @@ static void *agg_bkt_worker_thread(void *vp) {
     if (w->lo >= w->hi) return NULL;
 
     for (d = 0; d < w->nlevels; d++) {
-        if (path_row_map_init(&w->maps[d], 1024u + (size_t)d * 512u) != 0) {
+        size_t chunk_records = (w->hi > w->lo) ? (w->hi - w->lo) : 0;
+        if (path_row_map_init(&w->maps[d], path_row_map_est_initial_cap(chunk_records, d)) != 0) {
             w->err = 1;
             while (d > 0) path_row_map_destroy(&w->maps[--d]);
             return NULL;
@@ -5550,7 +5540,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
         size_t dense_cnt = 0;
         size_t show_n;
 
-        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++)
+        for (bi = 0; bi < slice_dense_parents->nbuckets; bi++)
             for (n = slice_dense_parents->buckets[bi]; n; n = n->next) dense_cnt++;
 
         if (dense_cnt > 0) {
@@ -5562,7 +5552,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                 rows = (dense_drill_row_t *)malloc(kcap * sizeof(*rows));
                 if (rows) {
                     size_t hsz = 0;
-                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                    for (bi = 0; bi < slice_dense_parents->nbuckets; bi++) {
                         for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
                             dense_drill_row_t row;
 
@@ -5578,7 +5568,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                 rows = (dense_drill_row_t *)calloc(dense_cnt, sizeof(*rows));
                 if (rows) {
                     size_t k = 0;
-                    for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                    for (bi = 0; bi < slice_dense_parents->nbuckets; bi++) {
                         for (n = slice_dense_parents->buckets[bi]; n; n = n->next) {
                             rows[k].parent = n->parent;
                             rows[k].slice_files = n->n;
@@ -5700,7 +5690,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
         }
 
         if (deep_ok) {
-            for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++)
+            for (bi = 0; bi < dm_bytes.nbuckets; bi++)
                 for (n = dm_bytes.buckets[bi]; n; n = n->next) deep_cnt++;
 
             if (deep_cnt > 0) {
@@ -5712,7 +5702,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                     rows = (deep_drill_row_t *)malloc(kcap * sizeof(*rows));
                     if (rows) {
                         size_t hsz = 0;
-                        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                        for (bi = 0; bi < dm_bytes.nbuckets; bi++) {
                             for (n = dm_bytes.buckets[bi]; n; n = n->next) {
                                 deep_drill_row_t row;
 
@@ -5728,7 +5718,7 @@ static void emit_bucket_shape_drill_section(FILE *out,
                     rows = (deep_drill_row_t *)calloc(deep_cnt, sizeof(*rows));
                     if (rows) {
                         size_t k = 0;
-                        for (bi = 0; bi < DENSE_PARENT_BUCKETS; bi++) {
+                        for (bi = 0; bi < dm_bytes.nbuckets; bi++) {
                             for (n = dm_bytes.buckets[bi]; n; n = n->next) {
                                 rows[k].parent = n->parent;
                                 rows[k].bytes = n->n;
@@ -5961,7 +5951,7 @@ static int emit_bucket_detail_page(const char *filename,
     }
 
     for (d = 0; d < detail_levels; d++) {
-        if (path_row_map_init(&maps[d], 1024 + (size_t)d * 512) != 0) {
+        if (path_row_map_init(&maps[d], path_row_map_est_initial_cap(details->count, d)) != 0) {
             init_fail_at = d;
             break;
         }
@@ -7617,90 +7607,16 @@ typedef struct {
 } shape_margin_ctx_t;
 
 /*
- * Merge n source maps into rm over a disjoint range of hash buckets. A parent always hashes to the
- * same bucket index in every map, so threads owning distinct bucket ranges write distinct rm buckets
- * with no locking. This replaces the old "parallel-copy then serial-fold" path whose final fold ran
- * single-threaded and dominated the heaviest row/column strip (the "one thread" path-shape stall).
+ * Merge n source maps into rm. With per-map dynamic bucket counts a parent no longer hashes to the
+ * same bucket index across maps, so the old bucket-strip-parallel merge is invalid; re-insert by hash
+ * instead. This runs once per row/column strip post-join and the enclosing shape_margin worker pool
+ * already parallelizes across the AGE_BUCKETS+SIZE_BUCKETS strips, so each strip merging serially is fine.
  */
-typedef struct {
-    dense_cell_map_t *dst;
-    const dense_cell_map_t *const *srcv;
-    int n;
-    size_t b_lo;
-    size_t b_hi;
-} shape_strip_merge_ctx_t;
-
-static void *shape_strip_merge_worker(void *vp) {
-    shape_strip_merge_ctx_t *c = (shape_strip_merge_ctx_t *)vp;
-    size_t bi;
-    int k;
-
-    for (bi = c->b_lo; bi < c->b_hi; bi++) {
-        for (k = 0; k < c->n; k++) {
-            const dense_node_t *nd;
-
-            for (nd = c->srcv[k]->buckets[bi]; nd; nd = nd->next) {
-                if (dense_cell_add_h(c->dst, nd->parent, nd->hash, nd->n, NULL) != 0) return NULL;
-            }
-        }
-    }
-    return NULL;
-}
-
 static void shape_margin_merge_strip(dense_cell_map_t *rm, const dense_cell_map_t *const *srcv, int n) {
-    int nt;
-    size_t total = 0;
     int k;
-    pthread_t *tp = NULL;
-    shape_strip_merge_ctx_t *ctxs = NULL;
-    size_t per;
-    int spawned;
-    int t;
 
     if (!rm || !srcv || n < 1) return;
-
-    nt = parse_ereport_thread_count();
-    if (nt < 1) nt = 1;
-    for (k = 0; k < n; k++) total += dense_cell_total_nodes(srcv[k]);
-
-    /* Serial merge when the work is small or threads are unavailable. */
-    if (nt < 2 || total < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
-        for (k = 0; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
-        return;
-    }
-    if ((size_t)nt > DENSE_PARENT_BUCKETS) nt = (int)DENSE_PARENT_BUCKETS;
-
-    tp = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
-    ctxs = (shape_strip_merge_ctx_t *)calloc((size_t)nt, sizeof(*ctxs));
-    if (!tp || !ctxs) {
-        free(tp);
-        free(ctxs);
-        for (k = 0; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
-        return;
-    }
-
-    per = ((size_t)DENSE_PARENT_BUCKETS + (size_t)nt - 1) / (size_t)nt;
-    spawned = 0;
-    for (t = 0; t < nt; t++) {
-        size_t blo = (size_t)t * per;
-        size_t bhi = blo + per;
-
-        if (blo >= DENSE_PARENT_BUCKETS) break;
-        if (bhi > DENSE_PARENT_BUCKETS) bhi = DENSE_PARENT_BUCKETS;
-        ctxs[spawned].dst = rm;
-        ctxs[spawned].srcv = srcv;
-        ctxs[spawned].n = n;
-        ctxs[spawned].b_lo = blo;
-        ctxs[spawned].b_hi = bhi;
-        if (pthread_create(&tp[spawned], NULL, shape_strip_merge_worker, &ctxs[spawned]) != 0)
-            shape_strip_merge_worker(&ctxs[spawned]); /* run this range inline */
-        else
-            spawned++;
-    }
-    for (t = 0; t < spawned; t++) pthread_join(tp[t], NULL);
-
-    free(tp);
-    free(ctxs);
+    for (k = 0; k < n; k++) dense_cell_merge_add(rm, srcv[k], NULL);
 }
 
 static void shape_margin_merge_bucket_strip_parallel(dense_cell_map_t *rm,
@@ -8161,6 +8077,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
         }
 
+        /* --path-rewrite: relabel the stored prefix before any path use, so the report, heat map, and the
+         * --subtree filter all operate in the rewritten namespace. */
+        if (g_rewrite_from && pathbuf) {
+            (void)rewrite_path_prefix(pathbuf, PATH_MAX);
+        }
+
         /* --subtree: keep only records at or under the requested directory (full absolute path retained).
          * Filter before any accounting so totals/heat-map/distinct-uids reflect just the subtree. */
         if (g_subtree_prefix && !(pathbuf && starts_with_dir_prefix(pathbuf, g_subtree_prefix))) {
@@ -8176,6 +8098,23 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
         sum->matched_records++;
         if (progress) progress->matched_records++;
+
+        /* When retaining paths, dup the (already rewritten) path into the worker arena exactly once and
+         * share that pointer between the matched_records and per-cell details lists, instead of arena-duping
+         * it in each. This halves the retained path bytes (the dominant cost on huge --bucket-details runs).
+         * Only valid when both lists are arena-backed + paths_external (set in main); otherwise fall back to
+         * the per-list dup so ownership/free stays correct. */
+        char *stored_path = NULL;
+        int share_paths = (!skip_paths) && matched_records->arena != NULL;
+        if (share_paths) {
+            stored_path = path_arena_dup(matched_records->arena, pathbuf ? pathbuf : "");
+            if (!stored_path) {
+                fprintf(stderr, "warn: path arena alloc failed in %s\n", chunk->path);
+                sum->bad_input_files++;
+                if (progress) progress->bad_input_files++;
+                break;
+            }
+        }
 
         time_t rec_time = pick_time(&r, basis); /* computed once; reused for age bucket + fanout stats */
 
@@ -8238,7 +8177,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
 
             if (!skip_paths) {
-                if (bucket_details_append(&details[ab][sb], pathbuf, accounted_size, ctime_led) != 0) {
+                int drc = share_paths
+                    ? bucket_details_append_ptr(&details[ab][sb], stored_path, accounted_size, ctime_led)
+                    : bucket_details_append(&details[ab][sb], pathbuf, accounted_size, ctime_led);
+                if (drc != 0) {
                     fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
                     sum->bad_input_files++;
                     if (progress) progress->bad_input_files++;
@@ -8264,7 +8206,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (!skip_paths) {
-            if (matched_records_append(matched_records, pathbuf, r.type, accounted_size) != 0) {
+            int mrc = share_paths
+                ? matched_records_append_ptr(matched_records, stored_path, r.type, accounted_size)
+                : matched_records_append(matched_records, pathbuf, r.type, accounted_size);
+            if (mrc != 0) {
                 fprintf(stderr, "warn: matched record append failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
@@ -8870,6 +8815,22 @@ static void *chunk_prep_worker_main(void *arg) {
     return NULL;
 }
 
+/* Emit one ';'-separated source segment as an <li>, applying --path-rewrite so the provenance line
+ * matches the rewritten paths shown elsewhere in the report. seg is not NUL-terminated; seg_len bytes. */
+static void emit_storage_source_segment(FILE *out, const char *seg, size_t seg_len) {
+    fprintf(out, "<li>");
+    if (g_rewrite_from && seg_len < PATH_MAX) {
+        char buf[PATH_MAX];
+        memcpy(buf, seg, seg_len);
+        buf[seg_len] = '\0';
+        (void)rewrite_path_prefix(buf, sizeof(buf));
+        html_escape(out, buf);
+    } else {
+        html_escape_segment(out, seg, seg_len);
+    }
+    fprintf(out, "</li>\n");
+}
+
 static void emit_storage_sources_html(FILE *out, size_t crawl_source_count, const char *label) {
     fprintf(out, "<div class=\"report-sources-section\"><h3>Crawl sources</h3>\n");
     fprintf(out, "<p class=\"lead\">Data merged from <strong>%zu</strong> crawl location%s.</p>\n", crawl_source_count,
@@ -8882,15 +8843,11 @@ static void emit_storage_sources_html(FILE *out, size_t crawl_source_count, cons
         while (*p) {
             const char *semi = strchr(p, ';');
             if (!semi) {
-                fprintf(out, "<li>");
-                html_escape(out, p);
-                fprintf(out, "</li>\n");
+                emit_storage_source_segment(out, p, strlen(p));
                 break;
             }
             if (semi > p) {
-                fprintf(out, "<li>");
-                html_escape_segment(out, p, (size_t)(semi - p));
-                fprintf(out, "</li>\n");
+                emit_storage_source_segment(out, p, (size_t)(semi - p));
             }
             p = semi + 1;
         }
@@ -10028,6 +9985,8 @@ int main(int argc, char **argv) {
     int bucket_detail_levels = 0;
     char report_dir_opt[PATH_MAX];
     static char subtree_buf[PATH_MAX]; /* backs g_subtree_prefix; static so it outlives main()'s frame for worker threads */
+    static char rewrite_from_buf[PATH_MAX]; /* backs g_rewrite_from; static for the same reason */
+    static char rewrite_to_buf[PATH_MAX];   /* backs g_rewrite_to */
     uint64_t distinct_uid_count = 0;
     double t0, t1;
     ereport_run_stats_t run_stats;
@@ -10068,11 +10027,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--verbose [minutes]]] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10085,6 +10044,9 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Optional --subtree PATH (absolute): analyze only records at or under PATH, as if just that "
                 "directory had been crawled (full absolute paths kept; totals/heat-map/badges scoped to the subtree).\n");
+        fprintf(stderr,
+                "Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW in the "
+                "report/heat-map at read time (bins unchanged), e.g. /data1/group=/orcd/data. Applied before --subtree.\n");
         fprintf(stderr,
                 "Optional --verbose [minutes]: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics). Optional integer 1…10080 is accepted for compatibility; stderr "
@@ -10203,6 +10165,52 @@ int main(int argc, char **argv) {
                     g_subtree_prefix = subtree_buf;
                     g_subtree_prefix_len = sl;
                 }
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--path-rewrite") == 0) {
+                const char *eq;
+                size_t fl, tl;
+
+                if (g_rewrite_from != NULL) {
+                    fprintf(stderr, "ereport: duplicate --path-rewrite\n");
+                    return 2;
+                }
+                if (ac < 3) {
+                    fprintf(stderr, "ereport: --path-rewrite requires OLD=NEW (two absolute directory paths)\n");
+                    return 2;
+                }
+                eq = strchr(av[2], '=');
+                if (!eq || eq == av[2] || eq[1] == '\0') {
+                    fprintf(stderr, "ereport: --path-rewrite must be OLD=NEW (got '%s')\n", av[2]);
+                    return 2;
+                }
+                fl = (size_t)(eq - av[2]);
+                if (av[2][0] != '/' || eq[1] != '/') {
+                    fprintf(stderr, "ereport: --path-rewrite OLD and NEW must both be absolute\n");
+                    return 2;
+                }
+                if (fl >= sizeof(rewrite_from_buf) ||
+                    snprintf(rewrite_to_buf, sizeof(rewrite_to_buf), "%s", eq + 1) >= (int)sizeof(rewrite_to_buf)) {
+                    fprintf(stderr, "ereport: --path-rewrite path too long\n");
+                    return 2;
+                }
+                memcpy(rewrite_from_buf, av[2], fl);
+                rewrite_from_buf[fl] = '\0';
+                /* Normalize: strip trailing '/'. Both sides must name a directory below root (not a bare "/"). */
+                while (fl > 1 && rewrite_from_buf[fl - 1] == '/') rewrite_from_buf[--fl] = '\0';
+                tl = strlen(rewrite_to_buf);
+                while (tl > 1 && rewrite_to_buf[tl - 1] == '/') rewrite_to_buf[--tl] = '\0';
+                if (fl < 2 || tl < 2) {
+                    fprintf(stderr, "ereport: --path-rewrite OLD and NEW must name a directory below root (not '/')\n");
+                    return 2;
+                }
+                g_rewrite_from = rewrite_from_buf;
+                g_rewrite_from_len = fl;
+                g_rewrite_to = rewrite_to_buf;
+                g_rewrite_to_len = tl;
                 memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
                 ac -= 2;
                 argc = ac;
