@@ -304,6 +304,21 @@ static void path_arena_destroy(path_arena_t *a) {
     a->head = NULL;
 }
 
+/* Sum of bytes the arena actually holds (block headers + capacity). Diagnostic only. */
+static void path_arena_bytes(const path_arena_t *a, size_t *alloc_bytes, size_t *used_bytes) {
+    const path_arena_block_t *b;
+    size_t al = 0, us = 0;
+
+    if (a) {
+        for (b = a->head; b; b = b->next) {
+            al += sizeof(*b) + b->cap;
+            us += b->used;
+        }
+    }
+    if (alloc_bytes) *alloc_bytes = al;
+    if (used_bytes) *used_bytes = us;
+}
+
 /*
  * A retained path is stored split as parent + leaf rather than one contiguous string:
  *   - parent: the directory prefix INCLUDING its trailing '/', interned once per directory
@@ -3187,6 +3202,99 @@ static void worker_path_arenas_destroy(worker_arg_t *args, int nthreads) {
 
     if (!args || nthreads < 1) return;
     for (ti = 0; ti < nthreads; ti++) path_arena_destroy(&args[ti].path_arena);
+}
+
+/* Opt-in (EREPORT_MEMSTATS=1) breakdown of the resident per-worker structures right after the
+ * read phase — the data is fully built but the finalize merges haven't allocated yet, so this is
+ * the closest printable point to peak RSS. Sums across workers; walks the fanout maps to total
+ * their inline/strdup parent bytes. Diagnostic only; prints to stderr and flushes. */
+static size_t ereport_catalog_bytes(const file_state_t *fs, size_t n);
+
+static void ereport_print_memstats(const worker_arg_t *args, int nthreads, const inode_set_t *inodes,
+                                   const file_state_t *file_states, size_t path_count) {
+    size_t matched_cnt = 0, details_cnt = 0;
+    size_t dense_nodes = 0, fanout_nodes = 0, fstat_nodes = 0;
+    size_t arena_alloc = 0, arena_used = 0;
+    size_t fanout_parent_bytes = 0, fstat_parent_bytes = 0;
+    size_t inode_cnt = 0, inode_bytes = 0;
+    size_t catalog_bytes = 0;
+    int ti, ab, sb;
+    double gib = 1024.0 * 1024.0 * 1024.0;
+
+    if (!args || nthreads < 1) return;
+    for (ti = 0; ti < nthreads; ti++) {
+        size_t aa = 0, au = 0;
+        size_t bi;
+
+        matched_cnt += args[ti].matched_records.count;
+        for (ab = 0; ab < AGE_BUCKETS; ab++) {
+            for (sb = 0; sb < SIZE_BUCKETS; sb++) {
+                details_cnt += args[ti].details[ab][sb].count;
+                dense_nodes += args[ti].dense_maps[ab][sb].count;
+            }
+        }
+        path_arena_bytes(&args[ti].path_arena, &aa, &au);
+        arena_alloc += aa;
+        arena_used += au;
+
+        fanout_nodes += args[ti].parent_fanout.count;
+        if (!args[ti].parent_fanout.parents_external) {
+            for (bi = 0; bi < args[ti].parent_fanout.nbuckets; bi++) {
+                const dense_node_t *n;
+                for (n = args[ti].parent_fanout.buckets[bi]; n; n = n->next)
+                    fanout_parent_bytes += (n->parent ? strlen(n->parent) : 0) + 1;
+            }
+        }
+        fstat_nodes += args[ti].parent_fanout_stats.count;
+        if (!args[ti].parent_fanout_stats.parents_external) {
+            for (bi = 0; bi < args[ti].parent_fanout_stats.nbuckets; bi++) {
+                const fanout_parent_stat_node_t *n;
+                for (n = args[ti].parent_fanout_stats.buckets[bi]; n; n = n->next)
+                    fstat_parent_bytes += (n->parent ? strlen(n->parent) : 0) + 1;
+            }
+        }
+    }
+    if (inodes) {
+        int s;
+        for (s = 0; s < INODE_SET_SHARDS; s++) {
+            inode_cnt += inodes->shard[s].count;
+            inode_bytes += inodes->shard[s].cap * (sizeof(inode_key_t) + 1);
+        }
+    }
+    catalog_bytes = ereport_catalog_bytes(file_states, path_count);
+
+    {
+        size_t matched_b = matched_cnt * sizeof(matched_record_t);
+        size_t details_b = details_cnt * sizeof(detail_record_t);
+        size_t dense_b = dense_nodes * sizeof(dense_node_t);
+        size_t fanout_b = fanout_nodes * sizeof(dense_node_t) + fanout_parent_bytes;
+        size_t fstat_b = fstat_nodes * sizeof(fanout_parent_stat_node_t) + fstat_parent_bytes;
+        size_t total = matched_b + details_b + arena_alloc + dense_b + fanout_b + fstat_b
+                       + inode_bytes + catalog_bytes;
+
+        fprintf(stderr,
+            "\n=== ereport memstats (post-read, per-worker sums) ===\n"
+            "  matched_records : %10.2f GiB  (%zu items x %zuB)\n"
+            "  bucket details  : %10.2f GiB  (%zu items x %zuB)\n"
+            "  path arena      : %10.2f GiB  (used %.2f GiB; parents+leaves)\n"
+            "  dense maps      : %10.2f GiB  (%zu nodes x %zuB, parents interned in arena)\n"
+            "  parent_fanout   : %10.2f GiB  (%zu nodes; own parents %.2f GiB, 0 if interned)\n"
+            "  fanout_stats    : %10.2f GiB  (%zu nodes; own parents %.2f GiB, 0 if interned)\n"
+            "  inode set       : %10.2f GiB  (%zu inodes)\n"
+            "  shard catalogs  : %10.2f GiB  (freed right after this point)\n"
+            "  ------------------------------------------------\n"
+            "  tracked total   : %10.2f GiB\n\n",
+            matched_b / gib, matched_cnt, sizeof(matched_record_t),
+            details_b / gib, details_cnt, sizeof(detail_record_t),
+            arena_alloc / gib, arena_used / gib,
+            dense_b / gib, dense_nodes, sizeof(dense_node_t),
+            fanout_b / gib, fanout_nodes, fanout_parent_bytes / gib,
+            fstat_b / gib, fstat_nodes, fstat_parent_bytes / gib,
+            inode_bytes / gib, inode_cnt,
+            catalog_bytes / gib,
+            total / gib);
+        fflush(stderr);
+    }
 }
 
 /* Count one immediate child under its parent (used for crawl-wide megadir / Dense badge).
@@ -7939,6 +8047,50 @@ static void ereport_free_file_states(file_state_t *fs, size_t n) {
     free(fs);
 }
 
+/* Free only the shard catalogs (keep the file_state_t array). The catalogs back path
+ * reconstruction during the read phase; nothing in finalize/emission touches them, so freeing
+ * them right after the workers join returns their footprint (per-dir arrays + name strdups,
+ * tens of GiB on a large crawl) before the finalize merges and the matched/details gather
+ * allocate. Idempotent: catalogs are NULLed, so the later ereport_free_file_states is a no-op
+ * for them and still frees the array exactly once. */
+static void ereport_free_shard_catalogs(file_state_t *fs, size_t n) {
+    size_t i;
+
+    if (!fs) return;
+    for (i = 0; i < n; i++) {
+        if (fs[i].catalog) {
+            crawl_bin_catalog_free(fs[i].catalog);
+            free(fs[i].catalog);
+            fs[i].catalog = NULL;
+        }
+    }
+}
+
+/* Approximate resident bytes held by all loaded shard catalogs (diagnostic only). Sums the
+ * per-dir parallel arrays (sized cap+1) plus the owned per-component name strings. */
+static size_t ereport_catalog_bytes(const file_state_t *fs, size_t n) {
+    size_t i;
+    size_t total = 0;
+    /* per-slot fixed cost: parent_dir_id(8) depth(4) name_len(2) name_comp ptr(8)
+     * + 5 imm_child_* uint64 arrays (40) = 62 bytes. */
+    const size_t per_slot = 8 + 4 + 2 + 8 + 5 * 8;
+
+    if (!fs) return 0;
+    for (i = 0; i < n; i++) {
+        const crawl_bin_catalog_t *c = fs[i].catalog;
+        uint64_t slots, d;
+        if (!c) continue;
+        slots = c->cap + 1;
+        total += (size_t)slots * per_slot;
+        /* owned name strings (strdup'd per directory component) */
+        if (c->name_len) {
+            for (d = 1; d <= c->max_dir_id; d++)
+                if (c->name_len[d]) total += (size_t)c->name_len[d] + 1;
+        }
+    }
+    return total;
+}
+
 static int ereport_attach_shard_catalog(file_state_t *fs, const char *path) {
     FILE *fp;
     bin_file_header_t fh;
@@ -10986,6 +11138,17 @@ int main(int argc, char **argv) {
         if (g_ereport_verbose) vt_parse0 = now_sec();
         for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
         if (g_ereport_verbose && vt_parse0 > 0.0) run_stats.vt_parse_workers_sec += now_sec() - vt_parse0;
+
+        if (getenv("EREPORT_MEMSTATS")) {
+            clear_status_line();
+            ereport_print_memstats(args, threads_used, &seen_inodes, file_states, path_count);
+        }
+
+        /* The shard catalogs back path reconstruction during the read phase only; nothing in
+         * finalize/emission touches them. Free them now (workers have joined) so their footprint
+         * is reclaimed before the finalize merges and the matched/details gather allocate, cutting
+         * the finalize-phase peak RSS. The array itself is freed later by ereport_free_file_states. */
+        ereport_free_shard_catalogs(file_states, path_count);
 
         /* Progress thread: keep parsing status (rec/s line) until workers exit; then finalize banner. */
         atomic_store(&run_stats.parse_workers_done, 1);
