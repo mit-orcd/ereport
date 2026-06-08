@@ -102,14 +102,9 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
  * walk (measured). Sparse per-cell maps stay small instead of each pre-allocating 32 KiB.
  */
 #define DENSE_PARENT_BUCKETS_INIT 64U   /* initial bucket count for a freshly-populated map (power of two) */
-/* Wider hash only for merged crawl-wide fanout — shortens chains for path-shape lookups (stack ~512 KiB). */
-#define DENSE_PARENT_BUCKETS_FANOUT_LOOKUP 65536U
 #define SUMMARY_REDUCE_MIN_CHUNK 4
 /* Parent-directory map merge: use threads inside each merge when the tournament has few pairs (late rounds). */
 #define DENSE_CELL_MERGE_PARALLEL_MIN_NODES 4096u
-/* Repartition merged narrow fanout (512 buckets) into wide lookup (65k): parallel when not tiny. */
-#define DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES 2048u
-#define DENSE_CELL_STEAL_FANOUT_MAX_NT 128
 /*
  * dense_cell_max_fanout_among_parents: inner bucket-range workers. Capped so path_shape’s first phase
  * (up to 36 cell workers) does not multiply into hundreds of simultaneous pthreads.
@@ -272,6 +267,31 @@ static char *path_arena_dup(path_arena_t *a, const char *s) {
     return out;
 }
 
+/* Like path_arena_dup but for a (possibly non-NUL-terminated) length-delimited slice. Used to
+ * intern parent-directory prefixes (the path up to and including the trailing '/') so that all
+ * records under one directory share a single copy of the parent bytes. */
+static char *path_arena_dup_n(path_arena_t *a, const char *s, size_t len) {
+    size_t need = len + 1;
+    path_arena_block_t *b = a->head;
+    char *out;
+
+    if (!b || (b->cap - b->used) < need) {
+        size_t cap = (need > PATH_ARENA_BLOCK_BYTES) ? need : PATH_ARENA_BLOCK_BYTES;
+        path_arena_block_t *nb = (path_arena_block_t *)malloc(sizeof(path_arena_block_t) + cap);
+        if (!nb) return NULL;
+        nb->next = a->head;
+        nb->used = 0;
+        nb->cap = cap;
+        a->head = nb;
+        b = nb;
+    }
+    out = b->data + b->used;
+    if (len && s) memcpy(out, s, len);
+    out[len] = '\0';
+    b->used += need;
+    return out;
+}
+
 static void path_arena_destroy(path_arena_t *a) {
     path_arena_block_t *b;
     if (!a) return;
@@ -284,8 +304,19 @@ static void path_arena_destroy(path_arena_t *a) {
     a->head = NULL;
 }
 
+/*
+ * A retained path is stored split as parent + leaf rather than one contiguous string:
+ *   - parent: the directory prefix INCLUDING its trailing '/', interned once per directory
+ *             and shared by every record under it (and shared between the matched_records and
+ *             per-cell details lists). This removes the dominant per-record cost on huge
+ *             --bucket-details runs (the parent bytes were previously copied for every file).
+ *   - leaf:   the final path component (basename), arena-duped once per record.
+ * parent + leaf concatenated reproduces the original absolute path byte-for-byte, so every
+ * consumer that needs the full path simply reconstructs it into a scratch buffer.
+ */
 typedef struct {
-    char *path;
+    const char *parent;
+    const char *leaf;
     uint64_t size;
     uint8_t ctime_led;
 } detail_record_t;
@@ -301,7 +332,8 @@ typedef struct {
 } bucket_details_t;
 
 typedef struct {
-    char *path;
+    const char *parent; /* directory prefix incl trailing '/', interned/shared (see detail_record_t) */
+    const char *leaf;   /* final path component (basename) */
     uint8_t type;
     uint64_t size;
 } matched_record_t;
@@ -313,6 +345,161 @@ typedef struct {
     path_arena_t *arena;     /* non-NULL: append copies into this arena */
     int paths_external;      /* non-zero: free() must not touch item paths */
 } matched_records_t;
+
+/*
+ * Reconstruct the full path of a split (parent, leaf) record into caller scratch. parent already
+ * carries its trailing '/', so the join is a plain concatenation that byte-exactly reproduces the
+ * original absolute path. Returns buf (always NUL-terminated). Cheap: two memcpy of ~path length.
+ */
+static inline const char *path_join_pl(const char *parent, const char *leaf, char *buf, size_t bufsz) {
+    size_t pl = parent ? strlen(parent) : 0;
+    size_t ll = leaf ? strlen(leaf) : 0;
+    if (bufsz == 0) return "";
+    if (pl + ll + 1 > bufsz) {
+        /* Defensive truncation; reconstructed paths fit PATH_MAX by construction. */
+        if (pl >= bufsz) pl = bufsz - 1;
+        if (pl) memcpy(buf, parent, pl);
+        ll = (pl + ll + 1 > bufsz) ? (bufsz - 1 - pl) : ll;
+        if (ll) memcpy(buf + pl, leaf, ll);
+        buf[pl + ll] = '\0';
+        return buf;
+    }
+    if (pl) memcpy(buf, parent, pl);
+    if (ll) memcpy(buf + pl, leaf, ll);
+    buf[pl + ll] = '\0';
+    return buf;
+}
+
+/*
+ * Split an absolute path into (parent-incl-slash, leaf). parent_len counts up to and including the
+ * last '/'; leaf points at the basename within the same buffer. For "/c" -> parent "/" + leaf "c";
+ * for "/a/b/c" -> parent "/a/b/" + leaf "c". Absolute crawl paths always contain a '/'.
+ */
+static inline void path_split_pl(const char *path, size_t *parent_len, const char **leaf) {
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    if (slash) {
+        *parent_len = (size_t)(slash - path) + 1; /* include the slash */
+        *leaf = slash + 1;
+    } else {
+        /* No slash (degenerate / relative): empty parent, whole string is the leaf. */
+        *parent_len = 0;
+        *leaf = path ? path : "";
+    }
+}
+
+/*
+ * Per-chunk parent-directory interner. Maps a parent prefix (the bytes up to and including the last
+ * '/') to a single arena-owned copy, so every record under a directory shares one parent string
+ * (and that string is shared between the matched_records and details lists). This is the core of the
+ * large-dataset memory reduction: parent bytes used to be re-stored for every file.
+ *
+ * A last-hit cache keyed by parent_dir_id short-circuits contiguous same-directory runs (the common
+ * case; mirrors the existing shape/fanout/dir caches, which likewise trust parent_dir_id as a stable
+ * per-chunk directory key). Non-contiguous repeats fall back to an open-addressing hash probe.
+ */
+typedef struct {
+    const char *parent; /* arena-owned, NUL-terminated, includes trailing '/' */
+    uint32_t hash;
+    uint32_t len;
+} pintern_slot_t;
+
+typedef struct {
+    pintern_slot_t *slots;
+    size_t nslots; /* power of two, 0 until first insert */
+    size_t count;
+    path_arena_t *arena;
+    uint64_t last_id;
+    const char *last_parent;
+    int last_ok;
+} parent_intern_t;
+
+static inline uint32_t pintern_hash(const char *s, size_t n) {
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+
+static void pintern_init(parent_intern_t *t, path_arena_t *arena) {
+    t->slots = NULL;
+    t->nslots = 0;
+    t->count = 0;
+    t->arena = arena;
+    t->last_id = 0;
+    t->last_parent = NULL;
+    t->last_ok = 0;
+}
+
+static void pintern_free(parent_intern_t *t) {
+    free(t->slots);
+    t->slots = NULL;
+    t->nslots = 0;
+    t->count = 0;
+}
+
+static int pintern_grow(parent_intern_t *t, size_t want) {
+    size_t newn = t->nslots ? t->nslots : 64;
+    pintern_slot_t *ns;
+    size_t i;
+
+    while (newn < want) newn <<= 1;
+    ns = (pintern_slot_t *)calloc(newn, sizeof(*ns));
+    if (!ns) return -1;
+    for (i = 0; i < t->nslots; i++) {
+        size_t idx;
+        if (!t->slots[i].parent) continue;
+        idx = t->slots[i].hash & (newn - 1);
+        while (ns[idx].parent) idx = (idx + 1) & (newn - 1);
+        ns[idx] = t->slots[i];
+    }
+    free(t->slots);
+    t->slots = ns;
+    t->nslots = newn;
+    return 0;
+}
+
+static const char *pintern_get(parent_intern_t *t, uint64_t parent_id, const char *src, size_t plen) {
+    size_t mask;
+    size_t idx;
+    char *dup;
+    uint32_t h;
+
+    /* Contiguous same-directory runs (the common crawl-bin layout) short-circuit here without
+     * hashing the prefix at all — the prefix FNV was a top read-phase cost at 950M+ records. */
+    if (t->last_ok && t->last_id == parent_id) return t->last_parent;
+
+    h = pintern_hash(src, plen);
+
+    if (t->nslots == 0) {
+        if (pintern_grow(t, 64) != 0) return NULL;
+    } else if ((t->count + 1) * 4 >= t->nslots * 3) {
+        if (pintern_grow(t, t->nslots * 2) != 0) return NULL;
+    }
+
+    mask = t->nslots - 1;
+    idx = h & mask;
+    while (t->slots[idx].parent) {
+        if (t->slots[idx].hash == h && t->slots[idx].len == plen &&
+            memcmp(t->slots[idx].parent, src, plen) == 0) {
+            t->last_ok = 1;
+            t->last_id = parent_id;
+            t->last_parent = t->slots[idx].parent;
+            return t->slots[idx].parent;
+        }
+        idx = (idx + 1) & mask;
+    }
+
+    dup = path_arena_dup_n(t->arena, src, plen);
+    if (!dup) return NULL;
+    t->slots[idx].parent = dup;
+    t->slots[idx].hash = h;
+    t->slots[idx].len = (uint32_t)plen;
+    t->count++;
+    t->last_ok = 1;
+    t->last_id = parent_id;
+    t->last_parent = dup;
+    return dup;
+}
 
 typedef crawl_bin_file_chunk_t file_chunk_t;
 
@@ -502,7 +689,13 @@ static const char *ereport_finalize_index_step_cstr(unsigned step) {
 
 typedef struct dense_node {
     struct dense_node *next;
-    char *parent;  /* points into the trailing bytes of this same malloc block (see dense_node_new); never freed separately */
+    /* For an "owning" node (map->parents_external == 0) this points into the trailing bytes
+     * of this same malloc block (see dense_node_new) and is freed with the node. For an
+     * "external" node (map->parents_external == 1) it instead references a parent string
+     * interned in a per-worker arena that outlives the map (see dense_pintern); the node is a
+     * bare struct (no trailing bytes) and free(node) must not free the parent. Either way
+     * free(node) is correct because the owned copy lives inside the node's own allocation. */
+    char *parent;
     uint64_t n;
     uint32_t hash; /* full 32-bit FNV of parent; bucket = hash & (nbuckets-1) */
 } dense_node_t;
@@ -524,10 +717,22 @@ typedef struct {
      * merge/steal never create nodes, so this stays exact for any populated map; the
      * parallel-vs-serial decisions read it (O(1)) instead of walking every chain. */
     size_t count;
+    /* When 1, newly created nodes reference an externally-owned (interned) parent string
+     * instead of copying it into trailing bytes. Set on the per-worker per-cell dense maps,
+     * whose parents are interned once per worker (dense_pintern) and shared across all 36
+     * age/size cells + fanout, eliminating the dominant per-cell parent-string duplication.
+     * Maps that are fed ephemeral (stack) parent strings (e.g. the deep-parents drilldown
+     * temporaries) must leave this 0 so they keep owning their own copy. */
+    int parents_external;
 } dense_cell_map_t;
 
 typedef struct {
-    dense_node_t *buckets[DENSE_PARENT_BUCKETS_FANOUT_LOOKUP];
+    /* Crawl-wide parent -> immediate-child-count lookup. Dynamically sized to the parent count
+     * (power-of-two, mask indexing) so chains stay ~1 even with hundreds of millions of
+     * directories; a fixed bucket array degraded to thousands-deep strcmp chains per probe and
+     * dominated finalize CPU on large datasets. NULL/0 until built. */
+    dense_node_t **buckets;
+    size_t nbuckets;
 } dense_cell_fanout_lookup_t;
 
 /*
@@ -556,6 +761,13 @@ typedef struct {
     fanout_parent_stat_node_t *last; /* last-hit cache keyed by parent_dir_id */
     uint64_t last_id;
     size_t count;
+    /* When 1, node->parent references an externally-owned (per-worker interned) string instead of
+     * a strdup'd copy: the accumulator stores the interned pointer it is handed, and neither the
+     * merge nor the free touches it. The fanout-stat parent is the same per-worker interned
+     * no-slash prefix the dense maps share, so this drops a full duplicate copy of every parent
+     * path (~40 GiB on the production crawl). Requires the caller to always pass that interned
+     * pointer (true whenever the worker arena exists). */
+    int parents_external;
 } fanout_parent_stat_map_t;
 
 typedef struct {
@@ -1129,18 +1341,36 @@ static int bucket_details_append(bucket_details_t *b, const char *path, uint64_t
         b->cap = new_cap;
     }
 
-    b->items[b->count].path = b->arena ? path_arena_dup(b->arena, path ? path : "") : strdup(path ? path : "");
-    if (!b->items[b->count].path) return -1;
+    {
+        const char *src = path ? path : "";
+        size_t plen;
+        const char *leaf;
+        char *dp;
+        char *dl;
+        path_split_pl(src, &plen, &leaf);
+        if (b->arena) {
+            dp = path_arena_dup_n(b->arena, src, plen);
+            dl = path_arena_dup(b->arena, leaf);
+        } else {
+            dp = (char *)malloc(plen + 1);
+            if (dp) { if (plen) memcpy(dp, src, plen); dp[plen] = '\0'; }
+            dl = strdup(leaf);
+        }
+        if (!dp || !dl) { if (!b->arena) { free(dp); free(dl); } return -1; }
+        b->items[b->count].parent = dp;
+        b->items[b->count].leaf = dl;
+    }
     b->items[b->count].size = size;
     b->items[b->count].ctime_led = (uint8_t)(ctime_led ? 1 : 0);
     b->count++;
     return 0;
 }
 
-/* Append a detail record whose path string is already owned by a shared arena (e.g. the same string
- * the matched_records entry points at). No copy is made; caller must guarantee paths_external so the
- * shared pointer is never individually freed. Lets one arena-dup back both lists, halving path bytes. */
-static int bucket_details_append_ptr(bucket_details_t *b, char *path, uint64_t size, int ctime_led) {
+/* Append a detail record whose parent + leaf strings are already owned by a shared arena (the same
+ * pointers the matched_records entry points at). No copy is made; caller must guarantee paths_external
+ * so the shared pointers are never individually freed. Lets one arena-dup back both lists. */
+static int bucket_details_append_ptr(bucket_details_t *b, const char *parent, const char *leaf,
+                                     uint64_t size, int ctime_led) {
     detail_record_t *tmp;
 
     if (b->count == b->cap) {
@@ -1150,7 +1380,8 @@ static int bucket_details_append_ptr(bucket_details_t *b, char *path, uint64_t s
         b->items = tmp;
         b->cap = new_cap;
     }
-    b->items[b->count].path = path;
+    b->items[b->count].parent = parent;
+    b->items[b->count].leaf = leaf;
     b->items[b->count].size = size;
     b->items[b->count].ctime_led = (uint8_t)(ctime_led ? 1 : 0);
     b->count++;
@@ -1160,7 +1391,7 @@ static int bucket_details_append_ptr(bucket_details_t *b, char *path, uint64_t s
 static void bucket_details_free(bucket_details_t *b) {
     size_t i;
     if (!b->paths_external) {
-        for (i = 0; i < b->count; i++) free(b->items[i].path);
+        for (i = 0; i < b->count; i++) { free((void *)b->items[i].parent); free((void *)b->items[i].leaf); }
     }
     free(b->items);
     b->items = NULL;
@@ -1179,17 +1410,35 @@ static int matched_records_append(matched_records_t *m, const char *path, uint8_
         m->cap = new_cap;
     }
 
-    m->items[m->count].path = m->arena ? path_arena_dup(m->arena, path ? path : "") : strdup(path ? path : "");
-    if (!m->items[m->count].path) return -1;
+    {
+        const char *src = path ? path : "";
+        size_t plen;
+        const char *leaf;
+        char *dp;
+        char *dl;
+        path_split_pl(src, &plen, &leaf);
+        if (m->arena) {
+            dp = path_arena_dup_n(m->arena, src, plen);
+            dl = path_arena_dup(m->arena, leaf);
+        } else {
+            dp = (char *)malloc(plen + 1);
+            if (dp) { if (plen) memcpy(dp, src, plen); dp[plen] = '\0'; }
+            dl = strdup(leaf);
+        }
+        if (!dp || !dl) { if (!m->arena) { free(dp); free(dl); } return -1; }
+        m->items[m->count].parent = dp;
+        m->items[m->count].leaf = dl;
+    }
     m->items[m->count].type = type;
     m->items[m->count].size = size;
     m->count++;
     return 0;
 }
 
-/* Append a matched record whose path string is already owned by a shared arena. No copy is made;
- * caller must guarantee paths_external so the shared pointer is never individually freed. */
-static int matched_records_append_ptr(matched_records_t *m, char *path, uint8_t type, uint64_t size) {
+/* Append a matched record whose parent + leaf strings are already owned by a shared arena. No copy
+ * is made; caller must guarantee paths_external so the shared pointers are never individually freed. */
+static int matched_records_append_ptr(matched_records_t *m, const char *parent, const char *leaf,
+                                      uint8_t type, uint64_t size) {
     matched_record_t *tmp;
 
     if (m->count == m->cap) {
@@ -1199,7 +1448,8 @@ static int matched_records_append_ptr(matched_records_t *m, char *path, uint8_t 
         m->items = tmp;
         m->cap = new_cap;
     }
-    m->items[m->count].path = path;
+    m->items[m->count].parent = parent;
+    m->items[m->count].leaf = leaf;
     m->items[m->count].type = type;
     m->items[m->count].size = size;
     m->count++;
@@ -1209,7 +1459,7 @@ static int matched_records_append_ptr(matched_records_t *m, char *path, uint8_t 
 static void matched_records_free(matched_records_t *m) {
     size_t i;
     if (!m->paths_external) {
-        for (i = 0; i < m->count; i++) free(m->items[i].path);
+        for (i = 0; i < m->count; i++) { free((void *)m->items[i].parent); free((void *)m->items[i].leaf); }
     }
     free(m->items);
     m->items = NULL;
@@ -2195,6 +2445,26 @@ static dense_node_t *dense_node_new(const char *parent, uint32_t h, uint64_t n) 
     return node;
 }
 
+/* External variant: the parent string is interned elsewhere (per-worker arena) and outlives
+ * this node, so the node is a bare struct that merely references it. free(node) frees only the
+ * node. Used by maps with parents_external == 1 to avoid copying the parent into every cell. */
+static dense_node_t *dense_node_new_ref(const char *parent, uint32_t h, uint64_t n) {
+    dense_node_t *node = (dense_node_t *)malloc(sizeof(*node));
+
+    if (!node) return NULL;
+    node->parent = (char *)parent; /* not owned; interned in a longer-lived arena */
+    node->n = n;
+    node->hash = h;
+    node->next = NULL;
+    return node;
+}
+
+static inline dense_node_t *dense_node_make(const dense_cell_map_t *m, const char *parent,
+                                            uint32_t h, uint64_t n) {
+    return m->parents_external ? dense_node_new_ref(parent, h, n)
+                               : dense_node_new(parent, h, n);
+}
+
 /* Ensure m->buckets exists and has room (load factor < 1). On growth, doubles the table
  * and rehashes every node by its stored full hash. Nodes keep their addresses (only relinked),
  * so m->last stays valid across a grow. Single-threaded use only (per-worker accumulation and
@@ -2249,7 +2519,7 @@ static int dense_cell_add_h(dense_cell_map_t *m, const char *parent, uint32_t h,
         if (sum) sum->bad_input_files++;
         return -1;
     }
-    node = dense_node_new(parent, h, delta);
+    node = dense_node_make(m, parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
@@ -2292,7 +2562,7 @@ static int dense_cell_add_cached_h(dense_cell_map_t *m, const char *parent, uint
         if (sum) sum->bad_input_files++;
         return -1;
     }
-    node = dense_node_new(parent, h, delta);
+    node = dense_node_make(m, parent, h, delta);
     if (!node) {
         if (sum) sum->bad_input_files++;
         return -1;
@@ -2325,6 +2595,14 @@ typedef struct {
     pthread_barrier_t mid;
 } dmerge_sync_t;
 
+/* Merge src's bucket range into dst by STEALING (relinking) src nodes rather than allocating a
+ * fresh dst node and copying the parent for each. On a duplicate parent the counts are folded and
+ * the now-redundant src node is freed; otherwise the src node is relinked straight into dst,
+ * carrying its parent (owned trailing bytes for an internal node, or the shared interned pointer
+ * for an external node) unchanged. This removes the per-node malloc/free + parent memcpy storm
+ * (the dominant allocator/TLB churn during finalize) and the transient peak of holding both the
+ * src node and a freshly-copied dst node at once. dst->count stays exact (only relinks increment
+ * it). Single-threaded use (post-join merges); dst->last is not maintained here. */
 static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_t *src, summary_t *sum, size_t bi_lo, size_t bi_hi) {
     size_t bi;
 
@@ -2335,8 +2613,30 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
         src->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            if (dense_cell_add_h(dst, n->parent, n->hash, n->n, sum) != 0) {
-                /* Leak avoidance on OOM: drop remaining src chain. */
+            dense_node_t **pp = NULL;
+            dense_node_t *hit = NULL;
+            size_t dbi;
+
+            if (dst->nbuckets) {
+                dbi = (size_t)n->hash & (dst->nbuckets - 1);
+                pp = &dst->buckets[dbi];
+                while (*pp) {
+                    if ((*pp)->hash == n->hash && strcmp((*pp)->parent, n->parent) == 0) {
+                        hit = *pp;
+                        break;
+                    }
+                    pp = &(*pp)->next;
+                }
+            }
+            if (hit) {
+                hit->n += n->n;
+                free(n); /* redundant src node; parent (if owned) lives in its trailing bytes */
+                n = nx;
+                continue;
+            }
+            if (dense_cell_reserve(dst) != 0) {
+                /* OOM: cannot grow dst. Drop this node and the rest of the src chain. */
+                if (sum) sum->bad_input_files++;
                 free(n);
                 n = nx;
                 while (n) {
@@ -2346,7 +2646,10 @@ static void dense_cell_merge_bucket_range(dense_cell_map_t *dst, dense_cell_map_
                 }
                 break;
             }
-            free(n);
+            dbi = (size_t)n->hash & (dst->nbuckets - 1);
+            n->next = dst->buckets[dbi];
+            dst->buckets[dbi] = n;
+            dst->count++;
             n = nx;
         }
     }
@@ -2378,17 +2681,42 @@ static void dense_cell_merge_add(dense_cell_map_t *dst, const dense_cell_map_t *
     }
 }
 
+/* Allocate the lookup bucket array sized to the parent count (power-of-two, load factor ~1) so
+ * probes stay O(1). No-op if already built. Returns 0 on success, -1 on OOM. */
+static int dense_cell_fanout_lookup_reserve(dense_cell_fanout_lookup_t *lk, size_t want_nodes) {
+    size_t nb = 1024;
+
+    if (!lk || lk->buckets) return 0;
+    while (nb < want_nodes) nb <<= 1;
+    lk->buckets = (dense_node_t **)calloc(nb, sizeof(*lk->buckets));
+    if (!lk->buckets) return -1;
+    lk->nbuckets = nb;
+    return 0;
+}
+
+/*
+ * Move every node of the merged narrow fanout map into the lookup. This is a one-time O(nodes)
+ * relink (the heavy cost on large datasets is the *probes* afterward, which the dynamic sizing
+ * makes O(1)); a serial pass avoids the per-thread nt*nbuckets staging that a parallel partition
+ * would need and that does not scale to a large dynamic bucket count.
+ */
 static void dense_cell_steal_into_fanout_lookup(dense_cell_map_t *narrow, dense_cell_fanout_lookup_t *lk) {
     size_t bi;
+    size_t mask;
 
     if (!narrow || !lk) return;
+    if (!lk->buckets) {
+        size_t want = narrow->count ? narrow->count : 1024;
+        if (dense_cell_fanout_lookup_reserve(lk, want) != 0) return; /* OOM: leave empty (probes return 0) */
+    }
+    mask = lk->nbuckets - 1;
     for (bi = 0; bi < narrow->nbuckets; bi++) {
         dense_node_t *n = narrow->buckets[bi];
 
         narrow->buckets[bi] = NULL;
         while (n) {
             dense_node_t *nx = n->next;
-            uint32_t biw = n->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
+            size_t biw = (size_t)n->hash & mask;
 
             n->next = lk->buckets[biw];
             lk->buckets[biw] = n;
@@ -2397,202 +2725,20 @@ static void dense_cell_steal_into_fanout_lookup(dense_cell_map_t *narrow, dense_
     }
 }
 
-typedef struct {
-    dmerge_sync_t *sync;
-    dense_cell_map_t *narrow;
-    dense_cell_fanout_lookup_t *lk;
-    dense_node_t **st;
-    int nt;
-    int tid;
-} fanout_steal_pt_ctx_t;
-
-static void fanout_steal_do_phase1(fanout_steal_pt_ctx_t *c) {
-    size_t bi;
-
-    for (bi = (size_t)c->tid; bi < c->narrow->nbuckets; bi += (size_t)c->nt) {
-        dense_node_t *n = c->narrow->buckets[bi];
-
-        c->narrow->buckets[bi] = NULL;
-        while (n) {
-            dense_node_t *nx = n->next;
-            uint32_t biw = n->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
-
-            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw];
-            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + (size_t)biw] = n;
-            n = nx;
-        }
-    }
-}
-
-static void fanout_steal_do_phase2(fanout_steal_pt_ctx_t *c) {
-    size_t biw;
-    int t;
-
-    for (biw = (size_t)c->tid; biw < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; biw += (size_t)c->nt) {
-        for (t = 0; t < c->nt; t++) {
-            dense_node_t *head = c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw];
-
-            c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw] = NULL;
-            if (!head) continue;
-            {
-                dense_node_t *tail = head;
-
-                while (tail->next) tail = tail->next;
-                tail->next = c->lk->buckets[biw];
-                c->lk->buckets[biw] = head;
-            }
-        }
-    }
-}
-
-static void *fanout_steal_parallel_worker(void *vp) {
-    fanout_steal_pt_ctx_t *c = (fanout_steal_pt_ctx_t *)vp;
-
-    for (;;) {
-        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
-
-        if (g == 1) break;
-        if (g == 2) return NULL;
-        sched_yield();
-    }
-    fanout_steal_do_phase1(c);
-    pthread_barrier_wait(&c->sync->mid);
-    fanout_steal_do_phase2(c);
-    return NULL;
-}
-
 static void dense_cell_steal_into_fanout_lookup_ex(dense_cell_map_t *narrow, dense_cell_fanout_lookup_t *lk, int merge_threads) {
-    dense_node_t **st = NULL;
-    fanout_steal_pt_ctx_t *ctx = NULL;
-    pthread_t *tids = NULL;
-    dmerge_sync_t sync;
-    int nt_cap, nt_want, nthr, n_join, ti, k, brc;
-
-    if (!narrow || !lk) return;
-    if (merge_threads < 2) {
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
-    }
-    if (dense_cell_total_nodes(narrow) < DENSE_CELL_STEAL_FANOUT_PARALLEL_MIN_NODES) {
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
-    }
-
-    nt_cap = merge_threads;
-    if (nt_cap > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_cap = DENSE_CELL_STEAL_FANOUT_MAX_NT;
-    if (nt_cap < 2) {
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
-    }
-
-    /*
-     * Staging is nt_want * 65536 pointers (~512 KiB per thread at nt_want=128). If calloc fails, halve nt_want
-     * instead of falling back to single-threaded steal on multi-million-node maps (can wall-clock for tens of minutes).
-     */
-    st = NULL;
-    ctx = NULL;
-    tids = NULL;
-    nt_want = nt_cap;
-    for (;;) {
-        if (nt_want < 2) {
-            dense_cell_steal_into_fanout_lookup(narrow, lk);
-            return;
-        }
-        st = (dense_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(dense_node_t *));
-        if (!st) {
-            if (nt_want <= 2) {
-                dense_cell_steal_into_fanout_lookup(narrow, lk);
-                return;
-            }
-            nt_want /= 2;
-            continue;
-        }
-        ctx = (fanout_steal_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
-        tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
-        if (ctx && (tids || nt_want == 1)) break;
-        free(st);
-        st = NULL;
-        free(ctx);
-        ctx = NULL;
-        free(tids);
-        tids = NULL;
-        if (nt_want <= 2) {
-            dense_cell_steal_into_fanout_lookup(narrow, lk);
-            return;
-        }
-        nt_want /= 2;
-    }
-
-    if (g_ereport_verbose && nt_want < nt_cap) {
-        fprintf(stderr,
-                "ereport: fanout lookup steal using %d parallel teams (retry after staging alloc; wanted %d)\n",
-                nt_want,
-                nt_cap);
-        fflush(stderr);
-    }
-
-    atomic_init(&sync.gate, 0);
-    for (ti = 0; ti < nt_want; ti++) {
-        ctx[ti].sync = &sync;
-        ctx[ti].narrow = narrow;
-        ctx[ti].lk = lk;
-        ctx[ti].st = st;
-        ctx[ti].nt = 0;
-        ctx[ti].tid = 0;
-    }
-
-    n_join = 0;
-    for (ti = 1; ti < nt_want; ti++) {
-        if (pthread_create(&tids[ti - 1], NULL, fanout_steal_parallel_worker, &ctx[ti]) != 0) break;
-        n_join++;
-    }
-    nthr = n_join + 1;
-    if (nthr < 2) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
-    }
-
-    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
-    if (brc != 0) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        dense_cell_steal_into_fanout_lookup(narrow, lk);
-        return;
-    }
-
-    for (ti = 0; ti < nthr; ti++) {
-        ctx[ti].nt = nthr;
-        ctx[ti].tid = ti;
-    }
-    atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&sync.gate, 1, memory_order_release);
-    fanout_steal_do_phase1(&ctx[0]);
-    pthread_barrier_wait(&sync.mid);
-    fanout_steal_do_phase2(&ctx[0]);
-    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-    pthread_barrier_destroy(&sync.mid);
-    free(st);
-    free(ctx);
-    free(tids);
+    (void)merge_threads;
+    dense_cell_steal_into_fanout_lookup(narrow, lk);
 }
 
 /* _h variants take the parent's full dense hash (callers iterate dense nodes that
  * already carry ->hash), so emission lookups don't re-run dense_hash_full per row.
  * All dense_node_t are created with ->hash set, so the hash pre-check is exact. */
 static uint64_t dense_cell_fanout_lookup_get_n_h(const dense_cell_fanout_lookup_t *lk, const char *parent, uint32_t h) {
-    uint32_t biw;
+    size_t biw;
     const dense_node_t *n;
 
-    if (!lk || !parent) return 0;
-    biw = h % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
+    if (!lk || !parent || lk->nbuckets == 0) return 0;
+    biw = (size_t)h & (lk->nbuckets - 1);
     for (n = lk->buckets[biw]; n; n = n->next) {
         if (n->hash == h && strcmp(n->parent, parent) == 0) return n->n;
     }
@@ -2614,8 +2760,8 @@ static uint64_t dense_cell_map_get_n_h(const dense_cell_map_t *m, const char *pa
 static void dense_cell_fanout_lookup_free(dense_cell_fanout_lookup_t *lk) {
     size_t bi;
 
-    if (!lk) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+    if (!lk || !lk->buckets) return;
+    for (bi = 0; bi < lk->nbuckets; bi++) {
         dense_node_t *n = lk->buckets[bi];
 
         lk->buckets[bi] = NULL;
@@ -2626,6 +2772,9 @@ static void dense_cell_fanout_lookup_free(dense_cell_fanout_lookup_t *lk) {
             n = nx;
         }
     }
+    free(lk->buckets);
+    lk->buckets = NULL;
+    lk->nbuckets = 0;
 }
 
 /*
@@ -2770,7 +2919,7 @@ static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
         while (n) {
             fanout_parent_stat_node_t *nx = n->next;
 
-            free(n->parent);
+            if (!m->parents_external) free(n->parent);
             free(n);
             n = nx;
         }
@@ -2836,7 +2985,7 @@ static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_
                         if (src_node->t_max > (*pp)->t_max) (*pp)->t_max = src_node->t_max;
                     }
                 }
-                free(src_node->parent);
+                if (!dst->parents_external) free(src_node->parent);
                 free(src_node);
                 return;
             }
@@ -2845,7 +2994,7 @@ static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_
     }
     if (fanout_parent_stat_reserve(dst) != 0) {
         /* OOM: cannot grow dst; drop this node rather than corrupt the table. */
-        free(src_node->parent);
+        if (!dst->parents_external) free(src_node->parent);
         free(src_node);
         return;
     }
@@ -2964,11 +3113,15 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
         if (sum) sum->bad_input_files++;
         return;
     }
-    node->parent = strdup(parent);
-    if (!node->parent) {
-        free(node);
-        if (sum) sum->bad_input_files++;
-        return;
+    if (m->parents_external) {
+        node->parent = (char *)parent; /* per-worker interned; not owned by this node */
+    } else {
+        node->parent = strdup(parent);
+        if (!node->parent) {
+            free(node);
+            if (sum) sum->bad_input_files++;
+            return;
+        }
     }
     node->n_files = nf;
     node->n_dirs = nd;
@@ -3407,14 +3560,17 @@ static char *dup_common_dir_prefix(const bucket_details_t *details) {
     size_t i;
     size_t len;
 
+    char pbuf0[PATH_MAX];
+    char pbufi[PATH_MAX];
+
     if (details->count == 0) return strdup("");
 
-    prefix = strdup(details->items[0].path ? details->items[0].path : "");
+    prefix = strdup(path_join_pl(details->items[0].parent, details->items[0].leaf, pbuf0, sizeof(pbuf0)));
     if (!prefix) return NULL;
     len = strlen(prefix);
 
     for (i = 1; i < details->count; i++) {
-        const char *p = details->items[i].path ? details->items[i].path : "";
+        const char *p = path_join_pl(details->items[i].parent, details->items[i].leaf, pbufi, sizeof(pbufi));
         size_t j = 0;
         while (j < len && prefix[j] && p[j] && prefix[j] == p[j]) j++;
         len = j;
@@ -3435,7 +3591,7 @@ static char *dup_common_dir_prefix(const bucket_details_t *details) {
         int all_dir_boundary = 1;
 
         for (i = 0; i < details->count; i++) {
-            const char *pth = details->items[i].path ? details->items[i].path : "";
+            const char *pth = path_join_pl(details->items[i].parent, details->items[i].leaf, pbufi, sizeof(pbufi));
             if (!starts_with_dir_prefix(pth, prefix)) {
                 all_dir_boundary = 0;
                 break;
@@ -3447,7 +3603,7 @@ static char *dup_common_dir_prefix(const bucket_details_t *details) {
             if (slash) {
                 if (slash == prefix) prefix[1] = '\0';
                 else *slash = '\0';
-            } else if (details->items[0].path && details->items[0].path[0] == '/') {
+            } else if (pbuf0[0] == '/') {
                 free(prefix);
                 prefix = strdup("/");
                 if (!prefix) return NULL;
@@ -3505,7 +3661,8 @@ static size_t matched_ord_lower_bound_seg(const matched_records_t *rec, const si
     if (!key) key = "";
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        const char *p = rec->items[ord[mid]].path ? rec->items[ord[mid]].path : "";
+        char pbuf[PATH_MAX];
+        const char *p = path_join_pl(rec->items[ord[mid]].parent, rec->items[ord[mid]].leaf, pbuf, sizeof(pbuf));
         if (path_cmp_seg(p, key) < 0)
             lo = mid + 1;
         else
@@ -3529,7 +3686,8 @@ static size_t matched_ord_first_not_under_prefix(const matched_records_t *rec,
     if (!rec || !ord || lo > n) return n;
     while (a < b) {
         size_t mid = a + (b - a) / 2;
-        const char *pp = rec->items[ord[mid]].path ? rec->items[ord[mid]].path : "";
+        char pbuf[PATH_MAX];
+        const char *pp = path_join_pl(rec->items[ord[mid]].parent, rec->items[ord[mid]].leaf, pbuf, sizeof(pbuf));
 
         if (starts_with_dir_prefix(pp, prefix))
             a = mid + 1;
@@ -3545,8 +3703,9 @@ static const matched_record_t *g_bucket_path_sort_items;
 static int matched_path_ord_cmp(const void *aa, const void *bb) {
     const size_t ia = *(const size_t *)aa;
     const size_t ib = *(const size_t *)bb;
-    const char *pa = g_bucket_path_sort_items[ia].path ? g_bucket_path_sort_items[ia].path : "";
-    const char *pb = g_bucket_path_sort_items[ib].path ? g_bucket_path_sort_items[ib].path : "";
+    char ba[PATH_MAX], bb_[PATH_MAX];
+    const char *pa = path_join_pl(g_bucket_path_sort_items[ia].parent, g_bucket_path_sort_items[ia].leaf, ba, sizeof(ba));
+    const char *pb = path_join_pl(g_bucket_path_sort_items[ib].parent, g_bucket_path_sort_items[ib].leaf, bb_, sizeof(bb_));
     return path_cmp_seg(pa, pb);
 }
 
@@ -3555,8 +3714,9 @@ static int matched_path_ord_cmp_r(const void *aa, const void *bb, void *ctx) {
     const matched_record_t *items = (const matched_record_t *)ctx;
     const size_t ia = *(const size_t *)aa;
     const size_t ib = *(const size_t *)bb;
-    const char *pa = items[ia].path ? items[ia].path : "";
-    const char *pb = items[ib].path ? items[ib].path : "";
+    char ba[PATH_MAX], bb_[PATH_MAX];
+    const char *pa = path_join_pl(items[ia].parent, items[ia].leaf, ba, sizeof(ba));
+    const char *pb = path_join_pl(items[ib].parent, items[ib].leaf, bb_, sizeof(bb_));
     return path_cmp_seg(pa, pb);
 }
 
@@ -3569,8 +3729,9 @@ static void merge_ord_path_slice(const matched_record_t *items,
     size_t i = lo, j = mid, k = lo;
 
     while (i < mid && j < hi) {
-        const char *pa = items[ord[i]].path ? items[ord[i]].path : "";
-        const char *pb = items[ord[j]].path ? items[ord[j]].path : "";
+        char ba[PATH_MAX], bb_[PATH_MAX];
+        const char *pa = path_join_pl(items[ord[i]].parent, items[ord[i]].leaf, ba, sizeof(ba));
+        const char *pb = path_join_pl(items[ord[j]].parent, items[ord[j]].leaf, bb_, sizeof(bb_));
         if (path_cmp_seg(pa, pb) <= 0)
             tmp[k++] = ord[i++];
         else
@@ -3741,31 +3902,57 @@ static int path_ord_merge_max_depth(void) {
 #define PATH_RADIX_SPAWN_MIN (1u << 18) /* only hand a sub-bucket to a thread above this size */
 #endif
 
+/*
+ * Two-part cursor over a split (parent-incl-slash, leaf) path. It produces exactly the same
+ * transform-byte stream T() that the old single-string cursor produced for the joined path, so the
+ * radix sort yields a byte-identical permutation. The trick: walk the parent's components, but when
+ * the parent sub-cursor would emit its terminal END, instead switch to the leaf sub-cursor (whose
+ * stream ends with the real END). The SEP the parent emits just before ending is exactly the
+ * separator between the parent's last component and the leaf; an empty parent ("/") emits no
+ * leading SEP, matching the joined "/leaf" transform.
+ */
 typedef struct {
-    const char *p;
-    uint8_t st; /* 0 = reading component, 1 = owe SEP, 2 = ended */
+    const char *p;     /* read pointer within the active sub-segment */
+    const char *leaf;  /* leaf segment, walked after the parent ends */
+    uint8_t st;        /* 0 = reading component, 1 = owe SEP, 2 = sub-segment ended */
+    uint8_t phase;     /* 0 = walking parent, 1 = walking leaf */
 } path_tcur_t;
 
-static inline void path_tcur_init(path_tcur_t *c, const char *s) {
-    if (!s) s = "";
+static inline void path_tcur_init(path_tcur_t *c, const char *parent, const char *leaf) {
+    const char *s = parent ? parent : "";
     while (*s == '/') s++;
+    c->leaf = leaf ? leaf : "";
+    c->phase = 0u;
     c->p = s;
     c->st = (*s == '\0') ? 2u : 0u;
 }
 
 static inline int path_tcur_next(path_tcur_t *c) {
-    if (c->st == 2u) return 0;
-    if (c->st == 1u) {
-        c->st = 0u;
-        while (*c->p == '/') c->p++;
-        if (*c->p == '\0') c->st = 2u;
-        return PATH_RADIX_SEP;
-    }
-    {
-        unsigned char ch = (unsigned char)*c->p;
-        c->p++;
-        if (*c->p == '/' || *c->p == '\0') c->st = 1u;
-        return (int)ch + 1;
+    for (;;) {
+        if (c->st == 2u) {
+            if (c->phase == 0u) {
+                /* Parent exhausted: switch to leaf instead of emitting the parent's END. */
+                const char *s = c->leaf;
+                while (*s == '/') s++;
+                c->p = s;
+                c->phase = 1u;
+                c->st = (*s == '\0') ? 2u : 0u;
+                continue;
+            }
+            return 0; /* leaf END = real END */
+        }
+        if (c->st == 1u) {
+            c->st = 0u;
+            while (*c->p == '/') c->p++;
+            if (*c->p == '\0') c->st = 2u;
+            return PATH_RADIX_SEP;
+        }
+        {
+            unsigned char ch = (unsigned char)*c->p;
+            c->p++;
+            if (*c->p == '/' || *c->p == '\0') c->st = 1u;
+            return (int)ch + 1;
+        }
     }
 }
 
@@ -3774,8 +3961,9 @@ static int matched_path_radix_leaf_cmp(const void *aa, const void *bb, void *ctx
     const matched_record_t *items = (const matched_record_t *)ctx;
     size_t ia = *(const size_t *)aa;
     size_t ib = *(const size_t *)bb;
-    const char *pa = items[ia].path ? items[ia].path : "";
-    const char *pb = items[ib].path ? items[ib].path : "";
+    char ba[PATH_MAX], bb_[PATH_MAX];
+    const char *pa = path_join_pl(items[ia].parent, items[ia].leaf, ba, sizeof(ba));
+    const char *pb = path_join_pl(items[ib].parent, items[ib].leaf, bb_, sizeof(bb_));
     int c = path_cmp_seg(pa, pb);
     if (c) return c;
     return ia < ib ? -1 : (ia > ib ? 1 : 0);
@@ -3944,7 +4132,7 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec, er
     {
         path_tcur_t *curs = (path_tcur_t *)malloc(n * sizeof(*curs));
         if (curs) {
-            for (i = 0; i < n; i++) path_tcur_init(&curs[i], rec->items[i].path);
+            for (i = 0; i < n; i++) path_tcur_init(&curs[i], rec->items[i].parent, rec->items[i].leaf);
             g_path_radix_max = nw;
             atomic_store(&g_path_radix_active, 1);
             path_radix_sort(rec->items, ord, tmp, curs, n);
@@ -4038,12 +4226,13 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
     for (i = lo; i < hi; i++) {
         const detail_record_t *r = &details->items[i];
         char rowpath[PATH_MAX];
+        char fbuf[PATH_MAX];
         size_t rowlen = 0;
         uint64_t h = base_hash;
         const char *p;
         int depth;
 
-        p = path_after_base_prefix(r->path, base_prefix);
+        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), base_prefix);
         if (!p || *p == '\0') continue;
 
         rowpath[0] = '\0';
@@ -4337,6 +4526,7 @@ static void *agg_totals_par_worker(void *vp) {
         size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
         const matched_record_t *r = &w->records->items[i];
         char rowpath[PATH_MAX];
+        char fbuf[PATH_MAX];
         size_t rowlen = 0;
         uint64_t h = base_hash;
         const char *p;
@@ -4344,7 +4534,7 @@ static void *agg_totals_par_worker(void *vp) {
 
         if (atomic_load_explicit(w->fatal_atom, memory_order_relaxed)) break;
 
-        p = path_after_base_prefix(r->path, w->base_prefix);
+        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), w->base_prefix);
         if (!p || *p == '\0') continue;
 
         rowpath[0] = '\0';
@@ -4768,12 +4958,13 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
         size_t i = use_ord_slice ? path_ord[ii] : ii;
         const matched_record_t *r = &records->items[i];
         char rowpath[PATH_MAX];
+        char fbuf[PATH_MAX];
         size_t rowlen = 0;
         uint64_t h = base_hash;
         const char *p;
         int depth;
 
-        p = path_after_base_prefix(r->path, base_prefix);
+        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), base_prefix);
         if (!p || *p == '\0') continue;
 
         rowpath[0] = '\0';
@@ -5582,12 +5773,14 @@ static void emit_bucket_shape_drill_section(FILE *out,
         if (details && details->count > 0) {
             for (i = 0; i < details->count; i++) {
                 char parent[PATH_MAX];
+                char fbuf[PATH_MAX];
                 const detail_record_t *rec = &details->items[i];
+                const char *full = path_join_pl(rec->parent, rec->leaf, fbuf, sizeof(fbuf));
 
-                if (!rec->path) continue;
-                if (path_slash_count_str(rec->path) < PATH_SHAPE_DEEP_MIN_SLASHES) continue;
+                if (!full || !*full) continue;
+                if (path_slash_count_str(full) < PATH_SHAPE_DEEP_MIN_SLASHES) continue;
                 uint32_t ph;
-                if (parent_dir_to_buf(rec->path, parent, sizeof(parent)) != 0) continue;
+                if (parent_dir_to_buf(full, parent, sizeof(parent)) != 0) continue;
                 ph = dense_hash_full(parent);
                 if (dense_cell_add_h(&dm_bytes, parent, ph, rec->size, NULL) != 0 ||
                     dense_cell_add_h(&dm_files, parent, ph, 1ULL, NULL) != 0) {
@@ -7857,6 +8050,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
                           dense_cell_map_t dense_maps[AGE_BUCKETS][SIZE_BUCKETS],
                           dense_cell_map_t *parent_fanout,
                           fanout_parent_stat_map_t *parent_fanout_stats,
+                          parent_intern_t *pintern,
+                          parent_intern_t *dense_pintern,
                           ereport_run_stats_t *run_stats) {
     FILE *fp = NULL;
     int rc = -1;
@@ -7865,6 +8060,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
     char *pathbuf_store = NULL;
     char *stdio_buf = NULL;
     crawl_bin_block_reader_t br;
+    /* The parent interners are owned by the worker and reused across every chunk it processes:
+     * the hash table is grown a handful of times per worker instead of being rebuilt (calloc +
+     * rehash, zero-page COW + cross-CPU TLB shootdowns) for every chunk, and a directory that
+     * recurs across chunk boundaries is stored once per worker rather than once per chunk. */
+    int dense_intern = (matched_records->arena != NULL); /* matches dense_maps' parents_external */
     memset(&br, 0, sizeof(br));
 
     fp = counted_fopen(chunk->path, "rb");
@@ -7918,6 +8118,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
     uint32_t shape_phash = 0;
     uint64_t shape_parent_id = 0; /* 0 never appears as a real parent_dir_id */
     int shape_parent_ok = 0;
+    const char *shape_parent_interned = NULL; /* interned form of shape_parent, recomputed per distinct parent_id */
 
     for (;;) {
         bin_record_hdr_t r;
@@ -8007,16 +8208,23 @@ static int read_one_chunk(const file_chunk_t *chunk,
         sum->matched_records++;
         if (progress) progress->matched_records++;
 
-        /* When retaining paths, dup the (already rewritten) path into the worker arena exactly once and
-         * share that pointer between the matched_records and per-cell details lists, instead of arena-duping
-         * it in each. This halves the retained path bytes (the dominant cost on huge --bucket-details runs).
-         * Only valid when both lists are arena-backed + paths_external (set in main); otherwise fall back to
-         * the per-list dup so ownership/free stays correct. */
-        char *stored_path = NULL;
+        /* When retaining paths, store each path split into an interned parent prefix (shared by every
+         * record under the directory) plus a per-record leaf, and share both pointers between the
+         * matched_records and per-cell details lists. This is the dominant memory win on huge
+         * --bucket-details runs: parent bytes are kept once per directory instead of once per file.
+         * Only valid when both lists are arena-backed + paths_external (set in main); otherwise fall
+         * back to the per-list dup so ownership/free stays correct. */
+        const char *stored_parent = NULL;
+        const char *stored_leaf = NULL;
         int share_paths = (!skip_paths) && matched_records->arena != NULL;
         if (share_paths) {
-            stored_path = path_arena_dup(matched_records->arena, pathbuf ? pathbuf : "");
-            if (!stored_path) {
+            const char *src = pathbuf ? pathbuf : "";
+            size_t plen;
+            const char *leaf;
+            path_split_pl(src, &plen, &leaf);
+            stored_parent = pintern_get(pintern, r.parent_dir_id, src, plen);
+            stored_leaf = path_arena_dup(matched_records->arena, leaf);
+            if (!stored_parent || !stored_leaf) {
                 fprintf(stderr, "warn: path arena alloc failed in %s\n", chunk->path);
                 sum->bad_input_files++;
                 if (progress) progress->bad_input_files++;
@@ -8036,11 +8244,32 @@ static int read_one_chunk(const file_chunk_t *chunk,
                     shape_phash = dense_hash_full(shape_parent);
                     shape_parent_id = r.parent_dir_id;
                     shape_parent_ok = 1;
+                    shape_parent_interned = NULL; /* recompute the interned copy for this new parent */
                 } else {
                     shape_parent_ok = 0;
                 }
             }
-            if (shape_parent_ok) { shp = shape_parent; shp_h = shape_phash; }
+            if (shape_parent_ok) {
+                if (dense_intern) {
+                    /* Intern once per distinct parent_id; the dense maps store this pointer
+                     * (parents_external), so it must be stable for the run, not the stack buffer.
+                     * fanout/fanout-stat copy it on their own and are unaffected. */
+                    if (!shape_parent_interned) {
+                        size_t sl = strlen(shape_parent);
+                        shape_parent_interned = pintern_get(dense_pintern, r.parent_dir_id, shape_parent, sl);
+                        if (!shape_parent_interned) {
+                            fprintf(stderr, "warn: dense parent arena alloc failed in %s\n", chunk->path);
+                            sum->bad_input_files++;
+                            if (progress) progress->bad_input_files++;
+                            break;
+                        }
+                    }
+                    shp = shape_parent_interned;
+                } else {
+                    shp = shape_parent;
+                }
+                shp_h = shape_phash;
+            }
         }
 
         if (r.type == 'f') {
@@ -8086,7 +8315,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
             if (!skip_paths) {
                 int drc = share_paths
-                    ? bucket_details_append_ptr(&details[ab][sb], stored_path, accounted_size, ctime_led)
+                    ? bucket_details_append_ptr(&details[ab][sb], stored_parent, stored_leaf, accounted_size, ctime_led)
                     : bucket_details_append(&details[ab][sb], pathbuf, accounted_size, ctime_led);
                 if (drc != 0) {
                     fprintf(stderr, "warn: detail append failed in %s\n", chunk->path);
@@ -8115,7 +8344,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
         if (!skip_paths) {
             int mrc = share_paths
-                ? matched_records_append_ptr(matched_records, stored_path, r.type, accounted_size)
+                ? matched_records_append_ptr(matched_records, stored_parent, stored_leaf, r.type, accounted_size)
                 : matched_records_append(matched_records, pathbuf, r.type, accounted_size);
             if (mrc != 0) {
                 fprintf(stderr, "warn: matched record append failed in %s\n", chunk->path);
@@ -8146,8 +8375,16 @@ out:
 static void *worker_main(void *arg_void) {
     worker_arg_t *arg = (worker_arg_t *)arg_void;
     progress_local_t progress;
+    /* Owned by this worker and reused across all chunks it pulls: avoids per-chunk hash rebuilds
+     * (the dominant read-phase cost — calloc/rehash zero-page COW + TLB shootdowns) and dedups
+     * directories that span chunk boundaries to a single arena copy per worker. The interned
+     * strings live in this worker's path arena (freed only after report emission). */
+    parent_intern_t pintern;
+    parent_intern_t dense_pintern;
 
     memset(&progress, 0, sizeof(progress));
+    pintern_init(&pintern, arg->matched_records.arena);
+    pintern_init(&dense_pintern, arg->matched_records.arena);
 
     for (;;) {
         file_chunk_t *chunk = queue_pop(arg->queue);
@@ -8165,13 +8402,17 @@ static void *worker_main(void *arg_void) {
                        &progress,
                        &arg->summary,
                        arg->details,
-                       &                       arg->matched_records,
+                       &arg->matched_records,
                        arg->dense_maps,
                        &arg->parent_fanout,
                        &arg->parent_fanout_stats,
+                       &pintern,
+                       &dense_pintern,
                        arg->run_stats);
     }
 
+    pintern_free(&pintern);
+    pintern_free(&dense_pintern);
     progress_flush_local(&progress, arg->run_stats);
 
     return NULL;
@@ -10677,9 +10918,20 @@ int main(int argc, char **argv) {
                 for (sb2 = 0; sb2 < SIZE_BUCKETS; sb2++) {
                     args[i].details[ab2][sb2].arena = &args[i].path_arena;
                     args[i].details[ab2][sb2].paths_external = 1;
+                    /* Per-cell dense parents are interned once per worker (read_one_chunk's
+                     * dense_pintern, backed by this same arena) and shared across all 36
+                     * age/size cells, so each node only references the interned string. This
+                     * removes the dominant per-cell parent-string duplication at peak. */
+                    args[i].dense_maps[ab2][sb2].parents_external = 1;
                 }
             }
         }
+        /* parent_fanout and parent_fanout_stats are fed the same per-worker interned no-slash
+         * parent (shp) the dense maps use, so they reference it instead of keeping their own
+         * inline/strdup copy — dropping two further full copies of every parent path (~80 GiB on
+         * the production crawl). */
+        args[i].parent_fanout.parents_external = 1;
+        args[i].parent_fanout_stats.parents_external = 1;
 
         if (all_users_mode) {
             if (uid_accum_init(&args[i].uid_distinct, 8192) != 0) {
@@ -10759,6 +11011,16 @@ int main(int argc, char **argv) {
     memset(&merged_dense_shape, 0, sizeof(merged_dense_shape));
     memset(&fanout_lookup_shape, 0, sizeof(fanout_lookup_shape));
     memset(&merged_fanout_stats, 0, sizeof(merged_fanout_stats));
+    /* The merged maps receive the per-worker nodes by relink/absorb, which reference interned
+     * arena parents — mark them external so neither merge nor free touches those strings. */
+    merged_fanout_stats.parents_external = 1;
+    {
+        int ab2, sb2;
+        for (ab2 = 0; ab2 < AGE_BUCKETS; ab2++) {
+            for (sb2 = 0; sb2 < SIZE_BUCKETS; sb2++)
+                merged_dense_shape[ab2][sb2].parents_external = 1;
+        }
+    }
 
     if (bucket_detail_levels > 0) {
         atomic_store(&run_stats.finalize_merge_substep, 2);
@@ -10807,6 +11069,7 @@ int main(int argc, char **argv) {
 
                 if (g_ereport_verbose) __vt_dense = now_sec();
                 memset(&merged_fanout, 0, sizeof(merged_fanout));
+                merged_fanout.parents_external = 1; /* receives interned per-worker fanout nodes by relink */
                 if (fanout_shard_summaries_reduce_parallel(&merged_fanout, &merged_fanout_stats, args, threads_used,
                                                           &run_stats) != 0) {
                     for (i = 0; i < threads_used; i++) {
