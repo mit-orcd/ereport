@@ -173,6 +173,13 @@ static int set_path_rewrite(const char *arg) {
 }
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
+/*
+ * tmp_trigrams shards: accumulate records per (worker × bucket) and emit one zstd frame
+ * per ~64 KiB of source so framing overhead and read()/decompress syscalls amortize over
+ * thousands of records instead of the ~1 record per frame the per-batch path produced.
+ */
+#define TRIGRAM_TMP_FRAME_BYTES (1U << 16)
+#define TRIGRAM_TMP_FRAME_RECORDS (TRIGRAM_TMP_FRAME_BYTES / sizeof(trigram_record_t))
 #define MERGE_MAX_WORKERS 16
 #define MERGE_PARALLEL_MIN 4
 /* Each parallel merge worker holds ~2× bucket file bytes (mmap + radix aux) plus stdio buffers — cap workers to avoid OOM. */
@@ -337,6 +344,8 @@ typedef struct {
     uint32_t trigram_tmp_shard_count;
     FILE **tw_worker_fp; /* [trigram_tmp_shard_count * TRIGRAM_BUCKET_COUNT] */
     uint8_t *tw_worker_fp_magic; /* 1 if EITG0001 header already on disk for this open fp */
+    trigram_record_t **tw_worker_buf; /* per open shard: pending records, flushed as one zstd frame */
+    uint32_t *tw_worker_buf_n; /* records currently buffered in tw_worker_buf[ix] */
     uint64_t *tw_worker_lru_age;
     uint32_t *tw_worker_open_count; /* [trigram_tmp_shard_count] */
     uint32_t tw_worker_max_open;
@@ -2267,18 +2276,24 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
 
     ctx->tw_worker_fp = (FILE **)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(FILE *));
     ctx->tw_worker_fp_magic = (uint8_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint8_t));
+    ctx->tw_worker_buf = (trigram_record_t **)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(trigram_record_t *));
+    ctx->tw_worker_buf_n = (uint32_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint32_t));
     ctx->tw_worker_lru_age = (uint64_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint64_t));
     ctx->tw_worker_open_count = (uint32_t *)calloc((size_t)shard_count, sizeof(uint32_t));
     ctx->tw_worker_lru_next_tick = (uint64_t *)calloc((size_t)shard_count, sizeof(uint64_t));
-    if (!ctx->tw_worker_fp || !ctx->tw_worker_fp_magic || !ctx->tw_worker_lru_age ||
-        !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick) {
+    if (!ctx->tw_worker_fp || !ctx->tw_worker_fp_magic || !ctx->tw_worker_buf || !ctx->tw_worker_buf_n ||
+        !ctx->tw_worker_lru_age || !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick) {
         free(ctx->tw_worker_fp);
         free(ctx->tw_worker_fp_magic);
+        free(ctx->tw_worker_buf);
+        free(ctx->tw_worker_buf_n);
         free(ctx->tw_worker_lru_age);
         free(ctx->tw_worker_open_count);
         free(ctx->tw_worker_lru_next_tick);
         ctx->tw_worker_fp = NULL;
         ctx->tw_worker_fp_magic = NULL;
+        ctx->tw_worker_buf = NULL;
+        ctx->tw_worker_buf_n = NULL;
         ctx->tw_worker_lru_age = NULL;
         ctx->tw_worker_open_count = NULL;
         ctx->tw_worker_lru_next_tick = NULL;
@@ -2311,6 +2326,37 @@ static trigram_record_t *tw_ensure_sort_buf(size_t n) {
     return tw_sort_buf;
 }
 
+/* Compress + write the records pending in tw_worker_buf[ix] as one zstd frame; reset the buffer. */
+static int tw_worker_flush_locked(build_ctx_t *ctx, size_t ix) {
+    FILE *fp;
+
+    if (ctx->tw_worker_buf_n[ix] == 0) return 0;
+    fp = ctx->tw_worker_fp[ix];
+    if (!fp) return -1;
+    if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix],
+                                   ctx->tw_worker_buf[ix], ctx->tw_worker_buf_n[ix]) != 0)
+        return -1;
+    ctx->tw_worker_buf_n[ix] = 0;
+    return 0;
+}
+
+/* Flush the pending frame, close the FILE*, and free the buffer for one open shard. */
+static int tw_worker_close_ix(build_ctx_t *ctx, uint32_t worker_id, size_t ix) {
+    int rc = 0;
+
+    if (!ctx->tw_worker_fp[ix]) return 0;
+    if (tw_worker_flush_locked(ctx, ix) != 0) rc = -1;
+    if (mk_fclose(ctx->tw_worker_fp[ix]) != 0) rc = -1;
+    ctx->tw_worker_fp[ix] = NULL;
+    ctx->tw_worker_fp_magic[ix] = 0;
+    free(ctx->tw_worker_buf[ix]);
+    ctx->tw_worker_buf[ix] = NULL;
+    ctx->tw_worker_buf_n[ix] = 0;
+    if (ctx->tw_worker_open_count && ctx->tw_worker_open_count[worker_id] > 0)
+        ctx->tw_worker_open_count[worker_id]--;
+    return rc;
+}
+
 static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     uint32_t wid, b;
 
@@ -2320,9 +2366,9 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
             size_t ix = tw_worker_fp_ix(wid, b);
 
             if (ctx->tw_worker_fp[ix]) {
-                mk_fclose(ctx->tw_worker_fp[ix]);
-                ctx->tw_worker_fp[ix] = NULL;
-                ctx->tw_worker_fp_magic[ix] = 0;
+                if (tw_worker_close_ix(ctx, wid, ix) != 0)
+                    fprintf(stderr, "ereport_index: flush/close tmp_trigrams bucket %u worker %u: %s\n",
+                            b, wid, strerror(errno));
             }
         }
         if (ctx->tw_worker_open_count) ctx->tw_worker_open_count[wid] = 0;
@@ -2331,6 +2377,10 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     ctx->tw_worker_fp = NULL;
     free(ctx->tw_worker_fp_magic);
     ctx->tw_worker_fp_magic = NULL;
+    free(ctx->tw_worker_buf);
+    ctx->tw_worker_buf = NULL;
+    free(ctx->tw_worker_buf_n);
+    ctx->tw_worker_buf_n = NULL;
     free(ctx->tw_worker_lru_age);
     ctx->tw_worker_lru_age = NULL;
     free(ctx->tw_worker_open_count);
@@ -2348,7 +2398,6 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
                                                  const trigram_record_t *recs, size_t n) {
     FILE *fp;
     char path[PATH_MAX];
-    uint64_t tick;
     size_t ix;
 
     if (n == 0) return 0;
@@ -2357,84 +2406,69 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
     ei_note_trigram_append_batch();
     ix = tw_worker_fp_ix(worker_id, bucket);
     fp = ctx->tw_worker_fp[ix];
-    if (fp) {
-        tick = ++ctx->tw_worker_lru_next_tick[worker_id];
-        ctx->tw_worker_lru_age[ix] = tick;
-        if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
-            fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
-                    strerror(errno));
-            return -1;
-        }
-        return 0;
-    }
 
-    while (ctx->tw_worker_open_count[worker_id] >= ctx->tw_worker_max_open) {
-        uint32_t victim = tw_worker_pick_lru_victim(ctx, worker_id, bucket);
-        size_t vix;
+    if (!fp) {
+        /* Evict this worker's LRU shards (never the bucket we're about to use) to stay under the fd cap. */
+        while (ctx->tw_worker_open_count[worker_id] >= ctx->tw_worker_max_open) {
+            uint32_t victim = tw_worker_pick_lru_victim(ctx, worker_id, bucket);
 
-        if (victim == UINT32_MAX) {
-            fprintf(stderr,
-                    "ereport_index: internal: no LRU victim (worker %u open_count=%u max=%u)\n",
-                    worker_id, ctx->tw_worker_open_count[worker_id], ctx->tw_worker_max_open);
-            return -1;
-        }
-        vix = tw_worker_fp_ix(worker_id, victim);
-        if (ctx->tw_worker_fp[vix]) {
-            if (mk_fclose(ctx->tw_worker_fp[vix]) != 0) {
-                fprintf(stderr, "ereport_index: fclose tmp_trigrams bucket %u worker %u: %s\n", victim, worker_id,
-                        strerror(errno));
-            }
-            ctx->tw_worker_fp[vix] = NULL;
-            ctx->tw_worker_fp_magic[vix] = 0;
-            ctx->tw_worker_open_count[worker_id]--;
-        }
-        fp = ctx->tw_worker_fp[ix];
-        if (fp) {
-            tick = ++ctx->tw_worker_lru_next_tick[worker_id];
-            ctx->tw_worker_lru_age[ix] = tick;
-            if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
-                fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
-                        strerror(errno));
+            if (victim == UINT32_MAX) {
+                fprintf(stderr, "ereport_index: internal: no LRU victim (worker %u open_count=%u max=%u)\n",
+                        worker_id, ctx->tw_worker_open_count[worker_id], ctx->tw_worker_max_open);
                 return -1;
             }
-            return 0;
+            if (tw_worker_close_ix(ctx, worker_id, tw_worker_fp_ix(worker_id, victim)) != 0) {
+                fprintf(stderr, "ereport_index: flush/close tmp_trigrams bucket %u worker %u: %s\n",
+                        victim, worker_id, strerror(errno));
+                return -1;
+            }
         }
-    }
 
-    fp = ctx->tw_worker_fp[ix];
-    if (fp) {
-        tick = ++ctx->tw_worker_lru_next_tick[worker_id];
-        ctx->tw_worker_lru_age[ix] = tick;
-        if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
-            fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id,
-                    strerror(errno));
+        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, worker_id) >=
+            (int)sizeof(path)) {
+            fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u worker %u)\n", bucket, worker_id);
             return -1;
         }
-        return 0;
+        ctx->tw_worker_buf[ix] = (trigram_record_t *)malloc(TRIGRAM_TMP_FRAME_RECORDS * sizeof(trigram_record_t));
+        if (!ctx->tw_worker_buf[ix]) {
+            fprintf(stderr, "ereport_index: alloc tmp_trigrams frame buffer (bucket %u worker %u)\n", bucket, worker_id);
+            return -1;
+        }
+        ctx->tw_worker_buf_n[ix] = 0;
+        /* Reopened-after-eviction shards already carry the EITG header; brand-new (empty) files do not. */
+        ctx->tw_worker_fp_magic[ix] = (uint8_t)tmp_trigram_file_has_magic(path);
+        fp = mk_fopen(path, "ab");
+        if (!fp) {
+            fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
+            free(ctx->tw_worker_buf[ix]);
+            ctx->tw_worker_buf[ix] = NULL;
+            return -1;
+        }
+        if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+        }
+        ctx->bucket_nonempty[bucket] = 1;
+        ctx->tw_worker_fp[ix] = fp;
+        ctx->tw_worker_open_count[worker_id]++;
     }
 
-    if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, worker_id) >=
-        (int)sizeof(path)) {
-        fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u worker %u)\n", bucket, worker_id);
-        return -1;
-    }
-    /* Reopened-after-eviction shards already carry the EITG header; brand-new (empty) files do not. */
-    ctx->tw_worker_fp_magic[ix] = (uint8_t)tmp_trigram_file_has_magic(path);
-    fp = mk_fopen(path, "ab");
-    if (!fp) {
-        fprintf(stderr, "ereport_index: fopen %s: %s\n", path, strerror(errno));
-        return -1;
-    }
-    if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
-    }
-    ctx->bucket_nonempty[bucket] = 1;
-    ctx->tw_worker_fp[ix] = fp;
-    ctx->tw_worker_open_count[worker_id]++;
-    tick = ++ctx->tw_worker_lru_next_tick[worker_id];
-    ctx->tw_worker_lru_age[ix] = tick;
-    if (tmp_trigram_fp_write_batch(fp, &ctx->tw_worker_fp_magic[ix], recs, n) != 0) {
-        fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n", bucket, worker_id, strerror(errno));
-        return -1;
+    ctx->tw_worker_lru_age[ix] = ++ctx->tw_worker_lru_next_tick[worker_id];
+
+    /* Accumulate records into the per-shard buffer; flush one zstd frame each time it fills. */
+    while (n > 0) {
+        size_t space = (size_t)TRIGRAM_TMP_FRAME_RECORDS - ctx->tw_worker_buf_n[ix];
+        size_t take = n < space ? n : space;
+
+        memcpy(ctx->tw_worker_buf[ix] + ctx->tw_worker_buf_n[ix], recs, take * sizeof(*recs));
+        ctx->tw_worker_buf_n[ix] += (uint32_t)take;
+        recs += take;
+        n -= take;
+        if (ctx->tw_worker_buf_n[ix] == (uint32_t)TRIGRAM_TMP_FRAME_RECORDS) {
+            if (tw_worker_flush_locked(ctx, ix) != 0) {
+                fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n",
+                        bucket, worker_id, strerror(errno));
+                return -1;
+            }
+        }
     }
     return 0;
 }

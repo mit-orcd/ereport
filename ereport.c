@@ -3185,14 +3185,23 @@ static size_t path_row_map_est_initial_cap(size_t record_count, int depth) {
     size_t est;
 
     if (record_count == 0) return 4096;
-    est = 65536;
-    if (depth >= 1) {
-        size_t shifted = record_count >> (unsigned)depth;
-        if (shifted > est) est = shifted;
+    /*
+     * Distinct keys at this depth are bounded by record_count. Assume the trie roughly
+     * halves the number of distinct prefixes per level (branching ~2): depth 0 uses the
+     * full count (shift 0) so flat megadirs — where every record is a distinct depth-0
+     * key — presize correctly instead of rehashing up from a tiny table, while deeper
+     * levels shrink geometrically. Summed across depths this stays ~2× record_count.
+     */
+    if (depth <= 0) {
+        est = record_count;
+    } else if (depth >= (int)(sizeof(size_t) * 8)) {
+        est = 0;
+    } else {
+        est = record_count >> (unsigned)depth;
     }
     if (est < 4096) est = 4096;
     if (est > record_count) est = record_count;
-    if (est > (1u << 20)) est = (1u << 20); /* 1M slots (~ load 0.7 → ~700k distinct keys) */
+    if (est > (1u << 26)) est = (1u << 26); /* 64M-slot safety cap (~5 GB table) before load-factor scaling */
     /* Match get_or_insert_h load factor 7/10 so the first growth rehash is avoided. */
     return (est * 10 + 6) / 7;
 }
