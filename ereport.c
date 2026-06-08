@@ -547,9 +547,15 @@ typedef struct fanout_parent_stat_node {
 } fanout_parent_stat_node_t;
 
 typedef struct {
-    fanout_parent_stat_node_t *buckets[DENSE_PARENT_BUCKETS_FANOUT_LOOKUP];
+    /* Dynamically grown bucket array (power-of-two nbuckets; NULL/0 until first insert),
+     * indexed by hash & (nbuckets-1). Grows + rehashes at load factor ~1 so chains stay
+     * short even at tens of millions of distinct parents (a fixed table degraded to long
+     * chains and a large share of CPU in the accumulate strcmp walk). */
+    fanout_parent_stat_node_t **buckets;
+    size_t nbuckets;
     fanout_parent_stat_node_t *last; /* last-hit cache keyed by parent_dir_id */
     uint64_t last_id;
+    size_t count;
 } fanout_parent_stat_map_t;
 
 typedef struct {
@@ -2172,10 +2178,6 @@ static uint32_t dense_hash_full(const char *parent) {
     return h;
 }
 
-static uint32_t dense_parent_bucket_fanout_lookup(const char *parent) {
-    return dense_hash_full(parent) % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
-}
-
 /* Single allocation: node header immediately followed by the NUL-terminated parent
  * string. node->parent points into the same block, so it is never freed separately
  * (all free sites just free(node)) and it shares cache lines with the node header,
@@ -2761,7 +2763,7 @@ static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
     size_t bi;
 
     if (!m) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+    for (bi = 0; bi < m->nbuckets; bi++) {
         fanout_parent_stat_node_t *n = m->buckets[bi];
 
         m->buckets[bi] = NULL;
@@ -2773,57 +2775,91 @@ static void fanout_parent_stat_map_free(fanout_parent_stat_map_t *m) {
             n = nx;
         }
     }
+    free(m->buckets);
+    m->buckets = NULL;
+    m->nbuckets = 0;
+    m->count = 0;
+    m->last = NULL;
+    m->last_id = 0;
 }
 
-static size_t fanout_parent_stat_map_total_nodes(const fanout_parent_stat_map_t *m) {
-    size_t c = 0, bi;
+/* Lazily create / double + rehash the bucket array so the load factor stays ~<=1. Nodes are only
+ * relinked (addresses preserved, so m->last stays valid). Single-threaded use (per-worker accumulate
+ * and post-join merges). Returns -1 on OOM (map unchanged). */
+static int fanout_parent_stat_reserve(fanout_parent_stat_map_t *m) {
+    size_t newn;
+    fanout_parent_stat_node_t **nb;
+    size_t i;
 
-    if (!m) return 0;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
-        const fanout_parent_stat_node_t *n;
+    if (m->buckets && m->count < m->nbuckets) return 0;
+    newn = m->nbuckets ? (m->nbuckets << 1) : (size_t)DENSE_PARENT_BUCKETS_INIT;
+    nb = (fanout_parent_stat_node_t **)calloc(newn, sizeof(*nb));
+    if (!nb) return -1;
+    for (i = 0; i < m->nbuckets; i++) {
+        fanout_parent_stat_node_t *n = m->buckets[i];
 
-        for (n = m->buckets[bi]; n; n = n->next) c++;
+        while (n) {
+            fanout_parent_stat_node_t *nx = n->next;
+            size_t bi = (size_t)n->hash & (newn - 1);
+
+            n->next = nb[bi];
+            nb[bi] = n;
+            n = nx;
+        }
     }
-    return c;
+    free(m->buckets);
+    m->buckets = nb;
+    m->nbuckets = newn;
+    return 0;
 }
 
 static void fanout_parent_stat_absorb_one(fanout_parent_stat_map_t *dst, fanout_parent_stat_node_t *src_node, summary_t *sum) {
-    uint32_t biw;
+    size_t biw;
     fanout_parent_stat_node_t **pp;
 
     (void)sum;
-    biw = src_node->hash % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; /* node carries its full hash */
-    pp = &dst->buckets[biw];
-    while (*pp) {
-        if ((*pp)->hash == src_node->hash && strcmp((*pp)->parent, src_node->parent) == 0) {
-            (*pp)->n_files += src_node->n_files;
-            (*pp)->n_dirs += src_node->n_dirs;
-            (*pp)->n_others += src_node->n_others;
-            if (src_node->have_time) {
-                if (!(*pp)->have_time) {
-                    (*pp)->t_min = src_node->t_min;
-                    (*pp)->t_max = src_node->t_max;
-                    (*pp)->have_time = 1;
-                } else {
-                    if (src_node->t_min < (*pp)->t_min) (*pp)->t_min = src_node->t_min;
-                    if (src_node->t_max > (*pp)->t_max) (*pp)->t_max = src_node->t_max;
+    if (dst->nbuckets) {
+        biw = (size_t)src_node->hash & (dst->nbuckets - 1); /* node carries its full hash */
+        pp = &dst->buckets[biw];
+        while (*pp) {
+            if ((*pp)->hash == src_node->hash && strcmp((*pp)->parent, src_node->parent) == 0) {
+                (*pp)->n_files += src_node->n_files;
+                (*pp)->n_dirs += src_node->n_dirs;
+                (*pp)->n_others += src_node->n_others;
+                if (src_node->have_time) {
+                    if (!(*pp)->have_time) {
+                        (*pp)->t_min = src_node->t_min;
+                        (*pp)->t_max = src_node->t_max;
+                        (*pp)->have_time = 1;
+                    } else {
+                        if (src_node->t_min < (*pp)->t_min) (*pp)->t_min = src_node->t_min;
+                        if (src_node->t_max > (*pp)->t_max) (*pp)->t_max = src_node->t_max;
+                    }
                 }
+                free(src_node->parent);
+                free(src_node);
+                return;
             }
-            free(src_node->parent);
-            free(src_node);
-            return;
+            pp = &(*pp)->next;
         }
-        pp = &(*pp)->next;
     }
+    if (fanout_parent_stat_reserve(dst) != 0) {
+        /* OOM: cannot grow dst; drop this node rather than corrupt the table. */
+        free(src_node->parent);
+        free(src_node);
+        return;
+    }
+    biw = (size_t)src_node->hash & (dst->nbuckets - 1);
     src_node->next = dst->buckets[biw];
     dst->buckets[biw] = src_node;
+    dst->count++;
 }
 
 static void fanout_parent_stat_merge_bucket_range_serial(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum) {
     size_t bi;
 
     if (!dst || !src) return;
-    for (bi = 0; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi++) {
+    for (bi = 0; bi < src->nbuckets; bi++) {
         fanout_parent_stat_node_t *n = src->buckets[bi];
 
         src->buckets[bi] = NULL;
@@ -2837,166 +2873,16 @@ static void fanout_parent_stat_merge_bucket_range_serial(fanout_parent_stat_map_
     }
 }
 
-typedef struct {
-    atomic_int gate; /* 0 spin, 1 run, 2 abort (pthread_create failure) */
-    pthread_barrier_t mid;
-} fps_merge_sync_t;
-
-typedef struct {
-    fps_merge_sync_t *sync;
-    fanout_parent_stat_map_t *dst;
-    fanout_parent_stat_map_t *src;
-    fanout_parent_stat_node_t **st;
-    summary_t *sum;
-    int nt;
-    int tid;
-} fps_merge_pt_ctx_t;
-
-static void fps_merge_do_phase1(fps_merge_pt_ctx_t *c) {
-    size_t bi;
-
-    for (bi = (size_t)c->tid; bi < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; bi += (size_t)c->nt) {
-        fanout_parent_stat_node_t *n = c->src->buckets[bi];
-
-        c->src->buckets[bi] = NULL;
-        while (n) {
-            fanout_parent_stat_node_t *nx = n->next;
-
-            n->next = c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + bi];
-            c->st[(size_t)c->tid * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + bi] = n;
-            n = nx;
-        }
-    }
-}
-
-static void fps_merge_do_phase2(fps_merge_pt_ctx_t *c) {
-    size_t biw;
-    int t;
-
-    for (biw = (size_t)c->tid; biw < DENSE_PARENT_BUCKETS_FANOUT_LOOKUP; biw += (size_t)c->nt) {
-        for (t = 0; t < c->nt; t++) {
-            fanout_parent_stat_node_t *n = c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw];
-
-            c->st[(size_t)t * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP + biw] = NULL;
-            while (n) {
-                fanout_parent_stat_node_t *nx = n->next;
-
-                n->next = NULL;
-                fanout_parent_stat_absorb_one(c->dst, n, c->sum);
-                n = nx;
-            }
-        }
-    }
-}
-
-static void *fps_merge_parallel_worker(void *vp) {
-    fps_merge_pt_ctx_t *c = (fps_merge_pt_ctx_t *)vp;
-
-    for (;;) {
-        int g = atomic_load_explicit(&c->sync->gate, memory_order_acquire);
-
-        if (g == 1) break;
-        if (g == 2) return NULL;
-        sched_yield();
-    }
-    fps_merge_do_phase1(c);
-    pthread_barrier_wait(&c->sync->mid);
-    fps_merge_do_phase2(c);
-    return NULL;
-}
-
 /*
- * Merge src into dst. When merge_threads > 1 and src is large enough, partition src buckets across threads,
- * barrier, then each thread absorbs staged nodes into a disjoint subset of dst buckets (same pattern as dense_cell_merge_into_ex).
+ * Merge src into dst by absorbing every src node (dst grows its own dynamic hash). Sequential:
+ * with per-map dynamic bucket counts a parent need not map to the same bucket index in src and dst,
+ * so the old bucket-index-parallel two-phase merge is invalid. Runs post-join (no concurrent writers);
+ * coarse parallelism across worker maps is preserved by the caller's tournament reduce.
  */
 static void fanout_parent_stat_merge_into_ex(fanout_parent_stat_map_t *dst, fanout_parent_stat_map_t *src, summary_t *sum, int merge_threads) {
-    fanout_parent_stat_node_t **st = NULL;
-    fps_merge_pt_ctx_t *ctx = NULL;
-    pthread_t *tids = NULL;
-    fps_merge_sync_t sync;
-    int nt_want, nthr, n_join, ti, k, brc;
-
+    (void)merge_threads;
     if (!dst || !src) return;
-    if (merge_threads < 2) {
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-    if (fanout_parent_stat_map_total_nodes(src) < DENSE_CELL_MERGE_PARALLEL_MIN_NODES) {
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-
-    nt_want = merge_threads;
-    if (nt_want > DENSE_CELL_STEAL_FANOUT_MAX_NT) nt_want = DENSE_CELL_STEAL_FANOUT_MAX_NT;
-    if (nt_want > (int)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP) nt_want = (int)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
-
-    st = (fanout_parent_stat_node_t **)calloc((size_t)nt_want * DENSE_PARENT_BUCKETS_FANOUT_LOOKUP, sizeof(fanout_parent_stat_node_t *));
-    if (!st) {
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-    ctx = (fps_merge_pt_ctx_t *)calloc((size_t)nt_want, sizeof(*ctx));
-    tids = (pthread_t *)calloc((size_t)(nt_want > 1 ? (size_t)(nt_want - 1) : 0u), sizeof(*tids));
-    if (!ctx || (!tids && nt_want > 1)) {
-        free(st);
-        free(ctx);
-        free(tids);
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-
-    atomic_init(&sync.gate, 0);
-    for (ti = 0; ti < nt_want; ti++) {
-        ctx[ti].sync = &sync;
-        ctx[ti].dst = dst;
-        ctx[ti].src = src;
-        ctx[ti].st = st;
-        ctx[ti].sum = sum;
-        ctx[ti].nt = 0;
-        ctx[ti].tid = 0;
-    }
-
-    n_join = 0;
-    for (ti = 1; ti < nt_want; ti++) {
-        if (pthread_create(&tids[ti - 1], NULL, fps_merge_parallel_worker, &ctx[ti]) != 0) break;
-        n_join++;
-    }
-    nthr = n_join + 1;
-    if (nthr < 2) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-
-    brc = pthread_barrier_init(&sync.mid, NULL, (unsigned)nthr);
-    if (brc != 0) {
-        atomic_store_explicit(&sync.gate, 2, memory_order_release);
-        for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-        free(st);
-        free(ctx);
-        free(tids);
-        fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
-        return;
-    }
-
-    for (ti = 0; ti < nthr; ti++) {
-        ctx[ti].nt = nthr;
-        ctx[ti].tid = ti;
-    }
-    atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&sync.gate, 1, memory_order_release);
-    fps_merge_do_phase1(&ctx[0]);
-    pthread_barrier_wait(&sync.mid);
-    fps_merge_do_phase2(&ctx[0]);
-    for (k = 0; k < n_join; k++) pthread_join(tids[k], NULL);
-    pthread_barrier_destroy(&sync.mid);
-    free(st);
-    free(ctx);
-    free(tids);
+    fanout_parent_stat_merge_bucket_range_serial(dst, src, sum);
 }
 
 static void fanout_parent_stat_node_apply(fanout_parent_stat_node_t *node,
@@ -3027,7 +2913,8 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
                                           uint32_t pre_phash) {
     char parent_buf[PATH_MAX];
     const char *parent;
-    uint32_t h, biw;
+    uint32_t h;
+    size_t biw;
     fanout_parent_stat_node_t **pp;
     fanout_parent_stat_node_t *node;
     uint64_t nf = 0;
@@ -3055,16 +2942,22 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
         h = dense_hash_full(parent);
     }
 
-    biw = h % (uint32_t)DENSE_PARENT_BUCKETS_FANOUT_LOOKUP;
-    pp = &m->buckets[biw];
-    while (*pp) {
-        if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
-            fanout_parent_stat_node_apply(*pp, nf, nd, no, pick_ts);
-            m->last = *pp;
-            m->last_id = parent_id;
-            return;
+    if (m->nbuckets) {
+        biw = (size_t)h & (m->nbuckets - 1);
+        pp = &m->buckets[biw];
+        while (*pp) {
+            if ((*pp)->hash == h && strcmp((*pp)->parent, parent) == 0) {
+                fanout_parent_stat_node_apply(*pp, nf, nd, no, pick_ts);
+                m->last = *pp;
+                m->last_id = parent_id;
+                return;
+            }
+            pp = &(*pp)->next;
         }
-        pp = &(*pp)->next;
+    }
+    if (fanout_parent_stat_reserve(m) != 0) {
+        if (sum) sum->bad_input_files++;
+        return;
     }
     node = (fanout_parent_stat_node_t *)malloc(sizeof(*node));
     if (!node) {
@@ -3084,18 +2977,24 @@ static void fanout_parent_stat_accumulate(fanout_parent_stat_map_t *m,
     node->t_max = pick_ts;
     node->have_time = 1;
     node->hash = h;
+    biw = (size_t)h & (m->nbuckets - 1);
     node->next = m->buckets[biw];
     m->buckets[biw] = node;
+    m->count++;
+    m->last = node;
+    m->last_id = parent_id;
 }
 
 static const fanout_parent_stat_node_t *fanout_parent_stat_lookup(const fanout_parent_stat_map_t *m, const char *parent) {
-    uint32_t biw;
+    uint32_t h;
+    size_t biw;
     const fanout_parent_stat_node_t *n;
 
-    if (!m || !parent) return NULL;
-    biw = dense_parent_bucket_fanout_lookup(parent);
+    if (!m || !parent || m->nbuckets == 0) return NULL;
+    h = dense_hash_full(parent);
+    biw = (size_t)h & (m->nbuckets - 1);
     for (n = m->buckets[biw]; n; n = n->next) {
-        if (strcmp(n->parent, parent) == 0) return n;
+        if (n->hash == h && strcmp(n->parent, parent) == 0) return n;
     }
     return NULL;
 }
