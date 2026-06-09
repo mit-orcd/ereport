@@ -2704,6 +2704,45 @@ static void index_free_file_states(file_state_t *fs, size_t n) {
     free(fs);
 }
 
+/* Free only the shard catalogs (keep the file_state_t array). Catalogs back path reconstruction in
+ * the index phase (process_chunk_make); nothing in the merge/stitch phase touches them, so freeing
+ * them once the index workers join returns their footprint (per-dir arrays + name strdups, ~18 GiB on
+ * a large crawl) before the memory-hungry merge runs. Idempotent: catalogs are NULLed, so the later
+ * index_free_file_states is a no-op for them and still frees the array exactly once. */
+static void index_free_shard_catalogs(file_state_t *fs, size_t n) {
+    size_t i;
+
+    if (!fs) return;
+    for (i = 0; i < n; i++) {
+        if (fs[i].catalog) {
+            crawl_bin_catalog_free(fs[i].catalog);
+            free(fs[i].catalog);
+            fs[i].catalog = NULL;
+        }
+    }
+}
+
+/* Approximate resident bytes held by all loaded shard catalogs (diagnostic only; mirrors ereport). */
+static size_t index_catalog_bytes(const file_state_t *fs, size_t n) {
+    size_t i;
+    size_t total = 0;
+    const size_t per_slot = 8 + 4 + 2 + 8 + 5 * 8; /* parent_dir_id+depth+name_len+name_comp ptr+5 imm_child_* */
+
+    if (!fs) return 0;
+    for (i = 0; i < n; i++) {
+        const crawl_bin_catalog_t *c = fs[i].catalog;
+        uint64_t slots, d;
+        if (!c) continue;
+        slots = c->cap + 1;
+        total += (size_t)slots * per_slot;
+        if (c->name_len) {
+            for (d = 1; d <= c->max_dir_id; d++)
+                if (c->name_len[d]) total += (size_t)c->name_len[d] + 1;
+        }
+    }
+    return total;
+}
+
 static int index_attach_shard_catalog(file_state_t *fs, const char *path) {
     FILE *fp;
     bin_file_header_t fh;
@@ -3184,13 +3223,41 @@ static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_
     return nb;
 }
 
-static uint64_t merge_largest_bucket_file_bytes(build_ctx_t *ctx, const uint32_t *bucket_list, size_t nbuckets) {
+/* Sum of *decompressed* trigram-record bytes a bucket's tmp files expand to in RAM (n_records × 12),
+ * read cheaply from the zstd frame headers (no decompression). This — not the compressed on-disk size —
+ * is what a merge worker actually allocates: merge_load_bucket_tmp_files mallocs this many bytes for the
+ * records buffer and merge_bucket_to_segment_files mallocs an equal-size radix aux buffer (≈2× this). */
+static uint64_t bucket_tmp_files_decompressed_bytes(build_ctx_t *ctx, uint32_t bucket) {
+    char path[PATH_MAX], leg[PATH_MAX];
+    uint64_t sum = 0;
+    uint32_t w, max_w;
+
+    merge_ctx_ensure_trigram_shard_count(ctx);
+    max_w = ctx->trigram_tmp_shard_count;
+    if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) < (int)sizeof(leg)) {
+        uint64_t ub = 0;
+        if (tmp_trigram_count_file_records(leg, NULL, &ub) == 0) sum += ub;
+    }
+    for (w = 0; w < max_w; w++) {
+        uint64_t ub = 0;
+        if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))
+            continue;
+        if (tmp_trigram_count_file_records(path, NULL, &ub) == 0) sum += ub;
+    }
+    return sum;
+}
+
+/* Largest per-bucket decompressed footprint — the correct input to the merge-parallelism RAM budget.
+ * Using the compressed file size here (as the on-disk-bytes variant does) underestimates a worker's true
+ * resident set by the zstd ratio and lets too many workers run, which OOM-kills large --make runs. */
+static uint64_t merge_largest_bucket_decompressed_bytes(build_ctx_t *ctx, const uint32_t *bucket_list,
+                                                        size_t nbuckets) {
     size_t bi;
     uint64_t maxb = 0;
 
     merge_ctx_ensure_trigram_shard_count(ctx);
     for (bi = 0; bi < nbuckets; bi++) {
-        uint64_t sz = bucket_tmp_files_total_bytes(ctx, bucket_list[bi]);
+        uint64_t sz = bucket_tmp_files_decompressed_bytes(ctx, bucket_list[bi]);
 
         if (sz > maxb) maxb = sz;
     }
@@ -3211,6 +3278,25 @@ static uint64_t read_proc_memavailable_kib(void) {
     }
     fclose(fp);
     return (uint64_t)kb;
+}
+
+/* Current and peak resident set (KiB) from /proc/self/status; 0 if unreadable. Diagnostic only. */
+static void read_proc_self_rss_kib(uint64_t *vmrss_kib, uint64_t *vmhwm_kib) {
+    FILE *fp;
+    char line[256];
+
+    if (vmrss_kib) *vmrss_kib = 0;
+    if (vmhwm_kib) *vmhwm_kib = 0;
+    fp = fopen("/proc/self/status", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long kb = 0;
+        if (vmrss_kib && strncmp(line, "VmRSS:", 6) == 0 && sscanf(line + 6, " %lu", &kb) == 1)
+            *vmrss_kib = (uint64_t)kb;
+        else if (vmhwm_kib && strncmp(line, "VmHWM:", 6) == 0 && sscanf(line + 6, " %lu", &kb) == 1)
+            *vmhwm_kib = (uint64_t)kb;
+    }
+    fclose(fp);
 }
 
 /* cgroup v2 memory.max for this process, or 0 if unlimited / unreadable. */
@@ -3668,7 +3754,10 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     unlink(postings_path);
     merge_unlink_orphan_segment_halves(ctx);
 
-    ctx->merge_max_bucket_bytes = merge_largest_bucket_file_bytes(ctx, need_merge, n_need);
+    /* Size the parallel-merge RAM budget off the *decompressed* bucket footprint a worker actually
+     * allocates (records buffer + radix aux ≈ 2×), not the compressed on-disk size — the latter
+     * underestimates by the zstd ratio and over-subscribes workers into an OOM kill. */
+    ctx->merge_max_bucket_bytes = merge_largest_bucket_decompressed_bytes(ctx, need_merge, n_need);
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
     ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -3926,7 +4015,9 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     if (setvbuf(postings_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    ctx->merge_max_bucket_bytes = merge_largest_bucket_file_bytes(ctx, bucket_list, nbuckets);
+    /* Decompressed footprint (records buffer + radix aux ≈ 2×) is the real per-worker RAM, not the
+     * compressed on-disk size — sizing off the latter over-subscribes workers into an OOM kill. */
+    ctx->merge_max_bucket_bytes = merge_largest_bucket_decompressed_bytes(ctx, bucket_list, nbuckets);
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
     ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4825,6 +4916,34 @@ static int build_index_dir(const char *user_spec,
     ctx.trigram_writer_workers_used = trigram_threads_used;
 
     parallel_bucket_io_shutdown(&ctx);
+
+    if (getenv("EREPORT_INDEX_MEMSTATS")) {
+        uint64_t vmrss = 0, vmhwm = 0;
+        double gib = 1024.0 * 1024.0 * 1024.0;
+        size_t cat_b = index_catalog_bytes(file_states, path_count);
+
+        read_proc_self_rss_kib(&vmrss, &vmhwm);
+        clear_status_line();
+        fprintf(stderr,
+            "\n=== ereport_index memstats (index phase done, before merge) ===\n"
+            "  indexed paths   : %llu\n"
+            "  trigram records : %llu\n"
+            "  shard catalogs  : %10.2f GiB  (freed right after this point)\n"
+            "  RSS now / peak  : %.2f / %.2f GiB\n"
+            "  note: the merge phase decompresses each trigram bucket into RAM (~2x its records);\n"
+            "        worker count is sized off the largest bucket's DECOMPRESSED bytes vs the RAM budget.\n"
+            "================================================================\n\n",
+            (unsigned long long)ctx.indexed_paths,
+            (unsigned long long)ctx.trigram_records,
+            (double)cat_b / gib,
+            (double)vmrss * 1024.0 / gib, (double)vmhwm * 1024.0 / gib);
+        fflush(stderr);
+    }
+
+    /* Catalogs back path reconstruction in the index phase only; the merge/stitch phase never touches
+     * them. Free them now (index workers have joined) so their footprint is reclaimed before the
+     * memory-hungry merge runs. The file_state_t array is released later by index_free_file_states. */
+    index_free_shard_catalogs(file_states, path_count);
 
     {
         int merge_rc = process_trigram_buckets(&ctx);
