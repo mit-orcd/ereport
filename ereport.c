@@ -6208,7 +6208,9 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "tbody td:first-child{background:#f8f5ee;z-index:1}\n");
     fprintf(out, "td.r,th.r{text-align:right}\n");
     fprintf(out,
-            ".bucket-table-wrap td.num,.bucket-table-wrap th.num{white-space:nowrap;box-sizing:border-box}\n");
+            ".bucket-table-wrap td.num{white-space:nowrap;box-sizing:border-box}\n"
+            ".bucket-table-wrap th.num{white-space:normal;box-sizing:border-box}\n"
+            ".bucket-table-wrap th.num .th-text{overflow-wrap:break-word;word-break:normal}\n");
     fprintf(out,
             ".bucket-table-wrap th.sort-h{cursor:pointer;user-select:none}\n"
             ".bucket-table-wrap th.sort-h:hover{background:#ddd4c4}\n"
@@ -9947,8 +9949,8 @@ static int emit_html(const char *report_path,
     fputs("if(n==null||!isFinite(n))return'';\n", out);
     fputs("n=Math.round(Number(n));if(n<1000)return String(n);\n", out);
     fputs("if(n<1000000)return Math.round(n/1000)+'K';\n", out);
-    fputs("if(n<1000000000)return Math.round(n/1e6)+'M';\n", out);
-    fputs("return Math.round(n/1e9)+'G';\n", out);
+    fputs("if(n<1000000000)return (n/1e6).toFixed(1).replace(/\\.0$/,'')+'M';\n", out);
+    fputs("return (n/1e9).toFixed(1).replace(/\\.0$/,'')+'G';\n", out);
     fputs("}\n", out);
     fputs("function corpusMeta(j){\n", out);
     fputs("if(!j)return'';\n", out);
