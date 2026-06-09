@@ -184,9 +184,14 @@ static int set_path_rewrite(const char *arg) {
 #define MERGE_PARALLEL_MIN 4
 /* Each parallel merge worker holds ~2× bucket file bytes (mmap + radix aux) plus stdio buffers — cap workers to avoid OOM. */
 #define MERGE_PER_WORKER_OVERHEAD_BYTES (16ULL << 20)
-/* Fraction of min(MemAvailable, cgroup memory.max) used as merge parallelism budget. 55% lets ~2 workers
- * run when max bucket ≈50 GiB and the host has ~360+ GiB MemAvailable; 45% often capped to 1 worker. */
-#define MERGE_RAM_FRAC_NUM 55U
+/* Fraction of min(MemAvailable, cgroup memory.max) used as the merge anonymous-RAM budget (sum of
+ * concurrent workers' record+aux buffers, via admission control). Kept well below 100% on purpose:
+ * the merge ALSO drives heavy file I/O (reading hundreds of GB of compressed tmp_trigrams, writing
+ * merge_seg/tri_postings), and that page cache — especially dirty writeback to a slow/network index
+ * dir — competes with these anon buffers for physical RAM. At 55% a 953M-path build pinned ~367 GiB
+ * anon and the page cache pushed total over the 768 GiB host → OOM kill. 35% leaves the cache headroom.
+ * Tune with EREPORT_INDEX_MERGE_RAM_FRAC / EREPORT_INDEX_MERGE_MEMORY_MB. */
+#define MERGE_RAM_FRAC_NUM 35U
 #define MERGE_RAM_FRAC_DEN 100U
 /*
  * Publish scanned_records to the stats thread this often while a chunk is in flight.
@@ -3247,23 +3252,6 @@ static uint64_t bucket_tmp_files_decompressed_bytes(build_ctx_t *ctx, uint32_t b
     return sum;
 }
 
-/* Largest per-bucket decompressed footprint — the correct input to the merge-parallelism RAM budget.
- * Using the compressed file size here (as the on-disk-bytes variant does) underestimates a worker's true
- * resident set by the zstd ratio and lets too many workers run, which OOM-kills large --make runs. */
-static uint64_t merge_largest_bucket_decompressed_bytes(build_ctx_t *ctx, const uint32_t *bucket_list,
-                                                        size_t nbuckets) {
-    size_t bi;
-    uint64_t maxb = 0;
-
-    merge_ctx_ensure_trigram_shard_count(ctx);
-    for (bi = 0; bi < nbuckets; bi++) {
-        uint64_t sz = bucket_tmp_files_decompressed_bytes(ctx, bucket_list[bi]);
-
-        if (sz > maxb) maxb = sz;
-    }
-    return maxb;
-}
-
 static uint64_t read_proc_memavailable_kib(void) {
     FILE *fp;
     char line[256];
@@ -3339,7 +3327,7 @@ static uint64_t cgroup_v2_memory_max_bytes(void) {
  * Conservative RAM budget for concurrent parallel merge workers.
  * Respects the smaller of MemAvailable and cgroup memory.max (user sessions often have a low cap).
  * Override: EREPORT_INDEX_MERGE_MEMORY_MB=<MiB> sets an explicit budget.
- *           EREPORT_INDEX_MERGE_RAM_FRAC=0.55 (fraction of min(mem,cgroup) to use; default 55%).
+ *           EREPORT_INDEX_MERGE_RAM_FRAC=0.35 (fraction of min(mem,cgroup) to use; default 35%).
  */
 static uint64_t merge_parallel_ram_budget_bytes(void) {
     const char *e;
@@ -3389,11 +3377,16 @@ static uint64_t merge_parallel_ram_budget_bytes(void) {
 typedef struct {
     build_ctx_t *ctx;
     const uint32_t *buckets;
+    const uint64_t *needs; /* per-dispatch-index RAM need (2x decompressed + overhead); NULL = no gating */
     size_t bucket_count;
     atomic_size_t next;
     atomic_int failed;
     atomic_ullong bytes_in;
     atomic_ullong records_in;
+    uint64_t budget;          /* merge RAM budget in bytes; 0 = no gating */
+    pthread_mutex_t adm_mu;   /* guards ram_reserved */
+    pthread_cond_t adm_cv;
+    uint64_t ram_reserved;
 } merge_parallel_arg_t;
 
 static void merge_unlink_segment_pair(build_ctx_t *ctx, uint32_t bucket) {
@@ -3487,11 +3480,38 @@ err:
 
 static void *merge_parallel_worker(void *arg) {
     merge_parallel_arg_t *p = (merge_parallel_arg_t *)arg;
+    int gated = (p->needs != NULL && p->budget > 0);
 
     for (;;) {
         size_t i = atomic_fetch_add_explicit(&p->next, 1U, memory_order_relaxed);
+        uint64_t need = 0;
+
         if (i >= p->bucket_count) break;
-        if (merge_bucket_to_segment_files(p->ctx, p->buckets[i], p) != 0) atomic_store_explicit(&p->failed, 1, memory_order_relaxed);
+
+        /* Memory-aware admission: reserve this bucket's ~2x-decompressed footprint against a shared
+         * budget before loading it. A bucket that fits waits only until enough RAM frees; a bucket
+         * that alone exceeds the budget runs exclusively (admitted once nothing else is resident).
+         * This keeps peak RSS bounded while letting the many small buckets run concurrently, instead
+         * of pinning the whole pool to one worker because a single bucket is huge. Deadlock-free:
+         * whichever worker sees ram_reserved==0 always proceeds. */
+        if (gated) {
+            need = p->needs[i];
+            pthread_mutex_lock(&p->adm_mu);
+            while (p->ram_reserved > 0 && p->ram_reserved + need > p->budget)
+                pthread_cond_wait(&p->adm_cv, &p->adm_mu);
+            p->ram_reserved += need;
+            pthread_mutex_unlock(&p->adm_mu);
+        }
+
+        if (merge_bucket_to_segment_files(p->ctx, p->buckets[i], p) != 0)
+            atomic_store_explicit(&p->failed, 1, memory_order_relaxed);
+
+        if (gated) {
+            pthread_mutex_lock(&p->adm_mu);
+            p->ram_reserved -= need;
+            pthread_cond_broadcast(&p->adm_cv);
+            pthread_mutex_unlock(&p->adm_mu);
+        }
     }
     mk_io_tls_flush();
     return NULL;
@@ -3678,27 +3698,40 @@ static int merge_bucket_size_cmp_desc(const void *a, const void *b) {
 }
 
 /*
- * Reorder a merge dispatch list largest-bucket-first (longest-processing-time
- * scheduling). Merge workers pull buckets off a shared cursor, so starting the
- * biggest radix sorts first stops one huge bucket from being grabbed last and
- * forming a single-worker tail. This only affects the order buckets are
- * processed; per-bucket segment files and the canonical stitch order are
- * unchanged. On alloc failure the original order is kept (correct, just slower).
+ * Build a largest-first merge dispatch order keyed on each bucket's DECOMPRESSED footprint, plus the
+ * per-entry RAM need (2× decompressed + per-worker overhead) used by merge admission control. Fills
+ * dispatch_out[n] and needs_out[n] (aligned: needs_out[i] is for dispatch_out[i]) and returns the
+ * largest single-bucket decompressed footprint (diagnostic). Falls back to canonical order on alloc
+ * failure (still correct; admission still bounds RAM).
  */
-static void merge_sort_buckets_lpt(build_ctx_t *ctx, uint32_t *buckets, size_t n) {
+static uint64_t merge_build_dispatch_and_needs(build_ctx_t *ctx, const uint32_t *bucket_list, size_t n,
+                                               uint32_t *dispatch_out, uint64_t *needs_out) {
     merge_bucket_size_t *sz;
     size_t i;
+    uint64_t maxdec = 0;
 
-    if (n < 2) return;
     sz = (merge_bucket_size_t *)malloc(n * sizeof(*sz));
-    if (!sz) return;
+    if (!sz) {
+        for (i = 0; i < n; i++) {
+            uint64_t d = bucket_tmp_files_decompressed_bytes(ctx, bucket_list[i]);
+            dispatch_out[i] = bucket_list[i];
+            needs_out[i] = d * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+            if (d > maxdec) maxdec = d;
+        }
+        return maxdec;
+    }
     for (i = 0; i < n; i++) {
-        sz[i].bucket = buckets[i];
-        sz[i].bytes = bucket_tmp_files_total_bytes(ctx, buckets[i]);
+        sz[i].bucket = bucket_list[i];
+        sz[i].bytes = bucket_tmp_files_decompressed_bytes(ctx, bucket_list[i]);
     }
     qsort(sz, n, sizeof(*sz), merge_bucket_size_cmp_desc);
-    for (i = 0; i < n; i++) buckets[i] = sz[i].bucket;
+    for (i = 0; i < n; i++) {
+        dispatch_out[i] = sz[i].bucket;
+        needs_out[i] = sz[i].bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+        if (sz[i].bytes > maxdec) maxdec = sz[i].bytes;
+    }
     free(sz);
+    return maxdec;
 }
 
 /*
@@ -3754,10 +3787,8 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     unlink(postings_path);
     merge_unlink_orphan_segment_halves(ctx);
 
-    /* Size the parallel-merge RAM budget off the *decompressed* bucket footprint a worker actually
-     * allocates (records buffer + radix aux ≈ 2×), not the compressed on-disk size — the latter
-     * underestimates by the zstd ratio and over-subscribes workers into an OOM kill. */
-    ctx->merge_max_bucket_bytes = merge_largest_bucket_decompressed_bytes(ctx, need_merge, n_need);
+    /* Workers are sized by CPU; RAM is bounded at load time by per-bucket admission control (see
+     * merge_parallel_worker), so the single largest bucket no longer pins the pool to one worker. */
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
     ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -3772,25 +3803,6 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     }
 
     ctx->merge_workers_cpu = merge_workers;
-
-    if (merge_workers > 1 && ctx->merge_max_bucket_bytes > 0) {
-        uint64_t per_worker = ctx->merge_max_bucket_bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
-        int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
-        if (mw < 1) mw = 1;
-        if (mw < merge_workers) {
-            if (g_verbose) {
-                fprintf(stderr,
-                        "ereport_index: parallel merge workers %d -> %d "
-                        "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB — a fraction of MemAvailable/cgroup, not full RAM; resume)\n"
-                        "  Each worker needs ~2× max bucket size in RAM. EREPORT_INDEX_THREADS only affects `--make` "
-                        "indexing. For more workers: EREPORT_INDEX_MERGE_RAM_FRAC or EREPORT_INDEX_MERGE_MEMORY_MB.\n",
-                        merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
-                        (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
-            }
-            merge_workers = mw;
-        }
-    }
-
     ctx->merge_workers_used = merge_workers;
 
     if (n_need > 0) {
@@ -3820,24 +3832,38 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
         } else {
             merge_parallel_arg_t mp;
             pthread_t *threads = NULL;
+            uint64_t *needs = NULL;
             int ti;
 
             parallel_list = (uint32_t *)malloc(n_need * sizeof(uint32_t));
-            if (!parallel_list) goto out;
-            memcpy(parallel_list, need_merge, n_need * sizeof(uint32_t));
-            merge_sort_buckets_lpt(ctx, parallel_list, n_need);
+            needs = (uint64_t *)malloc(n_need * sizeof(uint64_t));
+            if (!parallel_list || !needs) {
+                free(needs);
+                goto out;
+            }
+            ctx->merge_max_bucket_bytes = merge_build_dispatch_and_needs(ctx, need_merge, n_need, parallel_list, needs);
 
             memset(&mp, 0, sizeof(mp));
             mp.ctx = ctx;
             mp.buckets = parallel_list;
+            mp.needs = needs;
             mp.bucket_count = n_need;
+            mp.budget = ctx->merge_parallel_budget_bytes;
+            mp.ram_reserved = 0;
+            pthread_mutex_init(&mp.adm_mu, NULL);
+            pthread_cond_init(&mp.adm_cv, NULL);
             atomic_init(&mp.next, 0);
             atomic_init(&mp.failed, 0);
             atomic_init(&mp.bytes_in, 0);
             atomic_init(&mp.records_in, 0);
 
             threads = (pthread_t *)calloc((size_t)merge_workers, sizeof(*threads));
-            if (!threads) goto out;
+            if (!threads) {
+                pthread_mutex_destroy(&mp.adm_mu);
+                pthread_cond_destroy(&mp.adm_cv);
+                free(needs);
+                goto out;
+            }
             for (ti = 0; ti < merge_workers; ti++) {
                 if (pthread_create(&threads[ti], NULL, merge_parallel_worker, &mp) != 0) {
                     atomic_store(&mp.failed, 1);
@@ -3847,6 +3873,9 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
             ctx->merge_workers_used = ti;
             for (ti = 0; ti < ctx->merge_workers_used; ti++) pthread_join(threads[ti], NULL);
             free(threads);
+            pthread_mutex_destroy(&mp.adm_mu);
+            pthread_cond_destroy(&mp.adm_cv);
+            free(needs);
 
             if (atomic_load(&mp.failed)) {
                 for (bi = 0; bi < n_need; bi++) merge_unlink_segment_pair(ctx, need_merge[bi]);
@@ -4015,9 +4044,8 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     if (setvbuf(postings_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    /* Decompressed footprint (records buffer + radix aux ≈ 2×) is the real per-worker RAM, not the
-     * compressed on-disk size — sizing off the latter over-subscribes workers into an OOM kill. */
-    ctx->merge_max_bucket_bytes = merge_largest_bucket_decompressed_bytes(ctx, bucket_list, nbuckets);
+    /* Workers are sized by CPU; RAM is bounded at load time by per-bucket admission control (the
+     * worker pool is no longer pinned to the single largest bucket, which serialized the whole merge). */
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
     ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4028,25 +4056,6 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     if (nbuckets < (size_t)MERGE_PARALLEL_MIN) merge_workers = 1;
 
     ctx->merge_workers_cpu = merge_workers;
-
-    if (merge_workers > 1 && ctx->merge_max_bucket_bytes > 0) {
-        uint64_t per_worker = ctx->merge_max_bucket_bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
-        int mw = (int)(ctx->merge_parallel_budget_bytes / per_worker);
-        if (mw < 1) mw = 1;
-        if (mw < merge_workers) {
-            if (g_verbose) {
-                fprintf(stderr,
-                        "ereport_index: parallel merge workers %d -> %d "
-                        "(max bucket %.2f GiB, merge RAM budget ~%.2f GiB; "
-                        "EREPORT_INDEX_MERGE_MEMORY_MB / EREPORT_INDEX_MERGE_RAM_FRAC to adjust)\n"
-                        "  EREPORT_INDEX_THREADS applies to `--make` indexing only, not merge.\n",
-                        merge_workers, mw, (double)ctx->merge_max_bucket_bytes / (1024.0 * 1024.0 * 1024.0),
-                        (double)ctx->merge_parallel_budget_bytes / (1024.0 * 1024.0 * 1024.0));
-            }
-            merge_workers = mw;
-        }
-    }
-
     ctx->merge_workers_used = merge_workers;
 
     if (nbuckets == 0) {
@@ -4096,19 +4105,28 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         merge_parallel_arg_t mp;
         pthread_t *threads = NULL;
         uint32_t *dispatch_list;
+        uint64_t *needs;
         int ti;
 
-        /* Dispatch biggest-first; bucket_list stays canonical for the stitch. */
+        /* Dispatch biggest-first by decompressed footprint; bucket_list stays canonical for the stitch. */
         dispatch_list = (uint32_t *)malloc(nbuckets * sizeof(uint32_t));
-        if (dispatch_list) {
-            memcpy(dispatch_list, bucket_list, nbuckets * sizeof(uint32_t));
-            merge_sort_buckets_lpt(ctx, dispatch_list, nbuckets);
+        needs = (uint64_t *)malloc(nbuckets * sizeof(uint64_t));
+        if (!dispatch_list || !needs) {
+            free(dispatch_list);
+            free(needs);
+            goto out;
         }
+        ctx->merge_max_bucket_bytes = merge_build_dispatch_and_needs(ctx, bucket_list, nbuckets, dispatch_list, needs);
 
         memset(&mp, 0, sizeof(mp));
         mp.ctx = ctx;
-        mp.buckets = dispatch_list ? dispatch_list : bucket_list;
+        mp.buckets = dispatch_list;
+        mp.needs = needs;
         mp.bucket_count = nbuckets;
+        mp.budget = ctx->merge_parallel_budget_bytes;
+        mp.ram_reserved = 0;
+        pthread_mutex_init(&mp.adm_mu, NULL);
+        pthread_cond_init(&mp.adm_cv, NULL);
         atomic_init(&mp.next, 0);
         atomic_init(&mp.failed, 0);
         atomic_init(&mp.bytes_in, 0);
@@ -4116,7 +4134,10 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
 
         threads = (pthread_t *)calloc((size_t)merge_workers, sizeof(*threads));
         if (!threads) {
+            pthread_mutex_destroy(&mp.adm_mu);
+            pthread_cond_destroy(&mp.adm_cv);
             free(dispatch_list);
+            free(needs);
             goto out;
         }
         for (ti = 0; ti < merge_workers; ti++) {
@@ -4128,7 +4149,10 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         ctx->merge_workers_used = ti;
         for (ti = 0; ti < ctx->merge_workers_used; ti++) pthread_join(threads[ti], NULL);
         free(threads);
+        pthread_mutex_destroy(&mp.adm_mu);
+        pthread_cond_destroy(&mp.adm_cv);
         free(dispatch_list);
+        free(needs);
 
         if (atomic_load(&mp.failed)) {
             for (bi = 0; bi < nbuckets; bi++) merge_unlink_segment_pair(ctx, bucket_list[bi]);
