@@ -1518,8 +1518,8 @@ static void die_usage(const char *argv0) {
             "    Plain search prints paths.\n"
             "    With --json: UTF-8 JSON object {\"total\",\"skip\",\"limit\",\"search_ms\",\"index_keys\",\"indexed_paths\",\"paths\":[...]}\n"
             "      (indexed_paths from meta.txt = corpus size; index_keys = distinct trigrams in tri_keys.bin.)\n"
-            "    Parallelism: EREPORT_INDEX_THREADS (default 32) loads postings lists and filters paths in parallel\n"
-            "    when the query has multiple trigrams and the candidate set is large.\n"
+            "    Search: intersects rarest trigrams first and stops early, then filters the candidate\n"
+            "    paths in parallel via EREPORT_INDEX_THREADS (default 32) when the candidate set is large.\n"
             "    --make tuning: EREPORT_INDEX_TRIGRAM_THREADS (default: same as EREPORT_INDEX_THREADS) parallel\n"
             "    writers to tmp_trigram bucket files; EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH (default scales with\n"
             "    EREPORT_INDEX_TRIGRAM_THREADS, max 16384 unless set; range 512…262144)\n"
@@ -5240,11 +5240,15 @@ static int collect_query_trigrams(const char *term, uint32_t **out_codes, size_t
     return 0;
 }
 
-static int cmp_vec_count_asc(const void *a, const void *b) {
-    const u64_vec_t *aa = (const u64_vec_t *)a;
-    const u64_vec_t *bb = (const u64_vec_t *)b;
-    if (aa->count < bb->count) return -1;
-    if (aa->count > bb->count) return 1;
+/* Order query trigrams by posting-list size (rarest first); tie-break on trigram for a
+ * deterministic intersection order. */
+static int cmp_key_postings_bytes_asc(const void *a, const void *b) {
+    const trigram_key_t *aa = (const trigram_key_t *)a;
+    const trigram_key_t *bb = (const trigram_key_t *)b;
+    if (aa->postings_bytes < bb->postings_bytes) return -1;
+    if (aa->postings_bytes > bb->postings_bytes) return 1;
+    if (aa->trigram < bb->trigram) return -1;
+    if (aa->trigram > bb->trigram) return 1;
     return 0;
 }
 
@@ -5331,58 +5335,11 @@ static void json_escape_stdout(FILE *out, const char *s) {
 }
 
 enum {
-    SEARCH_TRIGRAM_PAR_MIN = 2,
-    SEARCH_PATH_PAR_MIN = 64
+    SEARCH_PATH_PAR_MIN = 64,
+    /* Stop intersecting once the next posting list is more than this many bytes per surviving
+     * candidate: decoding it would cost more than just verifying the candidates we already have. */
+    SEARCH_INTERSECT_STOP_RATIO = 64
 };
-
-typedef struct {
-    const char *keys_path;
-    const char *postings_path;
-    uint64_t key_count;
-    const uint32_t *query_trigrams;
-    u64_vec_t *lists;
-    size_t lo;
-    size_t hi;
-    atomic_int *err;
-} search_trigram_load_arg_t;
-
-static void *search_trigram_load_worker(void *v) {
-    search_trigram_load_arg_t *a = (search_trigram_load_arg_t *)v;
-    FILE *kf;
-    FILE *pf;
-    size_t i;
-
-    if (a->lo >= a->hi) return NULL;
-    if (atomic_load_explicit(a->err, memory_order_relaxed)) return NULL;
-    kf = fopen(a->keys_path, "rb");
-    pf = fopen(a->postings_path, "rb");
-    if (!kf || !pf) {
-        atomic_store_explicit(a->err, 1, memory_order_relaxed);
-        if (kf) fclose(kf);
-        if (pf) fclose(pf);
-        return NULL;
-    }
-
-    for (i = a->lo; i < a->hi; i++) {
-        trigram_key_t key;
-        int found;
-
-        if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
-        found = find_trigram_key(kf, a->key_count, a->query_trigrams[i], &key);
-        if (found < 0) {
-            atomic_store_explicit(a->err, 1, memory_order_relaxed);
-            break;
-        }
-        if (found > 0) continue;
-        if (load_postings_list(pf, &key, &a->lists[i]) != 0) {
-            atomic_store_explicit(a->err, 1, memory_order_relaxed);
-            break;
-        }
-    }
-    fclose(kf);
-    fclose(pf);
-    return NULL;
-}
 
 typedef struct {
     const char *paths_path;
@@ -5443,7 +5400,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     uint64_t indexed_paths_corpus = 0;
     uint32_t *query_trigrams = NULL;
     size_t query_trigram_count = 0;
-    u64_vec_t *lists = NULL;
+    trigram_key_t *qkeys = NULL;
     u64_vec_t current, next;
     char *lower_term = NULL;
     int rc = 1;
@@ -5471,77 +5428,76 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     lower_term = ascii_lower_dup(term);
     if (!lower_term) goto out;
 
-    lists = (u64_vec_t *)calloc(query_trigram_count, sizeof(*lists));
-    if (!lists) goto out;
+    memset(&current, 0, sizeof(current));
+    memset(&next, 0, sizeof(next));
 
-    if (query_trigram_count >= (size_t)SEARCH_TRIGRAM_PAR_MIN && search_threads > 1) {
-        int nw = search_threads;
-        int w;
+    /* collect_query_trigrams guarantees at least one trigram for any term of length >= 3. */
+    if (query_trigram_count == 0) {
+        if (json_output) json_print_empty_search(skip_req, limit_req, key_count, indexed_paths_corpus, &t_search_start);
+        rc = 0;
+        goto out;
+    }
 
-        if (nw > (int)query_trigram_count) nw = (int)query_trigram_count;
+    keys_fp = fopen(keys_path, "rb");
+    postings_fp = fopen(postings_path, "rb");
+    if (!keys_fp || !postings_fp) {
+        fprintf(stderr, "cannot open index under %s\n", index_dir);
+        goto out;
+    }
 
-        {
-            pthread_t *tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
-            search_trigram_load_arg_t *args = (search_trigram_load_arg_t *)calloc((size_t)nw, sizeof(*args));
-            atomic_int load_err = 0;
-
-            if (!tids || !args) {
-                free(tids);
-                free(args);
-                goto out;
+    /* Locate each query trigram's posting list (offset + size) without decoding it: a single
+     * binary search per trigram.  Any trigram missing from the index means no path can match. */
+    qkeys = (trigram_key_t *)calloc(query_trigram_count, sizeof(*qkeys));
+    if (!qkeys) goto out;
+    for (size_t i = 0; i < query_trigram_count; i++) {
+        int found = find_trigram_key(keys_fp, key_count, query_trigrams[i], &qkeys[i]);
+        if (found != 0) {
+            if (found < 0) {
+                rc = 1;
+            } else {
+                if (json_output)
+                    json_print_empty_search(skip_req, limit_req, key_count, indexed_paths_corpus,
+                                            &t_search_start);
+                rc = 0;
             }
-            for (w = 0; w < nw; w++) {
-                size_t span = (query_trigram_count + (size_t)nw - 1) / (size_t)nw;
-                size_t a_lo = (size_t)w * span;
-                size_t a_hi = a_lo + span;
-                if (a_hi > query_trigram_count) a_hi = query_trigram_count;
-                args[w].keys_path = keys_path;
-                args[w].postings_path = postings_path;
-                args[w].key_count = key_count;
-                args[w].query_trigrams = query_trigrams;
-                args[w].lists = lists;
-                args[w].lo = a_lo;
-                args[w].hi = a_hi;
-                args[w].err = &load_err;
-            }
-            for (w = 0; w < nw; w++) {
-                if (pthread_create(&tids[w], NULL, search_trigram_load_worker, &args[w]) != 0) {
-                    int j;
-                    atomic_store_explicit(&load_err, 1, memory_order_relaxed);
-                    for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
-                    free(tids);
-                    free(args);
-                    goto out;
-                }
-            }
-            for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
-            free(tids);
-            free(args);
-            if (atomic_load_explicit(&load_err, memory_order_relaxed)) goto out;
-        }
-    } else {
-        keys_fp = fopen(keys_path, "rb");
-        postings_fp = fopen(postings_path, "rb");
-        if (!keys_fp || !postings_fp) {
-            fprintf(stderr, "cannot open index under %s\n", index_dir);
             goto out;
         }
-        for (size_t i = 0; i < query_trigram_count; i++) {
-            trigram_key_t key;
-            int found = find_trigram_key(keys_fp, key_count, query_trigrams[i], &key);
-            if (found != 0) {
-                if (found < 0) {
-                    rc = 1;
-                } else if (json_output) {
-                    json_print_empty_search(skip_req, limit_req, key_count, indexed_paths_corpus, &t_search_start);
-                    rc = 0;
-                } else {
-                    rc = 0;
-                }
-                goto out;
-            }
-            if (load_postings_list(postings_fp, &key, &lists[i]) != 0) goto out;
+    }
+
+    /* Intersect rarest-first.  The final substring check (path_matches_term) is authoritative,
+     * and every true match contains the whole term -- hence every query trigram -- so it appears
+     * in the rarest list and survives all intersections.  Intersecting fewer trigrams therefore
+     * only enlarges the candidate set; it never drops a match and never changes their order
+     * (lists stay ascending by path_id).  So results are byte-identical no matter where we stop,
+     * and we can skip decoding the pathologically common lists entirely. */
+    qsort(qkeys, query_trigram_count, sizeof(*qkeys), cmp_key_postings_bytes_asc);
+
+    if (load_postings_list(postings_fp, &qkeys[0], &current) != 0) goto out;
+
+    for (size_t i = 1; i < query_trigram_count && current.count > 0; i++) {
+        u64_vec_t list_i;
+
+        /* Decoding the next list costs ~postings_bytes of work; verifying the surviving
+         * candidates costs ~current.count path reads.  Once the next list dwarfs the candidate
+         * set, verifying directly is cheaper, so stop and let path_matches_term finish the job. */
+        if (qkeys[i].postings_bytes > (uint64_t)current.count * (uint64_t)SEARCH_INTERSECT_STOP_RATIO)
+            break;
+
+        if (load_postings_list(postings_fp, &qkeys[i], &list_i) != 0) {
+            free(current.ids);
+            current.ids = NULL;
+            goto out;
         }
+        if (intersect_postings(&current, &list_i, &next) != 0) {
+            free(list_i.ids);
+            free(current.ids);
+            current.ids = NULL;
+            goto out;
+        }
+        free(list_i.ids);
+        free(current.ids);
+        current = next;
+        memset(&next, 0, sizeof(next));
     }
 
     if (keys_fp) {
@@ -5552,34 +5508,8 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         fclose(postings_fp);
         postings_fp = NULL;
     }
-
-    qsort(lists, query_trigram_count, sizeof(*lists), cmp_vec_count_asc);
-    memset(&current, 0, sizeof(current));
-    memset(&next, 0, sizeof(next));
-
-    if (query_trigram_count == 0) {
-        if (json_output) json_print_empty_search(skip_req, limit_req, key_count, indexed_paths_corpus, &t_search_start);
-        rc = 0;
-        goto out;
-    }
-
-    current.ids = lists[0].ids;
-    current.count = lists[0].count;
-    current.cap = lists[0].count;
-    lists[0].ids = NULL;
-    lists[0].count = lists[0].cap = 0;
-
-    for (size_t i = 1; i < query_trigram_count; i++) {
-        if (intersect_postings(&current, &lists[i], &next) != 0) {
-            free(current.ids);
-            current.ids = NULL;
-            goto out;
-        }
-        free(current.ids);
-        current = next;
-        memset(&next, 0, sizeof(next));
-        if (current.count == 0) break;
-    }
+    free(qkeys);
+    qkeys = NULL;
 
     {
         uint64_t max_emit = json_output ? limit_req : UINT64_MAX;
@@ -5746,10 +5676,7 @@ out:
                 "ereport_index: search_ms=%" PRIu64 " (EREPORT_INDEX_THREADS=%d)\n",
                 monotonic_ms_elapsed(&t_search_start),
                 search_threads);
-    if (lists) {
-        for (size_t i = 0; i < query_trigram_count; i++) free(lists[i].ids);
-        free(lists);
-    }
+    free(qkeys);
     free(query_trigrams);
     free(lower_term);
     if (keys_fp) fclose(keys_fp);
