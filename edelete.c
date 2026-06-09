@@ -14,9 +14,10 @@
  * deepest first, without ascending above the start path or removing "/".
  *
  * Usage:
- *   ./edelete [--delete] [--force] [--verbose] <path>
- *   ./edelete [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>
+ *   ./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>
+ *   ./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>
  *
+ * Optional --uid / --gid restrict deletion to entries whose st_uid / st_gid match (both apply when set).
  * Default is dry-run (counts would_delete, no unlink). Pass --delete to be prompted (type YES), then unlink,
  * unless --force is also given (--delete --force skips the prompt).
  *
@@ -181,6 +182,10 @@ static int g_unlink_inflight = 0;
 static time_basis_t g_basis = TB_MTIME;
 static int g_age_days = 0;
 static int g_delete_all = 0;
+static int g_have_uid_filter = 0;
+static int g_have_gid_filter = 0;
+static uid_t g_filter_uid = 0;
+static gid_t g_filter_gid = 0;
 static time_t g_now = 0;
 
 #define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
@@ -354,6 +359,30 @@ static int age_eligible_seconds(time_t ts) {
     return ts <= cutoff;
 }
 
+static int ownership_eligible(const struct stat *st) {
+    if (g_have_uid_filter && st->st_uid != g_filter_uid) return 0;
+    if (g_have_gid_filter && st->st_gid != g_filter_gid) return 0;
+    return 1;
+}
+
+static int parse_id_filter(const char *label, const char *s, unsigned long *out) {
+    char *end = NULL;
+    unsigned long v;
+
+    if (!s || !*s) {
+        fprintf(stderr, "edelete: %s requires a numeric argument\n", label);
+        return -1;
+    }
+    errno = 0;
+    v = strtoul(s, &end, 10);
+    if (errno || end == s || *end) {
+        fprintf(stderr, "edelete: %s must be a non-negative integer\n", label);
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
 static char *dup_parent_dir(const char *path) {
     const char *slash;
     size_t len;
@@ -437,6 +466,50 @@ static int cmp_parent_path_desc(const void *a, const void *b) {
     return strcmp(pa, pb);
 }
 
+typedef struct {
+    char *path;
+    int depth;
+} depth_path_t;
+
+static int cmp_depth_path_desc(const void *a, const void *b) {
+    const depth_path_t *pa = (const depth_path_t *)a;
+    const depth_path_t *pb = (const depth_path_t *)b;
+
+    if (pa->depth != pb->depth) return pb->depth - pa->depth;
+    return strcmp(pa->path, pb->path);
+}
+
+/*
+ * Sort `list` of `n` path strings deepest-first (by '/'-count), then lexicographically — the order
+ * try_rmdir_chain / the scan pass need so children are removed before their parents.
+ *
+ * Computes each path's slash-count once (Schwartzian transform) instead of recomputing it on every
+ * qsort comparison; for many/deep parent dirs this removes the O(N log N · path-length) string scans
+ * that path_slash_count showed up as in profiles. On allocation failure, falls back to the in-place
+ * comparator (same order, just slower).
+ */
+static void sort_paths_deepest_first(char **list, size_t n) {
+    depth_path_t *tmp;
+    size_t i;
+
+    if (n < 2) return;
+
+    tmp = (depth_path_t *)malloc(n * sizeof(*tmp));
+    if (!tmp) {
+        qsort(list, n, sizeof(*list), cmp_parent_path_desc);
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        tmp[i].path = list[i];
+        tmp[i].depth = path_slash_count(list[i]);
+    }
+    qsort(tmp, n, sizeof(*tmp), cmp_depth_path_desc);
+    for (i = 0; i < n; i++) list[i] = tmp[i].path;
+
+    free(tmp);
+}
+
 static void stats_add_error(shared_state_t *s) {
     pthread_mutex_lock(&s->stats_mutex);
     s->total_errors++;
@@ -505,7 +578,7 @@ static void remove_empty_directories_after_delete(shared_state_t *shared, const 
         return;
     }
 
-    qsort(list, n, sizeof(*list), cmp_parent_path_desc);
+    sort_paths_deepest_first(list, n);
 
     w = 0;
     for (i = 0; i < n; i++) {
@@ -593,7 +666,7 @@ static void remove_empty_directories_scan_pass(const char *root_path, shared_sta
         return;
     }
 
-    qsort(list.paths, list.n, sizeof(*list.paths), cmp_parent_path_desc);
+    sort_paths_deepest_first(list.paths, list.n);
 
     for (i = 0; i < list.n; i++) {
         const char *p = list.paths[i];
@@ -869,6 +942,8 @@ static int try_delete_nondir(shared_state_t *shared, const char *path, const str
     if (edelete_is_forbidden_dot_entry_path(path)) return 0;
     if (S_ISDIR(st->st_mode)) return 0;
     if (g_shutdown_requested) return 0;
+
+    if (!ownership_eligible(st)) return 0;
 
     ts = pick_ts(st, g_basis);
     if (!age_eligible_seconds(ts)) return 0;
@@ -1218,6 +1293,13 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
                 basis_str,
                 age_days);
     }
+    if (g_have_uid_filter || g_have_gid_filter) {
+        fprintf(stderr, "  Ownership filter:    ");
+        if (g_have_uid_filter) fprintf(stderr, "uid=%u", (unsigned)g_filter_uid);
+        if (g_have_uid_filter && g_have_gid_filter) fprintf(stderr, " ");
+        if (g_have_gid_filter) fprintf(stderr, "gid=%u", (unsigned)g_filter_gid);
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr,
             "  Threads:             %d  (EDELETE_THREADS)\n"
             "  Max unlink inflight: %d  (EDELETE_MAX_UNLINK_INFLIGHT; 0 = unlimited)\n"
@@ -1245,10 +1327,11 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--delete] [--force] [--verbose] <path>\n"
-            "       %s [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>\n"
+            "Usage: %s [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>\n"
+            "       %s [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>\n"
             "  First form: every non-directory under <path> is eligible (still dry-run unless --delete).\n"
             "  Second form: only entries whose chosen timestamp is at least <days> full days old.\n"
+            "  --uid / --gid: optional ownership filters; both apply when set.\n"
             "  Walks in parallel without following symlinks; by default dry-run (counts would_delete, no unlink).\n"
             "  Pass <path> itself; shell globs like parent/* skip hidden names (e.g. .om2) unless matched explicitly.\n"
             "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs\n"
@@ -1288,6 +1371,32 @@ int main(int argc, char **argv) {
         if (strcmp(argv[ai], "--force") == 0) {
             g_force = 1;
             ai++;
+            continue;
+        }
+        if (strcmp(argv[ai], "--uid") == 0) {
+            unsigned long v;
+            if (ai + 1 >= argc) {
+                fprintf(stderr, "edelete: --uid requires an argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            if (parse_id_filter("--uid", argv[ai + 1], &v) != 0) return 2;
+            g_filter_uid = (uid_t)v;
+            g_have_uid_filter = 1;
+            ai += 2;
+            continue;
+        }
+        if (strcmp(argv[ai], "--gid") == 0) {
+            unsigned long v;
+            if (ai + 1 >= argc) {
+                fprintf(stderr, "edelete: --gid requires an argument\n");
+                usage(argv[0]);
+                return 2;
+            }
+            if (parse_id_filter("--gid", argv[ai + 1], &v) != 0) return 2;
+            g_filter_gid = (gid_t)v;
+            g_have_gid_filter = 1;
+            ai += 2;
             continue;
         }
         if (strcmp(argv[ai], "--help") == 0) {
@@ -1514,6 +1623,10 @@ int main(int argc, char **argv) {
                 printf("age_days=%d\n", g_age_days);
             }
             printf("force=%d\n", g_force);
+            printf("filter_uid_set=%d\n", g_have_uid_filter);
+            if (g_have_uid_filter) printf("filter_uid=%u\n", (unsigned)g_filter_uid);
+            printf("filter_gid_set=%d\n", g_have_gid_filter);
+            if (g_have_gid_filter) printf("filter_gid=%u\n", (unsigned)g_filter_gid);
             printf("mode=%s\n", g_dry_run ? "dry-run" : "delete");
             printf("start_path=%s\n", root_path);
             printf("threads=%d\n", worker_count_started);

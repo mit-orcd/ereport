@@ -128,15 +128,17 @@ Incomplete / invalid shards: `ereport` and `ereport_index` reject a shard when `
 - Same crawl parallelism pattern as `ecrawl` — task queue, worker threads, local directory stacks, and work donation so wide trees stay busy across threads.
 - Does not follow symlinks — traversal uses `lstat` / `fstatat(..., AT_SYMLINK_NOFOLLOW)`; symlink inodes can be `unlink`’d if eligible, but targets are not walked through links.
 - Deletes non-directory paths only — regular files, symlinks, FIFOs, sockets, etc.; directories are opened and enumerated, then removed with `rmdir` only after `--delete` when they become empty (deepest first, without ascending above the start path or removing `/`).
-- Default is dry-run — counts `would_delete` and prints `mode=dry-run`; `--delete` prints a summary of resolved path, filter, thread settings, and `verbose`, then requires typing `YES` on stdin before any `unlink` and empty-dir cleanup—unless `--force` is also passed (`--delete --force` skips the prompt for scripting).
+- Default is dry-run — counts `would_delete` and prints `mode=dry-run`; `--delete` prints a summary of resolved path, filter, thread settings, and `verbose`, then requires typing `YES` on stdin before any `unlink` and empty-dir cleanup—unless `--force` is also passed (`--delete --force` skips the prompt for scripting). There is no separate `--dry-run` flag: omit `--delete` to preview.
 - Live status line — rolling `entries/s(10s)` and totals on stdout (similar spirit to `ecrawl`); `--verbose` is currently parsed but does not change output.
 
 Usage:
 
 ```bash
-./edelete [--delete] [--force] [--verbose] <path>
-./edelete [--delete] [--force] [--verbose] <atime|mtime|ctime> <days> <path>
+./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>
+./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>
 ```
+
+Optional `--uid` and/or `--gid` restrict eligibility to entries whose `st_uid` / `st_gid` match; when both are set, both must match.
 
 The start path is resolved to an absolute path (`realpath(3)`). With one argument, every non-directory under `path` is eligible (still dry-run unless `--delete`). With three arguments, `days` selects entries whose chosen timestamp is at least `days × 86400` seconds older than wall-clock now.
 
@@ -156,6 +158,23 @@ Examples:
 EDELETE_THREADS=32 ./edelete --delete ctime 14 /mnt/cache/tmp
 EDELETE_MAX_UNLINK_INFLIGHT=128 ./edelete --delete atime 30 /big/tree
 ```
+
+Performance tuning — unlink contention on quota'd XFS:
+
+- On an XFS filesystem with disk quotas enabled, every `unlink(2)` must reserve and later apply quota for the file owner's dquot, all under a single per-dquot kernel mutex (`xfs_trans_dqresv` / `xfs_trans_apply_dquot_deltas`, plus `xfs_qm_dqattach` on a cold cache). When many threads delete files belonging to the **same uid/gid**, they serialize on that one mutex. In profiles this shows up as the kernel burning ~70%+ of CPU in `osq_lock` / `mutex_spin_on_owner` — i.e. spinning, not unlinking. More unlink threads then make it *slower*, not faster.
+- The lever is `EDELETE_MAX_UNLINK_INFLIGHT`: lowering it caps how many threads pile onto the dquot mutex. On a quota'd XFS deleting one owner's tree, a small cap (2–4) typically matches or beats the default with a fraction of the CPU. Keep `EDELETE_THREADS` high if you like — traversal and `fstatat` parallelize fine; it is specifically concurrent `unlink` on the same dquot that serializes.
+- Concurrency *does* help when deletions span many distinct owners (different dquots = different mutexes), or on filesystems without quotas (or non-XFS), where this contention is absent.
+- Quick sweep to find the knee on your filesystem (compare `deleted_files` ÷ `elapsed_sec`):
+
+```bash
+for n in 1 2 4 8 16; do
+  EDELETE_THREADS="$n" EDELETE_MAX_UNLINK_INFLIGHT="$n" \
+    ./edelete --delete --force <path> 2>/dev/null \
+    | awk -F= '/^deleted_files=/{d=$2} /^elapsed_sec=/{e=$2} END{printf "inflight=%s deleted=%s sec=%s rate=%.0f/s\n", "'"$n"'", d, e, e>0?d/e:0}'
+done
+```
+
+edelete does **not** auto-detect this contention or adjust concurrency on its own (see the note below on why) — it is a deliberate manual knob.
 
 Final stdout summary includes `delete_all` (`1` when the one-argument form was used), `basis` / `age_days` when the age filter is used, `force` (`1` if `--force` was passed), `mode`, scan counts, `deleted_files`, `removed_empty_dirs`, `would_delete`, `errors`, throughput metrics, and donation counters.
 
@@ -195,6 +214,7 @@ make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs all bi
 
 - `test.sh` — runs two phases:
   - Integration (always): `ecrawl` on a tiny `/tmp` tree, then `ereport` single-user (`mtime`, counts vs `ecrawl`) and all-users (incl. `distinct_uids`), then smoke tests on the same tree — `ecrawl_repair --dry-run`, `ecrawl_analyze`, `edelete` (dry-run), and `ereport_index --make` (checks `tri_keys.bin` / `paths.bin` exist).
+  - `./test.sh --edelete-only` — edelete smoke + synthetic probes only (needs `./edelete` built; skips ecrawl/ereport and filesystem correlation).
   - Filesystem correlation (only with a directory argument): one `find`/`fd` baseline — file/dir/symlink counts and unique regular-file bytes via `find %D:%i` (not `du`) — compared against `ecrawl` and against `ereport` all-users, plus `ecrawl` vs `ereport` all-users (`entries` ↔ `scanned_records`, etc.). Single-user checks are subset/consistency checks, skipped when no shard maps to that UID (uid-shard crawls omit empty shards). All checks print; any failure fails the step.
   - Notes: expect strict equality only on quiescent trees (a busy tree drifts before `ecrawl` finishes); directory counts use `find -type d` so the crawl root is included (`fd` omits it); a `find` exit status of 1 on unreadable subdirs is tolerated; `SKIP_FS=1` skips only the correlation phase; `--summary` prints a copy/paste results table. Override binaries/threads via `ECRAWL`, `EREPORT`, `ECRAWL_REPAIR`, `ECRAWL_ANALYZE`, `EDELETE`, `EREPORT_INDEX`, `ECRAWL_CRAWL_THREADS`, `EREPORT_THREADS`, `EREPORT_INDEX_THREADS`.
 - `test_setup.sh` — Removes and recreates `./test` (default: `…/ereport/test`) with a deep chain (`deep/seg001/…`), a wide branch layout (`wide/b00/…`), symlinks, hardlinks, and root files. Tune size with `DEPTH`, `BRANCHES`, `FILES_WIDE`.
