@@ -5,6 +5,7 @@
 #
 # Usage:
 #   ./test.sh                      # integration + tool smoke tests (temp tree + built binaries)
+#   ./test.sh --edelete-only       # edelete smoke + synthetic probes only (needs ./edelete built)
 #   ./test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./test.sh
@@ -341,6 +342,152 @@ edelete_synthetic_dot_dotdot_tests() {
     expect_eq "edelete dots: t7 errors" "0" "$(kv_last errors "$out")"
 
     pass "edelete synthetic (. .. argv paths, cwd ., dot-named dirs)"
+}
+
+edelete_uid_gid_filter_tests() {
+    local td_root=$1
+    local base out my_uid my_gid other_uid other_gid
+
+    base="${td_root}/edelete_uid_gid"
+    rm -rf "$base"
+    mkdir -p "$base/mixed"
+
+    my_uid=$(id -u)
+    my_gid=$(id -g)
+    other_uid=$((my_uid + 1))
+    other_gid=$((my_gid + 1))
+
+    echo mine >"${base}/mixed/mine.txt"
+    echo other >"${base}/mixed/other.txt"
+    chown "${my_uid}:${my_gid}" "${base}/mixed/mine.txt"
+    chown "${other_uid}:${other_gid}" "${base}/mixed/other.txt" 2>/dev/null || {
+        log "edelete uid/gid: skip (cannot chown to ${other_uid}:${other_gid})"
+        return 0
+    }
+
+    out="${base}/uid.stdout"
+    "$EDELETE" --delete --force --uid "$my_uid" "${base}/mixed" >"$out" 2>"${base}/uid.stderr" || die "edelete uid filter failed"
+    [[ -f "${base}/mixed/other.txt" ]] || die "edelete uid filter: other.txt should remain"
+    [[ ! -f "${base}/mixed/mine.txt" ]] || die "edelete uid filter: mine.txt should be removed"
+    expect_eq "edelete uid filter errors" "0" "$(kv_last errors "$out")"
+
+    echo mine2 >"${base}/mixed/mine2.txt"
+    echo other2 >"${base}/mixed/other2.txt"
+    chown "${my_uid}:${my_gid}" "${base}/mixed/mine2.txt"
+    chown "${other_uid}:${other_gid}" "${base}/mixed/other2.txt"
+
+    out="${base}/gid.stdout"
+    "$EDELETE" --delete --force --gid "$other_gid" "${base}/mixed" >"$out" 2>"${base}/gid.stderr" || die "edelete gid filter failed"
+    [[ -f "${base}/mixed/mine2.txt" ]] || die "edelete gid filter: mine2.txt should remain"
+    [[ ! -f "${base}/mixed/other2.txt" ]] || die "edelete gid filter: other2.txt should be removed"
+    expect_eq "edelete gid filter errors" "0" "$(kv_last errors "$out")"
+
+    echo both >"${base}/mixed/both.txt"
+    chown "${my_uid}:${other_gid}" "${base}/mixed/both.txt"
+
+    out="${base}/both.stdout"
+    "$EDELETE" --delete --force --uid "$my_uid" --gid "$other_gid" "${base}/mixed" >"$out" 2>"${base}/both.stderr" || die "edelete uid+gid filter failed"
+    [[ ! -f "${base}/mixed/both.txt" ]] || die "edelete uid+gid filter: both.txt should be removed"
+    expect_eq "edelete uid+gid filter errors" "0" "$(kv_last errors "$out")"
+
+    pass "edelete --uid / --gid ownership filters"
+}
+
+# Negative ("must not delete") invariants that need no special privileges:
+#   - symlinks are unlinked, but their targets outside the start tree are never followed/removed;
+#   - the age filter never deletes entries newer than the threshold;
+#   - --delete never ascends above the start path (siblings / parents survive).
+edelete_safety_negative_tests() {
+    local td_root=$1
+    local base out
+
+    base="${td_root}/edelete_safety"
+    rm -rf "$base"
+
+    # n1: symlinks under the start path point outside it; only the links may go, never the targets.
+    mkdir -p "${base}/n1/tree" "${base}/n1/outside/dir_keep"
+    echo keep >"${base}/n1/outside/file_keep.txt"
+    echo inner >"${base}/n1/outside/dir_keep/inner.txt"
+    ln -s ../outside/file_keep.txt "${base}/n1/tree/flink"
+    ln -s ../outside/dir_keep "${base}/n1/tree/dlink"
+    out="${base}/n1.stdout"
+    "$EDELETE" --delete --force "${base}/n1/tree" >"$out" 2>"${base}/n1.stderr" || die "edelete safety: n1 symlink walk failed"
+    [[ -f "${base}/n1/outside/file_keep.txt" ]] || die "edelete safety: n1 symlink target file must survive"
+    [[ -d "${base}/n1/outside/dir_keep" ]] || die "edelete safety: n1 symlinked dir must survive (no follow)"
+    [[ -f "${base}/n1/outside/dir_keep/inner.txt" ]] || die "edelete safety: n1 contents under symlinked dir must survive"
+    expect_eq "edelete safety: n1 errors" "0" "$(kv_last errors "$out")"
+
+    # n2: age filter must keep entries newer than the threshold (only the backdated file is eligible).
+    mkdir -p "${base}/n2/agetree"
+    echo old >"${base}/n2/agetree/old.txt"
+    echo fresh >"${base}/n2/agetree/fresh.txt"
+    if touch -d "100 days ago" "${base}/n2/agetree/old.txt" 2>/dev/null; then
+        out="${base}/n2.stdout"
+        "$EDELETE" --delete --force mtime 30 "${base}/n2/agetree" >"$out" 2>"${base}/n2.stderr" || die "edelete safety: n2 age filter failed"
+        [[ ! -f "${base}/n2/agetree/old.txt" ]] || die "edelete safety: n2 old.txt (>=30d) should be removed"
+        [[ -f "${base}/n2/agetree/fresh.txt" ]] || die "edelete safety: n2 fresh.txt (<30d) must survive"
+        expect_eq "edelete safety: n2 deleted_files" "1" "$(kv_last deleted_files "$out")"
+        expect_eq "edelete safety: n2 errors" "0" "$(kv_last errors "$out")"
+    else
+        log "edelete safety: skip n2 (touch -d not supported)"
+    fi
+
+    # n3: deleting a leaf subtree must never touch a parent file or a sibling subtree.
+    mkdir -p "${base}/n3/keep_sibling" "${base}/n3/delete_me/sub"
+    echo parent >"${base}/n3/parent_file.txt"
+    echo sib >"${base}/n3/keep_sibling/s.txt"
+    echo gone >"${base}/n3/delete_me/sub/g.txt"
+    out="${base}/n3.stdout"
+    "$EDELETE" --delete --force "${base}/n3/delete_me" >"$out" 2>"${base}/n3.stderr" || die "edelete safety: n3 containment failed"
+    [[ ! -e "${base}/n3/delete_me" ]] || die "edelete safety: n3 target subtree should be gone"
+    [[ -f "${base}/n3/parent_file.txt" ]] || die "edelete safety: n3 parent file must survive"
+    [[ -f "${base}/n3/keep_sibling/s.txt" ]] || die "edelete safety: n3 sibling subtree must survive"
+    expect_eq "edelete safety: n3 errors" "0" "$(kv_last errors "$out")"
+
+    pass "edelete safety negatives (symlink targets, age freshness, containment)"
+}
+
+# Optional args: temp dir and walk root from run_integration; when omitted, creates its own tree.
+run_edelete_tests() {
+    local td=${1:-} root_abs=${2:-}
+    local own_temp=0
+
+    if [[ -z "$td" ]]; then
+        own_temp=1
+        log "edelete test suite (synthetic tree)"
+        td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_edelete.XXXXXX")
+        cleanup_edelete() {
+            rm -rf "$td"
+        }
+        trap cleanup_edelete EXIT
+        mkdir -p "${td}/walk/sub"
+        echo hello >"${td}/walk/a.txt"
+        echo world >"${td}/walk/sub/b.txt"
+        root_abs=$(cd "${td}/walk" && pwd)
+    fi
+
+    section_int "[edelete] dry-run smoke"
+    log "edelete dry-run (synthetic walk tree)"
+    "$EDELETE" "$root_abs" >"${td}/edelete.stdout" 2>"${td}/edelete.stderr" || {
+        tail -n 40 "${td}/edelete.stderr" >&2 || true
+        die "edelete dry-run failed"
+    }
+    summary_add PASS "edelete --dry-run" "ran ok"
+
+    section_int "[edelete] synthetic . / .. path probes (--delete)"
+    edelete_synthetic_dot_dotdot_tests "$td"
+
+    section_int "[edelete] uid/gid ownership filters"
+    edelete_uid_gid_filter_tests "$td"
+
+    section_int "[edelete] safety negatives (must-not-delete invariants)"
+    edelete_safety_negative_tests "$td"
+
+    if [[ "$own_temp" == 1 ]]; then
+        trap - EXIT
+        cleanup_edelete
+        pass "edelete test suite"
+    fi
 }
 
 # --- Optional: correlate crawl totals with find/fd on a real tree (slow on huge trees) ---
@@ -734,15 +881,7 @@ run_integration() {
     grep -q '^parse_chunk_jobs=' "${td}/analyze.stdout" || die "ecrawl_analyze missing parse_chunk_jobs"
     summary_add PASS "ecrawl_analyze smoke" "banner+records_total+parse_chunk_jobs"
 
-    log "edelete dry-run (synthetic walk tree)"
-    "$EDELETE" "$root_abs" >"${td}/edelete.stdout" 2>"${td}/edelete.stderr" || {
-        tail -n 40 "${td}/edelete.stderr" >&2 || true
-        die "edelete dry-run failed"
-    }
-    summary_add PASS "edelete --dry-run" "ran ok"
-
-    section_int "[integration] edelete — synthetic . / .. path probes (--delete)"
-    edelete_synthetic_dot_dotdot_tests "$td"
+    run_edelete_tests "$td" "$root_abs"
 
     local idx_make="${td}/index_make"
     log "ereport_index --make (trigram index under ${idx_make})"
@@ -762,27 +901,42 @@ run_integration() {
 
 # --- main ---
 ROOT=""
+EDELETE_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --summary) SUMMARY=1 ;;
+        --edelete-only) EDELETE_ONLY=1 ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [--summary] [/path/to/tree]
-  --summary   collect results into copy/paste-friendly box tables (Metrics + Checks)
-              printed at the end (no ANSI; pastes into slides / screenshots cleanly).
-  /path/...   optional crawl root for filesystem correlation (SKIP_FS=1 to skip).
+Usage: $0 [--summary] [--edelete-only] [/path/to/tree]
+  --summary       collect results into copy/paste-friendly box tables (Metrics + Checks)
+                  printed at the end (no ANSI; pastes into slides / screenshots cleanly).
+  --edelete-only  run edelete smoke + synthetic probes only (requires ./edelete; no ecrawl/ereport).
+  /path/...       optional crawl root for filesystem correlation (SKIP_FS=1 to skip).
 EOF
             exit 0
             ;;
+        -*) die "unknown option: $arg (try --help)" ;;
         *) ROOT="$arg" ;;
     esac
 done
+
+if [[ "$EDELETE_ONLY" == 1 && -n "$ROOT" ]]; then
+    die "--edelete-only cannot be combined with a filesystem correlation root path"
+fi
 
 # In --summary mode, mute the per-check chatter on stdout (the table is emitted
 # to fd 3 at the end); FAIL lines and fatal errors still go to stderr.
 run_phase() {
     if [[ "$SUMMARY" == 1 ]]; then "$@" >/dev/null; else "$@"; fi
 }
+
+if [[ "$EDELETE_ONLY" == 1 ]]; then
+    need_exe "$EDELETE"
+    run_phase run_edelete_tests
+    render_summary
+    exit $(( SUMMARY_FAILS > 0 ? 1 : 0 ))
+fi
 
 need_exe "$ECRAWL"
 need_exe "$EREPORT"
