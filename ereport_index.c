@@ -41,7 +41,24 @@
 #endif
 
 #define INDEX_VERSION 1
+/*
+ * Top bits of the 24-bit trigram used to partition records into tmp_trigrams_<bucket>_w<shard>.bin
+ * during the index phase, and into one merge segment per bucket during the merge phase.
+ *
+ * Finer partitions (more bits) would shrink the hottest merge bucket, but they are NOT viable with the
+ * current per-(worker × bucket) tmp-file design: each trigram worker keeps at most ~499 shard FILE*s
+ * open (fd budget) as an LRU cache. At 12 bits (4096 buckets) consecutive paths' trigrams reuse an
+ * overlapping subset of buckets, so the cache hits and open/close churn stays low. At 16 bits (65536
+ * buckets) each path's ~150 trigrams scatter across buckets with almost no cross-path reuse, so the
+ * cache thrashes: ~150 cold fopen+fclose per path × billions of paths, serialized on glibc's global
+ * open-file-list lock (_IO_list_lock). A 16-bit experiment spent 81% of cycles in fclose/__IO_un_link
+ * and was ~13× slower in the index phase. So keep this at 12; pursue merge parallelism by splitting
+ * hot buckets WITHIN the merge phase instead of by finer global bucketing.
+ * Overridable at compile time (e.g. -DTRIGRAM_BUCKET_BITS=14) only for experiments.
+ */
+#ifndef TRIGRAM_BUCKET_BITS
 #define TRIGRAM_BUCKET_BITS 12
+#endif
 #define TRIGRAM_BUCKET_COUNT (1U << TRIGRAM_BUCKET_BITS)
 #define DEFAULT_THREADS 32
 /* LRU ceiling per trigram worker when EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS is unset. */
@@ -355,6 +372,11 @@ typedef struct {
     uint32_t *tw_worker_open_count; /* [trigram_tmp_shard_count] */
     uint32_t tw_worker_max_open;
     uint64_t *tw_worker_lru_next_tick; /* [trigram_tmp_shard_count] — per-worker LRU clock (no atomics). */
+    /* Compact list of currently-open bucket ids per worker so LRU-victim search is O(max_open), not
+     * O(TRIGRAM_BUCKET_COUNT). tw_worker_open_list is [trigram_tmp_shard_count * tw_worker_max_open];
+     * tw_worker_list_pos[ix] holds the index of bucket within its worker's open_list (valid only while open). */
+    uint32_t *tw_worker_open_list;
+    uint32_t *tw_worker_list_pos; /* [trigram_tmp_shard_count * TRIGRAM_BUCKET_COUNT] */
     index_run_stats_t *run_stats;
     int merge_workers_used;
     int merge_workers_cpu; /* before memory cap */
@@ -2291,11 +2313,15 @@ static size_t tw_worker_fp_ix(uint32_t wid, uint32_t bucket) {
 }
 
 static uint32_t tw_worker_pick_lru_victim(const build_ctx_t *ctx, uint32_t wid, uint32_t exclude) {
-    uint32_t b, best = UINT32_MAX;
+    uint32_t k, best = UINT32_MAX;
     uint64_t best_age = 0;
     int found = 0;
+    size_t base = (size_t)wid * (size_t)ctx->tw_worker_max_open;
+    uint32_t cnt = ctx->tw_worker_open_count[wid];
 
-    for (b = 0; b < TRIGRAM_BUCKET_COUNT; b++) {
+    /* Scan only this worker's open buckets (O(open) ≤ max_open), not all TRIGRAM_BUCKET_COUNT slots. */
+    for (k = 0; k < cnt; k++) {
+        uint32_t b = ctx->tw_worker_open_list[base + k];
         size_t ix;
 
         if (b == exclude) continue;
@@ -2337,6 +2363,9 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
     if (shard_count < 1U) shard_count = 1U;
     ctx->trigram_tmp_shard_count = shard_count;
 
+    gmax = compute_max_open_trigram_buckets();
+    ctx->tw_worker_max_open = compute_tw_worker_max_open(shard_count, gmax);
+
     ctx->tw_worker_fp = (FILE **)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(FILE *));
     ctx->tw_worker_fp_magic = (uint8_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint8_t));
     ctx->tw_worker_buf = (trigram_record_t **)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(trigram_record_t *));
@@ -2344,8 +2373,11 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
     ctx->tw_worker_lru_age = (uint64_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint64_t));
     ctx->tw_worker_open_count = (uint32_t *)calloc((size_t)shard_count, sizeof(uint32_t));
     ctx->tw_worker_lru_next_tick = (uint64_t *)calloc((size_t)shard_count, sizeof(uint64_t));
+    ctx->tw_worker_open_list = (uint32_t *)calloc((size_t)shard_count * (size_t)ctx->tw_worker_max_open, sizeof(uint32_t));
+    ctx->tw_worker_list_pos = (uint32_t *)calloc((size_t)shard_count * (size_t)TRIGRAM_BUCKET_COUNT, sizeof(uint32_t));
     if (!ctx->tw_worker_fp || !ctx->tw_worker_fp_magic || !ctx->tw_worker_buf || !ctx->tw_worker_buf_n ||
-        !ctx->tw_worker_lru_age || !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick) {
+        !ctx->tw_worker_lru_age || !ctx->tw_worker_open_count || !ctx->tw_worker_lru_next_tick ||
+        !ctx->tw_worker_open_list || !ctx->tw_worker_list_pos) {
         free(ctx->tw_worker_fp);
         free(ctx->tw_worker_fp_magic);
         free(ctx->tw_worker_buf);
@@ -2353,6 +2385,8 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
         free(ctx->tw_worker_lru_age);
         free(ctx->tw_worker_open_count);
         free(ctx->tw_worker_lru_next_tick);
+        free(ctx->tw_worker_open_list);
+        free(ctx->tw_worker_list_pos);
         ctx->tw_worker_fp = NULL;
         ctx->tw_worker_fp_magic = NULL;
         ctx->tw_worker_buf = NULL;
@@ -2360,12 +2394,12 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
         ctx->tw_worker_lru_age = NULL;
         ctx->tw_worker_open_count = NULL;
         ctx->tw_worker_lru_next_tick = NULL;
+        ctx->tw_worker_open_list = NULL;
+        ctx->tw_worker_list_pos = NULL;
         ctx->trigram_tmp_shard_count = 0;
         return -1;
     }
 
-    gmax = compute_max_open_trigram_buckets();
-    ctx->tw_worker_max_open = compute_tw_worker_max_open(shard_count, gmax);
     if (g_verbose) {
         fprintf(stderr,
                 "ereport_index: tmp_trigram shard writers=%u max_open_per_shard=%u (EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS=%u)\n",
@@ -2415,8 +2449,19 @@ static int tw_worker_close_ix(build_ctx_t *ctx, uint32_t worker_id, size_t ix) {
     free(ctx->tw_worker_buf[ix]);
     ctx->tw_worker_buf[ix] = NULL;
     ctx->tw_worker_buf_n[ix] = 0;
-    if (ctx->tw_worker_open_count && ctx->tw_worker_open_count[worker_id] > 0)
+    if (ctx->tw_worker_open_count && ctx->tw_worker_open_count[worker_id] > 0) {
+        /* Swap-remove this bucket from the worker's open list to keep it dense (and the victim scan O(open)). */
+        if (ctx->tw_worker_open_list && ctx->tw_worker_list_pos) {
+            size_t base = (size_t)worker_id * (size_t)ctx->tw_worker_max_open;
+            uint32_t pos = ctx->tw_worker_list_pos[ix];
+            uint32_t last = ctx->tw_worker_open_count[worker_id] - 1U;
+            uint32_t moved = ctx->tw_worker_open_list[base + last];
+
+            ctx->tw_worker_open_list[base + pos] = moved;
+            ctx->tw_worker_list_pos[tw_worker_fp_ix(worker_id, moved)] = pos;
+        }
         ctx->tw_worker_open_count[worker_id]--;
+    }
     return rc;
 }
 
@@ -2450,6 +2495,10 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     ctx->tw_worker_open_count = NULL;
     free(ctx->tw_worker_lru_next_tick);
     ctx->tw_worker_lru_next_tick = NULL;
+    free(ctx->tw_worker_open_list);
+    ctx->tw_worker_open_list = NULL;
+    free(ctx->tw_worker_list_pos);
+    ctx->tw_worker_list_pos = NULL;
     /* trigram_tmp_shard_count kept for merge phase (merge_load uses worker shard paths). */
 }
 
@@ -2511,6 +2560,12 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
         }
         ctx->bucket_nonempty[bucket] = 1;
         ctx->tw_worker_fp[ix] = fp;
+        {
+            size_t base = (size_t)worker_id * (size_t)ctx->tw_worker_max_open;
+            uint32_t pos = ctx->tw_worker_open_count[worker_id];
+            ctx->tw_worker_open_list[base + pos] = bucket;
+            ctx->tw_worker_list_pos[ix] = pos;
+        }
         ctx->tw_worker_open_count[worker_id]++;
     }
 
@@ -3814,8 +3869,8 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     char key_path[PATH_MAX], postings_path[PATH_MAX];
     FILE *keys_fp = NULL;
     FILE *postings_fp = NULL;
-    uint32_t need_merge[TRIGRAM_BUCKET_COUNT];
-    uint32_t stitch_buckets[TRIGRAM_BUCKET_COUNT];
+    uint32_t *need_merge = NULL;
+    uint32_t *stitch_buckets = NULL;
     uint32_t *parallel_list = NULL;
     size_t n_need;
     size_t n_stitch = 0;
@@ -3841,6 +3896,13 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
         build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0)
         return -1;
 
+    need_merge = (uint32_t *)malloc((size_t)TRIGRAM_BUCKET_COUNT * sizeof(uint32_t));
+    stitch_buckets = (uint32_t *)malloc((size_t)TRIGRAM_BUCKET_COUNT * sizeof(uint32_t));
+    if (!need_merge || !stitch_buckets) {
+        fprintf(stderr, "ereport_index: resume-merge: out of memory allocating bucket lists\n");
+        goto out;
+    }
+
     n_need = merge_resume_list_tmp_buckets(ctx, need_merge, TRIGRAM_BUCKET_COUNT);
     {
         struct stat st_tri;
@@ -3850,7 +3912,7 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
             fprintf(stderr,
                     "ereport_index: cannot resume-merge: tmp_trigrams_*.bin remain but tri_keys.bin exists and there are "
                     "no merge_seg_*.bin files (merge used the single-thread path). Re-run a full `ereport_index --make`.\n");
-            return -1;
+            goto out;
         }
     }
 
@@ -3998,6 +4060,8 @@ out:
     ctx->merge_bytes_tri_postings_written = postings_fp ? (uint64_t)ftello(postings_fp) : 0U;
     free(parallel_list);
     parallel_list = NULL;
+    free(need_merge);
+    free(stitch_buckets);
     if (keys_fp) mk_fclose(keys_fp);
     if (postings_fp) mk_fclose(postings_fp);
     if (rc == 0) return 0;
