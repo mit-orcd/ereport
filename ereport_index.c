@@ -782,6 +782,7 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
     {
         size_t cap = 4096;
         size_t n = 0;
+        unsigned frame_idx = 0;
         trigram_record_t *recs = (trigram_record_t *)malloc(cap * sizeof(*recs));
 
         if (!recs) {
@@ -795,6 +796,7 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
 
             if (r == 0) break;
             if (r != 4 || tmp_trigram_read_exact_fd(fd, &clen, 4) != 0) {
+                fprintf(stderr, "  %s: truncated frame header at frame %u (file ends mid-write)\n", path, frame_idx);
                 free(recs);
                 close(fd);
                 return -1;
@@ -811,6 +813,8 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
                     return -1;
                 }
                 if (tmp_trigram_read_exact_fd(fd, comp, (size_t)clen) != 0) {
+                    fprintf(stderr, "  %s: short read of compressed frame %u (%u bytes, file truncated)\n", path,
+                            frame_idx, clen);
                     free(comp);
                     free(recs);
                     close(fd);
@@ -836,13 +840,23 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
                 }
                 dec = ZSTD_decompress(recs + n, src_bytes, comp, (size_t)clen);
                 free(comp);
-                if (ZSTD_isError(dec) || dec != src_bytes) {
+                if (ZSTD_isError(dec)) {
+                    fprintf(stderr, "  %s: zstd decompress error at frame %u: %s (corrupt frame)\n", path, frame_idx,
+                            ZSTD_getErrorName(dec));
+                    free(recs);
+                    close(fd);
+                    return -1;
+                }
+                if (dec != src_bytes) {
+                    fprintf(stderr, "  %s: frame %u decompressed %zu bytes, expected %zu (corrupt frame)\n", path,
+                            frame_idx, dec, src_bytes);
                     free(recs);
                     close(fd);
                     return -1;
                 }
                 n += (size_t)frame_n;
             }
+            frame_idx++;
         }
         close(fd);
         if (recs_out) *recs_out = recs;
@@ -3098,21 +3112,33 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))
             return -1;
         if (stat(path, &st) != 0 || st.st_size == 0) continue;
-        if (tmp_trigram_count_file_records(path, &nrec, &ubytes) != 0) return -1;
+        if (tmp_trigram_count_file_records(path, &nrec, &ubytes) != 0) {
+            fprintf(stderr, "ereport_index: merge bucket %04u: cannot count records in %s (corrupt/truncated tmp file?)\n",
+                    bucket, path);
+            return -1;
+        }
         total_bytes += ubytes;
         total_n += nrec;
     }
 
-    if (total_n == 0) return -1;
+    if (total_n == 0) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: tmp_trigrams present but 0 records counted\n", bucket);
+        return -1;
+    }
 
     buf = (unsigned char *)malloc(total_n * sizeof(trigram_record_t));
-    if (!buf) return -1;
+    if (!buf) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: malloc failed for %zu records (%.2f GiB)\n", bucket, total_n,
+                (double)(total_n * sizeof(trigram_record_t)) / (1024.0 * 1024.0 * 1024.0));
+        return -1;
+    }
 
     if (stat(leg, &st) == 0 && st.st_size > 0) {
         trigram_record_t *recs = NULL;
         size_t nrec = 0;
 
         if (tmp_trigram_load_file(leg, &recs, &nrec, NULL) != 0) {
+            fprintf(stderr, "ereport_index: merge bucket %04u: failed to load %s\n", bucket, leg);
             free(buf);
             return -1;
         }
@@ -3130,6 +3156,7 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
         }
         if (stat(path, &st) != 0 || st.st_size == 0) continue;
         if (tmp_trigram_load_file(path, &recs, &nrec, NULL) != 0) {
+            fprintf(stderr, "ereport_index: merge bucket %04u: failed to load %s\n", bucket, path);
             free(buf);
             return -1;
         }
@@ -3437,6 +3464,8 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     }
     aux = (trigram_record_t *)malloc(L.n * sizeof(*aux));
     if (!aux) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: malloc failed for radix aux (%zu records, %.2f GiB)\n",
+                bucket, L.n, (double)(L.n * sizeof(*aux)) / (1024.0 * 1024.0 * 1024.0));
         merge_loaded_bucket_destroy(&L);
         return -1;
     }
@@ -3445,19 +3474,29 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
 
     kf = mk_fopen(kseg, "wb");
     pf = mk_fopen(pseg, "wb");
-    if (!kf || !pf) goto err;
+    if (!kf || !pf) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: cannot open segment file %s: %s\n", bucket, kf ? pseg : kseg,
+                strerror(errno));
+        goto err;
+    }
     if (setvbuf(kf, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
     if (setvbuf(pf, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    if (write_sorted_bucket_records(kf, pf, L.records, L.n, &u) != 0) goto err;
+    if (write_sorted_bucket_records(kf, pf, L.records, L.n, &u) != 0) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: write failed (%s; disk full or RLIMIT_FSIZE?)\n", bucket,
+                strerror(errno));
+        goto err;
+    }
     if (mk_fclose(kf) != 0) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: close %s failed: %s\n", bucket, kseg, strerror(errno));
         kf = NULL;
         goto err;
     }
     kf = NULL;
     if (mk_fclose(pf) != 0) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: close %s failed: %s\n", bucket, pseg, strerror(errno));
         pf = NULL;
         goto err;
     }
@@ -3783,6 +3822,12 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
         }
     }
 
+    if (g_verbose) {
+        merge_ctx_ensure_trigram_shard_count(ctx);
+        fprintf(stderr, "ereport_index: resume-merge: %zu tmp_trigram bucket(s) to merge, tmp shard writers=%u\n", n_need,
+                ctx->trigram_tmp_shard_count);
+    }
+
     unlink(key_path);
     unlink(postings_path);
     merge_unlink_orphan_segment_halves(ctx);
@@ -3878,6 +3923,7 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
             free(needs);
 
             if (atomic_load(&mp.failed)) {
+                fprintf(stderr, "ereport_index: resume-merge: a parallel tmp\u2192seg worker failed (see bucket error above)\n");
                 for (bi = 0; bi < n_need; bi++) merge_unlink_segment_pair(ctx, need_merge[bi]);
                 goto out;
             }
@@ -3886,17 +3932,27 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
         }
     }
 
-    if (merge_list_segment_bucket_ids(ctx, stitch_buckets, &n_stitch, TRIGRAM_BUCKET_COUNT) != 0) goto out;
+    if (merge_list_segment_bucket_ids(ctx, stitch_buckets, &n_stitch, TRIGRAM_BUCKET_COUNT) != 0) {
+        fprintf(stderr, "ereport_index: resume-merge: failed to list merge_seg_*.bin segments in %s\n", ctx->index_dir);
+        goto out;
+    }
 
     keys_fp = mk_fopen(key_path, "wb");
     postings_fp = mk_fopen(postings_path, "wb");
-    if (!keys_fp || !postings_fp) goto out;
+    if (!keys_fp || !postings_fp) {
+        fprintf(stderr, "ereport_index: resume-merge: cannot create %s: %s\n", keys_fp ? postings_path : key_path,
+                strerror(errno));
+        goto out;
+    }
     if (setvbuf(keys_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
     if (setvbuf(postings_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    if (merge_stitch_segments(ctx, stitch_buckets, n_stitch, keys_fp, postings_fp, &unique_trigrams) != 0) goto out;
+    if (merge_stitch_segments(ctx, stitch_buckets, n_stitch, keys_fp, postings_fp, &unique_trigrams) != 0) {
+        fprintf(stderr, "ereport_index: resume-merge: stitch of %zu segments failed (%s)\n", n_stitch, strerror(errno));
+        goto out;
+    }
     rc = 0;
 
 out:
