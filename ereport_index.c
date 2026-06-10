@@ -199,6 +199,18 @@ static int set_path_rewrite(const char *arg) {
 #define TRIGRAM_TMP_FRAME_RECORDS (TRIGRAM_TMP_FRAME_BYTES / sizeof(trigram_record_t))
 #define MERGE_MAX_WORKERS 16
 #define MERGE_PARALLEL_MIN 4
+/*
+ * Within-bucket parallel sort: a single hot bucket (tens of GiB) is otherwise radix-sorted by one
+ * thread while the other merge workers idle (RAM admission blocks them), so the merge wall is pinned
+ * to that serial tail. Buckets with at least this many records use a parallel MSD-partition + parallel
+ * per-partition radix sort that borrows idle merge threads from a shared budget. Small buckets keep the
+ * single-threaded path (they already run concurrently across workers). The output is byte-identical to
+ * the serial radix sort. */
+#define MERGE_PARALLEL_SORT_MIN_RECORDS (8ULL << 20)
+/* Target records per sort thread: keeps small buckets from spawning many threads for trivial work. */
+#define MERGE_RECORDS_PER_SORT_THREAD (4ULL << 20)
+/* MSD partition fan-out (one byte). */
+#define MERGE_SORT_PARTITIONS 256
 /* Each parallel merge worker holds ~2× bucket file bytes (mmap + radix aux) plus stdio buffers — cap workers to avoid OOM. */
 #define MERGE_PER_WORKER_OVERHEAD_BYTES (16ULL << 20)
 /* Fraction of min(MemAvailable, cgroup memory.max) used as the merge anonymous-RAM budget (sum of
@@ -382,6 +394,11 @@ typedef struct {
     int merge_workers_cpu; /* before memory cap */
     uint64_t merge_max_bucket_bytes;
     uint64_t merge_parallel_budget_bytes;
+    /* Shared budget of idle CPU threads a worker may borrow to parallel-sort a hot bucket. While a huge
+     * bucket sorts, the other merge workers are blocked in RAM admission, so their cores are free. */
+    pthread_mutex_t merge_thr_mu;
+    int merge_thr_free;
+    int merge_sort_threads_max; /* per-bucket cap (default ncpu, env override) */
     double index_phase_sec;
     int index_workers_used;
     int trigram_writer_workers_used;
@@ -2057,6 +2074,215 @@ static void radix_sort_trigram_records(trigram_record_t *records, size_t n, trig
     if (in != records) memcpy(records, in, n * sizeof(*records));
 }
 
+/*
+ * Parallel sort of one bucket's records. Strategy: one MSD counting-sort pass on the most-significant
+ * byte that actually varies across the bucket (trigram bytes dominate path_id bytes in the sort order),
+ * which splits the records into up to 256 contiguous, key-ordered partitions; then each partition is
+ * radix-sorted independently by a pool of threads (work-stolen by partition). count, scatter and the
+ * final copyback are also parallelized over disjoint record ranges, so essentially all of the sort runs
+ * in parallel. Concatenating the sorted partitions in partition order reproduces the exact global
+ * (trigram, path_id) order — output is byte-identical to radix_sort_trigram_records().
+ */
+typedef struct {
+    const trigram_record_t *src; /* count/scatter: input; copyback: source (aux) */
+    trigram_record_t *dst;       /* scatter: aux; copyback: records */
+    size_t begin;
+    size_t end;
+    int mp;        /* MSD pass index */
+    int pid_bytes;
+    size_t hist[256];  /* count output */
+    size_t woff[256];  /* scatter write-offset base (per partition) */
+} psort_range_arg_t;
+
+typedef struct {
+    trigram_record_t *part_base;    /* aux (partitioned data) */
+    trigram_record_t *scratch_base; /* records (per-partition radix scratch) */
+    const size_t *part_start;
+    const size_t *part_count;
+    atomic_uint *cursor;
+} psort_part_arg_t;
+
+static void *psort_count_worker(void *v) {
+    psort_range_arg_t *a = (psort_range_arg_t *)v;
+    size_t i;
+
+    memset(a->hist, 0, sizeof(a->hist));
+    for (i = a->begin; i < a->end; i++)
+        a->hist[trigram_record_radix_byte(&a->src[i], a->mp, a->pid_bytes)]++;
+    return NULL;
+}
+
+static void *psort_scatter_worker(void *v) {
+    psort_range_arg_t *a = (psort_range_arg_t *)v;
+    size_t off[256];
+    size_t i;
+
+    memcpy(off, a->woff, sizeof(off));
+    for (i = a->begin; i < a->end; i++) {
+        unsigned b = trigram_record_radix_byte(&a->src[i], a->mp, a->pid_bytes);
+        a->dst[off[b]++] = a->src[i];
+    }
+    return NULL;
+}
+
+static void *psort_copyback_worker(void *v) {
+    psort_range_arg_t *a = (psort_range_arg_t *)v;
+
+    if (a->end > a->begin)
+        memcpy(a->dst + a->begin, a->src + a->begin, (a->end - a->begin) * sizeof(trigram_record_t));
+    return NULL;
+}
+
+static void *psort_partition_worker(void *v) {
+    psort_part_arg_t *a = (psort_part_arg_t *)v;
+
+    for (;;) {
+        unsigned p = atomic_fetch_add_explicit(a->cursor, 1U, memory_order_relaxed);
+
+        if (p >= (unsigned)MERGE_SORT_PARTITIONS) break;
+        if (a->part_count[p] >= 2)
+            radix_sort_trigram_records(a->part_base + a->part_start[p], a->part_count[p],
+                                       a->scratch_base + a->part_start[p]);
+    }
+    return NULL;
+}
+
+/* Spawn workers over T equal ranges of [0,n) running fn(&args[t]); the caller's thread runs range 0. */
+static void psort_run_ranges(void *(*fn)(void *), psort_range_arg_t *args, int T, pthread_t *tids) {
+    int t, spawned = 0;
+
+    for (t = 1; t < T; t++) {
+        if (pthread_create(&tids[t], NULL, fn, &args[t]) != 0) break;
+        spawned = t;
+    }
+    fn(&args[0]);
+    for (t = 1; t <= spawned; t++) pthread_join(tids[t], NULL);
+    /* If a spawn failed mid-way, run the remaining ranges inline (correctness over parallelism). */
+    for (t = spawned + 1; t < T; t++) fn(&args[t]);
+}
+
+static void parallel_radix_sort_trigram_records(trigram_record_t *records, size_t n, trigram_record_t *aux,
+                                                int nthreads) {
+    uint64_t pid_or = 0, pid_and = ~0ULL;
+    uint32_t tri_or = 0, tri_and = ~0U;
+    uint64_t pid_diff;
+    uint32_t tri_diff;
+    int pid_bytes = 1, tri_bytes = 1, total_passes, p, mp = -1;
+    int T, t;
+    size_t i;
+    psort_range_arg_t *args = NULL;
+    pthread_t *tids = NULL;
+    size_t cnt[256];
+    size_t start[256];
+    size_t running[256];
+    psort_part_arg_t parg;
+    atomic_uint cursor;
+
+    if (nthreads <= 1 || n < MERGE_PARALLEL_SORT_MIN_RECORDS) {
+        radix_sort_trigram_records(records, n, aux);
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        pid_or |= records[i].path_id;
+        pid_and &= records[i].path_id;
+        tri_or |= records[i].trigram;
+        tri_and &= records[i].trigram;
+    }
+    while (pid_bytes < 8 && (pid_or >> (pid_bytes * 8)) != 0) pid_bytes++;
+    while (tri_bytes < 4 && (tri_or >> (tri_bytes * 8)) != 0) tri_bytes++;
+    total_passes = pid_bytes + tri_bytes;
+    pid_diff = pid_or ^ pid_and;
+    tri_diff = tri_or ^ tri_and;
+
+    /* Most-significant pass whose byte actually varies (trigram bytes are the high passes). */
+    for (p = total_passes - 1; p >= 0; p--) {
+        unsigned char d;
+
+        if (p >= pid_bytes)
+            d = (unsigned char)((tri_diff >> ((p - pid_bytes) * 8)) & 0xFFU);
+        else
+            d = (unsigned char)((pid_diff >> (p * 8)) & 0xFFULL);
+        if (d) { mp = p; break; }
+    }
+    if (mp < 0) return; /* all records identical: any order is correct */
+
+    T = nthreads;
+    if ((size_t)T > n) T = (int)n;
+    if (T < 1) T = 1;
+
+    args = (psort_range_arg_t *)malloc((size_t)T * sizeof(*args));
+    tids = (pthread_t *)malloc((size_t)T * sizeof(*tids));
+    if (!args || !tids) {
+        free(args);
+        free(tids);
+        radix_sort_trigram_records(records, n, aux);
+        return;
+    }
+
+    for (t = 0; t < T; t++) {
+        args[t].src = records;
+        args[t].dst = aux;
+        args[t].begin = (size_t)((double)n * t / T);
+        args[t].end = (size_t)((double)n * (t + 1) / T);
+        args[t].mp = mp;
+        args[t].pid_bytes = pid_bytes;
+    }
+    args[T - 1].end = n;
+
+    /* 1. parallel count of the MSD byte */
+    psort_run_ranges(psort_count_worker, args, T, tids);
+
+    /* 2. global partition offsets + per-thread scatter write offsets (serial, 256*T) */
+    memset(cnt, 0, sizeof(cnt));
+    for (t = 0; t < T; t++) {
+        int v;
+        for (v = 0; v < 256; v++) cnt[v] += args[t].hist[v];
+    }
+    start[0] = 0;
+    for (i = 1; i < 256; i++) start[i] = start[i - 1] + cnt[i - 1];
+    {
+        int v;
+        for (v = 0; v < 256; v++) running[v] = start[v];
+        for (t = 0; t < T; t++) {
+            for (v = 0; v < 256; v++) {
+                args[t].woff[v] = running[v];
+                running[v] += args[t].hist[v];
+            }
+        }
+    }
+
+    /* 3. parallel scatter records -> aux (each thread writes disjoint slots) */
+    psort_run_ranges(psort_scatter_worker, args, T, tids);
+
+    /* 4. parallel per-partition radix sort (aux in place, records as scratch) */
+    atomic_init(&cursor, 0);
+    parg.part_base = aux;
+    parg.scratch_base = records;
+    parg.part_start = start;
+    parg.part_count = cnt;
+    parg.cursor = &cursor;
+    {
+        int spawned = 0;
+        for (t = 1; t < T; t++) {
+            if (pthread_create(&tids[t], NULL, psort_partition_worker, &parg) != 0) break;
+            spawned = t;
+        }
+        psort_partition_worker(&parg);
+        for (t = 1; t <= spawned; t++) pthread_join(tids[t], NULL);
+    }
+
+    /* 5. parallel copyback aux -> records */
+    for (t = 0; t < T; t++) {
+        args[t].src = aux;
+        args[t].dst = records;
+    }
+    psort_run_ranges(psort_copyback_worker, args, T, tids);
+
+    free(args);
+    free(tids);
+}
+
 /* Postings flush buffer. The per-delta path used to call fwrite ~once per posting (~100B calls on a 1B-path
  * corpus); buffering the varints and flushing in MiB chunks removes that per-call overhead. Offsets are
  * tracked with a local counter (postings_pos) instead of ftello() since bytes may be unflushed. */
@@ -3525,11 +3751,89 @@ static void merge_unlink_orphan_segment_halves(const build_ctx_t *ctx) {
     }
 }
 
+/*
+ * Set up the within-bucket parallel-sort thread budget. The merge worker pool is capped at
+ * MERGE_MAX_WORKERS, but the host typically has many more cores; while a giant bucket sorts, the other
+ * workers are blocked in RAM admission, so the sort may borrow up to the full core count. Default cap
+ * and pool size = online CPUs; override the per-bucket cap with EREPORT_INDEX_MERGE_SORT_THREADS.
+ */
+static void merge_init_thread_budget(build_ctx_t *ctx, long ncpu_real) {
+    long maxt = ncpu_real;
+    const char *e = getenv("EREPORT_INDEX_MERGE_SORT_THREADS");
+
+    if (e && *e) {
+        char *end;
+        long v;
+
+        errno = 0;
+        v = strtol(e, &end, 10);
+        if (!errno && end != e && !*end && v >= 1 && v <= 4096) maxt = v;
+    }
+    if (maxt < 1) maxt = 1;
+    if (maxt > 4096) maxt = 4096;
+    pthread_mutex_init(&ctx->merge_thr_mu, NULL);
+    ctx->merge_sort_threads_max = (int)maxt;
+    ctx->merge_thr_free = (int)(ncpu_real < 1 ? 1 : ncpu_real);
+}
+
+static void merge_destroy_thread_budget(build_ctx_t *ctx) {
+    pthread_mutex_destroy(&ctx->merge_thr_mu);
+}
+
+/* Borrow up to `want` idle CPU threads from the shared merge budget; returns the number granted. */
+static int merge_thr_acquire(build_ctx_t *ctx, int want) {
+    int got;
+
+    if (want <= 0) return 0;
+    pthread_mutex_lock(&ctx->merge_thr_mu);
+    got = ctx->merge_thr_free < want ? ctx->merge_thr_free : want;
+    if (got < 0) got = 0;
+    ctx->merge_thr_free -= got;
+    pthread_mutex_unlock(&ctx->merge_thr_mu);
+    return got;
+}
+
+static void merge_thr_release(build_ctx_t *ctx, int n) {
+    if (n <= 0) return;
+    pthread_mutex_lock(&ctx->merge_thr_mu);
+    ctx->merge_thr_free += n;
+    pthread_mutex_unlock(&ctx->merge_thr_mu);
+}
+
+/*
+ * Allocate the radix aux buffer and sort one loaded bucket. Large buckets borrow idle merge threads
+ * (the others are blocked in RAM admission while a giant bucket is resident) and sort in parallel;
+ * small buckets sort single-threaded. Returns 0 on success, -1 on aux alloc failure.
+ */
+static int merge_sort_loaded_bucket(build_ctx_t *ctx, merge_loaded_bucket_t *L) {
+    trigram_record_t *aux;
+    int got = 0, threads = 1;
+
+    if (L->n >= MERGE_PARALLEL_SORT_MIN_RECORDS && ctx->merge_sort_threads_max > 1) {
+        uint64_t want64 = L->n / MERGE_RECORDS_PER_SORT_THREAD;
+        int want = (int)(want64 > (uint64_t)ctx->merge_sort_threads_max ? (uint64_t)ctx->merge_sort_threads_max
+                                                                        : want64);
+
+        if (want > 1) {
+            got = merge_thr_acquire(ctx, want - 1);
+            threads = 1 + got;
+        }
+    }
+    aux = (trigram_record_t *)malloc(L->n * sizeof(*aux));
+    if (!aux) {
+        merge_thr_release(ctx, got);
+        return -1;
+    }
+    parallel_radix_sort_trigram_records(L->records, L->n, aux, threads);
+    free(aux);
+    merge_thr_release(ctx, got);
+    return 0;
+}
+
 static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merge_parallel_arg_t *accum) {
     char kseg[PATH_MAX];
     char pseg[PATH_MAX];
     merge_loaded_bucket_t L;
-    trigram_record_t *aux = NULL;
     FILE *kf = NULL;
     FILE *pf = NULL;
     uint64_t u = 0;
@@ -3549,15 +3853,12 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
                 break;
         }
     }
-    aux = (trigram_record_t *)malloc(L.n * sizeof(*aux));
-    if (!aux) {
+    if (merge_sort_loaded_bucket(ctx, &L) != 0) {
         fprintf(stderr, "ereport_index: merge bucket %04u: malloc failed for radix aux (%zu records, %.2f GiB)\n",
-                bucket, L.n, (double)(L.n * sizeof(*aux)) / (1024.0 * 1024.0 * 1024.0));
+                bucket, L.n, (double)(L.n * sizeof(trigram_record_t)) / (1024.0 * 1024.0 * 1024.0));
         merge_loaded_bucket_destroy(&L);
         return -1;
     }
-    radix_sort_trigram_records(L.records, L.n, aux);
-    free(aux);
 
     kf = mk_fopen(kseg, "wb");
     pf = mk_fopen(pseg, "wb");
@@ -3889,12 +4190,18 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
     ctx->last_status_sec = 0.0;
     ctx->merge_workers_used = 1;
     ctx->merge_workers_cpu = 1;
+    {
+        long ncpu_real = sysconf(_SC_NPROCESSORS_ONLN);
+        merge_init_thread_budget(ctx, ncpu_real < 1 ? 4 : ncpu_real);
+    }
 
     if (g_verbose) fprintf(stderr, "ereport_index: resuming merge in %s\n", ctx->index_dir);
 
     if (build_path(key_path, sizeof(key_path), ctx->index_dir, "tri_keys.bin") != 0 ||
-        build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0)
+        build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0) {
+        merge_destroy_thread_budget(ctx);
         return -1;
+    }
 
     need_merge = (uint32_t *)malloc((size_t)TRIGRAM_BUCKET_COUNT * sizeof(uint32_t));
     stitch_buckets = (uint32_t *)malloc((size_t)TRIGRAM_BUCKET_COUNT * sizeof(uint32_t));
@@ -4062,6 +4369,7 @@ out:
     parallel_list = NULL;
     free(need_merge);
     free(stitch_buckets);
+    merge_destroy_thread_budget(ctx);
     if (keys_fp) mk_fclose(keys_fp);
     if (postings_fp) mk_fclose(postings_fp);
     if (rc == 0) return 0;
@@ -4177,6 +4485,10 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     ctx->last_rate_merge_units = 0;
     ctx->last_status_sec = 0.0;
     ctx->merge_workers_used = 1;
+    {
+        long ncpu_real = sysconf(_SC_NPROCESSORS_ONLN);
+        merge_init_thread_budget(ctx, ncpu_real < 1 ? 4 : ncpu_real);
+    }
 
     nbuckets = merge_collect_nonempty_from_bitset(ctx, &bucket_list);
     if (nbuckets == 0) nbuckets = merge_collect_nonempty_buckets_stat_scan(ctx, &bucket_list);
@@ -4185,6 +4497,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
     if (build_path(key_path, sizeof(key_path), ctx->index_dir, "tri_keys.bin") != 0 ||
         build_path(postings_path, sizeof(postings_path), ctx->index_dir, "tri_postings.bin") != 0) {
         free(bucket_list);
+        merge_destroy_thread_budget(ctx);
         return -1;
     }
 
@@ -4220,7 +4533,6 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
         for (bi = 0; bi < nbuckets; bi++) {
             uint32_t bucket = bucket_list[bi];
             merge_loaded_bucket_t L;
-            trigram_record_t *aux;
             uint64_t u = 0;
 
             if (merge_load_bucket_tmp_files(ctx, bucket, &L) != 0) goto out;
@@ -4236,13 +4548,10 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
             }
             merge_bytes_temp += L.bytes;
             merge_records_in += (uint64_t)L.n;
-            aux = (trigram_record_t *)malloc(L.n * sizeof(*aux));
-            if (!aux) {
+            if (merge_sort_loaded_bucket(ctx, &L) != 0) {
                 merge_loaded_bucket_destroy(&L);
                 goto out;
             }
-            radix_sort_trigram_records(L.records, L.n, aux);
-            free(aux);
             if (write_sorted_bucket_records(keys_fp, postings_fp, L.records, L.n, &u) != 0) {
                 merge_loaded_bucket_destroy(&L);
                 goto out;
@@ -4328,6 +4637,7 @@ out:
     ctx->merge_bytes_tri_keys_written = keys_fp ? (uint64_t)ftello(keys_fp) : 0U;
     ctx->merge_bytes_tri_postings_written = postings_fp ? (uint64_t)ftello(postings_fp) : 0U;
     free(bucket_list);
+    merge_destroy_thread_budget(ctx);
     if (keys_fp) mk_fclose(keys_fp);
     if (postings_fp) mk_fclose(postings_fp);
     if (rc == 0) return 0;
