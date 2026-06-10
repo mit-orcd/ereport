@@ -205,7 +205,8 @@ static int set_path_rewrite(const char *arg) {
  * to that serial tail. Buckets with at least this many records use a parallel MSD-partition + parallel
  * per-partition radix sort that borrows idle merge threads from a shared budget. Small buckets keep the
  * single-threaded path (they already run concurrently across workers). The output is byte-identical to
- * the serial radix sort. */
+ * the serial radix sort. NOTE: disabled by default (see merge_init_thread_budget) because the merge is
+ * I/O/bandwidth-bound, not sort-CPU-bound; enable only via EREPORT_INDEX_MERGE_SORT_THREADS. */
 #define MERGE_PARALLEL_SORT_MIN_RECORDS (8ULL << 20)
 /* Target records per sort thread: keeps small buckets from spawning many threads for trivial work. */
 #define MERGE_RECORDS_PER_SORT_THREAD (4ULL << 20)
@@ -3758,7 +3759,17 @@ static void merge_unlink_orphan_segment_halves(const build_ctx_t *ctx) {
  * and pool size = online CPUs; override the per-bucket cap with EREPORT_INDEX_MERGE_SORT_THREADS.
  */
 static void merge_init_thread_budget(build_ctx_t *ctx, long ncpu_real) {
-    long maxt = ncpu_real;
+    /*
+     * Default OFF (1 = serial sort). Measured on a 953M-path build: merge_phase_sec ≈
+     * decompressed_bytes / temp_read_rate in every run — the merge is bound by the rate it pulls
+     * records through (tmp-file read + memory bandwidth), not by sort CPU. Parallel-sorting many
+     * buckets at once touches large fresh anon aux buffers in bursts, which under the merge's memory
+     * budget triggers a kernel page-reclaim storm (it evicts the very tmp page cache the merge is
+     * reading) and *lowers* throughput (489→421 MB/s, merge 2414→2806 s). Opt in with
+     * EREPORT_INDEX_MERGE_SORT_THREADS>1 only when the merge is CPU-bound (e.g. fast local NVMe where
+     * read bandwidth is not the limit). The parallel sort path is verified byte-identical to serial.
+     */
+    long maxt = 1;
     const char *e = getenv("EREPORT_INDEX_MERGE_SORT_THREADS");
 
     if (e && *e) {
