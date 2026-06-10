@@ -68,6 +68,10 @@
 
 #define DEFAULT_THREADS 16
 #define DEFAULT_MAX_UNLINK_INFLIGHT 256
+/* Files at least this large are handed to the shared queue (when peer threads are idle) so their
+ * potentially slow unlink(2) fans out across threads instead of running serially on one worker.
+ * Small files stay on the zero-alloc inline path. 0 disables fan-out. */
+#define DEFAULT_FANOUT_MIN_BYTES (64ULL << 20)
 #define WINDOW_SECONDS 10
 #define PERF_FLUSH_INTERVAL 1024U
 #define LOCAL_STACK_DONATE_FLOOR 8
@@ -176,6 +180,7 @@ static int g_force = 0;
 static int g_dry_run = 1;
 static int g_threads = DEFAULT_THREADS;
 static int g_max_unlink_inflight = 0;
+static unsigned long long g_fanout_min_bytes = DEFAULT_FANOUT_MIN_BYTES;
 static pthread_mutex_t g_unlink_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_unlink_gate_cond = PTHREAD_COND_INITIALIZER;
 static int g_unlink_inflight = 0;
@@ -313,6 +318,19 @@ static int parse_max_unlink_inflight(void) {
     if (errno || end == e || *end || v < 0 || v > (long)INT_MAX) return DEFAULT_MAX_UNLINK_INFLIGHT;
     if (v == 0) return 0;
     return (int)v;
+}
+
+/* Min file size to fan a delete out to the queue; 0 disables, unset uses DEFAULT_FANOUT_MIN_BYTES. */
+static unsigned long long parse_fanout_min_bytes(void) {
+    const char *e = getenv("EDELETE_FANOUT_MIN_BYTES");
+    unsigned long long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_FANOUT_MIN_BYTES;
+    errno = 0;
+    v = strtoull(e, &end, 10);
+    if (errno || end == e || *end) return DEFAULT_FANOUT_MIN_BYTES;
+    return v;
 }
 
 static int unlink_gate_enter(void) {
@@ -878,6 +896,14 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
     return 0;
 }
 
+/* True if at least one peer worker is currently idle (no task), so handing off work pays off. */
+static int peers_idle(const shared_state_t *shared) {
+    int started = (int)shared->crawl_threads_started;
+    int active = atomic_load(&g_active_workers);
+
+    return started > 1 && active < started;
+}
+
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
     uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
     int active = atomic_load(&g_active_workers);
@@ -1118,6 +1144,35 @@ static int process_directory_iterative(dir_stack_t *stack, shared_state_t *share
                     } else {
                         char child[PATH_MAX];
 
+                        /*
+                         * Large files can have slow unlink(2) (e.g. ZFS freeing many blocks). When peer
+                         * threads are idle, push such files onto the work stack so the donation path fans
+                         * their deletes out across threads instead of unlinking them serially here — this is
+                         * what lets a single directory full of huge files drain in parallel. Pushed files are
+                         * account_leaf-counted when popped (like directories), so we do NOT count them here.
+                         * Small files, dry-run, and the all-busy case stay on the zero-alloc inline path.
+                         */
+                        if (!g_dry_run && g_fanout_min_bytes > 0 &&
+                            (unsigned long long)child_st.st_size >= g_fanout_min_bytes && peers_idle(shared)) {
+                            char *child_path_owned;
+                            size_t child_path_len;
+
+                            if (path_join_alloc(dir_path, dir_path_len, ent->d_name, child_name_len,
+                                                &child_path_owned, &child_path_len) == 0) {
+                                if (dir_stack_push_take(stack, child_path_owned, child_path_len, &child_st) == 0) {
+                                    while (!g_shutdown_requested && should_donate_work(shared, stack)) {
+                                        if (donate_stack_chunk(stack, queue, aux) != 0) {
+                                            stats_add_error(shared);
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                free(child_path_owned);
+                            }
+                            /* alloc/push failed: fall through to inline unlink below */
+                        }
+
                         account_leaf(perf, &child_st);
 
                         if (path_join_fast(dir_path, dir_path_len, ent->d_name, child_name_len, child, sizeof(child)) !=
@@ -1235,6 +1290,12 @@ static void *stats_thread_main(void *arg) {
             unsigned long long unlink_live =
                 g_dry_run ? atomic_load(&g_live_would_unlink) : atomic_load(&g_live_unlinked);
             unsigned int divisor = atomic_load(&g_seconds_seen);
+
+            /* g_total_entries is updated in batched flushes (every PERF_FLUSH_INTERVAL per worker),
+             * while unlink_live is updated per unlink. Each entry is account_leaf-counted before it is
+             * unlinked, so true walked >= true unlinked; clamp the displayed walked up to unlink_live so
+             * the lagging flushed total never reads below unlinked. No hot-path cost. */
+            if (unlink_live > total_entries) total_entries = unlink_live;
             double walk_rate;
             double elapsed_sec = now_sec() - *run_start_ptr;
             char walked_buf[32], rate_buf[32], unlink_buf[32], elapsed_buf[32];
@@ -1303,11 +1364,13 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
     fprintf(stderr,
             "  Threads:             %d  (EDELETE_THREADS)\n"
             "  Max unlink inflight: %d  (EDELETE_MAX_UNLINK_INFLIGHT; 0 = unlimited)\n"
+            "  Fan-out min bytes:   %llu  (EDELETE_FANOUT_MIN_BYTES; 0 = off)\n"
             "  Verbose:             %s\n"
             "\n"
             "Type YES to proceed, anything else cancels: ",
             g_threads,
             g_max_unlink_inflight,
+            g_fanout_min_bytes,
             g_verbose ? "yes" : "no");
     fflush(stderr);
 
@@ -1338,8 +1401,11 @@ static void usage(const char *prog) {
             "            (including the start directory if empty; never removes `/`).\n"
             "  --force:  with --delete only, skip the YES prompt (non-interactive / scripting).\n"
             "  Thread count: EDELETE_THREADS (default %d).\n"
-            "  Max concurrent unlinks (all threads): EDELETE_MAX_UNLINK_INFLIGHT (default %d; 0 = unlimited).\n",
-            prog, prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT);
+            "  Max concurrent unlinks (all threads): EDELETE_MAX_UNLINK_INFLIGHT (default %d; 0 = unlimited).\n"
+            "  Fan-out: files >= EDELETE_FANOUT_MIN_BYTES (default %llu; 0 = off) are queued so their\n"
+            "    (potentially slow) unlink runs across threads instead of serially in one worker.\n",
+            prog, prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT,
+            (unsigned long long)DEFAULT_FANOUT_MIN_BYTES);
 }
 
 int main(int argc, char **argv) {
@@ -1471,6 +1537,7 @@ int main(int argc, char **argv) {
 
     g_threads = parse_thread_count();
     g_max_unlink_inflight = parse_max_unlink_inflight();
+    g_fanout_min_bytes = parse_fanout_min_bytes();
 
     if (!g_dry_run && !g_force && confirm_delete_prompt(root_path, g_delete_all, basis_str, g_age_days) != 0)
         return 3;
@@ -1631,6 +1698,7 @@ int main(int argc, char **argv) {
             printf("start_path=%s\n", root_path);
             printf("threads=%d\n", worker_count_started);
             printf("max_unlink_inflight=%d\n", g_max_unlink_inflight);
+            printf("fanout_min_bytes=%llu\n", g_fanout_min_bytes);
             printf("walk_entries=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
             printf("entries_scanned=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_entries));
             printf("dirs_seen=%" PRIu64 "\n", (uint64_t)atomic_load(&g_total_dirs));
