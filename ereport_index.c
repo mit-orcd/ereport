@@ -1982,32 +1982,48 @@ static int cmp_u32(const void *a, const void *b) {
     return (aa > bb) - (aa < bb);
 }
 
-static int write_varint_u64(FILE *fp, uint64_t value);
-
-/* LSD radix: 96-bit key as trigram<<64|path_id (big-endian); passes 0..7 = path_id LE, 8..11 = trigram LE. */
-static unsigned char trigram_record_radix_byte(const trigram_record_t *r, int pass) {
-    if (pass < 8) return ((const unsigned char *)&r->path_id)[pass];
-    return ((const unsigned char *)&r->trigram)[pass - 8];
+/* LSD radix byte: little-endian, path_id bytes first (least significant key), then trigram bytes — so the
+ * final order is trigram-major, path_id-minor (what write_sorted_bucket_records needs). */
+static unsigned char trigram_record_radix_byte(const trigram_record_t *r, int pass, int pid_bytes) {
+    if (pass < pid_bytes) return ((const unsigned char *)&r->path_id)[pass];
+    return ((const unsigned char *)&r->trigram)[pass - pid_bytes];
 }
 
 static void radix_sort_trigram_records(trigram_record_t *records, size_t n, trigram_record_t *aux) {
     trigram_record_t *in;
     trigram_record_t *out;
+    uint64_t max_pid = 0;
+    uint32_t max_tri = 0;
+    int pid_bytes = 1;
+    int tri_bytes = 1;
+    int total_passes;
     int pass;
+    size_t i;
 
     if (n < 2) return;
+
+    /* Only radix over the bytes actually present: path_id <= total paths and the trigram is 24-bit, so the
+     * high bytes are uniformly zero. Skipping them drops the 12 fixed passes to ~7 on real corpora. The one
+     * O(n) max scan is far cheaper than the ~5 passes it removes. Output is identical to the full-width sort. */
+    for (i = 0; i < n; i++) {
+        if (records[i].path_id > max_pid) max_pid = records[i].path_id;
+        if (records[i].trigram > max_tri) max_tri = records[i].trigram;
+    }
+    while (pid_bytes < 8 && (max_pid >> (pid_bytes * 8)) != 0) pid_bytes++;
+    while (tri_bytes < 4 && (max_tri >> (tri_bytes * 8)) != 0) tri_bytes++;
+    total_passes = pid_bytes + tri_bytes;
+
     in = records;
     out = aux;
-    for (pass = 0; pass < 12; pass++) {
+    for (pass = 0; pass < total_passes; pass++) {
         size_t c[256];
         size_t pos[256];
-        size_t i;
         memset(c, 0, sizeof(c));
-        for (i = 0; i < n; i++) c[trigram_record_radix_byte(&in[i], pass)]++;
+        for (i = 0; i < n; i++) c[trigram_record_radix_byte(&in[i], pass, pid_bytes)]++;
         pos[0] = 0;
         for (i = 1; i < 256; i++) pos[i] = pos[i - 1] + c[i - 1];
         for (i = 0; i < n; i++) {
-            unsigned k = trigram_record_radix_byte(&in[i], pass);
+            unsigned k = trigram_record_radix_byte(&in[i], pass, pid_bytes);
             out[pos[k]++] = in[i];
         }
         {
@@ -2019,43 +2035,71 @@ static void radix_sort_trigram_records(trigram_record_t *records, size_t n, trig
     if (in != records) memcpy(records, in, n * sizeof(*records));
 }
 
+/* Postings flush buffer. The per-delta path used to call fwrite ~once per posting (~100B calls on a 1B-path
+ * corpus); buffering the varints and flushing in MiB chunks removes that per-call overhead. Offsets are
+ * tracked with a local counter (postings_pos) instead of ftello() since bytes may be unflushed. */
+#define MERGE_POSTINGS_FLUSH_BYTES ((size_t)1 << 20)
+
 static int write_sorted_bucket_records(FILE *keys_fp, FILE *postings_fp, trigram_record_t *records, size_t record_count,
                                        uint64_t *unique_out) {
     size_t i = 0;
+    uint64_t postings_pos = (uint64_t)ftello(postings_fp);
+    unsigned char *pbuf;
+    size_t plen = 0;
+    int rc = -1;
 
     *unique_out = 0;
+    pbuf = (unsigned char *)malloc(MERGE_POSTINGS_FLUSH_BYTES);
+    if (!pbuf) return -1;
+
     while (i < record_count) {
         trigram_key_t key;
         uint64_t prev = 0;
+        uint64_t last_path = UINT64_MAX;
         size_t j;
+        size_t k;
 
         key.trigram = records[i].trigram;
         key.reserved = 0;
-        key.postings_offset = (uint64_t)ftello(postings_fp);
+        key.postings_offset = postings_pos;
 
         j = i;
         while (j < record_count && records[j].trigram == key.trigram) j++;
 
-        {
-            uint64_t last_path = UINT64_MAX;
-            for (size_t k = i; k < j; k++) {
-                uint64_t path_id = records[k].path_id;
-                uint64_t delta;
+        for (k = i; k < j; k++) {
+            uint64_t path_id = records[k].path_id;
+            uint64_t v;
 
-                if (path_id == last_path) continue;
-                delta = (prev == 0) ? (path_id + 1U) : (path_id - prev);
-                if (write_varint_u64(postings_fp, delta) != 0) return -1;
-                prev = path_id;
-                last_path = path_id;
+            if (path_id == last_path) continue;
+            v = (prev == 0) ? (path_id + 1U) : (path_id - prev);
+            /* A single varint is at most 10 bytes; flush before it can overflow the buffer. */
+            if (plen + 10 > MERGE_POSTINGS_FLUSH_BYTES) {
+                if (mk_fwrite(pbuf, 1, plen, postings_fp) != plen) goto out;
+                plen = 0;
             }
+            while (v >= 0x80U) {
+                pbuf[plen++] = (unsigned char)((v & 0x7FU) | 0x80U);
+                v >>= 7;
+                postings_pos++;
+            }
+            pbuf[plen++] = (unsigned char)v;
+            postings_pos++;
+            prev = path_id;
+            last_path = path_id;
         }
 
-        key.postings_bytes = (uint64_t)ftello(postings_fp) - key.postings_offset;
-        if (mk_fwrite(&key, sizeof(key), 1, keys_fp) != 1) return -1;
+        key.postings_bytes = postings_pos - key.postings_offset;
+        if (mk_fwrite(&key, sizeof(key), 1, keys_fp) != 1) goto out;
         (*unique_out)++;
         i = j;
     }
-    return 0;
+
+    if (plen > 0 && mk_fwrite(pbuf, 1, plen, postings_fp) != plen) goto out;
+    rc = 0;
+
+out:
+    free(pbuf);
+    return rc;
 }
 
 static char *ascii_lower_dup(const char *s) {
@@ -2490,18 +2534,6 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
         }
     }
     return 0;
-}
-
-static int write_varint_u64(FILE *fp, uint64_t value) {
-    unsigned char buf[10];
-    size_t n = 0;
-
-    while (value >= 0x80U) {
-        buf[n++] = (unsigned char)((value & 0x7FU) | 0x80U);
-        value >>= 7;
-    }
-    buf[n++] = (unsigned char)value;
-    return mk_fwrite(buf, 1, n, fp) == n ? 0 : -1;
 }
 
 static int decode_varint_u64_buf(const unsigned char *buf, size_t len, size_t *pos, uint64_t *out) {
