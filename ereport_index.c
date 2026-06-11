@@ -214,6 +214,14 @@ static int set_path_rewrite(const char *arg) {
 #define MERGE_SORT_PARTITIONS 256
 /* Each parallel merge worker holds ~2× bucket file bytes (mmap + radix aux) plus stdio buffers — cap workers to avoid OOM. */
 #define MERGE_PER_WORKER_OVERHEAD_BYTES (16ULL << 20)
+/*
+ * A bucket whose decompressed records exceed this is sorted as fixed-size slices (each radix-sorted with a
+ * reused aux buffer of this many bytes) and k-way merged, instead of allocating an n-sized radix aux. This
+ * caps a giant bucket's peak at ~1× records + one slice (≈60 GiB for the 58 GiB hot bucket) instead of 2×
+ * (≈116 GiB), so its admission reservation no longer monopolizes the merge RAM budget and the other workers
+ * run alongside it — with no extra disk I/O (everything stays in RAM). Tune with
+ * EREPORT_INDEX_MERGE_SORT_SLICE_MB (min 64). */
+#define MERGE_SORT_SLICE_BYTES_DEFAULT (2ULL << 30)
 /* Fraction of min(MemAvailable, cgroup memory.max) used as the merge anonymous-RAM budget (sum of
  * concurrent workers' record+aux buffers, via admission control). Kept well below 100% on purpose:
  * the merge ALSO drives heavy file I/O (reading hundreds of GB of compressed tmp_trigrams, writing
@@ -2289,65 +2297,194 @@ static void parallel_radix_sort_trigram_records(trigram_record_t *records, size_
  * tracked with a local counter (postings_pos) instead of ftello() since bytes may be unflushed. */
 #define MERGE_POSTINGS_FLUSH_BYTES ((size_t)1 << 20)
 
+/*
+ * Streaming postings encoder. Fed a globally (trigram, path_id)-ascending stream one record at a time, it
+ * groups by trigram, drops consecutive duplicate path_ids, delta-varint-encodes the postings, and writes a
+ * trigram_key_t per group. Driving the encoding through one emit() lets both the flat-array writer and the
+ * k-way slice merge produce byte-identical tri_keys/tri_postings output.
+ */
+typedef struct {
+    FILE *keys_fp;
+    FILE *postings_fp;
+    unsigned char *pbuf;
+    size_t plen;
+    uint64_t postings_pos;
+    uint64_t unique;
+    uint32_t cur_trigram;
+    uint64_t group_offset;
+    uint64_t prev;      /* last path_id encoded in the current group (0 => none yet) */
+    uint64_t last_path; /* dedup of consecutive equal path_ids within a group */
+    int have_group;
+} postings_enc_t;
+
+static int pe_init(postings_enc_t *pe, FILE *keys_fp, FILE *postings_fp) {
+    memset(pe, 0, sizeof(*pe));
+    pe->keys_fp = keys_fp;
+    pe->postings_fp = postings_fp;
+    pe->postings_pos = (uint64_t)ftello(postings_fp);
+    pe->last_path = UINT64_MAX;
+    pe->pbuf = (unsigned char *)malloc(MERGE_POSTINGS_FLUSH_BYTES);
+    return pe->pbuf ? 0 : -1;
+}
+
+/* Write the key for the group that just ended (postings_bytes is now known). */
+static int pe_close_group(postings_enc_t *pe) {
+    trigram_key_t key;
+
+    if (!pe->have_group) return 0;
+    key.trigram = pe->cur_trigram;
+    key.reserved = 0;
+    key.postings_offset = pe->group_offset;
+    key.postings_bytes = pe->postings_pos - pe->group_offset;
+    if (mk_fwrite(&key, sizeof(key), 1, pe->keys_fp) != 1) return -1;
+    pe->unique++;
+    pe->have_group = 0;
+    return 0;
+}
+
+static int pe_emit(postings_enc_t *pe, uint32_t trigram, uint64_t path_id) {
+    uint64_t v;
+
+    if (!pe->have_group || trigram != pe->cur_trigram) {
+        if (pe_close_group(pe) != 0) return -1;
+        pe->cur_trigram = trigram;
+        pe->group_offset = pe->postings_pos;
+        pe->prev = 0;
+        pe->last_path = UINT64_MAX;
+        pe->have_group = 1;
+    }
+    if (path_id == pe->last_path) return 0;
+    v = (pe->prev == 0) ? (path_id + 1U) : (path_id - pe->prev);
+    /* A single varint is at most 10 bytes; flush before it can overflow the buffer. */
+    if (pe->plen + 10 > MERGE_POSTINGS_FLUSH_BYTES) {
+        if (mk_fwrite(pe->pbuf, 1, pe->plen, pe->postings_fp) != pe->plen) return -1;
+        pe->plen = 0;
+    }
+    while (v >= 0x80U) {
+        pe->pbuf[pe->plen++] = (unsigned char)((v & 0x7FU) | 0x80U);
+        v >>= 7;
+        pe->postings_pos++;
+    }
+    pe->pbuf[pe->plen++] = (unsigned char)v;
+    pe->postings_pos++;
+    pe->prev = path_id;
+    pe->last_path = path_id;
+    return 0;
+}
+
+static int pe_finish(postings_enc_t *pe, uint64_t *unique_out) {
+    if (pe_close_group(pe) != 0) return -1;
+    if (pe->plen > 0 && mk_fwrite(pe->pbuf, 1, pe->plen, pe->postings_fp) != pe->plen) return -1;
+    *unique_out = pe->unique;
+    return 0;
+}
+
 static int write_sorted_bucket_records(FILE *keys_fp, FILE *postings_fp, trigram_record_t *records, size_t record_count,
                                        uint64_t *unique_out) {
-    size_t i = 0;
-    uint64_t postings_pos = (uint64_t)ftello(postings_fp);
-    unsigned char *pbuf;
-    size_t plen = 0;
+    postings_enc_t pe;
+    size_t i;
     int rc = -1;
 
     *unique_out = 0;
-    pbuf = (unsigned char *)malloc(MERGE_POSTINGS_FLUSH_BYTES);
-    if (!pbuf) return -1;
-
-    while (i < record_count) {
-        trigram_key_t key;
-        uint64_t prev = 0;
-        uint64_t last_path = UINT64_MAX;
-        size_t j;
-        size_t k;
-
-        key.trigram = records[i].trigram;
-        key.reserved = 0;
-        key.postings_offset = postings_pos;
-
-        j = i;
-        while (j < record_count && records[j].trigram == key.trigram) j++;
-
-        for (k = i; k < j; k++) {
-            uint64_t path_id = records[k].path_id;
-            uint64_t v;
-
-            if (path_id == last_path) continue;
-            v = (prev == 0) ? (path_id + 1U) : (path_id - prev);
-            /* A single varint is at most 10 bytes; flush before it can overflow the buffer. */
-            if (plen + 10 > MERGE_POSTINGS_FLUSH_BYTES) {
-                if (mk_fwrite(pbuf, 1, plen, postings_fp) != plen) goto out;
-                plen = 0;
-            }
-            while (v >= 0x80U) {
-                pbuf[plen++] = (unsigned char)((v & 0x7FU) | 0x80U);
-                v >>= 7;
-                postings_pos++;
-            }
-            pbuf[plen++] = (unsigned char)v;
-            postings_pos++;
-            prev = path_id;
-            last_path = path_id;
-        }
-
-        key.postings_bytes = postings_pos - key.postings_offset;
-        if (mk_fwrite(&key, sizeof(key), 1, keys_fp) != 1) goto out;
-        (*unique_out)++;
-        i = j;
+    if (pe_init(&pe, keys_fp, postings_fp) != 0) return -1;
+    for (i = 0; i < record_count; i++) {
+        if (pe_emit(&pe, records[i].trigram, records[i].path_id) != 0) goto out;
     }
-
-    if (plen > 0 && mk_fwrite(pbuf, 1, plen, postings_fp) != plen) goto out;
+    if (pe_finish(&pe, unique_out) != 0) goto out;
     rc = 0;
 
 out:
-    free(pbuf);
+    free(pe.pbuf);
+    return rc;
+}
+
+/*
+ * K-way merge writer for oversized buckets. `records` holds `nslices = ceil(n/slice_recs)` contiguous slices,
+ * each already (trigram, path_id)-sorted in place. A binary min-heap streams the records back in global order
+ * into the shared postings encoder, so the output is byte-identical to radix-sorting the whole bucket and
+ * calling write_sorted_bucket_records — but without ever allocating an n-sized radix aux buffer.
+ */
+typedef struct {
+    uint32_t trigram;
+    uint64_t path_id;
+    const trigram_record_t *next; /* next record after the loaded head */
+    const trigram_record_t *end;
+} kmerge_node_t;
+
+static inline int kmerge_less(const kmerge_node_t *a, const kmerge_node_t *b) {
+    if (a->trigram != b->trigram) return a->trigram < b->trigram;
+    return a->path_id < b->path_id;
+}
+
+static void kmerge_sift_down(kmerge_node_t *h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1;
+        size_t r = 2 * i + 2;
+        size_t m = i;
+        kmerge_node_t tmp;
+
+        if (l < n && kmerge_less(&h[l], &h[m])) m = l;
+        if (r < n && kmerge_less(&h[r], &h[m])) m = r;
+        if (m == i) break;
+        tmp = h[i];
+        h[i] = h[m];
+        h[m] = tmp;
+        i = m;
+    }
+}
+
+static int merge_kway_write_bucket(FILE *keys_fp, FILE *postings_fp, const trigram_record_t *records, size_t n,
+                                   size_t slice_recs, uint64_t *unique_out) {
+    size_t nslices;
+    kmerge_node_t *heap;
+    size_t hn = 0;
+    size_t s, i;
+    postings_enc_t pe;
+    int rc = -1;
+
+    *unique_out = 0;
+    if (n == 0) return 0;
+    if (slice_recs == 0) slice_recs = 1;
+    nslices = (n + slice_recs - 1) / slice_recs;
+
+    heap = (kmerge_node_t *)malloc(nslices * sizeof(*heap));
+    if (!heap) return -1;
+    for (s = 0; s < nslices; s++) {
+        size_t base = s * slice_recs;
+        size_t cnt = (base + slice_recs <= n) ? slice_recs : (n - base);
+        const trigram_record_t *b = records + base;
+
+        heap[hn].trigram = b->trigram;
+        heap[hn].path_id = b->path_id;
+        heap[hn].next = b + 1;
+        heap[hn].end = b + cnt;
+        hn++;
+    }
+    if (hn > 1)
+        for (i = hn / 2; i-- > 0;) kmerge_sift_down(heap, hn, i);
+
+    if (pe_init(&pe, keys_fp, postings_fp) != 0) {
+        free(heap);
+        return -1;
+    }
+    while (hn > 0) {
+        if (pe_emit(&pe, heap[0].trigram, heap[0].path_id) != 0) goto out;
+        if (heap[0].next < heap[0].end) {
+            heap[0].trigram = heap[0].next->trigram;
+            heap[0].path_id = heap[0].next->path_id;
+            heap[0].next++;
+        } else {
+            heap[0] = heap[hn - 1];
+            hn--;
+        }
+        kmerge_sift_down(heap, hn, 0);
+    }
+    if (pe_finish(&pe, unique_out) != 0) goto out;
+    rc = 0;
+
+out:
+    free(pe.pbuf);
+    free(heap);
     return rc;
 }
 
@@ -3715,10 +3852,35 @@ static uint64_t merge_parallel_ram_budget_bytes(void) {
     return cap_b;
 }
 
+/* Max aux bytes per radix-sort slice for the oversized-bucket path (see MERGE_SORT_SLICE_BYTES_DEFAULT). */
+static uint64_t merge_sort_slice_bytes(void) {
+    const char *e = getenv("EREPORT_INDEX_MERGE_SORT_SLICE_MB");
+
+    if (e && *e) {
+        char *end;
+        unsigned long mb = strtoul(e, &end, 10);
+
+        if (end != e && mb >= 64 && mb < (ULONG_MAX / (1024UL * 1024UL))) return (uint64_t)mb * 1024ULL * 1024ULL;
+    }
+    return MERGE_SORT_SLICE_BYTES_DEFAULT;
+}
+
+/*
+ * Peak anonymous RAM a merge worker holds for a bucket with `dec_bytes` decompressed records, used by
+ * admission control. Buckets up to one slice radix-sort with an equal-size aux (2× peak); larger buckets
+ * use the slice + k-way path that caps aux at one slice (1× records + one slice peak).
+ */
+static uint64_t merge_bucket_ram_need(uint64_t dec_bytes) {
+    uint64_t slice = merge_sort_slice_bytes();
+
+    if (dec_bytes <= slice) return dec_bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+    return dec_bytes + slice + MERGE_PER_WORKER_OVERHEAD_BYTES;
+}
+
 typedef struct {
     build_ctx_t *ctx;
     const uint32_t *buckets;
-    const uint64_t *needs; /* per-dispatch-index RAM need (2x decompressed + overhead); NULL = no gating */
+    const uint64_t *needs; /* per-dispatch-index RAM need (see merge_bucket_ram_need); NULL = no gating */
     size_t bucket_count;
     atomic_size_t next;
     atomic_int failed;
@@ -3841,6 +4003,40 @@ static int merge_sort_loaded_bucket(build_ctx_t *ctx, merge_loaded_bucket_t *L) 
     return 0;
 }
 
+/*
+ * Sort one loaded bucket and write its keys/postings to keys_fp/postings_fp (segment or final files).
+ * Buckets that fit in a single sort slice take the existing full-width radix path; oversized buckets
+ * radix-sort fixed-size slices with one reused aux buffer and k-way merge them straight into the postings
+ * encoder, capping peak RAM at ~1× records + one slice. Output is byte-identical either way.
+ */
+static int merge_sort_and_write_bucket(build_ctx_t *ctx, merge_loaded_bucket_t *L, FILE *keys_fp, FILE *postings_fp,
+                                       uint64_t *unique_out) {
+    uint64_t slice_bytes = merge_sort_slice_bytes();
+
+    if ((uint64_t)L->n * sizeof(trigram_record_t) <= slice_bytes) {
+        if (merge_sort_loaded_bucket(ctx, L) != 0) return -1;
+        return write_sorted_bucket_records(keys_fp, postings_fp, L->records, L->n, unique_out);
+    }
+    {
+        size_t slice_recs = (size_t)(slice_bytes / sizeof(trigram_record_t));
+        size_t nslices, s;
+        trigram_record_t *aux;
+
+        if (slice_recs < 1) slice_recs = 1;
+        nslices = (L->n + slice_recs - 1) / slice_recs;
+        aux = (trigram_record_t *)malloc(slice_recs * sizeof(*aux));
+        if (!aux) return -1;
+        for (s = 0; s < nslices; s++) {
+            size_t base = s * slice_recs;
+            size_t cnt = (base + slice_recs <= L->n) ? slice_recs : (L->n - base);
+
+            radix_sort_trigram_records(L->records + base, cnt, aux);
+        }
+        free(aux); /* drop the slice aux before the merge so peak stays at ~1× records */
+        return merge_kway_write_bucket(keys_fp, postings_fp, L->records, L->n, slice_recs, unique_out);
+    }
+}
+
 static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merge_parallel_arg_t *accum) {
     char kseg[PATH_MAX];
     char pseg[PATH_MAX];
@@ -3855,7 +4051,7 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
 
     if (merge_load_bucket_tmp_files(ctx, bucket, &L) != 0) return -1;
     {
-        uint64_t peak = L.bytes * 2ULL;
+        uint64_t peak = merge_bucket_ram_need(L.bytes) - MERGE_PER_WORKER_OVERHEAD_BYTES;
         uint64_t cur = atomic_load_explicit(&ctx->merge_bucket_ram_peak, memory_order_relaxed);
 
         while (peak > cur) {
@@ -3863,12 +4059,6 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
                                                       memory_order_relaxed))
                 break;
         }
-    }
-    if (merge_sort_loaded_bucket(ctx, &L) != 0) {
-        fprintf(stderr, "ereport_index: merge bucket %04u: malloc failed for radix aux (%zu records, %.2f GiB)\n",
-                bucket, L.n, (double)(L.n * sizeof(trigram_record_t)) / (1024.0 * 1024.0 * 1024.0));
-        merge_loaded_bucket_destroy(&L);
-        return -1;
     }
 
     kf = mk_fopen(kseg, "wb");
@@ -3883,9 +4073,10 @@ static int merge_bucket_to_segment_files(build_ctx_t *ctx, uint32_t bucket, merg
     if (setvbuf(pf, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
 
-    if (write_sorted_bucket_records(kf, pf, L.records, L.n, &u) != 0) {
-        fprintf(stderr, "ereport_index: merge bucket %04u: write failed (%s; disk full or RLIMIT_FSIZE?)\n", bucket,
-                strerror(errno));
+    if (merge_sort_and_write_bucket(ctx, &L, kf, pf, &u) != 0) {
+        fprintf(stderr, "ereport_index: merge bucket %04u: sort/write failed (%zu records; OOM, disk full, or "
+                        "RLIMIT_FSIZE?)\n",
+                bucket, L.n);
         goto err;
     }
     if (mk_fclose(kf) != 0) {
@@ -4153,7 +4344,7 @@ static uint64_t merge_build_dispatch_and_needs(build_ctx_t *ctx, const uint32_t 
         for (i = 0; i < n; i++) {
             uint64_t d = bucket_tmp_files_decompressed_bytes(ctx, bucket_list[i]);
             dispatch_out[i] = bucket_list[i];
-            needs_out[i] = d * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+            needs_out[i] = merge_bucket_ram_need(d);
             if (d > maxdec) maxdec = d;
         }
         return maxdec;
@@ -4165,7 +4356,7 @@ static uint64_t merge_build_dispatch_and_needs(build_ctx_t *ctx, const uint32_t 
     qsort(sz, n, sizeof(*sz), merge_bucket_size_cmp_desc);
     for (i = 0; i < n; i++) {
         dispatch_out[i] = sz[i].bucket;
-        needs_out[i] = sz[i].bytes * 2ULL + MERGE_PER_WORKER_OVERHEAD_BYTES;
+        needs_out[i] = merge_bucket_ram_need(sz[i].bytes);
         if (sz[i].bytes > maxdec) maxdec = sz[i].bytes;
     }
     free(sz);
@@ -4548,7 +4739,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
 
             if (merge_load_bucket_tmp_files(ctx, bucket, &L) != 0) goto out;
             {
-                uint64_t peak = L.bytes * 2ULL;
+                uint64_t peak = merge_bucket_ram_need(L.bytes) - MERGE_PER_WORKER_OVERHEAD_BYTES;
                 uint64_t cur = atomic_load_explicit(&ctx->merge_bucket_ram_peak, memory_order_relaxed);
 
                 while (peak > cur) {
@@ -4559,11 +4750,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
             }
             merge_bytes_temp += L.bytes;
             merge_records_in += (uint64_t)L.n;
-            if (merge_sort_loaded_bucket(ctx, &L) != 0) {
-                merge_loaded_bucket_destroy(&L);
-                goto out;
-            }
-            if (write_sorted_bucket_records(keys_fp, postings_fp, L.records, L.n, &u) != 0) {
+            if (merge_sort_and_write_bucket(ctx, &L, keys_fp, postings_fp, &u) != 0) {
                 merge_loaded_bucket_destroy(&L);
                 goto out;
             }
