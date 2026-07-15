@@ -48,9 +48,18 @@
 #   SPARSE_FILE_MIB=0          # if >0, each flat file is sparse-truncated to this many MiB
 #                               (logical size; sparse blocks often use little space — still capped in estimate)
 #
-# Optional wide tree under wide_shallow/:
-#   WIDE_PARENTS=0             # number of sibling dirs (0 = skip)
+# Optional wide tree under wide_shallow/ (on by default for a wide-directory challenge):
+#   WIDE_PARENTS=64            # number of sibling dirs (0 = skip)
 #   WIDE_FILES_EACH=1000       # regular files per sibling dir
+#
+# Symlinks and hard links under links_and_specials/ (on by default):
+#   SYNTH_LINKS_ENABLE=1       # 0 skips the whole links_and_specials/ subtree
+#   SYNTH_LINK_TARGETS=512     # real regular files under links_and_specials/targets/ (link destinations)
+#   SYNTH_HARDLINKS=1500       # extra hard-linked names under hardlinks/ → st_nlink>1, inode dedup
+#   SYNTH_SYMLINKS=1500        # relative symlinks under symlinks/ → symlink accounting (ecrawl never follows)
+#   SYNTH_LINK_SPARSE_TARGETS=2         # first N targets are sparse-large (exercise hardlink dedup of big logical bytes)
+#   SYNTH_LINK_SPARSE_TARGET_MIB=1024   # logical MiB per sparse target (sparse; little real disk)
+#   Also emits specials/: relative, absolute, to-directory, broken/dangling, and symlink-to-symlink.
 #
 # Optional depth/slash profile (matches ecrawl_analyze "depth_bin_*" = count of '/' in stored path
 # relative to crawl root — one leading segment depth_slash_profile/ adds one slash):
@@ -255,8 +264,15 @@ ASSUMED_BYTES_PER_CHAIN_DIR=${ASSUMED_BYTES_PER_CHAIN_DIR:-4096}
 AUTO_CAP_FLAT=${AUTO_CAP_FLAT:-1}
 SPARSE_FILE_MIB=${SPARSE_FILE_MIB:-0}
 
-WIDE_PARENTS=${WIDE_PARENTS:-0}
+WIDE_PARENTS=${WIDE_PARENTS:-64}
 WIDE_FILES_EACH=${WIDE_FILES_EACH:-1000}
+
+SYNTH_LINKS_ENABLE=${SYNTH_LINKS_ENABLE:-1}
+SYNTH_LINK_TARGETS=${SYNTH_LINK_TARGETS:-512}
+SYNTH_HARDLINKS=${SYNTH_HARDLINKS:-1500}
+SYNTH_SYMLINKS=${SYNTH_SYMLINKS:-1500}
+SYNTH_LINK_SPARSE_TARGETS=${SYNTH_LINK_SPARSE_TARGETS:-2}
+SYNTH_LINK_SPARSE_TARGET_MIB=${SYNTH_LINK_SPARSE_TARGET_MIB:-1024}
 
 DEPTH_SLICE_ENABLE=${DEPTH_SLICE_ENABLE:-0}
 DEPTH_PEAK_LO=${DEPTH_PEAK_LO:-12}
@@ -338,6 +354,7 @@ chain_root="$ROOT/deep_skinny_chain"
 wide_root="$ROOT/wide_shallow"
 depth_slice_root="$ROOT/depth_slash_profile"
 badge_fixtures_parent="$ROOT/ereport_badge_fixtures"
+links_root="$ROOT/links_and_specials"
 
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
   if ! command -v python3 >/dev/null 2>&1; then
@@ -491,6 +508,24 @@ if [[ "$SYNTH_FLAT_SHARD_CAP" != "0" ]]; then
   fi
   if [[ "$BATCH_CREATE" != "1" ]] || ! command -v python3 >/dev/null 2>&1; then
     echo "ERROR: SYNTH_FLAT_SHARD_CAP requires BATCH_CREATE=1 and python3." >&2
+    exit 1
+  fi
+fi
+
+if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
+  for _lv in SYNTH_LINK_TARGETS SYNTH_HARDLINKS SYNTH_SYMLINKS SYNTH_LINK_SPARSE_TARGETS SYNTH_LINK_SPARSE_TARGET_MIB; do
+    if ! [[ "${!_lv}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: $_lv must be a non-negative integer (got ${!_lv})." >&2
+      exit 1
+    fi
+  done
+  unset _lv
+  if [[ "$SYNTH_LINK_TARGETS" -lt 1 ]]; then
+    echo "ERROR: SYNTH_LINK_TARGETS must be >= 1 when SYNTH_LINKS_ENABLE=1." >&2
+    exit 1
+  fi
+  if [[ "$SYNTH_LINK_SPARSE_TARGETS" -gt "$SYNTH_LINK_TARGETS" ]]; then
+    echo "ERROR: SYNTH_LINK_SPARSE_TARGETS ($SYNTH_LINK_SPARSE_TARGETS) cannot exceed SYNTH_LINK_TARGETS ($SYNTH_LINK_TARGETS)." >&2
     exit 1
   fi
 fi
@@ -721,6 +756,30 @@ margin_neutral_assumed_bytes() {
   echo $((fc * BADGE_MARGIN_NEUTRAL_BYTES))
 }
 
+# links_and_specials/ entry count (targets + hard links + symlinks + 5 specials).
+links_entry_count() {
+  if [[ "${SYNTH_LINKS_ENABLE:-1}" != "1" ]]; then
+    echo 0
+    return
+  fi
+  echo $((SYNTH_LINK_TARGETS + SYNTH_HARDLINKS + SYNTH_SYMLINKS + 5))
+}
+
+# Conservative footprint for links_and_specials/ (target files + symlink inodes cost ~1 block;
+# hard links share target inodes so they add only a dir entry; sparse targets counted at logical size).
+links_assumed_bytes() {
+  local sparse_bytes
+  if [[ "${SYNTH_LINKS_ENABLE:-1}" != "1" ]]; then
+    echo 0
+    return
+  fi
+  sparse_bytes=0
+  if [[ "$SYNTH_LINK_SPARSE_TARGETS" -gt 0 && "$SYNTH_LINK_SPARSE_TARGET_MIB" -gt 0 ]]; then
+    sparse_bytes=$((SYNTH_LINK_SPARSE_TARGETS * SYNTH_LINK_SPARSE_TARGET_MIB * 1024 * 1024))
+  fi
+  echo $(((SYNTH_LINK_TARGETS + SYNTH_SYMLINKS) * ASSUMED_BYTES_PER_FLAT_FILE + sparse_bytes))
+}
+
 # Regular files only (SYNTH_PROFILE=extreme mega_dir1 + mega_dir2).
 extreme_mega_file_count() {
   if [[ "$SYNTH_PROFILE" != "extreme" ]]; then
@@ -747,7 +806,7 @@ extreme_mega_assumed_bytes() {
 }
 
 estimate_bytes() {
-  local flat_bytes chain_bytes wide_bytes sparse_extra sparse_flat slice_bytes badge_bytes margin_bytes extreme_bytes
+  local flat_bytes chain_bytes wide_bytes sparse_extra sparse_flat slice_bytes badge_bytes margin_bytes extreme_bytes links_bytes
 
   flat_bytes=$((FLAT_FILES * ASSUMED_BYTES_PER_FLAT_FILE))
   chain_bytes=$((DEPTH_CHAIN * ASSUMED_BYTES_PER_CHAIN_DIR))
@@ -769,8 +828,9 @@ estimate_bytes() {
   badge_bytes=$(badge_fixtures_assumed_bytes)
   margin_bytes=$(margin_neutral_assumed_bytes)
   extreme_bytes=$(extreme_mega_assumed_bytes)
+  links_bytes=$(links_assumed_bytes)
 
-  echo $((flat_bytes + chain_bytes + wide_bytes + sparse_extra + slice_bytes + badge_bytes + margin_bytes + extreme_bytes))
+  echo $((flat_bytes + chain_bytes + wide_bytes + sparse_extra + slice_bytes + badge_bytes + margin_bytes + extreme_bytes + links_bytes))
 }
 
 # Bytes used by wide tree only (for AUTO_CAP headroom).
@@ -824,7 +884,8 @@ if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
     badge_bytes_nonflat=$(badge_fixtures_assumed_bytes)
     margin_bytes_nonflat=$(margin_neutral_assumed_bytes)
     extreme_bytes_nonflat=$(extreme_mega_assumed_bytes)
-    headroom=$((DISK_BUDGET_BYTES - chain_bytes - wide_bytes_nonflat - slice_bytes_nonflat - badge_bytes_nonflat - margin_bytes_nonflat - extreme_bytes_nonflat))
+    links_bytes_nonflat=$(links_assumed_bytes)
+    headroom=$((DISK_BUDGET_BYTES - chain_bytes - wide_bytes_nonflat - slice_bytes_nonflat - badge_bytes_nonflat - margin_bytes_nonflat - extreme_bytes_nonflat - links_bytes_nonflat))
     if [[ "$headroom" -lt 0 ]]; then headroom=0; fi
     sparse_per=$((SPARSE_FILE_MIB * 1024 * 1024))
     denom=$((ASSUMED_BYTES_PER_FLAT_FILE + sparse_per))
@@ -834,7 +895,7 @@ if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
     FLAT_FILES=$new_flat
     est=$(estimate_bytes)
     if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
-      echo "ERROR: non-flat trees (DEPTH_CHAIN / wide_shallow / depth_slash_profile / ereport_badge_fixtures / SYNTH_PROFILE=extreme mega_dir* / SPARSE_FILE_MIB) consume the whole disk budget; reduce those or raise DISK_BUDGET_BYTES." >&2
+      echo "ERROR: non-flat trees (DEPTH_CHAIN / wide_shallow / depth_slash_profile / ereport_badge_fixtures / links_and_specials / SYNTH_PROFILE=extreme mega_dir* / SPARSE_FILE_MIB) consume the whole disk budget; reduce those or raise DISK_BUDGET_BYTES." >&2
       exit 1
     fi
   else
@@ -888,6 +949,11 @@ if [[ "$DEPTH_SLICE_ENABLE" == "1" ]]; then
 else
   echo "  depth_slash_profile: (skipped; DEPTH_SLICE_ENABLE=1 to mimic analyze depth histogram shapes)"
 fi
+if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
+  echo "  links_and_specials: $SYNTH_LINK_TARGETS targets ($SYNTH_LINK_SPARSE_TARGETS sparse ×${SYNTH_LINK_SPARSE_TARGET_MIB}MiB) + $SYNTH_HARDLINKS hard links + $SYNTH_SYMLINKS symlinks + specials (dir/abs/broken/symlink-to-symlink)"
+else
+  echo "  links_and_specials: (skipped; SYNTH_LINKS_ENABLE=1 for symlinks + hard links)"
+fi
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
   echo "  ereport_badge_fixtures: skew_cell (${BADGE_DENSE_N}+${BADGE_DEEP_N} × ${BADGE_FILE_BYTES}B, ~${BADGE_SKEW_STAMP_DAYS}d)$([[ "${BADGE_EXTRA_SKEW_CELL:-1}" == "1" ]] && echo -n " + skew_cell_b(~${BADGE_EXTRA_SKEW_STAMP_DAYS}d)" || echo -n "") + heatmap_grid ($([[ "$BADGE_HEATMAP_GRID" != "1" ]] && echo off || { [[ "$BADGE_HEATMAP_RANDOM" == "1" ]] && echo "on, random ${BADGE_GRID_FILES_MIN}–${BADGE_GRID_FILES_MAX}/cell showcase, ≤${BADGE_GRID_MAX_FILES_PER_DIR}/leaf, sb00×${BADGE_GRID_S0_FRAC} on showcase, _d=${BADGE_HEATMAP_DEEP_PREFIX_LEVELS}, BADGE_HEATMAP_BADGE_CELL_FRAC=${BADGE_HEATMAP_BADGE_CELL_FRAC}" || echo "on, uniform ${BADGE_GRID_FILES_PER_CELL}/cell showcase, _d=${BADGE_HEATMAP_DEEP_PREFIX_LEVELS}, BADGE_HEATMAP_BADGE_CELL_FRAC=${BADGE_HEATMAP_BADGE_CELL_FRAC}"; })) + multi_age (${BADGE_MULTI_DENSE_N}+${BADGE_MULTI_DEEP_N}, megadir shards ≤${BADGE_MEGADIR_SHARD_CAP})$([[ "$BADGE_DEEP_ONLY_N" -gt 0 ]] && echo " + deep_only(${BADGE_DEEP_ONLY_N} in band ${BADGE_DEEP_ONLY_BAND})" || echo "")$([[ "$BADGE_DEEP_ONLY_N" -gt 0 && "${BADGE_HEATMAP_FILL_DEEP_ONLY_S0:-0}" != "1" ]] && echo -n "; heatmap skips ab$(printf '%02d' "$BADGE_DEEP_ONLY_BAND")/sb00 for Deep drill" || true)$([[ "${BADGE_DENSE_FLAT_ENABLE:-1}" == "1" ]] && echo -n " + dense_flat_cell(${BADGE_DENSE_FLAT_N} files, ab${BADGE_DENSE_FLAT_BAND}/sb${BADGE_DENSE_FLAT_SB})" || echo -n "")$([[ "${BADGE_DENSE_FLAT_EXTRA_ENABLE:-1}" == "1" && -n "${BADGE_DENSE_FLAT_EXTRA_PAIRS:-}" ]] && echo -n " + dense_flat_cell_extra($(dense_flat_extra_pair_count)×${BADGE_DENSE_FLAT_EXTRA_N} @${BADGE_DENSE_FLAT_EXTRA_PAIRS})" || echo -n "") ; see header"
 else
@@ -917,7 +983,7 @@ if [[ "$sec_slow" -lt "$sec_fast" ]]; then sec_slow=$sec_fast; fi
 
 chain_leaf_extra=0
 [[ "$DEPTH_CHAIN" -gt 0 ]] && chain_leaf_extra=1
-approx_other_files=$((WIDE_PARENTS * WIDE_FILES_EACH + chain_leaf_extra + $(depth_slice_file_count) + $(badge_fixtures_file_count) + $(margin_neutral_file_count) + $(extreme_mega_file_count)))
+approx_other_files=$((WIDE_PARENTS * WIDE_FILES_EACH + chain_leaf_extra + $(depth_slice_file_count) + $(badge_fixtures_file_count) + $(margin_neutral_file_count) + $(extreme_mega_file_count) + $(links_entry_count)))
 echo ""
 echo "Rough ecrawl --no-write duration (flat megadir only; highly approximate):"
 echo "  assume ${ECRAWL_FLAT_LOW}–${ECRAWL_FLAT_HIGH} entries/s over $FLAT_FILES files in single_huge_dir"
@@ -1313,6 +1379,176 @@ def emit_range(lo: int, hi: int, n_per: int, tag: str) -> None:
 emit_range(plo, phi, pn, "peak")
 emit_range(zlo, zhi, zn, "plateau")
 PY
+fi
+
+# Symlinks + hard links fixture (links_and_specials/): ecrawl records these but never follows
+# symlinks; hard links share inodes (st_nlink>1) so hardlink-aware byte dedup is exercised.
+_synth_make_links() {
+  local dest=$1
+  SYNTH_LINK_TARGETS="$SYNTH_LINK_TARGETS" \
+  SYNTH_HARDLINKS="$SYNTH_HARDLINKS" \
+  SYNTH_SYMLINKS="$SYNTH_SYMLINKS" \
+  SYNTH_LINK_SPARSE_TARGETS="$SYNTH_LINK_SPARSE_TARGETS" \
+  SYNTH_LINK_SPARSE_TARGET_MIB="$SYNTH_LINK_SPARSE_TARGET_MIB" \
+    python3 - "$dest" "$CREATE_JOBS" <<'PY'
+import concurrent.futures as cf
+import os
+import sys
+
+root, jobs_cli = sys.argv[1], int(sys.argv[2])
+n_targets = int(os.environ["SYNTH_LINK_TARGETS"])
+n_hard = int(os.environ["SYNTH_HARDLINKS"])
+n_sym = int(os.environ["SYNTH_SYMLINKS"])
+n_sparse = int(os.environ["SYNTH_LINK_SPARSE_TARGETS"])
+sparse_mib = int(os.environ["SYNTH_LINK_SPARSE_TARGET_MIB"])
+
+targets_dir = os.path.join(root, "targets")
+hard_dir = os.path.join(root, "hardlinks")
+sym_dir = os.path.join(root, "symlinks")
+spec_dir = os.path.join(root, "specials")
+for d in (targets_dir, hard_dir, sym_dir, spec_dir):
+    os.makedirs(d, exist_ok=True)
+
+
+def worker_cap(cli: int) -> int:
+    c = os.cpu_count() or 8
+    if cli <= 0:
+        return min(64, max(8, c * 2))
+    return max(1, cli)
+
+
+jw = worker_cap(jobs_cli)
+t_width = max(6, len(str(max(n_targets - 1, 1))))
+h_width = max(6, len(str(max(n_hard - 1, 1))))
+s_width = max(6, len(str(max(n_sym - 1, 1))))
+
+
+def target_name(i: int) -> str:
+    return f"t{i:0{t_width}d}"
+
+
+def make_target(i: int) -> None:
+    p = os.path.join(targets_dir, target_name(i))
+    if i < n_sparse and sparse_mib > 0:
+        sz = sparse_mib * 1024 * 1024
+        with open(p, "wb") as f:
+            f.seek(sz - 1)
+            f.write(b"\0")
+    else:
+        with open(p, "wb") as f:
+            f.write(b"\0" * 512)
+
+
+for i in range(n_targets):
+    make_target(i)
+
+
+def make_hard(i: int) -> None:
+    src = os.path.join(targets_dir, target_name(i % n_targets))
+    dst = os.path.join(hard_dir, f"h{i:0{h_width}d}")
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        pass
+
+
+def make_sym(i: int) -> None:
+    tgt = os.path.join("..", "targets", target_name(i % n_targets))
+    dst = os.path.join(sym_dir, f"s{i:0{s_width}d}")
+    try:
+        os.symlink(tgt, dst)
+    except FileExistsError:
+        pass
+
+
+def run(fn, n: int, tag: str) -> None:
+    if n <= 0:
+        return
+    if jw <= 1 or n < 2048:
+        for i in range(n):
+            fn(i)
+    else:
+        cs = max(1, (n + jw - 1) // jw)
+        ranges = [(i, min(n, i + cs)) for i in range(0, n, cs)]
+
+        def chunk(rg):
+            for i in range(rg[0], rg[1]):
+                fn(i)
+
+        with cf.ThreadPoolExecutor(max_workers=jw) as ex:
+            list(ex.map(chunk, ranges))
+    print(f"  ... links_and_specials: {n} {tag}", file=sys.stderr)
+
+
+run(make_hard, n_hard, "hard links")
+run(make_sym, n_sym, "symlinks")
+
+
+def force_symlink(target: str, linkpath: str) -> None:
+    try:
+        os.remove(linkpath)
+    except OSError:
+        pass
+    os.symlink(target, linkpath)
+
+
+t0 = target_name(0)
+force_symlink(os.path.join("..", "targets", t0), os.path.join(spec_dir, "rel_to_file"))
+force_symlink(os.path.abspath(os.path.join(targets_dir, t0)), os.path.join(spec_dir, "abs_to_file"))
+force_symlink(os.path.join("..", "targets"), os.path.join(spec_dir, "to_dir"))
+force_symlink("nonexistent_target", os.path.join(spec_dir, "broken"))
+force_symlink("rel_to_file", os.path.join(spec_dir, "to_symlink"))
+print(
+    "  ... links_and_specials: specials rel_to_file, abs_to_file, to_dir, broken, to_symlink",
+    file=sys.stderr,
+)
+PY
+}
+
+_synth_make_links_bash() {
+  local dest=$1
+  local targets_dir="$dest/targets" hard_dir="$dest/hardlinks" sym_dir="$dest/symlinks" spec_dir="$dest/specials"
+  local i tn hn sn
+  mkdir -p "$targets_dir" "$hard_dir" "$sym_dir" "$spec_dir"
+  i=0
+  while [[ "$i" -lt "$SYNTH_LINK_TARGETS" ]]; do
+    printf -v tn 't%06d' "$i"
+    if [[ "$i" -lt "$SYNTH_LINK_SPARSE_TARGETS" && "$SYNTH_LINK_SPARSE_TARGET_MIB" -gt 0 ]]; then
+      dd if=/dev/zero of="$targets_dir/$tn" bs=1 count=0 seek=$((SYNTH_LINK_SPARSE_TARGET_MIB * 1024 * 1024)) status=none 2>/dev/null || : >"$targets_dir/$tn"
+    else
+      head -c 512 /dev/zero >"$targets_dir/$tn" 2>/dev/null || : >"$targets_dir/$tn"
+    fi
+    i=$((i + 1))
+  done
+  i=0
+  while [[ "$i" -lt "$SYNTH_HARDLINKS" ]]; do
+    printf -v hn 'h%06d' "$i"
+    printf -v tn 't%06d' $((i % SYNTH_LINK_TARGETS))
+    ln "$targets_dir/$tn" "$hard_dir/$hn" 2>/dev/null || true
+    i=$((i + 1))
+  done
+  i=0
+  while [[ "$i" -lt "$SYNTH_SYMLINKS" ]]; do
+    printf -v sn 's%06d' "$i"
+    printf -v tn 't%06d' $((i % SYNTH_LINK_TARGETS))
+    ln -s "../targets/$tn" "$sym_dir/$sn" 2>/dev/null || true
+    i=$((i + 1))
+  done
+  ln -sf "../targets/t000000" "$spec_dir/rel_to_file"
+  ln -sf "$(cd "$targets_dir" && pwd)/t000000" "$spec_dir/abs_to_file"
+  ln -sf "../targets" "$spec_dir/to_dir"
+  ln -sf "nonexistent_target" "$spec_dir/broken"
+  ln -sf "rel_to_file" "$spec_dir/to_symlink"
+}
+
+if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
+  mkdir -p "$links_root"
+  echo "Creating links_and_specials under $links_root: $SYNTH_LINK_TARGETS targets ($SYNTH_LINK_SPARSE_TARGETS sparse), $SYNTH_HARDLINKS hard links, $SYNTH_SYMLINKS symlinks + specials (CREATE_JOBS=$CREATE_JOBS)..."
+  if [[ "$BATCH_CREATE" == "1" ]] && command -v python3 >/dev/null 2>&1; then
+    _synth_make_links "$links_root"
+  else
+    _synth_make_links_bash "$links_root"
+  fi
 fi
 
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
@@ -2181,9 +2417,12 @@ Why this is adversarial for ecrawl:
     python3 creation); higher cap shards into single_huge_dir/sNNNN/ subdirs.
   - deep_skinny_chain: mostly a single path of subdirectories (limited breadth until
     you fan back into other trees).
-  - wide_shallow (optional): many top-level buckets — workers can donate sibling dirs.
+  - wide_shallow (default on): many top-level buckets — workers can donate sibling dirs.
   - depth_slash_profile (optional): paths sized so stored slash counts match ecrawl_analyze
     depth_bin_* (see DEPTH_PEAK_* / DEPTH_PLATEAU_*): peak mass + deep plateau.
+  - links_and_specials (default on): symlinks (relative/absolute/to-directory/broken/symlink-to-symlink)
+    that ecrawl records but never follows, plus many hard links to shared inodes (st_nlink>1) so
+    hardlink-aware byte dedup and symlink accounting are exercised.
 
 To parallelize naturally, split files across *many sibling directories* instead of
 one directory.
