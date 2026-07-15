@@ -61,6 +61,11 @@
 #   SYNTH_LINK_SPARSE_TARGET_MIB=1024   # logical MiB per sparse target (sparse; little real disk)
 #   Also emits specials/: relative, absolute, to-directory, broken/dangling, and symlink-to-symlink.
 #
+# Real large files under real_large_files/ (on by default) — genuinely written, non-sparse:
+#   SYNTH_REAL_LARGE_ENABLE=1  # 0 skips real_large_files/
+#   SYNTH_REAL_LARGE_COUNT=10  # number of fully-written files (allocated ≈ logical, not sparse)
+#   SYNTH_REAL_LARGE_MIB=16    # size of each in MiB (zeros via dd; counts against DISK_BUDGET_BYTES)
+#
 # Optional depth/slash profile (matches ecrawl_analyze "depth_bin_*" = count of '/' in stored path
 # relative to crawl root — one leading segment depth_slash_profile/ adds one slash):
 #   DEPTH_SLICE_ENABLE=0       # set 1 to create depth_slash_profile/…
@@ -274,6 +279,10 @@ SYNTH_SYMLINKS=${SYNTH_SYMLINKS:-1500}
 SYNTH_LINK_SPARSE_TARGETS=${SYNTH_LINK_SPARSE_TARGETS:-2}
 SYNTH_LINK_SPARSE_TARGET_MIB=${SYNTH_LINK_SPARSE_TARGET_MIB:-1024}
 
+SYNTH_REAL_LARGE_ENABLE=${SYNTH_REAL_LARGE_ENABLE:-1}
+SYNTH_REAL_LARGE_COUNT=${SYNTH_REAL_LARGE_COUNT:-10}
+SYNTH_REAL_LARGE_MIB=${SYNTH_REAL_LARGE_MIB:-16}
+
 DEPTH_SLICE_ENABLE=${DEPTH_SLICE_ENABLE:-0}
 DEPTH_PEAK_LO=${DEPTH_PEAK_LO:-12}
 DEPTH_PEAK_HI=${DEPTH_PEAK_HI:-16}
@@ -355,6 +364,7 @@ wide_root="$ROOT/wide_shallow"
 depth_slice_root="$ROOT/depth_slash_profile"
 badge_fixtures_parent="$ROOT/ereport_badge_fixtures"
 links_root="$ROOT/links_and_specials"
+real_large_root="$ROOT/real_large_files"
 
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
   if ! command -v python3 >/dev/null 2>&1; then
@@ -528,6 +538,16 @@ if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
     echo "ERROR: SYNTH_LINK_SPARSE_TARGETS ($SYNTH_LINK_SPARSE_TARGETS) cannot exceed SYNTH_LINK_TARGETS ($SYNTH_LINK_TARGETS)." >&2
     exit 1
   fi
+fi
+
+if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" == "1" ]]; then
+  for _rv in SYNTH_REAL_LARGE_COUNT SYNTH_REAL_LARGE_MIB; do
+    if ! [[ "${!_rv}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: $_rv must be a non-negative integer (got ${!_rv})." >&2
+      exit 1
+    fi
+  done
+  unset _rv
 fi
 
 if [[ "$SYNTH_PROFILE" == "extreme" ]]; then
@@ -780,6 +800,24 @@ links_assumed_bytes() {
   echo $(((SYNTH_LINK_TARGETS + SYNTH_SYMLINKS) * ASSUMED_BYTES_PER_FLAT_FILE + sparse_bytes))
 }
 
+# real_large_files/ entry count.
+real_large_file_count() {
+  if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" != "1" ]]; then
+    echo 0
+    return
+  fi
+  echo "$SYNTH_REAL_LARGE_COUNT"
+}
+
+# Real (non-sparse) bytes actually written under real_large_files/ (counts against disk budget).
+real_large_assumed_bytes() {
+  if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" != "1" ]]; then
+    echo 0
+    return
+  fi
+  echo $((SYNTH_REAL_LARGE_COUNT * SYNTH_REAL_LARGE_MIB * 1024 * 1024))
+}
+
 # Regular files only (SYNTH_PROFILE=extreme mega_dir1 + mega_dir2).
 extreme_mega_file_count() {
   if [[ "$SYNTH_PROFILE" != "extreme" ]]; then
@@ -806,7 +844,7 @@ extreme_mega_assumed_bytes() {
 }
 
 estimate_bytes() {
-  local flat_bytes chain_bytes wide_bytes sparse_extra sparse_flat slice_bytes badge_bytes margin_bytes extreme_bytes links_bytes
+  local flat_bytes chain_bytes wide_bytes sparse_extra sparse_flat slice_bytes badge_bytes margin_bytes extreme_bytes links_bytes real_large_bytes
 
   flat_bytes=$((FLAT_FILES * ASSUMED_BYTES_PER_FLAT_FILE))
   chain_bytes=$((DEPTH_CHAIN * ASSUMED_BYTES_PER_CHAIN_DIR))
@@ -829,8 +867,9 @@ estimate_bytes() {
   margin_bytes=$(margin_neutral_assumed_bytes)
   extreme_bytes=$(extreme_mega_assumed_bytes)
   links_bytes=$(links_assumed_bytes)
+  real_large_bytes=$(real_large_assumed_bytes)
 
-  echo $((flat_bytes + chain_bytes + wide_bytes + sparse_extra + slice_bytes + badge_bytes + margin_bytes + extreme_bytes + links_bytes))
+  echo $((flat_bytes + chain_bytes + wide_bytes + sparse_extra + slice_bytes + badge_bytes + margin_bytes + extreme_bytes + links_bytes + real_large_bytes))
 }
 
 # Bytes used by wide tree only (for AUTO_CAP headroom).
@@ -885,7 +924,8 @@ if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
     margin_bytes_nonflat=$(margin_neutral_assumed_bytes)
     extreme_bytes_nonflat=$(extreme_mega_assumed_bytes)
     links_bytes_nonflat=$(links_assumed_bytes)
-    headroom=$((DISK_BUDGET_BYTES - chain_bytes - wide_bytes_nonflat - slice_bytes_nonflat - badge_bytes_nonflat - margin_bytes_nonflat - extreme_bytes_nonflat - links_bytes_nonflat))
+    real_large_bytes_nonflat=$(real_large_assumed_bytes)
+    headroom=$((DISK_BUDGET_BYTES - chain_bytes - wide_bytes_nonflat - slice_bytes_nonflat - badge_bytes_nonflat - margin_bytes_nonflat - extreme_bytes_nonflat - links_bytes_nonflat - real_large_bytes_nonflat))
     if [[ "$headroom" -lt 0 ]]; then headroom=0; fi
     sparse_per=$((SPARSE_FILE_MIB * 1024 * 1024))
     denom=$((ASSUMED_BYTES_PER_FLAT_FILE + sparse_per))
@@ -895,7 +935,7 @@ if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
     FLAT_FILES=$new_flat
     est=$(estimate_bytes)
     if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
-      echo "ERROR: non-flat trees (DEPTH_CHAIN / wide_shallow / depth_slash_profile / ereport_badge_fixtures / links_and_specials / SYNTH_PROFILE=extreme mega_dir* / SPARSE_FILE_MIB) consume the whole disk budget; reduce those or raise DISK_BUDGET_BYTES." >&2
+      echo "ERROR: non-flat trees (DEPTH_CHAIN / wide_shallow / depth_slash_profile / ereport_badge_fixtures / links_and_specials / real_large_files / SYNTH_PROFILE=extreme mega_dir* / SPARSE_FILE_MIB) consume the whole disk budget; reduce those or raise DISK_BUDGET_BYTES." >&2
       exit 1
     fi
   else
@@ -954,6 +994,11 @@ if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
 else
   echo "  links_and_specials: (skipped; SYNTH_LINKS_ENABLE=1 for symlinks + hard links)"
 fi
+if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" == "1" ]]; then
+  echo "  real_large_files:   $SYNTH_REAL_LARGE_COUNT × ${SYNTH_REAL_LARGE_MIB}MiB real (non-sparse) files (allocated≈logical; real >10MB bytes)"
+else
+  echo "  real_large_files:   (skipped; SYNTH_REAL_LARGE_ENABLE=1 for real large files)"
+fi
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
   echo "  ereport_badge_fixtures: skew_cell (${BADGE_DENSE_N}+${BADGE_DEEP_N} × ${BADGE_FILE_BYTES}B, ~${BADGE_SKEW_STAMP_DAYS}d)$([[ "${BADGE_EXTRA_SKEW_CELL:-1}" == "1" ]] && echo -n " + skew_cell_b(~${BADGE_EXTRA_SKEW_STAMP_DAYS}d)" || echo -n "") + heatmap_grid ($([[ "$BADGE_HEATMAP_GRID" != "1" ]] && echo off || { [[ "$BADGE_HEATMAP_RANDOM" == "1" ]] && echo "on, random ${BADGE_GRID_FILES_MIN}–${BADGE_GRID_FILES_MAX}/cell showcase, ≤${BADGE_GRID_MAX_FILES_PER_DIR}/leaf, sb00×${BADGE_GRID_S0_FRAC} on showcase, _d=${BADGE_HEATMAP_DEEP_PREFIX_LEVELS}, BADGE_HEATMAP_BADGE_CELL_FRAC=${BADGE_HEATMAP_BADGE_CELL_FRAC}" || echo "on, uniform ${BADGE_GRID_FILES_PER_CELL}/cell showcase, _d=${BADGE_HEATMAP_DEEP_PREFIX_LEVELS}, BADGE_HEATMAP_BADGE_CELL_FRAC=${BADGE_HEATMAP_BADGE_CELL_FRAC}"; })) + multi_age (${BADGE_MULTI_DENSE_N}+${BADGE_MULTI_DEEP_N}, megadir shards ≤${BADGE_MEGADIR_SHARD_CAP})$([[ "$BADGE_DEEP_ONLY_N" -gt 0 ]] && echo " + deep_only(${BADGE_DEEP_ONLY_N} in band ${BADGE_DEEP_ONLY_BAND})" || echo "")$([[ "$BADGE_DEEP_ONLY_N" -gt 0 && "${BADGE_HEATMAP_FILL_DEEP_ONLY_S0:-0}" != "1" ]] && echo -n "; heatmap skips ab$(printf '%02d' "$BADGE_DEEP_ONLY_BAND")/sb00 for Deep drill" || true)$([[ "${BADGE_DENSE_FLAT_ENABLE:-1}" == "1" ]] && echo -n " + dense_flat_cell(${BADGE_DENSE_FLAT_N} files, ab${BADGE_DENSE_FLAT_BAND}/sb${BADGE_DENSE_FLAT_SB})" || echo -n "")$([[ "${BADGE_DENSE_FLAT_EXTRA_ENABLE:-1}" == "1" && -n "${BADGE_DENSE_FLAT_EXTRA_PAIRS:-}" ]] && echo -n " + dense_flat_cell_extra($(dense_flat_extra_pair_count)×${BADGE_DENSE_FLAT_EXTRA_N} @${BADGE_DENSE_FLAT_EXTRA_PAIRS})" || echo -n "") ; see header"
 else
@@ -983,7 +1028,7 @@ if [[ "$sec_slow" -lt "$sec_fast" ]]; then sec_slow=$sec_fast; fi
 
 chain_leaf_extra=0
 [[ "$DEPTH_CHAIN" -gt 0 ]] && chain_leaf_extra=1
-approx_other_files=$((WIDE_PARENTS * WIDE_FILES_EACH + chain_leaf_extra + $(depth_slice_file_count) + $(badge_fixtures_file_count) + $(margin_neutral_file_count) + $(extreme_mega_file_count) + $(links_entry_count)))
+approx_other_files=$((WIDE_PARENTS * WIDE_FILES_EACH + chain_leaf_extra + $(depth_slice_file_count) + $(badge_fixtures_file_count) + $(margin_neutral_file_count) + $(extreme_mega_file_count) + $(links_entry_count) + $(real_large_file_count)))
 echo ""
 echo "Rough ecrawl --no-write duration (flat megadir only; highly approximate):"
 echo "  assume ${ECRAWL_FLAT_LOW}–${ECRAWL_FLAT_HIGH} entries/s over $FLAT_FILES files in single_huge_dir"
@@ -1549,6 +1594,23 @@ if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
   else
     _synth_make_links_bash "$links_root"
   fi
+fi
+
+if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" == "1" && "$SYNTH_REAL_LARGE_COUNT" -gt 0 ]]; then
+  mkdir -p "$real_large_root"
+  echo "Creating real_large_files: $SYNTH_REAL_LARGE_COUNT × ${SYNTH_REAL_LARGE_MIB}MiB non-sparse files under $real_large_root..."
+  _rl_i=0
+  while [[ "$_rl_i" -lt "$SYNTH_REAL_LARGE_COUNT" ]]; do
+    printf -v _rl_name 'big_%04d.bin' "$_rl_i"
+    if [[ "$SYNTH_REAL_LARGE_MIB" -gt 0 ]]; then
+      # Write real bytes (not seek) so allocated ≈ logical — genuinely large on disk.
+      dd if=/dev/zero of="$real_large_root/$_rl_name" bs=1048576 count="$SYNTH_REAL_LARGE_MIB" status=none 2>/dev/null || : >"$real_large_root/$_rl_name"
+    else
+      : >"$real_large_root/$_rl_name"
+    fi
+    _rl_i=$((_rl_i + 1))
+  done
+  unset _rl_i _rl_name
 fi
 
 if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
@@ -2423,6 +2485,8 @@ Why this is adversarial for ecrawl:
   - links_and_specials (default on): symlinks (relative/absolute/to-directory/broken/symlink-to-symlink)
     that ecrawl records but never follows, plus many hard links to shared inodes (st_nlink>1) so
     hardlink-aware byte dedup and symlink accounting are exercised.
+  - real_large_files (default on): a few genuinely large, fully-written files (allocated ≈ logical,
+    not sparse) so real large-file byte accounting and the large size buckets are populated.
 
 To parallelize naturally, split files across *many sibling directories* instead of
 one directory.
