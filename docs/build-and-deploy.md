@@ -15,6 +15,7 @@ make ereport_index
 make ecrawl_repair
 make ecrawl_analyze
 make edelete
+make ecrawl_mount      # optional; needs FUSE headers (see below)
 ```
 
 Clean:
@@ -23,9 +24,33 @@ Clean:
 make clean
 ```
 
+### Optional: FUSE for `ecrawl_mount`
+
+`ecrawl_mount` is built only when FUSE 2.x headers are present, so a host without them produces a link line identical to a vanilla build. `make` reports which way it resolved:
+
+```
+build: fuse enabled (-l:libfuse.so.2)
+build: fuse not found; ecrawl_mount will not be built (try: make fuse-headers)
+```
+
+Detection prefers `pkg-config --libs fuse` from `fuse-devel`:
+
+```bash
+sudo dnf install fuse-devel     # RHEL / Fedora / EL8+
+sudo apt install libfuse-dev    # Debian / Ubuntu
+```
+
+Without root, `make fuse-headers` unpacks only the headers from the matching distro RPM into `$(FUSE_PREFIX)` (default `~/.local/fuse-devel`) using `curl` + `rpm2cpio` + `cpio`, then links against the system `libfuse.so.2` — which is already present as part of the base `fuse-libs` package:
+
+```bash
+make fuse-headers && make ecrawl_mount
+```
+
+The header version is pinned to the distro's `libfuse.so.2` so the ABI matches exactly; override `FUSE_DEVEL_URL` / `FUSE_DEVEL_RPM` on another distro, or `FUSE_PREFIX` to unpack elsewhere. At runtime the host needs `/dev/fuse` and the setuid `fusermount` helper from the `fuse` package; no root is needed to mount. See [tools.md#ecrawl_mount](tools.md#ecrawl_mount).
+
 ### Optional: link native binaries against jemalloc
 
-The Makefile auto-detects jemalloc via `pkg-config` and, when `jemalloc-devel` / `libjemalloc-dev` is installed, links all native targets built by `make all` — `ereport`, `ereport_index`, `ecrawl`, `edelete`, `ecrawl_repair`, `ecrawl_analyze`, and `enfsprobe` / `enfsprobe-dist` — against `-ljemalloc`. `enfsprobe-static` is unchanged (fully static link + jemalloc is fragile). Install the dev package so `pkg-config` can find it:
+The Makefile auto-detects jemalloc via `pkg-config` and, when `jemalloc-devel` / `libjemalloc-dev` is installed, links all native targets built by `make all` — `ereport`, `ereport_index`, `ecrawl`, `edelete`, `ecrawl_repair`, `ecrawl_analyze`, `ecrawl_mount`, and `enfsprobe` / `enfsprobe-dist` — against `-ljemalloc`. `enfsprobe-static` is unchanged (fully static link + jemalloc is fragile). Install the dev package so `pkg-config` can find it:
 
 ```bash
 sudo dnf install jemalloc-devel    # RHEL / Fedora / EL8+ (EPEL)

@@ -162,6 +162,102 @@ Examples:
 ECRAWL_ANALYZE_THREADS=32 ./ecrawl_analyze -v /path/to/crawl-out
 ```
 
+## `ecrawl_mount`
+
+`ecrawl_mount` mounts a crawl output directory as a read-only FUSE filesystem, so any POSIX tool — `find`, `ls`, `stat`, `du`, `tree`, `df`, `fd`, `rsync -n`, shell globbing — can walk a crawl without the source filesystem being reachable. It is an optional build target: see [FUSE support](#fuse-support-optional) below.
+
+```bash
+./ecrawl_mount /path/to/crawl-out ~/mnt
+find ~/mnt -mtime +365 -size +1G          # works
+du -s --apparent-size ~/mnt/data/project  # exact
+fusermount -u ~/mnt                       # unmount
+```
+
+### What is faithful and what is synthesized
+
+A crawl stores metadata only, so the mounted view is metadata-only too. Everything `ecrawl` records is reported exactly:
+
+| Reported exactly | Synthesized, because the format does not store it |
+|---|---|
+| `st_size`, `st_mtime`, `st_atime`, `st_ctime` | `st_mode` permission bits — `0555` for directories, `0444` otherwise |
+| `st_uid`, `st_nlink`, `st_ino` | `st_gid` — `0` by default, set with `-o gid=N` |
+| entry type (file, dir, symlink, device, fifo, socket) | `st_blocks` — derived as `ceil(st_size/512)` so plain `du` is not zero |
+| | file contents — `read()` returns zeros up to `st_size` |
+| | symlink targets — `readlink()` fails with `EIO` |
+
+The consequences worth knowing:
+
+- `du --apparent-size`, `wc -c`, and `dd` are byte-exact; `cat`, `grep`, and `md5sum` see a file of NUL bytes.
+- Real `st_ino` and `st_nlink` mean `du` deduplicates hardlinks the same way it does on the live tree.
+- `find -type l` is correct, but `ls -l` prints an I/O error for each symlink because the target was never captured.
+- Permissions are uniform, so `find -perm` is meaningless here. `v7` dropped `mode` and `gid` deliberately; see [binary-format.md](binary-format.md).
+
+### The index
+
+The shard format is sharded by owner uid and has no path index, so one directory's children are spread across many shard files and nothing on disk maps a path to a record. `ecrawl_mount` therefore builds the whole namespace in memory at mount time, in three phases:
+
+1. Load every shard's directory catalog and merge them into one global directory tree, interning `(parent, name)` so the same logical directory appearing in many shard catalogs collapses to one node.
+2. Scan all record blocks in parallel (split on `.ckpt` boundaries, the same chunking `ereport` uses), emitting one flat row per record.
+3. Bucket rows by parent directory — a counting sort whose histogram is exactly the per-directory child count — then sort each directory's children by name. `readdir` is then a contiguous slice and lookup is a binary search, with no additional index.
+
+Cost is about 72 bytes per record plus the basenames, so roughly 90 bytes per file: ~9 GB for 100M files. Startup is dominated by zstd decompression of every shard. `--dry-run` reports the real numbers for a given crawl without mounting anything, and `--subtree PATH` mounts (and indexes) only part of the tree when the whole thing will not fit.
+
+Measured on a 4-shard, 192k-record crawl of `/usr`: index built in 0.17 s using 18 MB.
+
+### Paths and the mount root
+
+Records store absolute paths, so a crawl of `/data/project` appears at `~/mnt/data/project`. Directories above the crawl root (`~/mnt/data` here) have no record of their own and are synthesized as `0555` directories owned by the mounting user, timestamped from the crawl directory. Use `--subtree /data/project` to make that directory the mount root instead, which also shrinks the index.
+
+### Options
+
+```
+ecrawl_mount [options] <crawl-dir> <mountpoint>
+ecrawl_mount -o path=<crawl-dir> [options] <mountpoint>
+ecrawl_mount --dry-run [options] <crawl-dir>
+```
+
+- `-o path=DIR` — crawl directory, as an option instead of a positional argument.
+- `-o subtree=PATH` / `--subtree PATH` — mount only this subtree and index only its records.
+- `-o gid=N` — `st_gid` to report (default `0`).
+- `-o threads=N` — index build threads (default 32, or `ECRAWL_MOUNT_THREADS`).
+- `--dry-run` — build the index, print `key=value` stats on stdout, exit without mounting. Useful to validate a crawl directory or size its index: `records_total`, `directories`, `bytes_total`, `index_memory_bytes`, `elapsed_sec`, plus shard counts.
+- `-f` foreground, `-d` FUSE debug, `-s` single-threaded event loop, `-v` index build progress on stderr.
+- Unknown `-o` options are forwarded to libfuse, and filesystem-independent `mount(8)` flags (`ro`, `nosuid`, `relatime`, …) are accepted and ignored.
+
+The mount is always established with `ro,use_ino,kernel_cache` and 24-hour `entry_timeout` / `attr_timeout` / `negative_timeout`, since a crawl is immutable. `-o allow_other` is accepted but needs `user_allow_other` in `/etc/fuse.conf`, which requires root to enable; without it only your own processes can see the mount.
+
+### Using it as a mount helper
+
+`mount -t ecrawl` needs root, because `mount(8)` dispatches `-t TYPE` to `/sbin/mount.TYPE` and the mountpoint must be writable by the caller. The argument form is already compatible, so an administrator can enable it with a symlink and no code change:
+
+```bash
+ln -s /path/to/ecrawl_mount /sbin/mount.ecrawl
+mount -t ecrawl none /mnt -o path=/tmp/ecrawl-result
+```
+
+Without root, use the binary directly as shown above; it needs only the setuid `fusermount` helper that ships with the `fuse` package.
+
+### Performance
+
+Metadata fidelity is exact and index lookups are fast (~1.4 µs per entry served), but FUSE 2.x protocol overhead dominates directory traversal: about 130 µs fixed cost per `readdir` regardless of directory size, and ~15 µs per `getattr`. A full `find` over a 192k-entry mount takes ~5 s versus ~0.8 s on the warm live tree. FUSE 2.x cannot cache directory listings in the kernel (that arrived with FUSE 3's `cache_readdir`), so repeated traversals re-enter the filesystem each time. For bulk analytics `ereport` and `ecrawl_analyze` remain far faster; `ecrawl_mount` is for ad-hoc exploration with familiar tools, and for reaching a crawl whose source filesystem is gone.
+
+### FUSE support (optional)
+
+`ecrawl_mount` is built only when FUSE 2.x headers are found, exactly like `enfsprobe` and libnfs. `make` prints which way it resolved:
+
+```
+build: fuse enabled (-l:libfuse.so.2)
+build: fuse not found; ecrawl_mount will not be built (try: make fuse-headers)
+```
+
+The runtime library `libfuse.so.2` is part of the base system on RHEL/Rocky (the `fuse-libs` package), but the headers live in `fuse-devel`, which needs root to install. `make fuse-headers` unpacks just the headers of the matching RPM into `$(FUSE_PREFIX)` (default `~/.local/fuse-devel`) with `curl` + `rpm2cpio` + `cpio`, no root required:
+
+```bash
+make fuse-headers && make ecrawl_mount
+```
+
+The extracted version is pinned to the distro's `libfuse.so.2` so the ABI matches; override with `FUSE_DEVEL_URL` elsewhere. If `fuse-devel` is properly installed, `pkg-config --libs fuse` is found first and the fallback is skipped. Mounting also needs `/dev/fuse` to be accessible and the setuid `fusermount` helper present.
+
 ## `edelete`
 
 `edelete` is a parallel walker that deletes non-directory paths — everything under a path, or only entries older than an `atime`/`mtime`/`ctime` threshold. It is dry-run by default and never follows symlinks.
@@ -546,5 +642,7 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 - `crawl_bin_format.h` — magic, format version, `bin_file_header_t`, `bin_record_hdr_t`, `bin_dir_catalog_entry_t` (immediate-child aggregates).
 - `crawl_bin_catalog.h` / `crawl_bin_catalog.c` — load catalog tails (`crawl_bin_catalog_load()`, path helpers).
 - `crawl_bin_chunks.h` / `crawl_bin_chunks.c` — checkpoint-driven chunk boundaries (`crawl_bin_load_ckpt()`, `crawl_bin_build_chunks_for_file()`).
+- `crawl_result.h` / `crawl_result.c` — open a crawl directory: parse `crawl_manifest.txt`, enumerate finalized `uid_shard_*.bin` (skipping shards still being written), validate headers. Used by `ecrawl_mount`; `ereport` and `ereport_index` still carry their own uid-filtered copies of this logic and could migrate onto it.
+- `ecrawl_mount.c` — read-only FUSE view of a crawl (in-memory namespace index + libfuse 2.x high-level ops); optional target, built only when FUSE headers are present.
 - `crawl_ckpt.h` — shared on-disk checkpoint layout for `uid_shard_*.bin.ckpt` sidecars; included by `ecrawl`, `ereport`, `ereport_index`, `ecrawl_repair`, and `ecrawl_analyze`.
 - HTML emitters in `ereport.c` follow a common argument order where practical: output path / `FILE*` target first, then `username`, `all_users`, `distinct_uids`, `basis_str`, then function-specific fields (e.g. age/size bucket indices, detail levels).

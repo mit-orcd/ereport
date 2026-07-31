@@ -15,6 +15,7 @@ The Min logical CPUs and Min RAM columns below are practical floors for running 
 | `ecrawl` | Flush uid-sharded `.bin` output | `ECRAWL_WRITER_THREADS` | 8 writer threads | 4 | 4 GiB |
 | `ecrawl_repair` | Parallel rescans; optional `truncate` on incomplete tail; checkpoint rebuild / verify | `ECRAWL_REPAIR_THREADS` | 16 | 4 | 4 GiB |
 | `ecrawl_analyze` | Parallel shard scan for stats only (no writes) | `ECRAWL_ANALYZE_THREADS` (falls back to `ECRAWL_REPAIR_THREADS`) | 16 (maximum 4096) | 4 | 4 GiB |
+| `ecrawl_mount` | Build the in-memory namespace index at mount time (catalog merge, parallel record scan, per-directory sort) | `ECRAWL_MOUNT_THREADS` (or `-o threads=N`) | 32 (maximum 4096) | 8 | 8 GiB |
 | `edelete` | Parallel directory walk; optional `unlink` (bounded concurrency in `--delete`) | `EDELETE_THREADS`, `EDELETE_MAX_UNLINK_INFLIGHT` | 16 threads; 256 max concurrent `unlink` (`0` = unlimited) | 4 | 4 GiB |
 | `ereport` | Map/parse `.bin` chunks, emit up to 36 `bucket_*.html` files, live stderr stats | `EREPORT_THREADS` | 32 | 8 | 8 GiB |
 | `ereport_index` | `--make`: parallel chunk-boundary scan, parse workers; trigram temp writers default to the same count unless `EREPORT_INDEX_TRIGRAM_THREADS` is set. `--search`: parallel postings load and path filtering when the query and candidate set are large enough | `EREPORT_INDEX_THREADS` (and optionally `EREPORT_INDEX_TRIGRAM_THREADS`) | 32 | 16 | 16 GiB |
@@ -47,6 +48,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_STALL_HINT_SECONDS` | `ecrawl` | Stderr hint when the rolling `window_entries` stays at 0 for N consecutive seconds after warmup (default `5`; `0` = off). |
 | `ECRAWL_REPAIR_THREADS` | `ecrawl_repair` | Parallel shard rescans, tail salvage `truncate`, checkpoint rebuild (default 16, minimum 1). |
 | `ECRAWL_ANALYZE_THREADS` | `ecrawl_analyze` | Parallel shard scan for stats only (default 16, minimum 1, maximum 4096). If unset, `ECRAWL_REPAIR_THREADS` is used when set. |
+| `ECRAWL_MOUNT_THREADS` | `ecrawl_mount` | Index build threads: parallel record scan, scatter, and per-directory name sorts (default 32, range 1…4096). `-o threads=N` overrides it. Does not affect the FUSE event loop, which libfuse sizes itself (`-s` forces single-threaded). |
 | `EDELETE_THREADS` | `edelete` | Parallel walk workers (default 16, minimum 1). |
 | `EDELETE_MAX_UNLINK_INFLIGHT` | `edelete` `--delete` | Max concurrent `unlink` syscalls across all workers (default 256; `0` = unlimited). |
 | `EREPORT_THREADS` | `ereport` | Parallel `.bin` chunk readers, parallel `bucket_*.html` emission, and stats thread (default 32). |

@@ -9,7 +9,8 @@
 #   ./test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./test.sh
-#   ECRAWL_REPAIR ECRAWL_ANALYZE EDELETE EREPORT_INDEX override those binaries (same dir as this script by default).
+#   ECRAWL_REPAIR ECRAWL_ANALYZE EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (same dir as this script by default).
+#   SKIP_FUSE=1 ./test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
 # Requires: bash, coreutils, all Makefile targets built (default: same directory as this script).
 
@@ -22,6 +23,8 @@ ECRAWL_REPAIR="${ECRAWL_REPAIR:-$SCRIPT_DIR/ecrawl_repair}"
 ECRAWL_ANALYZE="${ECRAWL_ANALYZE:-$SCRIPT_DIR/ecrawl_analyze}"
 EDELETE="${EDELETE:-$SCRIPT_DIR/edelete}"
 EREPORT_INDEX="${EREPORT_INDEX:-$SCRIPT_DIR/ereport_index}"
+# Optional target: only built when FUSE headers were available (see 'make fuse-headers').
+ECRAWL_MOUNT="${ECRAWL_MOUNT:-$SCRIPT_DIR/ecrawl_mount}"
 
 # ANSI colors: disabled for non-tty or NO_COLOR (https://no-color.org/)
 _init_colors() {
@@ -747,6 +750,152 @@ run_fs_correlation() {
 }
 
 # --- Integration: synthetic tree in /tmp; no dependency on find/fd ---
+# Mountpoint of the ecrawl_mount smoke test, so the integration cleanup can
+# unmount before rm -rf: a live read-only mount under $td would otherwise make
+# rm walk the whole mounted view.
+EMOUNT_MP=""
+
+emount_unmount() {
+    local mp=$1 i
+    [[ -n "$mp" ]] || return 0
+    for i in 1 2 3 4 5; do
+        grep -qF " ${mp} fuse" /proc/mounts 2>/dev/null || { EMOUNT_MP=""; return 0; }
+        fusermount -u "$mp" 2>/dev/null && { EMOUNT_MP=""; return 0; }
+        sleep 0.3
+    done
+    printf '%swarn:%s could not unmount %s\n' "$Y" "$Z" "$mp" >&2
+    return 1
+}
+
+emount_cleanup_hook() { emount_unmount "$EMOUNT_MP"; }
+
+# ecrawl_mount smoke test.
+#
+# This is the one check in the harness that can compare a crawl against the live
+# tree it came from through an ordinary POSIX interface, so it diffs find(1)
+# output, per-entry stat fields, and du totals rather than any tool's own
+# reporting. --dry-run runs everywhere; the mount half needs a usable /dev/fuse.
+run_ecrawl_mount_tests() {
+    local td=$1 root_abs=$2 crawl_out=$3 want_entries=$4
+    local dr="${td}/emount.dryrun" drerr="${td}/emount.dryrun.err"
+    local mp="${td}/emount_mp" mroot
+    local got p a b n=0 bad=0
+
+    section_int "[integration] ecrawl_mount (smoke)"
+
+    if [[ ! -x "$ECRAWL_MOUNT" ]]; then
+        log "skip: ${ECRAWL_MOUNT} not built (needs FUSE headers: make fuse-headers)"
+        summary_add SKIP "ecrawl_mount" "binary not built"
+        return 0
+    fi
+
+    log "ecrawl_mount --dry-run (index build, no mount)"
+    "$ECRAWL_MOUNT" --dry-run "$crawl_out" >"$dr" 2>"$drerr" || {
+        tail -n 40 "$drerr" >&2 || true
+        die "ecrawl_mount --dry-run failed"
+    }
+    grep -q '^ecrawl_mount$' "$dr" || die "ecrawl_mount --dry-run missing banner line"
+    grep -q '^index_memory_bytes=' "$dr" || die "ecrawl_mount --dry-run missing index_memory_bytes"
+    # Every record ecrawl wrote must land in the index exactly once.
+    expect_eq "ecrawl_mount: records_total vs ecrawl.entries" "$want_entries" "$(kv_last records_total "$dr")" \
+        "index covers every record"
+    expect_eq "ecrawl_mount: records_skipped" "0" "$(kv_last records_skipped "$dr")"
+    expect_eq "ecrawl_mount: shards_unreadable" "0" "$(kv_last shards_unreadable "$dr")"
+    summary_add PASS "ecrawl_mount --dry-run" "records_total=${want_entries}"
+
+    if [[ -n "${SKIP_FUSE:-}" ]]; then
+        log "skip: live mount comparison (SKIP_FUSE set)"
+        summary_add SKIP "ecrawl_mount live mount" "SKIP_FUSE=1"
+        return 0
+    fi
+    if [[ ! -e /dev/fuse ]] || ! command -v fusermount >/dev/null 2>&1; then
+        log "skip: live mount comparison (no /dev/fuse or fusermount)"
+        summary_add SKIP "ecrawl_mount live mount" "no fuse on this host"
+        return 0
+    fi
+
+    mkdir -p "$mp"
+    log "ecrawl_mount ${crawl_out} -> ${mp}"
+    if ! "$ECRAWL_MOUNT" "$crawl_out" "$mp" >"${td}/emount.out" 2>"${td}/emount.err"; then
+        tail -n 20 "${td}/emount.err" >&2 || true
+        log "skip: mount failed on this host (unprivileged FUSE may be disabled)"
+        summary_add SKIP "ecrawl_mount live mount" "mount refused"
+        return 0
+    fi
+    EMOUNT_MP="$mp"
+    # Paths are stored absolute, so the crawled tree appears under its own path.
+    mroot="${mp}${root_abs}"
+
+    # 1. namespace: the mounted tree must have exactly the crawled paths.
+    if ! diff <(cd "$root_abs" && find . | sort) <(cd "$mroot" && find . | sort) >"${td}/emount.pathdiff"; then
+        head -n 20 "${td}/emount.pathdiff" >&2 || true
+        emount_unmount "$mp"
+        die "ecrawl_mount namespace differs from the live tree"
+    fi
+    expect_eq "ecrawl_mount: namespace matches live tree" "0" "0" "find output identical"
+
+    # 2. per-entry metadata that a crawl does record. atime is deliberately not
+    #    compared: the crawl froze it, while walking the live tree here keeps
+    #    moving it, so any atime check would be racy rather than meaningful.
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        a=$(stat -c '%s %Y %Z %u %h %i %F' "${root_abs}/${p}" 2>/dev/null) || continue
+        b=$(stat -c '%s %Y %Z %u %h %i %F' "${mroot}/${p}" 2>/dev/null) || {
+            printf 'missing in mount: %s\n' "$p" >&2
+            bad=1
+            continue
+        }
+        n=$((n + 1))
+        if [[ "$a" != "$b" ]]; then
+            printf 'stat mismatch %s\n  live: %s\n  mnt : %s\n' "$p" "$a" "$b" >&2
+            bad=1
+        fi
+    done < <(cd "$root_abs" && find . -printf '%P\n')
+    [[ "$n" -gt 0 ]] || { emount_unmount "$mp"; die "ecrawl_mount compared no entries"; }
+    if [[ "$bad" != 0 ]]; then
+        emount_unmount "$mp"
+        die "ecrawl_mount metadata differs from the live tree"
+    fi
+    expect_eq "ecrawl_mount: stat fields match on all ${n} entries" "0" "$bad" \
+        "size/mtime/ctime/uid/nlink/inode/type"
+
+    # 3. du: sizes are exact, so apparent-size totals must agree byte for byte.
+    expect_eq "ecrawl_mount: du --apparent-size total" \
+        "$(du --apparent-size -sb "$root_abs" | awk '{print $1}')" \
+        "$(du --apparent-size -sb "$mroot" | awk '{print $1}')" \
+        "byte-exact apparent size"
+
+    # 4. read() yields zeros for the recorded length: size-derived tools stay
+    #    correct even though contents were never captured.
+    got=$(wc -c <"${mroot}/a.txt")
+    expect_eq "ecrawl_mount: read length equals st_size" "$(wc -c <"${root_abs}/a.txt")" "$got"
+    got=$(tr -d '\0' <"${mroot}/a.txt" | wc -c)
+    expect_eq "ecrawl_mount: file content is zeros" "0" "$got"
+
+    # 5. symlink type survives even though the target does not.
+    expect_eq "ecrawl_mount: symlink type preserved" "link_a" "$(cd "$mroot" && find . -type l -printf '%f\n')"
+    if readlink "${mroot}/link_a" >/dev/null 2>&1; then
+        emount_unmount "$mp"
+        die "ecrawl_mount readlink should fail (targets are not recorded)"
+    fi
+    expect_eq "ecrawl_mount: readlink fails (target not recorded)" "0" "0" "EIO as documented"
+
+    # 6. the mount is genuinely read-only. The redirection itself is what must
+    #    fail, so it runs in a subshell whose stderr is discarded.
+    if ( : >"${mroot}/should_not_exist" ) 2>/dev/null; then
+        emount_unmount "$mp"
+        die "ecrawl_mount accepted a write"
+    fi
+    expect_eq "ecrawl_mount: writes refused" "0" "0" "EROFS"
+
+    # 7. statfs reports the crawl's own totals.
+    expect_eq "ecrawl_mount: statfs inode count" "$want_entries" \
+        "$(stat -f -c '%c' "$mroot")"
+
+    emount_unmount "$mp" || die "ecrawl_mount: unmount failed"
+    summary_add PASS "ecrawl_mount live mount" "namespace+stat+du+read+symlink+ro"
+}
+
 run_integration() {
     log "integration test (synthetic tree)"
 
@@ -760,6 +909,7 @@ run_integration() {
     au_err="${td}/ereport_all.stderr"
 
     cleanup_int() {
+        emount_cleanup_hook
         rm -rf "$td"
     }
     trap cleanup_int EXIT
@@ -925,6 +1075,8 @@ run_integration() {
     [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" ]] ||
         die "ereport_index did not write tri_keys.bin / paths.bin under ${idx_make}"
     summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin written"
+
+    run_ecrawl_mount_tests "$td" "$root_abs" "$crawl_out" "$ce"
 
     trap - EXIT
     cleanup_int

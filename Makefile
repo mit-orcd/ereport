@@ -47,6 +47,40 @@ endif
 # dlopen/dlsym: optional nfs_set_version at runtime (missing on EL7 libnfs)
 ENFSPROBE_LIBDL := -ldl
 
+# Optional FUSE 2.x for ecrawl_mount (read-only mount of a crawl result).
+# Preferred source is fuse.pc from fuse-devel. RHEL/Rocky ship libfuse.so.2 in
+# the base fuse-libs package but put the headers in fuse-devel, which needs
+# root to install; `make fuse-headers` unpacks just the headers of the matching
+# RPM into FUSE_PREFIX so an unprivileged user can still build. In that case we
+# link -l:libfuse.so.2 against the system library rather than -lfuse, because
+# the devel-only libfuse.so symlink is not present.
+FUSE_PREFIX ?= $(HOME)/.local/fuse-devel
+FUSE_CFLAGS ?= $(shell pkg-config --cflags fuse 2>/dev/null)
+FUSE_LIBS ?= $(shell pkg-config --libs fuse 2>/dev/null)
+ifeq ($(strip $(FUSE_LIBS)),)
+ifneq ($(wildcard $(FUSE_PREFIX)/usr/include/fuse.h),)
+FUSE_CFLAGS := -I$(FUSE_PREFIX)/usr/include
+FUSE_LIBS := -l:libfuse.so.2
+endif
+endif
+ifneq ($(strip $(FUSE_LIBS)),)
+TARGETS += ecrawl_mount
+FUSE_NOTE := fuse enabled ($(strip $(FUSE_LIBS)))
+else
+FUSE_NOTE := fuse not found; ecrawl_mount will not be built (try: make fuse-headers)
+endif
+
+# FUSE 2.9 API; the 2.x high-level (path-based) interface is what ecrawl_mount uses.
+FUSE_CPPFLAGS := -DFUSE_USE_VERSION=29 -D_FILE_OFFSET_BITS=64
+
+# Header-only install of fuse-devel into FUSE_PREFIX, no root required. The
+# extracted headers must match the installed libfuse.so.2 ABI, so the version
+# is pinned to what the distro ships rather than tracking upstream.
+FUSE_DEVEL_RPM ?= fuse-devel-2.9.7-19.el8.x86_64.rpm
+FUSE_DEVEL_URL ?= http://10.1.10.195/install/engaging/rocky-8.10/repos/baseos/Packages/f/$(FUSE_DEVEL_RPM)
+# The fuse-headers recipe lives below `all` on purpose: make takes the first
+# target in the file as the default goal, so a rule here would break bare `make`.
+
 # Optional jemalloc for native C binaries (all linked targets except enfsprobe-static).
 # Auto-detected via pkg-config; needs jemalloc-devel (RHEL/Fedora) or libjemalloc-dev
 # (Debian/Ubuntu). The runtime-only package ships just libjemalloc.so.2 with no .pc,
@@ -67,12 +101,32 @@ all: jemalloc-note $(TARGETS)
 
 jemalloc-note:
 	@echo "build: $(JEMALLOC_NOTE)"
+	@echo "build: $(FUSE_NOTE)"
+
+# Header-only install of fuse-devel into FUSE_PREFIX, no root required, for
+# hosts that ship libfuse.so.2 (base system) but not the devel package.
+fuse-headers:
+	@if test -f "$(FUSE_PREFIX)/usr/include/fuse.h"; then \
+	  echo "fuse-headers: already present at $(FUSE_PREFIX)/usr/include/fuse.h"; \
+	else \
+	  set -e; \
+	  mkdir -p "$(FUSE_PREFIX)"; \
+	  td=$$(mktemp -d); \
+	  echo "fuse-headers: fetching $(FUSE_DEVEL_URL)"; \
+	  curl -sSf -o "$$td/fuse-devel.rpm" "$(FUSE_DEVEL_URL)"; \
+	  rpm2cpio "$$td/fuse-devel.rpm" | cpio -idm --quiet -D "$(FUSE_PREFIX)"; \
+	  rm -rf "$$td"; \
+	  echo "fuse-headers: installed into $(FUSE_PREFIX); re-run make to build ecrawl_mount"; \
+	fi
 
 path_utils.o: path_utils.c path_utils.h
 	$(CC) $(CFLAGS) -c path_utils.c -o path_utils.o
 
 crawl_bin_catalog.o: crawl_bin_catalog.c crawl_bin_catalog.h crawl_bin_format.h
 	$(CC) $(CFLAGS) -c crawl_bin_catalog.c -o crawl_bin_catalog.o
+
+crawl_result.o: crawl_result.c crawl_result.h crawl_bin_format.h
+	$(CC) $(CFLAGS) -c crawl_result.c -o crawl_result.o
 
 crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
@@ -100,6 +154,9 @@ ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin
 
 ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+
+ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
@@ -132,7 +189,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static test_crawl_block_filter *.o crawl_bin_catalog.o crawl_bin_block.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter *.o crawl_bin_catalog.o crawl_bin_block.o crawl_result.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -151,4 +208,4 @@ check: $(TARGETS) test_crawl_block_filter
 check-tree: $(TARGETS)
 	./test_full.sh
 
-.PHONY: all clean debug serve serve-public check check-tree jemalloc-note enfsprobe-static enfsprobe-dist
+.PHONY: all clean debug serve serve-public check check-tree jemalloc-note enfsprobe-static enfsprobe-dist fuse-headers
