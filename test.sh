@@ -881,6 +881,38 @@ run_integration() {
     grep -q '^parse_chunk_jobs=' "${td}/analyze.stdout" || die "ecrawl_analyze missing parse_chunk_jobs"
     summary_add PASS "ecrawl_analyze smoke" "banner+records_total+parse_chunk_jobs"
 
+    log "ecrawl_analyze selective query block-skip parity"
+    # Skipping a block on its header summary must be invisible in the answer:
+    # same paths, same totals, just less decompression.
+    local qskip_out="${td}/query.skip.out" qskip_err="${td}/query.skip.err"
+    local qfull_out="${td}/query.full.out" qfull_err="${td}/query.full.err"
+    ECRAWL_ANALYZE_THREADS=1 "$ECRAWL_ANALYZE" --size-gt 5 --type f --list "$crawl_out" \
+        >"$qskip_out" 2>"$qskip_err" || die "block-skip query failed"
+    ECRAWL_ANALYZE_THREADS=1 ECRAWL_ANALYZE_BLOCK_SKIP=0 \
+        "$ECRAWL_ANALYZE" --size-gt 5 --type f --list "$crawl_out" \
+        >"$qfull_out" 2>"$qfull_err" || die "full-decompression query failed"
+    cmp <(sort "$qskip_out") <(sort "$qfull_out") >/dev/null ||
+        die "block-skip and full-decompression listed paths differ"
+    local qkey
+    for qkey in entries files dirs symlinks other bytes hardlink_dupes records_scanned; do
+        expect_eq "query block-skip parity: ${qkey}" "$(kv_last "$qkey" "$qfull_err")" \
+            "$(kv_last "$qkey" "$qskip_err")"
+    done
+    expect_eq "query strict > boundary (size 6 excluded)" "0" \
+        "$(ECRAWL_ANALYZE_THREADS=1 "$ECRAWL_ANALYZE" --size-gt 6 --type f "$crawl_out" 2>/dev/null |
+            awk -F= '$1=="entries"{print $2}')"
+
+    local qallskip="${td}/query.allskip"
+    ECRAWL_ANALYZE_THREADS=1 "$ECRAWL_ANALYZE" --size-gt 1000000000 --type f "$crawl_out" \
+        >"$qallskip" 2>/dev/null || die "all-block skip query failed"
+    [[ "$(kv_last blocks_skipped "$qallskip")" -gt 0 ]] || die "block-skip query skipped no blocks"
+    expect_eq "query avoids decompression when every block is impossible" "0" \
+        "$(kv_last blocks_decompressed "$qallskip")"
+    # records_scanned must still be right when the records were never decompressed.
+    expect_eq "skipped-record accounting matches a full scan" \
+        "$(kv_last records_scanned "$qfull_err")" "$(kv_last records_scanned "$qallskip")"
+    summary_add PASS "ecrawl_analyze block skipping" "parity+strict-boundary+all-skip+accounting"
+
     run_edelete_tests "$td" "$root_abs"
 
     local idx_make="${td}/index_make"
