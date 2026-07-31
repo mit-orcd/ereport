@@ -8243,7 +8243,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
         goto out;
     }
 
-    /* v6: records live in compressed blocks; the shared block reader seeks to the
+    /* Records live in compressed blocks; the shared block reader seeks to the
      * chunk start and decompresses block-by-block, returning each record header
      * plus a pointer to its name bytes (valid until the next call). */
     {

@@ -5,6 +5,7 @@
 /ereport_index
 /ecrawl_repair
 /ecrawl_analyze
+/test_crawl_block_filter
 /edelete
 /enfsprobe
 /enfsprobe-static

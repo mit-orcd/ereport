@@ -9,9 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CRAWL_BIN_MAGIC "ERCBIN06"
+#define CRAWL_BIN_MAGIC "ERCBIN07"
 #define CRAWL_BIN_MAGIC_LEN 8
-#define CRAWL_BIN_FORMAT_VERSION 6u
+#define CRAWL_BIN_FORMAT_VERSION 7u
 
 /* Aliases used by ecrawl / readers */
 #define FILE_MAGIC_LEN CRAWL_BIN_MAGIC_LEN
@@ -41,18 +41,44 @@ typedef struct __attribute__((packed)) {
 } bin_file_header_t;
 
 /*
- * v6 record-region block frame. The record region is a back-to-back sequence of
- * blocks; each block is this 8-byte header followed by comp_size bytes of a zstd
+ * v7 record-region block frame. The record region is a back-to-back sequence of
+ * blocks; each block is this 24-byte header followed by comp_size bytes of a zstd
  * frame that decompresses to raw_size bytes. The decompressed payload is a
  * concatenation of whole records (bin_record_hdr_t + name_len name bytes); a
  * record never spans a block boundary. Blocks are self-describing and
  * contiguous, so a reader walks them with header reads alone (no side index),
  * and chunk boundaries for parallel workers are always block boundaries.
+ *
+ * v7 adds a summary of the records inside the frame, so a reader can prove a
+ * block cannot satisfy a size/type predicate and seek past the frame instead of
+ * decompressing it (see crawl_bin_block_reader_set_filter). The summary is
+ * inline rather than in a side file precisely so it cannot go stale relative to
+ * the frame it describes: max_record_size and type_mask must cover *every*
+ * record in the block, since understating either silently drops query results.
+ * record_count lets a skipping reader still report an accurate scanned-record
+ * total. 16 bytes per ~256 KiB block is ~0.006% overhead.
  */
 typedef struct __attribute__((packed)) {
     uint32_t raw_size;
     uint32_t comp_size;
+    uint64_t max_record_size; /* max bin_record_hdr_t.size in this block */
+    uint32_t record_count;    /* records in this block */
+    uint16_t type_mask;       /* OR of crawl_bin_type_bit() over this block */
+    uint16_t reserved16;
 } bin_block_hdr_t;
+
+/*
+ * Stable bit per record type code, for bin_block_hdr_t.type_mask. The codes are
+ * the find(1)-style letters ecrawl stores in bin_record_hdr_t.type and
+ * ecrawl_analyze accepts for --type. Returns 0 for an unknown code, which the
+ * writer treats as an error rather than recording an incomplete mask.
+ */
+static inline uint16_t crawl_bin_type_bit(uint8_t type) {
+    static const char types[] = "fdlcbpso";
+    const char *p = (type != 0U) ? strchr(types, (int)type) : NULL;
+
+    return p ? (uint16_t)(1U << (unsigned)(p - types)) : 0U;
+}
 
 /* Target uncompressed bytes accumulated per block before it is flushed. 256 KiB
  * keeps per-open-shard writer memory modest (raw + compressed scratch) while

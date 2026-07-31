@@ -156,7 +156,8 @@ fail:
     return -1;
 }
 
-int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz) {
+int crawl_bin_catalog_dir_path_len(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz,
+                                   size_t *len_out) {
     size_t nparts = 0;
     size_t parts_len[128];
     const char *parts_ptr[128];
@@ -165,6 +166,7 @@ int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, ch
     size_t pi;
 
     if (!c || !out || out_sz == 0) return -1;
+    if (len_out) *len_out = 0;
     out[0] = '\0';
     if (dir_id == 0 || dir_id > c->max_dir_id) return -1;
 
@@ -196,16 +198,22 @@ int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, ch
             }
         }
         out[pos] = '\0';
+        if (len_out) *len_out = pos;
     }
     return 0;
 }
 
-int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_dir_id, const char *name,
-                                 size_t name_len, char *out, size_t out_sz) {
+int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz) {
+    return crawl_bin_catalog_dir_path_len(c, dir_id, out, out_sz, NULL);
+}
+
+int crawl_bin_catalog_entry_path_len(const crawl_bin_catalog_t *c, uint64_t parent_dir_id, const char *name,
+                                     size_t name_len, char *out, size_t out_sz, size_t *len_out) {
     size_t plen;
     int rc;
 
     if (!c || !out || out_sz == 0) return -1;
+    if (len_out) *len_out = 0;
     if (parent_dir_id == 0ULL) {
         errno = EINVAL;
         return -1;
@@ -217,12 +225,12 @@ int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_d
         out[0] = '/';
         if (name_len > 0 && name) memcpy(out + 1, name, name_len);
         out[1 + name_len] = '\0';
+        if (len_out) *len_out = 1U + name_len;
         return 0;
     }
 
-    rc = crawl_bin_catalog_dir_path(c, parent_dir_id, out, out_sz);
+    rc = crawl_bin_catalog_dir_path_len(c, parent_dir_id, out, out_sz, &plen);
     if (rc != 0) return rc;
-    plen = strlen(out);
     if (plen + 1 + name_len + 1 > out_sz) return -1;
     if (plen > 0) {
         out[plen] = '/';
@@ -230,5 +238,11 @@ int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_d
     }
     if (name_len > 0 && name) memcpy(out + plen, name, name_len);
     out[plen + name_len] = '\0';
+    if (len_out) *len_out = plen + name_len;
     return 0;
+}
+
+int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_dir_id, const char *name,
+                                 size_t name_len, char *out, size_t out_sz) {
+    return crawl_bin_catalog_entry_path_len(c, parent_dir_id, name, name_len, out, out_sz, NULL);
 }

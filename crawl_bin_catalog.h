@@ -43,11 +43,15 @@ int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, 
  * Build absolute stored path for directory dir_id into out (NUL-terminated).
  */
 int crawl_bin_catalog_dir_path(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz);
+int crawl_bin_catalog_dir_path_len(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz,
+                                   size_t *len_out);
 
 /*
  * parent_dir_id + file/dir name (not NUL-terminated; length name_len) -> full stored path.
  */
 int crawl_bin_catalog_entry_path(const crawl_bin_catalog_t *c, uint64_t parent_dir_id, const char *name,
                                  size_t name_len, char *out, size_t out_sz);
+int crawl_bin_catalog_entry_path_len(const crawl_bin_catalog_t *c, uint64_t parent_dir_id, const char *name,
+                                     size_t name_len, char *out, size_t out_sz, size_t *len_out);
 
 #endif /* CRAWL_BIN_CATALOG_H */

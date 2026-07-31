@@ -301,7 +301,7 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     }
     pos = (off_t)sizeof(bin_file_header_t);
 
-    /* v6: walk the self-describing compressed blocks; a crash leaves at most a
+    /* Walk the self-describing compressed blocks; a crash leaves at most a
      * truncated trailing block, which fails the bounds/read check below and is
      * salvaged by truncating to last_good_exclusive (the last whole block end). */
     while ((uint64_t)pos < scan_end) {

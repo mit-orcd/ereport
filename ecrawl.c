@@ -443,7 +443,7 @@ typedef struct {
     size_t ckpt_cap;
     uint64_t seg_start_byte;
     shard_cat_t cat;
-    /* v6: pending records are buffered here and flushed as zstd blocks. The
+    /* Pending records are buffered here and flushed as zstd blocks. The
      * buffer is reset (raw_len=0) per open; partial blocks are flushed before
      * the catalog is written and on LRU eviction, so on-disk blocks are always
      * complete. */
@@ -2324,7 +2324,7 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
     if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto fail;
     pos = (off_t)sizeof(bin_file_header_t);
 
-    /* v6: walk the self-describing compressed blocks (bin_block_hdr_t + frame),
+    /* Walk the self-describing compressed blocks (bin_block_hdr_t + frame),
      * recording block-start offsets at stride boundaries. */
     while ((uint64_t)pos < scan_end) {
         uint64_t blk_start = (uint64_t)pos;
@@ -2411,7 +2411,7 @@ static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_
     if (!s->fp) return 0;
     if (!s->ckpt_offs || s->ckpt_n == 0) return -1;
 
-    /* v6: flush the pending compressed block so bytes_written == EOF and the
+    /* Flush the pending compressed block so bytes_written == EOF and the
      * catalog is written immediately after the last block. */
     if (shard_block_flush(s) != 0) return -1;
 
@@ -2430,8 +2430,8 @@ static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_
     if (patch_bin_header_catalog_offset(s->fp, cat_off) != 0) return -1;
     if (ecrawl_io_fflush(s->fp) != 0) return -1;
 
-    /* Persist the catalog + ckpt sidecar so the on-disk shard stays complete/recoverable, but keep
-     * the in-memory cat/ckpt resident: a later reopen (LRU re-acquire) reuses them instead of
+    /* Persist the catalog and sidecar so the on-disk shard stays complete/recoverable, but keep
+     * the in-memory catalog/checkpoint resident: a later reopen reuses them instead of
      * reloading from disk. Final teardown frees them via shard_state_release(). */
     r = shard_ckpt_write_sidecar(bin_path, s->ckpt_offs, s->ckpt_n);
     return r;
@@ -2873,7 +2873,7 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     path_write = path_buf;
 
     memset(&hdr, 0, sizeof(hdr));
-    /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to on-disk v6. */
+    /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to the on-disk form. */
     hdr.parent_dir_id = 0;
     hdr.name_len = (uint16_t)path_len_write;
     hdr.type = (uint8_t)file_type_char(st->st_mode);
@@ -4573,7 +4573,7 @@ static int cmp_writer_batch_frame(const void *a, const void *b) {
  * Records whose on-disk wire size is <= WRITER_ONESHOT_RECORD_BYTES are written with one fwrite
  * (header + name) instead of two.
  */
-/* v6: compress and append the shard's pending record block to its file, pushing
+/* Compress and append the shard's pending record block to its file, pushing
  * a checkpoint offset at the block boundary once a stride's worth of file data
  * has accumulated (ckpt offsets are block starts, so segments align to blocks).
  * No-op when nothing is buffered. */
@@ -4708,18 +4708,14 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
          * the byte_credit computed once during the crawl. */
         shard_cat_update_imm_child_rollup(&st->cat, disk.parent_dir_id, frame.byte_credit, &disk);
 
-        /* v6: serialize the record into the pending block buffer; flush a
+        /* Serialize the record into the pending block buffer; flush a
          * compressed block once it reaches the raw target. (void)disk_len. */
         (void)disk_len;
-        if (crawl_bin_block_writer_append(&st->blk, &disk, sizeof(disk)) != 0) {
-            if (errno == 0) errno = ENOMEM;
-            return -1;
-        }
-        if (disk.name_len > 0U) {
+        {
             const unsigned char *nm = payload + sizeof(wire);
 
             if (wire.parent_dir_id == 0ULL) nm = (const unsigned char *)base;
-            if (crawl_bin_block_writer_append(&st->blk, nm, disk.name_len) != 0) {
+            if (crawl_bin_block_writer_append_record(&st->blk, &disk, nm) != 0) {
                 if (errno == 0) errno = ENOMEM;
                 return -1;
             }

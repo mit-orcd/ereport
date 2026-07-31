@@ -69,6 +69,11 @@
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
 #   REPS=1                     repetitions of the clean analyze pass per fixture.
 #   ECRAWL_ANALYZE_VERBOSE_ARGS=...  extra args appended to ecrawl_analyze.
+#   DO_QUERY=1                 also profile the selective hot-path query.
+#   QUERY_SIZE_GT=524288000    strict byte threshold for the query pass.
+#   QUERY_TYPE=f               record type for the query pass.
+#   QUERY_OUTPUT_SINK=/dev/null  listed paths destination; use a regular file or
+#                              production pipe to measure output backpressure.
 #
 # Data layout (under <bin-root>, persistent):
 #   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
@@ -84,6 +89,16 @@
 #   <fixture>/analyze/perf.report.bythread.txt per-thread CPU split (thread use)
 #   <fixture>/analyze/perf.sched.latency.txt   per-thread sched runtime/delay (DO_SCHED)
 #   <fixture>/analyze/perf.sched.summary.txt   perf sched timehist summary (DO_SCHED)
+#
+#   The selective query pass (DO_QUERY) writes the same file names under a dir
+#   named for its predicate, so several predicates can coexist in one run:
+#   <fixture>/query-size-gt-<N>-type-<C>/clean.stats.txt   totals + block-skip counters
+#   <fixture>/query-size-gt-<N>-type-<C>/clean.time.txt    /usr/bin/time -v
+#   <fixture>/query-size-gt-<N>-type-<C>/clean.wall.txt    wall_seconds
+#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.txt   perf report --stdio
+#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.caller.txt
+#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.bythread.txt
+#
 #   SUMMARY_TABLE.txt                          at-a-glance table
 #   COMBINED_REPORT.txt                        everything concatenated
 #   ecrawl_analyze-profile-<timestamp>.tar.gz  tarball (upload this)
@@ -110,20 +125,25 @@ mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DI
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
 # ---- locate binaries -------------------------------------------------------
+# Fails with return, not exit: this runs inside $(...), where exit would only end
+# the subshell and leave the run going with an empty path, producing a
+# structurally complete report full of rc=127. Callers must use || exit.
 find_bin() {
   local name=$1 var=$2
   local v=${!var:-}
   if [[ -n "$v" ]]; then
-    [[ -x "$v" ]] || { echo "ERROR: $var '$v' is not executable" >&2; exit 1; }
-    echo "$v"; return
+    [[ -f "$v" && -x "$v" ]] || { echo "ERROR: $var '$v' is not an executable file" >&2; return 1; }
+    echo "$v"; return 0
   fi
-  if   [[ -x "./$name" ]];   then echo "$(cd "$(dirname "./$name")" && pwd)/$name"
-  elif [[ -x "/tmp/$name" ]]; then echo "/tmp/$name"
+  # Tests -f as well as -x because a deploy dir can share the tool's name
+  # (/tmp/ereport), and a directory is -x, so -x alone picks the dir as the binary.
+  if   [[ -f "./$name" && -x "./$name" ]];   then echo "$(cd "$(dirname "./$name")" && pwd)/$name"
+  elif [[ -f "/tmp/$name" && -x "/tmp/$name" ]]; then echo "/tmp/$name"
   elif command -v "$name" >/dev/null 2>&1; then command -v "$name"
-  else echo "ERROR: cannot find $name; set $var=/path/to/$name" >&2; exit 1
+  else echo "ERROR: cannot find $name; set $var=/path/to/$name" >&2; return 1
   fi
 }
-ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN)
+ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN) || exit 1
 
 # ---- config ----------------------------------------------------------------
 ECRAWL_ANALYZE_THREADS=${ECRAWL_ANALYZE_THREADS:-32}
@@ -138,6 +158,12 @@ PERF_CALLGRAPH=${PERF_CALLGRAPH:-dwarf}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 ECRAWL_ANALYZE_VERBOSE_ARGS=${ECRAWL_ANALYZE_VERBOSE_ARGS:-}
+DO_QUERY=${DO_QUERY:-1}
+QUERY_SIZE_GT=${QUERY_SIZE_GT:-524288000}
+QUERY_TYPE=${QUERY_TYPE:-f}
+QUERY_OUTPUT_SINK=${QUERY_OUTPUT_SINK:-/dev/null}
+# Named for the predicate so runs with different filters do not overwrite each other.
+QUERY_DIR_NAME="query-size-gt-${QUERY_SIZE_GT}-type-${QUERY_TYPE}"
 
 KNOWN_FIXTURES=(
   deep_skinny_chain
@@ -194,6 +220,48 @@ build_argv() {
   # shellcheck disable=SC2206
   [[ -n "$ECRAWL_ANALYZE_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_ANALYZE_VERBOSE_ARGS)
   RUN_ARGV+=("$bindir")
+}
+
+build_query_argv() {
+  local bindir=$1
+  QUERY_ARGV=("$ECRAWL_ANALYZE_BIN" --size-gt "$QUERY_SIZE_GT" --type "$QUERY_TYPE" --list "$bindir")
+}
+
+run_query_clean() {
+  local dest=$1 bindir=$2 rep=$3
+  local sfx=""; [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
+  local t0 t1 rc
+  build_query_argv "$bindir"
+  echo "    query clean${sfx}: ${QUERY_ARGV[*]} >$QUERY_OUTPUT_SINK"
+  t0=$(date +%s.%N)
+  if [[ "$HAVE_TIME" == "1" ]]; then
+    "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
+      "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+  else
+    "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+  fi
+  rc=$?
+  t1=$(date +%s.%N)
+  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/clean.wall${sfx}.txt"
+  echo "rc=$rc" >>"$dest/clean.stats${sfx}.txt"
+}
+
+run_query_perf() {
+  local dest=$1 bindir=$2
+  [[ "$DO_PERF" == "1" ]] || return 0
+  build_query_argv "$bindir"
+  local data="$dest/perf.data"
+  echo "    query perf: process-scoped, output -> $QUERY_OUTPUT_SINK"
+  if perf record --call-graph "$PERF_CALLGRAPH" -F "$PERF_FREQ" -o "$data" \
+       "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/perf.record-stderr.txt"; then
+    perf report -i "$data" --stdio 2>/dev/null >"$dest/perf.report.txt" || true
+    perf report -i "$data" --stdio -g graph,0.5,caller 2>/dev/null >"$dest/perf.report.caller.txt" || true
+    perf report -i "$data" --stdio --no-children --sort comm,pid \
+      >"$dest/perf.report.bythread.txt" 2>"$dest/perf.report.bythread-stderr.txt" || true
+  else
+    echo "perf record failed; check perf.record-stderr.txt" >"$dest/perf.report.txt"
+  fi
+  rm -f "$data"
 }
 
 run_clean() {
@@ -283,6 +351,7 @@ profile_one() {
   local bindir="$fxout/bin"
   local dest="$RESULTS_DIR/$fixture"
   local adest="$dest/analyze"
+  local qdest="$dest/$QUERY_DIR_NAME"
   echo "==> $fixture  ($bindir)"
   local nsh
   nsh=$(shard_count "$bindir")
@@ -300,6 +369,13 @@ profile_one() {
   run_strace "$adest" "$bindir"
   run_perf   "$adest" "$bindir"
   run_sched  "$adest" "$bindir" "$fixture"
+  if [[ "$DO_QUERY" == "1" ]]; then
+    mkdir -p "$qdest"
+    for ((r = 1; r <= REPS; r++)); do
+      run_query_clean "$qdest" "$bindir" "$r"
+    done
+    run_query_perf "$qdest" "$bindir"
+  fi
 }
 
 # ---- env snapshot ----------------------------------------------------------
@@ -312,6 +388,7 @@ profile_one() {
   echo "ecrawl_analyze_bin=$ECRAWL_ANALYZE_BIN"
   echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
+  echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE sink=$QUERY_OUTPUT_SINK"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -367,24 +444,48 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
     echo "FIXTURE: $f"
     echo "========================================================================"
     d="$RESULTS_DIR/$f/analyze"
-    [[ -d "$d" ]] || continue
-    for part in clean.stats clean.time; do
-      for file in "$d/$part"*.txt; do
-        [[ -e "$file" ]] || continue
-        echo "----- $(basename "$file") -----"; cat "$file"; echo
+    if [[ -d "$d" ]]; then
+      echo "--- full-scan pass (analyze/) ---"
+      echo
+      for part in clean.stats clean.time; do
+        for file in "$d/$part"*.txt; do
+          [[ -e "$file" ]] || continue
+          echo "----- $(basename "$file") -----"; cat "$file"; echo
+        done
       done
-    done
-    if [[ -s "$d/strace.txt" ]]; then
-      echo "----- strace.txt (syscall histogram) -----"; cat "$d/strace.txt"; echo
+      if [[ -s "$d/strace.txt" ]]; then
+        echo "----- strace.txt (syscall histogram) -----"; cat "$d/strace.txt"; echo
+      fi
+      if [[ -s "$d/perf.report.txt" ]]; then
+        echo "----- perf.report.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.txt"; echo
+      fi
+      if [[ -s "$d/perf.report.bythread.txt" ]]; then
+        echo "----- perf.report.bythread.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.bythread.txt"; echo
+      fi
+      if [[ -s "$d/perf.sched.latency.txt" ]]; then
+        echo "----- perf.sched.latency.txt -----"; cat "$d/perf.sched.latency.txt"; echo
+      fi
     fi
-    if [[ -s "$d/perf.report.txt" ]]; then
-      echo "----- perf.report.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.txt"; echo
-    fi
-    if [[ -s "$d/perf.report.bythread.txt" ]]; then
-      echo "----- perf.report.bythread.txt (top 40 lines) -----"; head -n 40 "$d/perf.report.bythread.txt"; echo
-    fi
-    if [[ -s "$d/perf.sched.latency.txt" ]]; then
-      echo "----- perf.sched.latency.txt -----"; cat "$d/perf.sched.latency.txt"; echo
+    # The selective query is the hot path the block-skip work targets, so its
+    # profile belongs in the uploaded report next to the full scan.
+    q="$RESULTS_DIR/$f/$QUERY_DIR_NAME"
+    if [[ -d "$q" ]]; then
+      echo "--- selective query pass ($QUERY_DIR_NAME) ---"
+      echo "    ecrawl_analyze --size-gt $QUERY_SIZE_GT --type $QUERY_TYPE --list"
+      echo
+      for part in clean.stats clean.time; do
+        for file in "$q/$part"*.txt; do
+          [[ -e "$file" ]] || continue
+          echo "----- query/$(basename "$file") -----"; cat "$file"; echo
+        done
+      done
+      if [[ -s "$q/perf.report.txt" ]]; then
+        echo "----- query/perf.report.txt (top 40 lines) -----"; head -n 40 "$q/perf.report.txt"; echo
+      fi
+      if [[ -s "$q/perf.report.bythread.txt" ]]; then
+        echo "----- query/perf.report.bythread.txt (top 40 lines) -----"
+        head -n 40 "$q/perf.report.bythread.txt"; echo
+      fi
     fi
   done
 } >"$COMBINED"
@@ -392,12 +493,16 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
 # ---- summary table ---------------------------------------------------------
 SUMMARY_TABLE="$RESULTS_DIR/SUMMARY_TABLE.txt"
 if command -v python3 >/dev/null 2>&1; then
-  RESULTS_DIR="$RESULTS_DIR" FIXLIST_STR="${FIXLIST[*]}" python3 - <<'PY' >"$SUMMARY_TABLE" 2>/dev/null
+  RESULTS_DIR="$RESULTS_DIR" FIXLIST_STR="${FIXLIST[*]}" QUERY_DIR="$QUERY_DIR_NAME" \
+    QUERY_LABEL="--size-gt $QUERY_SIZE_GT --type $QUERY_TYPE --list" \
+    python3 - <<'PY' >"$SUMMARY_TABLE" 2>/dev/null
 import os, re
 from pathlib import Path
 
 root = Path(os.environ["RESULTS_DIR"])
 fixtures = os.environ.get("FIXLIST_STR", "").split()
+qdir = os.environ.get("QUERY_DIR", "")
+qlabel = os.environ.get("QUERY_LABEL", "")
 if (root / "_ALL_ROOT_").is_dir() and "_ALL_ROOT_" not in fixtures:
     fixtures.append("_ALL_ROOT_")
 
@@ -429,25 +534,29 @@ def kv(p):
 
 
 def analyze_kv(fx):
+    return pass_kv(fx, "analyze")
+
+
+def pass_kv(fx, sub):
     for cand in ("clean.stats.rep1.txt", "clean.stats.txt"):
-        p = root / fx / "analyze" / cand
+        p = root / fx / sub / cand
         if p.exists():
             return kv(p)
     return {}
 
 
-def reps_elapsed(fx):
-    """Analyze wall time from our own timer (clean.wall*), per rep."""
+def reps_elapsed(fx, sub="analyze"):
+    """Wall time from our own timer (clean.wall*), per rep."""
     out = []
     for r in range(1, 100):
-        p = root / fx / "analyze" / f"clean.wall.rep{r}.txt"
+        p = root / fx / sub / f"clean.wall.rep{r}.txt"
         if not p.exists():
             break
         v = num(kv(p).get("wall_seconds", ""))
         if v is not None:
             out.append(v)
     if not out:
-        p = root / fx / "analyze" / "clean.wall.txt"
+        p = root / fx / sub / "clean.wall.txt"
         if p.exists():
             v = num(kv(p).get("wall_seconds", ""))
             if v is not None:
@@ -550,6 +659,46 @@ for fx in fixtures:
     ]))
 lines.append("")
 
+# --- selective query pass (block skipping) --------------------------------
+# blks_dec/blks_skip come from ecrawl_analyze's own counters: a skipped block is
+# one whose header summary proved no record inside could match, so it was seeked
+# past instead of decompressed. skip% is the share of blocks avoided.
+qcols = ["fixture", "query(s)", "entries", "scanned", "blks_dec", "blks_skip", "skip%"]
+qw = [22, 10, 12, 14, 11, 11, 7]
+
+
+def qrow(vals):
+    return "  ".join(str(v).ljust(qw[i]) for i, v in enumerate(vals))
+
+
+qrows = []
+for fx in fixtures:
+    qv = pass_kv(fx, qdir) if qdir else {}
+    if not qv:
+        continue
+    el = reps_elapsed(fx, qdir)
+    el_avg = (sum(el) / len(el)) if el else None
+    dec = num(qv.get("blocks_decompressed"))
+    skip = num(qv.get("blocks_skipped"))
+    pct = None
+    if dec is not None and skip is not None and (dec + skip) > 0:
+        pct = 100.0 * skip / (dec + skip)
+    qrows.append(qrow([
+        fx,
+        fmt(el_avg, "f2") if el_avg is not None else "-",
+        fmt(num(qv.get("entries"))),
+        fmt(num(qv.get("records_scanned"))),
+        fmt(dec),
+        fmt(skip),
+        fmt(pct, "f1") if pct is not None else "-",
+    ]))
+if qrows:
+    lines.append(f"== SELECTIVE QUERY ({qlabel}) ==")
+    lines.append(qrow(qcols))
+    lines.append(qrow(["-" * x for x in qw]))
+    lines.extend(qrows)
+    lines.append("")
+
 # --- per-thread on-CPU spread (perf) --------------------------------------
 # threads_>=1% = how many distinct threads each carried >=1% of CPU samples.
 # ecrawl_analyze caps workers at the parse-chunk count, so a single big shard
@@ -583,6 +732,18 @@ for fx in fixtures:
     if el:
         avg = sum(el) / len(el)
         lines.append(f"  {fx}: {[round(x,2) for x in el]} avg={avg:.2f}s")
+
+if qdir:
+    qper = []
+    for fx in fixtures:
+        el = reps_elapsed(fx, qdir)
+        if el:
+            avg = sum(el) / len(el)
+            qper.append(f"  {fx}: {[round(x,2) for x in el]} avg={avg:.2f}s")
+    if qper:
+        lines.append("")
+        lines.append("== QUERY ELAPSED PER REP ==")
+        lines.extend(qper)
 
 print("\n".join(lines))
 PY

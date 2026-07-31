@@ -1,5 +1,5 @@
 /*
- * crawl_bin_block — zstd block (de)compression for v6 uid_shard_*.bin record
+ * crawl_bin_block — zstd block (de)compression for v7 uid_shard_*.bin record
  * regions. Shared by the writer (ecrawl), the chunker, and every reader
  * (ereport, ereport_index, ecrawl_analyze, ecrawl_repair).
  *
@@ -28,6 +28,10 @@ typedef struct {
     unsigned char *comp; /* scratch for the compressed frame */
     size_t comp_cap;
     int level;
+    /* Summary of the pending block, written into its bin_block_hdr_t on flush. */
+    uint64_t max_record_size;
+    uint16_t type_mask;
+    uint32_t record_count;
 } crawl_bin_block_writer_t;
 
 typedef size_t (*crawl_bin_block_fwrite_fn)(const void *ptr, size_t size, size_t nmemb, FILE *stream);
@@ -35,8 +39,9 @@ typedef size_t (*crawl_bin_block_fwrite_fn)(const void *ptr, size_t size, size_t
 int crawl_bin_block_writer_init(crawl_bin_block_writer_t *w);
 void crawl_bin_block_writer_free(crawl_bin_block_writer_t *w);
 
-/* Append one serialized record (header + name bytes) to the pending block. */
-int crawl_bin_block_writer_append(crawl_bin_block_writer_t *w, const void *data, size_t len);
+/* Append one complete record and update the pending block's query metadata. */
+int crawl_bin_block_writer_append_record(crawl_bin_block_writer_t *w, const bin_record_hdr_t *hdr,
+                                         const void *name);
 
 /* Bytes currently buffered (un-flushed) in the pending block. */
 static inline size_t crawl_bin_block_writer_pending(const crawl_bin_block_writer_t *w) {
@@ -45,11 +50,11 @@ static inline size_t crawl_bin_block_writer_pending(const crawl_bin_block_writer
 
 /*
  * Compress and write the pending block via wfwrite, then reset. On success sets
- * *bytes_written_out to the on-disk size of the block (8 + comp_size), or 0 when
- * nothing was pending. Returns 0 on success, -1 on error.
+ * *bytes_written_out to the on-disk size of the block (sizeof(bin_block_hdr_t) +
+ * comp_size), or 0 when nothing was pending. Returns 0 on success, -1 on error.
  */
-int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp,
-                                 crawl_bin_block_fwrite_fn wfwrite, uint64_t *bytes_written_out);
+int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bin_block_fwrite_fn wfwrite,
+                                 uint64_t *bytes_written_out);
 
 /* ----------------------------------------------------------------------------
  * Reader side: iterate records across the compressed blocks in a byte range.
@@ -65,6 +70,14 @@ typedef struct {
     size_t raw_cap;
     size_t raw_len; /* decompressed size of the current block */
     size_t raw_off; /* cursor within the current block */
+    /* Optional block-skipping predicate; see crawl_bin_block_reader_set_filter. */
+    uint64_t size_gt;
+    int have_size_gt;
+    uint16_t type_bit;
+    uint64_t blocks_decompressed;
+    uint64_t blocks_skipped;
+    uint64_t records_skipped; /* records in skipped blocks, from their headers */
+    void *dctx; /* reusable ZSTD_DCtx, kept opaque in the public header */
 } crawl_bin_block_reader_t;
 
 /*
@@ -75,6 +88,20 @@ typedef struct {
  */
 int crawl_bin_block_reader_init(crawl_bin_block_reader_t *r, const crawl_bin_chunk_stdio_t *io, FILE *fp,
                                 uint64_t start_off, uint64_t end_off);
+
+/* Reuse an initialized reader's ZSTD context and buffers for another range. */
+int crawl_bin_block_reader_reinit(crawl_bin_block_reader_t *r, const crawl_bin_chunk_stdio_t *io, FILE *fp,
+                                  uint64_t start_off, uint64_t end_off);
+
+/*
+ * Skip whole blocks whose bin_block_hdr_t summary proves no record inside can
+ * match: size_gt is the strict lower bound from --size-gt, type_filter is a
+ * record type code (0 for none). The predicate only ever skips blocks, so
+ * results are identical to an unfiltered scan; it must be re-armed after each
+ * reinit. Returns -1 if neither term is usable, leaving the reader unfiltered.
+ */
+int crawl_bin_block_reader_set_filter(crawl_bin_block_reader_t *r, int have_size_gt, uint64_t size_gt,
+                                      int type_filter);
 
 /*
  * Yield the next record. Copies the fixed header into *hdr and points *name at

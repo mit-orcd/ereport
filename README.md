@@ -99,7 +99,7 @@ Serves the static report and routes `GET …/search` to `ereport_index --search`
 - [Tool reference](docs/tools.md) — full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`, plus the source layout.
 - [Typical workflow & output semantics](docs/workflow.md) — multi-server crawls, merged reports, and how byte/capacity totals are computed.
 - [Environment variables & thread defaults](docs/environment-variables.md) — every tuning knob and the per-binary default thread counts.
-- [Crawl shard binary format](docs/binary-format.md) — `ERCBIN05` header, record stream, catalog tail, and `.ckpt` sidecars.
+- [Crawl shard binary format](docs/binary-format.md) — `ERCBIN07` header, zstd block-compressed record stream, catalog tail, and `.ckpt` sidecars.
 - [Performance & profiling](docs/performance.md) — why it is fast, adversarial-tree generation, and the profiling harness.
 - [Testing](docs/testing.md) — `test.sh` / `make check` and validation helpers.
 - [Build & deploy](docs/build-and-deploy.md) — jemalloc linking and the systemd daily-crawl units.

@@ -21,11 +21,12 @@ import os
 import struct
 import sys
 
-MAGIC = b"ERCBIN06"
+MAGIC = b"ERCBIN07"
 HEADER_FMT = "<8sIIQQ"          # magic, version, reserved, catalog_offset, reserved64
 HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 32
-BLOCK_FMT = "<II"               # raw_size, comp_size
-BLOCK_SIZE = struct.calcsize(BLOCK_FMT)     # 8
+# raw_size, comp_size, max_record_size, record_count, type_mask, reserved16
+BLOCK_FMT = "<IIQIHH"
+BLOCK_SIZE = struct.calcsize(BLOCK_FMT)     # 24
 CATALOG_ENTRY_SIZE = 64         # bin_dir_catalog_entry_t fixed part (name bytes follow)
 
 
@@ -90,7 +91,7 @@ def analyze_shard(path, block_target):
             bh = fp.read(BLOCK_SIZE)
             if len(bh) < BLOCK_SIZE:
                 raise ValueError("truncated block header")
-            raw_size, comp_size = struct.unpack(BLOCK_FMT, bh)
+            raw_size, comp_size = struct.unpack(BLOCK_FMT, bh)[:2]
             st.n_blocks += 1
             st.rec_raw_bytes += raw_size
             st.rec_comp_bytes += comp_size

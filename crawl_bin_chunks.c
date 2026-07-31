@@ -140,10 +140,10 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
     acc = 0;
     cur = seg_start;
 
-    /* v6: the record region is a sequence of self-describing compressed blocks
-     * (bin_block_hdr_t + comp_size frame). Walk block headers (8 bytes each,
-     * skipping the frame with one seek) and split into chunks at block
-     * boundaries once ~chunk_target_bytes of compressed data accumulate. */
+    /* The record region is a sequence of self-describing compressed blocks
+     * (bin_block_hdr_t + comp_size frame). Walk block headers (skipping each
+     * frame with one seek) and split into chunks at block boundaries once
+     * ~chunk_target_bytes of compressed data accumulate. */
     for (;;) {
         bin_block_hdr_t bh;
         uint64_t block_end;
