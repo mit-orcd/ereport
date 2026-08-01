@@ -11,7 +11,7 @@ description: >-
 
 ## When to use
 
-Any compile, `./test.sh`, `make check`, `scripts/profile/profiling.sh`, or heavy indexer work while the agent shell is on an ORCD login node.
+Any compile, `./scripts/test/test.sh`, `make check`, `scripts/profile/profiling.sh`, or heavy indexer work while the agent shell is on an ORCD login node.
 
 ## Layout
 
@@ -56,7 +56,7 @@ fi
 mkdir -p "$TMPDIR"
 cd /home/erbmi1/git/ereport
 make -j"$(nproc)"
-./test.sh
+./scripts/test/test.sh
 rm -rf "$TMPDIR"
 '
 ```
@@ -73,7 +73,7 @@ scontrol show partition mit_testing | grep -o 'MaxTime=\S*'
 ```
 
 - `mit_testing` — check this one. Few nodes, but they are large (224 CPUs, 2 TB) with a 7-day limit, and they are often idle while `mit_normal` queues on priority. Best choice for a tool build or a long indexer run.
-- `mit_quicktest` — 15 min hard cap. Environment probes and `./test.sh`, nothing that compiles a dependency tree.
+- `mit_quicktest` — 15 min hard cap. Environment probes and `./scripts/test/test.sh`, nothing that compiles a dependency tree.
 - `mit_normal` — 12 h, 50 nodes, but expect to wait behind `(Priority)`.
 - `mit_preemptable` — 2 days and hundreds of nodes; fine for restartable work, not for a long build you do not want killed.
 
@@ -150,6 +150,6 @@ export CARGO_TARGET_DIR=/scratch/$USER/cargo-$SLURM_JOB_ID
 
 ## Do not
 
-- Run `make -j`, `./test.sh`, or profilers on `orcd-login*`
+- Run `make -j`, `./scripts/test/test.sh`, or profilers on `orcd-login*`
 - Rewrite harness scripts just to relocate scratch
 - Put GUFI/XDU indexes or Rust/venv trees under home NFS

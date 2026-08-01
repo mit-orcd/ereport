@@ -110,7 +110,7 @@ Performance here is dominated by filesystem *shape*, not just file count: one 20
 1. Generate adversarial shapes with `scripts/fixtures/generate-ecrawl-adversarial-tree.sh` so every pathological case is reproducible on demand.
 2. Profile each shape with the scripts above and read the `SUMMARY_TABLE.txt` — timings, syscall histograms, and CPU call-graphs — to name the actual bottleneck (a specific syscall, lock, or callsite) instead of guessing.
 3. Change one thing, re-run the same profile, and compare. Keep the change only when the numbers move; the tarballs are the evidence trail.
-4. Guard the win with `test.sh` (use `--summary` for a copy/paste results table) so a correctness or throughput regression surfaces immediately.
+4. Guard the win with `scripts/test/test.sh` (use `--summary` for a copy/paste results table) so a correctness or throughput regression surfaces immediately.
 
 This loop turned several hunches into measured fixes — raising the writer's open-shard cap to cut uid-shard `open`/`close` churn ~90%, replacing a per-record `ftello()` in `ereport` that issued an `lseek` per record, and moving NSS lookups out of a global lock in `ecrawl` (which roughly halved a many-UID crawl). None were obvious from reading the code; the profiles pointed straight at them.
 

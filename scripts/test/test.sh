@@ -3,14 +3,14 @@
 # Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_repair / ecrawl_analyze /
 # edelete / ereport_index, optional live-tree correlation with find/fd.
 #
-# Usage (./test.sh at the repo root is a shim for this script):
-#   ./test.sh                      # integration + tool smoke tests (temp tree + built binaries)
-#   ./test.sh --edelete-only       # edelete smoke + synthetic probes only (needs ./edelete built)
-#   ./test.sh /path/to/tree        # above + filesystem correlation for that root
-#   SKIP_FS=1 ./test.sh /path      # integration only (ignore arg for fs checks)
-#   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./test.sh
+# Usage:
+#   ./scripts/test/test.sh                      # integration + tool smoke tests (temp tree + built binaries)
+#   ./scripts/test/test.sh --edelete-only       # edelete smoke + synthetic probes only (needs ./edelete built)
+#   ./scripts/test/test.sh /path/to/tree        # above + filesystem correlation for that root
+#   SKIP_FS=1 ./scripts/test/test.sh /path      # integration only (ignore arg for fs checks)
+#   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./scripts/test/test.sh
 #   ECRAWL_REPAIR ECRAWL_ANALYZE EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
-#   SKIP_FUSE=1 ./test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
+#   SKIP_FUSE=1 ./scripts/test/test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
 # Requires: bash, coreutils, all Makefile targets built (default: the repo root, two levels up).
 
