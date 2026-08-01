@@ -259,6 +259,8 @@ python3 scripts/compare-indexers/summarize.py scripts/compare-indexers/results/i
 
 `SYNTH_PROFILE=medium` is the default for `prepare-synth.sh` (reuse [generate-ecrawl-adversarial-tree.sh](../fixtures/generate-ecrawl-adversarial-tree.sh)). Raise to `heavy` / `extreme` for stress shapes (`mega_dir1`, etc.).
 
+A second run against the same synth root does not rebuild the tree. The generator leaves a `FIXTURE_MANIFEST.txt` recording the parameters it built from, and skips when a later run asks for the same ones — so only the first benchmark against a given root pays the generation cost. Asking for a *different* profile against that root is an error rather than an overlay, because the two trees would be laid over each other; `rm -rf` the root, or point at a different one. `FORCE=1` rebuilds in place. `prepare-synth.sh` still recreates `query_seeds/` on every run, which is cheap and keeps Q1's unique basename fresh.
+
 ### Checking a code change (`SYNTH_PROFILE=tiny`)
 
 For proving that a change to `ecrawl`, `ereport_index` or `ecrawl_analyze` still
@@ -334,29 +336,40 @@ Each smoke run writes five figures, each as both PNG and PDF:
 
 | File | Title | Question it answers |
 |---|---|---|
-| `charts/figure1_walk` | walking | How long does it take just to *see* every file? |
+| `charts/figure1_walk` | walking | How long does it take to *see* every file, and which tools have anything left over afterwards? |
 | `charts/figure2_build` | building | What does constructing the index cost, with the walk taken out? |
 | `charts/figure3_index_total` | walking and building | What does the whole thing cost from a cold tree? |
 | `charts/figure4_index_size` | index storage | What does the index cost to keep? |
 | `charts/figure5_queries` | query performance | How fast is each query, and did it answer correctly? |
 
 The first three are **one measurement cut in two and put back together**, not
-three takes on the same chart: **Figure 1 + Figure 2 = Figure 3**. For the ecrawl
-pipeline that is 2.52 s walking + 2.05 s building = 4.56 s end to end. They are
-nested rather than alternatives, so a phase that appears in two of them (the
-trigram build is in both the total and the build-only figure) is not counted
-twice. Each of the three states this on its own caption, because separated from
-each other they otherwise look redundant.
+three takes on the same chart: **Figure 1's walk-only bars + Figure 2 = Figure
+3**. For the ecrawl pipeline that is 2.52 s walking + 2.05 s building = 4.56 s
+end to end. They are nested rather than alternatives, so a phase that appears in
+two of them (the trigram build is in both the total and the build-only figure)
+is not counted twice. Figure 1's one storing bar sits outside that arithmetic —
+it already contains its own build — and reappears as the crawl phase of Figure
+3. Each of the three states this on its own caption, because separated from each
+other they otherwise look redundant.
 
 Every bar panel switches to a log x-axis once the spread exceeds 10×, which
 these runs almost always do: with GUFI's rollup at 495 s against a 4.6 s
 `ecrawl + ereport_index`, a linear axis ranks nothing but the slowest tool and
 flattens everything else into a sliver at the origin.
 
-**Figure 1** is the only chart whose bars compare with no asterisk at all: every
-tool on it traverses and stores nothing. This is where `ecrawl --no-write` earns
-its keep — `ecrawl`'s full capture against `find` is not a like-for-like race,
-but its walk without the capture is.
+**Figure 1** puts every full traversal in the run on one axis and uses
+**stippling** to say which of them keeps anything: solid bars store an index and
+carry what they kept (`43 MiB kept on disk`), stippled bars answer their question
+and forget the tree. Dots rather than the diagonals of Figure 5, deliberately —
+there hatching means a wrong answer, and storing nothing is a trade, not a
+defect. The stippled set is the only group that compares with no asterisk at
+all, which is where `ecrawl --no-write` earns its keep — `ecrawl`'s
+full capture against `find` is not a like-for-like race, but its walk without the
+capture is. Charting `ecrawl` beside it makes the price of the capture readable
+straight off the axis: the gap between the two bars is the same 1.03 s that
+Figure 2 reports as the inferred capture-write cost. `ecrawl --no-write` gets its
+own colour rather than sharing `ecrawl`'s blue, since the two now sit side by
+side and it appears on no other figure.
 
 **Figure 2** is *mostly estimate and says so*, using two tones per bar. A bar
 runs out to the end-to-end build minus the fastest walk in the run; since
@@ -400,7 +413,8 @@ under each value say which phase the time went to. A dashed line marks the
 fastest pure walk in the run, the floor no indexer can beat.
 
 **Figure 4** is index storage. Walk-only tools are absent because they store
-nothing, which is the trade they make for their times in Figure 1.
+nothing: they are the stippled bars in Figure 1, and this is the trade they make
+for the times they post there.
 
 **Figure 5** gives each query its own panel, ranked fastest-last, on a shared log
 time axis. Two things the earlier layout hid are now explicit:
@@ -540,10 +554,11 @@ Normalized like the paper:
 3. `ecrawl` / `nowrite` — walk only, storing nothing. This is the like-for-like
    row against `find`, `fd`, `du` and `dua`, and the gap to `ecrawl`/`write` is
    the cost of writing the capture. Not comparable to the full indexers, so it
-   is charted in Figure 1 with the other walkers rather than beside them; it is
-   also what makes `ecrawl` the one pipeline whose build-only cost in Figure 2
-   is measured instead of bounded. Default on under `benchmark.sh --do`,
-   otherwise `DO_NOWRITE=1`.
+   is charted in Figure 1 with the other walkers rather than beside them —
+   Figure 1 carries `ecrawl`/`write` too, so that gap is legible straight off
+   the axis. It is also what makes `ecrawl` the one pipeline whose build-only
+   cost in Figure 2 is measured instead of bounded. Default on under
+   `benchmark.sh --do`, otherwise `DO_NOWRITE=1`.
 4. GUFI `plain` (`gufi_dir2index`) vs `rollup_index` + `rollup_step`, the two
    commands the rollup variant needs, timed separately. `rollup_step`'s
    `index_bytes` is what the rollup adds on top of the replica, so the two rows
@@ -553,8 +568,9 @@ Normalized like the paper:
 7. `find` / `fd` / `du` / `dua` `walk` — live walks with `index_bytes=0`
 
 The walk rows time the same metadata sweep the indexers perform, only discarded
-instead of stored. They are reference points rather than indexers, so they get
-Figure 1 to themselves and stay out of the build and storage charts. `find` and
+instead of stored. They are reference points rather than indexers, so they stay
+out of the build and storage charts and appear only on Figure 1, stippled to
+mark that they kept nothing. `find` and
 `fd` write their listings to `/dev/null`: only the timing is
 used, and keeping a path list would cost tens of GiB per rep on a production
 tree while charging them for writes `du`/`dua` never make.

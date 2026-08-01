@@ -62,9 +62,9 @@ INDEX_ORDER = [
 ]
 
 # Walk-only rows: every one of these traverses the tree and stores nothing, so
-# they are the only rows in the run that can sit beside each other with no
-# asterisk. ecrawl --no-write is the suite's entry, and the reason it exists is
-# that comparing ecrawl's full capture against find is not a like-for-like race.
+# they are the rows that can sit beside each other with no asterisk.
+# ecrawl --no-write is the suite's entry, and the reason it exists is that
+# comparing ecrawl's full capture against find is not a like-for-like race.
 WALK_VARIANTS = ("walk", "nowrite")
 WALK_LABELS = {
     ("ecrawl", "nowrite"): "ecrawl --no-write",
@@ -73,7 +73,15 @@ WALK_LABELS = {
     ("du", "walk"): "du",
     ("dua", "walk"): "dua",
 }
-WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua"]
+
+# Figure 1 also carries the capture itself, so the walk everything here shares
+# can be read directly against what it costs to keep what that walk found.
+# Deliberately not a WALK_VARIANT: the traversal floor on Figure 3 has to be
+# the fastest *bare* walk, and a run that also writes cannot be allowed to set
+# it.
+CAPTURE_ROW = ("ecrawl", "write")
+CAPTURE_LABEL = "ecrawl"
+WALK_CHART_ORDER = ["ecrawl", "ecrawl --no-write", "fd", "find", "du", "dua"]
 QUERY_ORDER = [
     "ecrawl_analyze",
     "ereport",
@@ -101,7 +109,10 @@ QUERY_TITLES = {
 COLORS = {
     "ecrawl + ereport_index": "#0072B2",
     "ecrawl": "#0072B2",
-    "ecrawl --no-write": "#0072B2",
+    # Its own hue rather than ecrawl's blue: it is a diagnostic mode that
+    # appears on Figure 1 alone, and on that figure it sits directly beside the
+    # real ecrawl. Sharing a colour there would read as one tool measured twice.
+    "ecrawl --no-write": "#E69F00",
     "ereport": "#0072B2",
     "ecrawl_analyze": "#0072B2",
     "ereport_index": "#56B4E9",
@@ -317,17 +328,28 @@ def walk_floor(rows):
 
 
 def walk_metrics(rows):
-    """Traversal-only rows, as their own ranking rather than a single floor line."""
+    """Traversal rows as their own ranking rather than a single floor line: the
+    bare walkers, plus ecrawl's capture so the walk and the price of storing
+    what it found are on one axis.
+
+    Each entry carries what the tool left on disk, which is what separates the
+    two classes on the chart. A walker's zero is a measurement rather than a
+    missing value, so it is recorded as one.
+    """
     grouped = group_index(rows)
     result = {}
     for (tool, variant), selected in grouped.items():
-        if variant not in WALK_VARIANTS:
+        if (tool, variant) == CAPTURE_ROW:
+            label = CAPTURE_LABEL
+        elif variant in WALK_VARIANTS:
+            label = WALK_LABELS.get((tool, variant)) or "{} {}".format(tool, variant)
+        else:
             continue
         times = floats(selected, "sec_per_1M_files")
         if not times:
             continue
-        label = WALK_LABELS.get((tool, variant)) or "{} {}".format(tool, variant)
-        result[label] = {"time": mean_std(times)}
+        stored, _ = mean_std(floats(selected, "mib_per_1M_files"))
+        result[label] = {"time": mean_std(times), "stored": stored or 0.0}
     return result
 
 
@@ -626,12 +648,23 @@ def index_figure(datasets, out_dir, spec):
         for dataset in datasets
         for tool in tools
     )
+    # A storing bar gets what it kept printed under its time, which needs the
+    # same extra room a phase split does.
+    if spec.get("storage"):
+        split_rows = split_rows or any(
+            dataset[key].get(tool, {}).get("stored")
+            for dataset in datasets
+            for tool in tools
+        )
     floor = datasets[0].get("walk_floor") if spec.get("floor") else None
     row_in = 0.66 if split_rows else 0.52
     # The constant is the header, the caption and the panel title, none of
     # which shrink with the number of rows; a one-row figure needs it just as
     # much as a ten-row one.
     height = max(3.9, row_in * len(tools) * max(1, len(datasets)) + 2.9)
+    if multi:
+        # The band the dataset key sits in, below the caption.
+        height += 0.55
     if datasets[0].get("caveat"):
         height += 0.22
     fig, axis = plt.subplots(1, 1, figsize=(9.5, height))
@@ -707,6 +740,13 @@ def index_figure(datasets, out_dir, spec):
                     )
                     left += value
             else:
+                # Stippling marks the bars that keep nothing. It reads as
+                # porous, which is the point: the tool ran, answered, and left
+                # no trace to query a second time. Deliberately dots and not the
+                # diagonals Figure 5 uses, because there hatching flags a wrong
+                # answer; storing nothing is a trade, not a defect, and the two
+                # must not look alike across the set.
+                stores = bool(entry.get("stored")) if spec.get("storage") else True
                 axis.barh(
                     y,
                     mean,
@@ -714,6 +754,7 @@ def index_figure(datasets, out_dir, spec):
                     color=base,
                     edgecolor="white",
                     linewidth=0.6,
+                    hatch=None if stores else "...",
                     zorder=3,
                 )
             if std:
@@ -728,6 +769,11 @@ def index_figure(datasets, out_dir, spec):
                 )
             text = formatter(mean) if mean else "0"
             note = None
+            if spec.get("storage") and entry.get("stored"):
+                # The size turns the hatching from a category into a quantity:
+                # the reader sees not just that this bar kept something, but
+                # what the extra time bought.
+                note = "{} kept on disk".format(fmt_mib(entry["stored"]))
             if spec.get("estimated"):
                 # Every bar on an estimated panel is an upper bound, and saying
                 # so on the bar keeps a reader from taking the panel for
@@ -833,6 +879,30 @@ def index_figure(datasets, out_dir, spec):
             columnspacing=1.4,
         )
 
+    if spec.get("storage") and any(
+        dataset[key].get(tool, {}).get("stored")
+        for dataset in datasets
+        for tool in tools
+    ):
+        # Without this the hatching is just a texture. Neutral swatches, because
+        # the bars carry each tool's own hue and a coloured key would suggest a
+        # mapping that is not there.
+        axis.legend(
+            handles=[
+                Patch(facecolor="#555555", edgecolor="white",
+                      label="stores an index"),
+                Patch(facecolor="#555555", edgecolor="white", hatch="...",
+                      label="stores nothing"),
+            ],
+            loc="lower right",
+            bbox_to_anchor=(1.0, 1.0),
+            ncol=2,
+            frameon=False,
+            fontsize=8,
+            handlelength=1.4,
+            columnspacing=1.4,
+        )
+
     if floor:
         name, value = floor
         axis.axvline(value, color="#B00020", linestyle="--", linewidth=1.1, zorder=2)
@@ -849,30 +919,9 @@ def index_figure(datasets, out_dir, spec):
             ha="left",
         )
 
-    if multi:
-        # Neutral swatches: the bars carry the tool's own hue, so a coloured key
-        # would suggest a mapping that does not exist.
-        proxies = [
-            Patch(facecolor=shade("#555555", shades[i]), edgecolor="white",
-                  label=dataset["label"])
-            for i, dataset in enumerate(datasets)
-        ]
-        fig.legend(
-            handles=proxies,
-            title="Dataset (lighter shade = later)",
-            frameon=False,
-            fontsize=9,
-            loc="lower right",
-            bbox_to_anchor=(0.995, 0.10 / height),
-            ncol=len(proxies),
-        )
-
     subtitle = datasets[0]["label"] if not multi else "; ".join(d["label"] for d in datasets)
     conditions = datasets[0].get("conditions", "")
-    caption = (
-        "Bars are means over repetitions; whiskers are one population standard "
-        "deviation. Lower is better."
-    )
+    caption = "Means over repetitions; whiskers one standard deviation. Lower is better."
     if spec.get("caption"):
         caption += "\n" + spec["caption"]
     if spec.get("caption_if_exact") and any(
@@ -887,21 +936,8 @@ def index_figure(datasets, out_dir, spec):
         for tool in tools
     )
     if has_components:
-        caption += (
-            "\nPipelines built in two commands are split into their phases: the "
-            "bar is segmented, and the smaller line by each value gives the parts."
-        )
-        # Only gloss the pipelines this run actually contains.
-        glosses = {
-            "ecrawl + ereport_index": (
-                "ecrawl writes the capture, ereport_index --make adds the "
-                "trigram index on top of it"
-            ),
-            "GUFI rollup": "gufi_dir2index builds the replica, gufi_rollup folds it up",
-        }
-        shown = [glosses[tool] for tool in tools if tool in glosses]
-        if shown:
-            caption += "\n" + "; ".join(shown) + "."
+        # No gloss on what each phase is: the bar already names them in place.
+        caption += "\nTwo-command pipelines give their phases in the bar label."
     # Last, so it reads as a footnote about the set rather than interrupting
     # what this particular figure is saying.
     if spec.get("decomposition"):
@@ -932,10 +968,33 @@ def index_figure(datasets, out_dir, spec):
             fontweight="bold",
             va="top",
         )
-    fig.text(0.011, 0.16 / height, caption, fontsize=8.5, color="#555555", va="bottom")
+    # A dataset key gets a band of its own beneath the caption. The caption
+    # wraps to nearly the full width and the axis runs to the bottom of the
+    # plot, so there is no gap to tuck a key into; one has to be made.
+    legend_in = 0.55 if multi else 0.0
+    fig.text(0.011, (0.16 + legend_in) / height, caption,
+             fontsize=8.5, color="#555555", va="bottom")
     # The caption grew a line for every explanation the figure needs, so reserve
     # room by counting them rather than by guessing at two cases.
-    caption_in = 0.30 + 0.16 * caption.count("\n")
+    caption_in = 0.30 + 0.16 * caption.count("\n") + legend_in
+
+    if multi:
+        # Neutral swatches: the bars carry the tool's own hue, so a coloured key
+        # would suggest a mapping that does not exist.
+        proxies = [
+            Patch(facecolor=shade("#555555", shades[i]), edgecolor="white",
+                  label=dataset["label"])
+            for i, dataset in enumerate(datasets)
+        ]
+        fig.legend(
+            handles=proxies,
+            title="Dataset (lighter shade = later)",
+            frameon=False,
+            fontsize=9,
+            loc="lower left",
+            bbox_to_anchor=(0.011, 0.05 / height),
+            ncol=len(proxies),
+        )
     fig.tight_layout(rect=(0, caption_in / height, 1, 1 - header_in / height))
     outputs = []
     for suffix in ("png", "pdf"):
@@ -951,9 +1010,8 @@ def index_figure(datasets, out_dir, spec):
 # only thing that stops the shared phases -- the trigram build appears in both
 # the total and the build-only figure -- from reading as double counting.
 DECOMPOSITION_NOTE = (
-    "These three time figures decompose one measurement: Figure 1 (walking) + "
-    "Figure 2 (building) = Figure 3 (walking and building). They are nested, "
-    "not alternatives, so a phase appearing in two of them is not counted twice."
+    "Nested, not alternatives: Figure 1's walk-only bars + Figure 2 = Figure 3, "
+    "so a phase in two of them is not counted twice."
 )
 
 # The four index figures. Same renderer, different column of numbers, so a
@@ -963,17 +1021,17 @@ INDEX_FIGURES = [
         "name": "figure1_walk",
         "number": 1,
         "heading": "walking",
-        "panel_title": "Traversal only: seeing every file, storing nothing",
+        "panel_title": "Traversal time, and which tools keep the result",
         "key": "walk",
         "order": WALK_CHART_ORDER,
         "metric": "time",
         "formatter": fmt_seconds,
         "xlabel": "Seconds per 1M files",
+        "storage": True,
         "caption": (
-            "Every tool here traverses and stores nothing, so these are the only "
-            "bars in the set that compare directly. ecrawl --no-write is the "
-            "suite's walk without the capture, which is what makes it the "
-            "like-for-like row against find, fd and du."
+            "Stippled bars answer their question and forget the tree, so they "
+            "time the walk alone. ecrawl is that same walk plus a capture you "
+            "can query later: the gap to ecrawl --no-write is what storing costs."
         ),
         "decomposition": True,
     },
@@ -992,19 +1050,16 @@ INDEX_FIGURES = [
         "xlabel": "Seconds per 1M files",
         "estimated": True,
         "caption": (
-            "MOSTLY ESTIMATE: a bar runs out to the end-to-end build minus the "
-            "fastest walk anyone managed. No tool traverses faster than that, so "
-            "the subtraction removes no more than the tool's own walk did and "
-            "the bar end is an upper bound (\u2264), not a measurement."
+            "MOSTLY ESTIMATE: bars run to the end-to-end build minus the fastest "
+            "walk in the run, so the end is an upper bound (\u2264), not a "
+            "measurement."
         ),
         "decomposition": True,
         # Only true when a pipeline was timed both ways and the two runs
         # differed by more than the noise between them.
         "caption_if_exact": (
-            "ecrawl (the solid bar) was timed both with and without storing, so "
-            "its build cost is measured rather than bounded; the pale remainder "
-            "out to its bound is the part of its own walk that subtracting the "
-            "fastest walk failed to remove."
+            "Only ecrawl was timed both ways: its solid part is measured, the "
+            "pale remainder is the walk the subtraction failed to remove."
         ),
     },
     {
@@ -1019,10 +1074,9 @@ INDEX_FIGURES = [
         "xlabel": "Seconds per 1M files",
         "floor": True,
         "caption": (
-            "What each pipeline actually costs from an unindexed tree: the walk "
-            "and the index build together, and the only time figure here that is "
+            "The whole cost from an unindexed tree, and the only time figure "
             "measured end to end for every tool. The dashed line is the fastest "
-            "walk measured, the floor no indexer can go below."
+            "walk, the floor no indexer can go below."
         ),
         "decomposition": True,
     },
@@ -1037,8 +1091,8 @@ INDEX_FIGURES = [
         "formatter": fmt_mib,
         "xlabel": "MiB per 1M files",
         "caption": (
-            "Walk-only tools are absent because they store nothing; that is the "
-            "trade they make for the times in Figure 1."
+            "Walk-only tools are absent because they store nothing \u2014 the "
+            "stippled bars in Figure 1, and the trade behind their times there."
         ),
     },
 ]
@@ -1219,21 +1273,16 @@ def plot_queries(datasets, out_dir):
             va="top",
         )
 
-    caption = (
-        "Bars are mean wall time over repetitions; whiskers are one population "
-        "standard deviation. Shorter is better."
-    )
+    caption = "Mean wall time; whiskers one standard deviation. Shorter is better."
     if any_mismatch:
         caption += (
-            "\nHatched bars answered with a different result than the reference "
-            "tool, so their timing does not measure the same work."
+            "\nHatched bars disagreed with the reference tool, so their timing "
+            "does not measure the same work."
         )
     if walkers_seen:
         caption += (
-            "\nTraditional walkers ({}) are shown in neutral grey and tan; they search live "
-            "rather than from an index.".format(
-                ", ".join(t for t in QUERY_ORDER if t in walkers_seen)
-            )
+            "\nWalkers in neutral grey and tan ({}) search live, not from an "
+            "index.".format(", ".join(t for t in QUERY_ORDER if t in walkers_seen))
         )
     fig.text(0.011, 0.16 / fig_height, caption, fontsize=8.5, color="#555555", va="bottom")
 

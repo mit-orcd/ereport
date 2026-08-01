@@ -13,6 +13,11 @@ description: >-
 
 Any compile, `./scripts/test/test.sh`, `make check`, `scripts/profile/profiling.sh`, or heavy indexer work while the agent shell is on an ORCD login node.
 
+Chart and report regeneration counts. `plot_results.py` is easy to mistake for a
+light script because it only reads a CSV, but matplotlib renders five figures to
+PNG and PDF and takes ~15 s a call; iterating on a figure means calling it
+repeatedly.
+
 ## Layout
 
 ```text
@@ -22,10 +27,20 @@ Any compile, `./scripts/test/test.sh`, `make check`, `scripts/profile/profiling.
   cargo/     # CARGO_HOME
   rustup/    # RUSTUP_HOME
   work/      # --work indexes / TMPDIR for long runs
-  data/      # synthetic trees
+  data/      # synthetic trees that more than one job needs
+  src/       # third-party source checkouts init.sh reuses
+  report/    # REPORT_DIR for profiling.sh
+  scripts/   # job drivers written for a task, not for the repo
+  logs/      # sbatch stdout, one file per job id
+  results/   # per-job output dirs, named <run>-<jobid>
 ```
 
 Repo stays on home NFS (`~/git/ereport`). Scripts stay unchanged; override paths with env / flags they already accept.
+
+Keep new files inside those directories and name job artifacts after the job id,
+so a later session can tell a finished run from one still going. This tree is
+shared with concurrent sessions: add and clean up your own runs, and leave
+directories you did not create alone.
 
 ## Env (export on the compute node before tool installs)
 
@@ -76,6 +91,17 @@ scontrol show partition mit_testing | grep -o 'MaxTime=\S*'
 - `mit_quicktest` — 15 min hard cap. Environment probes and `./scripts/test/test.sh`, nothing that compiles a dependency tree.
 - `mit_normal` — 12 h, 50 nodes, but expect to wait behind `(Priority)`.
 - `mit_preemptable` — 2 days and hundreds of nodes; fine for restartable work, not for a long build you do not want killed.
+
+Never keep anything that has to outlive a job on node-local `/tmp` or `/scratch`:
+the next job may land on a different node, and what the last one wrote is then
+simply not there. Anything to be reused — fixture trees, tool prefixes, results,
+logs — goes under `$SCRATCH` (see the layout above).
+
+Node-local disk is still the right place for data a *single* job creates and
+consumes, and `mit_testing` nodes have ~1.7 TB free on `/`, so a million-file
+fixture tree belongs there when generation and measurement happen in one job. If
+two jobs need the same tree, either merge them or put the tree in `$SCRATCH/data`
+and accept NFS speed.
 
 Not every node can compile. `node1700` and `node1701` in `mit_testing` are missing
 `/usr/include/bits/wordsize.h`, so any `gcc` invocation dies in `<features.h>`;
@@ -148,8 +174,39 @@ export CARGO_TARGET_DIR=/scratch/$USER/cargo-$SLURM_JOB_ID
 
 `init.sh` builds each tool once and then leaves it alone (version stamps in `$PREFIX/var/lib/indexer-compare/`), so calling it before every run costs nothing. `FORCE_REINSTALL=1` rebuilds anyway.
 
+## Re-rendering charts from an existing results dir
+
+Use `benchmark.sh --charts <results-dir>`, not `plot_results.py` directly. It
+rereads the CSVs already in the results dir and rewrites `SUMMARY_TABLE.txt`,
+`FAILURES.txt` and `charts/`; nothing is crawled, indexed or queried, so it
+finishes in seconds and needs neither the benchmark tree nor the external
+tools. It also rewrites the summary alongside the figures on purpose — the two
+are read side by side, and a fresh figure beside a stale table is worse than
+either alone.
+
+```bash
+srun -p mit_quicktest -N 1 -c 4 -t 10:00 --mem=8G bash -lc '
+set -euo pipefail
+export PREFIX=$HOME/orcd/scratch/ereport-automated-testing/prefix
+cd /home/erbmi1/git/ereport/scripts/compare-indexers
+./benchmark.sh --charts results
+'
+```
+
+`PREFIX` is the one thing that must be set: it defaults to
+`~/.local/indexer-compare`, while the chart venv `resolve_chart_python` needs is
+under scratch. The action also points `MPLCONFIGDIR` at the results dir, which
+keeps matplotlib's font cache off home NFS.
+
+Call `plot_results.py` directly only for what the action cannot do — overlaying
+several result sets (`plot_results.py A B --labels before,after`) or writing
+figures somewhere other than `<results>/charts`. Then set
+`INDEXER_COMPARE_PREFIX` and use `$PREFIX/chartvenv/bin/python`, write output
+under `$SCRATCH/results/`, and keep repeated renders inside one allocation
+rather than one job per render.
+
 ## Do not
 
-- Run `make -j`, `./scripts/test/test.sh`, or profilers on `orcd-login*`
+- Run `make -j`, `./scripts/test/test.sh`, profilers, or `plot_results.py` on `orcd-login*`
 - Rewrite harness scripts just to relocate scratch
 - Put GUFI/XDU indexes or Rust/venv trees under home NFS

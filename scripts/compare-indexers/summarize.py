@@ -336,7 +336,7 @@ def summarize_index(rows):
 
     # Rows with index_MiB 0 walked the tree and stored nothing, so they measure
     # traversal alone and are not indexers. Keeping them in one table makes the
-    # cost of capture visible; Figure 1 plots only the indexers.
+    # cost of capture visible, which is the same comparison Figure 1 draws.
     walkers = sorted(
         "{0}/{1}".format(tool, variant)
         for (tool, variant) in groups
