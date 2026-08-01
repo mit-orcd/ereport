@@ -77,7 +77,60 @@ scontrol show partition mit_testing | grep -o 'MaxTime=\S*'
 - `mit_normal` — 12 h, 50 nodes, but expect to wait behind `(Priority)`.
 - `mit_preemptable` — 2 days and hundreds of nodes; fine for restartable work, not for a long build you do not want killed.
 
+Not every node can compile. `node1700` and `node1701` in `mit_testing` are missing
+`/usr/include/bits/wordsize.h`, so any `gcc` invocation dies in `<features.h>`;
+`node5500` / `node5501` are fine. A job that only relinks unchanged binaries will
+pass there and hide it, so probe before trusting a node, and exclude the bad ones:
+
+```bash
+srun -p mit_testing -N4 --ntasks-per-node=1 -c1 -t 3:00 --mem=2G bash -lc \
+  'echo "int main(void){return 0;}" >/tmp/p$$.c; printf "%s " "$(hostname)"; \
+   gcc -o /tmp/p$$ /tmp/p$$.c 2>/dev/null && echo cc=ok || echo cc=FAIL; rm -f /tmp/p$$*'
+sbatch -p mit_testing --exclude=node1700,node1701 ...
+```
+
 Ask for memory explicitly. The default is 1 GB per CPU, and a `-c 16` job therefore gets 16 GB, which is not enough to build XDU (it pins `lto = true` and `codegen-units = 1`, so `arrow` and `parquet` are optimised whole-program in one process). That allocation was OOM-killed 12 times; `--mem=64G` is a safe floor for a Rust build.
+
+## Submission privileges
+
+Snapshot verified with `sacctmgr`, `scontrol`, and `sbatch --test-only` on
+2026-08-01. Slurm configuration can change, so recheck it for unusually large
+or long jobs.
+
+- Account: `mit_general`; user is not a Slurm administrator.
+- User QOS: `normal` and `unlimited`; association permits up to 5,000 submitted
+  jobs.
+- `unlimited` is accepted only on `mit_normal`. It overrides that partition
+  QOS's aggregate resource cap, but not the partition's 12-hour wall-time.
+- Default memory is 1 GB per requested CPU; request memory explicitly.
+- CPU submission was validated on all partitions below:
+  - `mit_quicktest`: 15 minutes, at most 2 nodes; normal partition QOS allows
+    48 concurrent CPUs / 193 GB and 8 submitted jobs per user.
+  - `mit_normal`: 12 hours; normal partition QOS allows 96 concurrent CPUs /
+    386 GB and 448 submitted jobs per user. Use `--qos=unlimited` when a valid
+    job must exceed that resource cap.
+  - `mit_preemptable`: 2 days; 1,024 concurrent CPUs / 4 TB and 448 submitted
+    jobs per user; jobs may be requeued.
+  - `mit_testing`: 7 days; five 224-CPU, 2-TB nodes; access comes from
+    `orcd_rg_par_ou_orcd_testing`.
+  - `ou_ki`: 3 days; 96 concurrent CPUs / 377 GB and 448 submitted jobs per
+    user.
+  - `ou_ki_highmem`: 1 day; 96 concurrent CPUs / 1.5 TB and 448 submitted jobs
+    per user.
+  - `sched_opportunist`: 3 days and preemptible.
+  - `sched_any`, `sched_engaging_default`, `sched_mit_hill`, and `newnodes`:
+    12 hours.
+
+Recheck the association and ACLs without launching jobs:
+
+```bash
+sacctmgr -P show assoc where user="$USER" \
+  format=User,Account,Partition,QOS,DefaultQOS,GrpTRES,MaxTRESPJ,MaxJobs,MaxSubmit,MaxWall
+scontrol show partition -o
+scontrol show config | rg '^(AccountingStorageEnforce|DefMemPerCPU|MaxArraySize)'
+sbatch --test-only -p PARTITION -A mit_general -N 1 -c 1 --mem=1G \
+  -t 00:01:00 --wrap=true
+```
 
 ## profiling.sh / compare-indexers
 
