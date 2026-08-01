@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# profile-ereport-fixtures.sh
+# profile/ereport-fixtures.sh
 #
 # SPDX-License-Identifier: MIT
 #
 # Profile `ereport` over the shared per-fixture crawl output produced by
-# profile-ecrawl-fixtures.sh.
+# profile/ecrawl-fixtures.sh.
 #
-# This profiler does NOT crawl. Run profile-ecrawl-fixtures.sh first with the
+# This profiler does NOT crawl. Run profile/ecrawl-fixtures.sh first with the
 # same <bin-root> to populate <bin-root>/<fixture>/bin/; this script consumes
 # those shards and hard-errors if a selected fixture has none.
 #
@@ -16,7 +16,7 @@
 #                  --bucket-details 4) and capture a full profile.
 #
 # The REPORT phase runs up to three instrumented passes, mirroring
-# profile-ecrawl-fixtures.sh:
+# profile/ecrawl-fixtures.sh:
 #   clean   — /usr/bin/time -v + ereport --verbose key=value phase timings
 #             (elapsed_sec, finalize_*, verbose_sort_*). Only trustworthy timing.
 #   strace  — strace -f -c syscall histogram (timing NOT representative).
@@ -24,10 +24,10 @@
 #             ereport with `make debug` for best symbols).
 #
 # Usage:
-#   scripts/profile-ereport-fixtures.sh <bin-root> [results-dir]
+#   scripts/profile/ereport-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
-#   <bin-root>     dir produced by profile-ecrawl-fixtures.sh; for each fixture
+#   <bin-root>     dir produced by profile/ecrawl-fixtures.sh; for each fixture
 #                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
 #                  The emitted HTML is written alongside, and kept, at:
 #                      <bin-root>/<fixture>/all_users/  ereport HTML (clean pass)
@@ -81,16 +81,18 @@
 #
 set -uo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+
 # ---- args ------------------------------------------------------------------
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <bin-root> [results-dir]" >&2
   exit 2
 fi
-# Shared shard sets produced by profile-ecrawl-fixtures.sh; this profiler only
+# Shared shard sets produced by profile/ecrawl-fixtures.sh; this profiler only
 # consumes <bin-root>/<fixture>/bin and never crawls.
 BIN_ROOT=${1%/}
 if [[ ! -d "$BIN_ROOT" ]]; then
-  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile-ecrawl-fixtures.sh first)" >&2
+  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile/ecrawl-fixtures.sh first)" >&2
   exit 2
 fi
 BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
@@ -101,20 +103,7 @@ mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DI
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
 # ---- locate binaries -------------------------------------------------------
-find_bin() {
-  local name=$1 var=$2
-  local v=${!var:-}
-  if [[ -n "$v" ]]; then
-    [[ -x "$v" ]] || { echo "ERROR: $var '$v' is not executable" >&2; exit 1; }
-    echo "$v"; return
-  fi
-  if   [[ -x "./$name" ]];   then echo "$(cd "$(dirname "./$name")" && pwd)/$name"
-  elif [[ -x "/tmp/$name" ]]; then echo "/tmp/$name"
-  elif command -v "$name" >/dev/null 2>&1; then command -v "$name"
-  else echo "ERROR: cannot find $name; set $var=/path/to/$name" >&2; exit 1
-  fi
-}
-EREPORT_BIN=$(find_bin ereport EREPORT_BIN)
+EREPORT_BIN=$(find_bin ereport EREPORT_BIN) || exit 1
 
 # ---- config ----------------------------------------------------------------
 # Instrumentation passes (strace/perf) regenerate the report into a throwaway
@@ -134,17 +123,6 @@ INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 KEEP_REPORTS=${KEEP_REPORTS:-1}
 EREPORT_VERBOSE_ARGS=${EREPORT_VERBOSE_ARGS:-}
 
-KNOWN_FIXTURES=(
-  deep_skinny_chain
-  depth_slash_profile
-  wide_shallow
-  ereport_badge_fixtures
-  neutral_flat
-  single_huge_dir
-  mega_dir2
-  mega_dir1
-)
-
 if [[ -n "${FIXTURES:-}" ]]; then
   read -ra FIXLIST <<<"$FIXTURES"
 else
@@ -158,7 +136,7 @@ else
   fi
 fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
-  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile-ecrawl-fixtures.sh first)" >&2
+  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile/ecrawl-fixtures.sh first)" >&2
   exit 1
 fi
 
@@ -178,8 +156,6 @@ if [[ "$DO_PERF" == "1" && "$HAVE_PERF" != "1" ]]; then
 fi
 
 # ---- helpers ---------------------------------------------------------------
-fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
-shard_count() { find "$1" -maxdepth 1 -name 'uid_shard_*.bin' 2>/dev/null | wc -l; }
 
 # Build ereport argv (all-users form) into RUN_ARGV.
 build_argv() {
@@ -300,7 +276,7 @@ profile_one() {
   nsh=$(shard_count "$bindir")
   if [[ "$nsh" -eq 0 ]]; then
     echo "ERROR: no uid_shard_*.bin under '$bindir' for fixture '$fixture'." >&2
-    echo "       Run profile-ecrawl-fixtures.sh with the same <bin-root> first." >&2
+    echo "       Run profile/ecrawl-fixtures.sh with the same <bin-root> first." >&2
     exit 1
   fi
   mkdir -p "$dest" "$rdest"
@@ -582,14 +558,18 @@ for fx in fixtures:
 lines.append("")
 
 # --- strace top syscalls (report pass) ------------------------------------
-lines.append("== STRACE TOP SYSCALLS (report pass; %time, count) ==")
+strace_rows = []
 for fx in fixtures:
     top = strace_top(fx)
     if not top:
         continue
     parts = ", ".join(f"{name} {pct:.1f}%/{cnt:,}" for pct, name, cnt in top)
-    lines.append(f"  {fx}: {parts}")
-lines.append("")
+    strace_rows.append(f"  {fx}: {parts}")
+# With DO_STRACE=0 there is nothing to show, so skip the header entirely.
+if strace_rows:
+    lines.append("== STRACE TOP SYSCALLS (report pass; %time, count) ==")
+    lines.extend(strace_rows)
+    lines.append("")
 
 # --- elapsed per rep ------------------------------------------------------
 lines.append("== REPORT ELAPSED PER REP ==")

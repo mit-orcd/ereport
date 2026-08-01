@@ -1,5 +1,9 @@
 /test/
 *.o
+/scripts/compare-indexers/results/
+# Default results dirs of scripts/profile/*-fixtures.sh when run from the repo root
+/*-profile-*/
+__pycache__/
 /ecrawl
 /ereport
 /ereport_index

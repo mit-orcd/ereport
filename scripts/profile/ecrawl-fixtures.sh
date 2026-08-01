@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# profile-ecrawl-fixtures.sh
+# profile/ecrawl-fixtures.sh
 #
 # SPDX-License-Identifier: MIT
 #
@@ -28,7 +28,7 @@
 # and never crawl themselves. (Needs DO_WRITE=1, the default, to populate bins.)
 #
 # Usage:
-#   scripts/profile-ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]
+#   scripts/profile/ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]
 #
 # Required:
 #   <synth-root>   path passed to generate-ecrawl-adversarial-tree.sh
@@ -81,6 +81,7 @@
 #   env.txt                              system + build + env snapshot
 #   <fixture>/<mode>/clean.summary.txt   ecrawl --verbose stdout (key=value)
 #   <fixture>/<mode>/clean.stderr.txt    stderr (stall hints, warnings)
+#   <fixture>/<mode>/clean.wall.txt      wall_seconds= from our own sub-second timer
 #   <fixture>/<mode>/clean.time.txt      /usr/bin/time -v
 #   <fixture>/<mode>/shards.txt          uid_shard_*.bin count (write mode only)
 #   <bin-root>/<fixture>/bin/            kept, reusable uid_shard_*.bin (write mode)
@@ -93,6 +94,8 @@
 #   ecrawl-profile-<timestamp>.tar.gz    tarball of the whole results dir
 #
 set -uo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
 
 # ---- args ------------------------------------------------------------------
 if [[ $# -lt 2 ]]; then
@@ -116,20 +119,10 @@ RESULTS_DIR=${3:-"./ecrawl-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
-# ---- config ----------------------------------------------------------------
-ECRAWL_BIN=${ECRAWL_BIN:-}
-if [[ -z "$ECRAWL_BIN" ]]; then
-  if [[ -x ./ecrawl ]]; then ECRAWL_BIN=$(cd "$(dirname ./ecrawl)" && pwd)/ecrawl
-  elif [[ -x /tmp/ecrawl ]]; then ECRAWL_BIN=/tmp/ecrawl
-  elif command -v ecrawl >/dev/null 2>&1; then ECRAWL_BIN=$(command -v ecrawl)
-  else echo "ERROR: cannot find ecrawl; set ECRAWL_BIN=/path/to/ecrawl" >&2; exit 1
-  fi
-fi
-if [[ ! -x "$ECRAWL_BIN" ]]; then
-  echo "ERROR: ECRAWL_BIN '$ECRAWL_BIN' is not executable" >&2
-  exit 1
-fi
+# ---- locate binaries -------------------------------------------------------
+ECRAWL_BIN=$(find_bin ecrawl ECRAWL_BIN) || exit 1
 
+# ---- config ----------------------------------------------------------------
 OUTPUT_BASE=${OUTPUT_BASE:-"$RESULTS_DIR/_shard_output"}
 DO_NOWRITE=${DO_NOWRITE:-1}
 DO_WRITE=${DO_WRITE:-1}
@@ -142,19 +135,6 @@ DROP_CACHES=${DROP_CACHES:-1}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 ECRAWL_VERBOSE_ARGS=${ECRAWL_VERBOSE_ARGS:-}
-
-# Known fixtures emitted by generate-ecrawl-adversarial-tree.sh, ordered so the
-# cheap/fast ones run before the multi-minute mega dirs.
-KNOWN_FIXTURES=(
-  deep_skinny_chain
-  depth_slash_profile
-  wide_shallow
-  ereport_badge_fixtures
-  neutral_flat
-  single_huge_dir
-  mega_dir2
-  mega_dir1
-)
 
 if [[ -n "${FIXTURES:-}" ]]; then
   read -ra FIXLIST <<<"$FIXTURES"
@@ -194,7 +174,6 @@ if [[ "$DO_PERF" == "1" && "$HAVE_PERF" != "1" ]]; then
 fi
 
 # ---- helpers ---------------------------------------------------------------
-fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
 
 g_warned_no_drop=0
 maybe_drop_caches() {
@@ -242,16 +221,19 @@ run_clean() {
   maybe_drop_caches
 
   echo "    clean/$mode${sfx}: ${RUN_ARGV[*]}"
+  local t0 t1
+  t0=$(date +%s.%N)
   if [[ "$HAVE_TIME" == "1" ]]; then
     "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
       "${RUN_ARGV[@]}" >"$dest/clean.summary${sfx}.txt" 2>"$dest/clean.stderr${sfx}.txt"
   else
-    { \
-      /usr/bin/env bash -c 'st=$(date +%s.%N); "$@"; rc=$?; en=$(date +%s.%N); \
-        echo "wall_seconds=$(awk -v a=$st -v b=$en "BEGIN{printf \"%.3f\", b-a}")" >&2; exit $rc' \
-      _ "${RUN_ARGV[@]}" >"$dest/clean.summary${sfx}.txt" 2>"$dest/clean.stderr${sfx}.txt"; }
+    "${RUN_ARGV[@]}" >"$dest/clean.summary${sfx}.txt" 2>"$dest/clean.stderr${sfx}.txt"
   fi
   local rc=$?
+  t1=$(date +%s.%N)
+  # Sub-second wall clock in its own file, matching the other three profilers. Previously
+  # this went to the stderr capture, where nothing read it.
+  awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/clean.wall${sfx}.txt"
   echo "rc=$rc" >>"$dest/clean.stderr${sfx}.txt"
 
   if [[ "$mode" == "write" ]]; then
@@ -454,7 +436,7 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
       echo "========================================================================"
       echo "FIXTURE: $f   MODE: $mode"
       echo "========================================================================"
-      for part in clean.summary clean.time shards; do
+      for part in clean.summary clean.wall clean.time shards; do
         for file in "$d/$part"*.txt; do
           [[ -e "$file" ]] || continue
           echo "----- $(basename "$file") -----"
@@ -563,6 +545,13 @@ def reps_list(fx, mode, field):
         v = num(kv(p).get(field, ""))
         if v is not None:
             out.append(v)
+    if not out:
+        # REPS=1 writes the unsuffixed name, so without this the per-rep section is empty.
+        p = root / fx / mode / "clean.summary.txt"
+        if p.exists():
+            v = num(kv(p).get(field, ""))
+            if v is not None:
+                out = [v]
     return out
 
 
@@ -658,11 +647,15 @@ for fx in fixtures:
         el = reps_avg(fx, mode, "elapsed_sec")
         ent = num(d.get("entries"))
         ops = (ent / el) if (ent and el) else None
+        # Worker occupancy is sampled once per second, so a run shorter than that has no
+        # samples and avg_active_workers reads 0.00 for lack of data. Show "-" instead.
+        wkr_samples = num(d.get("active_workers_samples"))
+        avg_wkr = num(d.get("avg_active_workers")) if wkr_samples != 0 else None
         lines.append(row([
             fx, mode,
             fmt(ent), fmt(num(d.get("tasks_popped"))),
             fmt(num(d.get("donated_dirs"))),
-            fmt(num(d.get("avg_active_workers")), "f1"),
+            fmt(avg_wkr, "f1"),
             fmt(el, "f2") + "s" if el is not None else "-",
             fmt(ops, "ops"),
             fmt(num(d.get("io_opendir_calls"))),
@@ -717,15 +710,13 @@ def row3(vals):
     return "  ".join(str(v).ljust(w3[i]) for i, v in enumerate(vals))
 
 
-lines.append("== STRACE SYSCALL HISTOGRAM (counts; timing under strace NOT representative) ==")
-lines.append(row3(cols3))
-lines.append(row3(["-" * x for x in w3]))
+strace_rows = []
 for fx in fixtures:
     for mode in ("nowrite", "write"):
         sc = strace_counts(fx, mode)
         if not sc:
             continue
-        lines.append(row3([
+        strace_rows.append(row3([
             fx, mode,
             fmt(sc.get("getdents64")),
             fmt(sc.get("newfstatat")),
@@ -733,7 +724,14 @@ for fx in fixtures:
             fmt(sc.get("close")),
             fmt(sc.get("futex_pct"), "f1") if "futex_pct" in sc else "-",
         ]))
-lines.append("")
+# With DO_STRACE=0 there is nothing to show, so skip the section rather than print a
+# bare header over an empty table.
+if strace_rows:
+    lines.append("== STRACE SYSCALL HISTOGRAM (counts; timing under strace NOT representative) ==")
+    lines.append(row3(cols3))
+    lines.append(row3(["-" * x for x in w3]))
+    lines.extend(strace_rows)
+    lines.append("")
 
 # --- per-thread on-CPU spread (perf) --------------------------------------
 # threads_>=1% = how many distinct threads each carried >=1% of CPU samples;

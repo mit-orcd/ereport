@@ -1,13 +1,15 @@
 # Testing and validation
 
 ```bash
-make check              # ./test.sh: integration + ecrawl_repair / edelete / ereport_index smokes (tiny /tmp tree; fast)
-make check-tree         # ./test_setup.sh then ./test.sh on ./test (needs all binaries built)
+make check              # scripts/test/test.sh: integration + ecrawl_repair / edelete / ereport_index smokes (tiny /tmp tree; fast)
+make check-tree         # scripts/test/test_setup.sh then test.sh on ./test (needs all binaries built)
 ```
 
 ## Scripts
 
-- `test.sh` — runs two phases:
+The harnesses live in [`scripts/test/`](../scripts/test/). `./test.sh` at the repo root is a shim that execs `scripts/test/test.sh`, so either path works.
+
+- `scripts/test/test.sh` — runs two phases:
   - Integration (always): `ecrawl` on a tiny `/tmp` tree, then `ereport` single-user (`mtime`, counts vs `ecrawl`) and all-users (incl. `distinct_uids`), then smoke tests on the same tree — `ecrawl_repair --dry-run`, `ecrawl_analyze`, `edelete` (dry-run), `ereport_index --make` (checks `tri_keys.bin` / `paths.bin` exist), and `ecrawl_mount` (see below).
   - `./test.sh --edelete-only` — edelete smoke + synthetic probes only (needs `./edelete` built; skips ecrawl/ereport and filesystem correlation).
   - Filesystem correlation (only with a directory argument): one `find`/`fd` baseline — file/dir/symlink counts and unique regular-file bytes via `find %D:%i` (not `du`) — compared against `ecrawl` and against `ereport` all-users, plus `ecrawl` vs `ereport` all-users (`entries` ↔ `scanned_records`, etc.). Single-user checks are subset/consistency checks, skipped when no shard maps to that UID (uid-shard crawls omit empty shards). All checks print; any failure fails the step.
@@ -23,13 +25,13 @@ This is the only check that compares a crawl against the live tree it came from 
 `atime` is deliberately excluded from the per-entry comparison: the crawl froze it, while walking the live tree during the test keeps moving it, so comparing it would be racy rather than meaningful.
 
 Skips are reported rather than treated as failures, since `ecrawl_mount` is an optional target: the section is skipped when the binary was not built, when `SKIP_FUSE=1` is set, when the host has no `/dev/fuse` or `fusermount`, or when the mount itself is refused (unprivileged FUSE disabled). The mountpoint lives under the integration temp directory and the cleanup trap unmounts it before removing that directory, so a failed run cannot leave a stale mount behind.
-- `test_setup.sh` — Removes and recreates `./test` (default: `…/ereport/test`) with a deep chain (`deep/seg001/…`), a wide branch layout (`wide/b00/…`), symlinks, hardlinks, and root files. Tune size with `DEPTH`, `BRANCHES`, `FILES_WIDE`.
-- `test_full.sh` — Runs `test_setup.sh` and then `./test.sh` on that tree (same as `make check-tree`).
+- `scripts/test/test_setup.sh` — Removes and recreates `./test` (default: `…/ereport/test`) with a deep chain (`deep/seg001/…`), a wide branch layout (`wide/b00/…`), symlinks, hardlinks, and root files. Tune size with `DEPTH`, `BRANCHES`, `FILES_WIDE`.
+- `scripts/test/test_full.sh` — Runs `test_setup.sh` and then `test.sh` on that tree (same as `make check-tree`).
 
 Manual sequence:
 
 ```bash
-./test_setup.sh
+./scripts/test/test_setup.sh
 ./test.sh "$(pwd)/test"
 ```
 
@@ -44,3 +46,23 @@ Example:
 ```
 
 Used during development and benchmarking; not part of the normal end-user workflow.
+
+## Indexer comparison (Robinhood / GUFI / XDU vs ecrawl suite)
+
+Paper-style capture + Q1–Q5 harness lives under [`scripts/compare-indexers/`](../scripts/compare-indexers/README.md):
+
+```bash
+# Fast cycle, well under a minute: rebuilds the suite, generates a 2.5k-entry
+# tree, checks correctness over all of it, compares against find and du only.
+# For checking that a code change still answers Q1-Q5 correctly.
+scripts/compare-indexers/benchmark.sh --do /tmp/small --small
+
+# The same comparison without the driver, on a tree that already exists.
+SYNTH_PROFILE=tiny scripts/compare-indexers/run_smoke.sh /tmp/tinytree /tmp/tinyres
+
+# Hours: the benchmark tree and every installed indexer.
+make ecrawl ereport ereport_index
+scripts/compare-indexers/run_smoke.sh /tmp/indexer-compare-synth
+```
+
+See also [`scripts/compare-indexers/capability-matrix.md`](../scripts/compare-indexers/capability-matrix.md) and [`prod-protocol.md`](../scripts/compare-indexers/prod-protocol.md).

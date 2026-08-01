@@ -202,10 +202,10 @@ serve-public:
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
 check: $(TARGETS) test_crawl_block_filter
 	./test_crawl_block_filter
-	./test.sh
+	./scripts/test/test.sh
 
-# Larger fixture under ./test (see test_setup.sh), then same correlation as check
+# Larger fixture under ./test (see scripts/test/test_setup.sh), then same correlation as check
 check-tree: $(TARGETS)
-	./test_full.sh
+	./scripts/test/test_full.sh
 
 .PHONY: all clean debug serve serve-public check check-tree jemalloc-note enfsprobe-static enfsprobe-dist fuse-headers

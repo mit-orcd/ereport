@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# profile-ecrawl_analyze-fixtures.sh
+# profile/ecrawl_analyze-fixtures.sh
 #
 # SPDX-License-Identifier: MIT
 #
 # Profile `ecrawl_analyze` (read-only directory-shape stats over crawl shards)
 # over the shared per-fixture crawl output produced by
-# profile-ecrawl-fixtures.sh, the same way profile-ereport-fixtures.sh profiles
+# profile/ecrawl-fixtures.sh, the same way profile/ereport-fixtures.sh profiles
 # `ereport`.
 #
-# This profiler does NOT crawl. Run profile-ecrawl-fixtures.sh first with the
+# This profiler does NOT crawl. Run profile/ecrawl-fixtures.sh first with the
 # same <bin-root> to populate <bin-root>/<fixture>/bin/; this script consumes
 # those shards and hard-errors if a selected fixture has none.
 #
@@ -36,10 +36,10 @@
 # per-thread perf views below make the actual spread visible.
 #
 # Usage:
-#   scripts/profile-ecrawl_analyze-fixtures.sh <bin-root> [results-dir]
+#   scripts/profile/ecrawl_analyze-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
-#   <bin-root>     dir produced by profile-ecrawl-fixtures.sh; for each fixture
+#   <bin-root>     dir produced by profile/ecrawl-fixtures.sh; for each fixture
 #                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
 #                  ecrawl_analyze is read-only, so it produces no kept output.
 #
@@ -69,11 +69,17 @@
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
 #   REPS=1                     repetitions of the clean analyze pass per fixture.
 #   ECRAWL_ANALYZE_VERBOSE_ARGS=...  extra args appended to ecrawl_analyze.
-#   DO_QUERY=1                 also profile the selective hot-path query.
-#   QUERY_SIZE_GT=524288000    strict byte threshold for the query pass.
-#   QUERY_TYPE=f               record type for the query pass.
+#   DO_QUERY=1                 also profile the selective hot-path queries.
+#   QUERY_SIZE_GT=524288000    strict byte threshold substituted for @SIZE@.
+#   QUERY_TYPE=f               record type substituted for @TYPE@.
+#   QUERY_GID=$(id -g)         group id substituted for @GID@.
 #   QUERY_OUTPUT_SINK=/dev/null  listed paths destination; use a regular file or
 #                              production pipe to measure output backpressure.
+#   QUERY_VARIANTS=            newline-separated "name|env|args" list overriding
+#                              the default variant set (see QUERY_VARIANTS_DEFAULT
+#                              below for the shape and what each default isolates).
+#                              Narrow it to shorten a run:
+#                                QUERY_VARIANTS=$'subtree-rollup|| --subtree @ROOT@\nsubtree-exact|| --subtree @ROOT@ --exact'
 #
 # Data layout (under <bin-root>, persistent):
 #   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
@@ -90,14 +96,15 @@
 #   <fixture>/analyze/perf.sched.latency.txt   per-thread sched runtime/delay (DO_SCHED)
 #   <fixture>/analyze/perf.sched.summary.txt   perf sched timehist summary (DO_SCHED)
 #
-#   The selective query pass (DO_QUERY) writes the same file names under a dir
-#   named for its predicate, so several predicates can coexist in one run:
-#   <fixture>/query-size-gt-<N>-type-<C>/clean.stats.txt   totals + block-skip counters
-#   <fixture>/query-size-gt-<N>-type-<C>/clean.time.txt    /usr/bin/time -v
-#   <fixture>/query-size-gt-<N>-type-<C>/clean.wall.txt    wall_seconds
-#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.txt   perf report --stdio
-#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.caller.txt
-#   <fixture>/query-size-gt-<N>-type-<C>/perf.report.bythread.txt
+#   Each selective query variant (DO_QUERY) writes the same file names under its
+#   own directory, so all variants coexist in one run:
+#   <fixture>/query-<variant>/variant.txt        name, env and resolved argv
+#   <fixture>/query-<variant>/clean.stats.txt    totals + row group skip counters
+#   <fixture>/query-<variant>/clean.time.txt     /usr/bin/time -v
+#   <fixture>/query-<variant>/clean.wall.txt     wall_seconds
+#   <fixture>/query-<variant>/perf.report.txt    perf report --stdio
+#   <fixture>/query-<variant>/perf.report.caller.txt
+#   <fixture>/query-<variant>/perf.report.bythread.txt
 #
 #   SUMMARY_TABLE.txt                          at-a-glance table
 #   COMBINED_REPORT.txt                        everything concatenated
@@ -105,16 +112,18 @@
 #
 set -uo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/common.sh"
+
 # ---- args ------------------------------------------------------------------
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <bin-root> [results-dir]" >&2
   exit 2
 fi
-# Shared shard sets produced by profile-ecrawl-fixtures.sh; this profiler only
+# Shared shard sets produced by profile/ecrawl-fixtures.sh; this profiler only
 # consumes <bin-root>/<fixture>/bin and never crawls.
 BIN_ROOT=${1%/}
 if [[ ! -d "$BIN_ROOT" ]]; then
-  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile-ecrawl-fixtures.sh first)" >&2
+  echo "ERROR: bin-root '$BIN_ROOT' is not a directory (run profile/ecrawl-fixtures.sh first)" >&2
   exit 2
 fi
 BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
@@ -125,24 +134,6 @@ mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DI
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
 # ---- locate binaries -------------------------------------------------------
-# Fails with return, not exit: this runs inside $(...), where exit would only end
-# the subshell and leave the run going with an empty path, producing a
-# structurally complete report full of rc=127. Callers must use || exit.
-find_bin() {
-  local name=$1 var=$2
-  local v=${!var:-}
-  if [[ -n "$v" ]]; then
-    [[ -f "$v" && -x "$v" ]] || { echo "ERROR: $var '$v' is not an executable file" >&2; return 1; }
-    echo "$v"; return 0
-  fi
-  # Tests -f as well as -x because a deploy dir can share the tool's name
-  # (/tmp/ereport), and a directory is -x, so -x alone picks the dir as the binary.
-  if   [[ -f "./$name" && -x "./$name" ]];   then echo "$(cd "$(dirname "./$name")" && pwd)/$name"
-  elif [[ -f "/tmp/$name" && -x "/tmp/$name" ]]; then echo "/tmp/$name"
-  elif command -v "$name" >/dev/null 2>&1; then command -v "$name"
-  else echo "ERROR: cannot find $name; set $var=/path/to/$name" >&2; return 1
-  fi
-}
 ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN) || exit 1
 
 # ---- config ----------------------------------------------------------------
@@ -162,19 +153,54 @@ DO_QUERY=${DO_QUERY:-1}
 QUERY_SIZE_GT=${QUERY_SIZE_GT:-524288000}
 QUERY_TYPE=${QUERY_TYPE:-f}
 QUERY_OUTPUT_SINK=${QUERY_OUTPUT_SINK:-/dev/null}
-# Named for the predicate so runs with different filters do not overwrite each other.
-QUERY_DIR_NAME="query-size-gt-${QUERY_SIZE_GT}-type-${QUERY_TYPE}"
+QUERY_GID=${QUERY_GID:-$(id -g)}
 
-KNOWN_FIXTURES=(
-  deep_skinny_chain
-  depth_slash_profile
-  wide_shallow
-  ereport_badge_fixtures
-  neutral_flat
-  single_huge_dir
-  mega_dir2
-  mega_dir1
+# Query variants, one instrumented pass each: "name|env|args".
+#
+# `env` is a space-separated VAR=VAL list applied to that pass only (empty for
+# most). `args` are appended after the binary, before the bin dir. Placeholders
+# are substituted per fixture: @ROOT@ is the crawl's start_path from
+# crawl_manifest.txt, @GID@ is QUERY_GID, @SIZE@ is QUERY_SIZE_GT, @TYPE@ is
+# QUERY_TYPE. A variant naming @ROOT@ is skipped for a fixture whose manifest has
+# no start_path rather than being run against a wrong path.
+#
+# The set is chosen so each pass isolates one cost, and several exist only as the
+# A/B partner of another:
+#
+#   size-skipall        every row group pruned by the size zone map. Best case:
+#                       measures seek-past throughput and the fixed startup cost.
+#   size-matchall       nothing prunes, so the decoder actually runs. Worst case,
+#                       and the honest counterpart to size-skipall.
+#   size-matchall-nolist   same predicate without --list, so the delta against
+#                       size-matchall is path reconstruction plus the output write.
+#   size-matchall-noskip   same as -nolist with zone maps disabled; the delta is
+#                       what row group skipping is worth in seconds, not counters.
+#   subtree-rollup      a bare --subtree, answered from the catalog prefix sums
+#                       with zero record I/O. This is the headline v8 path.
+#   subtree-exact       the same question forced through a full record scan. Only
+#                       this pair licenses a claim about the rollup speedup.
+#   subtree-list        --subtree with a record predicate, so the DFS range test
+#                       runs per record and paths are rebuilt.
+#   gid-match           gid is RLE'd and near-constant per uid shard, so its zone
+#                       map usually prunes whole groups.
+#   perm-any            a bit test, which no zone map can prune: every group is
+#                       decoded. The floor for a mode predicate.
+QUERY_VARIANTS_DEFAULT=(
+  "size-skipall|| --size-gt @SIZE@ --type @TYPE@ --list"
+  "size-matchall|| --size-gt 0 --type @TYPE@ --list"
+  "size-matchall-nolist|| --size-gt 0 --type @TYPE@"
+  "size-matchall-noskip|ECRAWL_ANALYZE_BLOCK_SKIP=0| --size-gt 0 --type @TYPE@"
+  "subtree-rollup|| --subtree @ROOT@"
+  "subtree-exact|| --subtree @ROOT@ --exact"
+  "subtree-list|| --subtree @ROOT@ --type @TYPE@ --list"
+  "gid-match|| --gid @GID@ --type @TYPE@"
+  "perm-any|| --perm /0444 --type @TYPE@"
 )
+if [[ -n "${QUERY_VARIANTS:-}" ]]; then
+  IFS=$'\n' read -rd '' -a QVARIANTS <<<"$QUERY_VARIANTS" || true
+else
+  QVARIANTS=("${QUERY_VARIANTS_DEFAULT[@]}")
+fi
 
 if [[ -n "${FIXTURES:-}" ]]; then
   read -ra FIXLIST <<<"$FIXTURES"
@@ -189,7 +215,7 @@ else
   fi
 fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
-  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile-ecrawl-fixtures.sh first)" >&2
+  echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile/ecrawl-fixtures.sh first)" >&2
   exit 1
 fi
 
@@ -209,8 +235,6 @@ if [[ "$DO_PERF" == "1" && "$HAVE_PERF" != "1" ]]; then
 fi
 
 # ---- helpers ---------------------------------------------------------------
-fs_type() { stat -f -c '%T' "$1" 2>/dev/null || echo "?"; }
-shard_count() { find "$1" -maxdepth 1 -name 'uid_shard_*.bin' 2>/dev/null | wc -l; }
 
 # Build ecrawl_analyze argv into RUN_ARGV.
 build_argv() {
@@ -222,38 +246,90 @@ build_argv() {
   RUN_ARGV+=("$bindir")
 }
 
-build_query_argv() {
+# The crawl root, for variants that need a real --subtree argument. ecrawl always
+# writes start_path into the manifest, so no fixture needs a hand-supplied path.
+fixture_root() {
   local bindir=$1
-  QUERY_ARGV=("$ECRAWL_ANALYZE_BIN" --size-gt "$QUERY_SIZE_GT" --type "$QUERY_TYPE" --list "$bindir")
+  local mf="$bindir/crawl_manifest.txt"
+  [[ -f "$mf" ]] || return 1
+  local v
+  v=$(sed -n 's/^start_path=//p' "$mf" | tail -n1)
+  [[ -n "$v" ]] || return 1
+  echo "$v"
+}
+
+# Expand placeholders and split into QUERY_ARGV. Returns 1 if the variant needs a
+# crawl root this fixture does not have.
+build_variant_argv() {
+  local args=$1 bindir=$2 root=$3
+  if [[ "$args" == *"@ROOT@"* && -z "$root" ]]; then return 1; fi
+  args=${args//@ROOT@/$root}
+  args=${args//@GID@/$QUERY_GID}
+  args=${args//@SIZE@/$QUERY_SIZE_GT}
+  args=${args//@TYPE@/$QUERY_TYPE}
+  # shellcheck disable=SC2206 - deliberate word splitting of the variant's args
+  local parts=($args)
+  QUERY_ARGV=("$ECRAWL_ANALYZE_BIN" "${parts[@]}" "$bindir")
+  # Without --list the key=value totals are on stdout; with it they move to
+  # stderr and stdout carries the matched paths. Capture the totals either way,
+  # or a variant silently reports nothing.
+  if [[ " $args " == *" --list "* || "$args" == *" --list" ]]; then
+    QUERY_LISTS=1
+  else
+    QUERY_LISTS=0
+  fi
+  return 0
+}
+
+# Prefix for a variant's per-pass environment, as an argv (empty when unset).
+build_variant_env() {
+  local envs=$1
+  ENV_PREFIX=()
+  [[ -n "$envs" ]] || return 0
+  # shellcheck disable=SC2206 - deliberate word splitting of VAR=VAL pairs
+  local kv=($envs)
+  ENV_PREFIX=(env "${kv[@]}")
 }
 
 run_query_clean() {
-  local dest=$1 bindir=$2 rep=$3
+  local dest=$1 rep=$2
   local sfx=""; [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
   local t0 t1 rc
-  build_query_argv "$bindir"
-  echo "    query clean${sfx}: ${QUERY_ARGV[*]} >$QUERY_OUTPUT_SINK"
+  echo "    query clean${sfx}: ${ENV_PREFIX[*]:-} ${QUERY_ARGV[*]}"
   t0=$(date +%s.%N)
-  if [[ "$HAVE_TIME" == "1" ]]; then
-    "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
-      "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+  if [[ "$QUERY_LISTS" == "1" ]]; then
+    if [[ "$HAVE_TIME" == "1" ]]; then
+      "${ENV_PREFIX[@]}" "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
+        "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+    else
+      "${ENV_PREFIX[@]}" "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+    fi
   else
-    "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/clean.stats${sfx}.txt"
+    if [[ "$HAVE_TIME" == "1" ]]; then
+      "${ENV_PREFIX[@]}" "$TIME_BIN" -v -o "$dest/clean.time${sfx}.txt" \
+        "${QUERY_ARGV[@]}" >"$dest/clean.stats${sfx}.txt" 2>"$dest/clean.progress${sfx}.txt"
+    else
+      "${ENV_PREFIX[@]}" "${QUERY_ARGV[@]}" \
+        >"$dest/clean.stats${sfx}.txt" 2>"$dest/clean.progress${sfx}.txt"
+    fi
   fi
   rc=$?
   t1=$(date +%s.%N)
   awk -v a="$t0" -v b="$t1" 'BEGIN{printf "wall_seconds=%.3f\n", b-a}' >"$dest/clean.wall${sfx}.txt"
   echo "rc=$rc" >>"$dest/clean.stats${sfx}.txt"
+  echo "    query clean${sfx}: rc=$rc wall=$(cut -d= -f2 "$dest/clean.wall${sfx}.txt")s" \
+    "answered_from=$(sed -n 's/^answered_from=//p' "$dest/clean.stats${sfx}.txt" | tail -n1)"
 }
 
 run_query_perf() {
-  local dest=$1 bindir=$2
+  local dest=$1
   [[ "$DO_PERF" == "1" ]] || return 0
-  build_query_argv "$bindir"
   local data="$dest/perf.data"
-  echo "    query perf: process-scoped, output -> $QUERY_OUTPUT_SINK"
-  if perf record --call-graph "$PERF_CALLGRAPH" -F "$PERF_FREQ" -o "$data" \
-       "${QUERY_ARGV[@]}" >"$QUERY_OUTPUT_SINK" 2>"$dest/perf.record-stderr.txt"; then
+  local out="$QUERY_OUTPUT_SINK"
+  [[ "$QUERY_LISTS" == "1" ]] || out=/dev/null
+  echo "    query perf: process-scoped, output -> $out"
+  if "${ENV_PREFIX[@]}" perf record --call-graph "$PERF_CALLGRAPH" -F "$PERF_FREQ" -o "$data" \
+       "${QUERY_ARGV[@]}" >"$out" 2>"$dest/perf.record-stderr.txt"; then
     perf report -i "$data" --stdio 2>/dev/null >"$dest/perf.report.txt" || true
     perf report -i "$data" --stdio -g graph,0.5,caller 2>/dev/null >"$dest/perf.report.caller.txt" || true
     perf report -i "$data" --stdio --no-children --sort comm,pid \
@@ -351,13 +427,12 @@ profile_one() {
   local bindir="$fxout/bin"
   local dest="$RESULTS_DIR/$fixture"
   local adest="$dest/analyze"
-  local qdest="$dest/$QUERY_DIR_NAME"
   echo "==> $fixture  ($bindir)"
   local nsh
   nsh=$(shard_count "$bindir")
   if [[ "$nsh" -eq 0 ]]; then
     echo "ERROR: no uid_shard_*.bin under '$bindir' for fixture '$fixture'." >&2
-    echo "       Run profile-ecrawl-fixtures.sh with the same <bin-root> first." >&2
+    echo "       Run profile/ecrawl-fixtures.sh with the same <bin-root> first." >&2
     exit 1
   fi
   mkdir -p "$dest" "$adest"
@@ -370,11 +445,26 @@ profile_one() {
   run_perf   "$adest" "$bindir"
   run_sched  "$adest" "$bindir" "$fixture"
   if [[ "$DO_QUERY" == "1" ]]; then
-    mkdir -p "$qdest"
-    for ((r = 1; r <= REPS; r++)); do
-      run_query_clean "$qdest" "$bindir" "$r"
+    local root=""
+    root=$(fixture_root "$bindir" || true)
+    [[ -n "$root" ]] || echo "    note: no start_path in manifest; --subtree variants skipped"
+    local spec vname venv vargs qdest
+    for spec in "${QVARIANTS[@]}"; do
+      [[ -n "$spec" ]] || continue
+      IFS='|' read -r vname venv vargs <<<"$spec"
+      if ! build_variant_argv "$vargs" "$bindir" "$root"; then
+        echo "    query $vname: skipped (needs a crawl root)"
+        continue
+      fi
+      build_variant_env "$venv"
+      qdest="$dest/query-$vname"
+      mkdir -p "$qdest"
+      { echo "variant=$vname"; echo "env=${venv}"; echo "argv=${QUERY_ARGV[*]}"; } >"$qdest/variant.txt"
+      for ((r = 1; r <= REPS; r++)); do
+        run_query_clean "$qdest" "$r"
+      done
+      run_query_perf "$qdest"
     done
-    run_query_perf "$qdest" "$bindir"
   fi
 }
 
@@ -388,7 +478,8 @@ profile_one() {
   echo "ecrawl_analyze_bin=$ECRAWL_ANALYZE_BIN"
   echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
-  echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE sink=$QUERY_OUTPUT_SINK"
+  echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE gid=$QUERY_GID sink=$QUERY_OUTPUT_SINK"
+  echo "query_variants: $(printf '%s ' "${QVARIANTS[@]%%|*}")"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -466,43 +557,43 @@ COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
         echo "----- perf.sched.latency.txt -----"; cat "$d/perf.sched.latency.txt"; echo
       fi
     fi
-    # The selective query is the hot path the block-skip work targets, so its
-    # profile belongs in the uploaded report next to the full scan.
-    q="$RESULTS_DIR/$f/$QUERY_DIR_NAME"
-    if [[ -d "$q" ]]; then
-      echo "--- selective query pass ($QUERY_DIR_NAME) ---"
-      echo "    ecrawl_analyze --size-gt $QUERY_SIZE_GT --type $QUERY_TYPE --list"
+    # The selective queries are the hot paths the columnar work targets, so each
+    # variant's profile belongs in the uploaded report next to the full scan.
+    for q in "$RESULTS_DIR/$f"/query-*; do
+      [[ -d "$q" ]] || continue
+      vn=$(basename "$q")
+      echo "--- selective query pass ($vn) ---"
+      [[ -s "$q/variant.txt" ]] && sed 's/^/    /' "$q/variant.txt"
       echo
       for part in clean.stats clean.time; do
         for file in "$q/$part"*.txt; do
           [[ -e "$file" ]] || continue
-          echo "----- query/$(basename "$file") -----"; cat "$file"; echo
+          echo "----- $vn/$(basename "$file") -----"; cat "$file"; echo
         done
       done
       if [[ -s "$q/perf.report.txt" ]]; then
-        echo "----- query/perf.report.txt (top 40 lines) -----"; head -n 40 "$q/perf.report.txt"; echo
+        echo "----- $vn/perf.report.txt (top 40 lines) -----"; head -n 40 "$q/perf.report.txt"; echo
       fi
       if [[ -s "$q/perf.report.bythread.txt" ]]; then
-        echo "----- query/perf.report.bythread.txt (top 40 lines) -----"
+        echo "----- $vn/perf.report.bythread.txt (top 40 lines) -----"
         head -n 40 "$q/perf.report.bythread.txt"; echo
       fi
-    fi
+    done
   done
 } >"$COMBINED"
 
 # ---- summary table ---------------------------------------------------------
 SUMMARY_TABLE="$RESULTS_DIR/SUMMARY_TABLE.txt"
 if command -v python3 >/dev/null 2>&1; then
-  RESULTS_DIR="$RESULTS_DIR" FIXLIST_STR="${FIXLIST[*]}" QUERY_DIR="$QUERY_DIR_NAME" \
-    QUERY_LABEL="--size-gt $QUERY_SIZE_GT --type $QUERY_TYPE --list" \
+  RESULTS_DIR="$RESULTS_DIR" FIXLIST_STR="${FIXLIST[*]}" \
+    QUERY_VARIANT_NAMES="$(printf '%s ' "${QVARIANTS[@]%%|*}")" \
     python3 - <<'PY' >"$SUMMARY_TABLE" 2>/dev/null
 import os, re
 from pathlib import Path
 
 root = Path(os.environ["RESULTS_DIR"])
 fixtures = os.environ.get("FIXLIST_STR", "").split()
-qdir = os.environ.get("QUERY_DIR", "")
-qlabel = os.environ.get("QUERY_LABEL", "")
+variants = os.environ.get("QUERY_VARIANT_NAMES", "").split()
 if (root / "_ALL_ROOT_").is_dir() and "_ALL_ROOT_" not in fixtures:
     fixtures.append("_ALL_ROOT_")
 
@@ -659,45 +750,96 @@ for fx in fixtures:
     ]))
 lines.append("")
 
-# --- selective query pass (block skipping) --------------------------------
-# blks_dec/blks_skip come from ecrawl_analyze's own counters: a skipped block is
-# one whose header summary proved no record inside could match, so it was seeked
-# past instead of decompressed. skip% is the share of blocks avoided.
-qcols = ["fixture", "query(s)", "entries", "scanned", "blks_dec", "blks_skip", "skip%"]
-qw = [22, 10, 12, 14, 11, 11, 7]
+# --- selective query variants ---------------------------------------------
+# blks_dec/blks_skip come from ecrawl_analyze's own counters: a skipped row group
+# is one whose column zone maps proved no record inside could match, so it was
+# seeked past instead of decompressed. skip% is the share of groups avoided.
+# answered says whether the catalog rollups or a record scan produced the answer.
+qcols = ["fixture", "variant", "query(s)", "entries", "scanned",
+         "blks_dec", "blks_skip", "skip%", "answered"]
+qw = [20, 22, 10, 12, 14, 10, 10, 7, 16]
 
 
 def qrow(vals):
     return "  ".join(str(v).ljust(qw[i]) for i, v in enumerate(vals))
 
 
+def variant_stats(fx, vname):
+    """(avg wall seconds, key=value dict) for one variant, or (None, {})."""
+    sub = f"query-{vname}"
+    qv = pass_kv(fx, sub)
+    if not qv:
+        return None, {}
+    el = reps_elapsed(fx, sub)
+    return (sum(el) / len(el)) if el else None, qv
+
+
 qrows = []
 for fx in fixtures:
-    qv = pass_kv(fx, qdir) if qdir else {}
-    if not qv:
-        continue
-    el = reps_elapsed(fx, qdir)
-    el_avg = (sum(el) / len(el)) if el else None
-    dec = num(qv.get("blocks_decompressed"))
-    skip = num(qv.get("blocks_skipped"))
-    pct = None
-    if dec is not None and skip is not None and (dec + skip) > 0:
-        pct = 100.0 * skip / (dec + skip)
-    qrows.append(qrow([
-        fx,
-        fmt(el_avg, "f2") if el_avg is not None else "-",
-        fmt(num(qv.get("entries"))),
-        fmt(num(qv.get("records_scanned"))),
-        fmt(dec),
-        fmt(skip),
-        fmt(pct, "f1") if pct is not None else "-",
-    ]))
+    for vname in variants:
+        el_avg, qv = variant_stats(fx, vname)
+        if not qv:
+            continue
+        dec = num(qv.get("blocks_decompressed"))
+        skip = num(qv.get("blocks_skipped"))
+        pct = None
+        if dec is not None and skip is not None and (dec + skip) > 0:
+            pct = 100.0 * skip / (dec + skip)
+        qrows.append(qrow([
+            fx,
+            vname,
+            fmt(el_avg, "f2") if el_avg is not None else "-",
+            fmt(num(qv.get("entries"))),
+            fmt(num(qv.get("records_scanned"))),
+            fmt(dec),
+            fmt(skip),
+            fmt(pct, "f1") if pct is not None else "-",
+            qv.get("answered_from", "-"),
+        ]))
 if qrows:
-    lines.append(f"== SELECTIVE QUERY ({qlabel}) ==")
+    lines.append("== SELECTIVE QUERY VARIANTS ==")
     lines.append(qrow(qcols))
     lines.append(qrow(["-" * x for x in qw]))
     lines.extend(qrows)
     lines.append("")
+
+# --- A/B deltas -------------------------------------------------------------
+# Several variants exist only as each other's control. Doing the subtraction here
+# is the difference between a table of numbers and an answer, and it keeps the
+# claim honest: if a control is missing the row says so instead of being dropped.
+PAIRS = [
+    ("subtree-rollup", "subtree-exact",
+     "catalog rollup vs forced record scan (the v8 subtree win)"),
+    ("size-matchall-nolist", "size-matchall",
+     "cost of --list: path reconstruction plus the output write"),
+    ("size-matchall-nolist", "size-matchall-noskip",
+     "what row group zone-map skipping is worth"),
+    ("size-skipall", "size-matchall",
+     "everything pruned vs nothing pruned (selectivity spread)"),
+]
+ab = []
+for fast, slow, why in PAIRS:
+    rows = []
+    for fx in fixtures:
+        f_el, f_kv = variant_stats(fx, fast)
+        s_el, s_kv = variant_stats(fx, slow)
+        if not f_kv and not s_kv:
+            continue
+        if f_el is None or s_el is None:
+            rows.append(f"  {fx}: incomplete ({fast}="
+                        f"{'-' if f_el is None else f'{f_el:.2f}s'}, {slow}="
+                        f"{'-' if s_el is None else f'{s_el:.2f}s'})")
+            continue
+        speed = (s_el / f_el) if f_el > 0 else None
+        rows.append(f"  {fx}: {fast}={f_el:.3f}s  {slow}={s_el:.3f}s  "
+                    + (f"{speed:.1f}x faster" if speed else "n/a"))
+    if rows:
+        ab.append(f"  {fast} vs {slow} — {why}")
+        ab.extend(rows)
+        ab.append("")
+if ab:
+    lines.append("== A/B DELTAS ==")
+    lines.extend(ab)
 
 # --- per-thread on-CPU spread (perf) --------------------------------------
 # threads_>=1% = how many distinct threads each carried >=1% of CPU samples.
@@ -716,14 +858,18 @@ for fx in fixtures:
 lines.append("")
 
 # --- strace top syscalls (analyze pass) -----------------------------------
-lines.append("== STRACE TOP SYSCALLS (analyze pass; %time, count) ==")
+strace_rows = []
 for fx in fixtures:
     top = strace_top(fx)
     if not top:
         continue
     parts = ", ".join(f"{name} {pct:.1f}%/{cnt:,}" for pct, name, cnt in top)
-    lines.append(f"  {fx}: {parts}")
-lines.append("")
+    strace_rows.append(f"  {fx}: {parts}")
+# With DO_STRACE=0 there is nothing to show, so skip the header entirely.
+if strace_rows:
+    lines.append("== STRACE TOP SYSCALLS (analyze pass; %time, count) ==")
+    lines.extend(strace_rows)
+    lines.append("")
 
 # --- elapsed per rep ------------------------------------------------------
 lines.append("== ANALYZE ELAPSED PER REP ==")
@@ -733,17 +879,17 @@ for fx in fixtures:
         avg = sum(el) / len(el)
         lines.append(f"  {fx}: {[round(x,2) for x in el]} avg={avg:.2f}s")
 
-if qdir:
-    qper = []
-    for fx in fixtures:
-        el = reps_elapsed(fx, qdir)
+qper = []
+for fx in fixtures:
+    for vname in variants:
+        el = reps_elapsed(fx, f"query-{vname}")
         if el:
             avg = sum(el) / len(el)
-            qper.append(f"  {fx}: {[round(x,2) for x in el]} avg={avg:.2f}s")
-    if qper:
-        lines.append("")
-        lines.append("== QUERY ELAPSED PER REP ==")
-        lines.extend(qper)
+            qper.append(f"  {fx} / {vname}: {[round(x,2) for x in el]} avg={avg:.2f}s")
+if qper:
+    lines.append("")
+    lines.append("== QUERY ELAPSED PER REP ==")
+    lines.extend(qper)
 
 print("\n".join(lines))
 PY

@@ -8,10 +8,13 @@
 #     contrast with the single megadir.
 #
 # Usage:
-#   ./scripts/generate-ecrawl-adversarial-tree.sh [output_root]
+#   ./scripts/fixtures/generate-ecrawl-adversarial-tree.sh [output_root]
 #
 # Presets (optional — only fill vars you did not already export):
 #   SYNTH_PROFILE=           # unset or empty: quick smoke (~100k files in megadir; ecrawl may finish in ~1s on fast local disk)
+#   SYNTH_PROFILE=tiny       # ~3k entries, seconds to build: one of every shape (flat dir, deep chain, wide fan-out,
+#                            # hard links, symlinks, specials, sparse and real payloads) with the heat-map fixtures off.
+#                            # For testing behaviour, never for timings.
 #   SYNTH_PROFILE=medium     # ~2M flat files + wide_shallow + depth_slash_profile (still bounded by DISK_BUDGET_BYTES)
 #   SYNTH_PROFILE=heavy      # ~12M flat + larger wide + depth slice (aims for long ecrawl --no-write on megadir + extras)
 #   SYNTH_PROFILE=extreme    # Same scale defaults as heavy for single_huge_dir/chain/wide/depth_slice, plus extra flat megadirs:
@@ -174,7 +177,7 @@
 #                                       # Set **0** for a **true single-directory megadir**: all FLAT_FILES live directly under
 #                                       single_huge_dir/ as f000000000 … (same multi-threaded python3 creation when BATCH_CREATE=1).
 #                                       Example — ~20M files in one directory for ecrawl readdir stress:
-#                                         FLAT_FILES=20000000 SYNTH_FLAT_SHARD_CAP=0 ./scripts/generate-ecrawl-adversarial-tree.sh /tmp/x
+#                                         FLAT_FILES=20000000 SYNTH_FLAT_SHARD_CAP=0 ./scripts/fixtures/generate-ecrawl-adversarial-tree.sh /tmp/x
 #                                       (Raise DISK_BUDGET_BYTES / inode limits as needed; naming supports up to 999999999 files.)
 #
 # Optional heat-map footprint vs dilution (inner cells can stay badge-rich at lower absolute counts):
@@ -205,7 +208,7 @@
 #   EREPORT_HEAT_CTIME_LED_MIN_SHARE=0.45 ./ereport --bucket-details 1 <uid|name> mtime '$ROOT'
 #
 # Example stress (still under default budget if ASSUMED_BYTES_PER_FLAT_FILE=4096):
-#   FLAT_FILES=12000000 DEPTH_CHAIN=700 ./scripts/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl_adv
+#   FLAT_FILES=12000000 DEPTH_CHAIN=700 ./scripts/fixtures/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl_adv
 #
 set -euo pipefail
 
@@ -213,6 +216,29 @@ ROOT=${1:-./ecrawl_adversarial_scratch}
 SYNTH_PROFILE=${SYNTH_PROFILE:-}
 
 case "$SYNTH_PROFILE" in
+ tiny)
+   # Seconds to build, a few thousand entries: for exercising code paths, not
+   # for measuring anything. Keeps one of each shape ecrawl and the readers care
+   # about (a flat dir, a deep chain, a wide fan-out, hard links, symlinks,
+   # specials, sparse and real payloads) and drops the heat-map fixtures, whose
+   # smallest legal size is already larger than this whole tree.
+   echo "generate-ecrawl-adversarial-tree: SYNTH_PROFILE=tiny — small correctness fixture, not a benchmark tree" >&2
+   FLAT_FILES=${FLAT_FILES:-2000}
+   DEPTH_CHAIN=${DEPTH_CHAIN:-24}
+   WIDE_PARENTS=${WIDE_PARENTS:-8}
+   WIDE_FILES_EACH=${WIDE_FILES_EACH:-25}
+   DEPTH_SLICE_ENABLE=${DEPTH_SLICE_ENABLE:-0}
+   EREPORT_BADGE_FIXTURES=${EREPORT_BADGE_FIXTURES:-0}
+   BADGE_MARGIN_DILUTION_ENABLE=${BADGE_MARGIN_DILUTION_ENABLE:-0}
+   SYNTH_LINK_TARGETS=${SYNTH_LINK_TARGETS:-32}
+   SYNTH_HARDLINKS=${SYNTH_HARDLINKS:-64}
+   SYNTH_SYMLINKS=${SYNTH_SYMLINKS:-64}
+   SYNTH_LINK_SPARSE_TARGETS=${SYNTH_LINK_SPARSE_TARGETS:-2}
+   SYNTH_LINK_SPARSE_TARGET_MIB=${SYNTH_LINK_SPARSE_TARGET_MIB:-8}
+   SYNTH_REAL_LARGE_COUNT=${SYNTH_REAL_LARGE_COUNT:-2}
+   SYNTH_REAL_LARGE_MIB=${SYNTH_REAL_LARGE_MIB:-1}
+   SYNTH_RANDOM_UID_ENABLE=${SYNTH_RANDOM_UID_ENABLE:-0}
+   ;;
  medium)
    echo "generate-ecrawl-adversarial-tree: SYNTH_PROFILE=medium (override any default by exporting vars before this script)" >&2
    FLAT_FILES=${FLAT_FILES:-2000000}
@@ -246,7 +272,7 @@ case "$SYNTH_PROFILE" in
  "")
    ;;
  *)
-   echo "ERROR: unknown SYNTH_PROFILE='$SYNTH_PROFILE' (use medium, heavy, extreme, or unset)" >&2
+   echo "ERROR: unknown SYNTH_PROFILE='$SYNTH_PROFILE' (use tiny, medium, heavy, extreme, or unset)" >&2
    exit 2
    ;;
 esac
