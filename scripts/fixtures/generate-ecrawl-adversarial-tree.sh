@@ -10,6 +10,30 @@
 # Usage:
 #   ./scripts/fixtures/generate-ecrawl-adversarial-tree.sh [output_root]
 #
+# Manifest and reuse:
+#   On success the script writes <output_root>/FIXTURE_MANIFEST.txt — the parameters
+#   that shaped the tree, a fingerprint over them, and per-subdirectory counts.
+#   Re-running against the same root with the same parameters prints one line and
+#   exits 0 without rebuilding. These trees cost minutes to hours, so repeated test
+#   and benchmark runs reuse one rather than rebuild it.
+#     FORCE=1            # rebuild over the top, matching parameters or not
+#     MANIFEST_VERIFY=1  # additionally walk the finished tree and record measured
+#                        # counts (a second full traversal, so off by default)
+#   Running with *different* parameters against a root that already holds a tree is
+#   an error (exit 3): the second tree would be laid over the first and the result
+#   would match neither. rm -rf the root for a clean rebuild, or FORCE=1 to overlay.
+#   The manifest is written only once the tree is complete, so an interrupted run
+#   leaves none behind and the next run rebuilds instead of reusing a partial tree.
+#   Outside the fingerprint, so they never force a rebuild: the disk-budget knobs
+#   (their one effect on the tree, a capped FLAT_FILES, is itself recorded),
+#   IGNORE_DEPTH_PATH_MAX (likewise, via the clamped DEPTH_CHAIN), BATCH_CREATE and
+#   CREATE_JOBS, ECRAWL_FLAT_LOW/HIGH, the output path, and this script's own hash.
+#   [derived] counts come from the parameters and cost nothing; each subtree carries
+#   .exact=0|1, and ereport_badge_fixtures is 0 whenever heatmap_grid is on, since
+#   the grid picks its per-cell counts at run time. [measured] appears only under
+#   MANIFEST_VERIFY=1 and excludes whatever a caller adds after this script returns
+#   (compare-indexers/prepare-synth.sh writes its query_seeds/ tree afterwards).
+#
 # Presets (optional — only fill vars you did not already export):
 #   SYNTH_PROFILE=           # unset or empty: quick smoke (~100k files in megadir; ecrawl may finish in ~1s on fast local disk)
 #   SYNTH_PROFILE=tiny       # ~3k entries, seconds to build: one of every shape (flat dir, deep chain, wide fan-out,
@@ -958,6 +982,7 @@ if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
     if [[ "$denom" -lt 1 ]]; then denom=1; fi
     new_flat=$((headroom / denom))
     echo "AUTO_CAP_FLAT: reducing FLAT_FILES $FLAT_FILES -> $new_flat to stay within disk budget." >&2
+    MANIFEST_FLAT_FILES_REQUESTED=$FLAT_FILES
     FLAT_FILES=$new_flat
     est=$(estimate_bytes)
     if [[ "$est" -gt "$DISK_BUDGET_BYTES" ]]; then
@@ -992,6 +1017,447 @@ raise SystemExit(0 if 0 < x <= 1 else 1)
     exit 2
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# Fixture manifest
+#
+# These trees cost minutes to hours to build, so a finished one records the
+# parameters that shaped it. A later run with the same parameters reuses the
+# tree instead of laying a second one over the first — see the reuse gate
+# below, which runs before anything is created.
+# ---------------------------------------------------------------------------
+
+FIXTURE_MANIFEST_NAME=FIXTURE_MANIFEST.txt
+FIXTURE_MANIFEST="$ROOT/$FIXTURE_MANIFEST_NAME"
+FORCE=${FORCE:-0}
+MANIFEST_VERIFY=${MANIFEST_VERIFY:-0}
+
+# Read only through ${VAR:-default} elsewhere. Pinned to real variables here so
+# the manifest and the fingerprint record the same effective values the
+# generators below will use.
+BADGE_HEATMAP_FILL_DEEP_ONLY_S0=${BADGE_HEATMAP_FILL_DEEP_ONLY_S0:-0}
+BADGE_HEATMAP_SKIP_DENSE_FLAT_CELL=${BADGE_HEATMAP_SKIP_DENSE_FLAT_CELL:-1}
+BADGE_HEATMAP_RANDOM_SEED=${BADGE_HEATMAP_RANDOM_SEED:-}
+BADGE_HEATMAP_ROW_DAY_BIAS=${BADGE_HEATMAP_ROW_DAY_BIAS:-}
+SYNTH_RANDOM_UID_SEED=${SYNTH_RANDOM_UID_SEED:-}
+
+# Every knob that changes the shape of the tree, in a fixed order so the
+# fingerprint is stable. Read here rather than earlier because DEPTH_CHAIN was
+# clamped to PATH_MAX above and FLAT_FILES may have been capped to the disk
+# budget: these are the values the tree actually gets built from.
+MANIFEST_SHAPE_VARS=(
+  SYNTH_PROFILE
+  FLAT_FILES SYNTH_FLAT_SHARD_CAP SPARSE_FILE_MIB
+  DEPTH_CHAIN
+  WIDE_PARENTS WIDE_FILES_EACH
+  DEPTH_SLICE_ENABLE
+  DEPTH_PEAK_LO DEPTH_PEAK_HI DEPTH_PEAK_FILES_PER_BIN
+  DEPTH_PLATEAU_LO DEPTH_PLATEAU_HI DEPTH_PLATEAU_FILES_PER_BIN
+  SYNTH_LINKS_ENABLE SYNTH_LINK_TARGETS SYNTH_HARDLINKS SYNTH_SYMLINKS
+  SYNTH_LINK_SPARSE_TARGETS SYNTH_LINK_SPARSE_TARGET_MIB
+  SYNTH_REAL_LARGE_ENABLE SYNTH_REAL_LARGE_COUNT SYNTH_REAL_LARGE_MIB
+  SYNTH_EXTREME_MEGA_DIR1_FILES
+  SYNTH_EXTREME_MEGA_DIR2_TOP_FILES SYNTH_EXTREME_MEGA_DIR2_NESTED_PAIR_DIRS
+  EREPORT_BADGE_FIXTURES
+  BADGE_DENSE_N BADGE_DEEP_N BADGE_FILE_BYTES BADGE_DEEP_SEGMENTS
+  BADGE_SKEW_STAMP_DAYS BADGE_EXTRA_SKEW_CELL BADGE_EXTRA_SKEW_STAMP_DAYS
+  BADGE_DEEP_ONLY_N BADGE_DEEP_ONLY_BAND
+  BADGE_HEATMAP_GRID BADGE_HEATMAP_RANDOM BADGE_HEATMAP_RANDOM_SEED
+  BADGE_GRID_FILES_MIN BADGE_GRID_FILES_MAX BADGE_GRID_FILES_PER_CELL
+  BADGE_GRID_MAX_FILES_PER_DIR BADGE_GRID_S0_FRAC
+  BADGE_HEATMAP_OLDEST_DAYS BADGE_HEATMAP_ROW_DAY_BIAS
+  BADGE_HEATMAP_DEEP_PREFIX_LEVELS
+  BADGE_HEATMAP_BADGE_CELL_FRAC BADGE_HEATMAP_SHOWCASE_SEED
+  BADGE_HEATMAP_NEUTRAL_MIN_FILES BADGE_HEATMAP_NEUTRAL_MAX_FILES
+  BADGE_HEATMAP_CORPUS_BLEND_NUM BADGE_HEATMAP_CORPUS_BLEND_DEN
+  BADGE_HEATMAP_FILL_DEEP_ONLY_S0
+  BADGE_HEATMAP_SKIP_DENSE_FLAT_CELL BADGE_HEATMAP_SKIP_DENSE_FLAT_EXTRA_CELLS
+  BADGE_MULTI_DENSE_N BADGE_MULTI_DEEP_N BADGE_MEGADIR_SHARD_CAP
+  BADGE_DENSE_FLAT_ENABLE BADGE_DENSE_FLAT_N
+  BADGE_DENSE_FLAT_BAND BADGE_DENSE_FLAT_SB
+  BADGE_DENSE_FLAT_EXTRA_ENABLE BADGE_DENSE_FLAT_EXTRA_N
+  BADGE_DENSE_FLAT_EXTRA_PAIRS
+  BADGE_MARGIN_DILUTION_ENABLE BADGE_MARGIN_NEUTRAL_FILES
+  BADGE_MARGIN_NEUTRAL_PARENT_CAP BADGE_MARGIN_NEUTRAL_DEPTH
+  BADGE_MARGIN_NEUTRAL_BYTES BADGE_MARGIN_NEUTRAL_UTIME
+  SYNTH_RANDOM_UID_ENABLE SYNTH_RANDOM_UID_SCOPE SYNTH_RANDOM_UID_FRACTION
+  SYNTH_RANDOM_UID_MAX_CHOWN SYNTH_RANDOM_UID_MIN SYNTH_RANDOM_UID_MAX
+  SYNTH_RANDOM_UID_UNIQUE_MAX SYNTH_RANDOM_UID_SEED
+)
+
+# Deliberately outside the fingerprint. Including any of these would reject a
+# fixture that is in fact the right one:
+#   budget model — its only effect on the tree is the capped FLAT_FILES above,
+#     which is already in the list
+#   IGNORE_DEPTH_PATH_MAX — likewise, captured in the clamped DEPTH_CHAIN
+#   BATCH_CREATE / CREATE_JOBS — creation speed, same resulting tree
+#   ECRAWL_FLAT_LOW / HIGH — feed a printed runtime hint and nothing else
+#   FORCE / MANIFEST_VERIFY — control the manifest, not the tree
+MANIFEST_IGNORED_VARS=(
+  DISK_BUDGET_BYTES ASSUMED_BYTES_PER_FLAT_FILE ASSUMED_BYTES_PER_CHAIN_DIR
+  AUTO_CAP_FLAT IGNORE_DEPTH_PATH_MAX
+  BATCH_CREATE CREATE_JOBS
+  ECRAWL_FLAT_LOW ECRAWL_FLAT_HIGH
+  FORCE MANIFEST_VERIFY
+)
+
+manifest_params() {
+  local v
+  for v in "${MANIFEST_SHAPE_VARS[@]}"; do
+    printf '%s=%s\n' "$v" "${!v-}"
+  done
+}
+
+manifest_fingerprint() {
+  local sum
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum=$(manifest_params | sha256sum | cut -d' ' -f1)
+    printf 'sha256:%s' "$sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    sum=$(manifest_params | shasum -a 256 | cut -d' ' -f1)
+    printf 'sha256:%s' "$sum"
+  else
+    sum=$(manifest_params | cksum | tr -s ' ' '_')
+    printf 'cksum:%s' "$sum"
+  fi
+}
+
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    echo "unavailable"
+  fi
+}
+
+# With this many tunables the likely failure is a new one landing in neither
+# list, which would let a differently-shaped tree pass the reuse check as a
+# match. Warn rather than fail: a stale list should never block a build.
+manifest_check_var_drift() {
+  local known=" ${MANIFEST_SHAPE_VARS[*]} ${MANIFEST_IGNORED_VARS[*]} "
+  local v
+  local -a unclassified=()
+  while read -r v; do
+    [[ -n "$v" ]] || continue
+    [[ "$known" == *" $v "* ]] || unclassified+=("$v")
+  done < <(sed -n 's/^ *\([A-Z][A-Z0-9_]*\)=\${\1:-.*/\1/p' "${BASH_SOURCE[0]}" | sort -u)
+  if [[ ${#unclassified[@]} -gt 0 ]]; then
+    echo "WARNING: these tunables are in neither MANIFEST_SHAPE_VARS nor MANIFEST_IGNORED_VARS," >&2
+    echo "  so the reuse check ignores them: ${unclassified[*]}" >&2
+    echo "  Add each to MANIFEST_SHAPE_VARS (changes the tree) or MANIFEST_IGNORED_VARS (does not)." >&2
+  fi
+}
+
+manifest_check_var_drift
+MANIFEST_FINGERPRINT=$(manifest_fingerprint)
+
+_manifest_row() {
+  local name=$1 files=$2 dirs=$3 exact=$4
+  printf '%s.files=%s\n' "$name" "$files"
+  if [[ -n "$dirs" ]]; then
+    printf '%s.dirs=%s\n' "$name" "$dirs"
+  fi
+  printf '%s.exact=%s\n' "$name" "$exact"
+  return 0
+}
+
+# Per-subtree counts straight from the parameters, using the same helpers the
+# disk-budget estimate above already calls, so this costs nothing. `.exact=1`
+# means the file count is what the tree will hold; see the badge fixtures below
+# for the one case where it is an upper bound.
+manifest_derived() {
+  local total=0 total_links=0 all_exact=1 files dirs links exact
+  local -a disabled=()
+
+  if [[ "$SYNTH_FLAT_SHARD_CAP" == "0" ]]; then
+    dirs=1
+  else
+    dirs=$((1 + (FLAT_FILES + SYNTH_FLAT_SHARD_CAP - 1) / SYNTH_FLAT_SHARD_CAP))
+  fi
+  _manifest_row single_huge_dir "$FLAT_FILES" "$dirs" 1
+  total=$((total + FLAT_FILES))
+
+  if [[ "$DEPTH_CHAIN" -gt 0 ]]; then
+    # DEPTH_CHAIN counts levels below the subtree root; +1 so every .dirs here
+    # means the same thing as `find <subtree> -type d`.
+    _manifest_row deep_skinny_chain 1 $((DEPTH_CHAIN + 1)) 1
+    total=$((total + 1))
+  else
+    disabled+=(deep_skinny_chain)
+  fi
+
+  if [[ "$WIDE_PARENTS" -gt 0 ]]; then
+    files=$((WIDE_PARENTS * WIDE_FILES_EACH))
+    _manifest_row wide_shallow "$files" $((WIDE_PARENTS + 1)) 1
+    total=$((total + files))
+  else
+    disabled+=(wide_shallow)
+  fi
+
+  if [[ "$DEPTH_SLICE_ENABLE" == "1" ]]; then
+    files=$(depth_slice_file_count)
+    _manifest_row depth_slash_profile "$files" "$(depth_slice_dir_estimate)" 1
+    total=$((total + files))
+  else
+    disabled+=(depth_slash_profile)
+  fi
+
+  if [[ "${SYNTH_LINKS_ENABLE:-1}" == "1" ]]; then
+    # Counted the way a reader counts them, so total.files stays comparable to
+    # `find -type f`: each hard-link name is its own directory entry and counts
+    # as a file, while the symlinks and the five specials do not.
+    files=$((SYNTH_LINK_TARGETS + SYNTH_HARDLINKS))
+    links=$((SYNTH_SYMLINKS + 5))
+    _manifest_row links_and_specials "$files" 5 1
+    printf 'links_and_specials.targets=%s\n' "$SYNTH_LINK_TARGETS"
+    printf 'links_and_specials.hardlinks=%s\n' "$SYNTH_HARDLINKS"
+    printf 'links_and_specials.symlinks=%s\n' "$links"
+    total=$((total + files))
+    total_links=$((total_links + links))
+  else
+    disabled+=(links_and_specials)
+  fi
+
+  if [[ "${SYNTH_REAL_LARGE_ENABLE:-1}" == "1" && "$SYNTH_REAL_LARGE_COUNT" -gt 0 ]]; then
+    files=$(real_large_file_count)
+    _manifest_row real_large_files "$files" 1 1
+    total=$((total + files))
+  else
+    disabled+=(real_large_files)
+  fi
+
+  if [[ "$EREPORT_BADGE_FIXTURES" == "1" ]]; then
+    files=$(badge_fixtures_file_count)
+    # heatmap_grid picks its per-cell counts at run time and then scales them by
+    # BADGE_GRID_S0_FRAC and the corpus blend, and skips cells reserved for the
+    # dense_flat slices. badge_fixtures_file_count() cannot follow that, so with
+    # the grid on this is an upper bound. Seeding only makes it repeatable, not
+    # predictable from here.
+    exact=1
+    [[ "$BADGE_HEATMAP_GRID" == "1" ]] && exact=0
+    _manifest_row ereport_badge_fixtures "$files" "" "$exact"
+    [[ "$exact" == "1" ]] || all_exact=0
+    total=$((total + files))
+  else
+    disabled+=(ereport_badge_fixtures)
+  fi
+
+  files=$(margin_neutral_file_count)
+  if [[ "$files" -gt 0 ]]; then
+    _manifest_row neutral_flat "$files" "" 1
+    total=$((total + files))
+  else
+    disabled+=(neutral_flat)
+  fi
+
+  if [[ "$SYNTH_EXTREME_MEGA_DIR1_FILES" -gt 0 ]]; then
+    _manifest_row mega_dir1 "$SYNTH_EXTREME_MEGA_DIR1_FILES" 1 1
+    total=$((total + SYNTH_EXTREME_MEGA_DIR1_FILES))
+  else
+    disabled+=(mega_dir1)
+  fi
+
+  if [[ "$SYNTH_EXTREME_MEGA_DIR2_TOP_FILES" -gt 0 || "$SYNTH_EXTREME_MEGA_DIR2_NESTED_PAIR_DIRS" -gt 0 ]]; then
+    # Each nested pair dir holds exactly one file named `file`.
+    files=$((SYNTH_EXTREME_MEGA_DIR2_TOP_FILES + SYNTH_EXTREME_MEGA_DIR2_NESTED_PAIR_DIRS))
+    _manifest_row mega_dir2 "$files" $((1 + SYNTH_EXTREME_MEGA_DIR2_NESTED_PAIR_DIRS)) 1
+    total=$((total + files))
+  else
+    disabled+=(mega_dir2)
+  fi
+
+  printf 'total.files=%s\n' "$total"
+  printf 'total.symlinks=%s\n' "$total_links"
+  printf 'total.exact=%s\n' "$all_exact"
+  printf 'disabled=%s\n' "$(IFS=,; echo "${disabled[*]-}")"
+  return 0
+}
+
+# Counts read back off the finished tree (MANIFEST_VERIFY=1). A second full
+# traversal, which is why it is opt-in: on SYNTH_PROFILE=extreme that is 25M+
+# entries. Excludes anything a caller adds after this script returns, such as
+# the query_seeds/ tree from compare-indexers/prepare-synth.sh.
+manifest_measured() {
+  local -a names=("$@")
+  local n base files dirs links
+  if command -v python3 >/dev/null 2>&1; then
+    MANIFEST_ROOT="$ROOT" python3 - "${names[@]}" <<'MEASURE_PY'
+import os
+import sys
+
+root = os.environ["MANIFEST_ROOT"]
+grand = {"files": 0, "dirs": 0, "symlinks": 0, "other": 0}
+
+
+def walk(base):
+    # Explicit stack rather than os.walk: os.walk reports a symlink-to-directory
+    # in its dirnames, which would count it as a directory here.
+    counts = {"files": 0, "dirs": 1, "symlinks": 0, "other": 0}
+    stack = [base]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    counts["symlinks"] += 1
+                elif e.is_dir(follow_symlinks=False):
+                    counts["dirs"] += 1
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    counts["files"] += 1
+                else:
+                    counts["other"] += 1
+            except OSError:
+                continue
+    return counts
+
+
+for name in sys.argv[1:]:
+    base = os.path.join(root, name)
+    if not os.path.isdir(base):
+        continue
+    c = walk(base)
+    for k in grand:
+        grand[k] += c[k]
+    print(f"{name}.files={c['files']}")
+    print(f"{name}.dirs={c['dirs']}")
+    if c["symlinks"]:
+        print(f"{name}.symlinks={c['symlinks']}")
+    if c["other"]:
+        print(f"{name}.other={c['other']}")
+
+for k in ("files", "dirs", "symlinks"):
+    print(f"total.{k}={grand[k]}")
+if grand["other"]:
+    print(f"total.other={grand['other']}")
+MEASURE_PY
+  else
+    for n in "${names[@]}"; do
+      base="$ROOT/$n"
+      [[ -d "$base" ]] || continue
+      files=$(find "$base" -type f 2>/dev/null | wc -l)
+      dirs=$(find "$base" -type d 2>/dev/null | wc -l)
+      links=$(find "$base" -type l 2>/dev/null | wc -l)
+      printf '%s.files=%s\n%s.dirs=%s\n' "$n" "$files" "$n" "$dirs"
+      [[ "$links" -gt 0 ]] && printf '%s.symlinks=%s\n' "$n" "$links"
+    done
+  fi
+  return 0
+}
+
+# Written only once the tree is complete, and written atomically, so an
+# interrupted run leaves no manifest and the next run rebuilds rather than
+# reusing a half-built tree.
+manifest_write() {
+  local tmp="$FIXTURE_MANIFEST.tmp.$$"
+  local -a subtrees
+  {
+    echo "# generate-ecrawl-adversarial-tree.sh fixture manifest"
+    echo "# Re-running with the same [params] reuses this tree and exits 0."
+    echo "# FORCE=1 rebuilds over the top; rm -rf the root for a clean rebuild."
+    echo "schema=1"
+    echo "status=complete"
+    echo "fingerprint=$MANIFEST_FINGERPRINT"
+    echo "generated_at=$(date -Is 2>/dev/null || date)"
+    echo "duration_sec=$SECONDS"
+    echo "host=$(hostname -s 2>/dev/null || echo unknown)"
+    echo "root=$ROOT"
+    # Provenance only. Deliberately not part of the fingerprint: editing a
+    # comment in this script should not force a multi-hour rebuild.
+    echo "script_sha256=$(file_sha256 "${BASH_SOURCE[0]}")"
+    if [[ -n "${MANIFEST_FLAT_FILES_REQUESTED:-}" ]]; then
+      echo "flat_files_requested=$MANIFEST_FLAT_FILES_REQUESTED"
+    fi
+    echo ""
+    echo "[params]"
+    manifest_params
+    echo ""
+    echo "[derived]"
+    manifest_derived
+  } >"$tmp"
+
+  if [[ "$MANIFEST_VERIFY" == "1" ]]; then
+    echo "Verifying tree (MANIFEST_VERIFY=1; a second full traversal)…" >&2
+    mapfile -t subtrees < <(awk -F'[.=]' \
+      '/^[a-z0-9_]+\.files=[0-9]+$/ && $1 != "total" && $3+0 > 0 {print $1}' "$tmp" | sort -u)
+    {
+      echo ""
+      echo "[measured]"
+      manifest_measured "${subtrees[@]}"
+    } >>"$tmp"
+  fi
+
+  mv -f "$tmp" "$FIXTURE_MANIFEST"
+  echo "Wrote $FIXTURE_MANIFEST"
+}
+
+# --- Reuse gate ------------------------------------------------------------
+# Runs before anything is created. Nothing above this point writes to the tree.
+
+manifest_subtree_names() {
+  awk -F'[.=]' '/^[a-z0-9_]+\.files=[0-9]+$/ && $1 != "total" && $3+0 > 0 {print $1}' \
+    "$FIXTURE_MANIFEST" | sort -u
+}
+
+manifest_diff_keys() {
+  local v cur old shown=0
+  for v in "${MANIFEST_SHAPE_VARS[@]}"; do
+    cur=${!v-}
+    old=$(sed -n "s/^${v}=//p" "$FIXTURE_MANIFEST" | head -n1)
+    if [[ "$cur" != "$old" ]]; then
+      printf '    %s=%s (existing tree: %s)\n' "$v" "$cur" "${old:-<absent>}"
+      shown=$((shown + 1))
+      if [[ "$shown" -ge 6 ]]; then
+        printf '    … and possibly more\n'
+        break
+      fi
+    fi
+  done
+  return 0
+}
+
+if [[ "$FORCE" != "1" && -f "$FIXTURE_MANIFEST" ]]; then
+  _mf_status=$(sed -n 's/^status=//p' "$FIXTURE_MANIFEST" | head -n1)
+  _mf_fp=$(sed -n 's/^fingerprint=//p' "$FIXTURE_MANIFEST" | head -n1)
+  if [[ "$_mf_status" == "complete" && -n "$_mf_fp" ]]; then
+    if [[ "$_mf_fp" == "$MANIFEST_FINGERPRINT" ]]; then
+      # The fingerprint says the parameters match; check the tree is still
+      # actually there before trusting it, so a partly deleted fixture is not
+      # silently reused.
+      _mf_missing=()
+      while read -r _mf_sub; do
+        [[ -n "$_mf_sub" ]] || continue
+        [[ -d "$ROOT/$_mf_sub" ]] || _mf_missing+=("$_mf_sub")
+      done < <(manifest_subtree_names)
+      if [[ ${#_mf_missing[@]} -gt 0 ]]; then
+        echo "WARNING: $FIXTURE_MANIFEST matches these parameters but its subtrees are gone: ${_mf_missing[*]}" >&2
+        echo "  Rebuilding." >&2
+      else
+        _mf_when=$(sed -n 's/^generated_at=//p' "$FIXTURE_MANIFEST" | head -n1)
+        _mf_files=$(sed -n 's/^total\.files=//p' "$FIXTURE_MANIFEST" | head -n1)
+        echo "Reusing the fixture already at $ROOT"
+        echo "  built ${_mf_when:-?}, about ${_mf_files:-?} files, same parameters (${MANIFEST_FINGERPRINT:0:19}…)"
+        echo "  Nothing to do. FORCE=1 rebuilds over the top; rm -rf '$ROOT' for a clean rebuild."
+        exit 0
+      fi
+    else
+      echo "ERROR: $ROOT already holds a fixture built with different parameters." >&2
+      echo "  Building on top of it would mix two trees into one that matches neither." >&2
+      echo "  Differences:" >&2
+      manifest_diff_keys >&2
+      echo "  Either rm -rf '$ROOT' for a clean rebuild, or set FORCE=1 to overlay anyway." >&2
+      exit 3
+    fi
+  fi
+fi
+
+# A run that dies partway must not leave a manifest promising a complete tree.
+rm -f "$FIXTURE_MANIFEST"
 
 echo "Output root: $ROOT"
 if [[ "$SYNTH_FLAT_SHARD_CAP" == "0" ]]; then
@@ -2494,9 +2960,14 @@ PY
   fi
 fi
 
+manifest_write
+
 cat <<EOF
 
 Done.
+
+Re-running this command against '$ROOT' will reuse this tree and exit 0
+(see $FIXTURE_MANIFEST_NAME). FORCE=1 rebuilds over the top.
 
 Why this is adversarial for ecrawl:
   - single_huge_dir: one worker walks the entire directory stream; every file needs

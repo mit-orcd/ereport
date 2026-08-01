@@ -68,6 +68,8 @@ SYNTH_PROFILE=extreme DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) \
   ./scripts/fixtures/generate-ecrawl-adversarial-tree.sh /tmp/ecrawl-adversarial
 ```
 
+Reuse (`FIXTURE_MANIFEST.txt`): a finished tree records the parameters that built it, a fingerprint over them, and per-subdirectory counts. Re-running against the same root with the same parameters exits 0 without rebuilding, which is what makes it practical to keep an `extreme` tree on scratch and point run after run at it. `FORCE=1` rebuilds over the top; `MANIFEST_VERIFY=1` additionally walks the finished tree and records measured counts, at the cost of a second full traversal. Re-running with *different* parameters against an existing tree is an error rather than an overlay, since mixing two trees produces one that matches neither — `rm -rf` the root for a clean rebuild. The manifest is written only on success, so an interrupted run leaves none and the next run rebuilds. Knobs that do not change the tree (the disk-budget model, `BATCH_CREATE` / `CREATE_JOBS`, `ECRAWL_FLAT_LOW` / `ECRAWL_FLAT_HIGH`, the output path, and the script's own hash) are excluded from the fingerprint so they never force a rebuild.
+
 ## Profiling and performance work
 
 Companion scripts profile the tools per fixture and capture a full performance picture — wall-clock timings, `strace -f -c` syscall histograms, `perf record --call-graph dwarf` CPU profiles, and optional `perf sched` thread-concurrency traces (`DO_SCHED`, gated to `SCHED_FIXTURES`) — into an uploadable tarball with a `SUMMARY_TABLE.txt`. Build with `make debug` (or otherwise ensure `-g`) for the best `perf` symbols.

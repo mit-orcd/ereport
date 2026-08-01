@@ -28,7 +28,10 @@ fi
 mkdir -p "$SYNTH_ROOT"
 SYNTH_ROOT=$(cd "$SYNTH_ROOT" && pwd)
 
-echo "==> generating SYNTH_PROFILE=$SYNTH_PROFILE under $SYNTH_ROOT"
+# The generator reuses an existing tree when its FIXTURE_MANIFEST.txt records
+# the same parameters, so a second benchmark run against the same root does not
+# rebuild. It exits non-zero if the root holds a tree built with different ones.
+echo "==> ensuring SYNTH_PROFILE=$SYNTH_PROFILE tree under $SYNTH_ROOT"
 SYNTH_PROFILE="$SYNTH_PROFILE" "$GEN" "$SYNTH_ROOT"
 
 SEED_ROOT="$SYNTH_ROOT/$SEED_QUERY_DIR"
