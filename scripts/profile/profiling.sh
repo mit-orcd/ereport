@@ -44,7 +44,9 @@ function step1() {
   mkdir -p "$report_dir"
 
   DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) DEPTH_SLICE_ENABLE=1 SYNTH_PROFILE=extreme "$scripts_root/fixtures/generate-ecrawl-adversarial-tree.sh" "$data_dir"
-  ECRAWL_PROGRESS_LOG="$report_dir/ecrawl_progress.csv" ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "$data_dir" "$bin_dir"
+  # Crawled twice on purpose: --verbose turns on the per-call I/O counter atomics,
+  # so the quiet run is the one whose capture and timing the later steps use.
+  ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "$data_dir" "$bin_dir"
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "$data_dir" "$bin_dir"
   ECRAWL_ANALYZE_THREADS=64 "$bin_root/ecrawl_analyze" --top 10 "$bin_dir"
   EREPORT_THREADS=64 "$bin_root/ereport" --bucket-details 4 --report-dir "$report_dir" mtime "$bin_dir"
