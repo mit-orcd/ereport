@@ -63,15 +63,29 @@ FUSE_CFLAGS := -I$(FUSE_PREFIX)/usr/include
 FUSE_LIBS := -l:libfuse.so.2
 endif
 endif
-ifneq ($(strip $(FUSE_LIBS)),)
-TARGETS += ecrawl_mount
-FUSE_NOTE := fuse enabled ($(strip $(FUSE_LIBS)))
-else
-FUSE_NOTE := fuse not found; ecrawl_mount will not be built (try: make fuse-headers)
-endif
 
 # FUSE 2.9 API; the 2.x high-level (path-based) interface is what ecrawl_mount uses.
 FUSE_CPPFLAGS := -DFUSE_USE_VERSION=29 -D_FILE_OFFSET_BITS=64
+
+# ecrawl_mount is optional, so decide by asking the compiler whether <fuse.h> actually
+# resolves rather than by trusting that a fuse.pc implies usable headers. A .pc that sets
+# Libs but omits Cflags (same trap handled above for libnfs), or fuse-libs installed
+# without fuse-devel, would otherwise add the target and then fail the build.
+FUSE_HAVE_HEADER := $(shell $(CC) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -E -include fuse.h -x c /dev/null >/dev/null 2>&1 && echo 1)
+# Headers present but no .pc: RHEL/Rocky ship libfuse.so.2 in base fuse-libs, and the
+# devel-only libfuse.so symlink -lfuse needs is absent, so name the soname directly.
+ifeq ($(strip $(FUSE_LIBS)),)
+ifeq ($(strip $(FUSE_HAVE_HEADER)),1)
+FUSE_LIBS := -l:libfuse.so.2
+endif
+endif
+
+ifeq ($(strip $(FUSE_HAVE_HEADER))$(if $(strip $(FUSE_LIBS)),1,),11)
+TARGETS += ecrawl_mount
+FUSE_NOTE := fuse enabled ($(strip $(FUSE_LIBS)))
+else
+FUSE_NOTE := fuse headers not found; skipping optional ecrawl_mount (get them with: make fuse-headers)
+endif
 
 # Header-only install of fuse-devel into FUSE_PREFIX, no root required. The
 # extracted headers must match the installed libfuse.so.2 ABI, so the version
@@ -131,14 +145,20 @@ crawl_result.o: crawl_result.c crawl_result.h crawl_bin_format.h
 crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
 
-crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_format.h crawl_bin_chunks.h
+crawl_bin_codec.o: crawl_bin_codec.c crawl_bin_codec.h crawl_bin_format.h
+	$(CC) $(CFLAGS) -c crawl_bin_codec.c -o crawl_bin_codec.o
+
+crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_codec.h crawl_bin_format.h crawl_bin_chunks.h
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_bin_block.c -o crawl_bin_block.o
 
-test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_block_filter.c crawl_bin_block.o $(ZSTD_LIBS)
+test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
+	$(CC) $(CFLAGS) -o $@ test_crawl_codec.c crawl_bin_codec.o
 
-ecrawl: ecrawl.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS)
+
+ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
@@ -146,17 +166,17 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
-ecrawl_analyze: ecrawl_analyze.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ecrawl_analyze: ecrawl_analyze.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport: ereport.c crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport_index: ereport_index.c crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
@@ -189,7 +209,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter *.o crawl_bin_catalog.o crawl_bin_block.o crawl_result.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter test_crawl_codec *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -200,7 +220,8 @@ serve-public:
 	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
-check: $(TARGETS) test_crawl_block_filter
+check: $(TARGETS) test_crawl_codec test_crawl_block_filter
+	./test_crawl_codec
 	./test_crawl_block_filter
 	./scripts/test/test.sh
 

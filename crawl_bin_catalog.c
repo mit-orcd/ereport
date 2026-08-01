@@ -32,12 +32,35 @@ void crawl_bin_catalog_free(crawl_bin_catalog_t *c) {
     free(c->imm_child_ctime_led_count);
     free(c->imm_child_min_eff_time);
     free(c->imm_child_max_eff_time);
+    free(c->dfs_index);
+    free(c->dfs_subtree_dirs);
+    free(c->subtree_bytes);
+    free(c->subtree_count);
+    free(c->subtree_nlink_gt1_count);
+    free(c->subtree_files);
+    free(c->subtree_dirs);
+    free(c->subtree_symlinks);
+    free(c->self_bytes);
+    free(c->self_present);
     crawl_bin_catalog_init_empty(c);
+}
+
+/* realloc one optional uint64 array only when its group was requested. */
+static int cat_opt_grow(uint64_t **arr, int wanted, uint64_t slots) {
+    uint64_t *p;
+
+    if (!wanted) return 0;
+    p = (uint64_t *)realloc(*arr, (size_t)slots * sizeof(uint64_t));
+    if (!p) return -1;
+    *arr = p;
+    return 0;
 }
 
 static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
     uint64_t new_cap;
     uint64_t i;
+    int want_imm = (c->fields & CRAWL_CAT_IMM_CHILD) != 0;
+    int want_sub = (c->fields & CRAWL_CAT_SUBTREE) != 0;
 
     if (dir_id <= c->max_dir_id) return 0;
 
@@ -57,17 +80,29 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
         c->depth = (uint32_t *)realloc(c->depth, (size_t)(new_cap + 1ULL) * sizeof(uint32_t));
         c->name_len = (uint16_t *)realloc(c->name_len, (size_t)(new_cap + 1ULL) * sizeof(uint16_t));
         c->name_comp = (char **)realloc(c->name_comp, (size_t)(new_cap + 1ULL) * sizeof(char *));
-        c->imm_child_bytes = (uint64_t *)realloc(c->imm_child_bytes, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-        c->imm_child_count = (uint64_t *)realloc(c->imm_child_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-        c->imm_child_ctime_led_count =
-            (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-        c->imm_child_min_eff_time =
-            (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-        c->imm_child_max_eff_time =
-            (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
-        if (!c->parent_dir_id || !c->depth || !c->name_len || !c->name_comp ||
-            !c->imm_child_bytes || !c->imm_child_count || !c->imm_child_ctime_led_count ||
-            !c->imm_child_min_eff_time || !c->imm_child_max_eff_time) return -1;
+        if (!c->parent_dir_id || !c->depth || !c->name_len || !c->name_comp) return -1;
+
+        if (cat_opt_grow(&c->imm_child_bytes, want_imm, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->imm_child_count, want_imm, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->imm_child_ctime_led_count, want_imm, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->imm_child_min_eff_time, want_imm, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->imm_child_max_eff_time, want_imm, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->dfs_index, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->dfs_subtree_dirs, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_bytes, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_count, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_nlink_gt1_count, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_files, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_dirs, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->subtree_symlinks, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->self_bytes, want_sub, new_cap + 1ULL) != 0)
+            return -1;
+        if (want_sub) {
+            unsigned char *sp = (unsigned char *)realloc(c->self_present, (size_t)(new_cap + 1ULL));
+
+            if (!sp) return -1;
+            c->self_present = sp;
+        }
         c->cap = new_cap;
     }
 
@@ -76,22 +111,42 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
         c->depth[i] = 0;
         c->name_len[i] = 0;
         c->name_comp[i] = NULL;
-        c->imm_child_bytes[i] = 0;
-        c->imm_child_count[i] = 0;
-        c->imm_child_ctime_led_count[i] = 0;
-        c->imm_child_min_eff_time[i] = UINT64_MAX;
-        c->imm_child_max_eff_time[i] = 0;
+        if (want_imm) {
+            c->imm_child_bytes[i] = 0;
+            c->imm_child_count[i] = 0;
+            c->imm_child_ctime_led_count[i] = 0;
+            c->imm_child_min_eff_time[i] = UINT64_MAX;
+            c->imm_child_max_eff_time[i] = 0;
+        }
+        if (want_sub) {
+            c->dfs_index[i] = 0;
+            c->dfs_subtree_dirs[i] = 0;
+            c->subtree_bytes[i] = 0;
+            c->subtree_count[i] = 0;
+            c->subtree_nlink_gt1_count[i] = 0;
+            c->subtree_files[i] = 0;
+            c->subtree_dirs[i] = 0;
+            c->subtree_symlinks[i] = 0;
+            c->self_bytes[i] = 0;
+            c->self_present[i] = 0;
+        }
     }
     c->max_dir_id = dir_id;
     return 0;
 }
 
 int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, crawl_bin_catalog_t *out) {
+    return crawl_bin_catalog_load_sel(fp, catalog_offset, file_sz, CRAWL_CAT_ALL, out);
+}
+
+int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, unsigned fields,
+                               crawl_bin_catalog_t *out) {
     uint64_t n, i;
     unsigned char *tmp_name = NULL;
     size_t tmp_cap = 0;
 
     crawl_bin_catalog_init_empty(out);
+    out->fields = fields & CRAWL_CAT_ALL;
     if (!fp || catalog_offset > file_sz || catalog_offset + sizeof(uint64_t) > file_sz) {
         errno = EINVAL;
         return -1;
@@ -139,11 +194,25 @@ int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, 
         out->parent_dir_id[did] = ent.parent_dir_id;
         out->depth[did] = ent.depth;
         out->name_len[did] = ent.name_len;
-        out->imm_child_bytes[did] = ent.imm_child_bytes;
-        out->imm_child_count[did] = ent.imm_child_count;
-        out->imm_child_ctime_led_count[did] = ent.imm_child_ctime_led_count;
-        out->imm_child_min_eff_time[did] = ent.imm_child_min_eff_time;
-        out->imm_child_max_eff_time[did] = ent.imm_child_max_eff_time;
+        if (out->fields & CRAWL_CAT_IMM_CHILD) {
+            out->imm_child_bytes[did] = ent.imm_child_bytes;
+            out->imm_child_count[did] = ent.imm_child_count;
+            out->imm_child_ctime_led_count[did] = ent.imm_child_ctime_led_count;
+            out->imm_child_min_eff_time[did] = ent.imm_child_min_eff_time;
+            out->imm_child_max_eff_time[did] = ent.imm_child_max_eff_time;
+        }
+        if (out->fields & CRAWL_CAT_SUBTREE) {
+            out->dfs_index[did] = ent.dfs_index;
+            out->dfs_subtree_dirs[did] = ent.dfs_subtree_dirs;
+            out->subtree_bytes[did] = ent.subtree_bytes;
+            out->subtree_count[did] = ent.subtree_count;
+            out->subtree_nlink_gt1_count[did] = ent.subtree_nlink_gt1_count;
+            out->subtree_files[did] = ent.subtree_files;
+            out->subtree_dirs[did] = ent.subtree_dirs;
+            out->subtree_symlinks[did] = ent.subtree_symlinks;
+            out->self_bytes[did] = ent.self_bytes;
+            out->self_present[did] = (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1U : 0U;
+        }
     }
 
     free(tmp_name);

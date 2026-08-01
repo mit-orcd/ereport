@@ -140,13 +140,14 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
     acc = 0;
     cur = seg_start;
 
-    /* The record region is a sequence of self-describing compressed blocks
-     * (bin_block_hdr_t + comp_size frame). Walk block headers (skipping each
-     * frame with one seek) and split into chunks at block boundaries once
-     * ~chunk_target_bytes of compressed data accumulate. */
+    /* The record region is a sequence of self-describing row groups. Walk the
+     * group headers (skipping each group's directory and payloads with one
+     * seek) and split into chunks at group boundaries once ~chunk_target_bytes
+     * of compressed data accumulate. */
     for (;;) {
-        bin_block_hdr_t bh;
+        bin_rowgroup_hdr_t rg;
         uint64_t block_end;
+        uint64_t group_total;
 
         if (cur >= seg_end) {
             if (cur > seg_end) goto out;
@@ -159,17 +160,18 @@ int crawl_bin_build_chunks_for_segment(const crawl_bin_chunk_stdio_t *io, const 
             goto out;
         }
 
-        if (seg_end - cur < sizeof(bh)) goto out;
-        if (io->fread(&bh, sizeof(bh), 1, fp) != 1) {
+        if (seg_end - cur < sizeof(rg)) goto out;
+        if (io->fread(&rg, sizeof(rg), 1, fp) != 1) {
             if (feof(fp)) fprintf(stderr, "warn: unexpected EOF in segment of %s\n", path);
             goto out;
         }
-        block_end = cur + (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        group_total = crawl_bin_rowgroup_total_bytes(&rg);
+        block_end = cur + group_total;
         if (block_end > seg_end) goto out;
-        if (bh.comp_size && fseeko(fp, (off_t)bh.comp_size, SEEK_CUR) != 0) goto out;
+        if (fseeko(fp, (off_t)(group_total - sizeof(rg)), SEEK_CUR) != 0) goto out;
 
         cur = block_end;
-        acc += (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        acc += group_total;
 
         if (acc >= chunk_target_bytes) {
             if (crawl_bin_append_chunk(&chunks, &chunk_count, &chunk_cap, path, chunk_start, cur, file_index) != 0)

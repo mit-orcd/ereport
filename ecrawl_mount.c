@@ -6,9 +6,12 @@
  * The view is metadata-only, because that is all a crawl records:
  *   - read() returns zeros up to the recorded st_size. Sizes, and therefore
  *     `wc -c` and `du`, are exact; contents are not stored and never were.
- *   - mode and gid are not in the v7 record (see crawl_bin_format.h), so
- *     permissions are synthesized: 0555 for directories, 0444 otherwise, with
- *     the recorded uid and a configurable gid.
+ *   - permissions are synthesized: 0555 for directories, 0444 otherwise, with
+ *     the recorded uid and a configurable gid. The v8 record does carry mode
+ *     and gid, but the in-memory index deliberately omits them: the whole
+ *     namespace is resident, and two more fields per entry is a memory cost
+ *     paid on every mount for a read-only view that cannot honour the bits
+ *     anyway.
  *   - symlink targets are not stored, so readlink() fails with EIO. Type is
  *     still correct, so `find -type l` works.
  *
@@ -487,7 +490,8 @@ static int build_dir_namespace(uint32_t **l2g_out, uint64_t *l2g_len_out) {
             free(stack.ids);
             return -1;
         }
-        if (crawl_bin_catalog_load(fp, sh->catalog_offset, sh->file_size, &cat) != 0) {
+        /* Tree fields only: the mount rebuilds its own index and reads no rollup. */
+        if (crawl_bin_catalog_load_sel(fp, sh->catalog_offset, sh->file_size, 0U, &cat) != 0) {
             fprintf(stderr, PROG ": %s: cannot load the directory catalog\n", sh->path);
             fclose(fp);
             free(stack.ids);
@@ -606,6 +610,10 @@ static void scan_body(void *ctxv, size_t begin, size_t end, int tid) {
             atomic_store(&ctx->failed, 1);
             return;
         }
+        /* The in-memory index holds neither gid nor mode, so those two columns
+         * are never decoded. */
+        (void)crawl_bin_block_reader_set_projection(
+            &br, CRAWL_PROJECTION_ALL & ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE)));
 
         for (;;) {
             bin_record_hdr_t r;
@@ -1248,7 +1256,7 @@ static void usage(void) {
             "Options:\n"
             "  -o path=DIR        crawl output directory (alternative to the positional form)\n"
             "  -o subtree=PATH    mount only this subtree, which also shrinks the index\n"
-            "  -o gid=N           st_gid to report (default 0; gid is not recorded by ecrawl)\n"
+            "  -o gid=N           st_gid to report (default 0; the mount index omits gid)\n"
             "  -o threads=N       index build threads (default %d, or " "ECRAWL_MOUNT_THREADS" ")\n"
             "  -o allow_other     needs user_allow_other in /etc/fuse.conf\n"
             "  --subtree PATH     same as -o subtree=PATH\n"
@@ -1260,8 +1268,8 @@ static void usage(void) {
             "  -h, --help         this message\n"
             "\n"
             "The view is metadata-only: read() returns zeros up to the recorded size,\n"
-            "permissions are synthesized (0555 dirs / 0444 files) because ecrawl does not\n"
-            "record mode or gid, and readlink() fails with EIO because symlink targets are\n"
+            "permissions are synthesized (0555 dirs / 0444 files) because the mount index\n"
+            "omits mode and gid, and readlink() fails with EIO because symlink targets are\n"
             "not recorded. Sizes, timestamps, uid, nlink and inode numbers are exact.\n",
             DEFAULT_MOUNT_THREADS);
 }

@@ -26,10 +26,10 @@
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
- *   - With --no-write, global progress counters (TTY tot/obj/s) are folded from thread-local
- *     perf every NO_WRITE_GLOBAL_PERF_FLUSH_EVERY entries (no writer batches to trigger perf_flush_local).
- *     With writers, TTY rolling obj/s rates are updated per accounted entry
- *     (tot/f/d/s globals are updated the same way so tot: does not freeze between MiB batches).
+ *   - Global progress counters (TTY tot/obj/s) are folded from thread-local perf every
+ *     GLOBAL_PERF_FLUSH_EVERY entries and whenever the rolling window rolls, in both write and
+ *     --no-write mode: one atomic RMW per counter per entry costs more than the accounting itself
+ *     once a dozen threads share those cache lines.
  *   - Each run clears prior crawl outputs in the chosen output-dir: uid_shard_*.bin, matching *.bin.ckpt,
  *     and crawl_manifest.txt (uid.txt/gid.txt are reopened truncated). An interrupted crawl has nothing to
  *     resume across runs; only in-process shard reopen (LRU) reloads checkpoints for shards written this run.
@@ -78,6 +78,7 @@
 #include <grp.h>
 #include <stdarg.h>
 
+#include "alloc_tuning.h"
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_ckpt.h"
@@ -136,7 +137,6 @@
 #define RECORD_BATCH_BYTES (1U << 20)
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
-#define PERF_FLUSH_INTERVAL 1024U
 /* During one directory's readdir, periodically drain pending stat batches so megadirs do not hold an
  * unbounded number of completed batches until EOF (see stat_pending_drain_all). */
 #define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
@@ -148,9 +148,10 @@
 #define MIN_GETDENTS_BUF 4096U
 #define MAX_GETDENTS_BUF (64U * 1024U * 1024U)
 
-/* --no-write skips emit_record's writer batches, so perf would not reach perf_flush_local() until thread exit.
- * Fold thread-local perf into globals every N entries so TTY obj/s and totals stay live. */
-#define NO_WRITE_GLOBAL_PERF_FLUSH_EVERY 8192U
+/* Fold thread-local perf into the global progress counters every N accounted entries so TTY obj/s and totals
+ * stay live without an atomic RMW per entry. A batch is also flushed when the rolling window rolls, so the
+ * displayed numbers are never more than one stats tick behind whatever N is. */
+#define GLOBAL_PERF_FLUSH_EVERY 8192U
 #define DEFAULT_STAT_THREADS 8
 #define DEFAULT_STAT_RANDOM_QUEUE 1
 #define DEFAULT_STAT_BATCH_ENTRIES 1024U
@@ -224,6 +225,9 @@ typedef struct {
     uint64_t bytes;
     uint64_t allocated_bytes;
     uint64_t files_sparse_heuristic;
+    /* Rolling-window bucket these pending counts belong to, sampled when the batch opened. Folding them
+     * into whatever bucket happens to be current at flush time would credit them to a later second. */
+    int bucket_idx;
 } perf_local_t;
 
 typedef struct {
@@ -231,6 +235,28 @@ typedef struct {
     uint64_t donation_attempts;
     uint64_t donation_successes;
 } worker_aux_stats_t;
+
+/* Per-thread streamed output for --no-stat. Millions of paths from every crawl thread would
+ * serialize on stdio's lock one line at a time, so each worker fills its own buffer and hands it
+ * to write() in one piece; the mutex is taken once per full buffer rather than once per path. */
+#define PATHOUT_BUF_BYTES (256u * 1024u)
+
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+    /* Scratch for the windowed --contains test: lowercased parent tail + '/' + lowercased name. */
+    char *win;
+    size_t win_cap;
+} nostat_ctx_t;
+
+/* Per-directory --contains state, recomputed once on each stack pop. */
+typedef struct {
+    /* 1: this directory or an ancestor already contains the needle, so every entry at or below
+     * it matches and no per-entry compare is needed. */
+    int all_match;
+    size_t prefix_len; /* bytes of ctx->win already holding the parent tail + '/' */
+} dirmatch_t;
 
 typedef struct {
     pthread_mutex_t stats_mutex;
@@ -270,7 +296,16 @@ typedef struct {
     int have_stat;
     /* 1: account_entry_local + emit_record already ran for this directory (trusted DT_DIR discovery). */
     int pre_accounted_emit;
+    /* --no-stat + --contains: CONTAINS_* for this directory's own path, decided by the parent's
+     * windowed test so the child never rescans its full path. */
+    int ancestor_matched;
 } dir_work_t;
+
+/* Whether a pushed directory's own path contains the --contains needle. The parent resolves this
+ * for every child it pushes; only the crawl root arrives untested. */
+#define CONTAINS_UNKNOWN (-1)
+#define CONTAINS_NO 0
+#define CONTAINS_YES 1
 
 typedef struct {
     dir_work_t *items;
@@ -329,10 +364,17 @@ typedef struct {
     size_t cap;
 } pending_batch_t;
 
+/* One context per crawl thread, shared with the stat workers that process that thread's batches.
+ * pending_locks[i] guards pending[i] only, so concurrent emitters that hash to different writers
+ * never wait on each other, and the queue push happens after the lock is dropped.
+ * stats_lock guards the owner's crawl_stats_t / perf_local_t. */
 typedef struct {
     writer_queue_t *writer_queues;
     int writer_threads;
     pending_batch_t *pending;
+    pthread_mutex_t *pending_locks;
+    int pending_locks_n;
+    pthread_mutex_t *stats_lock;
     perf_local_t *perf;
 } emit_context_t;
 
@@ -345,6 +387,7 @@ typedef struct {
     crawl_stats_t stats;
     perf_local_t perf;
     worker_aux_stats_t aux;
+    nostat_ctx_t nostat;
     pthread_mutex_t emit_stats_lock;
 } worker_arg_t;
 
@@ -426,6 +469,33 @@ typedef struct {
     uint64_t *imm_child_ctime_led_count;
     uint64_t *imm_child_min_eff_time;
     uint64_t *imm_child_max_eff_time;
+    /*
+     * Hardlink-ambiguity counter. During the crawl this holds the number of
+     * *immediate* child records with nlink > 1; the end-of-crawl post-pass turns
+     * it into the subtree total in place. It is serialized in both states, which
+     * is what lets an LRU-evicted shard resume accumulating after reload -- the
+     * post-pass only ever runs once, on final close.
+     */
+    uint64_t *subtree_nlink_gt1_count;
+    /* Same immediate-then-subtree treatment: per-type record counts, so a
+     * subtree query can report its files/dirs/symlinks breakdown without a scan. */
+    uint64_t *subtree_files;
+    uint64_t *subtree_dirs;
+    uint64_t *subtree_symlinks;
+    /* Byte credit of this directory's *own* record, recorded when that record is
+     * written. The subtree sums deliberately exclude it (it belongs to the
+     * parent's immediate children), so a query on this directory adds it back. */
+    uint64_t *self_bytes;
+    unsigned char *self_present; /* this shard holds the directory's own record */
+    /*
+     * Allocated only by shard_cat_finalize, so the crawl does not carry 32 bytes
+     * per directory it will not read until shutdown.
+     */
+    uint64_t *dfs_index;
+    uint64_t *dfs_subtree_dirs;
+    uint64_t *subtree_bytes;
+    uint64_t *subtree_count;
+    unsigned char finalized;
     size_t arr_cap;
 } shard_cat_t;
 
@@ -497,7 +567,7 @@ static double now_sec(void);
 static void dir_stack_destroy(dir_stack_t *s);
 static int dir_stack_init(dir_stack_t *s);
 static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len, const struct stat *st,
-                               int pre_accounted_emit);
+                               int pre_accounted_emit, int ancestor_matched);
 static void stats_add_error(shared_state_t *s);
 static void perf_flush_local(perf_local_t *perf);
 static int build_default_output_dir(char *out, size_t out_sz);
@@ -505,7 +575,7 @@ static void discovered_dir_batch_init(discovered_dir_batch_t *b, task_queue_t *q
 static int discovered_dir_batch_flush(discovered_dir_batch_t *b);
 static void discovered_dir_batch_fini(discovered_dir_batch_t *b);
 static int discovered_dir_batch_push(discovered_dir_batch_t *b, char *path_owned, size_t path_len,
-                                     const struct stat *st_opt, int pre_accounted_emit);
+                                     const struct stat *st_opt, int pre_accounted_emit, int ancestor_matched);
 
 /* Live visibility */
 static atomic_ullong g_queue_depth         = 0;
@@ -681,6 +751,13 @@ static unsigned g_requested_max_open_shards = DEFAULT_MAX_OPEN_SHARDS;
 static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
+/* --no-stat: walk names only, never read an inode. Recursion needs just d_type, so records
+ * (uid/size/inode/nlink/times all come from stat) cannot be written and paths stream instead. */
+static int g_no_stat = 0;
+static int g_print0 = 0;
+/* --contains: lowercased needle for the full-path substring filter; NULL when unset. */
+static char *g_contains_lower = NULL;
+static size_t g_contains_len = 0;
 static int g_verbose = 0;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 static int g_stat_threads_configured = 0;
@@ -804,6 +881,249 @@ static struct dirent *ecrawl_preaddir(DIR *dir) {
 static int ecrawl_pclosedir(DIR *dir) {
     ATOMIC_ADD_RELAXED(&g_io_closedir_calls, 1);
     return closedir(dir);
+}
+
+/* ASCII-only lowering, matching ereport_index's path_matches_term so `ecrawl --contains` and
+ * `ereport_index --search` agree on what a path contains. */
+static unsigned char ascii_lower_byte(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + 32) : c;
+}
+
+static char *ascii_lower_dup(const char *s) {
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1);
+    size_t i;
+
+    if (!out) return NULL;
+    for (i = 0; i < n; i++) out[i] = (char)ascii_lower_byte((unsigned char)s[i]);
+    out[n] = '\0';
+    return out;
+}
+
+/* Substring search over an already-lowercased buffer. memmem would need _GNU_SOURCE, which this
+ * file does not define, so anchor on the needle's first byte with memchr and memcmp the rest. */
+static int lower_buf_contains(const char *hay, size_t hay_len, const char *needle, size_t needle_len) {
+    const char *p = hay;
+    size_t remaining = hay_len;
+
+    if (needle_len == 0) return 1;
+    if (hay_len < needle_len) return 0;
+
+    for (;;) {
+        size_t searchable = remaining - needle_len + 1;
+        const char *hit = (const char *)memchr(p, (unsigned char)needle[0], searchable);
+
+        if (!hit) return 0;
+        remaining -= (size_t)(hit - p);
+        if (remaining < needle_len) return 0;
+        if (memcmp(hit, needle, needle_len) == 0) return 1;
+        p = hit + 1;
+        remaining--;
+    }
+}
+
+static pthread_mutex_t g_pathout_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_ullong g_nostat_printed = 0;
+static atomic_ullong g_nostat_dtype_unknown_fallbacks = 0;
+
+/* Does `path` (any case, length path_len) contain the --contains needle? */
+static int path_contains_needle(const char *path, size_t path_len) {
+    char stackbuf[PATH_MAX];
+    char *heap = NULL;
+    char *buf;
+    size_t i;
+    int hit;
+
+    if (g_contains_len == 0) return 1;
+    if (path_len < g_contains_len) return 0;
+
+    if (path_len <= sizeof(stackbuf)) {
+        buf = stackbuf;
+    } else {
+        heap = (char *)malloc(path_len);
+        if (!heap) return 0;
+        buf = heap;
+    }
+    for (i = 0; i < path_len; i++) buf[i] = (char)ascii_lower_byte((unsigned char)path[i]);
+    hit = lower_buf_contains(buf, path_len, g_contains_lower, g_contains_len);
+    free(heap);
+    return hit;
+}
+
+static int nostat_ctx_init(nostat_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    if (!g_no_stat) return 0;
+
+    ctx->buf = (char *)malloc(PATHOUT_BUF_BYTES);
+    if (!ctx->buf) return -1;
+    ctx->cap = PATHOUT_BUF_BYTES;
+
+    if (g_contains_len > 0) {
+        /* Worst case: the whole parent tail (needle_len-1), a separator, and a NAME_MAX name. */
+        ctx->win_cap = g_contains_len + (size_t)NAME_MAX + 2u;
+        ctx->win = (char *)malloc(ctx->win_cap);
+        if (!ctx->win) {
+            free(ctx->buf);
+            ctx->buf = NULL;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void nostat_ctx_destroy(nostat_ctx_t *ctx) {
+    free(ctx->buf);
+    free(ctx->win);
+    ctx->buf = NULL;
+    ctx->win = NULL;
+    ctx->cap = 0;
+    ctx->len = 0;
+    ctx->win_cap = 0;
+}
+
+static int pathout_write_all(const char *data, size_t len) {
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n = write(STDOUT_FILENO, data + off, len - off);
+
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int pathout_flush(nostat_ctx_t *ctx) {
+    int rc;
+
+    if (ctx->len == 0) return 0;
+    pthread_mutex_lock(&g_pathout_lock);
+    rc = pathout_write_all(ctx->buf, ctx->len);
+    pthread_mutex_unlock(&g_pathout_lock);
+    ctx->len = 0;
+    return rc;
+}
+
+static int pathout_emit(nostat_ctx_t *ctx, const char *path, size_t path_len) {
+    size_t need = path_len + 1u;
+    char sep = g_print0 ? '\0' : '\n';
+
+    if (!ctx->buf) return -1;
+    if (need > ctx->cap) {
+        /* Longer than one whole buffer: flush what we have and write it straight through. */
+        int rc;
+
+        if (pathout_flush(ctx) != 0) return -1;
+        pthread_mutex_lock(&g_pathout_lock);
+        rc = pathout_write_all(path, path_len);
+        if (rc == 0) rc = pathout_write_all(&sep, 1);
+        pthread_mutex_unlock(&g_pathout_lock);
+        if (rc == 0) ATOMIC_ADD_RELAXED(&g_nostat_printed, 1);
+        return rc;
+    }
+    if (ctx->len + need > ctx->cap && pathout_flush(ctx) != 0) return -1;
+
+    memcpy(ctx->buf + ctx->len, path, path_len);
+    ctx->len += path_len;
+    ctx->buf[ctx->len++] = sep;
+    ATOMIC_ADD_RELAXED(&g_nostat_printed, 1);
+    return 0;
+}
+
+/* Resolve the --contains state for one directory. When all_match comes back set, every entry in
+ * this directory and every descendant matches, so no per-entry comparison is needed at all. */
+static void dirmatch_begin(nostat_ctx_t *ctx, const char *dir_path, size_t dir_path_len,
+                           int ancestor_matched, dirmatch_t *dm) {
+    size_t tail;
+    size_t i;
+
+    dm->all_match = 0;
+    dm->prefix_len = 0;
+
+    if (g_contains_len == 0) {
+        dm->all_match = 1;
+        return;
+    }
+    if (ancestor_matched == CONTAINS_YES) {
+        dm->all_match = 1;
+        return;
+    }
+    /* CONTAINS_NO means the parent's windowed test already proved this path has no match, so the
+     * only path that still needs a full scan is the crawl root. */
+    if (ancestor_matched == CONTAINS_UNKNOWN && path_contains_needle(dir_path, dir_path_len)) {
+        dm->all_match = 1;
+        return;
+    }
+
+    /* The needle is absent from dir_path, so any match under it must reach into the final
+     * component. An occurrence lying wholly inside dir_path would have been found above, so it
+     * can only start within the last needle_len-1 bytes; that tail plus "/name" is the whole
+     * search space, and it is bounded by the needle length rather than the path depth. */
+    tail = g_contains_len - 1u;
+    if (tail > dir_path_len) tail = dir_path_len;
+    for (i = 0; i < tail; i++)
+        ctx->win[i] = (char)ascii_lower_byte((unsigned char)dir_path[dir_path_len - tail + i]);
+    dm->prefix_len = tail;
+    /* Root is "/" and takes no extra separator, matching path_join_fast. */
+    if (!(dir_path_len == 1 && dir_path[0] == '/')) ctx->win[dm->prefix_len++] = '/';
+}
+
+static int dirmatch_hit(nostat_ctx_t *ctx, const dirmatch_t *dm, const char *name, size_t name_len) {
+    size_t total = dm->prefix_len + name_len;
+    size_t i;
+
+    if (dm->all_match) return 1;
+    if (total < g_contains_len) return 0;
+    if (total > ctx->win_cap) return 0; /* unreachable: name_len is bounded by NAME_MAX */
+
+    for (i = 0; i < name_len; i++)
+        ctx->win[dm->prefix_len + i] = (char)ascii_lower_byte((unsigned char)name[i]);
+    return lower_buf_contains(ctx->win, total, g_contains_lower, g_contains_len);
+}
+
+static unsigned char dtype_from_mode(mode_t m) {
+    if (S_ISDIR(m)) return DT_DIR;
+    if (S_ISREG(m)) return DT_REG;
+    if (S_ISLNK(m)) return DT_LNK;
+    if (S_ISFIFO(m)) return DT_FIFO;
+    if (S_ISSOCK(m)) return DT_SOCK;
+    if (S_ISCHR(m)) return DT_CHR;
+    if (S_ISBLK(m)) return DT_BLK;
+    return DT_UNKNOWN;
+}
+
+/* Counting counterpart to account_entry_local for the no-stat walk: only what d_type can prove.
+ * Byte totals, hardlink dedup and the uid/gid registries all need a struct stat and stay unset. */
+static void account_entry_dtype(crawl_stats_t *stats, perf_local_t *perf, unsigned char d_type) {
+    stats->total_entries++;
+    perf->entries++;
+    switch (d_type) {
+    case DT_DIR:
+        stats->total_dirs++;
+        perf->dirs++;
+        break;
+    case DT_REG:
+        stats->total_files++;
+        perf->files++;
+        break;
+    case DT_LNK:
+        stats->total_symlinks++;
+        break;
+    default:
+        stats->total_other++;
+        break;
+    }
+
+    {
+        int idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
+
+        if (perf->entries == 1) perf->bucket_idx = idx;
+        if (perf->entries >= (uint64_t)GLOBAL_PERF_FLUSH_EVERY || idx != perf->bucket_idx)
+            perf_flush_local(perf);
+    }
 }
 
 static void ecrawl_hook_task_popped_verbose(void) { ATOMIC_ADD_RELAXED(&g_tasks_popped, 1); }
@@ -1549,29 +1869,17 @@ static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats
         contrib = apparent_size;
     }
 
-    /* With writers, fold live TTY / progress totals and rolling-window atoms per entry; perf_flush_local then
-     * only clears thread-local perf (totals already applied here). --no-write keeps batching in perf_flush_local. */
-    if (!g_no_write) {
+    /* Fold into the process-wide progress counters in batches, never per entry: with 16 crawl plus 8 stat
+     * threads these six counters live on a handful of cache lines, and one atomic RMW per entry per counter
+     * costs more than the accounting itself. Flush on entry count, and whenever the rolling window rolls so
+     * a bucket only ever receives counts from its own second. */
+    {
         int idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
 
-        ATOMIC_ADD_RELAXED(&g_total_entries, 1);
-        ATOMIC_ADD_RELAXED(&g_window_entries, 1);
-        ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], 1ULL);
-        if (S_ISDIR(st->st_mode)) {
-            ATOMIC_ADD_RELAXED(&g_total_dirs, 1);
-            ATOMIC_ADD_RELAXED(&g_window_dirs, 1);
-            ATOMIC_ADD_RELAXED(&g_bucket_dirs[idx], 1ULL);
-        } else if (S_ISREG(st->st_mode)) {
-            ATOMIC_ADD_RELAXED(&g_total_files, 1);
-            ATOMIC_ADD_RELAXED(&g_window_files, 1);
-            ATOMIC_ADD_RELAXED(&g_bucket_files[idx], 1ULL);
-            ATOMIC_ADD_RELAXED(&g_total_bytes, byte_credit);
-            ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, rf.allocated_bytes);
-            ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, rf.sparse_heuristic_inc);
-        }
+        if (perf->entries == 1) perf->bucket_idx = idx;
+        if (perf->entries >= (uint64_t)GLOBAL_PERF_FLUSH_EVERY || idx != perf->bucket_idx)
+            perf_flush_local(perf);
     }
-
-    if (g_no_write && perf->entries >= (uint64_t)NO_WRITE_GLOBAL_PERF_FLUSH_EVERY) perf_flush_local(perf);
 
     return contrib;
 }
@@ -1619,30 +1927,32 @@ static void stats_add_donation_attempt_local(worker_aux_stats_t *s, uint64_t cou
 }
 
 static void perf_flush_local(perf_local_t *perf) {
+    int idx;
+
     if (!perf || perf->entries == 0) return;
 
-    if (g_no_write) {
-        int idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
+    /* The bucket the counts were accumulated in, which may no longer be the current one. It is still inside
+     * the live window: the stats thread only ever clears the bucket it is about to make current. */
+    idx = perf->bucket_idx;
+    if (idx < 0 || idx >= WINDOW_SECONDS) idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
 
-        ATOMIC_ADD_RELAXED(&g_total_entries, perf->entries);
-        ATOMIC_ADD_RELAXED(&g_window_entries, perf->entries);
-        ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], perf->entries);
+    ATOMIC_ADD_RELAXED(&g_total_entries, perf->entries);
+    ATOMIC_ADD_RELAXED(&g_window_entries, perf->entries);
+    ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], perf->entries);
 
-        if (perf->dirs > 0) {
-            ATOMIC_ADD_RELAXED(&g_total_dirs, perf->dirs);
-            ATOMIC_ADD_RELAXED(&g_window_dirs, perf->dirs);
-            ATOMIC_ADD_RELAXED(&g_bucket_dirs[idx], perf->dirs);
-        }
-        if (perf->files > 0) {
-            ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
-            ATOMIC_ADD_RELAXED(&g_window_files, perf->files);
-            ATOMIC_ADD_RELAXED(&g_bucket_files[idx], perf->files);
-            ATOMIC_ADD_RELAXED(&g_total_bytes, perf->bytes);
-            ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, perf->allocated_bytes);
-            ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, perf->files_sparse_heuristic);
-        }
+    if (perf->dirs > 0) {
+        ATOMIC_ADD_RELAXED(&g_total_dirs, perf->dirs);
+        ATOMIC_ADD_RELAXED(&g_window_dirs, perf->dirs);
+        ATOMIC_ADD_RELAXED(&g_bucket_dirs[idx], perf->dirs);
     }
-    /* Write mode: g_total_* / window_* already updated in account_entry_local; only reset perf here. */
+    if (perf->files > 0) {
+        ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
+        ATOMIC_ADD_RELAXED(&g_window_files, perf->files);
+        ATOMIC_ADD_RELAXED(&g_bucket_files[idx], perf->files);
+        ATOMIC_ADD_RELAXED(&g_total_bytes, perf->bytes);
+        ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, perf->allocated_bytes);
+        ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, perf->files_sparse_heuristic);
+    }
 
     memset(perf, 0, sizeof(*perf));
 }
@@ -1658,12 +1968,19 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
+            "Usage: %s [--no-write] [--no-stat [--contains <text>] [--print0]] [--verbose] "
+            "[--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
     fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
+    fprintf(stderr, "Search: %s --no-stat --contains slurm- /data1\n", prog);
+    fprintf(stderr,
+            "--no-stat: walk names only (no inode reads) and stream paths to stdout; no capture is written.\n"
+            "--contains: keep paths whose full path contains <text>, case-insensitive "
+            "(same rule as ereport_index --search). Requires --no-stat.\n"
+            "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n");
     fprintf(stderr,
             "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
@@ -1865,6 +2182,16 @@ static void shard_cat_destroy(shard_cat_t *c) {
     free(c->imm_child_ctime_led_count);
     free(c->imm_child_min_eff_time);
     free(c->imm_child_max_eff_time);
+    free(c->subtree_nlink_gt1_count);
+    free(c->subtree_files);
+    free(c->subtree_dirs);
+    free(c->subtree_symlinks);
+    free(c->self_bytes);
+    free(c->self_present);
+    free(c->dfs_index);
+    free(c->dfs_subtree_dirs);
+    free(c->subtree_bytes);
+    free(c->subtree_count);
     memset(c, 0, sizeof(*c));
 }
 
@@ -1880,6 +2207,12 @@ static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
     uint64_t *icl;
     uint64_t *icmin;
     uint64_t *icmax;
+    uint64_t *ichl;
+    uint64_t *icf;
+    uint64_t *icd;
+    uint64_t *ics;
+    uint64_t *slfb;
+    unsigned char *slfp;
 
     while (need_id >= ncap) ncap *= 2;
     if (need_id >= ncap) return -1;
@@ -1893,7 +2226,15 @@ static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
     icl = (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)ncap * sizeof(*icl));
     icmin = (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)ncap * sizeof(*icmin));
     icmax = (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)ncap * sizeof(*icmax));
-    if (!pp || !dp || !nl || !nm || !icb || !icc || !icl || !icmin || !icmax) return -1;
+    ichl = (uint64_t *)realloc(c->subtree_nlink_gt1_count, (size_t)ncap * sizeof(*ichl));
+    icf = (uint64_t *)realloc(c->subtree_files, (size_t)ncap * sizeof(*icf));
+    icd = (uint64_t *)realloc(c->subtree_dirs, (size_t)ncap * sizeof(*icd));
+    ics = (uint64_t *)realloc(c->subtree_symlinks, (size_t)ncap * sizeof(*ics));
+    slfb = (uint64_t *)realloc(c->self_bytes, (size_t)ncap * sizeof(*slfb));
+    slfp = (unsigned char *)realloc(c->self_present, (size_t)ncap);
+    if (!pp || !dp || !nl || !nm || !icb || !icc || !icl || !icmin || !icmax || !ichl || !icf || !icd ||
+        !ics || !slfb || !slfp)
+        return -1;
     c->parent_dir_id = pp;
     c->depth = dp;
     c->name_len = nl;
@@ -1903,6 +2244,12 @@ static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
     c->imm_child_ctime_led_count = icl;
     c->imm_child_min_eff_time = icmin;
     c->imm_child_max_eff_time = icmax;
+    c->subtree_nlink_gt1_count = ichl;
+    c->subtree_files = icf;
+    c->subtree_dirs = icd;
+    c->subtree_symlinks = ics;
+    c->self_bytes = slfb;
+    c->self_present = slfp;
     for (i = c->arr_cap; i < ncap; i++) {
         c->parent_dir_id[i] = 0;
         c->depth[i] = 0;
@@ -1913,6 +2260,12 @@ static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
         c->imm_child_ctime_led_count[i] = 0;
         c->imm_child_min_eff_time[i] = UINT64_MAX;
         c->imm_child_max_eff_time[i] = 0;
+        c->subtree_nlink_gt1_count[i] = 0;
+        c->subtree_files[i] = 0;
+        c->subtree_dirs[i] = 0;
+        c->subtree_symlinks[i] = 0;
+        c->self_bytes[i] = 0;
+        c->self_present[i] = 0;
     }
     c->arr_cap = (size_t)ncap;
     return 0;
@@ -2045,6 +2398,14 @@ static int shard_cat_load_from_disk_catalog(shard_cat_t *c, const crawl_bin_cata
         c->imm_child_ctime_led_count[id] = L->imm_child_ctime_led_count[id];
         c->imm_child_min_eff_time[id] = L->imm_child_min_eff_time[id];
         c->imm_child_max_eff_time[id] = L->imm_child_max_eff_time[id];
+        /* Pre-finalize this holds the immediate-child count, which is what an
+         * evicted shard must resume accumulating from. */
+        c->subtree_nlink_gt1_count[id] = L->subtree_nlink_gt1_count[id];
+        c->subtree_files[id] = L->subtree_files[id];
+        c->subtree_dirs[id] = L->subtree_dirs[id];
+        c->subtree_symlinks[id] = L->subtree_symlinks[id];
+        c->self_bytes[id] = L->self_bytes[id];
+        c->self_present[id] = L->self_present[id];
         if (shard_cat_ht_insert(c, key, id) != 0) {
             shard_cat_destroy(c);
             return -1;
@@ -2132,6 +2493,133 @@ static void shard_cat_update_imm_child_rollup(shard_cat_t *c, uint64_t pid, uint
     if (eff < c->imm_child_min_eff_time[pid]) c->imm_child_min_eff_time[pid] = eff;
     if (eff > c->imm_child_max_eff_time[pid]) c->imm_child_max_eff_time[pid] = eff;
     if (crawl_bin_record_ctime_led(r)) c->imm_child_ctime_led_count[pid]++;
+    /* Matches the set of records the query side treats as hardlink-ambiguous
+     * (any non-directory with nlink > 1), so a zero total genuinely means the
+     * byte rollup equals what an exact scan would compute. */
+    if (r->type != (uint8_t)'d' && r->nlink > 1ULL) c->subtree_nlink_gt1_count[pid]++;
+    if (r->type == (uint8_t)'f')
+        c->subtree_files[pid]++;
+    else if (r->type == (uint8_t)'d')
+        c->subtree_dirs[pid]++;
+    else if (r->type == (uint8_t)'l')
+        c->subtree_symlinks[pid]++;
+}
+
+/* Record a directory record's own byte credit on that directory's catalog row. */
+static void shard_cat_set_self_bytes(shard_cat_t *c, uint64_t dir_id, uint64_t byte_credit) {
+    if (!c || dir_id == 0ULL || (size_t)dir_id >= c->arr_cap) return;
+    c->self_bytes[dir_id] = byte_credit;
+    c->self_present[dir_id] = 1U;
+}
+
+/*
+ * End-of-crawl post-pass, O(directories): assign each directory its DFS
+ * pre-order position and roll the immediate-child aggregates up the tree.
+ *
+ * dir_id is handed out in crawl arrival order and is referenced by every
+ * record's parent_dir_id, so it cannot be renumbered into DFS order without
+ * rewriting the whole record region. dfs_index is therefore a permutation
+ * alongside it, which is enough to make subtree membership a range test.
+ *
+ * Must run exactly once, on final close. Running it on an LRU eviction would
+ * fold the same immediate counts into their ancestors a second time when the
+ * shard reopened and finalized again.
+ */
+static int shard_cat_finalize(shard_cat_t *c) {
+    uint64_t n;
+    uint64_t *child_head = NULL;   /* first child of each dir, 0 = none */
+    uint64_t *child_next = NULL;   /* next sibling */
+    uint64_t *order = NULL;        /* dfs position -> dir_id */
+    uint64_t *stack = NULL;
+    uint64_t id, top = 0, pos = 0;
+    int rc = -1;
+
+    if (!c) return -1;
+    if (c->finalized) return 0;
+    if (c->next_dir_id <= 1ULL) return 0;
+    n = c->next_dir_id; /* slots 1..n-1 are live */
+
+    c->dfs_index = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->dfs_subtree_dirs = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->subtree_bytes = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    c->subtree_count = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    child_head = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    child_next = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    order = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    stack = (uint64_t *)calloc((size_t)n, sizeof(uint64_t));
+    if (!c->dfs_index || !c->dfs_subtree_dirs || !c->subtree_bytes || !c->subtree_count || !child_head ||
+        !child_next || !order || !stack)
+        goto done;
+
+    /* Sibling lists, built by prepending so children of a parent end up in
+     * descending dir_id; the traversal below pushes them onto a stack, which
+     * flips them back to ascending. */
+    for (id = n - 1ULL; id >= 1ULL; id--) {
+        uint64_t p = c->parent_dir_id[id];
+
+        if (p == 0ULL || p >= n || p == id) continue; /* the root has no parent */
+        child_next[id] = child_head[p];
+        child_head[p] = id;
+    }
+
+    /* Iterative pre-order from the synthetic root; recursion would blow the
+     * stack on a deep tree, and directory depth is not bounded here. */
+    stack[top++] = 1ULL;
+    while (top > 0) {
+        uint64_t d = stack[--top];
+        uint64_t ch;
+
+        if (pos >= n) goto done;
+        c->dfs_index[d] = pos;
+        order[pos++] = d;
+        for (ch = child_head[d]; ch != 0ULL; ch = child_next[ch]) {
+            if (top >= n) goto done;
+            stack[top++] = ch;
+        }
+    }
+
+    /*
+     * A directory unreachable from the root would keep dfs_index 0 and alias the
+     * root's subtree range, silently pulling unrelated directories into every
+     * subtree query. Refuse instead of answering wrongly.
+     */
+    if (pos != n - 1ULL) {
+        errno = EINVAL;
+        goto done;
+    }
+
+    /* Seed with this directory's own immediate aggregates, then roll up. */
+    for (id = 1ULL; id < n; id++) {
+        c->subtree_bytes[id] = c->imm_child_bytes[id];
+        c->subtree_count[id] = c->imm_child_count[id];
+        c->dfs_subtree_dirs[id] = 1ULL;
+    }
+
+    /* Reverse pre-order visits every descendant before its ancestor, so each
+     * directory's totals are complete by the time they fold into its parent. */
+    while (pos > 0) {
+        uint64_t d = order[--pos];
+        uint64_t p = c->parent_dir_id[d];
+
+        if (d == 1ULL || p == 0ULL || p >= n || p == d) continue;
+        c->subtree_bytes[p] += c->subtree_bytes[d];
+        c->subtree_count[p] += c->subtree_count[d];
+        c->subtree_nlink_gt1_count[p] += c->subtree_nlink_gt1_count[d];
+        c->subtree_files[p] += c->subtree_files[d];
+        c->subtree_dirs[p] += c->subtree_dirs[d];
+        c->subtree_symlinks[p] += c->subtree_symlinks[d];
+        c->dfs_subtree_dirs[p] += c->dfs_subtree_dirs[d];
+    }
+
+    c->finalized = 1;
+    rc = 0;
+
+done:
+    free(child_head);
+    free(child_next);
+    free(order);
+    free(stack);
+    return rc;
 }
 
 static int shard_cat_write_tail(shard_cat_t *c, FILE *fp, uint64_t *catalog_start_out) {
@@ -2164,6 +2652,21 @@ static int shard_cat_write_tail(shard_cat_t *c, FILE *fp, uint64_t *catalog_star
         ent.imm_child_ctime_led_count = c->imm_child_ctime_led_count[id];
         ent.imm_child_min_eff_time = c->imm_child_min_eff_time[id];
         ent.imm_child_max_eff_time = c->imm_child_max_eff_time[id];
+        ent.subtree_nlink_gt1_count = c->subtree_nlink_gt1_count[id];
+        ent.subtree_files = c->subtree_files[id];
+        ent.subtree_dirs = c->subtree_dirs[id];
+        ent.subtree_symlinks = c->subtree_symlinks[id];
+        ent.self_bytes = c->self_bytes[id];
+        if (c->self_present[id]) ent.flags |= (uint16_t)CRAWL_DIR_FLAG_SELF_RECORD;
+        /* Zero until the final close runs the post-pass. An interim tail written
+         * on LRU eviction is only ever read back by the reopen path, which uses
+         * the imm_child_* fields and the raw nlink counter above. */
+        if (c->finalized) {
+            ent.dfs_index = c->dfs_index[id];
+            ent.dfs_subtree_dirs = c->dfs_subtree_dirs[id];
+            ent.subtree_bytes = c->subtree_bytes[id];
+            ent.subtree_count = c->subtree_count[id];
+        }
         if (fwrite(&ent, sizeof(ent), 1, fp) != 1) return -1;
         if (ent.name_len > 0 && c->name_comp[id]) {
             if (fwrite(c->name_comp[id], 1, ent.name_len, fp) != ent.name_len) return -1;
@@ -2324,12 +2827,14 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
     if (fseeko(fp, (off_t)sizeof(bin_file_header_t), SEEK_SET) != 0) goto fail;
     pos = (off_t)sizeof(bin_file_header_t);
 
-    /* Walk the self-describing compressed blocks (bin_block_hdr_t + frame),
-     * recording block-start offsets at stride boundaries. */
+    /* Walk the self-describing row groups, recording group-start offsets at
+     * stride boundaries. A group's total size comes from its header alone, so
+     * this never touches the column directory or any payload. */
     while ((uint64_t)pos < scan_end) {
         uint64_t blk_start = (uint64_t)pos;
-        bin_block_hdr_t bh;
+        bin_rowgroup_hdr_t rg;
         uint64_t block_end;
+        uint64_t group_total;
 
         if (blk_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
             if (n == cap) {
@@ -2342,11 +2847,12 @@ static int shard_ckpt_rebuild_scan(const char *bin_path, uint64_t file_sz, uint6
             buf[n++] = blk_start;
             seg0 = blk_start;
         }
-        if (scan_end - blk_start < sizeof(bh)) goto fail;
-        if (fread(&bh, sizeof(bh), 1, fp) != 1) goto fail;
-        block_end = blk_start + (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        if (scan_end - blk_start < sizeof(rg)) goto fail;
+        if (fread(&rg, sizeof(rg), 1, fp) != 1) goto fail;
+        group_total = crawl_bin_rowgroup_total_bytes(&rg);
+        block_end = blk_start + group_total;
         if (block_end > scan_end) goto fail;
-        if (bh.comp_size && fseeko(fp, (off_t)bh.comp_size, SEEK_CUR) != 0) goto fail;
+        if (fseeko(fp, (off_t)(group_total - sizeof(rg)), SEEK_CUR) != 0) goto fail;
         pos = (off_t)block_end;
     }
     if ((uint64_t)pos != scan_end) {
@@ -2404,16 +2910,24 @@ static int shard_ckpt_init_new(shard_file_state_t *s) {
 
 static int shard_block_flush(shard_file_state_t *s);
 
-static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_path) {
+/*
+ * Write the shard's catalog tail and checkpoint sidecar. `final` marks the last
+ * close of this shard for the whole crawl, which is the only point at which the
+ * DFS/subtree post-pass may run: an LRU eviction is followed by a reopen that
+ * keeps appending, and folding the rollups twice would double-count.
+ */
+static int shard_flush_ckpt_before_close(shard_file_state_t *s, const char *bin_path, int final) {
     uint64_t cat_off;
     int r;
 
     if (!s->fp) return 0;
     if (!s->ckpt_offs || s->ckpt_n == 0) return -1;
 
-    /* Flush the pending compressed block so bytes_written == EOF and the
-     * catalog is written immediately after the last block. */
+    /* Flush the pending row group so bytes_written == EOF and the catalog is
+     * written immediately after the last group. */
     if (shard_block_flush(s) != 0) return -1;
+
+    if (final && shard_cat_finalize(&s->cat) != 0) return -1;
 
     if (ecrawl_io_fflush(s->fp) != 0) return -1;
     if (fseeko(s->fp, 0, SEEK_END) != 0) return -1;
@@ -2544,11 +3058,12 @@ static int queue_push_stack_take(task_queue_t *q, dir_stack_t *task) {
 /* Enqueue a discovered subdirectory as its own task so other workers can run while this thread blocks
  * in readdir. Same pattern as enqueue_root_task (single-item dir_stack_t + queue_push_stack_take). */
 static int enqueue_discovered_dir_task(task_queue_t *queue, char *path_owned, size_t path_len,
-                                       const struct stat *st_opt, shared_state_t *shared, int pre_accounted_emit) {
+                                       const struct stat *st_opt, shared_state_t *shared, int pre_accounted_emit,
+                                       int ancestor_matched) {
     dir_stack_t task;
 
     dir_stack_init(&task);
-    if (dir_stack_push_take(&task, path_owned, path_len, st_opt, pre_accounted_emit) != 0) {
+    if (dir_stack_push_take(&task, path_owned, path_len, st_opt, pre_accounted_emit, ancestor_matched) != 0) {
         fprintf(stderr, "ERROR worker stack push %s: %s\n", path_owned, strerror(errno));
         free(path_owned);
         stats_add_error(shared);
@@ -2586,8 +3101,8 @@ static void discovered_dir_batch_fini(discovered_dir_batch_t *b) {
 }
 
 static int discovered_dir_batch_push(discovered_dir_batch_t *b, char *path_owned, size_t path_len,
-                                     const struct stat *st_opt, int pre_accounted_emit) {
-    if (dir_stack_push_take(&b->pending, path_owned, path_len, st_opt, pre_accounted_emit) != 0) {
+                                     const struct stat *st_opt, int pre_accounted_emit, int ancestor_matched) {
+    if (dir_stack_push_take(&b->pending, path_owned, path_len, st_opt, pre_accounted_emit, ancestor_matched) != 0) {
         fprintf(stderr, "ERROR worker discovered-dir batch push %s: %s\n", path_owned, strerror(errno));
         free(path_owned);
         stats_add_error(b->shared);
@@ -2735,39 +3250,72 @@ static record_batch_t *writer_queue_pop(writer_queue_t *q) {
 }
 
 static int emit_context_init(emit_context_t *ctx, writer_queue_t *writer_queues, int writer_threads,
-                             perf_local_t *perf) {
+                             perf_local_t *perf, pthread_mutex_t *stats_lock) {
+    int i;
+
     memset(ctx, 0, sizeof(*ctx));
     ctx->writer_queues = writer_queues;
     ctx->writer_threads = writer_threads;
     ctx->perf = perf;
+    ctx->stats_lock = stats_lock;
     if (g_no_write || writer_threads <= 0) return 0;
     ctx->pending = (pending_batch_t *)calloc((size_t)writer_threads, sizeof(*ctx->pending));
-    return ctx->pending ? 0 : -1;
+    if (!ctx->pending) return -1;
+    ctx->pending_locks = (pthread_mutex_t *)calloc((size_t)writer_threads, sizeof(*ctx->pending_locks));
+    if (!ctx->pending_locks) {
+        free(ctx->pending);
+        ctx->pending = NULL;
+        return -1;
+    }
+    for (i = 0; i < writer_threads; i++) {
+        if (pthread_mutex_init(&ctx->pending_locks[i], NULL) != 0) {
+            while (i > 0) pthread_mutex_destroy(&ctx->pending_locks[--i]);
+            free(ctx->pending_locks);
+            ctx->pending_locks = NULL;
+            free(ctx->pending);
+            ctx->pending = NULL;
+            return -1;
+        }
+        ctx->pending_locks_n = i + 1;
+    }
+    return 0;
 }
 
 static void emit_context_destroy(emit_context_t *ctx) {
     int i;
     if (!ctx) return;
-    for (i = 0; i < ctx->writer_threads; i++) free(ctx->pending[i].data);
+    for (i = 0; i < ctx->pending_locks_n; i++) pthread_mutex_destroy(&ctx->pending_locks[i]);
+    ctx->pending_locks_n = 0;
+    free(ctx->pending_locks);
+    ctx->pending_locks = NULL;
+    if (ctx->pending)
+        for (i = 0; i < ctx->writer_threads; i++) free(ctx->pending[i].data);
     free(ctx->pending);
     ctx->pending = NULL;
 }
 
-static int flush_pending_batch(emit_context_t *ctx, int writer_index) {
-    pending_batch_t *p = &ctx->pending[writer_index];
-    record_batch_t *batch;
-
-    if (p->len == 0) return 0;
-
-    batch = (record_batch_t *)malloc(sizeof(*batch));
-    if (!batch) return -1;
-    batch->data = p->data;
-    batch->len = p->len;
-    batch->next = NULL;
-
+/* Detach a filled buffer so the owning lock can be dropped before the queue push. */
+static void pending_batch_take(pending_batch_t *p, unsigned char **data_out, size_t *len_out) {
+    if (p->len == 0) return;
+    *data_out = p->data;
+    *len_out = p->len;
     p->data = NULL;
     p->len = 0;
     p->cap = 0;
+}
+
+/* Hand a detached buffer to its writer. Runs without any emit lock held: the malloc and the
+ * push (which blocks when the queue is full) must not stall other emitters. */
+static int submit_detached_batch(emit_context_t *ctx, int writer_index, unsigned char *data, size_t len) {
+    record_batch_t *batch = (record_batch_t *)malloc(sizeof(*batch));
+
+    if (!batch) {
+        free(data);
+        return -1;
+    }
+    batch->data = data;
+    batch->len = len;
+    batch->next = NULL;
 
     if (writer_queue_push(&ctx->writer_queues[writer_index], batch) != 0) {
         free(batch->data);
@@ -2775,9 +3323,28 @@ static int flush_pending_batch(emit_context_t *ctx, int writer_index) {
         return -1;
     }
 
-    if (ctx->perf) perf_flush_local(ctx->perf);
+    /* Folding the owner's pending perf on every MiB batch keeps the TTY totals moving on captures whose
+     * directories are too small to reach GLOBAL_PERF_FLUSH_EVERY. The owner is shared with its stat
+     * workers, so the fold needs its lock. */
+    if (ctx->perf) {
+        if (ctx->stats_lock) pthread_mutex_lock(ctx->stats_lock);
+        perf_flush_local(ctx->perf);
+        if (ctx->stats_lock) pthread_mutex_unlock(ctx->stats_lock);
+    }
 
     return 0;
+}
+
+static int flush_pending_batch(emit_context_t *ctx, int writer_index) {
+    unsigned char *data = NULL;
+    size_t len = 0;
+
+    pthread_mutex_lock(&ctx->pending_locks[writer_index]);
+    pending_batch_take(&ctx->pending[writer_index], &data, &len);
+    pthread_mutex_unlock(&ctx->pending_locks[writer_index]);
+
+    if (!data) return 0;
+    return submit_detached_batch(ctx, writer_index, data, len);
 }
 
 static int ensure_pending_capacity(pending_batch_t *p, size_t need) {
@@ -2864,6 +3431,10 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     char path_buf[PATH_MAX];
     const char *path_write = path;
     size_t path_len_write = path_len;
+    unsigned char *full_data = NULL;
+    size_t full_len = 0;
+    unsigned char *ready_data = NULL;
+    size_t ready_len = 0;
 
     if (!ctx || !path || !st) return -1;
     if (g_no_write) return 0;
@@ -2878,6 +3449,8 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     hdr.name_len = (uint16_t)path_len_write;
     hdr.type = (uint8_t)file_type_char(st->st_mode);
     hdr.uid = (uint64_t)st->st_uid;
+    hdr.gid = (uint64_t)st->st_gid;
+    hdr.mode = (uint32_t)st->st_mode;
     hdr.size = (uint64_t)st->st_size;
     hdr.inode = (uint64_t)st->st_ino;
     hdr.dev_major = (uint32_t)major(st->st_dev);
@@ -2898,12 +3471,19 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     frame.byte_credit = byte_credit;
     frame_len = sizeof(frame) + record_len;
 
-    if (pending->len > 0 && pending->len + frame_len > pending->cap) {
-        if (flush_pending_batch(ctx, writer_index) != 0) return -1;
-        pending = &ctx->pending[writer_index];
-    }
+    /* Everything above is thread-local. Only the append is shared, and only with emitters that
+     * hash to the same writer. Full buffers leave the lock as detached handoffs, submitted below
+     * in the order they were filled. */
+    pthread_mutex_lock(&ctx->pending_locks[writer_index]);
 
-    if (ensure_pending_capacity(pending, pending->len + frame_len) != 0) return -1;
+    if (pending->len > 0 && pending->len + frame_len > pending->cap)
+        pending_batch_take(pending, &full_data, &full_len);
+
+    if (ensure_pending_capacity(pending, pending->len + frame_len) != 0) {
+        pthread_mutex_unlock(&ctx->pending_locks[writer_index]);
+        if (full_data) (void)submit_detached_batch(ctx, writer_index, full_data, full_len);
+        return -1;
+    }
 
     memcpy(pending->data + pending->len, &frame, sizeof(frame));
     pending->len += sizeof(frame);
@@ -2914,11 +3494,28 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
         pending->len += path_len_write;
     }
 
-    if (pending->len >= RECORD_BATCH_BYTES) {
-        if (flush_pending_batch(ctx, writer_index) != 0) return -1;
-    }
+    if (pending->len >= RECORD_BATCH_BYTES) pending_batch_take(pending, &ready_data, &ready_len);
+
+    pthread_mutex_unlock(&ctx->pending_locks[writer_index]);
+
+    if (full_data && submit_detached_batch(ctx, writer_index, full_data, full_len) != 0) return -1;
+    if (ready_data && submit_detached_batch(ctx, writer_index, ready_data, ready_len) != 0) return -1;
 
     return 0;
+}
+
+/* The owner's counters are shared with its stat workers, so keep the critical section to the
+ * accounting itself: the stat call, the path join and emit_record all stay outside it. */
+static uint64_t account_entry_shared(emit_context_t *ctx, shared_state_t *shared, crawl_stats_t *stats,
+                                     perf_local_t *perf, const struct stat *st) {
+    uint64_t contrib;
+
+    if (!ctx || !ctx->stats_lock) return account_entry_local(shared, stats, perf, st);
+
+    pthread_mutex_lock(ctx->stats_lock);
+    contrib = account_entry_local(shared, stats, perf, st);
+    pthread_mutex_unlock(ctx->stats_lock);
+    return contrib;
 }
 
 static int emit_context_flush_all(emit_context_t *ctx) {
@@ -2947,7 +3544,7 @@ static void dir_stack_destroy(dir_stack_t *s) {
 }
 
 static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len, const struct stat *st,
-                               int pre_accounted_emit) {
+                               int pre_accounted_emit, int ancestor_matched) {
     if (s->count == s->cap) {
         size_t new_cap = (s->cap == 0) ? 64 : (s->cap * 2);
         dir_work_t *new_items = (dir_work_t *)realloc(s->items, new_cap * sizeof(*new_items));
@@ -2958,6 +3555,7 @@ static int dir_stack_push_take(dir_stack_t *s, char *path_owned, size_t path_len
 
     s->items[s->count].path = path_owned;
     s->items[s->count].path_len = path_len;
+    s->items[s->count].ancestor_matched = ancestor_matched;
     if (st) {
         s->items[s->count].st = *st;
         s->items[s->count].have_stat = 1;
@@ -3097,7 +3695,7 @@ static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t 
         uint64_t contrib;
 
         record_ids_from_stat(&st);
-        contrib = account_entry_local(shared, stats, perf, &st);
+        contrib = account_entry_shared(emit, shared, stats, perf, &st);
         if (!g_no_write) {
             char child[PATH_MAX];
             size_t child_emitted_len = dir_path_len + name_len + ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
@@ -3119,12 +3717,12 @@ static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t 
         stats_add_error(shared);
         return;
     }
-    if (dir_stack_push_take(stack, owned, owned_len, &st, 0) != 0) {
+    if (dir_stack_push_take(stack, owned, owned_len, &st, 0, 0) != 0) {
         fprintf(stderr, "ERROR worker stack push %s: %s\n", owned, strerror(errno));
         stats_add_error(shared);
         if (disc_batch) {
-            (void)discovered_dir_batch_push(disc_batch, owned, owned_len, &st, 0);
-        } else if (enqueue_discovered_dir_task(queue, owned, owned_len, &st, shared, 0) != 0) {
+            (void)discovered_dir_batch_push(disc_batch, owned, owned_len, &st, 0, 0);
+        } else if (enqueue_discovered_dir_task(queue, owned, owned_len, &st, shared, 0, 0) != 0) {
             fprintf(stderr, "ERROR worker failed to enqueue subdirectory task: %s\n", strerror(errno));
             free(owned);
         }
@@ -3226,14 +3824,14 @@ static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, siz
                 stats_add_error(shared);
                 continue;
             }
-            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0) != 0)
+            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0, 0) != 0)
                 continue;
             stat_batch_record_unexpected_dir(parent_path, parent_len, name, nl);
         } else {
             uint64_t contrib;
 
             record_ids_from_stat(&child_st);
-            contrib = account_entry_local(shared, &wa->stats, &wa->perf, &child_st);
+            contrib = account_entry_shared(emit, shared, &wa->stats, &wa->perf, &child_st);
             if (!g_no_write) {
                 char child[PATH_MAX];
                 size_t child_path_len =
@@ -3406,15 +4004,16 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
                 stats_add_error(wa->shared);
                 continue;
             }
-            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0) != 0)
+            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0, 0) != 0)
                 continue;
             stat_batch_record_unexpected_dir(batch->parent_path, batch->parent_len, name, nl);
         } else {
             uint64_t contrib;
 
-            pthread_mutex_lock(&wa->emit_stats_lock);
+            /* The id registries and emit_record synchronize themselves; only the owner's
+             * counters need its lock, so several workers on one owner still run in parallel. */
             record_ids_from_stat(&child_st);
-            contrib = account_entry_local(wa->shared, &wa->stats, &wa->perf, &child_st);
+            contrib = account_entry_shared(emit, wa->shared, &wa->stats, &wa->perf, &child_st);
             if (!g_no_write) {
                 char child[PATH_MAX];
                 size_t child_path_len =
@@ -3423,7 +4022,6 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
                 if (path_join_fast(batch->parent_path, batch->parent_len, name, nl, child, sizeof(child)) != 0) {
                     fprintf(stderr, "ERROR worker path too long: %s/%s\n", batch->parent_path, name);
                     stats_add_error(wa->shared);
-                    pthread_mutex_unlock(&wa->emit_stats_lock);
                     continue;
                 }
                 if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
@@ -3431,7 +4029,6 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
                     stats_add_error(wa->shared);
                 }
             }
-            pthread_mutex_unlock(&wa->emit_stats_lock);
         }
     }
 
@@ -3801,41 +4398,57 @@ static int process_directory_iterative(dir_stack_t *stack,
         ecrawl_dir_reader_t rd;
         const char *ent_name;
         unsigned char ent_dtype;
+        dirmatch_t dm;
 
         if (dir_stack_pop(stack, &work) != 0) break;
 
         dir_path = work.path;
+        dm.all_match = 1;
+        dm.prefix_len = 0;
 
-        if (work.have_stat) st = work.st;
-        else {
-            memset(&st, 0, sizeof(st));
-            if (ecrawl_io_lstat(dir_path, &st) != 0) {
-                fprintf(stderr, "ERROR worker lstat %s: %s\n", dir_path, strerror(errno));
+        if (g_no_stat) {
+            /* d_type already proved this is a directory when the parent pushed it, so the walk
+             * never reads its inode. Directories are printed here, on pop, so each appears once. */
+            dir_path_len = work.path_len;
+            account_entry_dtype(stats, perf, DT_DIR);
+            dirmatch_begin(&wa->nostat, dir_path, dir_path_len, work.ancestor_matched, &dm);
+            if (dm.all_match && pathout_emit(&wa->nostat, dir_path, dir_path_len) != 0) {
                 stats_add_error(shared);
                 free(dir_path);
                 continue;
             }
-        }
-
-        if (!work.pre_accounted_emit) {
-            record_ids_from_stat(&st);
-            {
-                uint64_t contrib = account_entry_local(shared, stats, perf, &st);
-
-                dir_path_len = work.path_len;
-                if (emit_record(emit, dir_path, dir_path_len, &st, contrib) != 0) {
-                    fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
+        } else {
+            if (work.have_stat) st = work.st;
+            else {
+                memset(&st, 0, sizeof(st));
+                if (ecrawl_io_lstat(dir_path, &st) != 0) {
+                    fprintf(stderr, "ERROR worker lstat %s: %s\n", dir_path, strerror(errno));
                     stats_add_error(shared);
                     free(dir_path);
                     continue;
                 }
             }
-        } else
-            dir_path_len = work.path_len;
 
-        if (!S_ISDIR(st.st_mode)) {
-            free(dir_path);
-            continue;
+            if (!work.pre_accounted_emit) {
+                record_ids_from_stat(&st);
+                {
+                    uint64_t contrib = account_entry_shared(emit, shared, stats, perf, &st);
+
+                    dir_path_len = work.path_len;
+                    if (emit_record(emit, dir_path, dir_path_len, &st, contrib) != 0) {
+                        fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
+                        stats_add_error(shared);
+                        free(dir_path);
+                        continue;
+                    }
+                }
+            } else
+                dir_path_len = work.path_len;
+
+            if (!S_ISDIR(st.st_mode)) {
+                free(dir_path);
+                continue;
+            }
         }
 
         {
@@ -3867,7 +4480,78 @@ static int process_directory_iterative(dir_stack_t *stack,
                 continue;
             }
 
-            if (g_stat_threads_configured > 0) {
+            if (g_no_stat) {
+                size_t dirs_since_donate_check = 0;
+
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
+                    size_t child_name_len;
+                    unsigned char child_d_type = ent_dtype;
+
+                    if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
+                    child_name_len = strlen(ent_name);
+
+                    /* Filesystems without d_type support report DT_UNKNOWN, and we cannot recurse
+                     * without knowing whether this is a directory. This is the one case where a
+                     * names-only walk still has to read an inode; the counter makes it visible. */
+                    if (child_d_type == DT_UNKNOWN) {
+                        struct stat probe;
+
+                        if (ecrawl_io_fstatat_nf(dir_fd, ent_name, &probe) != 0) {
+                            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent_name,
+                                    strerror(errno));
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        ATOMIC_ADD_RELAXED(&g_nostat_dtype_unknown_fallbacks, 1);
+                        child_d_type = dtype_from_mode(probe.st_mode);
+                    }
+
+                    if (child_d_type == DT_DIR) {
+                        char *child_path_owned;
+                        size_t child_path_len;
+                        int child_contains;
+
+                        if (path_join_alloc(dir_path, dir_path_len, ent_name, child_name_len, &child_path_owned,
+                                            &child_path_len) != 0) {
+                            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent_name,
+                                    strerror(errno));
+                            stats_add_error(shared);
+                            continue;
+                        }
+                        /* Resolve the child's match here, while the parent's window is loaded, so the
+                         * child never rescans its own full path when it is popped. */
+                        child_contains = dirmatch_hit(&wa->nostat, &dm, ent_name, child_name_len) ? CONTAINS_YES
+                                                                                                  : CONTAINS_NO;
+                        /* Accounted and printed on pop, like every other directory. */
+                        if (dir_stack_push_take(stack, child_path_owned, child_path_len, NULL, 0, child_contains) !=
+                            0) {
+                            fprintf(stderr, "ERROR worker stack push %s: %s\n", child_path_owned, strerror(errno));
+                            stats_add_error(shared);
+                            (void)discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, NULL, 0,
+                                                            child_contains);
+                        }
+                        dirs_since_donate_check++;
+                        donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
+                    } else {
+                        account_entry_dtype(stats, perf, child_d_type);
+                        if (dirmatch_hit(&wa->nostat, &dm, ent_name, child_name_len)) {
+                            char child[PATH_MAX];
+                            size_t child_path_len = dir_path_len + child_name_len +
+                                                    ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+
+                            /* Only matches pay for a full path assembly. */
+                            if (path_join_fast(dir_path, dir_path_len, ent_name, child_name_len, child,
+                                               sizeof(child)) != 0) {
+                                fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent_name);
+                                stats_add_error(shared);
+                                continue;
+                            }
+                            if (pathout_emit(&wa->nostat, child, child_path_len) != 0) stats_add_error(shared);
+                        }
+                    }
+                }
+                donate_spill_if_needed(shared, stack, queue, aux);
+            } else if (g_stat_threads_configured > 0) {
                 stat_names_builder_t nb;
                 stat_pending_vec_t pend;
 
@@ -3927,7 +4611,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                     continue;
                                 }
                                 if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
-                                                              0) != 0)
+                                                              0, 0) != 0)
                                     continue;
                                 stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent_name, child_name_len);
                                 dirs_since_donate_check++;
@@ -3936,7 +4620,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 uint64_t contrib;
 
                                 record_ids_from_stat(&child_st);
-                                contrib = account_entry_local(shared, stats, perf, &child_st);
+                                contrib = account_entry_shared(emit, shared, stats, perf, &child_st);
                                 if (!g_no_write) {
                                     char child[PATH_MAX];
                                     size_t child_path_emitted_len = dir_path_len + child_name_len +
@@ -4043,7 +4727,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                                 continue;
                             }
                             if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
-                                                          0) != 0)
+                                                          0, 0) != 0)
                                 continue;
                             dirs_since_donate_check++;
                             donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
@@ -4051,7 +4735,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                             uint64_t contrib;
 
                             record_ids_from_stat(&child_st);
-                            contrib = account_entry_local(shared, stats, perf, &child_st);
+                            contrib = account_entry_shared(emit, shared, stats, perf, &child_st);
                             if (!g_no_write) {
                                 char child[PATH_MAX];
                                 size_t child_path_len = dir_path_len + child_name_len +
@@ -4085,13 +4769,75 @@ static int process_directory_iterative(dir_stack_t *stack,
     return 0;
 }
 
+/* Helper threads (stats tick, disk-space monitor) idle between wakeups. A plain sleep(1) is
+ * not interruptible, so pthread_join at shutdown had to wait out the in-flight sleep: every
+ * run paid up to a full second of dead time after the crawl finished, which quantized total
+ * wall time to whole seconds. Wait on a condvar instead, broadcast when a stop is requested. */
+static pthread_mutex_t g_helper_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_helper_wait_cond = PTHREAD_COND_INITIALIZER;
+
+static int stats_stop_requested(void) {
+    return atomic_load(&g_stop_stats) != 0;
+}
+
+static int disk_monitor_stop_requested(void) {
+    return atomic_load_explicit(&g_disk_monitor_stop, memory_order_acquire) != 0U;
+}
+
+/* Idle for `seconds` unless stopped(). Returns 1 when the full interval elapsed, 0 when a
+ * stop was requested. Waiting on an absolute deadline makes spurious wakeups (including a
+ * broadcast aimed at the other helper) resume the remaining time rather than tick early. */
+static int helper_wait_or_stop(double seconds, int (*stopped)(void)) {
+    struct timespec deadline;
+    long nsec;
+    int rc = 0;
+
+    if (stopped()) return 0;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)seconds;
+    nsec = deadline.tv_nsec + (long)((seconds - (double)(time_t)seconds) * 1e9);
+    if (nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        nsec -= 1000000000L;
+    }
+    deadline.tv_nsec = nsec;
+
+    pthread_mutex_lock(&g_helper_wait_lock);
+    while (!stopped() && rc != ETIMEDOUT) {
+        rc = pthread_cond_timedwait(&g_helper_wait_cond, &g_helper_wait_lock, &deadline);
+    }
+    pthread_mutex_unlock(&g_helper_wait_lock);
+
+    return stopped() ? 0 : 1;
+}
+
+/* Wake both helpers so their joins return without waiting out the current interval. */
+static void helper_stop_broadcast(void) {
+    pthread_mutex_lock(&g_helper_wait_lock);
+    pthread_cond_broadcast(&g_helper_wait_cond);
+    pthread_mutex_unlock(&g_helper_wait_lock);
+}
+
+static void stats_stop_request(void) {
+    atomic_store(&g_stop_stats, 1);
+    helper_stop_broadcast();
+}
+
+static void disk_monitor_stop_request(void) {
+    atomic_store(&g_disk_monitor_stop, 1);
+    helper_stop_broadcast();
+}
+
 static void *stats_thread_main(void *arg) {
     static int stall_zero_secs = 0;
     static int stall_announced = 0;
     (void)arg;
 
     while (!atomic_load(&g_stop_stats)) {
-        sleep(1);
+        /* A partial final interval would skew the per-second rolling window, so a stop
+         * request ends the loop instead of recording a short tick. */
+        if (!helper_wait_or_stop(1.0, stats_stop_requested)) break;
 
         {
             int idx_record = atomic_load(&g_bucket_index);
@@ -4233,9 +4979,17 @@ static void *worker_thread_main(void *arg_void) {
     size_t dirbuf_cap = g_getdents_buf_bytes;
     char *dirbuf = NULL;
 
-    if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads, &arg->perf) != 0) {
+    if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads, &arg->perf,
+                          &arg->emit_stats_lock) != 0) {
         fprintf(stderr, "ERROR worker %" PRIu64 " failed to initialize emit context\n", arg->worker_index);
         stats_add_error(arg->shared);
+        return NULL;
+    }
+
+    if (nostat_ctx_init(&arg->nostat) != 0) {
+        fprintf(stderr, "ERROR worker %" PRIu64 " failed to allocate path output buffer\n", arg->worker_index);
+        stats_add_error(arg->shared);
+        emit_context_destroy(&emit);
         return NULL;
     }
 
@@ -4261,9 +5015,15 @@ static void *worker_thread_main(void *arg_void) {
         dir_stack_destroy(&task);
     }
 
+    /* Last fold for this owner: its stat workers are done with these counters by now, but they share the
+     * lock with it, so keep the fold inside it like every other one. */
+    pthread_mutex_lock(&arg->emit_stats_lock);
     perf_flush_local(&arg->perf);
+    pthread_mutex_unlock(&arg->emit_stats_lock);
     if (emit_context_flush_all(&emit) != 0) stats_add_error(arg->shared);
     emit_context_destroy(&emit);
+    if (pathout_flush(&arg->nostat) != 0) stats_add_error(arg->shared);
+    nostat_ctx_destroy(&arg->nostat);
     tls_flush_thread_batch_counters();
     free(dirbuf);
     return NULL;
@@ -4284,7 +5044,8 @@ static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_in
     {
         uint32_t shard = (uint32_t)(victim - shards);
         char path[PATH_MAX];
-        if (build_shard_path(shard, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(victim, path);
+        if (build_shard_path(shard, path, sizeof(path)) == 0)
+            (void)shard_flush_ckpt_before_close(victim, path, 0);
     }
     ecrawl_io_fclose(victim->fp);
     victim->fp = NULL;
@@ -4479,7 +5240,6 @@ static void writer_wait_disk_ok(void) {
 
 static void *disk_monitor_thread_main(void *arg) {
     int show_paused = 0;
-    int s;
 
     (void)arg;
 
@@ -4526,10 +5286,7 @@ static void *disk_monitor_thread_main(void *arg) {
             atomic_store_explicit(&g_disk_low, 0U, memory_order_release);
         }
 
-        for (s = 0; s < DISK_SPACE_CHECK_INTERVAL_SEC; s++) {
-            if (atomic_load_explicit(&g_disk_monitor_stop, memory_order_relaxed)) break;
-            sleep(1);
-        }
+        if (!helper_wait_or_stop((double)DISK_SPACE_CHECK_INTERVAL_SEC, disk_monitor_stop_requested)) break;
     }
 
     return NULL;
@@ -4708,6 +5465,24 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
          * the byte_credit computed once during the crawl. */
         shard_cat_update_imm_child_rollup(&st->cat, disk.parent_dir_id, frame.byte_credit, &disk);
 
+        /*
+         * A directory's own record is an immediate child of its *parent*, so the
+         * subtree sums rooted at it never include it. Park its byte credit on its
+         * own catalog row so a --subtree query can add it back and match du -sb,
+         * which counts the directory it was handed. Only reachable when the
+         * writer resolved the path itself (parent_dir_id == 0 on the wire);
+         * path_z holds the full path in exactly that case.
+         */
+        if (disk.type == (uint8_t)'d' && wire.parent_dir_id == 0ULL) {
+            uint64_t own = shard_cat_ensure_dir(&st->cat, path_z);
+
+            if (own == 0ULL) {
+                if (errno == 0) errno = EINVAL;
+                return -1;
+            }
+            shard_cat_set_self_bytes(&st->cat, own, frame.byte_credit);
+        }
+
         /* Serialize the record into the pending block buffer; flush a
          * compressed block once it reaches the raw target. (void)disk_len. */
         (void)disk_len;
@@ -4720,7 +5495,11 @@ static int writer_process_batch_frame(uint32_t writer_index, shard_file_state_t 
                 return -1;
             }
         }
-        if (crawl_bin_block_writer_pending(&st->blk) >= CRAWL_BIN_BLOCK_RAW_TARGET) {
+        /* Flush on decoded bytes or on the record cap, whichever comes first:
+         * a shard of very short names would otherwise buffer far more rows than
+         * the column arrays are allowed to hold. */
+        if (crawl_bin_block_writer_pending(&st->blk) >= CRAWL_BIN_BLOCK_RAW_TARGET ||
+            crawl_bin_block_writer_records(&st->blk) >= CRAWL_BIN_ROWGROUP_MAX_RECORDS) {
             if (shard_block_flush(st) != 0) return -1;
         }
     }
@@ -4837,9 +5616,28 @@ static void *writer_thread_main(void *arg_void) {
     {
         uint32_t i;
         for (i = arg->writer_index; i < g_uid_shards; i += (uint32_t)g_writer_threads) {
+            /*
+             * A shard evicted earlier and never touched again still has an
+             * un-finalized catalog on disk, so reopen it rather than leaving its
+             * subtree rollups zeroed. writer_open_shard_file's non-zero
+             * bytes_written path reopens, truncates the old tail and clears
+             * catalog_offset, which is exactly the state the final write needs.
+             */
+            if (!shards[i].fp && shards[i].initialized && shards[i].bytes_written != 0) {
+                char path[PATH_MAX];
+                if (build_shard_path(i, path, sizeof(path)) == 0 &&
+                    writer_open_shard_file(&shards[i], path) != 0)
+                    fprintf(stderr, "ERROR writer %u could not reopen shard %u to finalize: %s\n",
+                            arg->writer_index, i, strerror(errno));
+            }
             if (shards[i].fp) {
                 char path[PATH_MAX];
-                if (build_shard_path(i, path, sizeof(path)) == 0) (void)shard_flush_ckpt_before_close(&shards[i], path);
+                if (build_shard_path(i, path, sizeof(path)) == 0 &&
+                    shard_flush_ckpt_before_close(&shards[i], path, 1) != 0) {
+                    fprintf(stderr, "ERROR writer %u failed finalizing shard %u: %s\n", arg->writer_index, i,
+                            strerror(errno));
+                    atomic_store(&g_writer_failed, 1U);
+                }
                 ecrawl_io_fclose(shards[i].fp);
                 shards[i].fp = NULL;
             }
@@ -4878,7 +5676,7 @@ static int enqueue_root_task(const char *path, shared_state_t *shared, task_queu
     }
 
     path_len = strlen(path);
-    if (dir_stack_push_take(&task, dup, path_len, &st, 0) != 0) {
+    if (dir_stack_push_take(&task, dup, path_len, &st, 0, CONTAINS_UNKNOWN) != 0) {
         fprintf(stderr, "ERROR main stack push %s: %s\n", path, strerror(errno));
         free(dup);
         stats_add_error(shared);
@@ -4947,7 +5745,19 @@ static void print_queue_wait_metrics_to(FILE *fp) {
     fprintf(fp, "wait_stat_enqueue=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_enqueue));
 }
 
-static void print_queue_wait_metrics(void) { print_queue_wait_metrics_to(stdout); }
+/* What a names-only walk can and cannot report. Byte totals, hardlink dedup and the uid/gid
+ * registries all derive from struct stat, so they are named as unavailable rather than printed
+ * as zeros that would read as measured facts. */
+static void print_no_stat_stats(FILE *fp) {
+    fprintf(fp, "byte_accounting=(unavailable: --no-stat reads no inodes)\n");
+    fprintf(fp, "hardlink_files=(unavailable: --no-stat reads no inodes)\n");
+    fprintf(fp, "total_bytes=(unavailable: --no-stat reads no inodes)\n");
+    if (g_contains_lower)
+        fprintf(fp, "contains=%s\n", g_contains_lower);
+    fprintf(fp, "paths_printed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_nostat_printed));
+    /* Nonzero only on filesystems that do not report d_type, where recursion still needs a stat. */
+    fprintf(fp, "dtype_unknown_fallbacks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_nostat_dtype_unknown_fallbacks));
+}
 
 static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, double elapsed_sec,
                                       int writer_threads_used, const char *start_path) {
@@ -5011,17 +5821,21 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "entries=%" PRIu64 "\n", shared->total_entries);
     fprintf(fp, "dirs=%" PRIu64 "\n", shared->total_dirs);
     fprintf(fp, "files=%" PRIu64 "\n", shared->total_files);
-    fprintf(fp, "hardlink_files=%" PRIu64 "\n", shared->total_hardlink_files);
     fprintf(fp, "symlinks=%" PRIu64 "\n", shared->total_symlinks);
     fprintf(fp, "other=%" PRIu64 "\n", shared->total_other);
-    fprintf(fp, "total_bytes=%" PRIu64 "\n", shared->total_bytes);
-    fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
-    fprintf(fp, "total_allocated_bytes=%" PRIu64 "\n", shared->total_allocated_bytes);
-    fprintf(fp, "files_sparse_heuristic=%" PRIu64 "\n", shared->files_sparse_heuristic);
-    fprintf(fp, "dir_apparent_bytes=%" PRIu64 "\n", shared->dir_apparent_bytes);
-    fprintf(fp, "symlink_apparent_bytes=%" PRIu64 "\n", shared->symlink_apparent_bytes);
-    fprintf(fp, "other_apparent_bytes=%" PRIu64 "\n", shared->other_apparent_bytes);
-    fprintf(fp, "apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
+    if (g_no_stat) {
+        print_no_stat_stats(fp);
+    } else {
+        fprintf(fp, "hardlink_files=%" PRIu64 "\n", shared->total_hardlink_files);
+        fprintf(fp, "total_bytes=%" PRIu64 "\n", shared->total_bytes);
+        fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
+        fprintf(fp, "total_allocated_bytes=%" PRIu64 "\n", shared->total_allocated_bytes);
+        fprintf(fp, "files_sparse_heuristic=%" PRIu64 "\n", shared->files_sparse_heuristic);
+        fprintf(fp, "dir_apparent_bytes=%" PRIu64 "\n", shared->dir_apparent_bytes);
+        fprintf(fp, "symlink_apparent_bytes=%" PRIu64 "\n", shared->symlink_apparent_bytes);
+        fprintf(fp, "other_apparent_bytes=%" PRIu64 "\n", shared->other_apparent_bytes);
+        fprintf(fp, "apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
+    }
     fprintf(fp, "errors=%" PRIu64 "\n", shared->total_errors);
     fprintf(fp, "writer_failed=%u\n", atomic_load(&g_writer_failed));
     fprintf(fp, "io_lstat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_lstat_calls));
@@ -5055,6 +5869,10 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
             g_active_workers_samples ? (double)g_active_workers_sum / (double)g_active_workers_samples : 0.0);
     fprintf(fp, "min_active_workers=%d\n", g_active_workers_min);
     fprintf(fp, "max_active_workers=%d\n", g_active_workers_max);
+    /* Worker occupancy is sampled by the once-per-second stats tick, so a sub-second run
+     * collects no samples and the averages above are 0 for lack of data, not for lack of
+     * workers. Report the sample count so readers can tell those two cases apart. */
+    fprintf(fp, "active_workers_samples=%" PRIu64 "\n", g_active_workers_samples);
     fprintf(fp, "seconds_single_worker=%" PRIu64 "\n", g_seconds_single_worker);
     fprintf(fp, "seconds_queue_empty_single_worker=%" PRIu64 "\n", g_seconds_queue_empty_single_worker);
     fprintf(fp, "elapsed_sec=%.3f\n", elapsed_sec);
@@ -5089,9 +5907,40 @@ int main(int argc, char **argv) {
     int i;
     int j;
 
+    tune_allocator();
+
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-write") == 0) {
             g_no_write = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-stat") == 0) {
+            g_no_stat = 1;
+            g_no_write = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--print0") == 0) {
+            g_print0 = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--contains") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--contains requires a substring\n");
+                print_usage(argv[0]);
+                return 2;
+            }
+            i++;
+            if (argv[i][0] == '\0') {
+                fprintf(stderr, "--contains substring must not be empty\n");
+                return 2;
+            }
+            free(g_contains_lower);
+            g_contains_lower = ascii_lower_dup(argv[i]);
+            if (!g_contains_lower) {
+                fprintf(stderr, "--contains: out of memory\n");
+                return 2;
+            }
+            g_contains_len = strlen(g_contains_lower);
             continue;
         }
         if (strcmp(argv[i], "--verbose") == 0) {
@@ -5168,6 +6017,21 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* A record's uid/size/inode/nlink/times all come from stat, so a names-only walk cannot
+     * produce a capture. Refuse rather than silently writing an empty output directory. */
+    if (g_no_stat && positional_count >= 2) {
+        fprintf(stderr, "--no-stat streams paths and cannot write a capture; drop the output-dir argument\n");
+        return 2;
+    }
+    if (g_contains_lower && !g_no_stat) {
+        fprintf(stderr, "--contains filters the streamed path list and requires --no-stat\n");
+        return 2;
+    }
+    if (g_print0 && !g_no_stat) {
+        fprintf(stderr, "--print0 applies to the --no-stat path stream\n");
+        return 2;
+    }
+
     ecrawl_install_verbose_profile();
 
     if (path_resolve_existing(positionals[0], g_start_path_canon, "ecrawl: start-path ") != 0) return 2;
@@ -5188,6 +6052,8 @@ int main(int argc, char **argv) {
     g_crawl_threads = parse_ecrawl_crawl_threads();
     g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
     g_stat_threads_configured = parse_ecrawl_stat_threads();
+    /* Nothing to offload when no entry is stat'd; leaving the pool up would just park threads. */
+    if (g_no_stat) g_stat_threads_configured = 0;
     g_getdents_buf_bytes = parse_ecrawl_getdents_buf();
     g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
     g_stat_batch_after_reliable_nondirs_cfg = parse_ecrawl_stat_batch_after_reliable_nondirs();
@@ -5420,7 +6286,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR failed to create stats thread\n");
         if (!g_no_write) {
             atomic_store(&g_disk_wait_disabled, 1);
-            atomic_store(&g_disk_monitor_stop, 1);
+            disk_monitor_stop_request();
             if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
             disk_monitor_started = 0;
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
@@ -5447,12 +6313,12 @@ int main(int argc, char **argv) {
         free(workers);
         free(worker_args);
         fprintf(stderr, "ERROR allocation failed for crawl thread table (%d threads)\n", g_crawl_threads);
-        atomic_store(&g_stop_stats, 1);
+        stats_stop_request();
         pthread_join(stats_thread, NULL);
         clear_status_line();
         if (!g_no_write) {
             atomic_store(&g_disk_wait_disabled, 1);
-            atomic_store(&g_disk_monitor_stop, 1);
+            disk_monitor_stop_request();
             if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
             disk_monitor_started = 0;
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
@@ -5478,12 +6344,12 @@ int main(int argc, char **argv) {
             while (i > 0) pthread_mutex_destroy(&worker_args[--i].emit_stats_lock);
             free(workers);
             free(worker_args);
-            atomic_store(&g_stop_stats, 1);
+            stats_stop_request();
             pthread_join(stats_thread, NULL);
             clear_status_line();
             if (!g_no_write) {
                 atomic_store(&g_disk_wait_disabled, 1);
-                atomic_store(&g_disk_monitor_stop, 1);
+                disk_monitor_stop_request();
                 if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
                 disk_monitor_started = 0;
                 for (j = 0; j < writer_threads_used; j++) writer_queue_close(&writer_queues[j]);
@@ -5509,12 +6375,12 @@ int main(int argc, char **argv) {
         for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
         free(workers);
         free(worker_args);
-        atomic_store(&g_stop_stats, 1);
+        stats_stop_request();
         pthread_join(stats_thread, NULL);
         clear_status_line();
         if (!g_no_write) {
             atomic_store(&g_disk_wait_disabled, 1);
-            atomic_store(&g_disk_monitor_stop, 1);
+            disk_monitor_stop_request();
             if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
             disk_monitor_started = 0;
             for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
@@ -5578,12 +6444,12 @@ int main(int argc, char **argv) {
         atomic_store(&g_disk_wait_disabled, 1);
         for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
         for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
-        atomic_store(&g_disk_monitor_stop, 1);
+        disk_monitor_stop_request();
         if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
     }
 
     if (stats_thread_started) {
-        atomic_store(&g_stop_stats, 1);
+        stats_stop_request();
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
@@ -5609,37 +6475,46 @@ int main(int argc, char **argv) {
         human_decimal(max_ops, max_ops_buf, sizeof(max_ops_buf));
         human_decimal(min_ops, min_ops_buf, sizeof(min_ops_buf));
 
+        /* --no-stat owns stdout for the path stream, so the summary goes to stderr and
+         * `ecrawl --no-stat ... | sort` stays a clean path list. */
+        FILE *sumfp = g_no_stat ? stderr : stdout;
+
         if (!g_verbose) {
-            printf("start_path=%s\n", start_path);
-            if (g_record_root) printf("record_root=%s\n", g_record_root);
-            printf("no_write=%d\n", g_no_write);
-            printf("output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
-            printf("crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
-            printf("writer_threads=%d\n", writer_threads_used);
-            printf("uid_shards=%u\n", g_uid_shards);
-            printf("max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
-            printf("byte_accounting=%s\n", "unique_regular_files");
-            printf("entries=%" PRIu64 "\n", shared.total_entries);
-            printf("dirs=%" PRIu64 "\n", shared.total_dirs);
-            printf("files=%" PRIu64 "\n", shared.total_files);
-            printf("hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
-            printf("symlinks=%" PRIu64 "\n", shared.total_symlinks);
-            printf("other=%" PRIu64 "\n", shared.total_other);
-            printf("total_bytes=%" PRIu64 "\n", shared.total_bytes);
-            printf("st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
-            printf("total_allocated_bytes=%" PRIu64 "\n", shared.total_allocated_bytes);
-            printf("files_sparse_heuristic=%" PRIu64 "\n", shared.files_sparse_heuristic);
-            printf("dir_apparent_bytes=%" PRIu64 "\n", shared.dir_apparent_bytes);
-            printf("symlink_apparent_bytes=%" PRIu64 "\n", shared.symlink_apparent_bytes);
-            printf("other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
-            printf("apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
-            printf("avg_ops_per_sec=%s\n", avg_ops_buf);
-            printf("elapsed_sec=%.3f\n", elapsed);
-            printf("errors=%" PRIu64 "\n", shared.total_errors);
-            printf("writer_failed=%u\n", atomic_load(&g_writer_failed));
-            print_queue_wait_metrics();
+            fprintf(sumfp, "start_path=%s\n", start_path);
+            if (g_record_root) fprintf(sumfp, "record_root=%s\n", g_record_root);
+            fprintf(sumfp, "no_write=%d\n", g_no_write);
+            fprintf(sumfp, "no_stat=%d\n", g_no_stat);
+            fprintf(sumfp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
+            fprintf(sumfp, "crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
+            fprintf(sumfp, "writer_threads=%d\n", writer_threads_used);
+            fprintf(sumfp, "uid_shards=%u\n", g_uid_shards);
+            fprintf(sumfp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
+            fprintf(sumfp, "entries=%" PRIu64 "\n", shared.total_entries);
+            fprintf(sumfp, "dirs=%" PRIu64 "\n", shared.total_dirs);
+            fprintf(sumfp, "files=%" PRIu64 "\n", shared.total_files);
+            fprintf(sumfp, "symlinks=%" PRIu64 "\n", shared.total_symlinks);
+            fprintf(sumfp, "other=%" PRIu64 "\n", shared.total_other);
+            if (g_no_stat) {
+                print_no_stat_stats(sumfp);
+            } else {
+                fprintf(sumfp, "byte_accounting=%s\n", "unique_regular_files");
+                fprintf(sumfp, "hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
+                fprintf(sumfp, "total_bytes=%" PRIu64 "\n", shared.total_bytes);
+                fprintf(sumfp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
+                fprintf(sumfp, "total_allocated_bytes=%" PRIu64 "\n", shared.total_allocated_bytes);
+                fprintf(sumfp, "files_sparse_heuristic=%" PRIu64 "\n", shared.files_sparse_heuristic);
+                fprintf(sumfp, "dir_apparent_bytes=%" PRIu64 "\n", shared.dir_apparent_bytes);
+                fprintf(sumfp, "symlink_apparent_bytes=%" PRIu64 "\n", shared.symlink_apparent_bytes);
+                fprintf(sumfp, "other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
+                fprintf(sumfp, "apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
+            }
+            fprintf(sumfp, "avg_ops_per_sec=%s\n", avg_ops_buf);
+            fprintf(sumfp, "elapsed_sec=%.3f\n", elapsed);
+            fprintf(sumfp, "errors=%" PRIu64 "\n", shared.total_errors);
+            fprintf(sumfp, "writer_failed=%u\n", atomic_load(&g_writer_failed));
+            print_queue_wait_metrics_to(sumfp);
         } else {
-            print_verbose_full_stats(stdout, &shared, elapsed, writer_threads_used, start_path);
+            print_verbose_full_stats(sumfp, &shared, elapsed, writer_threads_used, start_path);
         }
         print_stat_batch_unexpected_dir_warnings(stderr);
     }

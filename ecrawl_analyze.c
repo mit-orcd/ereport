@@ -14,9 +14,13 @@
  *
  * Parallelism: ECRAWL_ANALYZE_THREADS (default 16, minimum 1, maximum 4096). If unset,
  * ECRAWL_REPAIR_THREADS is used for compatibility with older workflows. Work is split
- * by chunk (a .ckpt segment), not by shard, so a single huge single-UID shard still
- * scales across cores; each shard's catalog is loaded once and shared read-only by all
- * of its chunks.
+ * by chunk, not by shard, so a single huge single-UID shard still scales across cores;
+ * each shard's catalog is loaded once and shared read-only by all of its chunks.
+ * Checkpoint segments are 32 MiB apart, which is coarser than the thread budget on a
+ * small capture, so segments are subdivided at block boundaries (see
+ * parse_split_target_bytes) — without that a capture under 32 MiB ran on one core.
+ * The parent-directory map is shared by all workers (stripe-locked inserts, atomic
+ * per-parent counters) rather than built per worker and merged; see parent_map_t.
  */
 
 #define _FILE_OFFSET_BITS 64
@@ -39,6 +43,7 @@
 #include <limits.h>
 
 #include "crawl_bin_format.h"
+#include "alloc_tuning.h"
 #include "crawl_bin_block.h"
 #include "crawl_ckpt.h"
 #include "crawl_bin_chunks.h"
@@ -57,7 +62,7 @@ static int g_verbose;
 static unsigned g_top_n = 32U;
 
 /*
- * Query mode (--subtree / --size-gt / --type / --list): the same parallel scan,
+ * Query mode (--subtree / --size-gt / --type / --gid / --perm / --list): the same parallel scan,
  * with a record predicate instead of the directory-shape histograms. This is how
  * the capture answers "files over N bytes", "bytes under a subtree" and "files
  * under a subtree" without a second index — the questions ereport could only
@@ -73,31 +78,73 @@ typedef struct {
     uint64_t size_gt;      /* strictly greater, matching find -size +Nc */
     int have_size_gt;
     int type_filter;       /* 0 = any type, else 'f' / 'd' / 'l' / … */
+    uint32_t gid;          /* --gid: exact group owner */
+    int have_gid;
+    uint32_t perm;         /* --perm: permission bits, masked to 07777 */
+    int perm_mode;         /* 0 = no filter, else PERM_EXACT / PERM_ALL / PERM_ANY */
     int list_paths;        /* print matching paths instead of counting them */
     int block_skip;        /* use block header summaries to skip blocks (see ECRAWL_ANALYZE_BLOCK_SKIP) */
+    int exact;             /* --exact: never answer from catalog rollups, always scan records */
 } query_spec_t;
 
+/* --perm forms, mirroring find(1): MODE is exact, -MODE is "all of these bits",
+ * /MODE is "any of these bits". */
+enum { PERM_NONE = 0, PERM_EXACT, PERM_ALL, PERM_ANY };
+
 static query_spec_t g_query;
+
+/* Permission-bit test against the recorded st_mode. */
+static int query_perm_match(uint32_t mode) {
+    uint32_t bits = mode & 07777U;
+
+    switch (g_query.perm_mode) {
+        case PERM_EXACT: return bits == g_query.perm;
+        case PERM_ALL: return (bits & g_query.perm) == g_query.perm;
+        case PERM_ANY: return g_query.perm == 0U || (bits & g_query.perm) != 0U;
+        default: return 1;
+    }
+}
 /* Top-list dimensions (selected via --top[,dim...]): dense = most regular files; deep = deepest directories. */
 static int g_top_dense = 1;
 static int g_top_deep = 0;
 
-/* Larger table → shorter collision chains; merge does many strcmp walks per insert. */
+/* Larger table → shorter collision chains on lookup, which is now the only thing the table does. */
 #define ANALYZE_HASH_BUCKETS 262144U
 #define ANALYZE_DEPTH_BINS 64U
+/*
+ * Insert locks per worker thread. Only chain insertion is serialized, and only against the threads that
+ * draw the same stripe, so more stripes than threads keeps that collision rare while the array stays small
+ * (a mutex per stripe, not per bucket).
+ */
+#define ANALYZE_INSERT_STRIPES_PER_THREAD 8U
+#define ANALYZE_INSERT_STRIPES_MAX 4096U
 
 typedef struct parent_node {
     struct parent_node *next;
     char *path;
-    uint64_t nfile;
-    uint64_t ndir;
-    uint64_t nsym;
-    uint64_t nother;
+    /*
+     * Bumped by whichever worker reads a child record under this parent, so they are atomic. Relaxed is
+     * enough: nothing is ordered against them and they are only read after every worker has joined.
+     */
+    _Atomic uint64_t nfile;
+    _Atomic uint64_t ndir;
+    _Atomic uint64_t nsym;
+    _Atomic uint64_t nother;
 } parent_node_t;
 
+/*
+ * One map for the whole run, shared by every parse worker.
+ *
+ * Each worker used to fill a private map which were then reduced pairwise. Nearly every directory lives in
+ * exactly one chunk, so that reduce re-hashed, re-compared and re-allocated almost every node it touched —
+ * it repeated the entire build, and cost more than half the CPU of a shape run (parent_map_merge_into 27.7%
+ * plus the merge threads' 23.9%). Sharing the map instead means a parent that spans chunks is simply found
+ * by the second worker, and the report reads the map the workers filled.
+ */
 typedef struct {
     parent_node_t *buckets[ANALYZE_HASH_BUCKETS];
-    size_t node_count; /* distinct parents inserted; maintained incrementally to avoid full bucket walks */
+    pthread_mutex_t *stripes;
+    size_t stripe_count; /* power of two; stripe = bucket & (stripe_count - 1) */
 } parent_map_t;
 
 /*
@@ -114,17 +161,31 @@ typedef struct {
 } analyze_dir_cache_ent_t;
 
 /*
- * Which directories of one shard's catalog lie at or under --subtree. Records
- * carry a parent_dir_id, so membership is a single array lookup per record; the
- * alternative is rebuilding a full path per record, which is what makes a
- * subtree question expensive in the first place. Built once per shard, beside
- * the catalog it indexes, and freed with it.
+ * Where --subtree lands in one shard's catalog. Membership is the DFS range test
+ * dfs_lo <= dfs_index[parent_dir_id] < dfs_hi, which is O(1) per record against
+ * an array the catalog already carries. Earlier this was a per-shard byte array
+ * painted by walking every directory's parent chain; the permutation makes both
+ * the extra pass and the extra allocation unnecessary. Built once per shard,
+ * beside the catalog it indexes.
  */
 typedef struct {
-    unsigned char *state; /* [0..max_dir_id]: 1 = at or under the subtree */
+    const uint64_t *dfs_index; /* borrowed from the catalog; NULL if unavailable */
     uint64_t max_dir_id;
+    uint64_t root_id; /* 0 = this shard holds nothing under the subtree */
+    uint64_t dfs_lo;
+    uint64_t dfs_hi;
     int whole; /* subtree covers the entire catalog */
 } shard_subtree_t;
+
+static inline int subtree_contains(const shard_subtree_t *s, uint64_t dir_id) {
+    uint64_t p;
+
+    if (!s) return 0;
+    if (s->whole) return 1;
+    if (!s->dfs_index || s->root_id == 0ULL || dir_id == 0ULL || dir_id > s->max_dir_id) return 0;
+    p = s->dfs_index[dir_id];
+    return p >= s->dfs_lo && p < s->dfs_hi;
+}
 
 /* One inode whose byte credit is deferred until the global hardlink merge. */
 typedef struct {
@@ -177,7 +238,7 @@ typedef struct {
     _Atomic size_t chunk_cursor;
     _Atomic int failures;
     _Atomic unsigned slot_assign;
-    parent_map_t **maps;
+    parent_map_t *map; /* shared by every parse worker; NULL in query mode */
     uint64_t **depth_hist;
     query_result_t *qres; /* array[nthreads]; query mode only */
     uint64_t analyze_bytes_total;
@@ -363,7 +424,8 @@ static int query_set_subtree(const char *arg, const char *prog) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--verbose] [--top[,dim...] N] <crawl-output-dir>\n"
-            "       %s [--subtree DIR] [--size-gt N] [--type f|d|l|c|b|p|s|o] [--list] <crawl-output-dir>\n"
+            "       %s [--subtree DIR] [--size-gt N] [--type f|d|l|c|b|p|s|o] [--gid N] [--perm MODE]\n"
+            "          [--list] <crawl-output-dir>\n"
             "  Read-only parallel scan of uid_shard_*.bin shards; directory-shape stats on stdout.\n"
             "  Uses .ckpt segment boundaries when sidecars are valid; else one range per shard.\n"
             "  Parallel threads: ECRAWL_ANALYZE_THREADS (default %u), or ECRAWL_REPAIR_THREADS if unset.\n"
@@ -374,17 +436,29 @@ static void usage(const char *prog) {
             "      deep  = top N deepest parent directories (by path slash count)\n"
             "    e.g. --top,deep N (deepest only) or --top,dense,deep N (both lists).\n"
             "\n"
-            "  Query form (any of --subtree/--size-gt/--type/--list): selects records instead of\n"
-            "  reporting directory shape. Filters combine with AND.\n"
+            "  Query form (any of --subtree/--size-gt/--type/--gid/--perm/--list): selects records\n"
+            "  instead of reporting directory shape. Filters combine with AND.\n"
             "    --subtree DIR  only records at or under DIR (DIR itself included, as du counts it)\n"
             "    --size-gt N    only records larger than N bytes (find -size +Nc)\n"
             "    --type C       only records of that type: f d l c b p s o (find -type)\n"
+            "    --gid N        only records owned by numeric group N\n"
+            "    --perm MODE    permission bits, octal, in the three find -perm forms:\n"
+            "                     0644  exactly these bits    e.g. --perm 0777\n"
+            "                     -MODE all of these bits     e.g. --perm -0002 (world-writable)\n"
+            "                     /MODE any of these bits     e.g. --perm /0022 (group- or world-writable)\n"
             "    --list         print each matching path on stdout; the totals move to stderr\n"
-            "  Compressed blocks whose header summary cannot match the size/type filters are skipped\n"
-            "  without decompressing; set ECRAWL_ANALYZE_BLOCK_SKIP=0 to decompress every block.\n"
+            "    --exact        never answer from catalog rollups; always scan the records\n"
+            "  A bare --subtree DIR aggregate is answered from the per-directory rollups the crawl\n"
+            "  already computed, reading no records at all, so its cost is O(directories) rather than\n"
+            "  O(files). That shortcut is taken only when it provably equals the scan: it is skipped\n"
+            "  when any record in the subtree has nlink > 1, since crawl-time hardlink credit is\n"
+            "  attributed to the first link seen anywhere in the tree while a scan dedups within the\n"
+            "  subtree. --exact forces the scan; answered_from= in the output says which ran.\n"
+            "  Row groups whose column zone maps cannot match the size/type/gid filters are skipped\n"
+            "  without decompressing; set ECRAWL_ANALYZE_BLOCK_SKIP=0 to decode every row group.\n"
             "  Totals are key=value lines: entries, files, dirs, symlinks, other, bytes,\n"
-            "  hardlink_dupes, records_scanned, block skip diagnostics, elapsed_sec. bytes is apparent size with each\n"
-            "  multiply-linked inode counted once, so it matches du -sb.\n",
+            "  hardlink_dupes, records_scanned, block skip diagnostics, answered_from, elapsed_sec.\n"
+            "  bytes is apparent size with each multiply-linked inode counted once, so it matches du -sb.\n",
             prog, prog, DEFAULT_ANALYZE_THREADS, g_top_n);
 }
 
@@ -462,8 +536,32 @@ static uint32_t analyze_hash_parent(const char *s) {
     return h;
 }
 
-static parent_map_t *parent_map_new(void) {
+/* nthreads: workers that will share the map, which sets how finely inserts are striped. */
+static parent_map_t *parent_map_new(unsigned nthreads) {
     parent_map_t *m = (parent_map_t *)calloc(1, sizeof(*m));
+    size_t want;
+    size_t i;
+
+    if (!m) return NULL;
+
+    want = (size_t)(nthreads ? nthreads : 1U) * (size_t)ANALYZE_INSERT_STRIPES_PER_THREAD;
+    if (want > (size_t)ANALYZE_INSERT_STRIPES_MAX) want = (size_t)ANALYZE_INSERT_STRIPES_MAX;
+    m->stripe_count = 1U;
+    while (m->stripe_count < want) m->stripe_count <<= 1;
+
+    m->stripes = (pthread_mutex_t *)calloc(m->stripe_count, sizeof(*m->stripes));
+    if (!m->stripes) {
+        free(m);
+        return NULL;
+    }
+    for (i = 0; i < m->stripe_count; i++) {
+        if (pthread_mutex_init(&m->stripes[i], NULL) != 0) {
+            while (i > 0U) pthread_mutex_destroy(&m->stripes[--i]);
+            free(m->stripes);
+            free(m);
+            return NULL;
+        }
+    }
     return m;
 }
 
@@ -480,90 +578,63 @@ static void parent_map_free(parent_map_t *m) {
             n = nx;
         }
     }
+    for (bi = 0; bi < m->stripe_count; bi++) pthread_mutex_destroy(&m->stripes[bi]);
+    free(m->stripes);
     free(m);
 }
 
 static inline void parent_node_bump(parent_node_t *n, uint8_t typ) {
+    _Atomic uint64_t *c;
+
     if (typ == (uint8_t)'f')
-        n->nfile++;
+        c = &n->nfile;
     else if (typ == (uint8_t)'d')
-        n->ndir++;
+        c = &n->ndir;
     else if (typ == (uint8_t)'l')
-        n->nsym++;
+        c = &n->nsym;
     else
-        n->nother++;
+        c = &n->nother;
+    atomic_fetch_add_explicit(c, 1ULL, memory_order_relaxed);
 }
 
-/* Find the node for parent, creating it (counters zeroed) if absent. Returns NULL only on allocation failure. */
+/*
+ * Find the node for parent, creating it (counters zeroed) if absent. Returns NULL only on allocation
+ * failure. Safe to call from every worker at once: the stripe lock covers both the chain walk and the
+ * insert, and the returned node stays valid for the rest of the run (nodes are never moved or freed until
+ * the report is done with them), so callers may memo the pointer.
+ */
 static parent_node_t *parent_map_get_or_add(parent_map_t *m, const char *parent) {
     uint32_t hx = analyze_hash_parent(parent);
     size_t bi = (size_t)(hx % ANALYZE_HASH_BUCKETS);
-    parent_node_t **pp = &m->buckets[bi];
+    pthread_mutex_t *lock = &m->stripes[bi & (m->stripe_count - 1U)];
     parent_node_t *node;
 
-    while (*pp) {
-        if (strcmp((*pp)->path, parent) == 0) return *pp;
-        pp = &(*pp)->next;
+    pthread_mutex_lock(lock);
+    for (node = m->buckets[bi]; node; node = node->next) {
+        if (strcmp(node->path, parent) == 0) {
+            pthread_mutex_unlock(lock);
+            return node;
+        }
     }
     node = (parent_node_t *)malloc(sizeof(*node));
-    if (!node) return NULL;
+    if (!node) {
+        pthread_mutex_unlock(lock);
+        return NULL;
+    }
     node->path = strdup(parent);
     if (!node->path) {
         free(node);
+        pthread_mutex_unlock(lock);
         return NULL;
     }
+    atomic_init(&node->nfile, 0ULL);
+    atomic_init(&node->ndir, 0ULL);
+    atomic_init(&node->nsym, 0ULL);
+    atomic_init(&node->nother, 0ULL);
     node->next = m->buckets[bi];
     m->buckets[bi] = node;
-    m->node_count++;
-    node->nfile = node->ndir = node->nsym = node->nother = 0;
+    pthread_mutex_unlock(lock);
     return node;
-}
-
-static void parent_map_add_totals(parent_map_t *m, const char *parent, uint64_t nf, uint64_t nd, uint64_t ns,
-                                  uint64_t no) {
-    uint32_t hx = analyze_hash_parent(parent);
-    size_t bi = (size_t)(hx % ANALYZE_HASH_BUCKETS);
-    parent_node_t **pp = &m->buckets[bi];
-
-    while (*pp) {
-        if (strcmp((*pp)->path, parent) == 0) {
-            (*pp)->nfile += nf;
-            (*pp)->ndir += nd;
-            (*pp)->nsym += ns;
-            (*pp)->nother += no;
-            return;
-        }
-        pp = &(*pp)->next;
-    }
-    {
-        parent_node_t *node = (parent_node_t *)malloc(sizeof(*node));
-        if (!node) return;
-        node->path = strdup(parent);
-        if (!node->path) {
-            free(node);
-            return;
-        }
-        node->next = m->buckets[bi];
-        m->buckets[bi] = node;
-        m->node_count++;
-        node->nfile = nf;
-        node->ndir = nd;
-        node->nsym = ns;
-        node->nother = no;
-    }
-}
-
-static void parent_map_merge_into(parent_map_t *dst, parent_map_t *src) {
-    size_t bi;
-
-    if (!dst || !src) return;
-    for (bi = 0; bi < ANALYZE_HASH_BUCKETS; bi++) {
-        parent_node_t *n = src->buckets[bi];
-        while (n) {
-            parent_map_add_totals(dst, n->path, n->nfile, n->ndir, n->nsym, n->nother);
-            n = n->next;
-        }
-    }
 }
 
 static int parent_dir_from_path(const unsigned char *path, uint16_t path_len, char *parent, size_t parent_sz) {
@@ -624,9 +695,8 @@ static const crawl_bin_chunk_stdio_t analyze_chunk_io = { fopen, analyze_stdio_f
 /*
  * Append one [lo, hi) segment, subdividing it at block boundaries when the
  * caller asked for smaller jobs. Checkpoint segments are 32 MiB apart, so a
- * capture of a few hundred MiB yields only a handful of jobs — fine for the
- * shape report, which is dominated by the merge, but it leaves most of a query's
- * thread budget idle. Splitting costs one pass over the block headers.
+ * capture of a few hundred MiB yields only a handful of jobs and leaves most of
+ * the thread budget idle. Splitting costs one pass over the block headers.
  */
 static int analyze_append_segment_jobs(crawl_bin_file_chunk_t **all, size_t *all_n, size_t *all_cap,
                                        const char *path, uint64_t lo, uint64_t hi, size_t file_index,
@@ -764,134 +834,6 @@ static int analyze_interleave_chunks_shard_round_robin(crawl_bin_file_chunk_t **
     return 0;
 }
 
-typedef struct {
-    parent_map_t *dst;
-    parent_map_t *src;
-} analyze_merge_pair_t;
-
-static void analyze_merge_pair_do(analyze_merge_pair_t *p) {
-    parent_map_merge_into(p->dst, p->src);
-    parent_map_free(p->src);
-    p->src = NULL;
-}
-
-static void *analyze_merge_pair_thread(void *arg) {
-    analyze_merge_pair_do((analyze_merge_pair_t *)arg);
-    return NULL;
-}
-
-typedef struct {
-    parent_map_t *m;
-    size_t cnt;
-} analyze_map_sz_t;
-
-static int cmp_analyze_map_sz_asc(const void *a, const void *b) {
-    const analyze_map_sz_t *xa = (const analyze_map_sz_t *)a;
-    const analyze_map_sz_t *xb = (const analyze_map_sz_t *)b;
-
-    if (xa->cnt < xb->cnt) return -1;
-    if (xa->cnt > xb->cnt) return 1;
-    return 0;
-}
-
-/* Sort maps by distinct-parent count so pairs (2k,2k+1) merge a smaller map into a larger one. */
-static void analyze_sort_maps_by_node_count(parent_map_t **maps, unsigned n) {
-    analyze_map_sz_t *rows;
-    unsigned i;
-
-    if (n <= 1U) return;
-    rows = (analyze_map_sz_t *)malloc((size_t)n * sizeof(*rows));
-    if (!rows) return;
-    for (i = 0; i < n; i++) {
-        rows[i].m = maps[i];
-        rows[i].cnt = maps[i]->node_count;
-    }
-    qsort(rows, (size_t)n, sizeof(*rows), cmp_analyze_map_sz_asc);
-    for (i = 0; i < n; i++) maps[i] = rows[i].m;
-    free(rows);
-}
-
-/*
- * Reduce *n_io maps at maps[0..*n_io-1] into maps[0]. Clears maps[*n_io..maps_cap-1] each round so no slot
- * keeps a dangling pointer after its map was freed as a merge source. Uses up to max_workers threads per batch.
- */
-static int analyze_parallel_reduce_parent_maps(parent_map_t **maps, unsigned *n_io, unsigned maps_cap,
-                                               unsigned max_workers) {
-    analyze_merge_pair_t *jobs = NULL;
-    pthread_t *ths = NULL;
-    unsigned mw = max_workers;
-    unsigned n = *n_io;
-    size_t jobs_sz;
-    unsigned pass = 0;
-
-    if (n <= 1U) {
-        *n_io = n;
-        return 0;
-    }
-    if (mw < 1U) mw = 1U;
-    if (mw > 1024U) mw = 1024U;
-
-    jobs_sz = (size_t)(maps_cap / 2U + 1U);
-    jobs = (analyze_merge_pair_t *)malloc(jobs_sz * sizeof(*jobs));
-    ths = (pthread_t *)malloc((size_t)mw * sizeof(*ths));
-    if (!jobs || !ths) {
-        free(jobs);
-        free(ths);
-        return -1;
-    }
-
-    while (n > 1U) {
-        unsigned np = n / 2U;
-        unsigned odd = n % 2U;
-        unsigned b;
-        unsigned u;
-
-        pass++;
-        fprintf(stderr, "ecrawl_analyze: merge pass %u: %u map(s) left (~%u parallel merge(s))\n", pass, n, np);
-        fflush(stderr);
-
-        analyze_sort_maps_by_node_count(maps, n);
-
-        if (np > jobs_sz) {
-            free(jobs);
-            free(ths);
-            return -1;
-        }
-        /* After ascending sort: maps[2b] is no larger than maps[2b+1]; merge smaller src into larger dst. */
-        for (b = 0; b < np; b++) {
-            jobs[b].src = maps[2U * b];
-            jobs[b].dst = maps[2U * b + 1U];
-        }
-
-        for (b = 0; b < np; b += mw) {
-            unsigned nb = np - b;
-            unsigned j;
-
-            if (nb > mw) nb = mw;
-            for (j = 0; j < nb; j++) {
-                if (pthread_create(&ths[j], NULL, analyze_merge_pair_thread, &jobs[b + j]) != 0) {
-                    for (unsigned k = 0; k < j; k++) pthread_join(ths[k], NULL);
-                    for (; j < nb; j++) analyze_merge_pair_do(&jobs[b + j]);
-                    goto batch_done;
-                }
-            }
-            for (j = 0; j < nb; j++) pthread_join(ths[j], NULL);
-        batch_done:;
-        }
-
-        for (b = 0; b < np; b++) maps[b] = jobs[b].dst;
-        if (odd)
-            maps[np] = maps[2U * np];
-        n = np + odd;
-        for (u = n; u < maps_cap; u++) maps[u] = NULL;
-    }
-
-    *n_io = n;
-    free(jobs);
-    free(ths);
-    return 0;
-}
-
 /*
  * Build parse jobs from .ckpt segment boundaries only (no prescan of shard bodies).
  * Falls back to one job per shard [sizeof(hdr), file_size) when sidecar is missing or invalid.
@@ -1026,6 +968,12 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
     bio.fread = fread_unlocked; /* fp is owned by one thread; unlocked is safe */
     bio.fclose = NULL;
     if (crawl_bin_block_reader_init(&br, &bio, fp, start_off, scan_end_exclusive) != 0) return -1;
+    /* Directory-shape stats need the parent, the type and the name. Sizes,
+     * timestamps and ownership are eight more columns this pass never reads, so
+     * leaving them out of the projection skips both their I/O and their decode. */
+    (void)crawl_bin_block_reader_set_projection(&br, CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID) |
+                                                         CRAWL_COL_BIT(CRAWL_COL_TYPE) |
+                                                         CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
 
     for (;;) {
         bin_record_hdr_t rh;
@@ -1090,15 +1038,15 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
 }
 
 /*
- * Mark every directory of one catalog that lies at or under g_query.subtree.
+ * Locate g_query.subtree in one catalog and record its DFS range.
  *
- * Two passes, both linear in the number of directories rather than records: find
- * the subtree's own dir_id by name (a component compare, so only namesakes cost a
- * path rebuild), then resolve the rest by walking parents with memoisation.
+ * One pass over the directories to find the subtree's own dir_id by name -- a
+ * component compare, so only namesakes cost a path rebuild -- and then the
+ * range comes straight out of the permutation. Membership for every record is a
+ * comparison against that range afterwards.
  */
 static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out) {
     uint64_t did;
-    uint64_t root_id = 0;
     char pathbuf[PATH_MAX];
 
     memset(out, 0, sizeof(*out));
@@ -1108,8 +1056,12 @@ static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out) {
         out->whole = 1;
         return 0;
     }
-    out->state = (unsigned char *)calloc((size_t)cat->max_dir_id + 1U, sizeof(*out->state));
-    if (!out->state) return -1;
+    if (!cat->dfs_index || !cat->dfs_subtree_dirs) {
+        /* A capture written before the post-pass, or a catalog loaded without
+         * the subtree group: refuse rather than silently matching nothing. */
+        errno = EINVAL;
+        return -1;
+    }
 
     for (did = 1; did <= cat->max_dir_id; did++) {
         if ((size_t)cat->name_len[did] != g_query.sub_base_len) continue;
@@ -1117,36 +1069,22 @@ static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out) {
         if (memcmp(cat->name_comp[did], g_query.sub_base, g_query.sub_base_len) != 0) continue;
         if (crawl_bin_catalog_dir_path(cat, did, pathbuf, sizeof(pathbuf)) != 0) continue;
         if (strcmp(pathbuf, g_query.subtree) == 0) {
-            root_id = did;
+            out->root_id = did;
             break; /* a path is unique within a catalog */
         }
     }
-    if (root_id == 0) return 0; /* this shard holds nothing under the subtree */
-    out->state[root_id] = 1;
+    if (out->root_id == 0) return 0; /* this shard holds nothing under the subtree */
 
-    for (did = 1; did <= cat->max_dir_id; did++) {
-        uint64_t cur = did;
-        uint64_t hops = 0;
-        unsigned char resolved = 2;
-
-        if (out->state[did] != 0) continue;
-        /* Walk to the first ancestor with a verdict, then paint the way back. */
-        while (cur >= 1ULL && cur <= cat->max_dir_id && out->state[cur] == 0 && cur != 1ULL) {
-            if (++hops > cat->max_dir_id) break; /* corrupt parent chain; treat as outside */
-            cur = cat->parent_dir_id[cur];
-        }
-        if (cur >= 1ULL && cur <= cat->max_dir_id && out->state[cur] != 0) resolved = out->state[cur];
-        for (cur = did; cur >= 1ULL && cur <= cat->max_dir_id && out->state[cur] == 0;
-             cur = cat->parent_dir_id[cur])
-            out->state[cur] = resolved;
-    }
+    out->dfs_index = cat->dfs_index;
+    out->dfs_lo = cat->dfs_index[out->root_id];
+    out->dfs_hi = out->dfs_lo + cat->dfs_subtree_dirs[out->root_id];
     return 0;
 }
 
 static void subtree_free(shard_subtree_t *s) {
     if (!s) return;
-    free(s->state);
-    s->state = NULL;
+    /* dfs_index is borrowed from the catalog, which owns it. */
+    memset(s, 0, sizeof(*s));
 }
 
 static pthread_mutex_t g_query_out_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1198,8 +1136,42 @@ static int query_hardlink_defer(query_result_t *qr, const bin_record_hdr_t *rh) 
     return 0;
 }
 
+static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, size_t fi, const char *full_path);
+
+/*
+ * Deferred catalog handle for one chunk. A query only needs the catalog to turn a matched
+ * record into a path, so loading it up front made a query that matches nothing (or that
+ * only counts) pay the full per-shard catalog build for no benefit — 55% of the profile on
+ * a 782k-parent shard whose blocks were all skipped. Resolve on first actual use instead.
+ */
+typedef struct {
+    analyze_pool_t *pool;
+    size_t fi;
+    const char *path;
+    const crawl_bin_catalog_t *cat;
+    unsigned char resolved;
+} query_cat_lazy_t;
+
+static void query_cat_lazy_init(query_cat_lazy_t *lz, analyze_pool_t *p, size_t fi, const char *path) {
+    lz->pool = p;
+    lz->fi = fi;
+    lz->path = path;
+    lz->cat = NULL;
+    lz->resolved = 0;
+}
+
+/* NULL when the shard's catalog is missing or fails to load; callers treat that as an error
+ * so a bad catalog still fails loudly rather than yielding pathless results. */
+static const crawl_bin_catalog_t *query_cat_lazy_get(query_cat_lazy_t *lz) {
+    if (!lz->resolved) {
+        lz->cat = analyze_get_shard_catalog(lz->pool, lz->fi, lz->path);
+        lz->resolved = 1;
+    }
+    return lz->cat;
+}
+
 static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_exclusive,
-                               const crawl_bin_catalog_t *cat, const shard_subtree_t *sub,
+                               query_cat_lazy_t *lz, const shard_subtree_t *sub,
                                crawl_bin_block_reader_t *br,
                                char *fullpath_buf, size_t fullpath_sz, query_result_t *qr,
                                uint64_t *nrec_out) {
@@ -1214,8 +1186,33 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
     bio.fread = fread_unlocked;
     bio.fclose = NULL;
     if (crawl_bin_block_reader_reinit(br, &bio, fp, start_off, scan_end_exclusive) != 0) return -1;
-    if (g_query.block_skip)
+    /*
+     * The query predicate reads the parent, the type and the size; the byte
+     * total additionally needs nlink plus (dev, inode) to dedup hardlinks the
+     * way du does. Timestamps and uid are never consulted here, and gid/mode
+     * only when --gid or --perm ask for them. Names are only needed to print
+     * paths, and to recognise the subtree's own directory record, whose parent
+     * lies outside the subtree by construction.
+     */
+    {
+        uint32_t proj = CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID) | CRAWL_COL_BIT(CRAWL_COL_TYPE) |
+                        CRAWL_COL_BIT(CRAWL_COL_SIZE) | CRAWL_COL_BIT(CRAWL_COL_NLINK) |
+                        CRAWL_COL_BIT(CRAWL_COL_INODE) | CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
+                        CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR);
+
+        if (g_query.list_paths || g_query.subtree) proj |= CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES);
+        if (g_query.have_gid) proj |= CRAWL_COL_BIT(CRAWL_COL_GID);
+        if (g_query.perm_mode) proj |= CRAWL_COL_BIT(CRAWL_COL_MODE);
+        (void)crawl_bin_block_reader_set_projection(br, proj);
+    }
+    if (g_query.block_skip) {
         (void)crawl_bin_block_reader_set_filter(br, g_query.have_size_gt, g_query.size_gt, g_query.type_filter);
+        /* gid is RLE'd and near-constant within a uid shard, so its zone map is
+         * usually a single value: --gid prunes whole row groups. --perm cannot,
+         * because a bit test is not a range. */
+        if (g_query.have_gid)
+            (void)crawl_bin_block_reader_add_range(br, CRAWL_COL_GID, g_query.gid, g_query.gid);
+    }
 
     for (;;) {
         bin_record_hdr_t rh;
@@ -1232,7 +1229,7 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
 
         in_scope = 1;
         if (g_query.subtree && !(sub && sub->whole)) {
-            in_scope = (sub && sub->state && pid <= sub->max_dir_id && sub->state[pid] == 1);
+            in_scope = subtree_contains(sub, pid);
             /*
              * The subtree's own directory record hangs off its parent, so the
              * membership array never claims it, yet du counts it. Namesake
@@ -1241,6 +1238,9 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
              */
             if (!in_scope && rh.type == (uint8_t)'d' && (size_t)rh.name_len == g_query.sub_base_len &&
                 memcmp(rec_name, g_query.sub_base, g_query.sub_base_len) == 0) {
+                const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+
+                if (!cat) return -1;
                 if (crawl_bin_catalog_entry_path(cat, pid, (const char *)rec_name, rh.name_len, fullpath_buf,
                                                  fullpath_sz) == 0 &&
                     strcmp(fullpath_buf, g_query.subtree) == 0)
@@ -1251,6 +1251,8 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
 
         if (g_query.have_size_gt && rh.size <= g_query.size_gt) continue;
         if (g_query.type_filter && rh.type != (uint8_t)g_query.type_filter) continue;
+        if (g_query.have_gid && rh.gid != g_query.gid) continue;
+        if (g_query.perm_mode && !query_perm_match(rh.mode)) continue;
 
         qr->entries++;
         if (rh.type == (uint8_t)'f')
@@ -1277,6 +1279,9 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
             size_t fullpath_len = 0;
 
             if (cached_parent_id != pid) {
+                const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+
+                if (!cat) return -1;
                 if (crawl_bin_catalog_dir_path_len(cat, pid, parent_path, sizeof(parent_path),
                                                    &cached_parent_len) != 0)
                     return -1;
@@ -1331,8 +1336,12 @@ static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, s
 
             if (fread(&fh, sizeof(fh), 1, fp) == 1 && crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION) &&
                 fh.catalog_offset != 0ULL && fh.catalog_offset <= fsz) {
-                if (crawl_bin_catalog_load(fp, fh.catalog_offset, fsz, &p->shard_cat[fi]) == 0) st = 1;
-                /* crawl_bin_catalog_load already frees + re-inits the struct on failure. */
+                /* Tree fields plus the DFS permutation subtree_build needs; the
+                 * imm_child_* rollups are only read by the fast path, which has
+                 * its own load below. */
+                if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, fsz, CRAWL_CAT_SUBTREE, &p->shard_cat[fi]) == 0)
+                    st = 1;
+                /* The loader already frees + re-inits the struct on failure. */
             }
             /* Subtree membership belongs to the catalog: same lifetime, built once. */
             if (st == 1 && p->shard_sub && subtree_build(&p->shard_cat[fi], &p->shard_sub[fi]) != 0) {
@@ -1425,14 +1434,13 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
 }
 
 static int query_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
-                               const crawl_bin_catalog_t *cat, const shard_subtree_t *sub,
+                               query_cat_lazy_t *lz, const shard_subtree_t *sub,
                                crawl_bin_block_reader_t *br,
                                char *fullpath_buf, size_t fullpath_sz, char *iobuf, size_t iobuf_sz,
                                query_result_t *qr, uint64_t *nrec_out) {
     FILE *fp;
     int rc;
 
-    if (!cat) return -1;
     if (start_off > file_sz || end_off > file_sz || start_off >= end_off) return -1;
     fp = fopen(full_path, "rb");
     if (!fp) {
@@ -1444,7 +1452,7 @@ static int query_process_chunk(const char *full_path, uint64_t start_off, uint64
         fclose(fp);
         return -1;
     }
-    rc = query_scan_fp_until(fp, start_off, end_off, cat, sub, br, fullpath_buf, fullpath_sz, qr, nrec_out);
+    rc = query_scan_fp_until(fp, start_off, end_off, lz, sub, br, fullpath_buf, fullpath_sz, qr, nrec_out);
     fclose(fp);
     return rc;
 }
@@ -1486,13 +1494,20 @@ static void *query_worker_main(void *arg) {
         if (i >= p->chunk_count) break;
         c = &p->chunks[i];
         {
-            const crawl_bin_catalog_t *cat = analyze_get_shard_catalog(p, c->file_index, c->path);
             const shard_subtree_t *sub = p->shard_sub ? &p->shard_sub[c->file_index] : NULL;
+            query_cat_lazy_t lz;
 
-            ar = cat ? query_process_chunk(c->path, c->start_offset, c->end_offset,
-                                           p->shard_file_sizes[c->file_index], cat, sub, &br,
-                                           fullpath_buf, PATH_MAX, iobuf, iobuf_sz, qr, &nrec)
-                     : -1;
+            query_cat_lazy_init(&lz, p, c->file_index, c->path);
+            /* --subtree filters records against membership state that is built from the
+             * catalog, so that mode has to resolve it before scanning. Every other query
+             * defers until a matched record needs a path. */
+            if (g_query.subtree && !query_cat_lazy_get(&lz)) {
+                ar = -1;
+            } else {
+                ar = query_process_chunk(c->path, c->start_offset, c->end_offset,
+                                         p->shard_file_sizes[c->file_index], &lz, sub, &br,
+                                         fullpath_buf, PATH_MAX, iobuf, iobuf_sz, qr, &nrec);
+            }
             analyze_release_shard_chunk(p, c->file_index);
         }
 
@@ -1578,6 +1593,126 @@ static uint64_t query_hardlink_bytes(query_result_t *res, unsigned n, uint64_t *
     return bytes;
 }
 
+/*
+ * Answer a plain --subtree aggregate from the catalog rollups alone, touching no
+ * records at all. This is the whole point of the DFS post-pass: the cost becomes
+ * O(directories) instead of O(files), so it holds at a billion files where a
+ * full pass does not.
+ *
+ * It is only attempted when the answer is provably identical to the scan:
+ *
+ *   - no --size-gt / --type / --gid / --perm, because the rollups aggregate every record; and no
+ *     --list, because printing paths needs the records regardless.
+ *   - subtree_nlink_gt1_count == 0 on the matched root in every shard. Crawl-time
+ *     hardlink credit lands with the first link visited anywhere in the tree,
+ *     while the scan dedups within the queried subtree, so with a multiply-linked
+ *     file in scope the two legitimately differ. Zero means there is none.
+ *   - the subtree root was found in exactly the shards that have it, with the
+ *     post-pass fields present.
+ *
+ * Returns 1 when it answered (filling *out), 0 when the caller must scan.
+ */
+typedef struct {
+    uint64_t entries, files, dirs, symlinks, other, bytes, dirs_scanned;
+} query_rollup_t;
+
+static int query_rollup_eligible(void) {
+    return g_query.active && g_query.subtree && !g_query.subtree_is_root && !g_query.exact &&
+           !g_query.have_size_gt && !g_query.type_filter && !g_query.have_gid && !g_query.perm_mode &&
+           !g_query.list_paths;
+}
+
+static int query_try_rollup(const char *dir_path, char **names, size_t name_count, query_rollup_t *out) {
+    size_t fi;
+    int found_any = 0;
+
+    memset(out, 0, sizeof(*out));
+
+    for (fi = 0; fi < name_count; fi++) {
+        char full[PATH_MAX];
+        FILE *fp;
+        bin_file_header_t fh;
+        struct stat stt;
+        crawl_bin_catalog_t cat;
+        shard_subtree_t sub;
+        uint64_t root;
+        int ok = 0;
+
+        if (snprintf(full, sizeof(full), "%s/%s", dir_path, names[fi]) >= (int)sizeof(full)) return 0;
+        if (stat(full, &stt) != 0) return 0;
+        fp = fopen(full, "rb");
+        if (!fp) return 0;
+
+        crawl_bin_catalog_init_empty(&cat);
+        if (fread(&fh, sizeof(fh), 1, fp) == 1 &&
+            crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION) && fh.catalog_offset != 0ULL &&
+            fh.catalog_offset <= (uint64_t)stt.st_size &&
+            crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)stt.st_size, CRAWL_CAT_SUBTREE, &cat) ==
+                0)
+            ok = 1;
+        fclose(fp);
+        if (!ok) {
+            crawl_bin_catalog_free(&cat);
+            return 0;
+        }
+
+        if (subtree_build(&cat, &sub) != 0) {
+            crawl_bin_catalog_free(&cat);
+            return 0;
+        }
+        root = sub.root_id;
+        out->dirs_scanned += cat.max_dir_id;
+        if (root != 0ULL) {
+            if (cat.subtree_nlink_gt1_count[root] != 0ULL) {
+                /* A multiply-linked file in scope makes the rollup and the scan
+                 * legitimately disagree; do not present it as the answer. */
+                crawl_bin_catalog_free(&cat);
+                return 0;
+            }
+            found_any = 1;
+            out->bytes += cat.subtree_bytes[root];
+            out->entries += cat.subtree_count[root];
+            out->files += cat.subtree_files[root];
+            out->dirs += cat.subtree_dirs[root];
+            out->symlinks += cat.subtree_symlinks[root];
+            /* The root directory's own record lives in exactly one shard -- the
+             * one owning it -- while every shard with a descendant carries a
+             * catalog row for the path. Count it where the record actually is. */
+            if (cat.self_present[root]) {
+                out->bytes += cat.self_bytes[root];
+                out->entries++;
+                out->dirs++;
+            }
+        }
+        crawl_bin_catalog_free(&cat);
+    }
+
+    if (!found_any) return 0;
+    out->other = out->entries - out->files - out->dirs - out->symlinks;
+    return 1;
+}
+
+/* Same key=value shape as query_report, so a caller cannot tell which path
+ * produced the answer except by the diagnostics. */
+static void query_report_rollup(const query_rollup_t *r, double elapsed) {
+    printf("subtree=%s\n", g_query.subtree);
+    printf("entries=%" PRIu64 "\n", r->entries);
+    printf("files=%" PRIu64 "\n", r->files);
+    printf("dirs=%" PRIu64 "\n", r->dirs);
+    printf("symlinks=%" PRIu64 "\n", r->symlinks);
+    printf("other=%" PRIu64 "\n", r->other);
+    printf("bytes=%" PRIu64 "\n", r->bytes);
+    printf("hardlink_dupes=0\n");
+    printf("records_scanned=0\n");
+    printf("blocks_decompressed=0\n");
+    printf("blocks_skipped=0\n");
+    printf("records_skipped_by_block_filter=0\n");
+    printf("answered_from=catalog_rollup\n");
+    printf("directories_examined=%" PRIu64 "\n", r->dirs_scanned);
+    printf("elapsed_sec=%.3f\n", elapsed);
+    fflush(stdout);
+}
+
 static void query_report(query_result_t *res, unsigned n, uint64_t records_scanned, double elapsed) {
     FILE *out = g_query.list_paths ? stderr : stdout;
     query_result_t sum;
@@ -1601,6 +1736,11 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
 
     fprintf(out, "subtree=%s\n", g_query.subtree ? g_query.subtree : "(whole capture)");
     if (g_query.have_size_gt) fprintf(out, "size_gt=%" PRIu64 "\n", g_query.size_gt);
+    if (g_query.have_gid) fprintf(out, "gid=%" PRIu32 "\n", g_query.gid);
+    if (g_query.perm_mode)
+        fprintf(out, "perm=%s%04o\n",
+                g_query.perm_mode == PERM_ALL ? "-" : (g_query.perm_mode == PERM_ANY ? "/" : ""),
+                (unsigned)g_query.perm);
     if (g_query.type_filter) fprintf(out, "type=%c\n", (char)g_query.type_filter);
     fprintf(out, "entries=%" PRIu64 "\n", sum.entries);
     fprintf(out, "files=%" PRIu64 "\n", sum.files);
@@ -1613,6 +1753,7 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
     fprintf(out, "blocks_decompressed=%" PRIu64 "\n", sum.blocks_decompressed);
     fprintf(out, "blocks_skipped=%" PRIu64 "\n", sum.blocks_skipped);
     fprintf(out, "records_skipped_by_block_filter=%" PRIu64 "\n", sum.records_skipped);
+    fprintf(out, "answered_from=record_scan\n");
     fprintf(out, "elapsed_sec=%.3f\n", elapsed);
     if (sum.oom) fprintf(out, "warning=allocation_failed_totals_may_be_wrong\n");
     fflush(out);
@@ -1632,7 +1773,7 @@ static void query_results_free(query_result_t *res, unsigned n) {
 static void *analyze_worker_main(void *arg) {
     analyze_pool_t *p = (analyze_pool_t *)arg;
     unsigned slot = atomic_fetch_add_explicit(&p->slot_assign, 1U, memory_order_relaxed);
-    parent_map_t *map = parent_map_new();
+    parent_map_t *map = p->map;
     uint64_t *dh = (uint64_t *)calloc((size_t)ANALYZE_DEPTH_BINS, sizeof(uint64_t));
     unsigned char *pathbuf = (unsigned char *)malloc(65536);
     char *parentbuf = (char *)malloc(65536);
@@ -1646,11 +1787,9 @@ static void *analyze_worker_main(void *arg) {
         free(pathbuf);
         free(parentbuf);
         free(dh);
-        if (map) parent_map_free(map);
         atomic_fetch_add_explicit(&p->failures, 1, memory_order_relaxed);
         return NULL;
     }
-    p->maps[slot] = map;
     p->depth_hist[slot] = dh;
 
     for (;;) {
@@ -1925,16 +2064,20 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
 }
 
 /*
- * Bytes per parse job in query mode. Checkpoint segments are 32 MiB apart, so a
- * query on a capture smaller than that would run single-threaded no matter what
- * the thread budget says. 4 MiB keeps the header pass short while giving a
- * typical capture enough jobs to fill the pool; ECRAWL_ANALYZE_CHUNK_BYTES
- * overrides it (tests use a tiny value to force many jobs from a small shard).
+ * Bytes per parse job. Checkpoint segments are 32 MiB apart, so a capture smaller
+ * than that yields one job and runs single-threaded no matter what the thread
+ * budget says — a 14 MiB shape report measured 94% CPU with 32 threads
+ * configured. 4 MiB keeps the header pass short while giving a typical capture
+ * enough jobs to fill the pool; ECRAWL_ANALYZE_CHUNK_BYTES overrides it (tests
+ * use a tiny value to force many jobs from a small shard).
+ *
+ * Splitting is safe for both modes: a job is any block-aligned byte range, and
+ * both the shape histograms and the query counters are accumulated per thread
+ * and merged at the end, so job boundaries cannot change the answer.
  */
-static uint64_t query_split_target_bytes(void) {
+static uint64_t parse_split_target_bytes(void) {
     const char *e;
 
-    if (!g_query.active) return 0ULL;
     e = getenv("ECRAWL_ANALYZE_CHUNK_BYTES");
     if (e && e[0]) {
         char *end;
@@ -1967,8 +2110,24 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     /* Off only for parity testing: skipping must never change query results. */
     g_query.block_skip = !(skip_env && strcmp(skip_env, "0") == 0);
 
+    /*
+     * A plain subtree aggregate is already summed in the catalogs, so answer it
+     * there and never open the record region: O(directories) instead of
+     * O(files). Falls through to the scan whenever the rollup cannot be proven
+     * equal to it (see query_try_rollup).
+     */
+    if (query_rollup_eligible()) {
+        query_rollup_t roll;
+        double t0 = analyze_now_sec();
+
+        if (query_try_rollup(dir_path, names, name_count, &roll)) {
+            query_report_rollup(&roll, analyze_now_sec() - t0);
+            return 0;
+        }
+    }
+
     if (analyze_build_all_chunks(dir_path, names, name_count, &shard_sizes, &chunks, &chunk_count, &chunk_byte_sum,
-                                 query_split_target_bytes()) != 0) {
+                                 parse_split_target_bytes()) != 0) {
         fprintf(stderr, "ecrawl_analyze: failed to build chunk job list\n");
         return 1;
     }
@@ -2040,14 +2199,14 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         }
     }
 
-    pool.maps = (parent_map_t **)calloc((size_t)nthreads, sizeof(*pool.maps));
+    /* Query mode keeps its counters per thread in pool.qres and never touches the parent map. */
+    if (!g_query.active) pool.map = parent_map_new(nthreads);
     pool.depth_hist = (uint64_t **)calloc((size_t)nthreads, sizeof(*pool.depth_hist));
     threads = (pthread_t *)calloc((size_t)nthreads, sizeof(*threads));
     if (g_query.active) {
         pool.qres = (query_result_t *)calloc((size_t)nthreads, sizeof(*pool.qres));
         if (!pool.qres) {
             perror("ecrawl_analyze: alloc");
-            free(pool.maps);
             free(pool.depth_hist);
             free(threads);
             analyze_free_shard_catalogs(&pool, name_count);
@@ -2057,11 +2216,12 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             return 1;
         }
     }
-    if (!pool.maps || !pool.depth_hist || !threads) {
+    if ((!g_query.active && !pool.map) || !pool.depth_hist || !threads) {
         perror("ecrawl_analyze: alloc");
-        free(pool.maps);
+        parent_map_free(pool.map);
         free(pool.depth_hist);
         free(threads);
+        query_results_free(pool.qres, nthreads);
         analyze_free_shard_catalogs(&pool, name_count);
         pthread_mutex_destroy(&pool.shard_cat_lock);
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
@@ -2092,13 +2252,12 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             for (j = 0; j < ti; j++) pthread_join(threads[j], NULL);
             rc = 1;
             merged = NULL;
+            parent_map_free(pool.map);
+            pool.map = NULL;
             for (j = 0; j < nthreads; j++) {
-                if (pool.maps[j]) parent_map_free(pool.maps[j]);
                 free(pool.depth_hist[j]);
-                pool.maps[j] = NULL;
                 pool.depth_hist[j] = NULL;
             }
-            free(pool.maps);
             free(pool.depth_hist);
             query_results_free(pool.qres, nthreads);
             pool.qres = NULL;
@@ -2132,42 +2291,16 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         pthread_mutex_destroy(&pool.shard_cat_lock);
         crawl_bin_free_chunk_array_rows(pool.chunks, pool.chunk_count);
         free(pool.shard_file_sizes);
-        free(pool.maps);
         free(pool.depth_hist);
         if (atomic_load_explicit(&pool.failures, memory_order_relaxed) > 0) rc = 1;
         return rc;
     }
 
-    merged = NULL;
-    {
-        unsigned nm = nthreads;
-
-        if (analyze_parallel_reduce_parent_maps(pool.maps, &nm, nthreads, nthreads) != 0 || nm != 1U) {
-            fprintf(stderr, "ecrawl_analyze: parallel map merge unavailable; using sequential merge\n");
-            merged = parent_map_new();
-            if (!merged) {
-                perror("parent_map_new");
-                rc = 1;
-            } else {
-                for (ti = 0; ti < nthreads; ti++) {
-                    if (pool.maps[ti]) {
-                        parent_map_merge_into(merged, pool.maps[ti]);
-                        parent_map_free(pool.maps[ti]);
-                        pool.maps[ti] = NULL;
-                    }
-                }
-            }
-        } else {
-            merged = pool.maps[0];
-            pool.maps[0] = NULL;
-        }
-    }
+    /* The workers filled it in place; nothing left to reduce but the 64-bin depth histograms. */
+    merged = pool.map;
+    pool.map = NULL;
 
     for (ti = 0; ti < nthreads; ti++) {
-        if (pool.maps[ti]) {
-            parent_map_free(pool.maps[ti]);
-            pool.maps[ti] = NULL;
-        }
         if (pool.depth_hist[ti]) {
             if (merged) {
                 for (dj = 0; dj < ANALYZE_DEPTH_BINS; dj++) merged_depth[dj] += pool.depth_hist[ti][dj];
@@ -2190,7 +2323,6 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     pool.chunks = NULL;
     pool.shard_file_sizes = NULL;
 
-    free(pool.maps);
     free(pool.depth_hist);
     if (atomic_load_explicit(&pool.failures, memory_order_relaxed) > 0) rc = 1;
     return rc;
@@ -2205,6 +2337,8 @@ int main(int argc, char **argv) {
     size_t name_count = 0, name_cap = 0;
     unsigned nthreads = parse_analyze_threads_env();
     int i;
+
+    tune_allocator();
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0)
@@ -2261,9 +2395,55 @@ int main(int argc, char **argv) {
             }
             g_query.type_filter = argv[++i][0];
             g_query.active = 1;
+        } else if (strcmp(argv[i], "--gid") == 0) {
+            char *end;
+            unsigned long long v;
+
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --gid requires a numeric group id\n", argv[0]);
+                return 2;
+            }
+            errno = 0;
+            v = strtoull(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end != '\0' || v > 0xFFFFFFFFULL) {
+                fprintf(stderr, "%s: --gid expects a numeric group id\n", argv[0]);
+                return 2;
+            }
+            g_query.gid = (uint32_t)v;
+            g_query.have_gid = 1;
+            g_query.active = 1;
+        } else if (strcmp(argv[i], "--perm") == 0) {
+            const char *s;
+            char *end;
+            unsigned long v;
+
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --perm requires a mode\n", argv[0]);
+                return 2;
+            }
+            s = argv[++i];
+            if (*s == '-') {
+                g_query.perm_mode = PERM_ALL;
+                s++;
+            } else if (*s == '/') {
+                g_query.perm_mode = PERM_ANY;
+                s++;
+            } else {
+                g_query.perm_mode = PERM_EXACT;
+            }
+            errno = 0;
+            v = strtoul(s, &end, 8);
+            if (errno || end == s || *end != '\0' || v > 07777UL) {
+                fprintf(stderr, "%s: --perm expects an octal mode, optionally prefixed by - or /\n", argv[0]);
+                return 2;
+            }
+            g_query.perm = (uint32_t)v;
+            g_query.active = 1;
         } else if (strcmp(argv[i], "--list") == 0) {
             g_query.list_paths = 1;
             g_query.active = 1;
+        } else if (strcmp(argv[i], "--exact") == 0) {
+            g_query.exact = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;

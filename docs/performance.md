@@ -9,7 +9,7 @@ The tools are fast because they combine compact binary I/O, parallelism along na
 ### Shared ideas (`ecrawl`, `edelete`, `ereport`, `ereport_index`)
 
 - Path arguments — Directory and crawl-root arguments are normalized to canonical absolute paths with `realpath(3)` once the path exists (see `path_canon.h`). Relative inputs are supported; symlink components are resolved. Output directories that are created on demand are canonicalized after `mkdir` where applicable.
-- Binary crawl records — Paths and metadata use a fixed header plus a zstd block-compressed record stream and (when finalized) a catalog tail (file magic `ERCBIN07`, format version 7). Layout and rejection rules are in [binary-format.md](binary-format.md).
+- Binary crawl records — Paths and metadata use a fixed header plus a columnar, zstd-compressed record region and (when finalized) a catalog tail (file magic `ERCBIN08`, format version 8). Each row group stores a field per column chunk with a min/max zone map, so a query decodes only the columns it names and skips groups that cannot match. Layout and rejection rules are in [binary-format.md](binary-format.md).
 - Checkpoint sidecars (`*.bin.ckpt`) — While crawling, `ecrawl` records record-aligned byte offsets at a fixed stride so `ereport` and `ereport_index` can split each shard into valid segments without a preliminary full-file scan. See [binary-format.md](binary-format.md#checkpoint-sidecars-binckpt).
 - Embarrassingly parallel units — Work is split by shard file, chunk, age×size bucket, or trigram bucket so threads rarely contend on the same byte or the same mutex for long.
 

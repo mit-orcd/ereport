@@ -301,13 +301,14 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
     }
     pos = (off_t)sizeof(bin_file_header_t);
 
-    /* Walk the self-describing compressed blocks; a crash leaves at most a
-     * truncated trailing block, which fails the bounds/read check below and is
-     * salvaged by truncating to last_good_exclusive (the last whole block end). */
+    /* Walk the self-describing row groups; a crash leaves at most a truncated
+     * trailing group, which fails the bounds/read check below and is salvaged
+     * by truncating to last_good_exclusive (the last whole group end). */
     while ((uint64_t)pos < scan_end) {
         uint64_t blk_start = (uint64_t)pos;
-        bin_block_hdr_t bh;
+        bin_rowgroup_hdr_t rg;
         uint64_t block_end;
+        uint64_t group_total;
 
         if (blk_start - seg0 >= CRAWL_CKPT_STRIDE_BYTES) {
             if (n == cap) {
@@ -320,16 +321,17 @@ static int rebuild_offsets_scan(const char *bin_path, uint64_t file_sz, uint64_t
             buf[n++] = blk_start;
             seg0 = blk_start;
         }
-        if (scan_end - blk_start < sizeof(bh) || fread(&bh, sizeof(bh), 1, fp) != 1) {
+        if (scan_end - blk_start < sizeof(rg) || fread(&rg, sizeof(rg), 1, fp) != 1) {
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }
-        block_end = blk_start + (uint64_t)sizeof(bh) + (uint64_t)bh.comp_size;
+        group_total = crawl_bin_rowgroup_total_bytes(&rg);
+        block_end = blk_start + group_total;
         if (block_end > scan_end) {
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }
-        if (bh.comp_size && fseeko(fp, (off_t)bh.comp_size, SEEK_CUR) != 0) {
+        if (fseeko(fp, (off_t)(group_total - sizeof(rg)), SEEK_CUR) != 0) {
             if (salvage_exclusive_end_out) *salvage_exclusive_end_out = last_good_exclusive;
             goto corrupt;
         }

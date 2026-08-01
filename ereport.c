@@ -59,6 +59,7 @@
 #include <stdatomic.h>
 #include <sys/time.h>
 
+#include "alloc_tuning.h"
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
@@ -102,6 +103,23 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
  * walk (measured). Sparse per-cell maps stay small instead of each pre-allocating 32 KiB.
  */
 #define DENSE_PARENT_BUCKETS_INIT 64U   /* initial bucket count for a freshly-populated map (power of two) */
+/*
+ * The three per-worker tables whose key is "every parent directory this worker sees" (the two parent
+ * interns and the crawl-wide fanout maps) know their size in advance: it is the capture's directory count
+ * spread over the workers. Starting them at DENSE_PARENT_BUCKETS_INIT made each worker walk ten doublings
+ * to get there, and a doubling is a calloc + rehash + free of a multi-megabyte array — read_one_chunk spent
+ * a third of its cycles in the fault handler, a tenth of that in TLB-shootdown IPIs to all cores.
+ *
+ * The estimate is an average, so it is only a starting point (the tables still double if a worker draws
+ * more chunks than its share) and it is capped: guessing high must cost a bounded amount of memory per
+ * table, not hundreds of megabytes. Per-(age,size)-cell maps are deliberately left tiny, since their keys
+ * are one bucket's worth of parents rather than all of them.
+ */
+#define PARENT_TABLE_RESERVE_MAX_SLOTS (1U << 18)
+/* The merged crawl-wide maps exist once per run, not once per worker, and their key count is exactly the
+ * capture's directory count, so they can be sized to it outright — growing into the same size costs the
+ * rehashes this is here to avoid. */
+#define MERGED_TABLE_RESERVE_MAX_BUCKETS (1U << 24)
 #define SUMMARY_REDUCE_MIN_CHUNK 4
 /* Parent-directory map merge: use threads inside each merge when the tournament has few pairs (late rounds). */
 #define DENSE_CELL_MERGE_PARALLEL_MIN_NODES 4096u
@@ -422,6 +440,7 @@ typedef struct {
     pintern_slot_t *slots;
     size_t nslots; /* power of two, 0 until first insert */
     size_t count;
+    size_t reserve_slots; /* size of the first allocation; 0 = start at DENSE_PARENT_BUCKETS_INIT */
     path_arena_t *arena;
     uint64_t last_id;
     const char *last_parent;
@@ -435,10 +454,29 @@ static inline uint32_t pintern_hash(const char *s, size_t n) {
     return h;
 }
 
-static void pintern_init(parent_intern_t *t, path_arena_t *arena) {
+/*
+ * Power-of-two table size that holds expect_keys without a rehash, for a table that grows once it is
+ * per_key_num/per_key_den full, clamped to max_slots. Returns 0 for an unknown count, meaning "start
+ * small and double". See PARENT_TABLE_RESERVE_MAX_SLOTS for why the answer is clamped at all.
+ */
+static size_t parent_table_size_for(size_t expect_keys, size_t per_key_num, size_t per_key_den,
+                                    size_t max_slots) {
+    size_t need;
+    size_t n = DENSE_PARENT_BUCKETS_INIT;
+
+    if (expect_keys == 0) return 0;
+    need = expect_keys * per_key_num / per_key_den + 1U;
+    while (n < need && n < max_slots) n <<= 1;
+    return n;
+}
+
+/* expect_parents: distinct parent directories this interner is expected to hold (0 if unknown). */
+static void pintern_init(parent_intern_t *t, path_arena_t *arena, size_t expect_parents) {
     t->slots = NULL;
     t->nslots = 0;
     t->count = 0;
+    /* pintern_get grows at 3/4 load. */
+    t->reserve_slots = parent_table_size_for(expect_parents, 4, 3, PARENT_TABLE_RESERVE_MAX_SLOTS);
     t->arena = arena;
     t->last_id = 0;
     t->last_parent = NULL;
@@ -460,6 +498,7 @@ static int pintern_grow(parent_intern_t *t, size_t want) {
     while (newn < want) newn <<= 1;
     ns = (pintern_slot_t *)calloc(newn, sizeof(*ns));
     if (!ns) return -1;
+    alloc_hint_hugepages(ns, newn * sizeof(*ns));
     for (i = 0; i < t->nslots; i++) {
         size_t idx;
         if (!t->slots[i].parent) continue;
@@ -486,7 +525,7 @@ static const char *pintern_get(parent_intern_t *t, uint64_t parent_id, const cha
     h = pintern_hash(src, plen);
 
     if (t->nslots == 0) {
-        if (pintern_grow(t, 64) != 0) return NULL;
+        if (pintern_grow(t, t->reserve_slots ? t->reserve_slots : 64) != 0) return NULL;
     } else if ((t->count + 1) * 4 >= t->nslots * 3) {
         if (pintern_grow(t, t->nslots * 2) != 0) return NULL;
     }
@@ -721,6 +760,9 @@ typedef struct {
      * when the load factor reaches ~1 so chains stay short on huge many-parent maps. */
     dense_node_t **buckets;
     size_t nbuckets;
+    /* Size of the first bucket allocation when the expected parent count is known (crawl-wide maps);
+     * 0 = start at DENSE_PARENT_BUCKETS_INIT and double, which is what the per-cell maps want. */
+    size_t reserve_buckets;
     /* Last-hit cache keyed by parent_dir_id: consecutive records under the same
      * directory (the common crawl-bin layout, esp. mega-dirs) then skip hashing
      * and strcmp entirely. Only used by the *_cached accumulate path; merge/insert
@@ -773,6 +815,7 @@ typedef struct {
      * chains and a large share of CPU in the accumulate strcmp walk). */
     fanout_parent_stat_node_t **buckets;
     size_t nbuckets;
+    size_t reserve_buckets; /* as in dense_cell_map_t */
     fanout_parent_stat_node_t *last; /* last-hit cache keyed by parent_dir_id */
     uint64_t last_id;
     size_t count;
@@ -827,6 +870,9 @@ typedef struct {
      * records + bucket details). Bulk-freed once via path_arena_destroy. */
     path_arena_t path_arena;
     ereport_run_stats_t *run_stats;
+    /* Distinct parent directories this worker is expected to see: the capture's directory count over the
+     * worker count. Sizes the parent interns and the two crawl-wide maps below; 0 leaves them growing. */
+    size_t expect_parents;
     dense_cell_map_t dense_maps[AGE_BUCKETS][SIZE_BUCKETS];
     /* Crawl-wide: immediate children per parent dir (all matched types with paths). */
     dense_cell_map_t parent_fanout;
@@ -2490,9 +2536,11 @@ static int dense_cell_reserve(dense_cell_map_t *m) {
     size_t i;
 
     if (m->buckets && m->count < m->nbuckets) return 0;
-    newn = m->nbuckets ? (m->nbuckets << 1) : (size_t)DENSE_PARENT_BUCKETS_INIT;
+    newn = m->nbuckets ? (m->nbuckets << 1)
+                       : (m->reserve_buckets ? m->reserve_buckets : (size_t)DENSE_PARENT_BUCKETS_INIT);
     nb = (dense_node_t **)calloc(newn, sizeof(*nb));
     if (!nb) return -1;
+    alloc_hint_hugepages(nb, newn * sizeof(*nb));
     for (i = 0; i < m->nbuckets; i++) {
         dense_node_t *n = m->buckets[i];
 
@@ -2956,9 +3004,11 @@ static int fanout_parent_stat_reserve(fanout_parent_stat_map_t *m) {
     size_t i;
 
     if (m->buckets && m->count < m->nbuckets) return 0;
-    newn = m->nbuckets ? (m->nbuckets << 1) : (size_t)DENSE_PARENT_BUCKETS_INIT;
+    newn = m->nbuckets ? (m->nbuckets << 1)
+                       : (m->reserve_buckets ? m->reserve_buckets : (size_t)DENSE_PARENT_BUCKETS_INIT);
     nb = (fanout_parent_stat_node_t **)calloc(newn, sizeof(*nb));
     if (!nb) return -1;
+    alloc_hint_hugepages(nb, newn * sizeof(*nb));
     for (i = 0; i < m->nbuckets; i++) {
         fanout_parent_stat_node_t *n = m->buckets[i];
 
@@ -3482,6 +3532,8 @@ static int path_row_map_init(path_row_map_t *m, size_t initial_cap) {
         m->count = 0;
         return -1;
     }
+
+    alloc_hint_hugepages(m->rows, cap * sizeof(*m->rows));
 
     m->cap = cap;
     m->count = 0;
@@ -8073,9 +8125,10 @@ static void ereport_free_shard_catalogs(file_state_t *fs, size_t n) {
 static size_t ereport_catalog_bytes(const file_state_t *fs, size_t n) {
     size_t i;
     size_t total = 0;
-    /* per-slot fixed cost: parent_dir_id(8) depth(4) name_len(2) name_comp ptr(8)
-     * + 5 imm_child_* uint64 arrays (40) = 62 bytes. */
-    const size_t per_slot = 8 + 4 + 2 + 8 + 5 * 8;
+    /* per-slot fixed cost: parent_dir_id(8) depth(4) name_len(2) name_comp ptr(8).
+     * ereport loads only the tree fields, so the optional rollup arrays are not
+     * allocated and must not be counted here. */
+    const size_t per_slot = 8 + 4 + 2 + 8;
 
     if (!fs) return 0;
     for (i = 0; i < n; i++) {
@@ -8121,7 +8174,9 @@ static int ereport_attach_shard_catalog(file_state_t *fs, const char *path) {
         errno = EINVAL;
         goto fail;
     }
-    if (crawl_bin_catalog_load(fp, fh.catalog_offset, (uint64_t)st.st_size, cat) != 0) {
+    /* Only the tree fields: ereport reconstructs paths and reads records, and
+     * consults no per-directory rollup. */
+    if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size, 0U, cat) != 0) {
         counted_fclose(fp);
         goto fail;
     }
@@ -8257,6 +8312,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
             if (progress) progress->bad_input_files++;
             goto out;
         }
+        /* Age buckets, capacity totals and the hardlink dedup between them touch
+         * every column except gid and mode, which nothing in the report reads. */
+        (void)crawl_bin_block_reader_set_projection(
+            &br, CRAWL_PROJECTION_ALL & ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE)));
     }
 
     /* Memoizes the last parent directory path so contiguous same-directory records
@@ -8537,8 +8596,8 @@ static void *worker_main(void *arg_void) {
     parent_intern_t dense_pintern;
 
     memset(&progress, 0, sizeof(progress));
-    pintern_init(&pintern, arg->matched_records.arena);
-    pintern_init(&dense_pintern, arg->matched_records.arena);
+    pintern_init(&pintern, arg->matched_records.arena, arg->expect_parents);
+    pintern_init(&dense_pintern, arg->matched_records.arena, arg->expect_parents);
 
     for (;;) {
         file_chunk_t *chunk = queue_pop(arg->queue);
@@ -8572,6 +8631,50 @@ static void *worker_main(void *arg_void) {
     return NULL;
 }
 
+/* The stats tick thread idles between wakeups. A plain sleep(1) is not interruptible, so
+ * pthread_join at shutdown had to wait out the in-flight sleep: every run paid up to a full
+ * second of dead time after the report finished, which quantized total wall time to whole
+ * seconds. Wait on a condvar instead, broadcast when a stop is requested. */
+static pthread_mutex_t g_stats_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_stats_wait_cond = PTHREAD_COND_INITIALIZER;
+
+/* Idle for `seconds` unless a stop is requested. Returns 1 when the full interval elapsed,
+ * 0 when stopped. Waiting on an absolute deadline makes spurious wakeups resume the
+ * remaining time rather than tick early. */
+static int stats_wait_or_stop(ereport_run_stats_t *rs, double seconds) {
+    struct timespec deadline;
+    long nsec;
+    int rc = 0;
+
+    if (atomic_load(&rs->stop_stats)) return 0;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)seconds;
+    nsec = deadline.tv_nsec + (long)((seconds - (double)(time_t)seconds) * 1e9);
+    if (nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        nsec -= 1000000000L;
+    }
+    deadline.tv_nsec = nsec;
+
+    pthread_mutex_lock(&g_stats_wait_lock);
+    while (!atomic_load(&rs->stop_stats) && rc != ETIMEDOUT) {
+        rc = pthread_cond_timedwait(&g_stats_wait_cond, &g_stats_wait_lock, &deadline);
+    }
+    pthread_mutex_unlock(&g_stats_wait_lock);
+
+    return atomic_load(&rs->stop_stats) ? 0 : 1;
+}
+
+/* Request shutdown and wake the tick thread so its join returns without waiting out the
+ * current interval. Every exit path must go through here, not a bare atomic_store. */
+static void ereport_stats_stop_request(ereport_run_stats_t *rs) {
+    atomic_store(&rs->stop_stats, 1);
+    pthread_mutex_lock(&g_stats_wait_lock);
+    pthread_cond_broadcast(&g_stats_wait_cond);
+    pthread_mutex_unlock(&g_stats_wait_lock);
+}
+
 static void *stats_thread_main(void *arg) {
     ereport_run_stats_t *rs = (ereport_run_stats_t *)arg;
 
@@ -8585,7 +8688,9 @@ static void *stats_thread_main(void *arg) {
         double elapsed_sec;
         char sf[32], tf[32], sr[32], mr[32], rr[32], elapsed_buf[32];
 
-        sleep(1);
+        /* A partial final interval would skew the per-second rolling window, so a stop
+         * request ends the loop instead of recording a short tick. */
+        if (!stats_wait_or_stop(rs, 1.0)) break;
 
         {
             int next = (atomic_load(&g_bucket_index) + 1) % WINDOW_SECONDS;
@@ -9078,6 +9183,9 @@ typedef struct {
     ereport_run_stats_t *run_stats;
     volatile const char **worker_cur_path;
     int worker_cur_path_slots;
+    /* Threads each scanner may use inside one file (its .ckpt segments are split
+     * across them), so the pool and the per-file split share one budget. */
+    int seg_threads;
 } chunk_prep_pool_t;
 
 typedef struct {
@@ -9102,7 +9210,7 @@ static void *chunk_prep_worker_main(void *arg) {
         if (pool->worker_cur_path && slot >= 0 && slot < pool->worker_cur_path_slots) pool->worker_cur_path[slot] = pool->paths[i];
 
         r = crawl_bin_build_chunks_for_file(&ereport_chunk_io, NULL, pool->paths[i], i, pool->chunk_targets[i],
-                                            parse_ereport_thread_count(), &local_chunks, &local_count, &fc);
+                                            pool->seg_threads, &local_chunks, &local_count, &fc);
 
         if (pool->worker_cur_path && slot >= 0 && slot < pool->worker_cur_path_slots) pool->worker_cur_path[slot] = NULL;
 
@@ -10252,6 +10360,15 @@ static void emit_run_stats(const char *username,
     }
     printf("avg_records_per_sec=%s\n", avg_records_buf);
     printf("elapsed_sec=%.3f\n", elapsed_sec);
+
+    /* The verbose_* phase timings otherwise only reach stderr from the ~30s progress peek,
+     * so any run shorter than that reported no phase breakdown at all. Emit them once here
+     * too; merge_sub/fft are 0 because they only annotate an in-flight fanout merge. */
+    if (g_ereport_verbose && run_rs) {
+        fflush(stdout);
+        ereport_verbose_fprint_timing_kv(run_rs, 0, 0);
+        fflush(stderr);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -10291,11 +10408,15 @@ int main(int argc, char **argv) {
     static char rewrite_from_buf[PATH_MAX]; /* backs g_rewrite_from; static for the same reason */
     static char rewrite_to_buf[PATH_MAX];   /* backs g_rewrite_to */
     uint64_t distinct_uid_count = 0;
+    uint64_t catalog_dirs_total = 0;
+    size_t expect_parents_per_worker = 0;
     double t0, t1;
     ereport_run_stats_t run_stats;
     ereport_crawl_timing_t crawl_timing;
     ereport_manifest_disk_t manifest_disk;
     path_shape_view_t path_shape;
+
+    tune_allocator();
 
     atomic_store(&g_io_opendir_calls, 0);
     atomic_store(&g_io_readdir_calls, 0);
@@ -10772,6 +10893,7 @@ int main(int argc, char **argv) {
         chunk_prep_thread_arg_t *prep_args = NULL;
         volatile const char **chunk_wpaths = NULL;
         int prep_threads;
+        int prep_seg_threads;
         size_t merge_off;
         double vt_chunk0 = 0.0;
 
@@ -10812,10 +10934,20 @@ int main(int argc, char **argv) {
         }
         stats_thread_started = 1;
 
+        /*
+         * Two levels: one scanner per input file, and inside each file the .ckpt
+         * segments are split again (crawl_bin_build_chunks_for_file). A single-file
+         * capture therefore still uses the whole budget, and N files do not each
+         * spawn `threads` helpers on top of the pool.
+         */
         prep_threads = threads;
         if ((size_t)prep_threads > path_count) prep_threads = (int)path_count;
+        if (prep_threads < 1) prep_threads = 1;
+        prep_seg_threads = threads / prep_threads;
+        if (prep_seg_threads < 1) prep_seg_threads = 1;
 
-        fprintf(stderr, "ereport: mapping chunk boundaries using %d parallel scanner(s)...\n", prep_threads);
+        fprintf(stderr, "ereport: mapping chunk boundaries using %d file scanner(s) x %d segment thread(s)...\n",
+                prep_threads, prep_seg_threads);
         fflush(stderr);
 
         chunk_wpaths = (volatile const char **)calloc((size_t)prep_threads, sizeof(*chunk_wpaths));
@@ -10824,7 +10956,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "allocation failed\n");
             free((void *)chunk_wpaths);
             free(prep_args);
-            atomic_store(&run_stats.stop_stats, 1);
+            ereport_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -10851,6 +10983,7 @@ int main(int argc, char **argv) {
         pool.run_stats = &run_stats;
         pool.worker_cur_path = chunk_wpaths;
         pool.worker_cur_path_slots = prep_threads;
+        pool.seg_threads = prep_seg_threads;
         atomic_store(&pool.next_path_index, 0);
 
         prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
@@ -10860,7 +10993,7 @@ int main(int argc, char **argv) {
             free(prep_args);
             run_stats.chunk_map_worker_paths = NULL;
             run_stats.chunk_map_path_slots = 0;
-            atomic_store(&run_stats.stop_stats, 1);
+            ereport_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -10888,7 +11021,7 @@ int main(int argc, char **argv) {
                 free(prep_args);
                 run_stats.chunk_map_worker_paths = NULL;
                 run_stats.chunk_map_path_slots = 0;
-                atomic_store(&run_stats.stop_stats, 1);
+                ereport_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -10932,7 +11065,7 @@ int main(int argc, char **argv) {
             merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
             if (!merged) {
                 fprintf(stderr, "allocation failed\n");
-                atomic_store(&run_stats.stop_stats, 1);
+                ereport_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -10975,7 +11108,7 @@ int main(int argc, char **argv) {
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            ereport_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -10991,7 +11124,7 @@ int main(int argc, char **argv) {
         if (ereport_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
             fprintf(stderr, "ereport: cannot load directory catalog from %s\n", paths[i]);
             if (stats_thread_started) {
-                atomic_store(&run_stats.stop_stats, 1);
+                ereport_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -11004,6 +11137,17 @@ int main(int argc, char **argv) {
             ereport_free_file_states(file_states, path_count);
             return 1;
         }
+    }
+
+    /* Now that the catalogs are in, the number of directories across the shards being read is known, and
+     * that is the bound on distinct parents. Chunks are handed out on demand, so the per-worker share is
+     * the even split; a worker that draws more than its share still grows its tables from there. */
+    {
+        size_t fi;
+
+        for (fi = 0; fi < path_count; fi++)
+            if (file_states[fi].catalog) catalog_dirs_total += file_states[fi].catalog->max_dir_id;
+        if (threads > 0) expect_parents_per_worker = (size_t)(catalog_dirs_total / (uint64_t)threads) + 1U;
     }
 
     threads_used = threads;
@@ -11022,7 +11166,7 @@ int main(int argc, char **argv) {
         free(chunks);
         chunks = NULL;
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            ereport_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -11061,6 +11205,7 @@ int main(int argc, char **argv) {
         args[i].now = now;
         args[i].seen_inodes = &seen_inodes;
         args[i].run_stats = &run_stats;
+        args[i].expect_parents = expect_parents_per_worker;
 
         /* Route this worker's path strings into its own arena; its append-side
          * structures must never individually free arena-owned strings. */
@@ -11086,6 +11231,10 @@ int main(int argc, char **argv) {
          * the production crawl). */
         args[i].parent_fanout.parents_external = 1;
         args[i].parent_fanout_stats.parents_external = 1;
+        /* Both are keyed by every parent this worker sees, the same cardinality as its interns. */
+        args[i].parent_fanout.reserve_buckets =
+            parent_table_size_for(expect_parents_per_worker, 1, 1, PARENT_TABLE_RESERVE_MAX_SLOTS);
+        args[i].parent_fanout_stats.reserve_buckets = args[i].parent_fanout.reserve_buckets;
 
         if (all_users_mode) {
             if (uid_accum_init(&args[i].uid_distinct, 8192) != 0) {
@@ -11095,7 +11244,7 @@ int main(int argc, char **argv) {
                 for (j = 0; j < i; j++) pthread_join(tids[j], NULL);
                 for (j = 0; j < i; j++) uid_accum_destroy(&args[j].uid_distinct);
                 if (stats_thread_started) {
-                    atomic_store(&run_stats.stop_stats, 1);
+                    ereport_stats_stop_request(&run_stats);
                     pthread_join(stats_thread, NULL);
                     clear_status_line();
                 }
@@ -11179,6 +11328,8 @@ int main(int argc, char **argv) {
     /* The merged maps receive the per-worker nodes by relink/absorb, which reference interned
      * arena parents — mark them external so neither merge nor free touches those strings. */
     merged_fanout_stats.parents_external = 1;
+    merged_fanout_stats.reserve_buckets =
+        parent_table_size_for((size_t)catalog_dirs_total, 1, 1, MERGED_TABLE_RESERVE_MAX_BUCKETS);
     {
         int ab2, sb2;
         for (ab2 = 0; ab2 < AGE_BUCKETS; ab2++) {
@@ -11196,7 +11347,7 @@ int main(int argc, char **argv) {
             if (matched_records_finalize_parallel(args, threads_used, &final_matched_records, &run_stats) != 0) {
                 fprintf(stderr, "allocation failed merging matched records\n");
                 if (stats_thread_started) {
-                    atomic_store(&run_stats.stop_stats, 1);
+                    ereport_stats_stop_request(&run_stats);
                     pthread_join(stats_thread, NULL);
                     clear_status_line();
                 }
@@ -11235,6 +11386,8 @@ int main(int argc, char **argv) {
                 if (g_ereport_verbose) __vt_dense = now_sec();
                 memset(&merged_fanout, 0, sizeof(merged_fanout));
                 merged_fanout.parents_external = 1; /* receives interned per-worker fanout nodes by relink */
+                merged_fanout.reserve_buckets =
+                    parent_table_size_for((size_t)catalog_dirs_total, 1, 1, MERGED_TABLE_RESERVE_MAX_BUCKETS);
                 if (fanout_shard_summaries_reduce_parallel(&merged_fanout, &merged_fanout_stats, args, threads_used,
                                                           &run_stats) != 0) {
                     for (i = 0; i < threads_used; i++) {
@@ -11256,7 +11409,7 @@ int main(int argc, char **argv) {
                         for (sb = 0; sb < SIZE_BUCKETS; sb++) dense_cell_free(&merged_dense_shape[ab][sb]);
                     }
                     if (stats_thread_started) {
-                        atomic_store(&run_stats.stop_stats, 1);
+                        ereport_stats_stop_request(&run_stats);
                         pthread_join(stats_thread, NULL);
                         clear_status_line();
                     }
@@ -11373,7 +11526,7 @@ int main(int argc, char **argv) {
             bucket_shape_maps_live = 0;
         }
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            ereport_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
         }
@@ -11433,7 +11586,7 @@ int main(int argc, char **argv) {
     final_sum.scanned_input_files = (uint64_t)path_count;
     t1 = now_sec();
     if (stats_thread_started) {
-        atomic_store(&run_stats.stop_stats, 1);
+        ereport_stats_stop_request(&run_stats);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }

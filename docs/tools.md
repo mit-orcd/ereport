@@ -11,6 +11,7 @@ Contents: [`ecrawl`](#ecrawl) · [`ecrawl_repair`](#ecrawl_repair) · [`ecrawl_a
 - parallel crawl threads
 - uid-sharded output files
 - optional `--no-write` benchmarking mode
+- optional `--no-stat` names-only walk that reads no inodes, for path search
 - live status output
 - separate accounting for:
   - unique regular-file logical bytes (`st_size`, hardlink-deduped)
@@ -28,7 +29,7 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+./ecrawl [--no-write] [--no-stat [--contains <text>] [--print0]] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
 ```
 
 Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
@@ -76,6 +77,9 @@ Examples:
 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --no-write /path/to/filesystem-tree
 ./ecrawl --no-write --verbose /path/to/filesystem-tree
+./ecrawl --no-stat /path/to/filesystem-tree                      # names only, no inode reads
+./ecrawl --no-stat --contains slurm- /path/to/filesystem-tree    # case-insensitive path search
+./ecrawl --no-stat --print0 /path/to/filesystem-tree | xargs -0 ls -l
 ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl /path/to/filesystem-tree host-a_apr-17-2026_15-03-01
 ./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
@@ -90,6 +94,9 @@ Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files.
 - `--verbose` enables the full end-of-run diagnostics.
+- `--no-stat` walks names only and never reads an inode, streaming each path to stdout instead of writing a capture. It implies `--no-write` and rejects an `output-dir`, because a record needs the uid, size, inode and mtime that only `stat` provides. Recursion is driven entirely by the `d_type` that `getdents64` already returns; on a filesystem that reports `DT_UNKNOWN` the walk falls back to one `fstatat` for those entries alone and counts them in `dtype_unknown_fallbacks`. Because stdout is the path stream, the run summary goes to stderr, so `./ecrawl --no-stat /tree | sort` is a clean path list.
+- `--contains <text>` (requires `--no-stat`) keeps only paths whose **full path** contains `text`, case-insensitively — the same rule as `ereport_index --search`, and equivalent to `find /tree | grep -iF text`. It is not a glob: `*` and `?` match themselves. Matching is cheap because a directory whose own path already matches short-circuits its whole subtree, and non-matching directories compare each child name against a small window instead of rebuilding the full path.
+- `--print0` (requires `--no-stat`) NUL-separates the stream, for paths containing newlines.
 - `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--verbose` end-of-run metrics and the built-in contention counters instead.
 - `--record-root <path>` rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks `start-path` on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with `realpath(3)`.
 
@@ -150,6 +157,7 @@ Usage:
 
 ```bash
 ./ecrawl_analyze [--verbose] [--top[,dim...] N] <crawl-output-dir>
+./ecrawl_analyze [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--perm MODE] [--list] [--exact] <crawl-output-dir>
 ```
 
 Examples:
@@ -161,6 +169,29 @@ Examples:
 ./ecrawl_analyze --top,dense,deep 50 /path/to/crawl-out    # both top lists
 ECRAWL_ANALYZE_THREADS=32 ./ecrawl_analyze -v /path/to/crawl-out
 ```
+
+### Query form
+
+Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--perm` / `--list` switches from directory-shape reporting to record selection. Filters combine with AND, and the totals come back as `key=value` lines: `entries`, `files`, `dirs`, `symlinks`, `other`, `bytes`, `hardlink_dupes`, `records_scanned`, block-skip diagnostics, `answered_from`, `elapsed_sec`. `bytes` is apparent size with each multiply-linked inode counted once, so it matches `du -sb`.
+
+- `--subtree DIR` — records at or under `DIR`, including `DIR` itself, as `du` counts it.
+- `--size-gt N` — strictly larger than `N` bytes (`find -size +Nc`).
+- `--type C` — one of `f d l c b p s o` (`find -type`).
+- `--gid N` — numeric group owner.
+- `--perm MODE` — octal permission bits in the three `find -perm` forms: `0644` exactly these bits, `-0002` all of these bits, `/0022` any of these bits.
+- `--list` — print each matching path on stdout; the totals move to stderr.
+- `--exact` — never answer from the catalog rollups; always scan the records.
+
+```bash
+./ecrawl_analyze --size-gt 524288000 --type f --list /path/to/crawl-out   # files over 500 MB
+./ecrawl_analyze --subtree /data/lab/jones /path/to/crawl-out             # bytes + counts under a subtree
+./ecrawl_analyze --type f --perm -0002 --list /path/to/crawl-out          # world-writable files
+./ecrawl_analyze --type f --gid 2001 /path/to/crawl-out                   # files owned by a group
+```
+
+Two v8 storage features do the work here. Row groups whose column zone maps cannot match the `--size-gt` / `--type` / `--gid` filters are skipped without decompressing, and only the columns a query names are decoded — `ECRAWL_ANALYZE_BLOCK_SKIP=0` disables the skipping for comparison.
+
+More importantly, a bare `--subtree DIR` aggregate is answered from the per-directory rollups the crawl already computed, reading no records at all (`records_scanned=0`), so its cost is O(directories) rather than O(files). That shortcut is taken only when it provably equals the scan; in particular it is skipped when any record in the subtree has `nlink > 1`, because crawl-time hardlink credit is attributed to the first link seen anywhere in the tree while a scan dedups within the subtree. `answered_from=catalog_rollup` or `answered_from=record_scan` says which ran, and `--exact` forces the scan. See [binary-format.md](binary-format.md#dfs-ordering-and-subtree-rollups-v8).
 
 ## `ecrawl_mount`
 
@@ -190,7 +221,7 @@ The consequences worth knowing:
 - `du --apparent-size`, `wc -c`, and `dd` are byte-exact; `cat`, `grep`, and `md5sum` see a file of NUL bytes.
 - Real `st_ino` and `st_nlink` mean `du` deduplicates hardlinks the same way it does on the live tree.
 - `find -type l` is correct, but `ls -l` prints an I/O error for each symlink because the target was never captured.
-- Permissions are uniform, so `find -perm` is meaningless here. `v7` dropped `mode` and `gid` deliberately; see [binary-format.md](binary-format.md).
+- Permissions are uniform, so `find -perm` is meaningless **on the mount**. The capture does record real `mode` and `gid`; the mount's in-memory index omits them, because it holds the whole namespace resident and two more fields per entry is a cost paid on every mount for a read-only view that cannot honour the bits anyway. Use `ecrawl_analyze --perm` / `--gid` to query them from the capture directly.
 
 ### The index
 
@@ -638,8 +669,10 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 ## Source layout
 
 - `edelete.c` — standalone parallel walker / deletion utility (`path_canon.h` only).
-- `ecrawl_analyze.c` — read-only `uid_shard_*.bin` analyzer (parent and depth histograms); links `crawl_bin_chunks.o` for shared chunk parsing.
-- `crawl_bin_format.h` — magic, format version, `bin_file_header_t`, `bin_record_hdr_t`, `bin_dir_catalog_entry_t` (immediate-child aggregates).
+- `ecrawl_analyze.c` — read-only `uid_shard_*.bin` analyzer (parent and depth histograms, plus the record query form); links `crawl_bin_chunks.o` for shared chunk parsing.
+- `crawl_bin_format.h` — magic, format version, `bin_file_header_t`, the columnar `bin_rowgroup_hdr_t` / `bin_colchunk_hdr_t`, `bin_record_hdr_t`, `bin_dir_catalog_entry_t` (immediate-child aggregates plus the v8 DFS ordering and subtree rollups).
+- `crawl_bin_block.h` / `crawl_bin_block.c` — columnar row-group writer and reader: encoding choice per column, zone-map skipping, column projection, and the row-reconstruction shim.
+- `crawl_bin_codec.h` / `crawl_bin_codec.c` — the per-column encoders and decoders (`RAW`, `FOR_BITPACK`, `RLE`, `CONST`); round-trip tested by `test_crawl_codec.c`.
 - `crawl_bin_catalog.h` / `crawl_bin_catalog.c` — load catalog tails (`crawl_bin_catalog_load()`, path helpers).
 - `crawl_bin_chunks.h` / `crawl_bin_chunks.c` — checkpoint-driven chunk boundaries (`crawl_bin_load_ckpt()`, `crawl_bin_build_chunks_for_file()`).
 - `crawl_result.h` / `crawl_result.c` — open a crawl directory: parse `crawl_manifest.txt`, enumerate finalized `uid_shard_*.bin` (skipping shards still being written), validate headers. Used by `ecrawl_mount`; `ereport` and `ereport_index` still carry their own uid-filtered copies of this logic and could migrate onto it.

@@ -30,6 +30,7 @@
 #include <time.h>
 #include <zstd.h>
 
+#include "alloc_tuning.h"
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
@@ -190,6 +191,9 @@ static int set_path_rewrite(const char *arg) {
 }
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
+/* path_offsets.bin entries staged per write, so a 1.3M-path capture costs a few hundred writes on the serial
+ * paths writer instead of one per path. */
+#define PATH_OFFSETS_STAGE_ENTRIES 8192U
 /*
  * tmp_trigrams shards: accumulate records per (worker × bucket) and emit one zstd frame
  * per ~64 KiB of source so framing overhead and read()/decompress syscalls amortize over
@@ -269,6 +273,7 @@ typedef struct write_batch {
     size_t count;
     size_t cap;
     size_t approx_body_bytes; /* path strings + trigram codes; excludes batch struct overhead */
+    struct wb_arena *arena;   /* holds every path string and codes array in this batch */
     struct write_batch *next;
 } write_batch_t;
 
@@ -335,6 +340,7 @@ typedef struct trigram_job {
     uint32_t *codes;
     size_t code_count;
     size_t approx_body_bytes; /* sizeof job + codes array */
+    struct wb_arena *arena;   /* job struct and codes live here; released once per job */
     struct trigram_job *next;
 } trigram_job_t;
 
@@ -363,6 +369,12 @@ typedef struct {
     char index_dir[PATH_MAX];
     FILE *paths_fp;
     FILE *path_offsets_fp;
+    /* paths.bin write position and the staged path_offsets.bin entries. Both belong to the single paths
+     * writer thread, which is the pipeline's only serial stage: asking stdio for the position (ftello) cost
+     * it an lseek per path, and the offsets went out one 8-byte fwrite at a time. */
+    uint64_t paths_pos;
+    uint64_t *path_offsets_buf;
+    size_t path_offsets_n;
     uint64_t input_files;
     uint64_t scanned_records;
     uint64_t indexed_paths;
@@ -424,6 +436,12 @@ typedef struct {
     size_t write_batch_flush_at;
     char *lower_seg_buf;
     size_t lower_seg_cap;
+    /* Reused per record: the reconstructed path and its trigram codes are copied
+     * into the batch arena, so neither needs a malloc per path. */
+    char *path_buf;
+    size_t path_cap;
+    char *codes_buf;
+    size_t codes_cap;
 } worker_arg_t;
 
 typedef struct {
@@ -723,6 +741,22 @@ static int tmp_trigram_read_exact_fd(int fd, void *buf, size_t n) {
     return 0;
 }
 
+/* Compression scratch, kept per thread: every trigram worker flushes frames constantly,
+ * and a malloc/free pair per frame is another cross-thread arena round-trip. */
+static __thread unsigned char *tls_zbuf;
+static __thread size_t tls_zcap;
+
+static unsigned char *tmp_trigram_zbuf(size_t need) {
+    if (need > tls_zcap) {
+        unsigned char *p = (unsigned char *)realloc(tls_zbuf, need);
+
+        if (!p) return NULL;
+        tls_zbuf = p;
+        tls_zcap = need;
+    }
+    return tls_zbuf;
+}
+
 static int tmp_trigram_write_compressed_frame(FILE *fp, const trigram_record_t *recs, size_t n) {
     size_t src_bytes = n * sizeof(*recs);
     size_t bound = ZSTD_compressBound(src_bytes);
@@ -730,24 +764,20 @@ static int tmp_trigram_write_compressed_frame(FILE *fp, const trigram_record_t *
     uint32_t n32;
     uint32_t clen32;
     size_t comp_len;
-    int rc = -1;
 
     if (n == 0) return 0;
     if (n > UINT32_MAX) return -1;
-    comp = (unsigned char *)malloc(bound);
+    comp = tmp_trigram_zbuf(bound);
     if (!comp) return -1;
     comp_len = ZSTD_compress(comp, bound, recs, src_bytes, tmp_trigram_zstd_level());
-    if (ZSTD_isError(comp_len)) goto out;
-    if (comp_len > UINT32_MAX) goto out;
+    if (ZSTD_isError(comp_len)) return -1;
+    if (comp_len > UINT32_MAX) return -1;
     n32 = (uint32_t)n;
     clen32 = (uint32_t)comp_len;
-    if (mk_fwrite(&n32, 1, 4, fp) != 4) goto out;
-    if (mk_fwrite(&clen32, 1, 4, fp) != 4) goto out;
-    if (mk_fwrite(comp, 1, comp_len, fp) != comp_len) goto out;
-    rc = 0;
-out:
-    free(comp);
-    return rc;
+    if (mk_fwrite(&n32, 1, 4, fp) != 4) return -1;
+    if (mk_fwrite(&clen32, 1, 4, fp) != 4) return -1;
+    if (mk_fwrite(comp, 1, comp_len, fp) != comp_len) return -1;
+    return 0;
 }
 
 static int tmp_trigram_fp_write_batch(FILE *fp, uint8_t *magic_on_disk, const trigram_record_t *recs, size_t n) {
@@ -1049,8 +1079,112 @@ static file_chunk_t *queue_pop(work_queue_t *q) {
     return chunk;
 }
 
-static int write_batch_append(write_batch_t *batch, char *path, uint32_t *codes, size_t code_count) {
+/*
+ * Bump arena behind one write batch.
+ *
+ * A path and its trigram codes are produced by a parse worker, written out by
+ * the paths writer, and consumed by whichever trigram workers get the slices of
+ * that batch's job chain. Allocating each of those per path meant every free
+ * crossed back into the producing thread's malloc arena: profiling showed 60% of
+ * index-phase CPU inside free(), nearly all of it blocked on the glibc arena
+ * lock. One arena per batch turns thousands of cross-thread frees into a handful.
+ *
+ * refs is one for the batch plus one per trigram job carved out of it, so the
+ * last holder releases the chunks no matter who finishes first.
+ */
+#define WB_ARENA_CHUNK_BYTES (256U * 1024U)
+
+typedef struct wb_chunk {
+    struct wb_chunk *next;
+    size_t used;
+    size_t cap;
+    unsigned char data[];
+} wb_chunk_t;
+
+typedef struct wb_arena {
+    atomic_uint refs;
+    wb_chunk_t *head; /* bump target; older chunks trail behind it */
+} wb_arena_t;
+
+static wb_arena_t *wb_arena_create(void) {
+    wb_arena_t *a = (wb_arena_t *)malloc(sizeof(*a));
+
+    if (!a) return NULL;
+    atomic_init(&a->refs, 1U);
+    a->head = NULL;
+    return a;
+}
+
+static void *wb_arena_alloc(wb_arena_t *a, size_t n, size_t align) {
+    size_t pad;
+    void *p;
+
+    if (!a) return NULL;
+    if (n == 0) n = 1;
+
+    if (a->head) {
+        pad = (align - (a->head->used & (align - 1U))) & (align - 1U);
+        if (a->head->used + pad + n <= a->head->cap) {
+            p = a->head->data + a->head->used + pad;
+            a->head->used += pad + n;
+            return p;
+        }
+    }
+
+    {
+        size_t cap = WB_ARENA_CHUNK_BYTES;
+        wb_chunk_t *c;
+
+        if (cap < n) cap = n;
+        c = (wb_chunk_t *)malloc(sizeof(*c) + cap);
+        if (!c) return NULL;
+        c->cap = cap;
+        c->used = n;
+        /* Keep the chunk with room at the front so the next bump finds it first. */
+        if (a->head && a->head->cap - a->head->used > cap - n) {
+            c->next = a->head->next;
+            a->head->next = c;
+        } else {
+            c->next = a->head;
+            a->head = c;
+        }
+        return c->data;
+    }
+}
+
+static void wb_arena_release(wb_arena_t *a) {
+    wb_chunk_t *c;
+
+    if (!a) return;
+    if (atomic_fetch_sub_explicit(&a->refs, 1U, memory_order_acq_rel) != 1U) return;
+
+    c = a->head;
+    while (c) {
+        wb_chunk_t *next = c->next;
+        free(c);
+        c = next;
+    }
+    free(a);
+}
+
+static write_batch_t *write_batch_create(void) {
+    write_batch_t *batch = (write_batch_t *)calloc(1, sizeof(*batch));
+
+    if (!batch) return NULL;
+    batch->arena = wb_arena_create();
+    if (!batch->arena) {
+        free(batch);
+        return NULL;
+    }
+    return batch;
+}
+
+/* Copies path and codes into the batch arena; the caller keeps its own buffers. */
+static int write_batch_append(write_batch_t *batch, const char *path, size_t path_len, const uint32_t *codes,
+                              size_t code_count) {
     parsed_path_t *tmp;
+    char *path_copy;
+    uint32_t *codes_copy = NULL;
 
     if (batch->count == batch->cap) {
         size_t new_cap = batch->cap ? batch->cap * 2 : 256;
@@ -1060,21 +1194,29 @@ static int write_batch_append(write_batch_t *batch, char *path, uint32_t *codes,
         batch->cap = new_cap;
     }
 
-    batch->items[batch->count].path = path;
-    batch->items[batch->count].codes = codes;
+    path_copy = (char *)wb_arena_alloc(batch->arena, path_len + 1U, 1U);
+    if (!path_copy) return -1;
+    memcpy(path_copy, path, path_len);
+    path_copy[path_len] = '\0';
+
+    if (code_count > 0) {
+        codes_copy = (uint32_t *)wb_arena_alloc(batch->arena, code_count * sizeof(*codes_copy), sizeof(*codes_copy));
+        if (!codes_copy) return -1;
+        memcpy(codes_copy, codes, code_count * sizeof(*codes_copy));
+    }
+
+    batch->items[batch->count].path = path_copy;
+    batch->items[batch->count].codes = codes_copy;
     batch->items[batch->count].code_count = code_count;
-    batch->approx_body_bytes += sizeof(parsed_path_t) + strlen(path) + 1U +
-                                code_count * sizeof(uint32_t);
+    batch->approx_body_bytes += sizeof(parsed_path_t) + path_len + 1U + code_count * sizeof(uint32_t);
     batch->count++;
     return 0;
 }
 
+/* Drops the batch's arena reference; jobs already carved out of it keep theirs. */
 static void write_batch_destroy(write_batch_t *batch) {
     if (!batch) return;
-    for (size_t i = 0; i < batch->count; i++) {
-        free(batch->items[i].path);
-        free(batch->items[i].codes);
-    }
+    wb_arena_release(batch->arena);
     free(batch->items);
     free(batch);
 }
@@ -1168,11 +1310,13 @@ static void write_queue_close(write_queue_t *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
+/* Release a chain of jobs that were handed off (queued): each drops one arena reference.
+ * Never call this on a chain the paths writer has not pushed yet — the batch still holds
+ * the only reference then, and write_batch_destroy releases it. */
 static void trigram_job_chain_free(trigram_job_t *head) {
     while (head) {
         trigram_job_t *next = head->next;
-        free(head->codes);
-        free(head);
+        wb_arena_release(head->arena);
         head = next;
     }
 }
@@ -2587,11 +2731,17 @@ static size_t count_path_trigram_windows(const char *path) {
     return total;
 }
 
+/*
+ * On success *out_codes points at the caller's scratch buffer (or heap memory the
+ * caller owns when scratch is NULL); it is valid until the next call for that
+ * scratch and must not be freed.
+ */
 static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t *out_count, worker_arg_t *scratch) {
     const char *seg = path;
     size_t nraw = count_path_trigram_windows(path);
     uint32_t *codes;
     size_t pos = 0;
+    int codes_owned = 0;
 
     if (nraw == 0) {
         *out_codes = NULL;
@@ -2599,8 +2749,14 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
         return 0;
     }
 
-    codes = (uint32_t *)malloc(nraw * sizeof(uint32_t));
-    if (!codes) return -1;
+    if (scratch) {
+        if (ensure_worker_buf(&scratch->codes_buf, &scratch->codes_cap, nraw * sizeof(uint32_t)) != 0) return -1;
+        codes = (uint32_t *)scratch->codes_buf;
+    } else {
+        codes = (uint32_t *)malloc(nraw * sizeof(uint32_t));
+        if (!codes) return -1;
+        codes_owned = 1;
+    }
 
     seg = path;
     while (*seg != '\0') {
@@ -2613,14 +2769,14 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
 
             if (scratch) {
                 if (ensure_worker_buf(&scratch->lower_seg_buf, &scratch->lower_seg_cap, seg_len + 1U) != 0) {
-                    free(codes);
+                    if (codes_owned) free(codes);
                     return -1;
                 }
                 lower_seg = scratch->lower_seg_buf;
             } else {
                 lower_seg = (char *)malloc(seg_len + 1);
                 if (!lower_seg) {
-                    free(codes);
+                    if (codes_owned) free(codes);
                     return -1;
                 }
             }
@@ -2645,7 +2801,7 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
     }
 
     if (pos != nraw) {
-        free(codes);
+        if (codes_owned) free(codes);
         return -1;
     }
 
@@ -2764,6 +2920,11 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
         return -1;
     }
 
+    /* Optional: stage_path_offset writes straight through if this is NULL, so a failure here is not fatal. */
+    ctx->path_offsets_buf =
+        (uint64_t *)malloc((size_t)PATH_OFFSETS_STAGE_ENTRIES * sizeof(*ctx->path_offsets_buf));
+    ctx->path_offsets_n = 0;
+
     if (g_verbose) {
         fprintf(stderr,
                 "ereport_index: tmp_trigram shard writers=%u max_open_per_shard=%u (EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS=%u)\n",
@@ -2831,6 +2992,12 @@ static int tw_worker_close_ix(build_ctx_t *ctx, uint32_t worker_id, size_t ix) {
 
 static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
     uint32_t wid, b;
+
+    /* Staged offsets are flushed by write_final_path_offset on the success path; on an error path the index
+     * is incomplete anyway, so just release the buffer. */
+    free(ctx->path_offsets_buf);
+    ctx->path_offsets_buf = NULL;
+    ctx->path_offsets_n = 0;
 
     if (!ctx->tw_worker_fp) return;
     for (wid = 0; wid < ctx->trigram_tmp_shard_count; wid++) {
@@ -2973,18 +3140,37 @@ static int decode_varint_u64_buf(const unsigned char *buf, size_t len, size_t *p
     return -1;
 }
 
-static int append_paths_only(build_ctx_t *ctx, const char *path) {
-    uint64_t offset;
+/* Write out whatever path offsets are staged. Called when the staging buffer fills and once at the end. */
+static int flush_path_offsets(build_ctx_t *ctx) {
+    size_t n = ctx->path_offsets_n;
 
-    offset = (uint64_t)ftello(ctx->paths_fp);
-    if (mk_fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) != 1) {
+    if (n == 0) return 0;
+    ctx->path_offsets_n = 0;
+    if (mk_fwrite(ctx->path_offsets_buf, sizeof(*ctx->path_offsets_buf), n, ctx->path_offsets_fp) != n) {
         fprintf(stderr, "ereport_index: fwrite path_offsets.bin: %s\n", strerror(errno));
         return -1;
     }
-    if (mk_fwrite(path, 1, strlen(path) + 1, ctx->paths_fp) != strlen(path) + 1) {
+    return 0;
+}
+
+static int stage_path_offset(build_ctx_t *ctx, uint64_t offset) {
+    if (!ctx->path_offsets_buf) /* allocation failed at startup: write straight through */
+        return mk_fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) == 1 ? 0 : -1;
+
+    ctx->path_offsets_buf[ctx->path_offsets_n++] = offset;
+    if (ctx->path_offsets_n == PATH_OFFSETS_STAGE_ENTRIES) return flush_path_offsets(ctx);
+    return 0;
+}
+
+static int append_paths_only(build_ctx_t *ctx, const char *path) {
+    size_t need = strlen(path) + 1;
+
+    if (stage_path_offset(ctx, ctx->paths_pos) != 0) return -1;
+    if (mk_fwrite(path, 1, need, ctx->paths_fp) != need) {
         fprintf(stderr, "ereport_index: fwrite paths.bin: %s\n", strerror(errno));
         return -1;
     }
+    ctx->paths_pos += (uint64_t)need;
     return 0;
 }
 
@@ -3002,6 +3188,10 @@ static void *paths_writer_main(void *arg_void) {
             size_t tj_n = 0;
             uint64_t base = pa->ctx->indexed_paths;
 
+            /* The jobs are bump-allocated from the batch's own arena, next to the codes
+             * they point at, so the whole batch costs one reference count instead of a
+             * malloc/free pair per path. Until the push below, the batch holds the only
+             * reference, so the error paths just destroy the batch. */
             for (size_t i = 0; i < batch->count; i++) {
                 parsed_path_t *item = &batch->items[i];
                 uint64_t path_id = base + (uint64_t)i;
@@ -3011,19 +3201,17 @@ static void *paths_writer_main(void *arg_void) {
                     pa->ctx->indexed_paths = base + (uint64_t)i;
                     atomic_fetch_add_explicit(&rs->indexed_paths, (unsigned long long)i, memory_order_relaxed);
                     atomic_store(&rs->writer_failed, 1);
-                    trigram_job_chain_free(tj_head);
                     write_batch_destroy(batch);
                     mk_io_tls_flush();
                     return NULL;
                 }
 
-                job = (trigram_job_t *)malloc(sizeof(*job));
+                job = (trigram_job_t *)wb_arena_alloc(batch->arena, sizeof(*job), sizeof(void *));
                 if (!job) {
-                    fprintf(stderr, "ereport_index: malloc(trigram_job): %s\n", strerror(errno));
+                    fprintf(stderr, "ereport_index: arena alloc(trigram_job): %s\n", strerror(errno));
                     pa->ctx->indexed_paths = base + (uint64_t)i + 1ULL;
                     atomic_fetch_add_explicit(&rs->indexed_paths, (unsigned long long)(i + 1U), memory_order_relaxed);
                     atomic_store(&rs->writer_failed, 1);
-                    trigram_job_chain_free(tj_head);
                     write_batch_destroy(batch);
                     mk_io_tls_flush();
                     return NULL;
@@ -3032,8 +3220,8 @@ static void *paths_writer_main(void *arg_void) {
                 job->codes = item->codes;
                 job->code_count = item->code_count;
                 job->approx_body_bytes = sizeof(trigram_job_t) + item->code_count * sizeof(uint32_t);
+                job->arena = batch->arena;
                 job->next = NULL;
-                item->codes = NULL;
 
                 if (!tj_head) {
                     tj_head = tj_tail = job;
@@ -3047,13 +3235,17 @@ static void *paths_writer_main(void *arg_void) {
             pa->ctx->indexed_paths = base + (uint64_t)batch->count;
             atomic_fetch_add_explicit(&rs->indexed_paths, (unsigned long long)batch->count, memory_order_relaxed);
 
-            if (tj_n != 0 && trigram_job_queue_push_chain_slices(pa->trigram_queue, tj_head) != 0) {
-                fprintf(stderr, "ereport_index: trigram job queue push failed (queue closed)\n");
-                trigram_job_chain_free(tj_head);
-                atomic_store(&rs->writer_failed, 1);
-                write_batch_destroy(batch);
-                mk_io_tls_flush();
-                return NULL;
+            if (tj_n != 0) {
+                /* One reference per job, taken before any worker can see them. */
+                atomic_fetch_add_explicit(&batch->arena->refs, (unsigned int)tj_n, memory_order_relaxed);
+                if (trigram_job_queue_push_chain_slices(pa->trigram_queue, tj_head) != 0) {
+                    /* The push released every job it could not hand off. */
+                    fprintf(stderr, "ereport_index: trigram job queue push failed (queue closed)\n");
+                    atomic_store(&rs->writer_failed, 1);
+                    write_batch_destroy(batch);
+                    mk_io_tls_flush();
+                    return NULL;
+                }
             }
         }
 
@@ -3083,8 +3275,7 @@ static void *paths_writer_main(void *arg_void) {
  */
 static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_t *rs, trigram_job_t *job) {
     if (atomic_load(&rs->writer_failed)) {
-        free(job->codes);
-        free(job);
+        wb_arena_release(job->arena);
         return 0; /* drain quietly once the run is failing */
     }
 
@@ -3096,8 +3287,7 @@ static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_
         if (!buf) {
             fprintf(stderr, "ereport_index: realloc trigram batch buf (%zu): %s\n", job->code_count, strerror(errno));
             atomic_store(&rs->writer_failed, 1);
-            free(job->codes);
-            free(job);
+            wb_arena_release(job->arena);
             return -1;
         }
         for (i = 0; i < job->code_count; i++) {
@@ -3116,8 +3306,7 @@ static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_
             }
             if (append_trigram_records_batch_parallel(tw->ctx, tw->worker_index, b, buf + run_i, run_j - run_i) != 0) {
                 atomic_store(&rs->writer_failed, 1);
-                free(job->codes);
-                free(job);
+                wb_arena_release(job->arena);
                 return -1;
             }
             run_i = run_j;
@@ -3125,8 +3314,7 @@ static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_
     }
 
     atomic_fetch_add(&rs->trigram_records, (unsigned long long)job->code_count);
-    free(job->codes);
-    free(job);
+    wb_arena_release(job->arena);
     return 0;
 }
 
@@ -3196,7 +3384,9 @@ static void index_free_shard_catalogs(file_state_t *fs, size_t n) {
 static size_t index_catalog_bytes(const file_state_t *fs, size_t n) {
     size_t i;
     size_t total = 0;
-    const size_t per_slot = 8 + 4 + 2 + 8 + 5 * 8; /* parent_dir_id+depth+name_len+name_comp ptr+5 imm_child_* */
+    /* parent_dir_id+depth+name_len+name_comp ptr; the optional rollup arrays are
+     * not requested at load, so they cost nothing. */
+    const size_t per_slot = 8 + 4 + 2 + 8;
 
     if (!fs) return 0;
     for (i = 0; i < n; i++) {
@@ -3241,7 +3431,8 @@ static int index_attach_shard_catalog(file_state_t *fs, const char *path) {
         errno = EINVAL;
         goto fail;
     }
-    if (crawl_bin_catalog_load(fp, fh.catalog_offset, (uint64_t)st.st_size, cat) != 0) {
+    /* The trigram index is built from paths alone; no rollup is consulted. */
+    if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size, 0U, cat) != 0) {
         mk_fclose(fp);
         goto fail;
     }
@@ -3288,6 +3479,11 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             atomic_fetch_add(&rs->bad_input_files, 1U);
             goto out;
         }
+        /* A trigram index over paths needs the path and the owner, nothing else:
+         * eleven of fourteen columns are never read, so never decoded. */
+        (void)crawl_bin_block_reader_set_projection(&br, CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID) |
+                                                             CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES) |
+                                                             CRAWL_COL_BIT(CRAWL_COL_UID));
     }
 
     for (;;) {
@@ -3332,12 +3528,14 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             break;
         }
 
-        pathbuf = (char *)malloc(PATH_MAX);
-        if (!pathbuf) {
+        /* Reconstruct into the worker's own buffer; write_batch_append copies the
+         * bytes that survive the filters into the batch arena. */
+        if (ensure_worker_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
             fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
             atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
         }
+        pathbuf = worker->path_buf;
         {
             const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
 
@@ -3345,7 +3543,6 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
                                              (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
                 fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
-                free(pathbuf);
                 break;
             }
         }
@@ -3357,11 +3554,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         }
 
         /* --subtree: only index records at or under the requested directory (full absolute path kept). */
-        if (g_subtree_prefix && !subtree_path_under_prefix(pathbuf)) {
-            free(pathbuf);
-            pathbuf = NULL;
-            continue;
-        }
+        if (g_subtree_prefix && !subtree_path_under_prefix(pathbuf)) continue;
 
         {
             uint32_t *codes = NULL;
@@ -3369,29 +3562,22 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             if (extract_path_trigrams(pathbuf, &codes, &code_count, worker) != 0) {
                 fprintf(stderr, "warn: failed to extract trigrams from %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
-                free(pathbuf);
                 break;
             }
 
             if (!batch) {
-                batch = (write_batch_t *)calloc(1, sizeof(*batch));
+                batch = write_batch_create();
                 if (!batch) {
                     fprintf(stderr, "warn: failed to allocate write batch for %s\n", chunk->path);
                     atomic_fetch_add(&rs->bad_input_files, 1U);
-                    free(codes);
-                    free(pathbuf);
                     break;
                 }
             }
-            if (write_batch_append(batch, pathbuf, codes, code_count) != 0) {
+            if (write_batch_append(batch, pathbuf, strlen(pathbuf), codes, code_count) != 0) {
                 fprintf(stderr, "warn: failed to append write batch for %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
-                free(codes);
-                free(pathbuf);
                 break;
             }
-            pathbuf = NULL;
-            codes = NULL;
 
             if (batch->count >= worker->write_batch_flush_at) {
                 if (write_queue_push(write_queue, batch) != 0) {
@@ -3404,8 +3590,6 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
                 batch = NULL;
             }
         }
-
-        free(pathbuf);
     }
 
 out:
@@ -3436,14 +3620,21 @@ static void *worker_main(void *arg_void) {
     free(arg->lower_seg_buf);
     arg->lower_seg_buf = NULL;
     arg->lower_seg_cap = 0;
+    free(arg->path_buf);
+    arg->path_buf = NULL;
+    arg->path_cap = 0;
+    free(arg->codes_buf);
+    arg->codes_buf = NULL;
+    arg->codes_cap = 0;
 
     mk_io_tls_flush();
     return NULL;
 }
 
+/* path_offsets.bin carries one more entry than there are paths: the end of the last path. */
 static int write_final_path_offset(build_ctx_t *ctx) {
-    uint64_t final_offset = (uint64_t)ftello(ctx->paths_fp);
-    return mk_fwrite(&final_offset, sizeof(final_offset), 1, ctx->path_offsets_fp) == 1 ? 0 : -1;
+    if (stage_path_offset(ctx, ctx->paths_pos) != 0) return -1;
+    return flush_path_offsets(ctx);
 }
 
 static int write_meta_file(const build_ctx_t *ctx) {
@@ -6436,6 +6627,8 @@ static int run_build_index_dir_resolved(const char *user_spec,
 int main(int argc, char **argv) {
     int vi;
     int cmd0;
+
+    tune_allocator();
 
     if (argc < 2) die_usage(argv[0]);
     for (vi = 1; vi < argc; vi++) {
