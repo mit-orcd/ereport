@@ -1,0 +1,19 @@
+---
+description: ORCD compile/test must use Slurm compute nodes and scratch, not the login node
+alwaysApply: true
+---
+
+# ORCD: Slurm for builds and tests
+
+When on ORCD (`orcd-login*`), do **not** compile or run heavy tests on the login node.
+
+- **Login node:** edit git, light inspection, submit/allocate Slurm jobs.
+- **Compute node:** `make`, `./test.sh`, `scripts/profile/profiling.sh`, compare-indexers runs, anything CPU/I/O heavy.
+- **Do not change** `test.sh`, `profiling.sh`, or other harness scripts for this — run them as-is under Slurm.
+- Prefer `srun` / `salloc` (short: `mit_quicktest`; longer: `mit_normal` / `mit_preemptable`). Batch via `sbatch` for unattended work.
+- On the node, set `TMPDIR` to local `/scratch/$USER/...` when writable (else fall back and note it).
+- Shared durable artifacts live under `~/orcd/scratch/ereport-automated-testing` (binaries, trees, indexes, toolchains). Point existing env vars / `PREFIX` / `--work` there — do not invent new script APIs.
+- Toolchains (Python venv, `CARGO_HOME`, `RUSTUP_HOME`, compare-indexers `PREFIX`) go under that scratch dir, not `~/.local` or `~/.cargo` on home.
+- **Never** run `find`, `fd`, `locate`, `du`, `rsync --dry-run`, or similar tree walks starting at `/`, `/orcd`, `/nfs`, or `/home` (or other cluster-wide mounts). Scope searches to a known small path (this repo, `$SCRATCH`, a job’s `/scratch/$USER/...`). Prefer `rg`/`Glob` in the workspace over shell filesystem crawls.
+
+For the concrete `srun` recipe, use the project skill `.cursor/skills/orcd-slurm-test/SKILL.md`.
