@@ -63,6 +63,7 @@ Optional environment variables (no CLI flags for these; see also [environment-va
 | `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | End-of-directory stat batches with fewer than this many names run inline on the crawl thread (default 32; `0` = always enqueue tail batches to the stat pool). Mid-directory flushes at `ECRAWL_STAT_BATCH_ENTRIES` always offload when the stat pool is enabled. |
 | `ECRAWL_STAT_QUEUE_BATCHES` | Max pending stat batches globally (default 64, range 4…4096); bounds `dup(dirfd)` backlog and crawl-thread blocking when the pool is full. |
 | `ECRAWL_STAT_RANDOM_QUEUE` | `0` = FIFO stat-batch dequeue; non-zero (default `1`) = pseudo-random dequeue among pending batches. |
+| `ECRAWL_STAT_INODE_ORDER` | `1` = sort each stat batch by the `d_ino` `getdents64` returned before statting it (default `0` = readdir order). XFS hands back dirents in name-hash order while the inodes sit in allocation order, so statting as read walks inode clusters at random; whether reordering pays depends on the filesystem and only shows with cold caches. |
 | `ECRAWL_DONATE_CHECK_EVERY` | During `readdir`, check whether to donate local directory-stack work every `N` `DT_DIR` pushes (default 64; `1` = check after every directory child). |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | When the local stack exceeds `ECRAWL_FORCE_DONATE_AT`, donate up to this many directories per queue push (default 2048). |
 | `ECRAWL_FORCE_DONATE_AT` | Spill local directory stack to the global task queue when it holds more than this many pending dirs (default 4096). |

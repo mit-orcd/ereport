@@ -39,6 +39,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | `ecrawl` | Min names in an end-of-directory stat batch before offloading to stat workers (default 32; `0` = always enqueue). |
 | `ECRAWL_STAT_QUEUE_BATCHES` | `ecrawl` | Max pending stat batches (default 64, range 4…4096). |
 | `ECRAWL_STAT_RANDOM_QUEUE` | `ecrawl` | `0` = FIFO stat-batch dequeue; non-zero (default `1`) = pseudo-random. |
+| `ECRAWL_STAT_INODE_ORDER` | `ecrawl` | `1` = sort each stat batch by inode before statting (default `0`). |
 | `ECRAWL_DONATE_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in `DT_DIR` pushes (default 64). |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | `ecrawl` | Max dirs donated per queue push on force spill (default 2048). |
 | `ECRAWL_FORCE_DONATE_AT` | `ecrawl` | Local stack size that triggers force donation (default 4096). |

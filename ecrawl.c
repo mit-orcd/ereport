@@ -314,6 +314,8 @@ typedef struct {
 } dir_stack_t;
 
 #define ID_SLOT_EMPTY 0xFFFFFFFFu
+/* Fills out with the id's account/group name, or with a placeholder when it cannot be resolved. */
+typedef void (*id_name_resolver_fn)(uint32_t id, char *out, size_t out_sz);
 typedef struct {
     uint32_t *slots;      /* open-addressing hash set; ID_SLOT_EMPTY marks empty */
     size_t cap;           /* power of two, 0 until first insert */
@@ -321,6 +323,7 @@ typedef struct {
     int has_sentinel;     /* whether the literal ID_SLOT_EMPTY id value was inserted */
     pthread_mutex_t mutex;
     FILE *fp;
+    id_name_resolver_fn resolve; /* run once per distinct id at teardown, never during the crawl */
     char path[PATH_MAX];
 } id_registry_t;
 
@@ -619,6 +622,14 @@ static atomic_ullong g_io_fopen_calls      = 0;
 static atomic_ullong g_io_fclose_calls     = 0;
 static atomic_ullong g_io_fwrite_calls     = 0;
 static atomic_ullong g_io_fflush_calls     = 0;
+/* Break io_fopen_calls down by cause. Only the shard bins are stdio; the .ckpt sidecars are written
+ * with raw fds (see shard_ckpt_write_sidecar), so a healthy write run opens ~1 stream per non-empty
+ * shard and anything above that is LRU churn, which these counters attribute instead of leaving it to
+ * be guessed at from totals. */
+static atomic_ullong g_shard_bin_opens     = 0; /* first open of a shard bin (header written) */
+static atomic_ullong g_shard_bin_reopens   = 0; /* reopen of a shard evicted earlier */
+static atomic_ullong g_shard_evictions     = 0; /* closes forced by max_open_shards / fd pressure */
+static atomic_ullong g_shard_ckpt_writes   = 0; /* .ckpt sidecar writes (one open()/write() each) */
 
 #define ATOMIC_ADD_RELAXED(obj, value) atomic_fetch_add_explicit((obj), (value), memory_order_relaxed)
 #define ATOMIC_SUB_RELAXED(obj, value) atomic_fetch_sub_explicit((obj), (value), memory_order_relaxed)
@@ -748,9 +759,12 @@ static int g_writer_threads = DEFAULT_WRITER_THREADS;
 static uint32_t g_uid_shards = DEFAULT_UID_SHARDS;
 static unsigned g_max_open_shards = DEFAULT_MAX_OPEN_SHARDS;
 static unsigned g_requested_max_open_shards = DEFAULT_MAX_OPEN_SHARDS;
+static int g_max_open_shards_explicit = 0; /* set when ECRAWL_MAX_OPEN_SHARDS asked for a value */
 static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
+/* ECRAWL_STAT_INODE_ORDER=1: sort each stat batch by inode before statting (see stat_names_builder_seal). */
+static int g_stat_inode_order = 0;
 /* --no-stat: walk names only, never read an inode. Recursion needs just d_type, so records
  * (uid/size/inode/nlink/times all come from stat) cannot be written and paths stream instead. */
 static int g_no_stat = 0;
@@ -1371,6 +1385,19 @@ static int parse_ecrawl_stat_random_queue(void) {
     return v != 0 ? 1 : 0;
 }
 
+/* Sort each stat batch by inode before statting: 1 = on, 0 = off (default). Env: ECRAWL_STAT_INODE_ORDER. */
+static int parse_ecrawl_stat_inode_order(void) {
+    const char *e = getenv("ECRAWL_STAT_INODE_ORDER");
+    long v;
+    char *end;
+
+    if (!e || !*e) return 0;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno || end == e || *end) return 0;
+    return v != 0 ? 1 : 0;
+}
+
 /* Writer thread count for uid-sharded output. Default: DEFAULT_WRITER_THREADS. */
 static int parse_ecrawl_writer_threads_env(void) {
     const char *e = getenv("ECRAWL_WRITER_THREADS");
@@ -1408,6 +1435,7 @@ static unsigned parse_ecrawl_max_open_shards_env(void) {
     v = strtoul(e, &end, 10);
     if (errno || end == e || *end || v < 1UL || v > (unsigned long)UINT_MAX)
         return DEFAULT_MAX_OPEN_SHARDS;
+    g_max_open_shards_explicit = 1;
     return (unsigned)v;
 }
 
@@ -1438,6 +1466,19 @@ static void configure_max_open_shards(void) {
                              (rlim_t)g_writer_threads;
 
     if (per_writer_fd_cap < 1U) per_writer_fd_cap = 1U;
+
+    /*
+     * The default is only right for the default writer count: with fewer writers each owns more than
+     * 128 shards, and holding just 128 of them open puts the rest on an LRU that evicts and reopens a
+     * shard for every burst of records belonging to it — each round trip costing an fopen, a catalog
+     * reload and a rewritten .ckpt sidecar. Raise the default to cover the whole ownership set when
+     * the fd budget allows; total buffer memory is bounded by uid_shards * WRITE_BUFFER_SIZE either
+     * way, since writers * per_writer_shard_count is just the shard count. An explicit
+     * ECRAWL_MAX_OPEN_SHARDS is a deliberate ceiling and is left alone.
+     */
+    if (!g_max_open_shards_explicit && per_writer_shard_count > (rlim_t)g_max_open_shards &&
+        per_writer_shard_count <= per_writer_fd_cap)
+        g_max_open_shards = (unsigned)per_writer_shard_count;
     if (per_writer_fd_cap < (rlim_t)g_max_open_shards) g_max_open_shards = (unsigned)per_writer_fd_cap;
     if (per_writer_shard_count < (rlim_t)g_max_open_shards) g_max_open_shards = (unsigned)per_writer_shard_count;
     if (g_max_open_shards < 1U) g_max_open_shards = 1U;
@@ -1576,11 +1617,12 @@ static int id_registry_insert_locked(id_registry_t *r, uint32_t id) {
     return 1;
 }
 
-static int id_registry_init(id_registry_t *r, const char *path) {
+static int id_registry_init(id_registry_t *r, const char *path, id_name_resolver_fn resolve) {
     int n;
 
     memset(r, 0, sizeof(*r));
     pthread_mutex_init(&r->mutex, NULL);
+    r->resolve = resolve;
 
     n = snprintf(r->path, sizeof(r->path), "%s", path);
     if (n < 0 || (size_t)n >= sizeof(r->path)) {
@@ -1598,7 +1640,50 @@ static int id_registry_init(id_registry_t *r, const char *path) {
     return 0;
 }
 
+static int cmp_u32_asc(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a;
+    uint32_t y = *(const uint32_t *)b;
+
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+/* Resolve and write every id the crawl collected. Doing this once at teardown instead of on first
+ * sight of each id keeps NSS off the crawl's hot path: getpwuid_r/getgrgid_r can mean a socket
+ * round-trip to nss-systemd or sssd, and on a tree with thousands of distinct owners those lookups
+ * showed up as ~10% of the write-mode profile, plus they hold up the stat worker that drew the
+ * unlucky entry. The id set is tiny (one entry per distinct owner), so the deferred pass costs the
+ * same lookups with none of the latency in the crawl. Emitted in ascending id order so the file is
+ * reproducible across runs rather than following whatever order the workers happened to see. */
+static void id_registry_write_names(id_registry_t *r) {
+    uint32_t *ids;
+    size_t n = 0, i;
+
+    if (!r->fp || !r->resolve || r->count == 0) return;
+
+    ids = (uint32_t *)malloc(r->count * sizeof(*ids));
+    if (!ids) {
+        fprintf(stderr, "ERROR out of memory writing %s\n", r->path);
+        return;
+    }
+
+    for (i = 0; i < r->cap && n < r->count; i++)
+        if (r->slots[i] != ID_SLOT_EMPTY) ids[n++] = r->slots[i];
+    if (r->has_sentinel && n < r->count) ids[n++] = ID_SLOT_EMPTY;
+
+    qsort(ids, n, sizeof(*ids), cmp_u32_asc);
+
+    for (i = 0; i < n; i++) {
+        char namebuf[256];
+
+        r->resolve(ids[i], namebuf, sizeof(namebuf));
+        fprintf(r->fp, "%u %s\n", (unsigned int)ids[i], namebuf);
+    }
+
+    free(ids);
+}
+
 static void id_registry_destroy(id_registry_t *r) {
+    id_registry_write_names(r);
     if (r->fp) ecrawl_io_fclose(r->fp);  /* fclose flushes the buffered id->name lines */
     free(r->slots);
     r->fp = NULL;
@@ -1609,46 +1694,38 @@ static void id_registry_destroy(id_registry_t *r) {
     pthread_mutex_destroy(&r->mutex);
 }
 
-static void write_uid_if_new(uid_t uid) {
+static void resolve_uid_name(uint32_t id, char *out, size_t out_sz) {
     char namebuf[4096];
     struct passwd pwd;
     struct passwd *result = NULL;
-    const char *name;
-    int is_new;
+    const char *name = "UNKNOWN";
 
-    /* Dedup under the lock only; the slow NSS lookup runs unlocked so that
-     * distinct ids resolve concurrently instead of serializing on the mutex. */
+    if (getpwuid_r((uid_t)id, &pwd, namebuf, sizeof(namebuf), &result) == 0 && result && result->pw_name)
+        name = result->pw_name;
+    snprintf(out, out_sz, "%s", name);
+}
+
+static void resolve_gid_name(uint32_t id, char *out, size_t out_sz) {
+    char namebuf[4096];
+    struct group grp;
+    struct group *result = NULL;
+    const char *name = "UNKNOWN";
+
+    if (getgrgid_r((gid_t)id, &grp, namebuf, sizeof(namebuf), &result) == 0 && result && result->gr_name)
+        name = result->gr_name;
+    snprintf(out, out_sz, "%s", name);
+}
+
+/* Hot path: dedup only. Names are resolved and written by id_registry_destroy. */
+static void write_uid_if_new(uid_t uid) {
     pthread_mutex_lock(&g_uid_registry.mutex);
-    is_new = id_registry_insert_locked(&g_uid_registry, (uint32_t)uid);
-    pthread_mutex_unlock(&g_uid_registry.mutex);
-    if (is_new <= 0) return;
-
-    if (getpwuid_r(uid, &pwd, namebuf, sizeof(namebuf), &result) == 0 && result && result->pw_name) name = result->pw_name;
-    else name = "UNKNOWN";
-
-    /* Buffered append under a short lock; flushed once at registry teardown. */
-    pthread_mutex_lock(&g_uid_registry.mutex);
-    fprintf(g_uid_registry.fp, "%u %s\n", (unsigned int)uid, name);
+    (void)id_registry_insert_locked(&g_uid_registry, (uint32_t)uid);
     pthread_mutex_unlock(&g_uid_registry.mutex);
 }
 
 static void write_gid_if_new(gid_t gid) {
-    char namebuf[4096];
-    struct group grp;
-    struct group *result = NULL;
-    const char *name;
-    int is_new;
-
     pthread_mutex_lock(&g_gid_registry.mutex);
-    is_new = id_registry_insert_locked(&g_gid_registry, (uint32_t)gid);
-    pthread_mutex_unlock(&g_gid_registry.mutex);
-    if (is_new <= 0) return;
-
-    if (getgrgid_r(gid, &grp, namebuf, sizeof(namebuf), &result) == 0 && result && result->gr_name) name = result->gr_name;
-    else name = "UNKNOWN";
-
-    pthread_mutex_lock(&g_gid_registry.mutex);
-    fprintf(g_gid_registry.fp, "%u %s\n", (unsigned int)gid, name);
+    (void)id_registry_insert_locked(&g_gid_registry, (uint32_t)gid);
     pthread_mutex_unlock(&g_gid_registry.mutex);
 }
 
@@ -1994,7 +2071,9 @@ static void print_usage(const char *prog) {
             "ECRAWL_STAT_BATCH_MIN_OFFLOAD (tail batches smaller than this many names use crawl-thread fstatat; "
             "default %u; 0=always offload tails to stat pool), "
             "ECRAWL_STAT_QUEUE_BATCHES (pending stat batches cap, default %u), "
-            "ECRAWL_STAT_RANDOM_QUEUE (default 1: random stat-batch dequeue; 0=FIFO).\n"
+            "ECRAWL_STAT_RANDOM_QUEUE (default 1: random stat-batch dequeue; 0=FIFO), "
+            "ECRAWL_STAT_INODE_ORDER (default 0; 1=sort each stat batch by inode before statting, which can help "
+            "on a cold XFS where dirents come back in name-hash order).\n"
             "Donation (reduce task-queue mutex traffic): ECRAWL_DONATE_CHECK_EVERY (default %u: donate check every N "
             "DT_DIR pushes during readdir), ECRAWL_DONATE_CHUNK_FORCE_MAX (default %u: max dirs per queue push when "
             "stack exceeds force threshold), ECRAWL_FORCE_DONATE_AT (default %u: spill stack to global queue above "
@@ -2705,28 +2784,76 @@ static int shard_ckpt_push(shard_file_state_t *s, uint64_t off) {
     return 0;
 }
 
+/*
+ * Sidecar I/O deliberately bypasses stdio. Every stream a process opens goes on one glibc-global
+ * list under one lock, so the burst of sidecar writes when a crawl closes its shards serializes
+ * against every other fopen/fclose in flight — and a sidecar is one header plus one array, which
+ * needs no buffering. write()/pread() on a raw fd produce the identical bytes.
+ */
+static int write_all_fd(int fd, const void *buf, size_t n) {
+    const unsigned char *p = (const unsigned char *)buf;
+
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) {
+            errno = EIO;
+            return -1;
+        }
+        p += (size_t)w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int pread_all_fd(int fd, void *buf, size_t n, off_t off) {
+    unsigned char *p = (unsigned char *)buf;
+
+    while (n > 0) {
+        ssize_t r = pread(fd, p, n, off);
+
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) {
+            errno = EINVAL; /* short file */
+            return -1;
+        }
+        p += (size_t)r;
+        n -= (size_t)r;
+        off += (off_t)r;
+    }
+    return 0;
+}
+
 static int shard_ckpt_write_sidecar(const char *bin_path, const uint64_t *offs, size_t n) {
     char ckpath[PATH_MAX];
     crawl_ckpt_file_hdr_t ch;
-    FILE *fp;
+    int fd;
 
     if (!offs || n == 0) return -1;
     if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
-    fp = ecrawl_io_fopen(ckpath, "wb");
-    if (!fp) return -1;
+    ATOMIC_ADD_RELAXED(&g_shard_ckpt_writes, 1);
+    fd = open(ckpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
     memset(&ch, 0, sizeof(ch));
     memcpy(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN);
     ch.version = CRAWL_CKPT_ONDISK_VERSION;
     ch.stride_bytes = CRAWL_CKPT_STRIDE_BYTES;
     ch.num_offsets = (uint64_t)n;
-    if (fwrite(&ch, sizeof(ch), 1, fp) != 1 || fwrite(offs, sizeof(uint64_t), n, fp) != n) {
+    if (write_all_fd(fd, &ch, sizeof(ch)) != 0 || write_all_fd(fd, offs, n * sizeof(uint64_t)) != 0) {
         int e = errno ? errno : EIO;
-        ecrawl_io_fclose(fp);
+
+        (void)close(fd);
         errno = e;
         return -1;
     }
-    if (ecrawl_io_fflush(fp) != 0 || ecrawl_io_fclose(fp) != 0) return -1;
-    return 0;
+    return close(fd) == 0 ? 0 : -1;
 }
 
 static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t record_region_end, uint64_t **offs_out,
@@ -2735,30 +2862,33 @@ static int shard_ckpt_read_sidecar(const char *bin_path, uint64_t record_region_
     crawl_ckpt_file_hdr_t ch;
     uint64_t *buf = NULL;
     size_t i;
-    FILE *fp;
+    int fd;
 
     *offs_out = NULL;
     *n_out = 0;
     if (ckpt_sidecar_path(bin_path, ckpath, sizeof(ckpath)) != 0) return -1;
-    fp = ecrawl_io_fopen(ckpath, "rb");
-    if (!fp) return -1;
-    if (fread(&ch, sizeof(ch), 1, fp) != 1) {
-        ecrawl_io_fclose(fp);
+    fd = open(ckpath, O_RDONLY);
+    if (fd < 0) return -1;
+    if (pread_all_fd(fd, &ch, sizeof(ch), 0) != 0) {
+        (void)close(fd);
         errno = EINVAL;
         return -1;
     }
     if (memcmp(ch.magic, CRAWL_CKPT_MAGIC, CRAWL_CKPT_MAGIC_LEN) != 0 || ch.version != CRAWL_CKPT_ONDISK_VERSION ||
         ch.stride_bytes != CRAWL_CKPT_STRIDE_BYTES || ch.num_offsets == 0 || ch.num_offsets > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
-        ecrawl_io_fclose(fp);
+        (void)close(fd);
         errno = EINVAL;
         return -1;
     }
     buf = (uint64_t *)malloc((size_t)ch.num_offsets * sizeof(*buf));
     if (!buf) {
-        ecrawl_io_fclose(fp);
+        int e = errno ? errno : ENOMEM;
+
+        (void)close(fd);
+        errno = e;
         return -1;
     }
-    if (fread(buf, sizeof(uint64_t), (size_t)ch.num_offsets, fp) != (size_t)ch.num_offsets || ecrawl_io_fclose(fp) != 0) {
+    if (pread_all_fd(fd, buf, (size_t)ch.num_offsets * sizeof(uint64_t), (off_t)sizeof(ch)) != 0 || close(fd) != 0) {
         free(buf);
         errno = EINVAL;
         return -1;
@@ -3730,11 +3860,23 @@ static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t 
     }
 }
 
+/* One name in the builder's blob, kept beside it so a batch can be reordered without re-parsing. */
+typedef struct {
+    uint64_t ino;
+    uint32_t off;
+    uint32_t len;
+} stat_name_ent_t;
+
 typedef struct {
     unsigned char *buf;
     size_t len;
     size_t cap;
     size_t count;
+    stat_name_ent_t *ents; /* [count], parallel to the blob; only read when inode ordering is on */
+    size_t ents_cap;
+    unsigned char *sortbuf; /* scratch the reordered blob is built into, then swapped with buf */
+    size_t sortcap;
+    unsigned char sealed; /* 1 once this batch has been ordered; flush paths can be reached twice */
 } stat_names_builder_t;
 
 typedef struct {
@@ -3747,19 +3889,26 @@ static void stat_names_builder_clear(stat_names_builder_t *nb) {
     if (!nb) return;
     nb->len = 0;
     nb->count = 0;
+    nb->sealed = 0;
 }
 
 static void stat_names_builder_free(stat_names_builder_t *nb) {
     if (!nb) return;
     free(nb->buf);
     nb->buf = NULL;
-    nb->len = nb->cap = nb->count = 0;
+    free(nb->ents);
+    nb->ents = NULL;
+    free(nb->sortbuf);
+    nb->sortbuf = NULL;
+    nb->len = nb->cap = nb->count = nb->ents_cap = nb->sortcap = 0;
+    nb->sealed = 0;
 }
 
-static int stat_names_builder_append(stat_names_builder_t *nb, const char *name, size_t name_len) {
+static int stat_names_builder_append(stat_names_builder_t *nb, const char *name, size_t name_len, uint64_t ino) {
     size_t need;
 
     if (!nb || !name) return -1;
+    if (name_len > UINT32_MAX || nb->len > UINT32_MAX) return -1;
     need = name_len + 1;
     if (nb->len + need > nb->cap) {
         size_t nc = nb->cap ? nb->cap * 2 : 4096;
@@ -3774,11 +3923,73 @@ static int stat_names_builder_append(stat_names_builder_t *nb, const char *name,
             nb->cap = nc;
         }
     }
+    if (nb->count + 1 > nb->ents_cap) {
+        size_t ne = nb->ents_cap ? nb->ents_cap * 2 : 256;
+        stat_name_ent_t *e = (stat_name_ent_t *)realloc(nb->ents, ne * sizeof(*e));
+
+        if (!e) return -1;
+        nb->ents = e;
+        nb->ents_cap = ne;
+    }
+    nb->ents[nb->count].ino = ino;
+    nb->ents[nb->count].off = (uint32_t)nb->len;
+    nb->ents[nb->count].len = (uint32_t)name_len;
     memcpy(nb->buf + nb->len, name, name_len);
     nb->buf[nb->len + name_len] = '\0';
     nb->len += need;
     nb->count++;
     return 0;
+}
+
+static int cmp_stat_name_ent_ino(const void *a, const void *b) {
+    uint64_t x = ((const stat_name_ent_t *)a)->ino;
+    uint64_t y = ((const stat_name_ent_t *)b)->ino;
+
+    return (x > y) - (x < y);
+}
+
+/*
+ * Order a batch's names by inode before anything stats them. XFS returns dirents in name-hash order
+ * while the inodes sit in allocation order, so a batch statted as read walks inode clusters at random;
+ * `fstatat` and the `xfs_iget` under it are most of a cold crawl. Off by default: the win depends on
+ * the filesystem and only shows with cold caches, so ECRAWL_STAT_INODE_ORDER=1 asks for it.
+ */
+static void stat_names_builder_seal(stat_names_builder_t *nb) {
+    unsigned char *out;
+    size_t pos = 0;
+    size_t i;
+
+    if (!nb || nb->sealed) return;
+    nb->sealed = 1;
+    if (!g_stat_inode_order || nb->count < 2 || !nb->ents) return;
+
+    if (nb->sortcap < nb->len) {
+        unsigned char *p = (unsigned char *)realloc(nb->sortbuf, nb->cap);
+
+        if (!p) return; /* fall back to readdir order */
+        nb->sortbuf = p;
+        nb->sortcap = nb->cap;
+    }
+    qsort(nb->ents, nb->count, sizeof(nb->ents[0]), cmp_stat_name_ent_ino);
+    out = nb->sortbuf;
+    for (i = 0; i < nb->count; i++) {
+        size_t nl = nb->ents[i].len;
+
+        memcpy(out + pos, nb->buf + nb->ents[i].off, nl);
+        out[pos + nl] = '\0';
+        nb->ents[i].off = (uint32_t)pos;
+        pos += nl + 1;
+    }
+    /* The blob is handed to the batch, so keep the one it replaced as next time's scratch. */
+    {
+        unsigned char *old_buf = nb->buf;
+        size_t old_cap = nb->cap;
+
+        nb->buf = nb->sortbuf;
+        nb->cap = nb->sortcap;
+        nb->sortbuf = old_buf;
+        nb->sortcap = old_cap;
+    }
 }
 
 static void stat_batch_record_unexpected_dir(const char *parent_path, size_t parent_len, const char *name,
@@ -3796,6 +4007,7 @@ static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, siz
     (void)stack;
     (void)aux;
     if (!nb || nb->count == 0) return 0;
+    stat_names_builder_seal(nb);
     {
         discovered_dir_batch_t db;
 
@@ -4229,6 +4441,7 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
     shared_state_t *shared = wa->shared;
 
     if (!nb || nb->count == 0) return 0;
+    stat_names_builder_seal(nb);
 
     dfd = dup(dir_fd);
     if (dfd < 0) {
@@ -4328,9 +4541,10 @@ static int ecrawl_dir_reader_fd(ecrawl_dir_reader_t *r) {
     return (r->fd >= 0) ? r->fd : dirfd(r->dirp);
 }
 
-/* Fetch the next entry's name + d_type. Returns 1 = got entry, 0 = end-of-directory, -1 = read error.
- * "." / ".." are not filtered here (callers already skip them), matching readdir semantics. */
-static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out, unsigned char *type_out) {
+/* Fetch the next entry's name, d_type and inode. Returns 1 = got entry, 0 = end-of-directory,
+ * -1 = read error. "." / ".." are not filtered here (callers already skip them), matching readdir. */
+static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out, unsigned char *type_out,
+                                  uint64_t *ino_out) {
     if (r->fd < 0) {
         struct dirent *de = ecrawl_io_readdir(r->dirp);
         if (!de) return 0;
@@ -4340,6 +4554,7 @@ static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out,
 #else
         *type_out = DT_UNKNOWN;
 #endif
+        if (ino_out) *ino_out = (uint64_t)de->d_ino;
         return 1;
     }
     for (;;) {
@@ -4360,6 +4575,7 @@ static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out,
         r->buf_off += d->d_reclen;
         *name_out = d->d_name;
         *type_out = d->d_type;
+        if (ino_out) *ino_out = d->d_ino;
         if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_readdir_calls, 1);
         return 1;
     }
@@ -4398,6 +4614,7 @@ static int process_directory_iterative(dir_stack_t *stack,
         ecrawl_dir_reader_t rd;
         const char *ent_name;
         unsigned char ent_dtype;
+        uint64_t ent_ino = 0;
         dirmatch_t dm;
 
         if (dir_stack_pop(stack, &work) != 0) break;
@@ -4483,7 +4700,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             if (g_no_stat) {
                 size_t dirs_since_donate_check = 0;
 
-                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     size_t child_name_len;
                     unsigned char child_d_type = ent_dtype;
 
@@ -4567,7 +4784,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     size_t readdir_drain_counter       = 0;
                     size_t dirs_since_donate_check     = 0;
 
-                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     readdir_drain_counter++;
                     if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
                         readdir_drain_counter = 0;
@@ -4643,7 +4860,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                         } else {
                             /* Batched fstatat: trusted non-dirs past inline cap, DT_UNKNOWN, etc. Stat workers
                              * enqueue discovered directories (same as crawl-thread inline path). */
-                            if (stat_names_builder_append(&nb, ent_name, child_name_len) != 0) {
+                            if (stat_names_builder_append(&nb, ent_name, child_name_len, ent_ino) != 0) {
                                 fprintf(stderr, "ERROR worker stat batch append %s/%s: %s\n", dir_path, ent_name,
                                         strerror(errno));
                                 stats_add_error(shared);
@@ -4696,7 +4913,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             } else {
                 size_t dirs_since_donate_check = 0;
 
-                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype) == 1) {
+                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     size_t child_name_len;
                     struct stat child_st;
                     unsigned char child_d_type = ent_dtype;
@@ -5047,6 +5264,7 @@ static int writer_close_lru_shard(shard_file_state_t *shards, uint32_t writer_in
         if (build_shard_path(shard, path, sizeof(path)) == 0)
             (void)shard_flush_ckpt_before_close(victim, path, 0);
     }
+    ATOMIC_ADD_RELAXED(&g_shard_evictions, 1);
     ecrawl_io_fclose(victim->fp);
     victim->fp = NULL;
     /* Release the block writer's buffers while evicted to bound writer memory to
@@ -5076,6 +5294,7 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
          * Avoid "a+" here: append streams may ignore seeks on write, so rewriting the 32-byte
          * header at offset 0 when finalizing the catalog would corrupt the shard tail instead.
          */
+        ATOMIC_ADD_RELAXED(&g_shard_bin_opens, 1);
         state->fp = ecrawl_io_fopen(path, "wb+");
         if (!state->fp) return -1;
         setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
@@ -5112,6 +5331,7 @@ static int writer_open_shard_file(shard_file_state_t *state, const char *path) {
         if (ecrawl_io_stat(path, &st) != 0) return -1;
         fsz = (uint64_t)st.st_size;
 
+        ATOMIC_ADD_RELAXED(&g_shard_bin_reopens, 1);
         state->fp = ecrawl_io_fopen(path, "rb+");
         if (!state->fp) return -1;
         setvbuf(state->fp, NULL, _IOFBF, WRITE_BUFFER_SIZE);
@@ -5850,6 +6070,10 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
     fprintf(fp, "io_fwrite_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fwrite_calls));
     fprintf(fp, "io_fflush_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fflush_calls));
+    fprintf(fp, "shard_bin_opens=%" PRIu64 "\n", (uint64_t)atomic_load(&g_shard_bin_opens));
+    fprintf(fp, "shard_bin_reopens=%" PRIu64 "\n", (uint64_t)atomic_load(&g_shard_bin_reopens));
+    fprintf(fp, "shard_evictions=%" PRIu64 "\n", (uint64_t)atomic_load(&g_shard_evictions));
+    fprintf(fp, "shard_ckpt_writes=%" PRIu64 "\n", (uint64_t)atomic_load(&g_shard_ckpt_writes));
     fprintf(fp, "manifest=%s\n", g_no_write ? "(disabled)" : "crawl_manifest.txt");
     fprintf(fp, "uid_output=%s\n", g_no_write ? "(disabled)" : g_uid_registry.path);
     fprintf(fp, "gid_output=%s\n", g_no_write ? "(disabled)" : g_gid_registry.path);
@@ -6060,6 +6284,7 @@ int main(int argc, char **argv) {
     g_stat_batch_min_offload_cfg          = parse_ecrawl_stat_batch_min_offload();
     g_stat_queue_max_batches_cfg = parse_ecrawl_stat_queue_batches();
     g_stat_random_queue_dequeue = parse_ecrawl_stat_random_queue();
+    g_stat_inode_order = parse_ecrawl_stat_inode_order();
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
     g_force_donate_count_cfg     = parse_ecrawl_force_donate_at();
@@ -6102,12 +6327,12 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            if (id_registry_init(&g_uid_registry, uid_path) != 0) {
+            if (id_registry_init(&g_uid_registry, uid_path, resolve_uid_name) != 0) {
                 fprintf(stderr, "ERROR failed to open %s: %s\n", uid_path, strerror(errno));
                 return 1;
             }
             uid_registry_ready = 1;
-            if (id_registry_init(&g_gid_registry, gid_path) != 0) {
+            if (id_registry_init(&g_gid_registry, gid_path, resolve_gid_name) != 0) {
                 fprintf(stderr, "ERROR failed to open %s: %s\n", gid_path, strerror(errno));
                 id_registry_destroy(&g_uid_registry);
                 uid_registry_ready = 0;
@@ -6233,6 +6458,10 @@ int main(int argc, char **argv) {
     atomic_store(&g_io_fclose_calls, 0);
     atomic_store(&g_io_fwrite_calls, 0);
     atomic_store(&g_io_fflush_calls, 0);
+    atomic_store(&g_shard_bin_opens, 0);
+    atomic_store(&g_shard_bin_reopens, 0);
+    atomic_store(&g_shard_evictions, 0);
+    atomic_store(&g_shard_ckpt_writes, 0);
 
     t0 = now_sec();
     g_run_start_sec = t0;
