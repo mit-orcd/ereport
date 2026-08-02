@@ -24,6 +24,8 @@ bin_colchunk_hdr_t[column_count]        the column directory
 
 with the payloads in directory order, so a reader that wants two columns reads the header plus directory and then seeks straight to those two payloads. Row groups are self-describing and contiguous — `crawl_bin_rowgroup_total_bytes()` gives the stride to the next group from the header alone — so a reader walks them with header reads and no side index, and every chunk boundary handed to a parallel worker is a group boundary. `ecrawl` flushes a group at about 1 MiB of uncompressed records or 65536 records, whichever comes first (`CRAWL_BIN_ROWGROUP_RAW_TARGET`, `CRAWL_BIN_ROWGROUP_MAX_RECORDS`). The 1 MiB target is what gives the codecs enough runway to pay off: a few thousand records per group is too short for run-length and frame-of-reference encoding to matter.
 
+That layout is intentionally heavier at **write** time than the older single-zstd block frames (v6/v7): each flush runs a codec pass and a `ZSTD_compress` per column. `--no-write` never enters this path, so a compare-indexers figure where `fd` / `find` / `du` / `ecrawl --no-write` stay flat while solid `ecrawl` (write) slows is the expected signature of a producer-format change, not a colder walk. See [performance.md](performance.md#ercbin08-capture-write-cost).
+
 `bin_rowgroup_hdr_t` (32 bytes): `record_count` `uint32_t`, `column_count` `uint32_t`, `comp_bytes` `uint64_t` (payload bytes after the directory), `raw_bytes` `uint64_t`, `type_mask` `uint16_t` (OR of `crawl_bin_type_bit()` over the group), then reserved.
 
 `bin_colchunk_hdr_t` (32 bytes): `column_id` `uint8_t`, `encoding` `uint8_t`, `bit_width` `uint8_t`, reserved, `comp_bytes` `uint32_t`, `raw_bytes` `uint64_t`, `min_value` `uint64_t`, `max_value` `uint64_t`.
