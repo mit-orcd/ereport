@@ -145,6 +145,9 @@ crawl_result.o: crawl_result.c crawl_result.h crawl_bin_format.h
 crawl_bin_chunks.o: crawl_bin_chunks.c crawl_bin_chunks.h crawl_bin_format.h crawl_ckpt.h
 	$(CC) $(CFLAGS) -c crawl_bin_chunks.c -o crawl_bin_chunks.o
 
+crawl_fpcache.o: crawl_fpcache.c crawl_fpcache.h
+	$(CC) $(CFLAGS) -c crawl_fpcache.c -o crawl_fpcache.o
+
 crawl_bin_codec.o: crawl_bin_codec.c crawl_bin_codec.h crawl_bin_format.h
 	$(CC) $(CFLAGS) -c crawl_bin_codec.c -o crawl_bin_codec.o
 
@@ -166,14 +169,14 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
-ecrawl_analyze: ecrawl_analyze.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ecrawl_analyze: ecrawl_analyze.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
