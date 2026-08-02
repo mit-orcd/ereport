@@ -35,13 +35,21 @@
 #endif
 #ifdef __linux__
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #define ALLOC_TUNE_TRIM_THRESHOLD (128 * 1024 * 1024)
 #define ALLOC_TUNE_MMAP_THRESHOLD (32 * 1024 * 1024)
 /* Below this an allocation cannot hold a whole huge page once aligned, so the hint would be a no-op. */
+/* -D the minimum huge to A/B without the hint. */
+#ifndef ALLOC_HUGEPAGE_MIN_BYTES
 #define ALLOC_HUGEPAGE_MIN_BYTES (4u * 1024u * 1024u)
+#endif
 #define ALLOC_HUGEPAGE_SIZE (2u * 1024u * 1024u)
+/* Below this the fault count is too small to be worth a syscall. -D it huge to A/B without prefaulting. */
+#ifndef ALLOC_PREFAULT_MIN_BYTES
+#define ALLOC_PREFAULT_MIN_BYTES (1u * 1024u * 1024u)
+#endif
 
 static inline void tune_allocator(void) {
 #ifdef __GLIBC__
@@ -73,6 +81,61 @@ static inline void alloc_hint_hugepages(void *p, size_t bytes) {
     end = (start + bytes) & ~(uintptr_t)(ALLOC_HUGEPAGE_SIZE - 1);
     if (end <= aligned) return;
     (void)madvise((void *)aligned, (size_t)(end - aligned), MADV_HUGEPAGE);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
+/*
+ * Populate the page tables of a large allocation now, instead of one fault at a time as it fills.
+ * MADV_HUGEPAGE on its own does not do this: the pages a fresh calloc hands back still fault on
+ * first write, and for the zero page that fault is a copy (wp_page_copy) whose page-table update
+ * sends a TLB shootdown IPI to every core running the process. On a 96-core box populating a
+ * multi-megabyte hash table that way cost ereport ~30% of its cycles in the fault handler with
+ * another ~8% in smp_call_function_many_cond. One madvise replaces the whole storm.
+ *
+ * MADV_POPULATE_WRITE is Linux 5.14+ and its value is spelled out because a toolchain older than
+ * the running kernel would otherwise hide it. Older kernels answer EINVAL, which falls back to a
+ * page-stride read-modify-write: it stores back exactly what it read, so it is safe whatever the
+ * buffer holds.
+ */
+/* MADV_HUGEPAGE stands in for "this translation unit sees madvise()": glibc gates the declaration and
+ * the MADV_* constants on the same feature macros, so a unit compiled without them uses the touch loop. */
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+#define ALLOC_HAVE_MADVISE 1
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#endif
+
+static inline void alloc_prefault(void *p, size_t bytes) {
+#if defined(__linux__)
+    long pagesz;
+    uintptr_t start = (uintptr_t)p;
+    uintptr_t aligned, end;
+
+    if (!p || bytes < (size_t)ALLOC_PREFAULT_MIN_BYTES) return;
+
+    pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+
+    /* madvise needs a page-aligned start; the head and tail partial pages are left to fault. */
+    aligned = (start + (uintptr_t)pagesz - 1u) & ~((uintptr_t)pagesz - 1u);
+    end = (start + bytes) & ~((uintptr_t)pagesz - 1u);
+    if (end <= aligned) return;
+
+#ifdef ALLOC_HAVE_MADVISE
+    if (madvise((void *)aligned, (size_t)(end - aligned), MADV_POPULATE_WRITE) == 0) return;
+#endif
+
+    {
+        volatile unsigned char *q = (volatile unsigned char *)aligned;
+        size_t span = (size_t)(end - aligned);
+        size_t off;
+
+        for (off = 0; off < span; off += (size_t)pagesz) q[off] = q[off];
+    }
 #else
     (void)p;
     (void)bytes;

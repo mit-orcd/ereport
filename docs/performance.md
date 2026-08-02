@@ -33,7 +33,7 @@ See [tools.md#edelete](tools.md#edelete) for the unlink-contention tuning note (
 
 - Parallel chunk mapping — Uses `*.ckpt` to build chunk lists (byte ranges that align with record starts). Chunk count scales with file size, so `EREPORT_THREADS` has enough units of work.
 - Parallel chunk parsing — Workers consume disjoint chunks; summaries and bucket histograms merge after workers finish (merge step is not on the per-record hot path across all threads).
-- Parallel bucket HTML — The 36 heat-map cells map to 36 independent output files; emission fans out across threads up to that cap. Per-page `aggregate_totals_for_page_n` uses a RAM-budgeted worker matrix; if the worker×row partial matrix cannot be allocated, worker count is reduced until `calloc` succeeds (avoids a single-threaded fallback that pins one CPU on huge path-row maps).
+- Parallel bucket HTML — The 36 heat-map cells map to 36 independent output files; emission fans out across threads up to that cap. Per-page `aggregate_totals_for_page_n` gives each worker a small open-addressed table keyed by row pointer instead of a worker×row matrix: a worker's slice of the records only ever touches a handful of the rows, so a table sized to that working set stays in cache, and one relaxed atomic add per touched row folds it into the shared totals at the end. Rows past the table's load limit go straight to those atomics, so a slice that touches everything still finishes without a fallback.
 - Cheap mode by default — Without `--bucket-details`, the parser seeks past path strings for histogram-only passes, keeping I/O and CPU down when you only need aggregates.
 
 ### `ereport_index`: trigram index build (`--make`)

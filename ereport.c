@@ -64,6 +64,7 @@
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
+#include "crawl_fpcache.h"
 #include "path_canon.h"
 #include "path_utils.h"
 
@@ -134,21 +135,17 @@ static double g_ctime_led_badge_min_share_frac = CTIME_LED_BADGE_MIN_SHARE_FRAC;
 #define PATH_ORD_MAX_MS_DEPTH 12
 /*
  * Bucket HTML: aggregate_totals_for_page_n walks matched records under base_prefix. Parallel path shards the
- * record range; each worker accumulates per-row partials. Partial matrix size is nw×R×3×uint64 — cap nw by
- * AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES so large path_row_map tables (big R) still use multiple workers. If the
- * nw×R partial matrix would exceed the budget, nw is capped; if calloc still fails, nw is halved until allocation
- * succeeds so we avoid falling back to a single-threaded scan over huge path-ordered slices (one slow bucket
- * otherwise pins ~100% CPU for a long time at "cells 35/36").
+ * record range; each worker accumulates into a private open-addressed table holding only the rows its slice
+ * touches (about R/nw of them), then adds those counts into the shared rows with relaxed atomics. Total table
+ * memory is O(R) and is capped by AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES; rows past a table's load limit are added
+ * atomically as they are seen, so a badly skewed slice costs contention rather than memory.
  *
- * When R is so large that the budget affords fewer than AGG_TOTALS_MATRIX_MIN_THREADS partial vectors, the
- * partial-matrix approach would collapse to ~1 thread (its memory is O(nw·R)). In that case we instead shard
- * records across the full requested thread count and accumulate directly into the shared row totals with
- * relaxed atomic adds (memory O(R), contention only on the hottest rows) — this is what keeps the largest
- * bucket from running single-threaded for hours at "cells 35/36".
+ * A dense nw×R×3×uint64 matrix was the earlier shape. It is not viable at scale: a row's index is its slot in
+ * the path_row_map, so a worker's rows are spread over the whole vector and every worker faults in and memsets
+ * all R rows — 27% of an ereport run was in the page-fault handler under that memset.
  */
 #define AGG_TOTALS_PAR_MIN_RECORDS (8192ULL)
 #define AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES (1536ULL * 1024ULL * 1024ULL)
-#define AGG_TOTALS_MATRIX_MIN_THREADS 4
 #define AGG_BKT_PAR_MIN_DETAILS 4096u
 #define AGG_BKT_PAR_MAX_THREADS 24
 
@@ -499,6 +496,7 @@ static int pintern_grow(parent_intern_t *t, size_t want) {
     ns = (pintern_slot_t *)calloc(newn, sizeof(*ns));
     if (!ns) return -1;
     alloc_hint_hugepages(ns, newn * sizeof(*ns));
+    alloc_prefault(ns, newn * sizeof(*ns));
     for (i = 0; i < t->nslots; i++) {
         size_t idx;
         if (!t->slots[i].parent) continue;
@@ -943,18 +941,31 @@ typedef struct {
     uint64_t total_files;
     uint64_t total_dirs;
     uint64_t total_bytes;
-    /*
-     * aggregate_totals_for_page_n_parallel only: index of this row in the sorted row_list (0..R-1).
-     * Filled right before worker threads start; O(1) partial-vector updates instead of binary search per record.
-     */
-    int par_agg_ix;
 } path_row_t;
+
+/*
+ * Row keys live in the map's own bump arena rather than one strdup per row. A bucket page
+ * inserts a row per distinct path prefix per level, so the old scheme meant a malloc per row
+ * on the way in and a free per row on the way out, every page — and the maps are rebuilt for
+ * every page by every aggregation worker. Blocks are kept when the map is cleared, so the
+ * next page writes over memory that is already resident.
+ */
+#define PATH_KEY_BLK_BYTES (256U * 1024U)
+
+typedef struct path_key_blk {
+    struct path_key_blk *next;
+    size_t len;
+    size_t cap;
+    char data[];
+} path_key_blk_t;
 
 typedef struct {
     path_row_t *rows;
     unsigned char *used;
     size_t cap;
     size_t count;
+    path_key_blk_t *keys;     /* all blocks, in allocation order */
+    path_key_blk_t *keys_cur; /* block currently being filled */
 } path_row_map_t;
 
 static uint64_t inode_key_hash(uint32_t dev_major, uint32_t dev_minor, uint64_t inode) {
@@ -1860,14 +1871,19 @@ static void progress_maybe_flush(progress_local_t *progress, ereport_run_stats_t
     if (progress->scanned_records >= PROGRESS_FLUSH_INTERVAL) progress_flush_local(progress, rs);
 }
 
+/*
+ * Read-only opens go through the shard handle cache: a shard is opened once for its
+ * catalog and again for every chunk of it, and glibc serializes all of that on one
+ * process-wide stdio list lock. Write opens (the report pages) fall straight through.
+ */
 static FILE *counted_fopen(const char *path, const char *mode) {
     if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fopen_calls, 1, memory_order_relaxed);
-    return fopen(path, mode);
+    return crawl_fpcache_fopen(path, mode);
 }
 
 static int counted_fclose(FILE *fp) {
     if (g_ereport_verbose) atomic_fetch_add_explicit(&g_io_fclose_calls, 1, memory_order_relaxed);
-    return fclose(fp);
+    return crawl_fpcache_fclose(fp);
 }
 
 static size_t counted_fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
@@ -2541,6 +2557,7 @@ static int dense_cell_reserve(dense_cell_map_t *m) {
     nb = (dense_node_t **)calloc(newn, sizeof(*nb));
     if (!nb) return -1;
     alloc_hint_hugepages(nb, newn * sizeof(*nb));
+    alloc_prefault(nb, newn * sizeof(*nb));
     for (i = 0; i < m->nbuckets; i++) {
         dense_node_t *n = m->buckets[i];
 
@@ -3009,6 +3026,7 @@ static int fanout_parent_stat_reserve(fanout_parent_stat_map_t *m) {
     nb = (fanout_parent_stat_node_t **)calloc(newn, sizeof(*nb));
     if (!nb) return -1;
     alloc_hint_hugepages(nb, newn * sizeof(*nb));
+    alloc_prefault(nb, newn * sizeof(*nb));
     for (i = 0; i < m->nbuckets; i++) {
         fanout_parent_stat_node_t *n = m->buckets[i];
 
@@ -3517,12 +3535,77 @@ static size_t path_row_map_est_initial_cap(size_t record_count, int depth) {
     return (est * 10 + 6) / 7;
 }
 
+/*
+ * Slot count for a page that will insert `record_count` records at `depth`, when the previous
+ * page on this worker is available to learn from. The branching-2 guess above is only a guess;
+ * the distinct-row count the last page actually produced at this level, scaled by how much
+ * bigger this page is, is a far better one — it stops flat megadirs from rehashing their way
+ * up at every level and stops deep levels from reserving room they never use.
+ */
+static size_t path_row_map_seed_cap(size_t record_count, int depth, size_t prev_distinct, size_t prev_records) {
+    size_t est;
+
+    if (record_count == 0 || prev_records == 0) return path_row_map_est_initial_cap(record_count, depth);
+
+    est = (size_t)((double)prev_distinct * (double)record_count / (double)prev_records * 1.25) + 64;
+    if (est > record_count) est = record_count;
+    if (est < 4096) est = 4096;
+    if (est > (1u << 26)) est = (1u << 26);
+    return (est * 10 + 6) / 7;
+}
+
+static void path_row_map_keys_free(path_row_map_t *m) {
+    path_key_blk_t *b = m->keys;
+
+    while (b) {
+        path_key_blk_t *next = b->next;
+
+        free(b);
+        b = next;
+    }
+    m->keys = NULL;
+    m->keys_cur = NULL;
+}
+
+static char *path_row_map_key_intern(path_row_map_t *m, const char *s) {
+    size_t n = strlen(s);
+    size_t need = n + 1U;
+    path_key_blk_t *b = m->keys_cur;
+    char *out;
+
+    if (b && b->cap - b->len < need) b = b->next; /* blocks past the cursor are empty */
+    if (b && b->cap - b->len < need) b = NULL;
+    if (!b) {
+        size_t cap = need > PATH_KEY_BLK_BYTES ? need : PATH_KEY_BLK_BYTES;
+
+        b = (path_key_blk_t *)malloc(sizeof(*b) + cap);
+        if (!b) return NULL;
+        b->cap = cap;
+        b->len = 0;
+        b->next = NULL;
+        if (m->keys_cur) {
+            b->next = m->keys_cur->next;
+            m->keys_cur->next = b;
+        } else {
+            b->next = m->keys;
+            m->keys = b;
+        }
+    }
+    out = b->data + b->len;
+    memcpy(out, s, need);
+    b->len += need;
+    m->keys_cur = b;
+    return out;
+}
+
 static int path_row_map_init(path_row_map_t *m, size_t initial_cap) {
     size_t cap = 1;
     while (cap < initial_cap) cap <<= 1;
 
     m->rows = (path_row_t *)calloc(cap, sizeof(*m->rows));
     m->used = (unsigned char *)calloc(cap, sizeof(*m->used));
+    m->keys = NULL;
+    m->keys_cur = NULL;
     if (!m->rows || !m->used) {
         free(m->rows);
         free(m->used);
@@ -3533,6 +3616,10 @@ static int path_row_map_init(path_row_map_t *m, size_t initial_cap) {
         return -1;
     }
 
+    /* Deliberately not alloc_prefault()ed, unlike the parent tables: initial_cap here is an upper
+     * bound (record count shifted by trie depth), and the deeper levels stay nearly empty, so
+     * populating them made resident what calloc was right to leave untouched — 1.3 GB -> 2.6 GB peak
+     * on a 1.3M-record capture. Faulting these in on demand is the cheaper trade. */
     alloc_hint_hugepages(m->rows, cap * sizeof(*m->rows));
 
     m->cap = cap;
@@ -3541,16 +3628,39 @@ static int path_row_map_init(path_row_map_t *m, size_t initial_cap) {
 }
 
 static void path_row_map_destroy(path_row_map_t *m) {
-    size_t i;
-    for (i = 0; i < m->cap; i++) {
-        if (m->used[i]) free(m->rows[i].path);
-    }
+    path_row_map_keys_free(m);
     free(m->rows);
     free(m->used);
     m->rows = NULL;
     m->used = NULL;
     m->cap = 0;
     m->count = 0;
+}
+
+/*
+ * Ready a map for the next page. Only the slots the last page occupied are touched, so a page
+ * that filled a corner of a large table does not fault in the rest of it; the key arena keeps
+ * its blocks and rewinds. A table far larger than the next page needs is dropped instead, so
+ * one huge page does not pin its capacity for the rest of the run.
+ */
+static int path_row_map_reset_or_init(path_row_map_t *m, size_t want_cap) {
+    size_t i;
+    path_key_blk_t *b;
+
+    if (!m->rows || m->cap < want_cap || m->cap > want_cap * 4U) {
+        path_row_map_destroy(m);
+        return path_row_map_init(m, want_cap);
+    }
+
+    for (i = 0; i < m->cap; i++) {
+        if (!m->used[i]) continue;
+        memset(&m->rows[i], 0, sizeof(m->rows[i]));
+        m->used[i] = 0;
+    }
+    m->count = 0;
+    for (b = m->keys; b; b = b->next) b->len = 0;
+    m->keys_cur = m->keys;
+    return 0;
 }
 
 static int path_row_map_rehash(path_row_map_t *m, size_t new_cap) {
@@ -3597,10 +3707,9 @@ static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *p
         idx = (idx + 1) & (m->cap - 1);
     }
 
-    m->rows[idx].path = strdup(path);
+    m->rows[idx].path = path_row_map_key_intern(m, path);
     if (!m->rows[idx].path) return NULL;
     m->rows[idx].hash = hash;
-    m->rows[idx].par_agg_ix = 0;
     m->used[idx] = 1;
     m->count++;
     return &m->rows[idx];
@@ -3787,6 +3896,33 @@ static int starts_with_dir_prefix(const char *path, const char *prefix) {
     return path[plen] == '\0' || path[plen] == '/';
 }
 
+/* Same test against a split (parent-incl-slash, leaf) record, without materialising the join. */
+static int starts_with_dir_prefix_pl(const char *parent, const char *leaf, const char *prefix) {
+    size_t plen;
+    size_t parlen;
+
+    if (!prefix || prefix[0] == '\0') return 1;
+    parent = parent ? parent : "";
+    leaf = leaf ? leaf : "";
+    if (strcmp(prefix, "/") == 0) return (parent[0] ? parent[0] : leaf[0]) == '/';
+
+    plen = strlen(prefix);
+    parlen = strlen(parent);
+    if (plen <= parlen) {
+        if (memcmp(parent, prefix, plen) != 0) return 0;
+        /* prefix ends inside the parent: the following byte of the join is the parent's or the leaf's */
+        return parent[plen] == '\0' ? (leaf[0] == '\0' || leaf[0] == '/') : parent[plen] == '/';
+    }
+    if (memcmp(parent, prefix, parlen) != 0) return 0;
+    {
+        const char *rest = prefix + parlen;
+        size_t restlen = plen - parlen;
+
+        if (strncmp(leaf, rest, restlen) != 0) return 0;
+        return leaf[restlen] == '\0' || leaf[restlen] == '/';
+    }
+}
+
 /*
  * Directory-aware sort: all paths under a POSIX directory prefix are contiguous (unlike raw strcmp),
  * so we can binary-search a slice of matched records per bucket page instead of scanning the full corpus.
@@ -3814,6 +3950,12 @@ static int path_cmp_seg(const char *a, const char *b) {
     }
 }
 
+/*
+ * path_cmp_seg over two split (parent-incl-slash, leaf) records, without materialising either path.
+ * Defined next to the transform cursor it walks; declared here because the comparators below predate it.
+ */
+static int path_cmp_seg_pl(const char *pa, const char *la, const char *pb, const char *lb);
+
 static size_t matched_ord_lower_bound_seg(const matched_records_t *rec, const size_t *ord, size_t n, const char *key) {
     size_t lo = 0;
     size_t hi = n;
@@ -3821,9 +3963,9 @@ static size_t matched_ord_lower_bound_seg(const matched_records_t *rec, const si
     if (!key) key = "";
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        char pbuf[PATH_MAX];
-        const char *p = path_join_pl(rec->items[ord[mid]].parent, rec->items[ord[mid]].leaf, pbuf, sizeof(pbuf));
-        if (path_cmp_seg(p, key) < 0)
+        const matched_record_t *r = &rec->items[ord[mid]];
+
+        if (path_cmp_seg_pl(r->parent, r->leaf, NULL, key) < 0)
             lo = mid + 1;
         else
             hi = mid;
@@ -3846,10 +3988,9 @@ static size_t matched_ord_first_not_under_prefix(const matched_records_t *rec,
     if (!rec || !ord || lo > n) return n;
     while (a < b) {
         size_t mid = a + (b - a) / 2;
-        char pbuf[PATH_MAX];
-        const char *pp = path_join_pl(rec->items[ord[mid]].parent, rec->items[ord[mid]].leaf, pbuf, sizeof(pbuf));
+        const matched_record_t *r = &rec->items[ord[mid]];
 
-        if (starts_with_dir_prefix(pp, prefix))
+        if (starts_with_dir_prefix_pl(r->parent, r->leaf, prefix))
             a = mid + 1;
         else
             b = mid;
@@ -3861,23 +4002,19 @@ static size_t matched_ord_first_not_under_prefix(const matched_records_t *rec,
 static const matched_record_t *g_bucket_path_sort_items;
 
 static int matched_path_ord_cmp(const void *aa, const void *bb) {
-    const size_t ia = *(const size_t *)aa;
-    const size_t ib = *(const size_t *)bb;
-    char ba[PATH_MAX], bb_[PATH_MAX];
-    const char *pa = path_join_pl(g_bucket_path_sort_items[ia].parent, g_bucket_path_sort_items[ia].leaf, ba, sizeof(ba));
-    const char *pb = path_join_pl(g_bucket_path_sort_items[ib].parent, g_bucket_path_sort_items[ib].leaf, bb_, sizeof(bb_));
-    return path_cmp_seg(pa, pb);
+    const matched_record_t *ra = &g_bucket_path_sort_items[*(const size_t *)aa];
+    const matched_record_t *rb = &g_bucket_path_sort_items[*(const size_t *)bb];
+
+    return path_cmp_seg_pl(ra->parent, ra->leaf, rb->parent, rb->leaf);
 }
 
 /* Thread-safe comparator for parallel merge-sort leaves (items via qsort_r context, not globals). */
 static int matched_path_ord_cmp_r(const void *aa, const void *bb, void *ctx) {
     const matched_record_t *items = (const matched_record_t *)ctx;
-    const size_t ia = *(const size_t *)aa;
-    const size_t ib = *(const size_t *)bb;
-    char ba[PATH_MAX], bb_[PATH_MAX];
-    const char *pa = path_join_pl(items[ia].parent, items[ia].leaf, ba, sizeof(ba));
-    const char *pb = path_join_pl(items[ib].parent, items[ib].leaf, bb_, sizeof(bb_));
-    return path_cmp_seg(pa, pb);
+    const matched_record_t *ra = &items[*(const size_t *)aa];
+    const matched_record_t *rb = &items[*(const size_t *)bb];
+
+    return path_cmp_seg_pl(ra->parent, ra->leaf, rb->parent, rb->leaf);
 }
 
 static void merge_ord_path_slice(const matched_record_t *items,
@@ -3889,10 +4026,10 @@ static void merge_ord_path_slice(const matched_record_t *items,
     size_t i = lo, j = mid, k = lo;
 
     while (i < mid && j < hi) {
-        char ba[PATH_MAX], bb_[PATH_MAX];
-        const char *pa = path_join_pl(items[ord[i]].parent, items[ord[i]].leaf, ba, sizeof(ba));
-        const char *pb = path_join_pl(items[ord[j]].parent, items[ord[j]].leaf, bb_, sizeof(bb_));
-        if (path_cmp_seg(pa, pb) <= 0)
+        const matched_record_t *ra = &items[ord[i]];
+        const matched_record_t *rb = &items[ord[j]];
+
+        if (path_cmp_seg_pl(ra->parent, ra->leaf, rb->parent, rb->leaf) <= 0)
             tmp[k++] = ord[i++];
         else
             tmp[k++] = ord[j++];
@@ -4116,16 +4253,47 @@ static inline int path_tcur_next(path_tcur_t *c) {
     }
 }
 
-/* Small-bucket leaf: comparator-sort, stable by original index for tie safety. */
+/*
+ * Compare the transform streams of two split paths from scratch. Same order as path_cmp_seg over the
+ * joined paths (see the T() description above), but nothing is copied: a comparison that resolves in
+ * the first component never reads the rest of either path. Records under one directory share their
+ * interned parent pointer, so that case skips the parent entirely.
+ */
+static int path_cmp_seg_pl(const char *pa, const char *la, const char *pb, const char *lb) {
+    path_tcur_t ca, cb;
+
+    if (pa == pb) return path_cmp_seg(la ? la : "", lb ? lb : "");
+
+    path_tcur_init(&ca, pa, la);
+    path_tcur_init(&cb, pb, lb);
+    for (;;) {
+        int xa = path_tcur_next(&ca);
+        int xb = path_tcur_next(&cb);
+
+        if (xa != xb) return xa < xb ? -1 : 1;
+        if (xa == 0) return 0;
+    }
+}
+
+/*
+ * Small-bucket leaf: comparator-sort, stable by original index for tie safety. Every record in this
+ * bucket has emitted the same transform prefix, so comparing copies of their live cursors resumes at
+ * the first byte that can differ instead of re-walking (and re-joining) the shared prefix.
+ */
 static int matched_path_radix_leaf_cmp(const void *aa, const void *bb, void *ctx) {
-    const matched_record_t *items = (const matched_record_t *)ctx;
+    const path_tcur_t *curs = (const path_tcur_t *)ctx;
     size_t ia = *(const size_t *)aa;
     size_t ib = *(const size_t *)bb;
-    char ba[PATH_MAX], bb_[PATH_MAX];
-    const char *pa = path_join_pl(items[ia].parent, items[ia].leaf, ba, sizeof(ba));
-    const char *pb = path_join_pl(items[ib].parent, items[ib].leaf, bb_, sizeof(bb_));
-    int c = path_cmp_seg(pa, pb);
-    if (c) return c;
+    path_tcur_t ca = curs[ia];
+    path_tcur_t cb = curs[ib];
+
+    for (;;) {
+        int xa = path_tcur_next(&ca);
+        int xb = path_tcur_next(&cb);
+
+        if (xa != xb) return xa < xb ? -1 : 1;
+        if (xa == 0) break;
+    }
     return ia < ib ? -1 : (ia > ib ? 1 : 0);
 }
 
@@ -4134,10 +4302,9 @@ static int g_path_radix_max;
 static __thread unsigned short *g_path_radix_cls;
 static __thread size_t g_path_radix_cls_cap;
 
-static void path_radix_sort(const matched_record_t *items, size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n);
+static void path_radix_sort(size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n);
 
 typedef struct {
-    const matched_record_t *items;
     size_t *idx;
     size_t *tmp;
     path_tcur_t *curs;
@@ -4146,7 +4313,7 @@ typedef struct {
 
 static void *path_radix_entry(void *vp) {
     path_radix_task_t *t = (path_radix_task_t *)vp;
-    path_radix_sort(t->items, t->idx, t->tmp, t->curs, t->n);
+    path_radix_sort(t->idx, t->tmp, t->curs, t->n);
     free(t);
     /* release this worker's class scratch (thread-local; not auto-freed on join) */
     free(g_path_radix_cls);
@@ -4155,7 +4322,7 @@ static void *path_radix_entry(void *vp) {
     return NULL;
 }
 
-static void path_radix_sort(const matched_record_t *items, size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n) {
+static void path_radix_sort(size_t *idx, size_t *tmp, path_tcur_t *curs, size_t n) {
     size_t count[PATH_RADIX_NCLASS];
     size_t off[PATH_RADIX_NCLASS];
     size_t cur[PATH_RADIX_NCLASS];
@@ -4163,13 +4330,13 @@ static void path_radix_sort(const matched_record_t *items, size_t *idx, size_t *
 descend:
     if (n <= 1) return;
     if (n <= PATH_RADIX_LEAF) {
-        qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)items);
+        qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
         return;
     }
     if (g_path_radix_cls_cap < n) {
         unsigned short *nb = (unsigned short *)realloc(g_path_radix_cls, n * sizeof(*nb));
         if (!nb) { /* no scratch: fall back to comparator sort for this bucket */
-            qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)items);
+            qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
             return;
         }
         g_path_radix_cls = nb;
@@ -4227,7 +4394,6 @@ descend:
                 if (prev < g_path_radix_max) {
                     path_radix_task_t *t = (path_radix_task_t *)malloc(sizeof(*t));
                     if (t) {
-                        t->items = items;
                         t->idx = idx + off[c];
                         t->tmp = tmp + off[c];
                         t->curs = curs;
@@ -4240,7 +4406,7 @@ descend:
                     atomic_fetch_sub(&g_path_radix_active, 1);
                 }
             }
-            path_radix_sort(items, idx + off[c], tmp + off[c], curs, count[c]);
+            path_radix_sort(idx + off[c], tmp + off[c], curs, count[c]);
         }
         {
             int i;
@@ -4295,7 +4461,7 @@ static size_t *matched_records_build_path_order(const matched_records_t *rec, er
             for (i = 0; i < n; i++) path_tcur_init(&curs[i], rec->items[i].parent, rec->items[i].leaf);
             g_path_radix_max = nw;
             atomic_store(&g_path_radix_active, 1);
-            path_radix_sort(rec->items, ord, tmp, curs, n);
+            path_radix_sort(ord, tmp, curs, n);
             free(g_path_radix_cls);
             g_path_radix_cls = NULL;
             g_path_radix_cls_cap = 0;
@@ -4371,8 +4537,40 @@ typedef struct {
     const bucket_details_t *details;
     const char *base_prefix;
     size_t lo, hi;
+    size_t seed_distinct[BUCKET_DETAIL_LEVELS_MAX]; /* what this slice's last page produced */
+    size_t seed_records;
     int err;
 } agg_bkt_worker_t;
+
+/*
+ * Row-map scratch owned by one bucket-page worker, reused for every page that worker emits.
+ *
+ * A page used to calloc (1 + aggregation workers) x levels tables, fill a fraction of them,
+ * strdup a key per row, then free the lot — for each of the 36 pages. Faulting in those fresh
+ * tables was 25-29% of a bucket-heavy run. Holding them here means a page starts by clearing
+ * the slots the previous page used and sizing itself from what that page actually produced.
+ */
+typedef struct {
+    path_row_map_t page_maps[BUCKET_DETAIL_LEVELS_MAX];
+    size_t page_distinct[BUCKET_DETAIL_LEVELS_MAX];
+    size_t page_records;
+    agg_bkt_worker_t *workers;
+    unsigned workers_cap;
+} bucket_page_scratch_t;
+
+static void bucket_page_scratch_free(bucket_page_scratch_t *s) {
+    int d;
+    unsigned i;
+
+    if (!s) return;
+    for (d = 0; d < BUCKET_DETAIL_LEVELS_MAX; d++) path_row_map_destroy(&s->page_maps[d]);
+    for (i = 0; i < s->workers_cap; i++) {
+        for (d = 0; d < BUCKET_DETAIL_LEVELS_MAX; d++) path_row_map_destroy(&s->workers[i].maps[d]);
+    }
+    free(s->workers);
+    s->workers = NULL;
+    s->workers_cap = 0;
+}
 
 static int aggregate_bucket_for_page_range(path_row_map_t *maps,
                                            int nlevels,
@@ -4443,9 +4641,10 @@ static void *agg_bkt_worker_thread(void *vp) {
 
     for (d = 0; d < w->nlevels; d++) {
         size_t chunk_records = (w->hi > w->lo) ? (w->hi - w->lo) : 0;
-        if (path_row_map_init(&w->maps[d], path_row_map_est_initial_cap(chunk_records, d)) != 0) {
+        size_t want = path_row_map_seed_cap(chunk_records, d, w->seed_distinct[d], w->seed_records);
+
+        if (path_row_map_reset_or_init(&w->maps[d], want) != 0) {
             w->err = 1;
-            while (d > 0) path_row_map_destroy(&w->maps[--d]);
             return NULL;
         }
     }
@@ -4453,14 +4652,11 @@ static void *agg_bkt_worker_thread(void *vp) {
     if (aggregate_bucket_for_page_range(w->maps, w->nlevels, w->details, w->base_prefix, w->lo, w->hi) != 0)
         w->err = 1;
 
+    /* What this slice produced sizes the same slice on the next page. */
+    w->seed_records = (w->hi > w->lo) ? (w->hi - w->lo) : 0;
+    for (d = 0; d < w->nlevels; d++) w->seed_distinct[d] = w->maps[d].count;
+
     return NULL;
-}
-
-static void agg_bkt_worker_destroy_maps(agg_bkt_worker_t *w) {
-    int d;
-
-    if (!w || w->lo >= w->hi) return;
-    for (d = 0; d < w->nlevels; d++) path_row_map_destroy(&w->maps[d]);
 }
 
 /*
@@ -4491,7 +4687,8 @@ static void *agg_bkt_merge_level_worker(void *vp) {
 static int aggregate_bucket_for_page_n(path_row_map_t *maps,
                                        int nlevels,
                                        const bucket_details_t *details,
-                                       const char *base_prefix) {
+                                       const char *base_prefix,
+                                       bucket_page_scratch_t *scratch) {
     unsigned thr;
     unsigned nw;
     size_t chunk;
@@ -4500,7 +4697,7 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
     pthread_t *tids = NULL;
     int any_err = 0;
 
-    if (!maps || nlevels < 1 || !details || !base_prefix) return -1;
+    if (!maps || nlevels < 1 || !details || !base_prefix || !scratch) return -1;
     if (nlevels > BUCKET_DETAIL_LEVELS_MAX) return -1;
 
     thr = parse_ereport_thread_count();
@@ -4513,13 +4710,19 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
     if (nw < 2)
         return aggregate_bucket_for_page_range(maps, nlevels, details, base_prefix, 0, details->count);
 
-    workers = (agg_bkt_worker_t *)calloc((size_t)nw, sizeof(*workers));
-    tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
-    if (!workers || !tids) {
-        free(workers);
-        free(tids);
-        return -1;
+    /* The worker slices — and the maps they carry from page to page — belong to this page
+     * worker, so a slice keeps facing comparable work across pages. */
+    if (scratch->workers_cap < nw) {
+        agg_bkt_worker_t *nwk = (agg_bkt_worker_t *)realloc(scratch->workers, (size_t)nw * sizeof(*nwk));
+
+        if (!nwk) return -1;
+        memset(nwk + scratch->workers_cap, 0, ((size_t)nw - scratch->workers_cap) * sizeof(*nwk));
+        scratch->workers = nwk;
+        scratch->workers_cap = nw;
     }
+    workers = scratch->workers;
+    tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+    if (!tids) return -1;
 
     chunk = (details->count + (size_t)nw - 1u) / (size_t)nw;
     for (i = 0; i < (size_t)nw; i++) {
@@ -4539,11 +4742,7 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
         if (pthread_create(&tids[i], NULL, agg_bkt_worker_thread, w) != 0) {
             size_t j;
 
-            for (j = 0; j < i; j++) {
-                (void)pthread_join(tids[j], NULL);
-                agg_bkt_worker_destroy_maps(&workers[j]);
-            }
-            free(workers);
+            for (j = 0; j < i; j++) (void)pthread_join(tids[j], NULL);
             free(tids);
             return -1;
         }
@@ -4595,8 +4794,7 @@ static int aggregate_bucket_for_page_n(path_row_map_t *maps,
         }
     }
 
-    for (i = 0; i < (size_t)nw; i++) agg_bkt_worker_destroy_maps(&workers[i]);
-    free(workers);
+    /* The worker maps stay allocated for the next page; see bucket_page_scratch_t. */
     free(tids);
 
     return any_err ? -1 : 0;
@@ -4609,40 +4807,6 @@ static size_t path_row_maps_total_used_rows(const path_row_map_t *maps, int nlev
     if (!maps || nlevels < 1) return 0;
     for (d = 0; d < (size_t)nlevels; d++) t += maps[d].count;
     return t;
-}
-
-static int collect_map_row_pointers(path_row_map_t *maps, int nlevels, path_row_t ***out_list, size_t *out_R) {
-    path_row_t **list;
-    size_t R;
-    size_t d, i, w = 0;
-
-    if (!maps || nlevels < 1 || !out_list || !out_R) return -1;
-    R = path_row_maps_total_used_rows(maps, nlevels);
-    *out_list = NULL;
-    *out_R = 0;
-    if (R == 0) return 0;
-
-    list = (path_row_t **)malloc(R * sizeof(*list));
-    if (!list) return -1;
-
-    for (d = 0; d < (size_t)nlevels; d++) {
-        for (i = 0; i < maps[d].cap; i++) {
-            if (maps[d].used[i]) list[w++] = &maps[d].rows[i];
-        }
-    }
-
-    *out_list = list;
-    *out_R = R;
-    return 0;
-}
-
-static int cmp_path_row_ptr(const void *a, const void *b) {
-    uintptr_t pa = (uintptr_t) * (path_row_t *const *)a;
-    uintptr_t pb = (uintptr_t) * (path_row_t *const *)b;
-
-    if (pa < pb) return -1;
-    if (pa > pb) return 1;
-    return 0;
 }
 
 static void zero_map_row_corpus_totals(path_row_map_t *maps, int nlevels) {
@@ -4659,6 +4823,17 @@ static void zero_map_row_corpus_totals(path_row_map_t *maps, int nlevels) {
     }
 }
 
+/*
+ * One accumulation slot in a worker's private table. Keyed by row pointer: rows never move once their
+ * map stops rehashing, and the aggregation pass only reads the maps.
+ */
+typedef struct {
+    path_row_t *key;
+    uint64_t files;
+    uint64_t dirs;
+    uint64_t bytes;
+} agg_tot_slot_t;
+
 typedef struct {
     path_row_map_t *maps;
     int nlevels;
@@ -4668,19 +4843,55 @@ typedef struct {
     int use_ord_slice;
     size_t c_lo;
     size_t c_hi;
-    size_t R;
-    uint64_t *part_base;
-    int atomic_mode; /* 1: accumulate directly into shared row totals via relaxed atomics (no part_base) */
+    agg_tot_slot_t *tbl; /* NULL in atomic_mode */
+    size_t tbl_mask;     /* slot count - 1, slot count a power of two */
+    size_t tbl_used;
+    size_t tbl_limit; /* stop inserting past this load; further rows go straight to the shared totals */
+    int atomic_mode;  /* 1: accumulate directly into shared row totals via relaxed atomics (no table) */
     atomic_int *fatal_atom;
 } agg_tot_par_wctx_t;
 
+/* Returns this row's slot, or NULL when the table is full and the caller must fall back to atomics. */
+static inline agg_tot_slot_t *agg_tot_slot_for(agg_tot_par_wctx_t *w, path_row_t *row) {
+    uint64_t h = ((uint64_t)(uintptr_t)row >> 3) * 0x9E3779B97F4A7C15ULL;
+    size_t i = (size_t)(h >> 32) & w->tbl_mask;
+
+    for (;;) {
+        agg_tot_slot_t *s = &w->tbl[i];
+
+        if (s->key == row) return s;
+        if (!s->key) {
+            if (w->tbl_used >= w->tbl_limit) return NULL;
+            s->key = row;
+            w->tbl_used++;
+            return s;
+        }
+        i = (i + 1) & w->tbl_mask;
+    }
+}
+
+/* Add a worker's private counts into the shared rows. Callers zero the rows before any worker starts. */
+static void agg_tot_flush_table(agg_tot_par_wctx_t *w) {
+    size_t i;
+
+    if (!w->tbl) return;
+    for (i = 0; i <= w->tbl_mask; i++) {
+        agg_tot_slot_t *s = &w->tbl[i];
+
+        if (!s->key) continue;
+        if (s->files) __atomic_fetch_add(&s->key->total_files, s->files, __ATOMIC_RELAXED);
+        if (s->dirs) __atomic_fetch_add(&s->key->total_dirs, s->dirs, __ATOMIC_RELAXED);
+        if (s->bytes) __atomic_fetch_add(&s->key->total_bytes, s->bytes, __ATOMIC_RELAXED);
+    }
+}
+
 static void *agg_totals_par_worker(void *vp) {
     agg_tot_par_wctx_t *w = (agg_tot_par_wctx_t *)vp;
-    uint64_t *my = w->part_base;
     size_t ii;
     uint64_t base_hash = w->base_prefix ? path_hash(w->base_prefix) : PATH_HASH_FNV_OFFSET;
 
-    if (!w->atomic_mode) memset(my, 0, w->R * 3 * sizeof(uint64_t));
+    /* The table is the emit thread's reused scratch and still holds the previous cell's counts. */
+    if (!w->atomic_mode) memset(w->tbl, 0, (w->tbl_mask + 1) * sizeof(*w->tbl));
 
     for (ii = w->c_lo; ii < w->c_hi; ii++) {
         size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
@@ -4702,7 +4913,7 @@ static void *agg_totals_par_worker(void *vp) {
             rowlen = strlen(w->base_prefix);
             if (rowlen >= sizeof(rowpath)) {
                 atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
-                return NULL;
+                goto done;
             }
             memcpy(rowpath, w->base_prefix, rowlen + 1);
         }
@@ -4724,33 +4935,33 @@ static void *agg_totals_par_worker(void *vp) {
             rowlen = path_append_component(rowpath, sizeof(rowpath), rowlen, start, comp_len);
             if (rowlen == (size_t)-1) {
                 atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
-                return NULL;
+                goto done;
             }
             h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
             row = path_row_map_find_h(&w->maps[depth], rowpath, h);
             if (row) {
-                if (w->atomic_mode) {
+                agg_tot_slot_t *s = w->atomic_mode ? NULL : agg_tot_slot_for(w, row);
+
+                if (s) {
+                    if (r->type == 'f')
+                        s->files++;
+                    else if (r->type == 'd')
+                        s->dirs++;
+                    s->bytes += r->size;
+                } else {
                     if (r->type == 'f')
                         __atomic_fetch_add(&row->total_files, 1ULL, __ATOMIC_RELAXED);
                     else if (r->type == 'd')
                         __atomic_fetch_add(&row->total_dirs, 1ULL, __ATOMIC_RELAXED);
                     __atomic_fetch_add(&row->total_bytes, r->size, __ATOMIC_RELAXED);
-                } else {
-                    int ri = row->par_agg_ix;
-
-                    if (ri >= 0 && (size_t)ri < w->R) {
-                        if (r->type == 'f')
-                            my[(size_t)ri * 3 + 0]++;
-                        else if (r->type == 'd')
-                            my[(size_t)ri * 3 + 1]++;
-                        my[(size_t)ri * 3 + 2] += r->size;
-                    }
                 }
             }
         }
     }
 
+done:
+    agg_tot_flush_table(w);
     return NULL;
 }
 
@@ -4808,8 +5019,7 @@ static int aggregate_totals_for_page_n_atomic(path_row_map_t *maps,
         ctxs[started].use_ord_slice = use_ord_slice;
         ctxs[started].c_lo = clo;
         ctxs[started].c_hi = chi;
-        ctxs[started].R = 0;
-        ctxs[started].part_base = NULL;
+        ctxs[started].tbl = NULL;
         ctxs[started].atomic_mode = 1;
         ctxs[started].fatal_atom = &shared_fatal;
 
@@ -4836,110 +5046,58 @@ static int aggregate_totals_for_page_n_atomic(path_row_map_t *maps,
 }
 
 /*
- * Parallel reduction of the nw partial vectors into the per-row totals.
- * Rows are independent, so each worker owns a disjoint [r_lo,r_hi) slice of row_list.
- * Output is identical to the serial sum-then-assign.
+ * Accumulation-table scratch, owned by the thread that emits the bucket cell. One page emits dozens of
+ * cells, so a fresh allocation per cell maps and unmaps the tables every time and faults them back in
+ * from scratch. One buffer per emit thread, only ever growing, keeps those pages resident across cells.
+ * It is malloc and not calloc because the workers zero their own tables in parallel.
  */
 typedef struct {
-    path_row_t **row_list;
-    const uint64_t *parts;
-    size_t R;
-    int started;
-    size_t r_lo;
-    size_t r_hi;
-} agg_tot_reduce_ctx_t;
+    void *buf;
+    size_t cap; /* bytes */
+} agg_parts_scratch_t;
 
-static void *agg_tot_reduce_worker(void *vp) {
-    agg_tot_reduce_ctx_t *c = (agg_tot_reduce_ctx_t *)vp;
-    size_t t;
+static pthread_key_t g_agg_parts_key;
+static pthread_once_t g_agg_parts_once = PTHREAD_ONCE_INIT;
+static int g_agg_parts_key_ok;
 
-    for (t = c->r_lo; t < c->r_hi; t++) {
-        path_row_t *row = c->row_list[t];
-        uint64_t tf = 0;
-        uint64_t td = 0;
-        uint64_t tb = 0;
-        int s;
+static void agg_parts_scratch_destroy(void *p) {
+    agg_parts_scratch_t *s = (agg_parts_scratch_t *)p;
 
-        for (s = 0; s < c->started; s++) {
-            tf += c->parts[(size_t)s * c->R * 3 + t * 3 + 0];
-            td += c->parts[(size_t)s * c->R * 3 + t * 3 + 1];
-            tb += c->parts[(size_t)s * c->R * 3 + t * 3 + 2];
-        }
-        row->total_files = tf;
-        row->total_dirs = td;
-        row->total_bytes = tb;
-    }
-    return NULL;
+    if (!s) return;
+    free(s->buf);
+    free(s);
 }
 
-/* Reduce parts[0..started)·R·3 into row_list[0..R) totals, parallelized across rows when worth it. */
-static void agg_totals_reduce_parts(path_row_t **row_list, const uint64_t *parts, size_t R, int started) {
-    int nw;
-    pthread_t *tp = NULL;
-    agg_tot_reduce_ctx_t *ctxs = NULL;
-    size_t per;
-    int t;
-    int spawned;
+static void agg_parts_key_init(void) {
+    g_agg_parts_key_ok = (pthread_key_create(&g_agg_parts_key, agg_parts_scratch_destroy) == 0);
+}
 
-    if (R == 0 || started < 1) return;
+/* At least need bytes with undefined contents, or NULL, which asks the caller to allocate its own. */
+static void *agg_parts_scratch_get(size_t need) {
+    agg_parts_scratch_t *s;
 
-    nw = parse_ereport_thread_count();
-    if (nw < 1) nw = 1;
-    /* Serial unless there is enough work: cost is ~R*started adds. */
-    if (nw < 2 || R < 4096 || (R * (size_t)started) < (size_t)(1u << 16)) {
-        agg_tot_reduce_ctx_t one;
-        one.row_list = row_list;
-        one.parts = parts;
-        one.R = R;
-        one.started = started;
-        one.r_lo = 0;
-        one.r_hi = R;
-        agg_tot_reduce_worker(&one);
-        return;
-    }
-    if ((size_t)nw > R) nw = (int)R;
+    pthread_once(&g_agg_parts_once, agg_parts_key_init);
+    if (!g_agg_parts_key_ok) return NULL;
 
-    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
-    ctxs = (agg_tot_reduce_ctx_t *)calloc((size_t)nw, sizeof(*ctxs));
-    if (!tp || !ctxs) {
-        agg_tot_reduce_ctx_t one;
-        free(tp);
-        free(ctxs);
-        one.row_list = row_list;
-        one.parts = parts;
-        one.R = R;
-        one.started = started;
-        one.r_lo = 0;
-        one.r_hi = R;
-        agg_tot_reduce_worker(&one);
-        return;
-    }
-
-    per = (R + (size_t)nw - 1) / (size_t)nw;
-    spawned = 0;
-    for (t = 0; t < nw; t++) {
-        size_t rlo = (size_t)t * per;
-        size_t rhi = rlo + per;
-
-        if (rlo >= R) break;
-        if (rhi > R) rhi = R;
-        ctxs[spawned].row_list = row_list;
-        ctxs[spawned].parts = parts;
-        ctxs[spawned].R = R;
-        ctxs[spawned].started = started;
-        ctxs[spawned].r_lo = rlo;
-        ctxs[spawned].r_hi = rhi;
-        if (pthread_create(&tp[spawned], NULL, agg_tot_reduce_worker, &ctxs[spawned]) != 0) {
-            /* Run this slice inline rather than dropping it. */
-            agg_tot_reduce_worker(&ctxs[spawned]);
-        } else {
-            spawned++;
+    s = (agg_parts_scratch_t *)pthread_getspecific(g_agg_parts_key);
+    if (!s) {
+        s = (agg_parts_scratch_t *)calloc(1, sizeof(*s));
+        if (!s) return NULL;
+        if (pthread_setspecific(g_agg_parts_key, s) != 0) {
+            free(s);
+            return NULL;
         }
     }
-    for (t = 0; t < spawned; t++) pthread_join(tp[t], NULL);
+    if (s->cap < need) {
+        /* Not realloc: every byte is rewritten, so copying the old contents would be wasted work. */
+        void *nb = malloc(need);
 
-    free(tp);
-    free(ctxs);
+        if (!nb) return NULL;
+        free(s->buf);
+        s->buf = nb;
+        s->cap = need;
+    }
+    return s->buf;
 }
 
 static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
@@ -4949,22 +5107,21 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
                                               const size_t *path_ord,
                                               int use_ord_slice,
                                               size_t lo,
-                                              size_t hi,
-                                              ereport_run_stats_t *run_rs) {
+                                              size_t hi) {
     size_t nscan = hi - lo;
     size_t R;
-    path_row_t **row_list = NULL;
-    uint64_t *parts = NULL;
+    agg_tot_slot_t *tables = NULL;
     pthread_t *tp = NULL;
     agg_tot_par_wctx_t *ctxs = NULL;
     int nw;
     int j;
     int started;
+    int tables_owned; /* 1: tables is a private allocation, not the emit thread's reused scratch */
+    size_t slots;
+    size_t want;
     size_t per;
     size_t t;
     atomic_int shared_fatal;
-
-    size_t row_mat_bytes;
 
     if (!maps || nlevels < 1 || !records || lo >= hi) return -1;
     if (nscan < AGG_TOTALS_PAR_MIN_RECORDS) return -1;
@@ -4975,59 +5132,41 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     nw = parse_ereport_thread_count();
     if (nw < 2) return -1;
 
-    row_mat_bytes = R * 3 * sizeof(uint64_t);
-    if (row_mat_bytes > 0) {
-        size_t cap = AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES / row_mat_bytes;
-
-        /*
-         * If the budget cannot afford even AGG_TOTALS_MATRIX_MIN_THREADS partial vectors, the matrix path
-         * would collapse toward a single thread; accumulate atomically with the full thread count instead.
-         */
-        if (cap < (size_t)AGG_TOTALS_MATRIX_MIN_THREADS)
-            return aggregate_totals_for_page_n_atomic(maps, nlevels, records, base_prefix, path_ord, use_ord_slice,
-                                                      lo, hi, nw);
-        if (cap >= 2 && (size_t)nw > cap) nw = (int)cap;
-    }
+    /*
+     * A worker walks a contiguous slice of the path-ordered records, and rows are ancestors of the records
+     * that produce them, so it only ever touches about R/nw distinct rows — scattered across the map tables,
+     * but few. Give it a table sized for twice that and let anything past the load limit fall through to the
+     * shared totals: the whole matrix is O(R) instead of the O(nw*R) a dense per-worker row vector needs, and
+     * a worker's working set is its own table rather than all R rows.
+     */
+    want = R / (size_t)nw * 2 + 128;
+    if (want > R + 128) want = R + 128;
+    slots = 256;
+    while (slots < want && slots < (SIZE_MAX >> 1)) slots <<= 1;
+    while (slots > 256 && (size_t)nw * slots * sizeof(agg_tot_slot_t) > AGG_TOTALS_PAR_MATRIX_BUDGET_BYTES)
+        slots >>= 1;
 
     atomic_init(&shared_fatal, 0);
 
-    if (collect_map_row_pointers(maps, nlevels, &row_list, &R) != 0) return -1;
-
-    VT_QSORT_BUCKET(run_rs, row_list, R, sizeof(*row_list), cmp_path_row_ptr);
-
-    {
-        size_t ax;
-
-        for (ax = 0; ax < R; ax++) row_list[ax]->par_agg_ix = (int)ax;
+    tables_owned = 0;
+    tables = (agg_tot_slot_t *)agg_parts_scratch_get((size_t)nw * slots * sizeof(*tables));
+    if (!tables) {
+        tables = (agg_tot_slot_t *)malloc((size_t)nw * slots * sizeof(*tables));
+        tables_owned = 1;
     }
-
-    parts = NULL;
-    tp = NULL;
-    ctxs = NULL;
-    while (nw >= 2) {
-        parts = (uint64_t *)calloc((size_t)nw * R * 3, sizeof(uint64_t));
-        if (!parts) {
-            nw /= 2;
-            continue;
-        }
-        tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
-        ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
-        if (tp && ctxs) break;
-        free(parts);
-        parts = NULL;
-        free(tp);
-        tp = NULL;
-        free(ctxs);
-        ctxs = NULL;
-        nw /= 2;
-    }
-    if (!parts || !tp || !ctxs || nw < 2) {
-        free(row_list);
-        free(parts);
+    tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
+    ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
+    if (!tables || !tp || !ctxs) {
+        if (tables_owned) free(tables);
         free(tp);
         free(ctxs);
-        return -1;
+        /* No memory for the tables; the atomic variant needs none beyond the rows themselves. */
+        return aggregate_totals_for_page_n_atomic(maps, nlevels, records, base_prefix, path_ord, use_ord_slice, lo,
+                                                  hi, nw);
     }
+
+    /* Workers add into the rows, so they have to start from zero rather than be assigned at the end. */
+    zero_map_row_corpus_totals(maps, nlevels);
 
     started = 0;
     per = (nscan + (size_t)nw - 1) / (size_t)nw;
@@ -5046,8 +5185,11 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
         ctxs[started].use_ord_slice = use_ord_slice;
         ctxs[started].c_lo = clo;
         ctxs[started].c_hi = chi;
-        ctxs[started].R = R;
-        ctxs[started].part_base = parts + (size_t)started * R * 3;
+        ctxs[started].tbl = tables + (size_t)started * slots;
+        ctxs[started].tbl_mask = slots - 1;
+        ctxs[started].tbl_used = 0;
+        ctxs[started].tbl_limit = slots - slots / 4;
+        ctxs[started].atomic_mode = 0;
         ctxs[started].fatal_atom = &shared_fatal;
 
         if (pthread_create(&tp[started], NULL, agg_totals_par_worker, &ctxs[started]) != 0) break;
@@ -5055,8 +5197,7 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     }
 
     if (started < 1) {
-        free(row_list);
-        free(parts);
+        if (tables_owned) free(tables);
         free(tp);
         free(ctxs);
         return -1;
@@ -5064,22 +5205,14 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
 
     for (j = 0; j < started; j++) pthread_join(tp[j], NULL);
 
-    if (atomic_load_explicit(&shared_fatal, memory_order_relaxed)) {
-        free(row_list);
-        free(parts);
-        free(tp);
-        free(ctxs);
-        return -1;
-    }
-
-    zero_map_row_corpus_totals(maps, nlevels);
-
-    agg_totals_reduce_parts(row_list, parts, R, started);
-
-    free(row_list);
-    free(parts);
+    if (tables_owned) free(tables);
     free(tp);
     free(ctxs);
+
+    if (atomic_load_explicit(&shared_fatal, memory_order_relaxed)) {
+        zero_map_row_corpus_totals(maps, nlevels);
+        return -1;
+    }
     return 0;
 }
 
@@ -5088,7 +5221,6 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
                                        const matched_records_t *records,
                                        const char *base_prefix,
                                        const size_t *path_ord,
-                                       ereport_run_stats_t *run_rs,
                                        size_t pre_lo,
                                        size_t pre_hi,
                                        int pre_slice_valid) {
@@ -5108,8 +5240,7 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
         }
     }
 
-    if (aggregate_totals_for_page_n_parallel(maps, nlevels, records, base_prefix, path_ord, use_ord_slice, lo, hi,
-                                             run_rs) == 0)
+    if (aggregate_totals_for_page_n_parallel(maps, nlevels, records, base_prefix, path_ord, use_ord_slice, lo, hi) == 0)
         return 0;
 
     {
@@ -6191,11 +6322,12 @@ static int emit_bucket_detail_page(const char *filename,
                                    const dense_cell_fanout_lookup_t *fanout_lookup_shape,
                                    const fanout_parent_stat_map_t *fanout_parent_stats,
                                    ereport_run_stats_t *run_rs,
-                                   const bucket_page_slice_t *pre_slice) {
+                                   const bucket_page_slice_t *pre_slice,
+                                   bucket_page_scratch_t *scratch) {
     FILE *out = counted_fopen(filename, "w");
     char *base_prefix = NULL;
     int base_prefix_owned = 0;
-    path_row_map_t maps[BUCKET_DETAIL_LEVELS_MAX];
+    path_row_map_t *maps;
     size_t i;
     uint64_t bucket_files = 0;
     uint64_t bucket_bytes = 0;
@@ -6206,19 +6338,21 @@ static int emit_bucket_detail_page(const char *filename,
 
     if (!out) return -1;
 
-    if (detail_levels < 1 || detail_levels > BUCKET_DETAIL_LEVELS_MAX) {
+    if (detail_levels < 1 || detail_levels > BUCKET_DETAIL_LEVELS_MAX || !scratch) {
         counted_fclose(out);
         return -1;
     }
 
+    maps = scratch->page_maps;
     for (d = 0; d < detail_levels; d++) {
-        if (path_row_map_init(&maps[d], path_row_map_est_initial_cap(details->count, d)) != 0) {
+        size_t want = path_row_map_seed_cap(details->count, d, scratch->page_distinct[d], scratch->page_records);
+
+        if (path_row_map_reset_or_init(&maps[d], want) != 0) {
             init_fail_at = d;
             break;
         }
     }
     if (init_fail_at >= 0) {
-        for (d = 0; d < init_fail_at; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return -1;
     }
@@ -6369,7 +6503,6 @@ static int emit_bucket_detail_page(const char *filename,
 
     if (details->count == 0) {
         fprintf(out, "<div class=\"note\">This bucket has no matching files.</div>\n</body>\n</html>\n");
-        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return 0;
     }
@@ -6382,7 +6515,6 @@ static int emit_bucket_detail_page(const char *filename,
         base_prefix_owned = 1;
     }
     if (!base_prefix) {
-        for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
         counted_fclose(out);
         return -1;
     }
@@ -6395,12 +6527,11 @@ static int emit_bucket_detail_page(const char *filename,
     {
         int pre_tot = (pre_slice && pre_slice->base_prefix && pre_slice->base_prefix[0] != '\0' && matched_path_ord);
 
-        if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix) != 0 ||
-            aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord, run_rs,
+        if (aggregate_bucket_for_page_n(maps, detail_levels, details, base_prefix, scratch) != 0 ||
+            aggregate_totals_for_page_n(maps, detail_levels, matched_records, base_prefix, matched_path_ord,
                                         pre_tot ? pre_slice->ord_lo : 0, pre_tot ? pre_slice->ord_hi : 0, pre_tot) !=
                 0) {
             if (base_prefix_owned) free(base_prefix);
-            for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
             counted_fclose(out);
             return -1;
         }
@@ -6486,7 +6617,9 @@ static int emit_bucket_detail_page(const char *filename,
     fprintf(out, "</body>\n</html>\n");
 
     if (base_prefix_owned) free(base_prefix);
-    for (d = 0; d < detail_levels; d++) path_row_map_destroy(&maps[d]);
+    /* Hand this page's shape to the next one and leave the tables allocated. */
+    scratch->page_records = details->count;
+    for (d = 0; d < detail_levels; d++) scratch->page_distinct[d] = maps[d].count;
     counted_fclose(out);
     return 0;
 }
@@ -6615,6 +6748,7 @@ typedef struct {
 
 typedef struct {
     bucket_emit_ctx_t *ctx;
+    bucket_page_scratch_t scratch; /* reused by every page this worker emits */
 } bucket_emit_thread_arg_t;
 
 typedef struct {
@@ -6821,7 +6955,7 @@ static void *bucket_page_emit_worker(void *arg) {
                                         c->matched_path_ord, c->corpus_total_user_files, c->corpus_total_user_bytes,
                                         c->sum_ref, c->path_shape, c->merged_dense_matrix, c->fanout_lookup_shape,
                                         c->fanout_parent_stats, c->run_stats,
-                                        c->page_slices ? &c->page_slices[ab][sb] : NULL);
+                                        c->page_slices ? &c->page_slices[ab][sb] : NULL, &ta->scratch);
         }
         if (page_rc != 0) atomic_store(&c->any_fail, 1);
         if (c->run_stats) atomic_fetch_add_explicit(&c->run_stats->finalize_bucket_done, 1U, memory_order_relaxed);
@@ -6974,6 +7108,7 @@ static int emit_all_bucket_detail_pages(const char *username,
                 atomic_store(&ctx.next_task, 0);
                 atomic_store(&ctx.any_fail, 0);
                 bucket_page_emit_worker(&args[0]);
+                for (j = 0; j < (size_t)nw; j++) bucket_page_scratch_free(&args[j].scratch);
                 free(args);
                 bucket_page_slices_free(page_slices);
                 free(ctx.matched_path_ord);
@@ -6988,6 +7123,7 @@ static int emit_all_bucket_detail_pages(const char *username,
             run_stats->vt_bucket_cells_wall_sec += now_sec() - cell_t0;
     }
     free(tids);
+    for (ti = 0; ti < (size_t)nw; ti++) bucket_page_scratch_free(&args[ti].scratch);
     free(args);
     bucket_page_slices_free(page_slices);
     free(ctx.matched_path_ord);
@@ -8267,7 +8403,6 @@ static int read_one_chunk(const file_chunk_t *chunk,
     /* Reused across every record in this chunk to avoid per-record malloc/free
      * of a 4 KiB path buffer and a name buffer (name_len is uint16). */
     char *pathbuf_store = NULL;
-    char *stdio_buf = NULL;
     crawl_bin_block_reader_t br;
     /* The parent interners are owned by the worker and reused across every chunk it processes:
      * the hash table is grown a handful of times per worker instead of being rebuilt (calloc +
@@ -8285,10 +8420,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
         return -1;
     }
 
-    /* Larger fully-buffered stdio reduces read() syscalls across the block reads.
-     * Buffer is owned by this thread for the FILE*'s lifetime. */
-    stdio_buf = (char *)malloc(EREPORT_PARSE_STDIO_BUFSZ);
-    if (stdio_buf) setvbuf(fp, stdio_buf, _IOFBF, EREPORT_PARSE_STDIO_BUFSZ);
+    /* Buffering (EREPORT_PARSE_STDIO_BUFSZ) is applied by the handle cache when the
+     * stream is really opened; a reused stream already has it and must not be setvbuf'd. */
 
     pathbuf_store = (char *)malloc(PATH_MAX);
     if (!pathbuf_store) {
@@ -8579,7 +8712,6 @@ out:
     crawl_bin_block_reader_free(&br);
     free(pathbuf_store);
     counted_fclose(fp);
-    free(stdio_buf); /* safe only after the stream using it is closed */
     finalize_chunk_file_progress(file_states, chunk->file_index, progress);
     progress_flush_local(progress, run_stats);
     return rc;
@@ -10292,6 +10424,9 @@ static void emit_run_stats(const char *username,
         printf("io_readdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_readdir_calls));
         printf("io_closedir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_closedir_calls));
         printf("io_fopen_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fopen_calls));
+        /* Of those calls, the ones that reached the kernel vs. the ones a parked shard handle served. */
+        printf("io_fopen_real=%" PRIu64 "\n", crawl_fpcache_real_opens());
+        printf("io_fopen_cached=%" PRIu64 "\n", crawl_fpcache_hits());
         printf("io_fclose_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fclose_calls));
         printf("io_fread_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_fread_calls));
         printf("mean_records_per_sec=%s\n", mean_records_buf);
@@ -10417,6 +10552,7 @@ int main(int argc, char **argv) {
     path_shape_view_t path_shape;
 
     tune_allocator();
+    crawl_fpcache_set_bufsz(EREPORT_PARSE_STDIO_BUFSZ);
 
     atomic_store(&g_io_opendir_calls, 0);
     atomic_store(&g_io_readdir_calls, 0);
@@ -11141,7 +11277,14 @@ int main(int argc, char **argv) {
 
     /* Now that the catalogs are in, the number of directories across the shards being read is known, and
      * that is the bound on distinct parents. Chunks are handed out on demand, so the per-worker share is
-     * the even split; a worker that draws more than its share still grows its tables from there. */
+     * the even split; a worker that draws more than its share still grows its tables from there.
+     *
+     * Deliberately not divided by the *chunk* count instead, even though with fewer chunks than threads
+     * only a few workers run and each does see a larger slice. Sizing the first table for that measured
+     * ~45% slower in the parse phase (0.50 s -> 0.73 s on a 1.3M-record capture, identical fault counts,
+     * with or without the huge-page hint): a table that starts small stays in cache while it fills and
+     * the doubling copies are cheap, whereas one that starts at its final size makes every insert a
+     * cache miss from the first record. Under-reserving and growing is the faster mistake to make. */
     {
         size_t fi;
 
