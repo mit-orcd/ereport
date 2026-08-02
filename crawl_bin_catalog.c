@@ -56,24 +56,21 @@ static int cat_opt_grow(uint64_t **arr, int wanted, uint64_t slots) {
     return 0;
 }
 
-static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
+/*
+ * Grow the arrays to hold dir_ids up to `want_cap`, without publishing any of the new slots
+ * (max_dir_id is the caller's business). Geometric: catalog entries arrive with roughly sequential
+ * dir_ids, so growing to exactly the requested id reallocated all nine arrays on nearly every entry
+ * -> O(n^2) copying (~27% of CPU in realloc/memmove/page-faults on a 1M-parent shard).
+ */
+static int catalog_reserve_cap(crawl_bin_catalog_t *c, uint64_t want_cap) {
     uint64_t new_cap;
-    uint64_t i;
     int want_imm = (c->fields & CRAWL_CAT_IMM_CHILD) != 0;
     int want_sub = (c->fields & CRAWL_CAT_SUBTREE) != 0;
 
-    if (dir_id <= c->max_dir_id) return 0;
-
-    if (dir_id > c->cap) {
-        /*
-         * Grow geometrically. Catalog entries arrive with roughly sequential
-         * dir_ids, so growing to exactly dir_id (the old behaviour) reallocated
-         * all nine arrays on nearly every entry -> O(n^2) copying (~27% of CPU
-         * in realloc/memmove/page-faults on a 1M-parent shard). Double, bounded
-         * to the request, with a small floor, to amortize realloc to O(n).
-         */
+    if (want_cap <= c->cap) return 0;
+    {
         new_cap = c->cap * 2ULL;
-        if (new_cap < dir_id) new_cap = dir_id;
+        if (new_cap < want_cap) new_cap = want_cap;
         if (new_cap < 256ULL) new_cap = 256ULL;
 
         c->parent_dir_id = (uint64_t *)realloc(c->parent_dir_id, (size_t)(new_cap + 1ULL) * sizeof(uint64_t));
@@ -105,6 +102,16 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
         }
         c->cap = new_cap;
     }
+    return 0;
+}
+
+static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
+    uint64_t i;
+    int want_imm = (c->fields & CRAWL_CAT_IMM_CHILD) != 0;
+    int want_sub = (c->fields & CRAWL_CAT_SUBTREE) != 0;
+
+    if (dir_id <= c->max_dir_id) return 0;
+    if (catalog_reserve_cap(c, dir_id) != 0) return -1;
 
     for (i = c->max_dir_id + 1; i <= dir_id; i++) {
         c->parent_dir_id[i] = 0;
@@ -159,6 +166,11 @@ int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_
         errno = EINVAL;
         return -1;
     }
+
+    /* ecrawl hands out dir_ids densely from 1, so the entry count is the array size: reserving it up
+     * front turns the doubling walk (nine reallocs and their page faults) into one allocation each.
+     * A sparse shard still grows through catalog_ensure_slots as its ids arrive. */
+    if (n > 0 && catalog_reserve_cap(out, n) != 0) goto fail;
 
     for (i = 0; i < n; i++) {
         bin_dir_catalog_entry_t ent;
