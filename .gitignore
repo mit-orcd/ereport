@@ -3,6 +3,10 @@
 /scripts/compare-indexers/results/
 # Default results dirs of scripts/profile/*-fixtures.sh when run from the repo root
 /*-profile-*/
+# Collected profile tarballs and generated ereport output when run from the repo root
+/logs/
+/all_users/
+/notes.txt
 __pycache__/
 /ecrawl
 /ereport
