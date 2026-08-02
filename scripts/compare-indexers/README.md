@@ -44,10 +44,17 @@ job, not on the login node, and nothing it produces belongs on a home
 filesystem: the tool prefix, the cloned sources, the synthetic tree and the
 indexes are all large, and a prefix built against one machine's glibc will not
 run on an older one. No script needs changing for that — every path is already
-an environment variable or a flag:
+an environment variable or a flag.
+
+On ORCD, when `$HOME/orcd/scratch/ereport-automated-testing/prefix` already
+exists, `benchmark.sh` and `init.sh` default `PREFIX` (and the matching `src/`)
+there instead of `$HOME/.local/indexer-compare`. That stops a root or
+login-node run from quietly using a home prefix that then fails probes on the
+compute node. Explicit `PREFIX=` / `SRC_ROOT=` still win. Elsewhere the home
+defaults remain.
 
 ```bash
-SCRATCH=/path/to/scratch
+SCRATCH=$HOME/orcd/scratch/ereport-automated-testing   # ORCD layout
 srun -p <partition> -N 1 -c 16 -t 3:00:00 bash -lc "
   export PREFIX=$SCRATCH/prefix SRC_ROOT=$SCRATCH/src \
          CARGO_HOME=$SCRATCH/cargo RUSTUP_HOME=$SCRATCH/rustup \
@@ -55,6 +62,19 @@ srun -p <partition> -N 1 -c 16 -t 3:00:00 bash -lc "
   scripts/compare-indexers/benchmark.sh --do $SCRATCH/data/tree --smoke --yes \
     --work $SCRATCH/work --results $SCRATCH/results"
 ```
+
+After `source "$PREFIX/env.sh"`, a quick check that baselines are actually
+runnable (not merely present) is `"$DUA_BIN" aggregate --help`. If the probe
+fails, smoke still lists dua/fd and writes `skipped` CSV rows with
+`dua_not_runnable: …` / `fd_not_runnable: …` instead of omitting them.
+
+`benchmark.sh` now makes that check itself, once it has sourced `env.sh` and so
+knows the `FD_BIN` and `DUA_BIN` the run will really use. A baseline that
+resolves but will not start prints `dua is unusable: …` before the measured
+work, naming which of the four reasons it was (gone, a directory, unreadable,
+or no `+x`) and how to repair it. Those rows are also filed under NOT AVAILABLE
+IN THIS RUN in `FAILURES.txt` rather than CANNOT EXPRESS THE QUERY: a broken
+install is something to fix, not an expected empty cell.
 
 Two things a compute node usually cannot do: install packages and run a MariaDB
 server. So `INSTALL_PACKAGES=0`, and Robinhood needs either a node you have root
@@ -185,6 +205,38 @@ after an interrupted setup. It defaults to `REPS=3` (rather than `run_smoke.sh`'
 `REPS=1`) so the charts get error bars, and to `DROP_CACHES=1` plus
 `DROP_DB_CACHE=1` when run as root. Add `--no-robinhood` to skip MariaDB
 entirely, and pass any environment variable the underlying scripts accept.
+
+### Repetitions per tool (`--reps`)
+
+Three repetitions is the right default for the cheap rows and an expensive
+mistake for the slow ones: a GUFI rollup takes 29 minutes a repetition on a
+4.4M-entry tree where `find` takes seconds, so a run that wants error bars on
+`find` should not have to buy three rollups to get them. `--reps` sets the count
+per tool.
+
+```bash
+--reps 1                    # every tool once
+--reps gufi=1,robinhood=1   # those two once, everything else at REPS
+--reps 3,gufi=1             # spell the default alongside the exception
+```
+
+A bare number sets the default for every tool and counts as an explicit `REPS`,
+so `--small`, `--quick` and `--smoke` will not override it. A `tool=n` entry
+overrides just that tool and leaves the mode defaults alone, so
+`--smoke --reps gufi=1` still runs everything else once. Entries are comma or
+space separated and may be repeated; the env spelling is `REPS_GUFI=1`. Tool
+names are checked against the list the harness actually runs, because a typo
+that was accepted would cost a whole run at a count nobody chose.
+
+Tools are still visited repetition-major, so each one meets the same cache state
+it would have met at a flat `REPS`; a tool that has had its repetitions simply
+drops out of the later passes. `REPS_EREPORT_INDEX` defaults to 1 — it indexes
+the capture `ecrawl` just wrote, so a second pass re-measures identical input —
+and is capped by `REPS_ECRAWL`.
+
+When any tool differs, `env.txt` records `reps_per_tool=`, and both
+`SUMMARY_TABLE.txt` and the chart captions name the exceptions rather than
+claiming one sample size for rows that do not share it.
 
 `--undo` prints exactly what it will remove and asks first (`--yes` to skip the
 prompt, which is mandatory off a terminal). It drops the benchmark database,
@@ -366,10 +418,12 @@ defect. The stippled set is the only group that compares with no asterisk at
 all, which is where `ecrawl --no-write` earns its keep — `ecrawl`'s
 full capture against `find` is not a like-for-like race, but its walk without the
 capture is. Charting `ecrawl` beside it makes the price of the capture readable
-straight off the axis: the gap between the two bars is the same 1.03 s that
-Figure 2 reports as the inferred capture-write cost. `ecrawl --no-write` gets its
-own colour rather than sharing `ecrawl`'s blue, since the two now sit side by
-side and it appears on no other figure.
+straight off the axis: the gap between the two bars is the same inferred
+capture-write cost Figure 2 reports (about 2.78 s/1M files on the ERCBIN08
+cold-cache synth run — see
+[docs/performance.md](../../docs/performance.md#ercbin08-capture-write-cost)).
+`ecrawl --no-write` gets its own colour rather than sharing `ecrawl`'s blue,
+since the two now sit side by side and it appears on no other figure.
 
 **Figure 2** is *mostly estimate and says so*, using two tones per bar. A bar
 runs out to the end-to-end build minus the fastest walk in the run; since
@@ -379,26 +433,29 @@ measurement. The **solid** part of a bar is what was actually measured and the
 **pale** part is what was not, which puts the uncertainty in the bar geometry
 instead of a footnote.
 
-Only `ecrawl` was timed both ways, so only it has a solid portion: 2.05 s
-measured against a 4.12 s bound. That 2.07 s gap is exactly `ecrawl`'s own walk
-minus `fd`'s (2.52 − 0.44), i.e. the traversal that subtracting the *fastest*
-walk failed to remove — a direct read on how loose the bound is for GUFI and XDU,
-whose bars are pale end to end because they have no lower bound at all. Rows are
-labelled by the work left in the bar (`capture write + trigram index`) rather
-than by the commands, whose cost is no longer all there.
+Only `ecrawl` was timed both ways, so only it has a solid portion (on the
+ERCBIN08 cold-cache synth run: about 3.47 s measured against a ~5.31 s bound).
+The pale remainder is exactly `ecrawl`'s own walk minus `fd`'s (~2.31 − 0.47),
+i.e. the traversal that subtracting the *fastest* walk failed to remove — a
+direct read on how loose the bound is for GUFI and XDU, whose bars are pale end
+to end because they have no lower bound at all. Rows are labelled by the work
+left in the bar (`capture write + trigram index`) rather than by the commands,
+whose cost is no longer all there.
 
-The suite's 2.05 s is itself two halves arrived at two different ways, and the
-bar prints the split: `1.03 s capture write (inferred) + 1.02 s trigram index
-(timed directly)`. Writing the capture is fused into `ecrawl`'s walk exactly as
-GUFI's write is fused into its own, so it can only be had by subtraction;
-`ereport_index --make` is a separate command whose input is the shard directory
-rather than the tree, so it is timed outright and needs no subtraction at all.
+The suite's measured half is itself two parts arrived at two different ways, and
+the bar prints the split (same run: `2.78 s capture write (inferred) + 690 ms
+trigram index (timed directly)`). Writing the capture is fused into `ecrawl`'s
+walk exactly as GUFI's write is fused into its own, so it can only be had by
+subtraction; `ereport_index --make` is a separate command whose input is the
+shard directory rather than the tree, so it is timed outright and needs no
+subtraction at all. ERCBIN08's columnar encode makes that inferred store larger
+than the old single-zstd block frames; walk-only bars do not move with it.
 
 Both halves belong in the bar because **the capture is itself a queried index,
 not scratch on the way to one**: `ecrawl_analyze` answers Q3, Q4 and Q5 straight
 from the ERCBIN shards without the trigram index, and Figure 4 counts the
-capture's 26 MiB alongside the trigram's 173 MiB as one 198 MiB index. Charging
-only the 1.02 s trigram build would compare `ecrawl`'s *extra* search layer
+capture (~43 MiB/1M) alongside the trigram index as one combined footprint.
+Charging only the trigram build would compare `ecrawl`'s *extra* search layer
 against GUFI's *entire* SQLite replica, while still charging `ecrawl` for storing
 both. The like-for-like pairing is GUFI's replica against `ecrawl`'s capture,
 with the trigram index as a layer GUFI has no equivalent to.
@@ -589,17 +646,18 @@ versions. [`init.sh`](init.sh) clones and builds the pinned tags into a private
 prefix:
 
 ```bash
-# Installs GUFI, XDU, Robinhood and dua into ~/.local/indexer-compare.
+# Installs GUFI, XDU, Robinhood and dua into the default PREFIX
+# (~/.local/indexer-compare, or the ORCD scratch prefix when that dir exists).
 # Lists the dnf/apt build dependencies and asks before installing them.
 scripts/compare-indexers/init.sh
-source ~/.local/indexer-compare/env.sh
+source "$PREFIX/env.sh"   # or ~/.local/indexer-compare/env.sh
 
 # Root/sudo: also install/start MariaDB, create a dedicated benchmark database,
 # and generate the Robinhood config for this tree.
 INSTALL_PACKAGES=1 SETUP_MARIADB=1 \
   RBH_FS_PATH=/tmp/indexer-compare-synth \
   scripts/compare-indexers/init.sh
-source ~/.local/indexer-compare/env.sh
+source "$PREFIX/env.sh"
 
 # Faster initial setup without Robinhood/MariaDB:
 TOOLS="gufi xdu" INSTALL_PACKAGES=1 scripts/compare-indexers/init.sh

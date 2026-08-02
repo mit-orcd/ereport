@@ -165,6 +165,19 @@ def summarize_scale(stats):
     ]
 
 
+def reps_note(env):
+    """The repetition count, naming the tools that do not share it.
+
+    Reps are per tool, so a bare "reps=3" beside a gufi row sampled once is a
+    claim the run did not make.
+    """
+    reps = env.get("reps") or "?"
+    detail = (env.get("reps_per_tool") or "").split()
+    if not detail:
+        return reps
+    return "{0} ({1})".format(reps, ", ".join(detail))
+
+
 def summarize_env(env):
     """Provenance: enough to reproduce or discredit the numbers below."""
     if not env:
@@ -182,7 +195,7 @@ def summarize_env(env):
         "{0:<16} {1}".format("compiler", get("cc")),
         "{0:<16} {1}".format("ereport commit", get("repo_commit")),
         "{0:<16} {1} cpus, reps={2}, open files={3}".format(
-            "capacity", get("nproc"), get("reps"), get("nofile", "?")
+            "capacity", get("nproc"), reps_note(env), get("nofile", "?")
         ),
         "{0:<16} {1}".format("threads", get("thread_plan", get("threads"))),
         "{0:<16} drop_caches={1} scope={2} drop_db_cache={3}".format(
@@ -492,11 +505,12 @@ def tail_lines(path, count=STDERR_TAIL_LINES):
     return kept[-count:]
 
 
-# A row that did not finish ok is one of four different things, and only the
-# first is a defect in the run. Lumping them together made an install problem
+# A row that did not finish ok is one of several different things, and only the
+# first few are defects in the run. Lumping them together made an install problem
 # read like a tool limitation and a tool limitation read like a bug.
 WRONG = "wrong"
 BROKEN = "broken"
+UNKNOWN = "unknown"
 REFUSED = "refused"
 CANNOT = "cannot"
 ABSENT = "absent"
@@ -510,6 +524,14 @@ CATEGORY_TITLES = [
         "\nand a query that answers nothing is fast for reasons unrelated to its index.",
     ),
     (BROKEN, "FAILED", "The tool ran and returned an error. This is the list to act on."),
+    (
+        UNKNOWN,
+        "UNRECOGNIZED SKIP REASON",
+        "The row was skipped for a reason this summary has no marker for, so it could"
+        "\nnot be sorted. Read it as needing attention and add the marker to"
+        "\nsummarize.py: an unmatched note used to land in CANNOT EXPRESS THE QUERY,"
+        "\nwhere a broken install reads as an expected empty cell.",
+    ),
     (
         REFUSED,
         "PREDICATE REFUSED BY THIS BUILD",
@@ -532,7 +554,10 @@ CATEGORY_TITLES = [
 
 # Section titles read as headings; the tally reads as a sentence, and only this
 # one is a countable noun.
-TALLY_LABELS = {WRONG: ("wrong answer", "wrong answers")}
+TALLY_LABELS = {
+    WRONG: ("wrong answer", "wrong answers"),
+    UNKNOWN: ("unrecognized skip reason", "unrecognized skip reasons"),
+}
 
 # Matched against the harness note, in order.
 CANNOT_MARKERS = (
@@ -556,6 +581,12 @@ ABSENT_MARKERS = (
     "outside_the_indexed_tree",
     "tree_mismatch",
     "db_down",
+    # A baseline that is installed but will not start: the file is gone, has
+    # lost +x, or was built against another libc. lib.sh spells these
+    # "<tool>_not_runnable: <the tool's own words>". Without this marker the
+    # note matched nothing and fell through to CANNOT, where a dead dua read as
+    # an expected empty cell for several runs before anyone noticed.
+    "not_runnable",
     # Both are gaps in this setup rather than in the tool: an xdu built without
     # --apparent-size indexes allocated blocks, and a Robinhood database has no
     # tables until something scans with --alter-db. A build or a scan brings the
@@ -566,7 +597,12 @@ ABSENT_MARKERS = (
 
 
 def classify_row(status, note):
-    """Which of the four kinds of not-ok this row is."""
+    """Which kind of not-ok this row is.
+
+    Unmatched notes are UNKNOWN rather than CANNOT. Defaulting to CANNOT meant
+    every reason nobody had written a marker for claimed to be a by-design gap,
+    which is the one bucket a reader is meant to skip.
+    """
     if status == "fail":
         return BROKEN
     low = (note or "").lower()
@@ -578,7 +614,7 @@ def classify_row(status, note):
     for marker in ABSENT_MARKERS:
         if marker in low:
             return ABSENT
-    return CANNOT
+    return UNKNOWN
 
 
 def wrong_answers(query_rows):
@@ -688,8 +724,8 @@ def summarize_failures(index_rows, query_rows):
         "Indexer comparison FAILURES AND SKIPS",
         "",
         "Every row that did not finish ok, plus every row that finished ok with the",
-        "wrong answer, grouped by kind. Read WRONG ANSWER and FAILED first: the last",
-        "three sections are things the run could not ask, not things that broke.",
+        "wrong answer, grouped by kind. Read the first three sections first: the last",
+        "three are things the run could not ask, not things that broke.",
         "",
     ]
     groups = [("INDEX", index_rows, "variant"), ("QUERIES", query_rows, "query")]

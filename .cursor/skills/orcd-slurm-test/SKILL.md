@@ -52,7 +52,14 @@ export RUSTUP_HOME=$SCRATCH/rustup
 export PATH=$PREFIX/bin:$CARGO_HOME/bin:$PATH
 ```
 
-After `init.sh` once: `source "$PREFIX/env.sh"` when present.
+`benchmark.sh` / `init.sh` already default `PREFIX` (and matching `src/`) to
+`$SCRATCH/prefix` when that directory exists, so a forgotten export does not
+fall back to `$HOME/.local/indexer-compare`. Still export explicitly in job
+scripts; keep Cargo/Rustup on scratch either way.
+
+After `init.sh` once: `source "$PREFIX/env.sh"` when present. Confirm baselines
+with `"$DUA_BIN" aggregate --help` before a measured run — a present-but-broken
+binary now emits `skipped` CSV rows rather than vanishing from the tool list.
 
 ## Run test.sh (default recipe)
 

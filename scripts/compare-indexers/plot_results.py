@@ -230,7 +230,13 @@ def run_conditions(env, reps):
     elif env.get("drop_caches") == "0":
         bits.append("warm caches")
     if reps:
-        bits.append("{} repetition{}".format(reps, "" if reps == 1 else "s"))
+        note = "{} repetition{}".format(reps, "" if reps == "1" else "s")
+        # Per-tool counts: without them the caption promises a sample size that
+        # some of the bars beside it were never given.
+        detail = (env.get("reps_per_tool") or "").split()
+        if detail:
+            note += " ({})".format(", ".join(detail))
+        bits.append(note)
     return "  \u00b7  ".join(bits)
 
 

@@ -288,30 +288,95 @@ raise_nofile() {
   fi
 }
 
+# First line of a failed probe that names the usual cause (a binary built
+# against a newer glibc), or empty when stderr has nothing useful.
+_probe_loader_hint() {
+  local bin=$1 err_file=$2
+  local line=""
+  line=$(grep -E -m1 'GLIBC_|version `|not found|No such file|cannot open shared object' \
+    "$err_file" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+  if [[ -z "$line" ]] && command -v ldd >/dev/null 2>&1; then
+    line=$(ldd "$bin" 2>&1 | grep -E -m1 'not found|GLIBC_' | tr -d '\r' | cut -c1-200 || true)
+  fi
+  printf '%s' "$line"
+}
+
+# Why a path that the harness resolved will not run. A failed -x answers "no" to
+# four different questions and each wants a different fix, so name the one that
+# applied: "not executable" alone sent a reader looking for a permission bit on
+# a dua that was simply no longer there.
+_unexecutable_why() {
+  local bin=$1 fix=$2
+  if [[ -d "$bin" ]]; then
+    printf 'is a directory, not a binary: %s' "$bin"
+  elif [[ ! -e "$bin" ]]; then
+    # Also how an unsearchable parent directory looks from here. Either way the
+    # path came from an env.sh written when the binary did resolve, so the
+    # prefix has changed under it since.
+    printf 'no such file: %s (%s)' "$bin" "$fix"
+  elif [[ ! -r "$bin" ]]; then
+    printf 'not readable as %s: %s' "$(id -un 2>/dev/null || echo '?')" "$bin"
+  else
+    printf 'no execute permission: %s (chmod +x it, or %s)' "$bin" "$fix"
+  fi
+}
+
+# How each baseline is repaired. Named once so the skip note in the CSV and the
+# warning benchmark.sh prints before the run give the same instruction.
+FD_FIX_HINT="install the fd-find package"
+DUA_FIX_HINT="rebuild it with 'TOOLS=dua FORCE_REINSTALL=1 scripts/compare-indexers/init.sh'"
+
 # fd is the "fast find" baseline test.sh already prefers over find(1).
 # Debian/Ubuntu install the fd-find package as `fdfind`.
 FD_BIN=${FD_BIN:-$(command -v fd 2>/dev/null || command -v fdfind 2>/dev/null || true)}
 # Match test.sh: fd skips hidden files and obeys ignore files unless told not to.
 FD_COMMON_ARGS=(--hidden --no-ignore)
 FD_HAS_SIZE=0
+FD_OK=0
+FD_WHY=""
 if [[ -n "$FD_BIN" && -x "$FD_BIN" ]]; then
   # Capture --help instead of piping to grep: with pipefail a SIGPIPE'd fd would
-  # invert the test result.
-  _fd_help=$("$FD_BIN" --help 2>/dev/null || true)
-  case "$_fd_help" in
-    # Keep parity with the harness's `find -xdev` when the option exists.
-    *--one-file-system*) FD_COMMON_ARGS+=(--one-file-system) ;;
-  esac
-  case "$_fd_help" in
-    *--size*) FD_HAS_SIZE=1 ;;
-  esac
-  case "$_fd_help" in
-    # Otherwise fd defaults to every logical processor while ecrawl, GUFI and
-    # XDU are held to THREADS, which would flatter the fd baseline.
-    *--threads*) FD_COMMON_ARGS+=(--threads "$THREADS") ;;
-  esac
-  unset _fd_help
+  # invert the test result. Require a successful probe the same way dua does —
+  # a binary that resolves but dies on a newer glibc must not look "available".
+  _fd_err=$(mktemp 2>/dev/null || echo /tmp/ic-fd-probe.$$)
+  _fd_st=0
+  _fd_help=$("$FD_BIN" --help 2>"$_fd_err") || _fd_st=$?
+  if [[ -n "$_fd_help" ]]; then
+    FD_OK=1
+    case "$_fd_help" in
+      # Keep parity with the harness's `find -xdev` when the option exists.
+      *--one-file-system*) FD_COMMON_ARGS+=(--one-file-system) ;;
+    esac
+    case "$_fd_help" in
+      *--size*) FD_HAS_SIZE=1 ;;
+    esac
+    case "$_fd_help" in
+      # Otherwise fd defaults to every logical processor while ecrawl, GUFI and
+      # XDU are held to THREADS, which would flatter the fd baseline.
+      *--threads*) FD_COMMON_ARGS+=(--threads "$THREADS") ;;
+    esac
+  else
+    FD_WHY=$(grep -m1 '.' "$_fd_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+    if [[ -z "$FD_WHY" ]]; then
+      FD_WHY=$(_probe_loader_hint "$FD_BIN" "$_fd_err")
+    fi
+    [[ -n "$FD_WHY" ]] || FD_WHY="--help exited ${_fd_st} with empty stdout/stderr"
+  fi
+  rm -f "$_fd_err"
+  unset _fd_err _fd_help _fd_st
+elif [[ -n "$FD_BIN" ]]; then
+  FD_WHY=$(_unexecutable_why "$FD_BIN" "$FD_FIX_HINT")
 fi
+
+fd_skip_reason() {
+  if [[ -z "${FD_BIN:-}" ]]; then
+    printf 'fd_not_found_install_fd-find'
+  elif [[ -n "$FD_WHY" ]]; then
+    printf 'fd_not_runnable: %s' "$FD_WHY"
+  else
+    printf 'fd_not_runnable'
+  fi
+}
 
 # dua (dua-cli) is the Rust du: the parallel "fast du" partner to fd.
 DUA_BIN=${DUA_BIN:-$(command -v dua 2>/dev/null || true)}
@@ -326,13 +391,8 @@ if [[ -n "$DUA_BIN" && -x "$DUA_BIN" ]]; then
   # A dua built against a newer glibc than the host still resolves through
   # command -v but dies on startup, so require a probe to succeed first.
   _dua_err=$(mktemp 2>/dev/null || echo /tmp/ic-dua-probe.$$)
-  _dua_help=$("$DUA_BIN" aggregate --help 2>"$_dua_err" || true)
-  if [[ -z "$_dua_help" ]]; then
-    DUA_WHY=$(grep -m1 '.' "$_dua_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
-    [[ -n "$DUA_WHY" ]] || DUA_WHY="exited without output"
-  fi
-  rm -f "$_dua_err"
-  unset _dua_err
+  _dua_st=0
+  _dua_help=$("$DUA_BIN" aggregate --help 2>"$_dua_err") || _dua_st=$?
   if [[ -n "$_dua_help" ]]; then
     DUA_OK=1
     # Apparent size keeps dua on the harness's byte convention (du -sb, ecrawl
@@ -358,8 +418,18 @@ if [[ -n "$DUA_BIN" && -x "$DUA_BIN" ]]; then
     case "$_dua_help" in
       *--threads*) DUA_AGG_ARGS+=(--threads "$THREADS") ;;
     esac
+  else
+    DUA_WHY=$(grep -m1 '.' "$_dua_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+    if [[ -z "$DUA_WHY" ]]; then
+      DUA_WHY=$(_probe_loader_hint "$DUA_BIN" "$_dua_err")
+    fi
+    [[ -n "$DUA_WHY" ]] || \
+      DUA_WHY="aggregate --help exited ${_dua_st} with empty stdout/stderr"
   fi
-  unset _dua_help
+  rm -f "$_dua_err"
+  unset _dua_err _dua_help _dua_st
+elif [[ -n "$DUA_BIN" ]]; then
+  DUA_WHY=$(_unexecutable_why "$DUA_BIN" "$DUA_FIX_HINT")
 fi
 
 # The skipped rows say why in the tool's own words, so a prefix built on another
@@ -372,6 +442,43 @@ dua_skip_reason() {
   else
     printf 'dua_not_runnable'
   fi
+}
+
+# True when the harness has a path for a baseline tool, whether or not the
+# probe succeeded. run_smoke uses this so a present-but-broken dua/fd still
+# lands in TOOLS and emits skipped CSV rows instead of vanishing.
+baseline_candidate() {
+  case "$1" in
+    fd) [[ -n "${FD_BIN:-}" ]] ;;
+    dua) [[ -n "${DUA_BIN:-}" ]] ;;
+    *) tool_available "$1" ;;
+  esac
+}
+
+# One line per baseline that resolves to a path but will not run, empty when
+# both are healthy. Callers print this before the measured work: found here a
+# dead baseline costs a chmod, found in the results it costs the whole run.
+#
+# Re-probed rather than read from FD_OK/DUA_OK, because those were computed when
+# lib.sh was sourced and benchmark.sh sources $PREFIX/env.sh afterwards -- and
+# that is what actually decides FD_BIN and DUA_BIN for the run.
+baseline_health_report() {
+  local tool bin fix why probe
+  for tool in fd dua; do
+    case "$tool" in
+      fd) bin=${FD_BIN:-} fix=$FD_FIX_HINT probe=(--help) ;;
+      dua) bin=${DUA_BIN:-} fix=$DUA_FIX_HINT probe=(aggregate --help) ;;
+    esac
+    # No path at all is a different story, and the skipped rows already tell it.
+    [[ -n "$bin" ]] || continue
+    why=""
+    if [[ ! -x "$bin" ]]; then
+      why=$(_unexecutable_why "$bin" "$fix")
+    elif ! "$bin" "${probe[@]}" >/dev/null 2>&1; then
+      why="$(basename "$bin") ${probe[*]} failed; $fix"
+    fi
+    [[ -z "$why" ]] || printf '%s is unusable: %s\n' "$tool" "$why"
+  done
 }
 
 # `dua aggregate <one-path>` prints a line per child of that path rather than
@@ -555,6 +662,93 @@ DROP_DB_CACHE=${DROP_DB_CACHE:-0}
 REPS=${REPS:-3}
 SIZE_GT_BYTES=${SIZE_GT_BYTES:-$((500 * 1024 * 1024))}
 
+# Repetitions are per tool, because their costs are not comparable: a GUFI
+# rollup is 29 minutes a repetition on a 4.4M-entry tree while `find` is
+# seconds, so a run that wants error bars on the cheap rows should not have to
+# pay for three rollups to get them. REPS is the default and REPS_<TOOL>
+# overrides it, spelled in upper case with '-' as '_': REPS_GUFI=1.
+#
+# Every name that can appear in TOOLS for either phase. Kept explicit so a typo
+# is rejected rather than silently ignored, which is the whole failure mode a
+# per-tool knob invites. Deliberately not spelled REPS_*, or the check below
+# would read this list as a tool of its own.
+KNOWN_REPS_TOOLS="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua"
+
+# ereport_index used to be pinned to rep 1 by a condition in run_index.sh. That
+# default is worth keeping -- it builds from ecrawl's capture, so repeating it
+# measures the same input twice -- but it is a default now, not a rule.
+REPS_EREPORT_INDEX=${REPS_EREPORT_INDEX:-1}
+
+reps_var_name() {
+  printf 'REPS_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+}
+
+# Checked once, here, rather than inside tool_reps: every caller of that runs it
+# in a command substitution, where an exit would end the subshell and leave the
+# run going with an empty count.
+_reps_check_all() {
+  local var value tool known ok
+  [[ "$REPS" =~ ^[0-9]+$ ]] && ((REPS >= 1)) ||
+    { echo "ERROR: REPS must be a whole number of at least 1, not '$REPS'" >&2; exit 1; }
+  for var in $(compgen -v | grep '^REPS_' || true); do
+    value=${!var}
+    [[ -n "$value" ]] || continue
+    tool=$(printf '%s' "${var#REPS_}" | tr '[:upper:]' '[:lower:]')
+    ok=0
+    for known in $KNOWN_REPS_TOOLS; do
+      [[ "$tool" == "$known" ]] && ok=1 && break
+    done
+    if ((!ok)); then
+      echo "ERROR: $var names no tool this harness runs." >&2
+      echo "       Known tools: $KNOWN_REPS_TOOLS" >&2
+      exit 1
+    fi
+    [[ "$value" =~ ^[0-9]+$ ]] && ((value >= 1)) ||
+      { echo "ERROR: $var must be a whole number of at least 1, not '$value'" >&2; exit 1; }
+  done
+}
+_reps_check_all
+
+# How many times this tool runs: REPS unless REPS_<TOOL> says otherwise.
+tool_reps() {
+  local var value
+  var=$(reps_var_name "$1")
+  value=${!var:-}
+  printf '%s' "${value:-$REPS}"
+}
+
+# The outer loop bound: tools are still visited rep-major so that the cache
+# state each one sees is the same as it was before per-tool counts existed.
+max_tool_reps() {
+  local t n max=0
+  for t in "$@"; do
+    n=$(tool_reps "$t")
+    ((n > max)) && max=$n
+  done
+  ((max > 0)) || max=$REPS
+  printf '%s' "$max"
+}
+
+# "3" when every tool agrees, otherwise "3 (gufi 1, robinhood 1)". Used for the
+# progress banner and for env.txt, so a results directory says what it did
+# rather than implying one count for rows that do not share it.
+reps_plan() {
+  local t n diff=()
+  for t in "$@"; do
+    n=$(tool_reps "$t")
+    [[ "$n" == "$REPS" ]] || diff+=("$t $n")
+  done
+  if ((${#diff[@]} == 0)); then
+    printf '%s' "$REPS"
+    return 0
+  fi
+  local joined=${diff[0]} i
+  for ((i = 1; i < ${#diff[@]}; i++)); do
+    joined+=", ${diff[i]}"
+  done
+  printf '%s (%s)' "$REPS" "$joined"
+}
+
 have_cmd() {
   local c=$1
   [[ -n "$c" && -x "$c" ]]
@@ -580,7 +774,7 @@ tool_available() {
     xdu) have_cmd "$XDU_BIN" && have_cmd "$XDU_FIND" ;;
     robinhood) have_cmd "$RBH_SCAN" || have_cmd "$RBH_FIND" ;;
     find) command -v find >/dev/null 2>&1 ;;
-    fd) have_cmd "$FD_BIN" ;;
+    fd) [[ "$FD_OK" == "1" ]] ;;
     du) command -v du >/dev/null 2>&1 ;;
     dua) [[ "$DUA_OK" == "1" ]] ;;
     *) return 1 ;;
@@ -908,8 +1102,13 @@ write_env_snapshot() {
     echo "version_xdu=$(tool_version "${XDU_BIN:-}" "${INDEXER_COMPARE_XDU_VERSION:-}")"
     echo "version_robinhood=$(tool_version "${RBH_SCAN:-}" "${INDEXER_COMPARE_ROBINHOOD_VERSION:-}")"
     echo "version_mariadb=$(bin_version mysql || bin_version mariadb || echo not_installed)"
-    echo "version_fd=$(tool_version "${FD_BIN:-}")"
-    # DUA_OK already distinguishes installed from actually runnable.
+    # FD_OK / DUA_OK already distinguish installed from actually runnable.
+    if [[ -n "${FD_BIN:-}" && "$FD_OK" != "1" ]]; then
+      echo "version_fd=present but not runnable: $FD_BIN"
+      echo "fd_unusable=${FD_WHY:-no error text}"
+    else
+      echo "version_fd=$(tool_version "${FD_BIN:-}")"
+    fi
     if [[ -n "${DUA_BIN:-}" && "$DUA_OK" != "1" ]]; then
       echo "version_dua=present but not runnable: $DUA_BIN"
       echo "dua_unusable=${DUA_WHY:-no error text}"
@@ -927,6 +1126,20 @@ write_env_snapshot() {
     echo "drop_caches_scope=$DROP_CACHES_SCOPE"
     echo "drop_db_cache=$DROP_DB_CACHE"
     echo "reps=$REPS"
+    # Only when some tool disagrees with REPS, so a uniform run reads exactly as
+    # it always did. Without it a mixed run claims one repetition count for rows
+    # that do not share it, and the error bars look inconsistent for no reason.
+    _ic_reps_tools=${TOOLS:-}
+    [[ "${INCLUDE_EREPORT_INDEX:-0}" != "1" ]] || _ic_reps_tools+=" ereport_index"
+    if [[ -n "${_ic_reps_tools// /}" ]]; then
+      _ic_reps_detail=""
+      for _ic_reps_t in $_ic_reps_tools; do
+        _ic_reps_n=$(tool_reps "$_ic_reps_t")
+        [[ "$_ic_reps_n" == "$REPS" ]] ||
+          _ic_reps_detail+="${_ic_reps_detail:+ }$_ic_reps_t=$_ic_reps_n"
+      done
+      [[ -z "$_ic_reps_detail" ]] || echo "reps_per_tool=$_ic_reps_detail"
+    fi
     echo "ecrawl_bin=$ECRAWL_BIN"
     echo "ereport_bin=$EREPORT_BIN"
     echo "ereport_index_bin=$EREPORT_INDEX_BIN"

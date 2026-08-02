@@ -10,6 +10,10 @@
 #   TOOLS="ecrawl gufi xdu robinhood find fd du dua"
 #                                   (find/fd/du/dua = live walk baselines only)
 #   REPS=3 DROP_CACHES=0|1 THREADS=16
+#   REPS_<TOOL>=n     repetitions for one tool, overriding REPS: REPS_GUFI=1
+#                     keeps a 29-minute rollup to a single pass while the cheap
+#                     rows still get their three. REPS_EREPORT_INDEX defaults to
+#                     1 and cannot exceed REPS_ECRAWL, whose capture it indexes.
 #   WORK_ROOT=<dir>   where tool indexes are written (default: <results-dir>/indexes)
 #   INCLUDE_EREPORT_INDEX=1   also time ereport_index --make after ecrawl (separate row)
 #   DO_NOWRITE=1      extra ecrawl row: full stat walk, no capture written
@@ -404,7 +408,7 @@ run_find_baseline() {
 run_fd_baseline() {
   local rep=$1
   if ! tool_available fd; then
-    append_row fd walk "$rep" skipped "" 0 "fd_not_found_install_fd-find"
+    append_row fd walk "$rep" skipped "" 0 "$(fd_skip_reason)"
     return 0
   fi
   local tfile="$OUT/fd_walk_r${rep}.time.txt"
@@ -471,12 +475,20 @@ run_dua_baseline() {
   fi
 }
 
-for ((rep = 1; rep <= REPS; rep++)); do
+REPS_MAX=$(max_tool_reps $TOOLS)
+echo "==> repetitions: $(reps_plan $TOOLS ereport_index)"
+
+for ((rep = 1; rep <= REPS_MAX; rep++)); do
   export CURRENT_REP=$rep
   for t in $TOOLS; do
+    t_reps=$(tool_reps "$t")
+    # Tools with a smaller count drop out of the later reps; the rest carry on,
+    # so each one still meets the cache state it would have met before per-tool
+    # counts existed.
+    ((rep <= t_reps)) || continue
     # Each tool's own output goes to $OUT/<tool>_*.std{out,err}.txt, so without
     # this the whole phase looks stalled.
-    printf '==> rep %d/%d: %s (%s)\n' "$rep" "$REPS" "$t" "$(date +%H:%M:%S)"
+    printf '==> rep %d/%d: %s (%s)\n' "$rep" "$t_reps" "$t" "$(date +%H:%M:%S)"
     case "$t" in
       ecrawl)
         run_ecrawl write "$rep"
@@ -486,7 +498,10 @@ for ((rep = 1; rep <= REPS; rep++)); do
         if [[ "${DO_NOSTAT:-0}" == "1" ]]; then
           run_ecrawl nostat "$rep"
         fi
-        if [[ "$INCLUDE_EREPORT_INDEX" == "1" && "$rep" -eq 1 ]]; then
+        # Runs inside ecrawl's branch because it indexes the capture ecrawl just
+        # wrote, so REPS_ECRAWL is also its ceiling. Defaults to 1: the input is
+        # identical every time, so a second pass measures the same work twice.
+        if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ((rep <= $(tool_reps ereport_index))); then
           run_ereport_index "$rep"
         fi
         ;;

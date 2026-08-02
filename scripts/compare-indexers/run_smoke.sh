@@ -83,9 +83,11 @@ if [[ -z "$TOOLS_INDEX" && "$SYNTH_PROFILE" == "tiny" && "$WITH_EXTERNALS" != "1
 fi
 if [[ -z "$TOOLS_INDEX" ]]; then
   TOOLS_INDEX="ecrawl find"
-  tool_available fd && TOOLS_INDEX+=" fd"
+  # fd/dua: include whenever a path is known, even if the probe failed, so the
+  # index script emits skipped rows with the reason instead of omitting them.
+  baseline_candidate fd && TOOLS_INDEX+=" fd"
   tool_available du && TOOLS_INDEX+=" du"
-  tool_available dua && TOOLS_INDEX+=" dua"
+  baseline_candidate dua && TOOLS_INDEX+=" dua"
   tool_available gufi && TOOLS_INDEX+=" gufi"
   tool_available xdu && TOOLS_INDEX+=" xdu"
   # Installed but unprovisioned Robinhood would contribute a scan that cannot
@@ -120,9 +122,9 @@ elif [[ "$SYNTH_PROFILE" == "tiny" && "$WITH_EXTERNALS" != "1" ]]; then
   TOOLS_Q="find du ecrawl_suite"
 else
   TOOLS_Q="find ecrawl_suite"
-  tool_available fd && TOOLS_Q+=" fd"
+  baseline_candidate fd && TOOLS_Q+=" fd"
   tool_available du && TOOLS_Q+=" du"
-  tool_available dua && TOOLS_Q+=" dua"
+  baseline_candidate dua && TOOLS_Q+=" dua"
   tool_available gufi && [[ -n "${GUFI_INDEX_DIR:-}" ]] && TOOLS_Q+=" gufi"
   tool_available xdu && [[ -n "${XDU_INDEX_DIR:-}" ]] && TOOLS_Q+=" xdu"
   tool_available robinhood && rbh_db_ready && TOOLS_Q+=" robinhood"

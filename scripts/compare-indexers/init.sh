@@ -15,8 +15,11 @@
 #     RBH_FS_PATH=/tmp/indexer-compare-synth scripts/compare-indexers/init.sh
 #
 # Environment:
-#   PREFIX=$HOME/.local/indexer-compare
-#   SRC_ROOT=$HOME/.cache/indexer-compare-src
+#   PREFIX=                default: $HOME/orcd/scratch/ereport-automated-testing/prefix
+#                          when that directory already exists, else
+#                          $HOME/.local/indexer-compare
+#   SRC_ROOT=              default: matching .../src beside the scratch PREFIX
+#                          when used, else $HOME/.cache/indexer-compare-src
 #   TOOLS="gufi xdu robinhood dua"
 #   JOBS=$(nproc)          build parallelism for every tool; lower it to share
 #                          a busy host
@@ -54,8 +57,27 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PREFIX=${PREFIX:-"$HOME/.local/indexer-compare"}
-SRC_ROOT=${SRC_ROOT:-"$HOME/.cache/indexer-compare-src"}
+# Prefer the shared ORCD scratch prefix when it already exists (same rule as
+# benchmark.sh) so init and measure agree without an explicit PREFIX=.
+_ic_scratch_prefix="$HOME/orcd/scratch/ereport-automated-testing/prefix"
+_ic_scratch_src="$HOME/orcd/scratch/ereport-automated-testing/src"
+if [[ -z "${PREFIX:-}" ]]; then
+  if [[ -d "$_ic_scratch_prefix" ]]; then
+    PREFIX=$_ic_scratch_prefix
+  else
+    PREFIX="$HOME/.local/indexer-compare"
+  fi
+fi
+if [[ -z "${SRC_ROOT:-}" ]]; then
+  if [[ -d "$_ic_scratch_src" ]]; then
+    SRC_ROOT=$_ic_scratch_src
+  elif [[ -d "$_ic_scratch_prefix" ]]; then
+    SRC_ROOT=$_ic_scratch_src
+  else
+    SRC_ROOT="$HOME/.cache/indexer-compare-src"
+  fi
+fi
+unset _ic_scratch_prefix _ic_scratch_src
 TOOLS=${TOOLS-"gufi xdu robinhood dua"}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 INSTALL_PACKAGES=${INSTALL_PACKAGES:-ask}

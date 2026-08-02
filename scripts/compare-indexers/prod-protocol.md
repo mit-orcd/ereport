@@ -46,6 +46,8 @@ Open-file limits matter at this scale; `benchmark.sh` raises `RLIMIT_NOFILE` to 
 TREE=/path/to/production/root   # or snapshot mount
 export DROP_CACHES=0   # or 1
 export REPS=1          # production index once; queries use REPS=3
+                       # or keep REPS=3 and spare only the slow rows:
+                       #   export REPS=3 REPS_GUFI=1 REPS_ROBINHOOD=1
 export TOOLS="ecrawl gufi xdu find fd du dua"   # add robinhood when RBH_SCAN_ARGS is set
 export INCLUDE_EREPORT_INDEX=1
 export DO_NOWRITE=0    # optional: also set DO_NOWRITE=1 for walk-only upper bound
@@ -55,7 +57,7 @@ scripts/compare-indexers/run_index.sh "$TREE" "$RESULTS/index"
 
 For GUFI rollup variant: ensure `gufi_rollup` is on `PATH` (`GUFI_DO_ROLLUP=1`, default).
 
-Budget the time for it. On a 4.4M-entry synthetic tree the rollup took **29 minutes per repetition** (485 s per million files, growing the index from 39 GB to 580 GB) against 33 seconds for `gufi_dir2index` — 91% of the entire index phase, which is why a 3-repetition run spent 1.6 hours there. It is measured as its own row precisely so that cost stays visible instead of being folded into GUFI's build. Two consequences: give the index phase `REPS=1` (the index is built once in production anyway), and expect the untimed bookkeeping around it — sizing a half-terabyte index tree with `du`, then deleting the previous repetition's copy — to add minutes of its own per repetition. `GUFI_DO_ROLLUP=0` drops the variant entirely, which is what `benchmark.sh --quick` does.
+Budget the time for it. On a 4.4M-entry synthetic tree the rollup took **29 minutes per repetition** (485 s per million files, growing the index from 39 GB to 580 GB) against 33 seconds for `gufi_dir2index` — 91% of the entire index phase, which is why a 3-repetition run spent 1.6 hours there. It is measured as its own row precisely so that cost stays visible instead of being folded into GUFI's build. Two consequences: hold the rollup to one pass (`REPS_GUFI=1`, or `REPS=1` for the whole index phase — the index is built once in production anyway; per-tool counts mean the cheap rows can still take their three), and expect the untimed bookkeeping around it — sizing a half-terabyte index tree with `du`, then deleting the previous repetition's copy — to add minutes of its own per repetition. `GUFI_DO_ROLLUP=0` drops the variant entirely, which is what `benchmark.sh --quick` does.
 
 Robinhood: set `RBH_SCAN`, `RBH_SCAN_ARGS`, and optionally `RBH_INDEX_DIR` / `RBH_INDEX_BYTES` for DB footprint.
 

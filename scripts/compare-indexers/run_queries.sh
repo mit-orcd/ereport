@@ -15,6 +15,7 @@
 #   GUFI_INDEX_DIR=... XDU_INDEX_DIR=...
 #
 # Env: TOOLS="find fd du dua ecrawl_suite gufi xdu robinhood" REPS=3
+#      REPS_<TOOL>=n overrides REPS for one tool, e.g. REPS_ROBINHOOD=1
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -497,7 +498,7 @@ q_fd() {
   local rep=$1
   local TOLERATE_EXIT1=1
   if ! tool_available fd; then
-    skip_all_queries fd "$rep" "fd_not_found_install_fd-find"
+    skip_all_queries fd "$rep" "$(fd_skip_reason)"
     return 0
   fi
   [[ -n "$Q1_NAME" ]] &&
@@ -674,10 +675,17 @@ blocked() {
   return 0
 }
 
-for ((rep = 1; rep <= REPS; rep++)); do
+REPS_MAX=$(max_tool_reps $TOOLS)
+echo "==> repetitions: $(reps_plan $TOOLS)"
+
+for ((rep = 1; rep <= REPS_MAX; rep++)); do
   export CURRENT_REP=$rep
   for t in $TOOLS; do
-    printf '==> rep %d/%d: %s Q1-Q5 (%s)\n' "$rep" "$REPS" "$t" "$(date +%H:%M:%S)"
+    t_reps=$(tool_reps "$t")
+    # A tool that has had its repetitions still leaves the others running, so
+    # the query series each one sees is unchanged.
+    ((rep <= t_reps)) || continue
+    printf '==> rep %d/%d: %s Q1-Q5 (%s)\n' "$rep" "$t_reps" "$t" "$(date +%H:%M:%S)"
     case "$t" in
       find) q_find "$rep" ;;
       fd) q_fd "$rep" ;;

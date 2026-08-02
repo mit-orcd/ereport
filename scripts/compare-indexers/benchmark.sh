@@ -48,6 +48,18 @@
 #                     --undo). Defaults to a timestamped directory next to this
 #                     script, or results/small with --small, which is reused so
 #                     the path stays the same from cycle to cycle.
+#   --reps <spec>     how many times each tool runs. A bare number sets them
+#                     all ("--reps 1"); "<tool>=<n>" sets one; the two combine,
+#                     comma or space separated, and later entries win:
+#                       --reps 1                      every tool once
+#                       --reps gufi=1,robinhood=1     those two once, rest at REPS
+#                       --reps 3,gufi=1               spell the default too
+#                     Tools differ by orders of magnitude -- a GUFI rollup is 29
+#                     minutes a repetition where find is seconds -- so this is
+#                     how the cheap rows get error bars without paying for three
+#                     of everything. A bare number counts as an explicit REPS,
+#                     so --small, --quick and --smoke will not override it; a
+#                     <tool>=<n> entry leaves those mode defaults alone.
 #   --yes, -y         answer every prompt with yes; required off a terminal
 #   --no-robinhood    skip MariaDB and Robinhood entirely
 #   --keep-tools      --undo: keep the built tools and their source clones
@@ -70,9 +82,13 @@
 #
 # Env (all optional, passed through to the underlying scripts):
 #   PREFIX, SRC_ROOT, JOBS, TOOLS, PKG_ARGS, INSTALL_PACKAGES, SETUP_CHARTS,
-#   WORK_ROOT, RESULTS_ROOT, SYNTH_PROFILE, REPS, DROP_CACHES,
+#   WORK_ROOT, RESULTS_ROOT, SYNTH_PROFILE, REPS, REPS_<TOOL>, DROP_CACHES,
 #   DROP_CACHES_SCOPE, DROP_DB_CACHE, KEEP_ALL_INDEXES, TOOLS_INDEX, TOOLS_QUERY,
 #   EDELETE_BIN, EDELETE_THREADS
+#
+# REPS_<TOOL> is the env spelling of --reps: REPS_GUFI=1 and --reps gufi=1 do
+# the same thing. REPS_EREPORT_INDEX defaults to 1 because it indexes ecrawl's
+# capture, so repeating it re-measures identical input; REPS_ECRAWL is its cap.
 #
 # WORK_ROOT and RESULTS_ROOT are the env spellings of --work and --results;
 # WORK_ROOT names the index directory itself, --work names a parent that also
@@ -94,8 +110,28 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-PREFIX=${PREFIX:-"$HOME/.local/indexer-compare"}
-SRC_ROOT=${SRC_ROOT:-"$HOME/.cache/indexer-compare-src"}
+# Prefer the shared ORCD scratch prefix when it already exists so a root or
+# login-node run does not quietly rebuild under $HOME/.local/indexer-compare
+# (and then fail probes against a glibc that does not match the compute node).
+_ic_scratch_prefix="$HOME/orcd/scratch/ereport-automated-testing/prefix"
+_ic_scratch_src="$HOME/orcd/scratch/ereport-automated-testing/src"
+if [[ -z "${PREFIX:-}" ]]; then
+  if [[ -d "$_ic_scratch_prefix" ]]; then
+    PREFIX=$_ic_scratch_prefix
+  else
+    PREFIX="$HOME/.local/indexer-compare"
+  fi
+fi
+if [[ -z "${SRC_ROOT:-}" ]]; then
+  if [[ -d "$_ic_scratch_src" ]]; then
+    SRC_ROOT=$_ic_scratch_src
+  elif [[ -d "$_ic_scratch_prefix" ]]; then
+    SRC_ROOT=$_ic_scratch_src
+  else
+    SRC_ROOT="$HOME/.cache/indexer-compare-src"
+  fi
+fi
+unset _ic_scratch_prefix _ic_scratch_src
 # Which knobs the caller set, recorded before anything is defaulted, so --small
 # can supply its own defaults without overriding an explicit choice.
 FROM_ENV_TOOLS=${TOOLS+1}
@@ -164,6 +200,61 @@ die() {
 usage() {
   # The whole header block, so a new option is documented in one place only.
   awk 'NR < 3 {next} /^[^#]/ {exit} {sub(/^#[ ]?/, ""); print}' "${BASH_SOURCE[0]}"
+}
+
+# Mirrors lib.sh's KNOWN_REPS_TOOLS. Repeated rather than sourced because this
+# script deliberately does not source lib.sh, and a typo has to be caught here:
+# rejected at the command line it costs a retype, accepted it costs a whole run
+# at a repetition count nobody chose.
+REPS_TOOL_NAMES="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua"
+
+reps_valid() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1)); }
+
+# --reps <spec>: "1", "gufi=1", or "3,gufi=1,robinhood=1". A bare number is the
+# default for every tool (REPS itself); <tool>=<n> overrides one, exported as
+# REPS_<TOOL> because that is what the run scripts read.
+parse_reps_spec() {
+  local spec=${1//,/ } entry tool value known ok
+  [[ -n "${spec// /}" ]] ||
+    die "--reps needs a value: a count, <tool>=<count>, or both"
+  for entry in $spec; do
+    if [[ "$entry" != *=* ]]; then
+      reps_valid "$entry" ||
+        die "--reps $entry: expected a count of at least 1, or <tool>=<count>"
+      REPS=$entry
+      # Only a bare number pins the global, so "--smoke --reps gufi=1" still
+      # gets smoke's REPS=1 for everything else.
+      FROM_ENV_REPS=1
+      continue
+    fi
+    tool=$(printf '%s' "${entry%%=*}" | tr '[:upper:]-' '[:lower:]_')
+    value=${entry#*=}
+    ok=0
+    for known in $REPS_TOOL_NAMES; do
+      [[ "$tool" == "$known" ]] && ok=1 && break
+    done
+    ((ok)) || die "$(
+      printf -- '--reps: no tool called %s\n' "$tool"
+      printf '       known tools: %s' "$REPS_TOOL_NAMES"
+    )"
+    reps_valid "$value" ||
+      die "--reps $entry: the count must be a whole number of at least 1"
+    export "$(printf 'REPS_%s' "$(printf '%s' "$tool" | tr '[:lower:]' '[:upper:]')")=$value"
+  done
+}
+
+# "3", or "3 (gufi 1, robinhood 1)" when tools disagree. ereport_index is absent
+# unless asked for explicitly: its default of 1 lives in lib.sh, and run_index.sh
+# prints the full plan including it once the tool list is settled.
+reps_summary() {
+  local var tool out=""
+  for var in $(compgen -v | grep '^REPS_' || true); do
+    [[ "$var" != REPS_TOOL_NAMES ]] || continue
+    [[ -n "${!var}" && "${!var}" != "$REPS" ]] || continue
+    tool=$(printf '%s' "${var#REPS_}" | tr '[:upper:]' '[:lower:]')
+    out+="${out:+, }$tool ${!var}"
+  done
+  printf '%s%s' "$REPS" "${out:+ ($out)}"
 }
 
 confirm() {
@@ -439,6 +530,15 @@ do_run() {
   info "  indexes -> $SCRATCH_INDEXES"
   info "  TMPDIR  -> $SCRATCH_TMP"
   info "threads: $THREADS per tool (every tool that can be told)"
+  info "reps:    $(reps_summary)"
+  # These modes each want a single repetition, but only when REPS was not set.
+  # An exported REPS=3 left over from a measured run therefore made a "quick"
+  # check take three times as long with nothing to say why.
+  if [[ -n "$FROM_ENV_REPS" && "$REPS" != "1" ]] &&
+    [[ "$SMALL$QUICK$SMOKE" == *1* ]]; then
+    info "  this mode defaults to 1, but REPS=$REPS was given, so it stands"
+    info "  pass --reps 1 (or unset REPS) for a single pass"
+  fi
   local soft=$(ulimit -Sn)
   if [[ "$soft" != unlimited ]] && ((soft < NOFILE_TARGET)); then
     info "open files: $soft -- wanted $NOFILE_TARGET, capped by the hard limit $(ulimit -Hn)"
@@ -478,6 +578,21 @@ do_run() {
   # interpreter here, and nothing else in it can hurt.
   # shellcheck source=/dev/null
   [[ -f "$PREFIX/env.sh" ]] && source "$PREFIX/env.sh"
+
+  # Asked here, once env.sh has had its say on FD_BIN and DUA_BIN, because this
+  # is the last moment it is cheap: a baseline that will not start is one line
+  # now, or a column of skipped rows noticed after the run is already spent.
+  # Same subshell trick as rbh_status; env.sh exports both paths, so the probe
+  # sees what the run scripts will see.
+  local health health_line
+  health=$(bash -c 'source "$1/lib.sh"; baseline_health_report' _ "$SCRIPT_DIR" 2>/dev/null) ||
+    health=""
+  if [[ -n "$health" ]]; then
+    while IFS= read -r health_line; do
+      info "$health_line"
+    done <<<"$health"
+    info "  those rows will be skipped; the other tools are unaffected"
+  fi
 
   # The generated config is the completion artifact: the ownership marker is
   # written early in setup, so it says "claimed", not "finished".
@@ -570,7 +685,7 @@ do_run() {
   # extra traversal per rep, which is the cheapest walk in the table.
   local nowrite=${DO_NOWRITE:-1}
 
-  log "4/5 benchmarking (REPS=$REPS DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
+  log "4/5 benchmarking (reps=$(reps_summary) DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
   info "results: $results"
   SKIP_PREPARE=1 REPS="$REPS" DROP_CACHES="$DROP_CACHES" DROP_DB_CACHE="$DROP_DB_CACHE" \
     DO_NOWRITE="$nowrite" WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
@@ -860,6 +975,11 @@ while [[ $# -gt 0 ]]; do
     --quick)
       QUICK=1
       shift
+      ;;
+    --reps)
+      [[ $# -ge 2 && -n "$2" ]] || die "--reps needs a count or <tool>=<count>"
+      parse_reps_spec "$2"
+      shift 2
       ;;
     --yes | -y)
       ASSUME_YES=1
