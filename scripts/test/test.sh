@@ -1244,6 +1244,43 @@ run_integration() {
         die "ereport_index did not write tri_keys.bin / paths.bin under ${idx_make}"
     summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin written"
 
+    expect_eq "ereport_index: paths.bin magic" "EPATH002" "$(head -c 8 "${idx_make}/paths.bin")" \
+        "paths.bin uses the compressed EPATH002 layout"
+    expect_eq "ereport_index: meta version" "2" "$(kv_last ereport_index_version "${idx_make}/meta.txt")" \
+        "meta.txt records the compressed index version"
+
+    # Round trip through both compressed files: postings decode, then a path comes back out of paths.bin.
+    log "ereport_index --search (compressed index round trip)"
+    "$EREPORT_INDEX" --search --index-dir "$idx_make" sub >"${td}/ei_search.out" 2>"${td}/ei_search.err" || {
+        tail -n 40 "${td}/ei_search.err" >&2 || true
+        die "ereport_index --search failed"
+    }
+    local ei_hits=0 ei_line
+    while IFS= read -r ei_line; do
+        [[ -n "$ei_line" ]] || continue
+        [[ "$ei_line" == *sub* ]] || die "ereport_index --search returned a path without the term: ${ei_line}"
+        [[ -e "$ei_line" ]] || die "ereport_index --search returned a path that does not exist: ${ei_line}"
+        ei_hits=$((ei_hits + 1))
+    done <"${td}/ei_search.out"
+    [[ "$ei_hits" -ge 1 ]] || die "ereport_index --search found no path containing 'sub'"
+    summary_add PASS "ereport_index --search" "${ei_hits} path(s) decoded from the compressed index"
+
+    "$EREPORT_INDEX" --search --index-dir "$idx_make" zzqqxxnotpresent >"${td}/ei_search_none.out" 2>/dev/null || true
+    [[ ! -s "${td}/ei_search_none.out" ]] ||
+        die "ereport_index --search returned matches for a term that is not in the tree"
+    summary_add PASS "ereport_index --search (no match)" "absent term returns nothing"
+
+    # An index from before the compression change must be rejected rather than misread.
+    local idx_stale="${td}/index_stale"
+    cp -r "$idx_make" "$idx_stale"
+    sed -i 's/^ereport_index_version=2$/ereport_index_version=1/' "${idx_stale}/meta.txt"
+    if "$EREPORT_INDEX" --search --index-dir "$idx_stale" sub >/dev/null 2>"${td}/ei_stale.err"; then
+        die "ereport_index --search accepted an index whose meta.txt claims version 1"
+    fi
+    grep -q "rebuild" "${td}/ei_stale.err" ||
+        die "ereport_index --search rejected the stale index without telling the user to rebuild"
+    summary_add PASS "ereport_index version gate" "a v1 index is refused with a rebuild hint"
+
     run_ecrawl_mount_tests "$td" "$root_abs" "$crawl_out" "$ce"
 
     trap - EXIT

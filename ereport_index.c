@@ -35,13 +35,18 @@
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
+#include "crawl_fpcache.h"
 #include "path_canon.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-#define INDEX_VERSION 1
+/*
+ * 2: durable paths.bin and tri_postings.bin are zstd-compressed (EPATH002 / chunked postings).
+ * Readers reject anything else — a v1 index has to be rebuilt with `--make`.
+ */
+#define INDEX_VERSION 2
 /*
  * Top bits of the 24-bit trigram used to partition records into tmp_trigrams_<bucket>_w<shard>.bin
  * during the index phase, and into one merge segment per bucket during the merge phase.
@@ -81,7 +86,7 @@
 static size_t g_write_batch_paths_base = WRITE_BATCH_PATHS;
 /* Like ecrawl/ereport: default output is a concise key=value summary; --verbose enables live detail and extra metrics. */
 static int g_verbose = 0;
-static int g_tmp_trigram_zstd_level = -1; /* -1 = parse EREPORT_INDEX_TMP_ZSTD_LEVEL on first use */
+static int g_durable_zstd_level = -1; /* -1 = parse EREPORT_INDEX_ZSTD_LEVEL on first use */
 
 /* --subtree <abs-path>: when non-NULL, only records whose reconstructed full path is at or under this
  * directory are indexed (full absolute paths kept), so the index mirrors an ereport --subtree report. */
@@ -195,8 +200,8 @@ static int set_path_rewrite(const char *arg) {
  * paths writer instead of one per path. */
 #define PATH_OFFSETS_STAGE_ENTRIES 8192U
 /*
- * tmp_trigrams shards: accumulate records per (worker × bucket) and emit one zstd frame
- * per ~64 KiB of source so framing overhead and read()/decompress syscalls amortize over
+ * tmp_trigrams shards: accumulate records per (worker × bucket) and emit one frame
+ * per ~64 KiB of source so framing overhead and read()/decode syscalls amortize over
  * thousands of records instead of the ~1 record per frame the per-batch path produced.
  */
 #define TRIGRAM_TMP_FRAME_BYTES (1U << 16)
@@ -362,6 +367,51 @@ typedef struct {
     crawl_bin_catalog_t *catalog;
 } file_state_t;
 
+/*
+ * paths.bin (EPATH002): the path bytes are split into chunks of at most PATHS_CHUNK_RAW, each compressed
+ * independently so a search can decompress exactly one chunk per hit. Chunks are cut on path boundaries,
+ * so no path ever straddles two of them.
+ *
+ * path_offsets.bin keeps storing offsets into the *uncompressed* stream, which is what makes this a local
+ * change: path-id arithmetic, --resume-merge and the offsets file are all untouched.
+ *
+ *   [header PATHS_HDR_BYTES][chunk frames…][chunk table]
+ *
+ * The table is at the end because chunk_count is only known once the last path has been written; the
+ * header records where it starts, so opening the file is still one seek and one sequential read.
+ *
+ * A trained zstd dictionary was measured and dropped. A 256 KiB chunk already holds ~1400 neighbouring
+ * paths, so its window captures nearly all of the shared-prefix redundancy on its own: on a 199k-path
+ * /usr corpus a 64 KiB dictionary shrank the frames by 1.7% but had to be stored, making the file 3%
+ * larger overall — and ZDICT_trainFromBuffer cost 0.34 s on the paths writer, the only serial stage of
+ * the --make pipeline.
+ */
+static const unsigned char PATHS_MAGIC[8] = {'E', 'P', 'A', 'T', 'H', '0', '0', '2'};
+#define PATHS_FORMAT_VERSION 2U
+#define PATHS_HDR_BYTES 40
+#define PATHS_CHUNK_RAW ((size_t)256 * 1024)
+
+/* One row per chunk; stored_len == raw_len means the chunk did not compress and is stored verbatim. */
+typedef struct __attribute__((packed)) {
+    uint64_t logical_start;
+    uint64_t file_off;
+    uint32_t stored_len;
+    uint32_t raw_len;
+} paths_chunk_ent_t;
+
+/* Header + chunk table + dictionary of an EPATH002 paths.bin. Read once per search and shared read-only
+ * across the path-filter workers, which is what keeps the table off the per-thread memory budget. */
+typedef struct {
+    paths_chunk_ent_t *table;
+    uint64_t chunk_count;
+    uint64_t total_logical;
+    uint32_t max_raw;
+    uint32_t max_stored;
+} paths_index_t;
+
+static int paths_index_open(const char *paths_path, paths_index_t *pi);
+static void paths_index_close(paths_index_t *pi);
+
 typedef struct {
     uid_t target_uid;
     int aggregate_all_users;
@@ -375,6 +425,17 @@ typedef struct {
     uint64_t paths_pos;
     uint64_t *path_offsets_buf;
     size_t path_offsets_n;
+    /* EPATH002 writer state, also owned exclusively by the paths writer thread. */
+    uint64_t paths_file_pos;
+    unsigned char *paths_chunk;
+    size_t paths_chunk_len;
+    uint64_t paths_chunk_logical;
+    unsigned char *paths_comp;
+    size_t paths_comp_cap;
+    ZSTD_CCtx *paths_cctx;
+    paths_chunk_ent_t *paths_table;
+    size_t paths_table_n;
+    size_t paths_table_cap;
     uint64_t input_files;
     uint64_t scanned_records;
     uint64_t indexed_paths;
@@ -398,8 +459,8 @@ typedef struct {
     /* Parallel trigram writers use disjoint tmp files per (bucket, worker) — no cross-thread FILE/mutex. */
     uint32_t trigram_tmp_shard_count;
     FILE **tw_worker_fp; /* [trigram_tmp_shard_count * TRIGRAM_BUCKET_COUNT] */
-    uint8_t *tw_worker_fp_magic; /* 1 if EITG0001 header already on disk for this open fp */
-    trigram_record_t **tw_worker_buf; /* per open shard: pending records, flushed as one zstd frame */
+    uint8_t *tw_worker_fp_magic; /* 1 if the EITG header is already on disk for this open fp */
+    trigram_record_t **tw_worker_buf; /* per open shard: pending records, flushed as one frame */
     uint32_t *tw_worker_buf_n; /* records currently buffered in tw_worker_buf[ix] */
     uint64_t *tw_worker_lru_age;
     uint32_t *tw_worker_open_count; /* [trigram_tmp_shard_count] */
@@ -662,10 +723,26 @@ static void finalize_chunk_progress_track(index_run_stats_t *rs, file_state_t *f
     if (old_remaining == 1U) atomic_fetch_add(&rs->scanned_input_files, 1U);
 }
 
+/*
+ * Shard reads only: the same shard is opened for its catalog and again for each of its
+ * chunks, and glibc funnels every fopen/fclose in the process through one stdio list lock.
+ * Deliberately not used for the merge spill files — those are unlinked right after they are
+ * read, and a parked handle would hold their (multi-GB) blocks until the thread exits.
+ */
+static FILE *ei_shard_fopen(const char *path, const char *mode) {
+    if (g_verbose) mk_io_tls.fopen_calls++;
+    return crawl_fpcache_fopen(path, mode);
+}
+
+static int ei_shard_fclose(FILE *stream) {
+    if (g_verbose) mk_io_tls.fclose_calls++;
+    return crawl_fpcache_fclose(stream);
+}
+
 static void ereport_index_sync_chunk_stdio(void) {
-    index_chunk_stdio.fopen = ei_fopen;
+    index_chunk_stdio.fopen = ei_shard_fopen;
     index_chunk_stdio.fread = ei_fread;
-    index_chunk_stdio.fclose = ei_fclose;
+    index_chunk_stdio.fclose = ei_shard_fclose;
 }
 
 static void ereport_index_install_verbose_io(void) {
@@ -704,15 +781,49 @@ static void ereport_index_install_verbose_io(void) {
 #define mk_mmap(addr, length, prot, flags, fd, offset) ((*ei_mmap)((addr), (length), (prot), (flags), (fd), (offset)))
 #define mk_munmap(addr, length) ((*ei_munmap)((addr), (length)))
 
-/* tmp_trigrams_*.bin are always zstd-framed: 8-byte magic, then [u32 n_recs][u32 comp_size][zstd frame]* */
-static const unsigned char TRIGRAM_TMP_MAGIC[8] = {'E', 'I', 'T', 'G', '0', '0', '0', '1'};
+/*
+ * tmp_trigrams_*.bin: 8-byte magic, then [u32 n_recs][u32 payload_bytes][payload]* frames.
+ *
+ * The payload is a delta-varint stream, not a zstd frame. Records reach a frame as runs of one path_id
+ * with strictly ascending trigrams that all share the file's bucket (see append_trigram_records_batch_parallel),
+ * so a varint pass gets them to 2-3 bytes per record for a fraction of zstd's cost. These files are written
+ * and read back inside one --make and never outlive it, so there is no on-disk format to stay compatible with.
+ *
+ * Each group is a maximal run of equal path_id with strictly ascending trigrams, encoded as
+ *   varint(zigzag(path_id - prev_path_id)) varint(count - 1) varint(zigzag(trigram - prev_trigram))
+ *   followed by count-1 x varint(trigram delta - 1).
+ * prev_path_id and prev_trigram carry across groups within a frame and start at 0; frames are independent.
+ */
+static const unsigned char TRIGRAM_TMP_MAGIC[8] = {'E', 'I', 'T', 'G', '0', '0', '0', '2'};
 
-/* Compression level for tmp_trigrams. EREPORT_INDEX_TMP_ZSTD_LEVEL selects 1..ZSTD_maxCLevel();
- * out-of-range / unparsable values fall back to the default. Uncompressed temp files are not supported. */
-static int tmp_trigram_zstd_level(void) {
-    if (g_tmp_trigram_zstd_level >= 0) return g_tmp_trigram_zstd_level;
+/* Worst case for a one-record group: 10-byte path delta, 1-byte count, 5-byte trigram delta. */
+#define TRIGRAM_TMP_MAX_BYTES_PER_REC 16
+
+static int decode_varint_u64_buf(const unsigned char *buf, size_t len, size_t *pos, uint64_t *out);
+
+static inline unsigned char *tmp_trigram_put_varint(unsigned char *p, uint64_t v) {
+    while (v >= 0x80U) {
+        *p++ = (unsigned char)((v & 0x7FU) | 0x80U);
+        v >>= 7;
+    }
+    *p++ = (unsigned char)v;
+    return p;
+}
+
+static inline uint64_t tmp_trigram_zigzag(int64_t v) {
+    return ((uint64_t)v << 1) ^ (uint64_t)(v < 0 ? -1 : 0);
+}
+
+static inline int64_t tmp_trigram_unzigzag(uint64_t u) {
+    return (int64_t)((u >> 1) ^ (uint64_t)(-(int64_t)(u & 1U)));
+}
+
+/* Compression level for the durable index (paths.bin, tri_postings.bin), from EREPORT_INDEX_ZSTD_LEVEL.
+ * Separate from the temp level: temp files live for one run, these are read by every search. */
+static int durable_zstd_level(void) {
+    if (g_durable_zstd_level >= 0) return g_durable_zstd_level;
     {
-        const char *env = getenv("EREPORT_INDEX_TMP_ZSTD_LEVEL");
+        const char *env = getenv("EREPORT_INDEX_ZSTD_LEVEL");
         int level = 3;
 
         if (env && env[0]) {
@@ -722,9 +833,9 @@ static int tmp_trigram_zstd_level(void) {
             if (end != env && *end == '\0' && v >= 1 && v <= ZSTD_maxCLevel())
                 level = (int)v;
         }
-        g_tmp_trigram_zstd_level = level;
+        g_durable_zstd_level = level;
     }
-    return g_tmp_trigram_zstd_level;
+    return g_durable_zstd_level;
 }
 
 static int tmp_trigram_read_exact_fd(int fd, void *buf, size_t n) {
@@ -741,43 +852,115 @@ static int tmp_trigram_read_exact_fd(int fd, void *buf, size_t n) {
     return 0;
 }
 
-/* Compression scratch, kept per thread: every trigram worker flushes frames constantly,
+/* Encode scratch, kept per thread: every trigram worker flushes frames constantly,
  * and a malloc/free pair per frame is another cross-thread arena round-trip. */
-static __thread unsigned char *tls_zbuf;
-static __thread size_t tls_zcap;
+static __thread unsigned char *tls_encbuf;
+static __thread size_t tls_enccap;
+static pthread_key_t g_encscratch_key;
+static pthread_once_t g_encscratch_once = PTHREAD_ONCE_INIT;
 
-static unsigned char *tmp_trigram_zbuf(size_t need) {
-    if (need > tls_zcap) {
-        unsigned char *p = (unsigned char *)realloc(tls_zbuf, need);
-
-        if (!p) return NULL;
-        tls_zbuf = p;
-        tls_zcap = need;
-    }
-    return tls_zbuf;
+static void tmp_trigram_scratch_free(void *unused) {
+    (void)unused;
+    free(tls_encbuf);
+    tls_encbuf = NULL;
+    tls_enccap = 0;
 }
 
-static int tmp_trigram_write_compressed_frame(FILE *fp, const trigram_record_t *recs, size_t n) {
-    size_t src_bytes = n * sizeof(*recs);
-    size_t bound = ZSTD_compressBound(src_bytes);
-    unsigned char *comp = NULL;
+static void tmp_trigram_scratch_key_init(void) {
+    (void)pthread_key_create(&g_encscratch_key, tmp_trigram_scratch_free);
+}
+
+static unsigned char *tmp_trigram_encbuf(size_t need) {
+    if (need > tls_enccap) {
+        unsigned char *p = (unsigned char *)realloc(tls_encbuf, need);
+
+        if (!p) return NULL;
+        tls_encbuf = p;
+        tls_enccap = need;
+        /* The key exists only so this thread's buffer is released when it exits. */
+        (void)pthread_once(&g_encscratch_once, tmp_trigram_scratch_key_init);
+        (void)pthread_setspecific(g_encscratch_key, (void *)tls_encbuf);
+    }
+    return tls_encbuf;
+}
+
+static int tmp_trigram_write_frame(FILE *fp, const trigram_record_t *recs, size_t n) {
+    unsigned char *out;
+    unsigned char *p;
+    size_t i = 0;
+    uint64_t prev_pid = 0;
+    uint32_t prev_tri = 0;
+    size_t len;
     uint32_t n32;
-    uint32_t clen32;
-    size_t comp_len;
+    uint32_t len32;
 
     if (n == 0) return 0;
     if (n > UINT32_MAX) return -1;
-    comp = tmp_trigram_zbuf(bound);
-    if (!comp) return -1;
-    comp_len = ZSTD_compress(comp, bound, recs, src_bytes, tmp_trigram_zstd_level());
-    if (ZSTD_isError(comp_len)) return -1;
-    if (comp_len > UINT32_MAX) return -1;
+    out = tmp_trigram_encbuf(n * TRIGRAM_TMP_MAX_BYTES_PER_REC);
+    if (!out) return -1;
+    p = out;
+    while (i < n) {
+        uint64_t pid = recs[i].path_id;
+        size_t j = i + 1;
+        size_t k;
+
+        while (j < n && recs[j].path_id == pid && recs[j].trigram > recs[j - 1].trigram) j++;
+        p = tmp_trigram_put_varint(p, tmp_trigram_zigzag((int64_t)(pid - prev_pid)));
+        p = tmp_trigram_put_varint(p, (uint64_t)(j - i - 1));
+        p = tmp_trigram_put_varint(p, tmp_trigram_zigzag((int64_t)recs[i].trigram - (int64_t)prev_tri));
+        for (k = i + 1; k < j; k++)
+            p = tmp_trigram_put_varint(p, (uint64_t)(recs[k].trigram - recs[k - 1].trigram - 1U));
+        prev_pid = pid;
+        prev_tri = recs[j - 1].trigram;
+        i = j;
+    }
+    len = (size_t)(p - out);
+    if (len > UINT32_MAX) return -1;
     n32 = (uint32_t)n;
-    clen32 = (uint32_t)comp_len;
+    len32 = (uint32_t)len;
     if (mk_fwrite(&n32, 1, 4, fp) != 4) return -1;
-    if (mk_fwrite(&clen32, 1, 4, fp) != 4) return -1;
-    if (mk_fwrite(comp, 1, comp_len, fp) != comp_len) return -1;
+    if (mk_fwrite(&len32, 1, 4, fp) != 4) return -1;
+    if (mk_fwrite(out, 1, len, fp) != len) return -1;
     return 0;
+}
+
+/* Inverse of tmp_trigram_write_frame; `out` must have room for exactly `n` records. */
+static int tmp_trigram_decode_frame(const unsigned char *buf, size_t len, trigram_record_t *out, size_t n) {
+    size_t pos = 0;
+    size_t done = 0;
+    uint64_t prev_pid = 0;
+    uint32_t prev_tri = 0;
+
+    while (done < n) {
+        uint64_t zpid;
+        uint64_t count_m1;
+        uint64_t ztri;
+        uint64_t pid;
+        uint32_t tri;
+        uint64_t k;
+
+        if (decode_varint_u64_buf(buf, len, &pos, &zpid) != 0) return -1;
+        if (decode_varint_u64_buf(buf, len, &pos, &count_m1) != 0) return -1;
+        if (decode_varint_u64_buf(buf, len, &pos, &ztri) != 0) return -1;
+        if (count_m1 >= (uint64_t)(n - done)) return -1;
+        pid = prev_pid + (uint64_t)tmp_trigram_unzigzag(zpid);
+        tri = (uint32_t)((int64_t)prev_tri + tmp_trigram_unzigzag(ztri));
+        out[done].trigram = tri;
+        out[done].path_id = pid;
+        done++;
+        for (k = 0; k < count_m1; k++) {
+            uint64_t d;
+
+            if (decode_varint_u64_buf(buf, len, &pos, &d) != 0) return -1;
+            tri = (uint32_t)(tri + (uint32_t)d + 1U);
+            out[done].trigram = tri;
+            out[done].path_id = pid;
+            done++;
+        }
+        prev_pid = pid;
+        prev_tri = tri;
+    }
+    return pos == len ? 0 : -1;
 }
 
 static int tmp_trigram_fp_write_batch(FILE *fp, uint8_t *magic_on_disk, const trigram_record_t *recs, size_t n) {
@@ -786,7 +969,7 @@ static int tmp_trigram_fp_write_batch(FILE *fp, uint8_t *magic_on_disk, const tr
         if (mk_fwrite(TRIGRAM_TMP_MAGIC, 1, 8, fp) != 8) return -1;
         if (magic_on_disk) *magic_on_disk = 1;
     }
-    return tmp_trigram_write_compressed_frame(fp, recs, n);
+    return tmp_trigram_write_frame(fp, recs, n);
 }
 
 /* 1 if an existing tmp_trigrams shard already holds the EITG header (i.e. is non-empty); 0 for new/empty. */
@@ -881,9 +1064,7 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
             }
             if (frame_n == 0) continue;
             {
-                size_t src_bytes = (size_t)frame_n * sizeof(trigram_record_t);
                 unsigned char *comp = (unsigned char *)malloc((size_t)clen);
-                size_t dec;
 
                 if (!comp) {
                     free(recs);
@@ -891,8 +1072,8 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
                     return -1;
                 }
                 if (tmp_trigram_read_exact_fd(fd, comp, (size_t)clen) != 0) {
-                    fprintf(stderr, "  %s: short read of compressed frame %u (%u bytes, file truncated)\n", path,
-                            frame_idx, clen);
+                    fprintf(stderr, "  %s: short read of frame %u (%u bytes, file truncated)\n", path, frame_idx,
+                            clen);
                     free(comp);
                     free(recs);
                     close(fd);
@@ -916,22 +1097,15 @@ static int tmp_trigram_load_file(const char *path, trigram_record_t **recs_out, 
                         cap = new_cap;
                     }
                 }
-                dec = ZSTD_decompress(recs + n, src_bytes, comp, (size_t)clen);
+                if (tmp_trigram_decode_frame(comp, (size_t)clen, recs + n, (size_t)frame_n) != 0) {
+                    free(comp);
+                    fprintf(stderr, "  %s: cannot decode frame %u (%u records, %u bytes; corrupt frame)\n", path,
+                            frame_idx, frame_n, clen);
+                    free(recs);
+                    close(fd);
+                    return -1;
+                }
                 free(comp);
-                if (ZSTD_isError(dec)) {
-                    fprintf(stderr, "  %s: zstd decompress error at frame %u: %s (corrupt frame)\n", path, frame_idx,
-                            ZSTD_getErrorName(dec));
-                    free(recs);
-                    close(fd);
-                    return -1;
-                }
-                if (dec != src_bytes) {
-                    fprintf(stderr, "  %s: frame %u decompressed %zu bytes, expected %zu (corrupt frame)\n", path,
-                            frame_idx, dec, src_bytes);
-                    free(recs);
-                    close(fd);
-                    return -1;
-                }
                 n += (size_t)frame_n;
             }
             frame_idx++;
@@ -1510,32 +1684,64 @@ static void memlog_sort_top3(uint64_t wq, uint64_t tq, uint64_t cq, uint64_t mq,
     *n3 = a[2].n;
 }
 
+/*
+ * The status tick and the memory log idle between wakeups. Polling their flags in fixed 100 ms
+ * slices left each join waiting out the in-flight slice, so every --make paid that as pure idle
+ * wall time — 0.20 s of which 0.14 s was idle on a 402-path capture. Wait on a condvar against an
+ * absolute deadline (a broadcast meant for the other helper resumes the remaining time rather
+ * than ticking early) and broadcast when a stop or an early wake is requested.
+ */
+static pthread_mutex_t g_helper_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_helper_wait_cond = PTHREAD_COND_INITIALIZER;
+
+static void helper_wait_broadcast(void) {
+    pthread_mutex_lock(&g_helper_wait_lock);
+    pthread_cond_broadcast(&g_helper_wait_cond);
+    pthread_mutex_unlock(&g_helper_wait_lock);
+}
+
+static void helper_wait_until(double seconds, int (*ready)(void *), void *arg) {
+    struct timespec deadline;
+    long nsec;
+    int rc = 0;
+
+    if (ready(arg)) return;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)seconds;
+    nsec = deadline.tv_nsec + (long)((seconds - (double)(time_t)seconds) * 1e9);
+    if (nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        nsec -= 1000000000L;
+    }
+    deadline.tv_nsec = nsec;
+
+    pthread_mutex_lock(&g_helper_wait_lock);
+    while (!ready(arg) && rc != ETIMEDOUT)
+        rc = pthread_cond_timedwait(&g_helper_wait_cond, &g_helper_wait_lock, &deadline);
+    pthread_mutex_unlock(&g_helper_wait_lock);
+}
+
+static int memlog_stop_ready(void *arg) {
+    const memlog_shared_t *ml = (const memlog_shared_t *)arg;
+
+    return atomic_load_explicit(&ml->stop, memory_order_acquire) != 0;
+}
+
+static void memlog_wait_interval(memlog_shared_t *ml) {
+    helper_wait_until((double)MEMLOG_INTERVAL_SEC, memlog_stop_ready, ml);
+}
+
 static void memlog_shutdown(memlog_shared_t *ml, pthread_t *tid, int *started) {
     if (!started || !*started || !ml) return;
     atomic_store_explicit(&ml->stop, 1, memory_order_release);
+    helper_wait_broadcast();
     pthread_join(*tid, NULL);
     if (ml->fp) {
         fclose(ml->fp);
         ml->fp = NULL;
     }
     *started = 0;
-}
-
-/* Sleep up to MEMLOG_INTERVAL_SEC in 100ms slices so a stop request is seen
- * within ~100ms instead of blocking memlog_shutdown()'s join for a whole
- * interval. A single sleep(MEMLOG_INTERVAL_SEC) added 0..MEMLOG_INTERVAL_SEC
- * of pure idle wall time to every --make run (the whole runtime for small
- * indexes). */
-static void memlog_wait_interval(memlog_shared_t *ml) {
-    int i;
-    struct timespec sl;
-
-    sl.tv_sec = 0;
-    sl.tv_nsec = 100000000L; /* 100ms */
-    for (i = 0; i < MEMLOG_INTERVAL_SEC * 10; i++) {
-        if (atomic_load_explicit(&ml->stop, memory_order_acquire)) return;
-        (void)nanosleep(&sl, NULL);
-    }
 }
 
 static void *memlog_thread_main(void *arg) {
@@ -1588,18 +1794,26 @@ static void *memlog_thread_main(void *arg) {
     return NULL;
 }
 
+static int stats_cycle_ready(void *arg) {
+    index_run_stats_t *rs = (index_run_stats_t *)arg;
+
+    if (atomic_load(&rs->stop_stats)) return 1;
+    return atomic_exchange_explicit(&rs->stats_wake, 0, memory_order_relaxed) != 0;
+}
+
 /* ~1s between status lines, but wake early when main signals (e.g. index phase just started). */
 static void stats_wait_cycle(index_run_stats_t *rs) {
-    int i;
-    struct timespec sl;
+    helper_wait_until(1.0, stats_cycle_ready, rs);
+}
 
-    sl.tv_sec = 0;
-    sl.tv_nsec = 100000000L; /* 100ms slices so stats_wake is seen within ~100ms */
+static void index_stats_stop_request(index_run_stats_t *rs) {
+    atomic_store(&rs->stop_stats, 1);
+    helper_wait_broadcast();
+}
 
-    for (i = 0; i < 10 && !atomic_load(&rs->stop_stats); i++) {
-        if (atomic_exchange_explicit(&rs->stats_wake, 0, memory_order_relaxed)) return;
-        (void)nanosleep(&sl, NULL);
-    }
+static void index_stats_wake_request(index_run_stats_t *rs) {
+    atomic_store_explicit(&rs->stats_wake, 1, memory_order_relaxed);
+    helper_wait_broadcast();
 }
 
 static void *stats_thread_main(void *arg) {
@@ -2442,6 +2656,28 @@ static void parallel_radix_sort_trigram_records(trigram_record_t *records, size_
 #define MERGE_POSTINGS_FLUSH_BYTES ((size_t)1 << 20)
 
 /*
+ * tri_postings.bin compression. A posting list is delta-varints, which zstd still shrinks by a good margin
+ * because the byte histogram is heavily skewed towards small deltas. Two things stop that from being a
+ * plain "one frame per list":
+ *
+ *  - The hottest trigrams on a billion-path corpus have posting lists in the hundreds of MiB, and a merge
+ *    worker cannot hold a whole list in RAM just to compress it. So a large list is written as a sequence
+ *    of independently-decodable chunks of at most POSTINGS_CHUNK_RAW raw varint bytes.
+ *  - Most trigrams have a handful of postings, where a chunk header plus a zstd frame costs more than the
+ *    payload. So a list that fits in POSTINGS_GROUP_RAW_MAX stays bare varints with no header at all.
+ *
+ * Which of the two a list uses is recorded in the (previously unused) trigram_key_t.reserved field.
+ * postings_offset/postings_bytes still delimit one contiguous span, so merge_stitch_segments can keep
+ * concatenating segment files and rebasing offsets without knowing any of this.
+ */
+#define POSTINGS_CHUNK_RAW ((size_t)128 * 1024)
+#define POSTINGS_GROUP_RAW_MAX ((size_t)512)
+#define POSTINGS_CHUNK_HDR 9 /* u32 raw_len, u32 stored_len, u8 stored_is_zstd */
+
+#define POSTINGS_ENC_RAW 0U    /* span is bare delta-varints */
+#define POSTINGS_ENC_CHUNKED 1U /* span is a sequence of POSTINGS_CHUNK_HDR-prefixed chunks */
+
+/*
  * Streaming postings encoder. Fed a globally (trigram, path_id)-ascending stream one record at a time, it
  * groups by trigram, drops consecutive duplicate path_ids, delta-varint-encodes the postings, and writes a
  * trigram_key_t per group. Driving the encoding through one emit() lets both the flat-array writer and the
@@ -2450,16 +2686,30 @@ static void parallel_radix_sort_trigram_records(trigram_record_t *records, size_
 typedef struct {
     FILE *keys_fp;
     FILE *postings_fp;
-    unsigned char *pbuf;
+    unsigned char *pbuf; /* output coalescing buffer, flushed to postings_fp in MiB units */
     size_t plen;
-    uint64_t postings_pos;
+    unsigned char *rawbuf; /* varints of the current chunk, not yet compressed */
+    size_t rawlen;
+    unsigned char *compbuf;
+    size_t compcap;
+    ZSTD_CCtx *cctx;
+    uint64_t postings_pos; /* byte offset in postings_fp, including bytes still sitting in pbuf */
     uint64_t unique;
     uint32_t cur_trigram;
     uint64_t group_offset;
     uint64_t prev;      /* last path_id encoded in the current group (0 => none yet) */
     uint64_t last_path; /* dedup of consecutive equal path_ids within a group */
     int have_group;
+    int group_chunked; /* set once the current group has spilled at least one chunk */
 } postings_enc_t;
+
+static void pe_destroy(postings_enc_t *pe) {
+    free(pe->pbuf);
+    free(pe->rawbuf);
+    free(pe->compbuf);
+    if (pe->cctx) ZSTD_freeCCtx(pe->cctx);
+    memset(pe, 0, sizeof(*pe));
+}
 
 static int pe_init(postings_enc_t *pe, FILE *keys_fp, FILE *postings_fp) {
     memset(pe, 0, sizeof(*pe));
@@ -2467,17 +2717,77 @@ static int pe_init(postings_enc_t *pe, FILE *keys_fp, FILE *postings_fp) {
     pe->postings_fp = postings_fp;
     pe->postings_pos = (uint64_t)ftello(postings_fp);
     pe->last_path = UINT64_MAX;
+    pe->compcap = ZSTD_compressBound(POSTINGS_CHUNK_RAW);
     pe->pbuf = (unsigned char *)malloc(MERGE_POSTINGS_FLUSH_BYTES);
-    return pe->pbuf ? 0 : -1;
+    /* Room for one more max-length varint past the chunk target, so pe_emit can append then check. */
+    pe->rawbuf = (unsigned char *)malloc(POSTINGS_CHUNK_RAW + 16);
+    pe->compbuf = (unsigned char *)malloc(pe->compcap);
+    pe->cctx = ZSTD_createCCtx();
+    if (!pe->pbuf || !pe->rawbuf || !pe->compbuf || !pe->cctx) {
+        pe_destroy(pe);
+        return -1;
+    }
+    return 0;
 }
 
-/* Write the key for the group that just ended (postings_bytes is now known). */
+/* Append to the coalescing buffer and advance the logical file position. */
+static int pe_out(postings_enc_t *pe, const void *src, size_t n) {
+    if (n == 0) return 0;
+    if (pe->plen + n > MERGE_POSTINGS_FLUSH_BYTES) {
+        if (pe->plen > 0 && mk_fwrite(pe->pbuf, 1, pe->plen, pe->postings_fp) != pe->plen) return -1;
+        pe->plen = 0;
+    }
+    if (n > MERGE_POSTINGS_FLUSH_BYTES) {
+        if (mk_fwrite(src, 1, n, pe->postings_fp) != n) return -1;
+    } else {
+        memcpy(pe->pbuf + pe->plen, src, n);
+        pe->plen += n;
+    }
+    pe->postings_pos += (uint64_t)n;
+    return 0;
+}
+
+/* Emit rawbuf as one independently-decodable chunk and switch the group to the chunked layout. */
+static int pe_flush_chunk(postings_enc_t *pe) {
+    unsigned char hdr[POSTINGS_CHUNK_HDR];
+    const unsigned char *payload;
+    uint32_t raw_len, stored_len;
+    size_t clen;
+
+    if (pe->rawlen == 0) return 0;
+    raw_len = (uint32_t)pe->rawlen;
+    clen = ZSTD_compressCCtx(pe->cctx, pe->compbuf, pe->compcap, pe->rawbuf, pe->rawlen, durable_zstd_level());
+    if (!ZSTD_isError(clen) && clen < pe->rawlen) {
+        payload = pe->compbuf;
+        stored_len = (uint32_t)clen;
+        hdr[8] = 1;
+    } else {
+        payload = pe->rawbuf;
+        stored_len = raw_len;
+        hdr[8] = 0;
+    }
+    memcpy(hdr, &raw_len, sizeof(raw_len));
+    memcpy(hdr + 4, &stored_len, sizeof(stored_len));
+    if (pe_out(pe, hdr, sizeof(hdr)) != 0) return -1;
+    if (pe_out(pe, payload, stored_len) != 0) return -1;
+    pe->rawlen = 0;
+    pe->group_chunked = 1;
+    return 0;
+}
+
+/* Write the group's payload and its key (postings_bytes is only known once the payload is out). */
 static int pe_close_group(postings_enc_t *pe) {
     trigram_key_t key;
 
     if (!pe->have_group) return 0;
+    if (!pe->group_chunked && pe->rawlen <= POSTINGS_GROUP_RAW_MAX) {
+        if (pe_out(pe, pe->rawbuf, pe->rawlen) != 0) return -1;
+        pe->rawlen = 0;
+    } else if (pe_flush_chunk(pe) != 0) {
+        return -1;
+    }
     key.trigram = pe->cur_trigram;
-    key.reserved = 0;
+    key.reserved = pe->group_chunked ? POSTINGS_ENC_CHUNKED : POSTINGS_ENC_RAW;
     key.postings_offset = pe->group_offset;
     key.postings_bytes = pe->postings_pos - pe->group_offset;
     if (mk_fwrite(&key, sizeof(key), 1, pe->keys_fp) != 1) return -1;
@@ -2496,21 +2806,18 @@ static int pe_emit(postings_enc_t *pe, uint32_t trigram, uint64_t path_id) {
         pe->prev = 0;
         pe->last_path = UINT64_MAX;
         pe->have_group = 1;
+        pe->group_chunked = 0;
+        pe->rawlen = 0;
     }
     if (path_id == pe->last_path) return 0;
     v = (pe->prev == 0) ? (path_id + 1U) : (path_id - pe->prev);
-    /* A single varint is at most 10 bytes; flush before it can overflow the buffer. */
-    if (pe->plen + 10 > MERGE_POSTINGS_FLUSH_BYTES) {
-        if (mk_fwrite(pe->pbuf, 1, pe->plen, pe->postings_fp) != pe->plen) return -1;
-        pe->plen = 0;
-    }
     while (v >= 0x80U) {
-        pe->pbuf[pe->plen++] = (unsigned char)((v & 0x7FU) | 0x80U);
+        pe->rawbuf[pe->rawlen++] = (unsigned char)((v & 0x7FU) | 0x80U);
         v >>= 7;
-        pe->postings_pos++;
     }
-    pe->pbuf[pe->plen++] = (unsigned char)v;
-    pe->postings_pos++;
+    pe->rawbuf[pe->rawlen++] = (unsigned char)v;
+    /* rawbuf has 16 bytes of slack past the target, so the overflow check can follow the append. */
+    if (pe->rawlen >= POSTINGS_CHUNK_RAW && pe_flush_chunk(pe) != 0) return -1;
     pe->prev = path_id;
     pe->last_path = path_id;
     return 0;
@@ -2519,6 +2826,7 @@ static int pe_emit(postings_enc_t *pe, uint32_t trigram, uint64_t path_id) {
 static int pe_finish(postings_enc_t *pe, uint64_t *unique_out) {
     if (pe_close_group(pe) != 0) return -1;
     if (pe->plen > 0 && mk_fwrite(pe->pbuf, 1, pe->plen, pe->postings_fp) != pe->plen) return -1;
+    pe->plen = 0;
     *unique_out = pe->unique;
     return 0;
 }
@@ -2538,7 +2846,7 @@ static int write_sorted_bucket_records(FILE *keys_fp, FILE *postings_fp, trigram
     rc = 0;
 
 out:
-    free(pe.pbuf);
+    pe_destroy(&pe);
     return rc;
 }
 
@@ -2627,7 +2935,7 @@ static int merge_kway_write_bucket(FILE *keys_fp, FILE *postings_fp, const trigr
     rc = 0;
 
 out:
-    free(pe.pbuf);
+    pe_destroy(&pe);
     free(heap);
     return rc;
 }
@@ -2685,6 +2993,60 @@ static void insertion_sort_u32(uint32_t *a, size_t n) {
     }
 }
 
+/*
+ * Longest input this can take on the stack. A path yields fewer trigram codes than it has bytes,
+ * so PATH_MAX rounded up covers every real input; anything larger falls back to qsort.
+ */
+#define RADIX_U32_MAX_N 4096
+
+/*
+ * LSD radix over the code bytes. glibc's qsort costs an indirect call per comparison plus a temp
+ * allocation, and this runs once per path — 8.3% of the badge run sat in msort_with_tmp. All four
+ * digit histograms come from a single counting pass, and a digit whose byte is the same in every
+ * key is skipped, so 24-bit trigram codes cost three scatter passes rather than four.
+ */
+static void radix_sort_u32(uint32_t *a, size_t n) {
+    uint32_t scratch[RADIX_U32_MAX_N];
+    size_t count[4][256];
+    uint32_t *src = a;
+    uint32_t *dst = scratch;
+    size_t i;
+    int pass;
+
+    memset(count, 0, sizeof(count));
+    for (i = 0; i < n; i++) {
+        uint32_t v = a[i];
+
+        count[0][v & 0xFFU]++;
+        count[1][(v >> 8) & 0xFFU]++;
+        count[2][(v >> 16) & 0xFFU]++;
+        count[3][(v >> 24) & 0xFFU]++;
+    }
+
+    for (pass = 0; pass < 4; pass++) {
+        unsigned shift = (unsigned)pass * 8U;
+        size_t off[256];
+        size_t acc = 0;
+        int d;
+
+        /* A permutation does not change the multiset, so the counts stay valid across passes. */
+        if (count[pass][(a[0] >> shift) & 0xFFU] == n) continue;
+
+        for (d = 0; d < 256; d++) {
+            off[d] = acc;
+            acc += count[pass][d];
+        }
+        for (i = 0; i < n; i++) dst[off[(src[i] >> shift) & 0xFFU]++] = src[i];
+        {
+            uint32_t *sw = src;
+
+            src = dst;
+            dst = sw;
+        }
+    }
+    if (src != a) memcpy(a, src, n * sizeof(*a));
+}
+
 static void sort_codes_unique(uint32_t *codes, size_t *count) {
     size_t n = *count;
     size_t w;
@@ -2693,6 +3055,8 @@ static void sort_codes_unique(uint32_t *codes, size_t *count) {
     if (n <= 1) return;
     if (n <= 64U)
         insertion_sort_u32(codes, n);
+    else if (n <= (size_t)RADIX_U32_MAX_N)
+        radix_sort_u32(codes, n);
     else
         qsort(codes, n, sizeof(*codes), cmp_u32);
 
@@ -2948,7 +3312,7 @@ static trigram_record_t *tw_ensure_sort_buf(size_t n) {
     return tw_sort_buf;
 }
 
-/* Compress + write the records pending in tw_worker_buf[ix] as one zstd frame; reset the buffer. */
+/* Encode + write the records pending in tw_worker_buf[ix] as one frame; reset the buffer. */
 static int tw_worker_flush_locked(build_ctx_t *ctx, size_t ix) {
     FILE *fp;
 
@@ -3102,7 +3466,7 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
 
     ctx->tw_worker_lru_age[ix] = ++ctx->tw_worker_lru_next_tick[worker_id];
 
-    /* Accumulate records into the per-shard buffer; flush one zstd frame each time it fills. */
+    /* Accumulate records into the per-shard buffer; flush one frame each time it fills. */
     while (n > 0) {
         size_t space = (size_t)TRIGRAM_TMP_FRAME_RECORDS - ctx->tw_worker_buf_n[ix];
         size_t take = n < space ? n : space;
@@ -3162,15 +3526,144 @@ static int stage_path_offset(build_ctx_t *ctx, uint64_t offset) {
     return 0;
 }
 
+static void paths_writer_free(build_ctx_t *ctx) {
+    free(ctx->paths_chunk);
+    ctx->paths_chunk = NULL;
+    free(ctx->paths_comp);
+    ctx->paths_comp = NULL;
+    free(ctx->paths_table);
+    ctx->paths_table = NULL;
+    if (ctx->paths_cctx) {
+        ZSTD_freeCCtx(ctx->paths_cctx);
+        ctx->paths_cctx = NULL;
+    }
+}
+
+/* Reserve the header; frames and the chunk table are appended after it as the run proceeds. */
+static int paths_writer_open(build_ctx_t *ctx) {
+    unsigned char hdr[PATHS_HDR_BYTES];
+
+    ctx->paths_comp_cap = ZSTD_compressBound(PATHS_CHUNK_RAW);
+    ctx->paths_chunk = (unsigned char *)malloc(PATHS_CHUNK_RAW);
+    ctx->paths_comp = (unsigned char *)malloc(ctx->paths_comp_cap);
+    ctx->paths_cctx = ZSTD_createCCtx();
+    if (!ctx->paths_chunk || !ctx->paths_comp || !ctx->paths_cctx) {
+        fprintf(stderr, "ereport_index: alloc paths.bin writer state\n");
+        paths_writer_free(ctx);
+        return -1;
+    }
+
+    memset(hdr, 0, sizeof(hdr));
+    if (mk_fwrite(hdr, 1, sizeof(hdr), ctx->paths_fp) != sizeof(hdr)) {
+        fprintf(stderr, "ereport_index: fwrite paths.bin header: %s\n", strerror(errno));
+        paths_writer_free(ctx);
+        return -1;
+    }
+    ctx->paths_file_pos = PATHS_HDR_BYTES;
+    return 0;
+}
+
+static int paths_table_push(build_ctx_t *ctx, const paths_chunk_ent_t *ent) {
+    if (ctx->paths_table_n == ctx->paths_table_cap) {
+        size_t cap = ctx->paths_table_cap ? ctx->paths_table_cap * 2 : 1024;
+        paths_chunk_ent_t *p = (paths_chunk_ent_t *)realloc(ctx->paths_table, cap * sizeof(*p));
+
+        if (!p) return -1;
+        ctx->paths_table = p;
+        ctx->paths_table_cap = cap;
+    }
+    ctx->paths_table[ctx->paths_table_n++] = *ent;
+    return 0;
+}
+
+static int paths_flush_chunk(build_ctx_t *ctx) {
+    paths_chunk_ent_t ent;
+    const unsigned char *payload;
+    size_t clen;
+
+    if (ctx->paths_chunk_len == 0) return 0;
+    clen = ZSTD_compressCCtx(ctx->paths_cctx, ctx->paths_comp, ctx->paths_comp_cap, ctx->paths_chunk,
+                             ctx->paths_chunk_len, durable_zstd_level());
+    if (!ZSTD_isError(clen) && clen < ctx->paths_chunk_len) {
+        payload = ctx->paths_comp;
+    } else {
+        payload = ctx->paths_chunk;
+        clen = ctx->paths_chunk_len;
+    }
+
+    ent.logical_start = ctx->paths_chunk_logical;
+    ent.file_off = ctx->paths_file_pos;
+    ent.stored_len = (uint32_t)clen;
+    ent.raw_len = (uint32_t)ctx->paths_chunk_len;
+    if (paths_table_push(ctx, &ent) != 0) {
+        fprintf(stderr, "ereport_index: alloc paths.bin chunk table\n");
+        return -1;
+    }
+    if (mk_fwrite(payload, 1, clen, ctx->paths_fp) != clen) {
+        fprintf(stderr, "ereport_index: fwrite paths.bin: %s\n", strerror(errno));
+        return -1;
+    }
+    ctx->paths_file_pos += (uint64_t)clen;
+    ctx->paths_chunk_len = 0;
+    return 0;
+}
+
+/* Add bytes that live at `logical_off` in the uncompressed stream, cutting a chunk if they do not fit. */
+static int paths_append_chunked(build_ctx_t *ctx, const void *bytes, size_t n, uint64_t logical_off) {
+    if (n > PATHS_CHUNK_RAW) {
+        fprintf(stderr, "ereport_index: path of %zu bytes exceeds the paths.bin chunk size\n", n);
+        return -1;
+    }
+    if (ctx->paths_chunk_len > 0 && ctx->paths_chunk_len + n > PATHS_CHUNK_RAW && paths_flush_chunk(ctx) != 0) return -1;
+    if (ctx->paths_chunk_len == 0) ctx->paths_chunk_logical = logical_off;
+    memcpy(ctx->paths_chunk + ctx->paths_chunk_len, bytes, n);
+    ctx->paths_chunk_len += n;
+    return 0;
+}
+
 static int append_paths_only(build_ctx_t *ctx, const char *path) {
     size_t need = strlen(path) + 1;
 
     if (stage_path_offset(ctx, ctx->paths_pos) != 0) return -1;
-    if (mk_fwrite(path, 1, need, ctx->paths_fp) != need) {
-        fprintf(stderr, "ereport_index: fwrite paths.bin: %s\n", strerror(errno));
+    if (paths_append_chunked(ctx, path, need, ctx->paths_pos) != 0) return -1;
+    ctx->paths_pos += (uint64_t)need;
+    return 0;
+}
+
+/* Flush the tail chunk, append the chunk table, then patch the reserved header now that both are known. */
+static int paths_writer_close(build_ctx_t *ctx) {
+    unsigned char hdr[PATHS_HDR_BYTES];
+    uint64_t table_offset;
+    uint32_t v32;
+    uint64_t v64;
+    size_t table_bytes;
+
+    if (paths_flush_chunk(ctx) != 0) return -1;
+
+    table_offset = ctx->paths_file_pos;
+    table_bytes = ctx->paths_table_n * sizeof(*ctx->paths_table);
+    if (table_bytes > 0 && mk_fwrite(ctx->paths_table, 1, table_bytes, ctx->paths_fp) != table_bytes) {
+        fprintf(stderr, "ereport_index: fwrite paths.bin chunk table: %s\n", strerror(errno));
         return -1;
     }
-    ctx->paths_pos += (uint64_t)need;
+    ctx->paths_file_pos += (uint64_t)table_bytes;
+
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, PATHS_MAGIC, sizeof(PATHS_MAGIC));
+    v32 = PATHS_FORMAT_VERSION;
+    memcpy(hdr + 8, &v32, sizeof(v32));
+    v32 = (uint32_t)durable_zstd_level();
+    memcpy(hdr + 12, &v32, sizeof(v32));
+    v64 = (uint64_t)ctx->paths_table_n;
+    memcpy(hdr + 16, &v64, sizeof(v64));
+    memcpy(hdr + 24, &table_offset, sizeof(table_offset));
+    memcpy(hdr + 32, &ctx->paths_pos, sizeof(ctx->paths_pos));
+
+    if (fflush(ctx->paths_fp) != 0 || fseeko(ctx->paths_fp, 0, SEEK_SET) != 0 ||
+        mk_fwrite(hdr, 1, sizeof(hdr), ctx->paths_fp) != sizeof(hdr) || fflush(ctx->paths_fp) != 0) {
+        fprintf(stderr, "ereport_index: rewrite paths.bin header: %s\n", strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -3415,28 +3908,28 @@ static int index_attach_shard_catalog(file_state_t *fs, const char *path) {
     crawl_bin_catalog_init_empty(cat);
 
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) goto fail;
-    fp = mk_fopen(path, "rb");
+    fp = ei_shard_fopen(path, "rb");
     if (!fp) goto fail;
     if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) {
-        mk_fclose(fp);
+        ei_shard_fclose(fp);
         goto fail;
     }
     if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) {
-        mk_fclose(fp);
+        ei_shard_fclose(fp);
         errno = EINVAL;
         goto fail;
     }
     if (fh.catalog_offset == 0ULL || fh.catalog_offset > (uint64_t)st.st_size) {
-        mk_fclose(fp);
+        ei_shard_fclose(fp);
         errno = EINVAL;
         goto fail;
     }
     /* The trigram index is built from paths alone; no rollup is consulted. */
     if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size, 0U, cat) != 0) {
-        mk_fclose(fp);
+        ei_shard_fclose(fp);
         goto fail;
     }
-    mk_fclose(fp);
+    ei_shard_fclose(fp);
     fs->catalog = cat;
     return 0;
 
@@ -3459,15 +3952,13 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     crawl_bin_block_reader_t br;
     memset(&br, 0, sizeof(br));
 
-    fp = mk_fopen(chunk->path, "rb");
+    fp = ei_shard_fopen(chunk->path, "rb");
     if (!fp) {
         fprintf(stderr, "warn: cannot open %s: %s\n", chunk->path, strerror(errno));
         atomic_fetch_add(&rs->bad_input_files, 1U);
         return -1;
     }
-
-    if (setvbuf(fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
-    }
+    /* Buffering is applied by the handle cache on the real open; a reused stream already has it. */
 
     {
         crawl_bin_chunk_stdio_t bio;
@@ -3596,7 +4087,7 @@ out:
     crawl_bin_block_reader_free(&br);
     if (scanned_local > scanned_published)
         atomic_fetch_add_explicit(&rs->scanned_records, scanned_local - scanned_published, memory_order_relaxed);
-    mk_fclose(fp);
+    ei_shard_fclose(fp);
     if (batch) {
         if (write_queue_push(write_queue, batch) != 0) {
             atomic_fetch_add(&rs->bad_input_files, 1U);
@@ -3637,15 +4128,38 @@ static int write_final_path_offset(build_ctx_t *ctx) {
     return flush_path_offsets(ctx);
 }
 
+/* paths.bin is authoritative for the level it was written at, so meta.txt just mirrors the header.
+ * That matters for --resume-merge, which rewrites meta.txt beside a paths.bin it did not create. */
+static uint32_t meta_read_paths_level(const char *index_dir) {
+    char path[PATH_MAX];
+    unsigned char hdr[PATHS_HDR_BYTES];
+    FILE *fp;
+    uint32_t level = 0;
+
+    if (build_path(path, sizeof(path), index_dir, "paths.bin") != 0) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+    if (fread(hdr, 1, sizeof(hdr), fp) == sizeof(hdr) && memcmp(hdr, PATHS_MAGIC, sizeof(PATHS_MAGIC)) == 0)
+        memcpy(&level, hdr + 12, sizeof(level));
+    fclose(fp);
+    return level;
+}
+
 static int write_meta_file(const build_ctx_t *ctx) {
     char path[PATH_MAX];
     FILE *fp;
+    uint32_t paths_level;
 
     if (build_path(path, sizeof(path), ctx->index_dir, "meta.txt") != 0) return -1;
     fp = mk_fopen(path, "w");
     if (!fp) return -1;
 
+    paths_level = meta_read_paths_level(ctx->index_dir);
+
     fprintf(fp, "ereport_index_version=%d\n", INDEX_VERSION);
+    fprintf(fp, "paths_comp=zstd_blocks\n");
+    fprintf(fp, "postings_comp=zstd_framed\n");
+    fprintf(fp, "zstd_level=%u\n", paths_level ? paths_level : (uint32_t)durable_zstd_level());
     fprintf(fp, "user=%s\n", ctx->display_name);
     fprintf(fp, "aggregate_all_users=%d\n", ctx->aggregate_all_users ? 1 : 0);
     fprintf(fp, "uid=%lu\n", (unsigned long)ctx->target_uid);
@@ -3722,7 +4236,7 @@ shards:
 
 /*
  * Load legacy single-file tmp_trigrams_%04u.bin (if present) plus all tmp_trigrams_%04u_w%04u.bin shards into
- * one buffer. Every tmp file is EITG0001 zstd-framed; records are decompressed and concatenated, then the
+ * one buffer. Every tmp file is EITG0002 delta-varint framed; records are decoded and concatenated, then the
  * caller's radix sort fixes global order.
  */
 static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_loaded_bucket_t *out) {
@@ -3897,8 +4411,8 @@ static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_
     return nb;
 }
 
-/* Sum of *decompressed* trigram-record bytes a bucket's tmp files expand to in RAM (n_records × 12),
- * read cheaply from the zstd frame headers (no decompression). This — not the compressed on-disk size —
+/* Sum of *decoded* trigram-record bytes a bucket's tmp files expand to in RAM (n_records × 12),
+ * read cheaply from the frame headers (no decoding). This — not the encoded on-disk size —
  * is what a merge worker actually allocates: merge_load_bucket_tmp_files mallocs this many bytes for the
  * records buffer and merge_bucket_to_segment_files mallocs an equal-size radix aux buffer (≈2× this). */
 static uint64_t bucket_tmp_files_decompressed_bytes(build_ctx_t *ctx, uint32_t bucket) {
@@ -4121,6 +4635,12 @@ static void merge_init_thread_budget(build_ctx_t *ctx, long ncpu_real) {
      * reading) and *lowers* throughput (489→421 MB/s, merge 2414→2806 s). Opt in with
      * EREPORT_INDEX_MERGE_SORT_THREADS>1 only when the merge is CPU-bound (e.g. fast local NVMe where
      * read bandwidth is not the limit). The parallel sort path is verified byte-identical to serial.
+     *
+     * Remeasured on node-local NVMe (single_huge_dir, 64 cores): merge_phase_sec 0.696 serial, 0.469 at
+     * 4 threads, 0.329 at 16 — the opposite sign to the 953M-path build above, because that fixture is
+     * small enough to be sort-bound. Left off by default: the workload it would speed up is the one that
+     * does not need it. Raising the worker pool instead (EREPORT_INDEX_MERGE_WORKERS=32/64) did not help
+     * either fixture (0.840 / 0.701 s), so MERGE_MAX_WORKERS stays at 16.
      */
     long maxt = 1;
     const char *e = getenv("EREPORT_INDEX_MERGE_SORT_THREADS");
@@ -4142,6 +4662,29 @@ static void merge_init_thread_budget(build_ctx_t *ctx, long ncpu_real) {
 
 static void merge_destroy_thread_budget(build_ctx_t *ctx) {
     pthread_mutex_destroy(&ctx->merge_thr_mu);
+}
+
+/*
+ * Merge worker pool size: online CPUs, capped at MERGE_MAX_WORKERS. The cap is not about CPU —
+ * each worker holds a bucket's records in anon RAM — so raising it only helps where admission
+ * control has budget to spare. Overridable with EREPORT_INDEX_MERGE_WORKERS for measurement;
+ * the RAM budget still gates how many of them run at once.
+ */
+static int merge_worker_cap(void) {
+    const char *e = getenv("EREPORT_INDEX_MERGE_WORKERS");
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long cap = MERGE_MAX_WORKERS;
+
+    if (e && *e) {
+        char *end;
+        long v;
+
+        errno = 0;
+        v = strtol(e, &end, 10);
+        if (!errno && end != e && !*end && v >= 1 && v <= 4096) cap = v;
+    }
+    if (ncpu < 1) ncpu = 4;
+    return (int)(ncpu > cap ? cap : ncpu);
 }
 
 /* Borrow up to `want` idle CPU threads from the shared merge budget; returns the number granted. */
@@ -4630,9 +5173,7 @@ static int process_trigram_buckets_resume(build_ctx_t *ctx) {
      * merge_parallel_worker), so the single largest bucket no longer pins the pool to one worker. */
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
-    ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 1) ncpu = 4;
-    if (ncpu > MERGE_MAX_WORKERS) ncpu = MERGE_MAX_WORKERS;
+    ncpu = merge_worker_cap();
     if (n_need == 0) {
         merge_workers = 1;
     } else {
@@ -4796,6 +5337,13 @@ static int resume_merge_index_dir(const char *index_dir) {
         fprintf(stderr, "ereport_index: missing %s (need completed index phase before resume-merge)\n", off_p);
         return 1;
     }
+    /* The merge only rewrites tri_*, so paths.bin has to already be in the format this build reads. */
+    {
+        paths_index_t pi;
+
+        if (paths_index_open(paths_p, &pi) != 0) return 1;
+        paths_index_close(&pi);
+    }
 
     ipc = path_offsets_indexed_path_count(ctx.index_dir);
     ctx.indexed_paths = ipc;
@@ -4906,9 +5454,7 @@ static int process_trigram_buckets(build_ctx_t *ctx) {
      * worker pool is no longer pinned to the single largest bucket, which serialized the whole merge). */
     ctx->merge_parallel_budget_bytes = merge_parallel_ram_budget_bytes();
 
-    ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    if (ncpu < 1) ncpu = 4;
-    if (ncpu > MERGE_MAX_WORKERS) ncpu = MERGE_MAX_WORKERS;
+    ncpu = merge_worker_cap();
     merge_workers = (int)ncpu;
     if ((size_t)merge_workers > nbuckets) merge_workers = (int)nbuckets;
     if (nbuckets < (size_t)MERGE_PARALLEL_MIN) merge_workers = 1;
@@ -5233,7 +5779,7 @@ static int build_index_dir(const char *user_spec,
         prep_tids = (pthread_t *)calloc((size_t)prep_threads, sizeof(*prep_tids));
         if (!prep_tids) {
             fprintf(stderr, "allocation failed\n");
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5251,7 +5797,7 @@ static int build_index_dir(const char *user_spec,
             if (pthread_create(&prep_tids[i], NULL, chunk_prep_worker_main, &pool) != 0) {
                 size_t j;
                 fprintf(stderr, "failed to create chunk-prep thread\n");
-                atomic_store(&run_stats.stop_stats, 1);
+                index_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -5297,7 +5843,7 @@ static int build_index_dir(const char *user_spec,
             merged = (file_chunk_t *)malloc(chunk_count * sizeof(file_chunk_t));
             if (!merged) {
                 fprintf(stderr, "allocation failed\n");
-                atomic_store(&run_stats.stop_stats, 1);
+                index_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -5350,7 +5896,7 @@ static int build_index_dir(const char *user_spec,
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", dirs_label);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5367,7 +5913,7 @@ static int build_index_dir(const char *user_spec,
         if (index_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
             fprintf(stderr, "ereport_index: cannot load directory catalog from %s\n", paths[i]);
             if (stats_thread_started) {
-                atomic_store(&run_stats.stop_stats, 1);
+                index_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -5384,7 +5930,7 @@ static int build_index_dir(const char *user_spec,
     if ((!index_dir_override || index_dir_override[0] == '\0') && ensure_dir_recursive(sanitized_name) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", sanitized_name, strerror(errno));
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5399,7 +5945,7 @@ static int build_index_dir(const char *user_spec,
     if (ensure_dir_recursive(ctx.index_dir) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", ctx.index_dir, strerror(errno));
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5417,7 +5963,7 @@ static int build_index_dir(const char *user_spec,
     if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
         build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0) {
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5436,10 +5982,14 @@ static int build_index_dir(const char *user_spec,
     }
     if (ctx.path_offsets_fp && setvbuf(ctx.path_offsets_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
+    if (ctx.paths_fp && ctx.path_offsets_fp && paths_writer_open(&ctx) != 0) {
+        mk_fclose(ctx.paths_fp);
+        ctx.paths_fp = NULL;
+    }
     if (!ctx.paths_fp || !ctx.path_offsets_fp) {
         fprintf(stderr, "failed to initialize index outputs in %s\n", ctx.index_dir);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5457,7 +6007,7 @@ static int build_index_dir(const char *user_spec,
     if (parallel_bucket_io_init(&ctx, (uint32_t)trigram_threads) != 0) {
         fprintf(stderr, "ereport_index: failed to initialize parallel tmp_trigram I/O\n");
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5489,7 +6039,7 @@ static int build_index_dir(const char *user_spec,
                 chunk_count);
         fflush(stderr);
     }
-    atomic_store_explicit(&run_stats.stats_wake, 1, memory_order_relaxed);
+    index_stats_wake_request(&run_stats);
 
     queue.chunks = chunks;
     queue.count = chunk_count;
@@ -5513,7 +6063,7 @@ static int build_index_dir(const char *user_spec,
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5542,7 +6092,7 @@ static int build_index_dir(const char *user_spec,
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5573,7 +6123,7 @@ static int build_index_dir(const char *user_spec,
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5613,7 +6163,7 @@ static int build_index_dir(const char *user_spec,
             free(tids);
             free(args);
             if (stats_thread_started) {
-                atomic_store(&run_stats.stop_stats, 1);
+                index_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
@@ -5653,7 +6203,7 @@ static int build_index_dir(const char *user_spec,
         free(tids);
         free(args);
         if (stats_thread_started) {
-            atomic_store(&run_stats.stop_stats, 1);
+            index_stats_stop_request(&run_stats);
             pthread_join(stats_thread, NULL);
             clear_status_line();
             stats_thread_started = 0;
@@ -5723,7 +6273,7 @@ static int build_index_dir(const char *user_spec,
     }
 
     if (stats_thread_started) {
-        atomic_store(&run_stats.stop_stats, 1);
+        index_stats_stop_request(&run_stats);
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
@@ -5761,7 +6311,9 @@ static int build_index_dir(const char *user_spec,
         return 1;
     }
 
-    if (write_final_path_offset(&ctx) != 0 || mk_fclose(ctx.paths_fp) != 0 || mk_fclose(ctx.path_offsets_fp) != 0) {
+    if (write_final_path_offset(&ctx) != 0 || paths_writer_close(&ctx) != 0 || mk_fclose(ctx.paths_fp) != 0 ||
+        mk_fclose(ctx.path_offsets_fp) != 0) {
+        paths_writer_free(&ctx);
         fprintf(stderr, "failed to finalize paths in %s\n", ctx.index_dir);
         memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
         free(tids);
@@ -5785,6 +6337,8 @@ static int build_index_dir(const char *user_spec,
         parallel_bucket_io_shutdown(&ctx);
         return 1;
     }
+
+    paths_writer_free(&ctx);
 
     ctx.index_phase_sec = now_sec() - t0;
     ctx.index_workers_used = threads_used;
@@ -5982,45 +6536,99 @@ static int find_trigram_key(FILE *fp, uint64_t key_count, uint32_t trigram, trig
     return out->trigram == trigram ? 0 : 1;
 }
 
+/* Decode one run of delta-varints. `prev` carries across calls so a posting list split into chunks
+ * decodes exactly like the same list stored as one run. */
+static int decode_postings_run(const unsigned char *buf, size_t len, uint64_t *prev, u64_vec_t *vec) {
+    size_t pos = 0;
+
+    while (pos < len) {
+        uint64_t delta;
+        uint64_t path_id;
+
+        if (decode_varint_u64_buf(buf, len, &pos, &delta) != 0) return -1;
+        path_id = (*prev == 0) ? (delta - 1U) : (*prev + delta);
+        if (u64_vec_push(vec, path_id) != 0) return -1;
+        *prev = path_id;
+    }
+    return 0;
+}
+
 static int load_postings_list(FILE *postings_fp, const trigram_key_t *key, u64_vec_t *vec) {
     unsigned char *buf;
-    size_t pos = 0;
+    unsigned char *raw = NULL;
+    size_t raw_cap = 0;
+    size_t span = (size_t)key->postings_bytes;
     uint64_t prev = 0;
+    int rc = -1;
 
     memset(vec, 0, sizeof(*vec));
     if (key->postings_bytes == 0) return 0;
 
-    buf = (unsigned char *)malloc((size_t)key->postings_bytes);
+    buf = (unsigned char *)malloc(span);
     if (!buf) return -1;
     if (fseeko(postings_fp, (off_t)key->postings_offset, SEEK_SET) != 0 ||
-        fread(buf, 1, (size_t)key->postings_bytes, postings_fp) != (size_t)key->postings_bytes) {
+        fread(buf, 1, span, postings_fp) != span) {
         free(buf);
         return -1;
     }
 
-    while (pos < (size_t)key->postings_bytes) {
-        uint64_t delta;
-        uint64_t path_id;
-        if (decode_varint_u64_buf(buf, (size_t)key->postings_bytes, &pos, &delta) != 0) {
-            free(buf);
-            free(vec->ids);
-            vec->ids = NULL;
-            vec->count = vec->cap = 0;
-            return -1;
+    if (key->reserved == POSTINGS_ENC_RAW) {
+        rc = decode_postings_run(buf, span, &prev, vec);
+    } else if (key->reserved == POSTINGS_ENC_CHUNKED) {
+        size_t pos = 0;
+
+        rc = 0;
+        while (pos < span) {
+            uint32_t raw_len, stored_len;
+            unsigned char is_zstd;
+
+            if (span - pos < (size_t)POSTINGS_CHUNK_HDR) {
+                rc = -1;
+                break;
+            }
+            memcpy(&raw_len, buf + pos, sizeof(raw_len));
+            memcpy(&stored_len, buf + pos + 4, sizeof(stored_len));
+            is_zstd = buf[pos + 8];
+            pos += POSTINGS_CHUNK_HDR;
+            if (stored_len > span - pos) {
+                rc = -1;
+                break;
+            }
+            if (!is_zstd) {
+                if (stored_len != raw_len || decode_postings_run(buf + pos, raw_len, &prev, vec) != 0) {
+                    rc = -1;
+                    break;
+                }
+            } else {
+                size_t dlen;
+
+                if (raw_len > raw_cap) {
+                    unsigned char *p = (unsigned char *)realloc(raw, raw_len);
+                    if (!p) {
+                        rc = -1;
+                        break;
+                    }
+                    raw = p;
+                    raw_cap = raw_len;
+                }
+                dlen = ZSTD_decompress(raw, raw_cap, buf + pos, stored_len);
+                if (ZSTD_isError(dlen) || dlen != raw_len || decode_postings_run(raw, raw_len, &prev, vec) != 0) {
+                    rc = -1;
+                    break;
+                }
+            }
+            pos += stored_len;
         }
-        path_id = (prev == 0) ? (delta - 1U) : (prev + delta);
-        if (u64_vec_push(vec, path_id) != 0) {
-            free(buf);
-            free(vec->ids);
-            vec->ids = NULL;
-            vec->count = vec->cap = 0;
-            return -1;
-        }
-        prev = path_id;
     }
 
+    free(raw);
     free(buf);
-    return 0;
+    if (rc != 0) {
+        free(vec->ids);
+        vec->ids = NULL;
+        vec->count = vec->cap = 0;
+    }
+    return rc;
 }
 
 static int intersect_postings(const u64_vec_t *a, const u64_vec_t *b, u64_vec_t *out) {
@@ -6054,9 +6662,136 @@ static int read_path_offsets(FILE *fp, uint64_t path_id, uint64_t *off0, uint64_
     return 0;
 }
 
-static char *read_path_by_id(FILE *paths_fp, FILE *offsets_fp, uint64_t path_id) {
-    uint64_t off0, off1;
-    size_t len;
+static void paths_index_close(paths_index_t *pi) {
+    free(pi->table);
+    memset(pi, 0, sizeof(*pi));
+}
+
+static int paths_index_open(const char *paths_path, paths_index_t *pi) {
+    unsigned char hdr[PATHS_HDR_BYTES];
+    FILE *fp;
+    uint32_t version;
+    uint64_t table_offset;
+    size_t table_bytes;
+    uint64_t i;
+
+    memset(pi, 0, sizeof(*pi));
+    fp = fopen(paths_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "cannot open %s: %s\n", paths_path, strerror(errno));
+        return -1;
+    }
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || memcmp(hdr, PATHS_MAGIC, sizeof(PATHS_MAGIC)) != 0) {
+        fprintf(stderr, "%s is not an EPATH002 paths file; rebuild with 'ereport_index --make'\n", paths_path);
+        fclose(fp);
+        return -1;
+    }
+    memcpy(&version, hdr + 8, sizeof(version));
+    memcpy(&pi->chunk_count, hdr + 16, sizeof(pi->chunk_count));
+    memcpy(&table_offset, hdr + 24, sizeof(table_offset));
+    memcpy(&pi->total_logical, hdr + 32, sizeof(pi->total_logical));
+    if (version != PATHS_FORMAT_VERSION) {
+        fprintf(stderr, "%s has paths format version %u, expected %u; rebuild with 'ereport_index --make'\n",
+                paths_path, version, PATHS_FORMAT_VERSION);
+        fclose(fp);
+        return -1;
+    }
+
+    if (pi->chunk_count > 0) {
+        table_bytes = (size_t)pi->chunk_count * sizeof(*pi->table);
+        pi->table = (paths_chunk_ent_t *)malloc(table_bytes);
+        if (!pi->table || fseeko(fp, (off_t)table_offset, SEEK_SET) != 0 ||
+            fread(pi->table, 1, table_bytes, fp) != table_bytes) {
+            fprintf(stderr, "cannot read the paths chunk table in %s\n", paths_path);
+            fclose(fp);
+            paths_index_close(pi);
+            return -1;
+        }
+        for (i = 0; i < pi->chunk_count; i++) {
+            if (pi->table[i].raw_len > pi->max_raw) pi->max_raw = pi->table[i].raw_len;
+            if (pi->table[i].stored_len > pi->max_stored) pi->max_stored = pi->table[i].stored_len;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+/* Per-thread cursor over one paths.bin. Holding the last decompressed chunk matters because postings come
+ * back in path-id order, so a run of hits usually lands in the same chunk. */
+typedef struct {
+    FILE *fp;
+    const paths_index_t *pi;
+    ZSTD_DCtx *dctx;
+    unsigned char *raw;
+    unsigned char *stored;
+    uint64_t cached_chunk; /* UINT64_MAX when nothing is cached */
+} paths_reader_t;
+
+static void paths_reader_free(paths_reader_t *pr) {
+    free(pr->raw);
+    free(pr->stored);
+    if (pr->dctx) ZSTD_freeDCtx(pr->dctx);
+    memset(pr, 0, sizeof(*pr));
+}
+
+static int paths_reader_init(paths_reader_t *pr, FILE *fp, const paths_index_t *pi) {
+    memset(pr, 0, sizeof(*pr));
+    pr->fp = fp;
+    pr->pi = pi;
+    pr->cached_chunk = UINT64_MAX;
+    if (pi->chunk_count == 0) return 0;
+    pr->dctx = ZSTD_createDCtx();
+    pr->raw = (unsigned char *)malloc(pi->max_raw);
+    pr->stored = (unsigned char *)malloc(pi->max_stored);
+    if (!pr->dctx || !pr->raw || !pr->stored) {
+        paths_reader_free(pr);
+        return -1;
+    }
+    return 0;
+}
+
+/* Index of the chunk holding logical offset `off`, or chunk_count if there is none. */
+static uint64_t paths_find_chunk(const paths_index_t *pi, uint64_t off) {
+    uint64_t lo = 0, hi = pi->chunk_count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+
+        if (pi->table[mid].logical_start <= off) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return pi->chunk_count;
+    lo--;
+    if (off - pi->table[lo].logical_start >= pi->table[lo].raw_len) return pi->chunk_count;
+    return lo;
+}
+
+static int paths_reader_load_chunk(paths_reader_t *pr, uint64_t ci) {
+    const paths_chunk_ent_t *ent = &pr->pi->table[ci];
+
+    if (pr->cached_chunk == ci) return 0;
+    pr->cached_chunk = UINT64_MAX;
+    if (ent->stored_len == ent->raw_len) {
+        if (fseeko(pr->fp, (off_t)ent->file_off, SEEK_SET) != 0 ||
+            fread(pr->raw, 1, ent->raw_len, pr->fp) != ent->raw_len)
+            return -1;
+    } else {
+        size_t dlen;
+
+        if (fseeko(pr->fp, (off_t)ent->file_off, SEEK_SET) != 0 ||
+            fread(pr->stored, 1, ent->stored_len, pr->fp) != ent->stored_len)
+            return -1;
+        dlen = ZSTD_decompressDCtx(pr->dctx, pr->raw, pr->pi->max_raw, pr->stored, ent->stored_len);
+        if (ZSTD_isError(dlen) || dlen != ent->raw_len) return -1;
+    }
+    pr->cached_chunk = ci;
+    return 0;
+}
+
+static char *read_path_by_id(paths_reader_t *pr, FILE *offsets_fp, uint64_t path_id) {
+    uint64_t off0, off1, ci;
+    size_t len, in_chunk;
     char *buf;
 
     if (read_path_offsets(offsets_fp, path_id, &off0, &off1) != 0) return NULL;
@@ -6064,14 +6799,16 @@ static char *read_path_by_id(FILE *paths_fp, FILE *offsets_fp, uint64_t path_id)
     len = (size_t)(off1 - off0);
     if (len == 0) return NULL;
 
+    ci = paths_find_chunk(pr->pi, off0);
+    if (ci >= pr->pi->chunk_count) return NULL;
+    in_chunk = (size_t)(off0 - pr->pi->table[ci].logical_start);
+    /* Chunks are cut on path boundaries, so a path never spans two of them. */
+    if (in_chunk + len > pr->pi->table[ci].raw_len) return NULL;
+    if (paths_reader_load_chunk(pr, ci) != 0) return NULL;
+
     buf = (char *)malloc(len);
     if (!buf) return NULL;
-    if (fseeko(paths_fp, (off_t)off0, SEEK_SET) != 0 ||
-        fread(buf, 1, len, paths_fp) != len) {
-        free(buf);
-        return NULL;
-    }
-
+    memcpy(buf, pr->raw + in_chunk, len);
     return buf;
 }
 
@@ -6125,6 +6862,37 @@ static int cmp_key_postings_bytes_asc(const void *a, const void *b) {
     if (aa->trigram < bb->trigram) return -1;
     if (aa->trigram > bb->trigram) return 1;
     return 0;
+}
+
+/*
+ * Refuse an index written by an older build. v1 stored paths.bin and tri_postings.bin uncompressed and
+ * there is no dual-read path, so the only fix is a rebuild.
+ */
+static int check_index_version(const char *index_dir) {
+    char path[PATH_MAX];
+    FILE *fp;
+    char buf[512];
+    int version = -1;
+
+    if (build_path(path, sizeof(path), index_dir, "meta.txt") != 0) return -1;
+    fp = fopen(path, "r");
+    if (fp) {
+        while (fgets(buf, sizeof(buf), fp)) {
+            int tmp;
+            if (sscanf(buf, "ereport_index_version=%d", &tmp) == 1) {
+                version = tmp;
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    if (version == INDEX_VERSION) return 0;
+    if (version < 0)
+        fprintf(stderr, "no ereport_index_version in %s/meta.txt; rebuild with 'ereport_index --make'\n", index_dir);
+    else
+        fprintf(stderr, "index in %s is version %d, this build needs version %d; rebuild with 'ereport_index --make'\n",
+                index_dir, version, INDEX_VERSION);
+    return -1;
 }
 
 /* Same value as indexed_paths= in meta.txt from --make (total paths in paths.bin). */
@@ -6219,6 +6987,7 @@ enum {
 typedef struct {
     const char *paths_path;
     const char *offsets_path;
+    const paths_index_t *paths_index;
     const uint64_t *ids;
     char **out_paths;
     const char *lower_term;
@@ -6231,13 +7000,14 @@ static void *search_path_filter_worker(void *v) {
     search_path_filter_arg_t *a = (search_path_filter_arg_t *)v;
     FILE *paths_fp;
     FILE *offsets_fp;
+    paths_reader_t pr;
     size_t i;
 
     if (a->lo >= a->hi) return NULL;
     if (atomic_load_explicit(a->err, memory_order_relaxed)) return NULL;
     paths_fp = fopen(a->paths_path, "rb");
     offsets_fp = fopen(a->offsets_path, "rb");
-    if (!paths_fp || !offsets_fp) {
+    if (!paths_fp || !offsets_fp || paths_reader_init(&pr, paths_fp, a->paths_index) != 0) {
         atomic_store_explicit(a->err, 1, memory_order_relaxed);
         if (paths_fp) fclose(paths_fp);
         if (offsets_fp) fclose(offsets_fp);
@@ -6248,7 +7018,7 @@ static void *search_path_filter_worker(void *v) {
         char *p;
 
         if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
-        p = read_path_by_id(paths_fp, offsets_fp, a->ids[i]);
+        p = read_path_by_id(&pr, offsets_fp, a->ids[i]);
         if (!p) {
             a->out_paths[i] = NULL;
             continue;
@@ -6260,6 +7030,7 @@ static void *search_path_filter_worker(void *v) {
             a->out_paths[i] = p;
         }
     }
+    paths_reader_free(&pr);
     fclose(paths_fp);
     fclose(offsets_fp);
     return NULL;
@@ -6269,6 +7040,8 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                             int json_output) {
     char keys_path[PATH_MAX], postings_path[PATH_MAX], paths_path[PATH_MAX], offsets_path[PATH_MAX];
     FILE *keys_fp = NULL, *postings_fp = NULL, *paths_fp = NULL, *offsets_fp = NULL;
+    paths_index_t paths_index;
+    paths_reader_t serial_pr;
     struct stat st;
     struct timespec t_search_start;
     uint64_t key_count;
@@ -6281,6 +7054,9 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
     int rc = 1;
     int search_threads = parse_index_thread_count();
 
+    memset(&paths_index, 0, sizeof(paths_index));
+    memset(&serial_pr, 0, sizeof(serial_pr));
+
     /* Avoid full buffering when stdout is a pipe (eserve subprocess): empty reads → 502 */
     if (json_output) setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -6291,6 +7067,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         return 1;
     }
 
+    if (check_index_version(index_dir) != 0) return 1;
     if (stat(keys_path, &st) != 0 || (st.st_size % (off_t)sizeof(trigram_key_t)) != 0) {
         fprintf(stderr, "invalid tri_keys.bin in %s\n", index_dir);
         return 1;
@@ -6395,6 +7172,14 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         size_t ki;
         char **pref_paths = NULL;
 
+        /* One shared header/chunk-table/dictionary load; the workers below only add a FILE* and a
+         * decompression context each, so the table does not get duplicated per thread. */
+        if (current.count > 0 && paths_index_open(paths_path, &paths_index) != 0) {
+            free(current.ids);
+            current.ids = NULL;
+            goto out;
+        }
+
         if (current.count >= (size_t)SEARCH_PATH_PAR_MIN && search_threads > 1) {
             int pnw = search_threads;
             int pw;
@@ -6421,6 +7206,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                 if (a_hi > current.count) a_hi = current.count;
                 pargs[pw].paths_path = paths_path;
                 pargs[pw].offsets_path = offsets_path;
+                pargs[pw].paths_index = &paths_index;
                 pargs[pw].ids = current.ids;
                 pargs[pw].out_paths = pref_paths;
                 pargs[pw].lower_term = lower_term;
@@ -6455,7 +7241,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         } else if (current.count > 0) {
             paths_fp = fopen(paths_path, "rb");
             offsets_fp = fopen(offsets_path, "rb");
-            if (!paths_fp || !offsets_fp) {
+            if (!paths_fp || !offsets_fp || paths_reader_init(&serial_pr, paths_fp, &paths_index) != 0) {
                 fprintf(stderr, "cannot open paths.bin under %s\n", index_dir);
                 if (paths_fp) fclose(paths_fp);
                 if (offsets_fp) fclose(offsets_fp);
@@ -6473,7 +7259,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
             if (pref_paths) {
                 path = pref_paths[i];
             } else {
-                path = read_path_by_id(paths_fp, offsets_fp, current.ids[i]);
+                path = read_path_by_id(&serial_pr, offsets_fp, current.ids[i]);
                 if (!path) continue;
                 if (!path_matches_term(path, lower_term)) {
                     free(path);
@@ -6509,6 +7295,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
             match_idx++;
         }
 
+        paths_reader_free(&serial_pr);
         if (paths_fp) {
             fclose(paths_fp);
             paths_fp = NULL;
@@ -6554,6 +7341,8 @@ out:
     free(qkeys);
     free(query_trigrams);
     free(lower_term);
+    paths_reader_free(&serial_pr);
+    paths_index_close(&paths_index);
     if (keys_fp) fclose(keys_fp);
     if (postings_fp) fclose(postings_fp);
     if (paths_fp) fclose(paths_fp);
@@ -6629,6 +7418,7 @@ int main(int argc, char **argv) {
     int cmd0;
 
     tune_allocator();
+    crawl_fpcache_set_bufsz(MERGE_IO_BUFSIZE);
 
     if (argc < 2) die_usage(argv[0]);
     for (vi = 1; vi < argc; vi++) {

@@ -61,5 +61,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS` | `ereport_index --make` | Per-worker LRU cap on `tmp_trigrams_*` shard `FILE*` handles (32…4096; default 4096). Use a high `ulimit -n` for large `--make`. |
 | `EREPORT_INDEX_MERGE_MEMORY_MB` | `ereport_index --make` / merge / resume-merge | Explicit merge RAM budget (MiB) for limiting parallel merge workers (optional). |
 | `EREPORT_INDEX_MERGE_RAM_FRAC` | `ereport_index --make` / merge / resume-merge | Fraction of `min(MemAvailable, cgroup memory.max)` used as that budget (default 0.55). |
+| `EREPORT_INDEX_MERGE_WORKERS` | `ereport_index --make` / merge / resume-merge | Cap on concurrent merge workers (1…4096; default 16, and never more than online CPUs). RAM admission still decides how many run at once, so raising this only helps when the budget has room. |
+| `EREPORT_INDEX_MERGE_SORT_THREADS` | `ereport_index --make` / merge / resume-merge | Per-bucket cap on threads for the within-bucket parallel sort (1…4096; default 1 = serial). Worth setting only when the merge is CPU-bound rather than temp-read-bound: on local NVMe it cut `merge_phase_sec` from 0.70 s to 0.33 s at 16, but on a 953M-path build it made the merge slower. |
 | `EREPORT_INDEX_BIN` | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
 | `EREPORT_SEARCH_INDEX_DIR` | `eserve.py` | Trigram index directory (`tri_keys.bin`). Overridden by `--index-dir`. |

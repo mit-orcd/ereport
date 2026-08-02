@@ -595,6 +595,21 @@ Current files under `<username>/index/`:
 - `tri_keys.bin`
 - `tri_postings.bin`
 
+#### Compression (index version 2)
+
+The two files that dominate index size are zstd-compressed; the two that are random-accessed by fixed-size record are not.
+
+- `paths.bin` — `EPATH002`: a 40-byte header, then the path bytes in independently compressed chunks of at most 256 KiB, then a chunk table (one row per chunk: logical start, file offset, stored and raw length). Chunks are cut on path boundaries, so a lookup decompresses exactly one chunk. The header records where the table starts, because the chunk count is only known once the last path is written. A chunk whose `stored_len` equals its `raw_len` is stored verbatim.
+- `tri_postings.bin` — a posting list of at most 512 bytes stays bare delta-varints, since a frame header would cost more than the payload; anything larger is written as a sequence of independently decodable chunks of at most 128 KiB of varints, each prefixed by `[u32 raw_len][u32 stored_len][u8 is_zstd]`. Which of the two a list uses is in the previously unused `reserved` field of its `tri_keys.bin` record. Chunking rather than one frame per list keeps writer memory bounded on trigrams whose posting lists run to hundreds of MiB.
+- `path_offsets.bin` — unchanged, and still offsets into the *uncompressed* path stream, so path-id arithmetic and `--resume-merge` are unaffected by any of this.
+- `tri_keys.bin` — unchanged 24-byte records, binary-searched at query time; `postings_bytes` now measures the compressed span.
+
+`EREPORT_INDEX_ZSTD_LEVEL` (default 3) sets the level for both files. The `tmp_trigrams_*.bin` scratch files, which only live for the duration of one `--make`, do not use zstd at all: they are `EITG0002` frames of delta-varints over runs of one path id with ascending trigrams, which encodes them about as small as zstd level 3 did for a fraction of the CPU.
+
+A trained zstd dictionary for `paths.bin` was measured and rejected. A 256 KiB chunk already holds roughly 1400 neighbouring paths, so its window captures nearly all of the shared-prefix redundancy: on a 199k-path `/usr` corpus a 64 KiB dictionary shrank the compressed frames by 1.7%, but storing the dictionary made the file 3% larger overall, and training it cost 0.34 s on the paths writer — the only serial stage of the `--make` pipeline.
+
+There is no dual-read path for older indexes: `--search` and `--resume-merge` check `ereport_index_version=2` in `meta.txt` and the `EPATH002` magic in `paths.bin`, and tell you to rebuild if either is missing.
+
 During merge, transient `tmp_trigrams_*.bin` files are removed as buckets are processed. Parallel merge may create short-lived `merge_seg_k_*` / `merge_seg_p_*` segment files under the same directory; successful runs delete them after the stitch step. `--resume-merge` also drops orphan half-segment files if a crash left only one of the pair.
 
 ## `eserve.py`
