@@ -665,7 +665,7 @@ lines.append("")
 
 # --- writer table (write mode only) ---------------------------------------
 cols2 = ["fixture", "max_open", "fopen", "fclose", "fflush", "shards",
-         "stat", "wr_wait(s)", "elapsed(avg)", "ops/s"]
+         "stat", "wr_idle(s)", "elapsed(avg)", "ops/s"]
 w2 = [22, 9, 9, 9, 9, 7, 9, 11, 13, 8]
 
 
@@ -674,6 +674,10 @@ def row2(vals):
 
 
 lines.append("== WRITER / UID-SHARD CHURN (write mode) ==")
+# writer_queue_wait_ns sums both ends of the batch queue, and with wait_writer_push at 0 all of
+# it is writer threads blocked on an empty queue. Reading a large value as crawl threads held up
+# by the writers inverts what happened, so the column says idle.
+lines.append("   wr_idle(s) = writer threads waiting for batches; see wait_writer_push for the other side")
 lines.append(row2(cols2))
 lines.append(row2(["-" * x for x in w2]))
 for fx in fixtures:

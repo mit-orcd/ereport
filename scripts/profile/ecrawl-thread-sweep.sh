@@ -23,11 +23,14 @@
 #   avgWkr         avg_active_workers (1 Hz samples of busy crawl workers). Blank
 #                  for runs too short to collect two samples.
 #   shards         uid_shard_*.bin files the capture actually wrote. Read it with
-#                  wr_wait: one shard is one writer thread doing all the zstd, no
+#                  wr_idle: one shard is one writer thread doing all the zstd, no
 #                  matter how many writer threads exist, so a single-owner tree
 #                  caps write throughput on one core.
-#   wr_wait(s)     writer_queue_wait_ns summed over writer threads (write mode);
-#                  large means crawl threads are blocked on the writers
+#   wr_idle(s)     writer_queue_wait_ns (write mode). The counter sums both ends of
+#                  the batch queue, but wait_writer_push is normally 0, so what it
+#                  reports is writer threads waiting for batches -- not crawl
+#                  threads held up by the writers. Check wait_writer_push before
+#                  reading a large value as back-pressure.
 #   tailInl        stat_batches_tail_inlined: batches the crawl thread stat'ed
 #                  itself instead of handing to a stat worker. High means the
 #                  stat pool is idle and ECRAWL_STAT_THREADS is not the knob.
@@ -300,7 +303,7 @@ SUMMARY_TABLE="$RESULTS_DIR/SUMMARY_TABLE.txt"
     END {
       printf "%-24s %-8s %6s %5s %10s %8s %7s %7s %7s %11s %12s %9s %s\n", \
              "fixture", "mode", "crawl", "stat", "entries", "ops/s", "cpu%", "avgWkr", \
-             "shards", "wr_wait(s)", "tailInl", "maxRSS_MB", "elapsed(s)"
+             "shards", "wr_idle(s)", "tailInl", "maxRSS_MB", "elapsed(s)"
       for (i = 1; i <= n; i++) {
         key = order[i]
         split(key, f, "\t")
@@ -316,8 +319,9 @@ SUMMARY_TABLE="$RESULTS_DIR/SUMMARY_TABLE.txt"
   ' "$CELLS"
   echo
   echo "Reading it: ops/s is the answer, cpu% says whether more threads bought"
-  echo "more work or just more waiting, and a wr_wait(s) that climbs with the"
-  echo "crawl thread count means the writers, not the crawl, are the limit."
+  echo "more work or just more waiting, and wr_idle(s) is writer threads waiting"
+  echo "for batches -- it grows when the writers are starved, not when they are"
+  echo "the limit. For real back-pressure read wait_writer_push in the summary."
   echo "Check shards before blaming the crawl side: one shard is one writer"
   echo "thread compressing everything, so a single-owner tree is writer-capped"
   echo "at any crawl thread count."
