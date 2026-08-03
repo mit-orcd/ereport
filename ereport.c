@@ -934,6 +934,7 @@ static char g_bucket_output_dir[PATH_MAX];
 typedef struct {
     char *path;
     uint64_t hash; /* cached full-path FNV-1a; reused by rehash + map merge so paths aren't re-hashed */
+    uint32_t path_len; /* strlen(path); lets probes memcmp a known span instead of scanning for NUL */
     uint64_t bucket_files;
     uint64_t bucket_bytes;
     uint64_t bucket_ctime_led_files;
@@ -3567,8 +3568,7 @@ static void path_row_map_keys_free(path_row_map_t *m) {
     m->keys_cur = NULL;
 }
 
-static char *path_row_map_key_intern(path_row_map_t *m, const char *s) {
-    size_t n = strlen(s);
+static char *path_row_map_key_intern(path_row_map_t *m, const char *s, size_t n) {
     size_t need = n + 1U;
     path_key_blk_t *b = m->keys_cur;
     char *out;
@@ -3692,9 +3692,23 @@ static int path_row_map_rehash(path_row_map_t *m, size_t new_cap) {
     return 0;
 }
 
-/* _h variants take the full-path FNV hash precomputed by the caller (built
- * incrementally across depth levels); the plain wrappers preserve old callers. */
-static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *path, uint64_t hash) {
+/*
+ * Both take the full-path FNV hash precomputed by the caller, built incrementally across depth
+ * levels so a path is hashed once rather than once per level, and the path's length, which the
+ * callers are already carrying to build the path.
+ *
+ * The stored hash settles almost every probe. Without it each collision walked two paths byte by
+ * byte, and directory paths share long prefixes, so strcmp read most of the string before finding
+ * the difference. What is left after the hash check is mostly the true match, which has to read
+ * the whole key either way -- so compare the lengths first (a mismatch ends it on a register) and
+ * memcmp a known span rather than have strcmp look for a NUL it already knows the position of.
+ */
+static inline int path_row_key_eq(const path_row_t *row, const char *path, size_t len, uint64_t hash) {
+    return row->hash == hash && row->path_len == (uint32_t)len && memcmp(row->path, path, len) == 0;
+}
+
+static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *path, size_t path_len,
+                                                uint64_t hash) {
     size_t idx;
 
     if ((m->count + 1) * 10 >= m->cap * 7) {
@@ -3703,26 +3717,27 @@ static path_row_t *path_row_map_get_or_insert_h(path_row_map_t *m, const char *p
 
     idx = (size_t)(hash & (m->cap - 1));
     while (m->used[idx]) {
-        if (strcmp(m->rows[idx].path, path) == 0) return &m->rows[idx];
+        if (path_row_key_eq(&m->rows[idx], path, path_len, hash)) return &m->rows[idx];
         idx = (idx + 1) & (m->cap - 1);
     }
 
-    m->rows[idx].path = path_row_map_key_intern(m, path);
+    m->rows[idx].path = path_row_map_key_intern(m, path, path_len);
     if (!m->rows[idx].path) return NULL;
     m->rows[idx].hash = hash;
+    m->rows[idx].path_len = (uint32_t)path_len;
     m->used[idx] = 1;
     m->count++;
     return &m->rows[idx];
 }
 
-static path_row_t *path_row_map_find_h(path_row_map_t *m, const char *path, uint64_t hash) {
+static path_row_t *path_row_map_find_h(path_row_map_t *m, const char *path, size_t path_len, uint64_t hash) {
     size_t idx;
 
     if (m->cap == 0) return NULL;
 
     idx = (size_t)(hash & (m->cap - 1));
     while (m->used[idx]) {
-        if (strcmp(m->rows[idx].path, path) == 0) return &m->rows[idx];
+        if (path_row_key_eq(&m->rows[idx], path, path_len, hash)) return &m->rows[idx];
         idx = (idx + 1) & (m->cap - 1);
     }
 
@@ -3755,7 +3770,7 @@ static int path_row_map_merge_accumulate(path_row_map_t *dst, const path_row_map
         if (!src->used[i]) continue;
         {
             const path_row_t *sr = &src->rows[i];
-            path_row_t *dr = path_row_map_get_or_insert_h(dst, sr->path, sr->hash);
+            path_row_t *dr = path_row_map_get_or_insert_h(dst, sr->path, sr->path_len, sr->hash);
 
             if (!dr) return -1;
             dr->bucket_files += sr->bucket_files;
@@ -4514,21 +4529,33 @@ static size_t path_append_component(char *buf, size_t bufsz, size_t len, const c
     return base + comp_len;
 }
 
-static const char *path_after_base_prefix(const char *path, const char *base_prefix) {
-    const char *p = path;
-    size_t plen;
+/*
+ * The base prefix is fixed for a whole aggregation phase, but the per-record test used to re-derive
+ * its length and re-run the "/" comparison for every path -- once per record in loops that run over
+ * every detail record in the capture. Resolve it once and the per-record work is a strncmp and a
+ * pointer bump.
+ */
+typedef struct {
+    const char *s; /* NULL when the prefix matches everything */
+    size_t len;
+    int is_root; /* prefix is exactly "/" */
+} base_prefix_t;
 
-    if (!starts_with_dir_prefix(path, base_prefix)) return NULL;
+static void base_prefix_init(base_prefix_t *bp, const char *prefix) {
+    bp->s = (prefix && prefix[0] != '\0') ? prefix : NULL;
+    bp->len = bp->s ? strlen(bp->s) : 0;
+    bp->is_root = bp->s && bp->len == 1U && bp->s[0] == '/';
+}
 
-    plen = base_prefix ? strlen(base_prefix) : 0;
-    if (base_prefix && base_prefix[0] != '\0' && strcmp(base_prefix, "/") != 0) {
-        p += plen;
-        if (*p == '/') p++;
-    } else if (base_prefix && strcmp(base_prefix, "/") == 0 && *p == '/') {
-        p++;
-    }
-
-    return p;
+/* Same result as path_after_base_prefix, with the prefix already measured. */
+static inline const char *path_after_base_prefix_bp(const char *path, const base_prefix_t *bp) {
+    if (!bp->s) return path;
+    if (bp->is_root) return path[0] == '/' ? path + 1 : NULL;
+    /* strncmp, not memcmp: path may be shorter than the prefix. */
+    if (strncmp(path, bp->s, bp->len) != 0) return NULL;
+    if (path[bp->len] == '\0') return path + bp->len;
+    if (path[bp->len] != '/') return NULL;
+    return path + bp->len + 1U;
 }
 
 typedef struct {
@@ -4580,25 +4607,29 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
                                            size_t hi) {
     size_t i;
     uint64_t base_hash = base_prefix ? path_hash(base_prefix) : PATH_HASH_FNV_OFFSET;
+    base_prefix_t bp;
+    size_t base_len;
+
+    base_prefix_init(&bp, base_prefix);
+    base_len = base_prefix ? strlen(base_prefix) : 0;
+    if (base_len >= PATH_MAX) return -1;
 
     for (i = lo; i < hi; i++) {
         const detail_record_t *r = &details->items[i];
         char rowpath[PATH_MAX];
         char fbuf[PATH_MAX];
-        size_t rowlen = 0;
+        size_t rowlen = base_len;
         uint64_t h = base_hash;
         const char *p;
         int depth;
 
-        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), base_prefix);
+        p = path_after_base_prefix_bp(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), &bp);
         if (!p || *p == '\0') continue;
 
-        rowpath[0] = '\0';
-        if (base_prefix) {
-            rowlen = strlen(base_prefix);
-            if (rowlen >= sizeof(rowpath)) return -1;
-            memcpy(rowpath, base_prefix, rowlen + 1);
-        }
+        if (base_prefix)
+            memcpy(rowpath, base_prefix, base_len + 1);
+        else
+            rowpath[0] = '\0';
 
         for (depth = 0; depth < nlevels; depth++) {
             const char *start;
@@ -4618,7 +4649,7 @@ static int aggregate_bucket_for_page_range(path_row_map_t *maps,
             if (rowlen == (size_t)-1) return -1;
             h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_get_or_insert_h(&maps[depth], rowpath, h);
+            row = path_row_map_get_or_insert_h(&maps[depth], rowpath, rowlen, h);
             if (!row) return -1;
             row->bucket_files++;
             row->bucket_bytes += r->size;
@@ -4889,6 +4920,14 @@ static void *agg_totals_par_worker(void *vp) {
     agg_tot_par_wctx_t *w = (agg_tot_par_wctx_t *)vp;
     size_t ii;
     uint64_t base_hash = w->base_prefix ? path_hash(w->base_prefix) : PATH_HASH_FNV_OFFSET;
+    base_prefix_t bp;
+    size_t base_len = w->base_prefix ? strlen(w->base_prefix) : 0;
+
+    base_prefix_init(&bp, w->base_prefix);
+    if (base_len >= PATH_MAX) {
+        atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
+        return NULL;
+    }
 
     /* The table is the emit thread's reused scratch and still holds the previous cell's counts. */
     if (!w->atomic_mode) memset(w->tbl, 0, (w->tbl_mask + 1) * sizeof(*w->tbl));
@@ -4898,25 +4937,20 @@ static void *agg_totals_par_worker(void *vp) {
         const matched_record_t *r = &w->records->items[i];
         char rowpath[PATH_MAX];
         char fbuf[PATH_MAX];
-        size_t rowlen = 0;
+        size_t rowlen = base_len;
         uint64_t h = base_hash;
         const char *p;
         int depth;
 
         if (atomic_load_explicit(w->fatal_atom, memory_order_relaxed)) break;
 
-        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), w->base_prefix);
+        p = path_after_base_prefix_bp(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), &bp);
         if (!p || *p == '\0') continue;
 
-        rowpath[0] = '\0';
-        if (w->base_prefix) {
-            rowlen = strlen(w->base_prefix);
-            if (rowlen >= sizeof(rowpath)) {
-                atomic_store_explicit(w->fatal_atom, 1, memory_order_relaxed);
-                goto done;
-            }
-            memcpy(rowpath, w->base_prefix, rowlen + 1);
-        }
+        if (w->base_prefix)
+            memcpy(rowpath, w->base_prefix, base_len + 1);
+        else
+            rowpath[0] = '\0';
 
         for (depth = 0; depth < w->nlevels; depth++) {
             const char *start;
@@ -4939,7 +4973,7 @@ static void *agg_totals_par_worker(void *vp) {
             }
             h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_find_h(&w->maps[depth], rowpath, h);
+            row = path_row_map_find_h(&w->maps[depth], rowpath, rowlen, h);
             if (row) {
                 agg_tot_slot_t *s = w->atomic_mode ? NULL : agg_tot_slot_for(w, row);
 
@@ -5245,25 +5279,28 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
 
     {
     uint64_t base_hash = base_prefix ? path_hash(base_prefix) : PATH_HASH_FNV_OFFSET;
+    base_prefix_t bp;
+    size_t base_len = base_prefix ? strlen(base_prefix) : 0;
+
+    base_prefix_init(&bp, base_prefix);
+    if (base_len >= PATH_MAX) return -1;
     for (ii = lo; ii < hi; ii++) {
         size_t i = use_ord_slice ? path_ord[ii] : ii;
         const matched_record_t *r = &records->items[i];
         char rowpath[PATH_MAX];
         char fbuf[PATH_MAX];
-        size_t rowlen = 0;
+        size_t rowlen = base_len;
         uint64_t h = base_hash;
         const char *p;
         int depth;
 
-        p = path_after_base_prefix(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), base_prefix);
+        p = path_after_base_prefix_bp(path_join_pl(r->parent, r->leaf, fbuf, sizeof(fbuf)), &bp);
         if (!p || *p == '\0') continue;
 
-        rowpath[0] = '\0';
-        if (base_prefix) {
-            rowlen = strlen(base_prefix);
-            if (rowlen >= sizeof(rowpath)) return -1;
-            memcpy(rowpath, base_prefix, rowlen + 1);
-        }
+        if (base_prefix)
+            memcpy(rowpath, base_prefix, base_len + 1);
+        else
+            rowpath[0] = '\0';
 
         for (depth = 0; depth < nlevels; depth++) {
             const char *start;
@@ -5283,7 +5320,7 @@ static int aggregate_totals_for_page_n(path_row_map_t *maps,
             if (rowlen == (size_t)-1) return -1;
             h = path_hash_fold(h, rowpath + prev_len, rowlen - prev_len);
 
-            row = path_row_map_find_h(&maps[depth], rowpath, h);
+            row = path_row_map_find_h(&maps[depth], rowpath, rowlen, h);
             if (row) {
                 if (r->type == 'f') row->total_files++;
                 else if (r->type == 'd') row->total_dirs++;
@@ -7094,6 +7131,13 @@ static int emit_all_bucket_detail_pages(const char *username,
 
     for (ti = 0; ti < (size_t)nw; ti++) args[ti].ctx = &ctx;
 
+    /*
+     * The inner aggregation pools below each ask for the full EREPORT_THREADS, so nw concurrent
+     * cells request nw × that many threads. Do not "fix" this by dividing the budget across cells:
+     * measured on a 3.9 GiB medium tree at EREPORT_THREADS=32 on 64 CPUs, dividing cost 9% of wall
+     * (median 3.29 s against 3.01 s over three reps each). Cells finish at very different times, and
+     * oversubscription is what lets a cell still working use the cores the finished ones left.
+     */
     {
         double cell_t0 = 0.0;
 
@@ -8359,11 +8403,11 @@ static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t pa
     }
 
     if (cache->id != parent_dir_id) {
-        if (crawl_bin_catalog_dir_path(cat, parent_dir_id, cache->dir, sizeof(cache->dir)) != 0) {
+        if (crawl_bin_catalog_dir_path_len(cat, parent_dir_id, cache->dir, sizeof(cache->dir), &cache->len) !=
+            0) {
             cache->id = 0;
             return -1;
         }
-        cache->len = strlen(cache->dir);
         cache->id = parent_dir_id;
     }
 
@@ -8449,6 +8493,11 @@ static int read_one_chunk(const file_chunk_t *chunk,
          * every column except gid and mode, which nothing in the report reads. */
         (void)crawl_bin_block_reader_set_projection(
             &br, CRAWL_PROJECTION_ALL & ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE)));
+        /* inode and dev are read only under `if (r.nlink > 1)` below, so row groups whose NLINK zone
+         * map tops out at 1 -- most of them on a tree without hardlinks -- can skip all three. */
+        (void)crawl_bin_block_reader_set_hardlink_columns(&br, CRAWL_COL_BIT(CRAWL_COL_INODE) |
+                                                                   CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
+                                                                   CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR));
     }
 
     /* Memoizes the last parent directory path so contiguous same-directory records
