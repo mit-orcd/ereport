@@ -203,9 +203,26 @@ static int set_path_rewrite(const char *arg) {
  * tmp_trigrams shards: accumulate records per (worker × bucket) and emit one frame
  * per ~64 KiB of source so framing overhead and read()/decode syscalls amortize over
  * thousands of records instead of the ~1 record per frame the per-batch path produced.
+ *
+ * Also the unit of buffer memory: one frame is held per *open* (worker × bucket) shard, so the
+ * footprint is frame bytes × open shards. Bigger frames mean fewer, larger writes and better
+ * compression, at more resident buffer. Tunable at runtime with EREPORT_INDEX_TRIGRAM_FRAME_BYTES.
  */
 #define TRIGRAM_TMP_FRAME_BYTES (1U << 16)
 #define TRIGRAM_TMP_FRAME_RECORDS (TRIGRAM_TMP_FRAME_BYTES / sizeof(trigram_record_t))
+#define TRIGRAM_TMP_FRAME_BYTES_MIN (1U << 12)
+#define TRIGRAM_TMP_FRAME_BYTES_MAX (1U << 24)
+/*
+ * Ceiling on merge workers; the pool is min(online CPUs, nonempty buckets, this).
+ *
+ * Do not raise it without a measurement that survives a repeat. Swept on 8M paths in one directory
+ * (383M trigram records, only 1035 distinct trigrams, so 34 very uneven nonempty buckets on 64 CPUs)
+ * merge_phase_sec went 4.31 s at 8 workers to 2.87 s at 16, then 2.89 s at 32 and 2.44 s at 34 --
+ * but a second run of the same sweep put 34 workers at 3.17 s against 3.15 s at 16, so everything
+ * past 16 was noise. Neither this constant nor RAM admission is the limit there (peak was 768 MiB
+ * against a 693 GiB budget): temp-read throughput sits at ~1.5 GB/s whatever the worker count,
+ * because the merge is bound by per-bucket frame decode and radix sort.
+ */
 #define MERGE_MAX_WORKERS 16
 #define MERGE_PARALLEL_MIN 4
 /*
@@ -462,6 +479,7 @@ typedef struct {
     uint8_t *tw_worker_fp_magic; /* 1 if the EITG header is already on disk for this open fp */
     trigram_record_t **tw_worker_buf; /* per open shard: pending records, flushed as one frame */
     uint32_t *tw_worker_buf_n; /* records currently buffered in tw_worker_buf[ix] */
+    uint32_t tw_frame_records;  /* records per emitted frame; see parse_trigram_frame_records */
     uint64_t *tw_worker_lru_age;
     uint32_t *tw_worker_open_count; /* [trigram_tmp_shard_count] */
     uint32_t tw_worker_max_open;
@@ -1280,6 +1298,98 @@ typedef struct wb_arena {
     wb_chunk_t *head; /* bump target; older chunks trail behind it */
 } wb_arena_t;
 
+/*
+ * Chunks are recycled through a small per-thread freelist instead of going back to malloc.
+ *
+ * The arena already collapsed thousands of per-string frees into one free per chunk, but
+ * wb_arena_release still showed 6.6% self time on a 12 M-path build: every batch mallocs its
+ * chunks on a parse worker and frees them wherever the last job holding the arena happens to
+ * finish, so the chunks keep crossing malloc arenas. They are all the same size and immediately
+ * wanted again, so holding a few per thread turns that into a pointer swap. The freelist is
+ * capped, and a chunk parked on one thread is simply reused by that thread later -- the cap is
+ * what keeps a thread that releases more than it allocates from hoarding memory.
+ */
+#define WB_CHUNK_CACHE_MAX 8U
+
+typedef struct {
+    wb_chunk_t *head;
+    unsigned count;
+} wb_chunk_cache_t;
+
+static pthread_key_t wb_chunk_cache_key;
+static pthread_once_t wb_chunk_cache_once = PTHREAD_ONCE_INIT;
+
+static void wb_chunk_cache_free(void *p) {
+    wb_chunk_cache_t *cache = (wb_chunk_cache_t *)p;
+    wb_chunk_t *c;
+
+    if (!cache) return;
+    c = cache->head;
+    while (c) {
+        wb_chunk_t *next = c->next;
+
+        free(c);
+        c = next;
+    }
+    free(cache);
+}
+
+static void wb_chunk_cache_key_init(void) {
+    (void)pthread_key_create(&wb_chunk_cache_key, wb_chunk_cache_free);
+}
+
+/* NULL is a valid answer: without a cache the chunk just goes to malloc, as it used to. */
+static wb_chunk_cache_t *wb_chunk_cache(void) {
+    wb_chunk_cache_t *cache;
+
+    if (pthread_once(&wb_chunk_cache_once, wb_chunk_cache_key_init) != 0) return NULL;
+    cache = (wb_chunk_cache_t *)pthread_getspecific(wb_chunk_cache_key);
+    if (!cache) {
+        cache = (wb_chunk_cache_t *)calloc(1, sizeof(*cache));
+        if (cache && pthread_setspecific(wb_chunk_cache_key, cache) != 0) {
+            free(cache);
+            cache = NULL;
+        }
+    }
+    return cache;
+}
+
+/* Only standard-size chunks are pooled; an oversized one exists for a single large allocation. */
+static wb_chunk_t *wb_chunk_get(size_t cap) {
+    wb_chunk_t *c;
+
+    if (cap == WB_ARENA_CHUNK_BYTES) {
+        wb_chunk_cache_t *cache = wb_chunk_cache();
+
+        if (cache && cache->head) {
+            c = cache->head;
+            cache->head = c->next;
+            cache->count--;
+            return c;
+        }
+    }
+    c = (wb_chunk_t *)malloc(sizeof(*c) + cap);
+    if (c) c->cap = cap;
+    return c;
+}
+
+static void wb_chunk_put(wb_chunk_t *c) {
+    wb_chunk_cache_t *cache;
+
+    if (c->cap != WB_ARENA_CHUNK_BYTES) {
+        free(c);
+        return;
+    }
+    cache = wb_chunk_cache();
+    if (!cache || cache->count >= WB_CHUNK_CACHE_MAX) {
+        free(c);
+        return;
+    }
+    c->next = cache->head;
+    cache->head = c;
+    cache->count++;
+}
+
 static wb_arena_t *wb_arena_create(void) {
     wb_arena_t *a = (wb_arena_t *)malloc(sizeof(*a));
 
@@ -1310,9 +1420,8 @@ static void *wb_arena_alloc(wb_arena_t *a, size_t n, size_t align) {
         wb_chunk_t *c;
 
         if (cap < n) cap = n;
-        c = (wb_chunk_t *)malloc(sizeof(*c) + cap);
+        c = wb_chunk_get(cap);
         if (!c) return NULL;
-        c->cap = cap;
         c->used = n;
         /* Keep the chunk with room at the front so the next bump finds it first. */
         if (a->head && a->head->cap - a->head->used > cap - n) {
@@ -1335,7 +1444,8 @@ static void wb_arena_release(wb_arena_t *a) {
     c = a->head;
     while (c) {
         wb_chunk_t *next = c->next;
-        free(c);
+
+        wb_chunk_put(c);
         c = next;
     }
     free(a);
@@ -2308,6 +2418,22 @@ static size_t parse_trigram_queue_depth(int trigram_workers) {
     return (size_t)v;
 }
 
+/* Bytes of source records per tmp_trigrams frame, rounded down to whole records (>= 1). */
+static uint32_t parse_trigram_frame_records(void) {
+    const char *e = getenv("EREPORT_INDEX_TRIGRAM_FRAME_BYTES");
+    unsigned long v;
+    uint32_t recs;
+    char *end;
+
+    if (!e || !*e) return (uint32_t)TRIGRAM_TMP_FRAME_RECORDS;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < TRIGRAM_TMP_FRAME_BYTES_MIN || v > TRIGRAM_TMP_FRAME_BYTES_MAX)
+        return (uint32_t)TRIGRAM_TMP_FRAME_RECORDS;
+    recs = (uint32_t)(v / sizeof(trigram_record_t));
+    return recs ? recs : 1U;
+}
+
 /* Target paths per write batch before flushing to the writer thread (scaled down when many parse workers). */
 static size_t parse_write_batch_paths(void) {
     const char *e = getenv("EREPORT_INDEX_WRITE_BATCH_PATHS");
@@ -3246,6 +3372,7 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
 
     if (shard_count < 1U) shard_count = 1U;
     ctx->trigram_tmp_shard_count = shard_count;
+    ctx->tw_frame_records = parse_trigram_frame_records();
 
     gmax = compute_max_open_trigram_buckets();
     ctx->tw_worker_max_open = compute_tw_worker_max_open(shard_count, gmax);
@@ -3436,7 +3563,8 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
             fprintf(stderr, "ereport_index: tmp_trigrams path too long (bucket %u worker %u)\n", bucket, worker_id);
             return -1;
         }
-        ctx->tw_worker_buf[ix] = (trigram_record_t *)malloc(TRIGRAM_TMP_FRAME_RECORDS * sizeof(trigram_record_t));
+        ctx->tw_worker_buf[ix] =
+            (trigram_record_t *)malloc((size_t)ctx->tw_frame_records * sizeof(trigram_record_t));
         if (!ctx->tw_worker_buf[ix]) {
             fprintf(stderr, "ereport_index: alloc tmp_trigrams frame buffer (bucket %u worker %u)\n", bucket, worker_id);
             return -1;
@@ -3468,14 +3596,14 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
 
     /* Accumulate records into the per-shard buffer; flush one frame each time it fills. */
     while (n > 0) {
-        size_t space = (size_t)TRIGRAM_TMP_FRAME_RECORDS - ctx->tw_worker_buf_n[ix];
+        size_t space = (size_t)ctx->tw_frame_records - ctx->tw_worker_buf_n[ix];
         size_t take = n < space ? n : space;
 
         memcpy(ctx->tw_worker_buf[ix] + ctx->tw_worker_buf_n[ix], recs, take * sizeof(*recs));
         ctx->tw_worker_buf_n[ix] += (uint32_t)take;
         recs += take;
         n -= take;
-        if (ctx->tw_worker_buf_n[ix] == (uint32_t)TRIGRAM_TMP_FRAME_RECORDS) {
+        if (ctx->tw_worker_buf_n[ix] == ctx->tw_frame_records) {
             if (tw_worker_flush_locked(ctx, ix) != 0) {
                 fprintf(stderr, "ereport_index: fwrite tmp_trigrams bucket %u worker %u: %s\n",
                         bucket, worker_id, strerror(errno));
@@ -3939,6 +4067,56 @@ fail:
     return -1;
 }
 
+/*
+ * Last-parent cache for path reconstruction. crawl_bin_catalog_entry_path walks the parent chain to
+ * the root for every record, and records under one directory are contiguous in crawl-bin output, so
+ * a single slot absorbs nearly all of it: on a 12M-path index the walk was the whole cost of turning
+ * a record into a path. Lives on the stack of one process_chunk_make call, which keeps it private to
+ * the worker and scoped to a chunk -- a chunk never spans shards, so dir_ids cannot collide.
+ */
+typedef struct {
+    uint64_t id; /* cached parent_dir_id (>1); 0 = empty */
+    size_t len;
+    char dir[PATH_MAX];
+} mk_dir_cache_t;
+
+static int mk_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_dir_id, const char *name,
+                                size_t name_len, char *out, size_t out_sz, mk_dir_cache_t *cache) {
+    size_t plen;
+
+    if (!cat || !out || out_sz == 0) return -1;
+    if (parent_dir_id == 0ULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (parent_dir_id == 1ULL) {
+        /* Direct child of the synthetic root: path is /<name> (paths are absolute). */
+        if (name_len + 2 > out_sz) return -1;
+        out[0] = '/';
+        if (name_len > 0 && name) memcpy(out + 1, name, name_len);
+        out[1 + name_len] = '\0';
+        return 0;
+    }
+
+    if (cache->id != parent_dir_id) {
+        if (crawl_bin_catalog_dir_path_len(cat, parent_dir_id, cache->dir, sizeof(cache->dir), &cache->len) !=
+            0) {
+            cache->id = 0;
+            return -1;
+        }
+        cache->id = parent_dir_id;
+    }
+
+    plen = cache->len;
+    if (plen + 1 + name_len + 1 > out_sz) return -1;
+    memcpy(out, cache->dir, plen);
+    if (plen > 0) out[plen++] = '/';
+    if (name_len > 0 && name) memcpy(out + plen, name, name_len);
+    out[plen + name_len] = '\0';
+    return 0;
+}
+
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     build_ctx_t *ctx = worker->ctx;
     index_run_stats_t *rs = ctx->run_stats;
@@ -3949,8 +4127,11 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     write_batch_t *batch = NULL;
     uint64_t scanned_local = 0;
     uint64_t scanned_published = 0;
+    mk_dir_cache_t dir_cache;
     crawl_bin_block_reader_t br;
     memset(&br, 0, sizeof(br));
+    dir_cache.id = 0;
+    dir_cache.len = 0;
 
     fp = ei_shard_fopen(chunk->path, "rb");
     if (!fp) {
@@ -4030,8 +4211,8 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         {
             const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
 
-            if (crawl_bin_catalog_entry_path(file_states[chunk->file_index].catalog, r.parent_dir_id,
-                                             (char *)name_bytes, r.name_len, pathbuf, PATH_MAX) != 0) {
+            if (mk_entry_path_cached(file_states[chunk->file_index].catalog, r.parent_dir_id,
+                                     (char *)name_bytes, r.name_len, pathbuf, PATH_MAX, &dir_cache) != 0) {
                 fprintf(stderr, "warn: path reconstruct failed in %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
                 break;
@@ -4665,10 +4846,10 @@ static void merge_destroy_thread_budget(build_ctx_t *ctx) {
 }
 
 /*
- * Merge worker pool size: online CPUs, capped at MERGE_MAX_WORKERS. The cap is not about CPU —
- * each worker holds a bucket's records in anon RAM — so raising it only helps where admission
- * control has budget to spare. Overridable with EREPORT_INDEX_MERGE_WORKERS for measurement;
- * the RAM budget still gates how many of them run at once.
+ * Merge worker pool size: online CPUs, capped at MERGE_MAX_WORKERS. Each worker holds a bucket's
+ * records in anon RAM, but per-bucket admission control — not this number — is what keeps that
+ * bounded. Overridable with EREPORT_INDEX_MERGE_WORKERS; see MERGE_MAX_WORKERS for why raising it
+ * did not help.
  */
 static int merge_worker_cap(void) {
     const char *e = getenv("EREPORT_INDEX_MERGE_WORKERS");
