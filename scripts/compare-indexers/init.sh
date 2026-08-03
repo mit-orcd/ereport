@@ -562,8 +562,11 @@ install_dua() {
     fi
     err=$("$prefix_dua" --version 2>&1 >/dev/null | grep -m1 '.' || true)
     log "WARN: $prefix_dua does not run here (${err:-no error text}); rebuilding it"
-  elif command -v dua >/dev/null 2>&1 && dua --version >/dev/null 2>&1; then
+  elif [[ "$FORCE_REINSTALL" != "1" ]] && command -v dua >/dev/null 2>&1 && dua --version >/dev/null 2>&1; then
+    # Distribution package is fine for the harness; FORCE_REINSTALL=1 is what
+    # builds the pinned DUA_VERSION into this prefix instead.
     log "dua already installed: $(command -v dua)"
+    mark_installed dua "$DUA_VERSION"
     return 0
   fi
 
@@ -720,10 +723,17 @@ export INDEXER_COMPARE_XDU_VERSION="$XDU_VERSION"
 export INDEXER_COMPARE_ROBINHOOD_VERSION="$ROBINHOOD_VERSION"
 export INDEXER_COMPARE_DUA_VERSION="$DUA_VERSION"
 EOF
-  # Only pin DUA_BIN to this prefix when it holds a dua; otherwise leave lib.sh
-  # to find the distribution package on PATH.
+  # Pin DUA_BIN when this prefix holds a dua. Otherwise unset any stale pin from
+  # an older env.sh (sourcing a file that omits the variable does not clear it)
+  # and, when a package dua is on PATH, export that path so the next run is
+  # explicit rather than relying on rediscovery.
   if [[ -x "$PREFIX/bin/dua" ]]; then
     printf 'export DUA_BIN="%s"\n' "$PREFIX/bin/dua" >>"$env_file"
+  else
+    printf 'unset DUA_BIN\n' >>"$env_file"
+    if command -v dua >/dev/null 2>&1; then
+      printf 'export DUA_BIN="%s"\n' "$(command -v dua)" >>"$env_file"
+    fi
   fi
   if [[ -x "$CHART_VENV/bin/python" ]]; then
     printf 'export CHART_PYTHON="%s"\n' "$CHART_VENV/bin/python" >>"$env_file"

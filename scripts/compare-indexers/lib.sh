@@ -326,23 +326,85 @@ _unexecutable_why() {
 FD_FIX_HINT="install the fd-find package"
 DUA_FIX_HINT="rebuild it with 'TOOLS=dua FORCE_REINSTALL=1 scripts/compare-indexers/init.sh'"
 
+# Prefer a pinned path only while it still exists and is executable; otherwise
+# rediscover on PATH. ${VAR:-default} keeps a stale env.sh pin forever even when
+# a package binary is sitting at /usr/bin, which is how dua vanished from charts.
+_resolve_or_find() {
+  local pinned=${1:-}
+  shift
+  local name
+  if [[ -n "$pinned" && -x "$pinned" ]]; then
+    printf '%s' "$pinned"
+    return 0
+  fi
+  for name in "$@"; do
+    if command -v "$name" >/dev/null 2>&1; then
+      command -v "$name"
+      return 0
+    fi
+  done
+  # Keep a dead pin so skip notes can still name the path that failed.
+  printf '%s' "$pinned"
+  return 1
+}
+
+# Apply dua aggregate --help feature flags to DUA_AGG_ARGS / DUA_HAS_BYTES.
+_dua_apply_help_flags() {
+  local help=$1
+  case "$help" in
+    *--apparent-size*) DUA_AGG_ARGS+=(--apparent-size) ;;
+  esac
+  case "$help" in
+    *--stay-on-filesystem*) DUA_AGG_ARGS+=(--stay-on-filesystem) ;;
+  esac
+  case "$help" in
+    *--format*)
+      DUA_AGG_ARGS+=(--format bytes)
+      DUA_HAS_BYTES=1
+      ;;
+  esac
+  case "$help" in
+    *--no-sort*) DUA_AGG_ARGS+=(--no-sort) ;;
+  esac
+  case "$help" in
+    *--no-total*) DUA_AGG_ARGS+=(--no-total) ;;
+  esac
+  case "$help" in
+    *--threads*) DUA_AGG_ARGS+=(--threads "$THREADS") ;;
+  esac
+}
+
 # fd is the "fast find" baseline test.sh already prefers over find(1).
 # Debian/Ubuntu install the fd-find package as `fdfind`.
-FD_BIN=${FD_BIN:-$(command -v fd 2>/dev/null || command -v fdfind 2>/dev/null || true)}
+FD_BIN=$(_resolve_or_find "${FD_BIN:-}" fd fdfind || true)
 # Match test.sh: fd skips hidden files and obeys ignore files unless told not to.
 FD_COMMON_ARGS=(--hidden --no-ignore)
 FD_HAS_SIZE=0
 FD_OK=0
 FD_WHY=""
-if [[ -n "$FD_BIN" && -x "$FD_BIN" ]]; then
+if [[ -n "$FD_BIN" ]]; then
   # Capture --help instead of piping to grep: with pipefail a SIGPIPE'd fd would
   # invert the test result. Require a successful probe the same way dua does —
   # a binary that resolves but dies on a newer glibc must not look "available".
   _fd_err=$(mktemp 2>/dev/null || echo /tmp/ic-fd-probe.$$)
   _fd_st=0
-  _fd_help=$("$FD_BIN" --help 2>"$_fd_err") || _fd_st=$?
-  if [[ -n "$_fd_help" ]]; then
-    FD_OK=1
+  _fd_help=""
+  _fd_candidates=("$FD_BIN")
+  _fd_alt=""
+  for _fd_name in fd fdfind; do
+    _fd_alt=$(command -v "$_fd_name" 2>/dev/null || true)
+    [[ -n "$_fd_alt" && "$_fd_alt" != "$FD_BIN" ]] && _fd_candidates+=("$_fd_alt")
+  done
+  for _fd_cand in "${_fd_candidates[@]}"; do
+    [[ -x "$_fd_cand" ]] || continue
+    _fd_help=$("$_fd_cand" --help 2>"$_fd_err") || _fd_st=$?
+    if [[ -n "$_fd_help" ]]; then
+      FD_BIN=$_fd_cand
+      FD_OK=1
+      break
+    fi
+  done
+  if [[ "$FD_OK" == "1" ]]; then
     case "$_fd_help" in
       # Keep parity with the harness's `find -xdev` when the option exists.
       *--one-file-system*) FD_COMMON_ARGS+=(--one-file-system) ;;
@@ -356,16 +418,18 @@ if [[ -n "$FD_BIN" && -x "$FD_BIN" ]]; then
       *--threads*) FD_COMMON_ARGS+=(--threads "$THREADS") ;;
     esac
   else
-    FD_WHY=$(grep -m1 '.' "$_fd_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
-    if [[ -z "$FD_WHY" ]]; then
-      FD_WHY=$(_probe_loader_hint "$FD_BIN" "$_fd_err")
+    if [[ -x "$FD_BIN" ]]; then
+      FD_WHY=$(grep -m1 '.' "$_fd_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+      if [[ -z "$FD_WHY" ]]; then
+        FD_WHY=$(_probe_loader_hint "$FD_BIN" "$_fd_err")
+      fi
+      [[ -n "$FD_WHY" ]] || FD_WHY="--help exited ${_fd_st} with empty stdout/stderr"
+    else
+      FD_WHY=$(_unexecutable_why "$FD_BIN" "$FD_FIX_HINT")
     fi
-    [[ -n "$FD_WHY" ]] || FD_WHY="--help exited ${_fd_st} with empty stdout/stderr"
   fi
   rm -f "$_fd_err"
-  unset _fd_err _fd_help _fd_st
-elif [[ -n "$FD_BIN" ]]; then
-  FD_WHY=$(_unexecutable_why "$FD_BIN" "$FD_FIX_HINT")
+  unset _fd_err _fd_help _fd_st _fd_candidates _fd_alt _fd_name _fd_cand
 fi
 
 fd_skip_reason() {
@@ -379,7 +443,7 @@ fd_skip_reason() {
 }
 
 # dua (dua-cli) is the Rust du: the parallel "fast du" partner to fd.
-DUA_BIN=${DUA_BIN:-$(command -v dua 2>/dev/null || true)}
+DUA_BIN=$(_resolve_or_find "${DUA_BIN:-}" dua || true)
 DUA_AGG_ARGS=(aggregate)
 DUA_OK=0
 DUA_HAS_BYTES=0
@@ -387,49 +451,41 @@ DUA_HAS_BYTES=0
 # last run looking for a bug in the harness when the binary was simply built
 # somewhere else and says so on its first line of stderr.
 DUA_WHY=""
-if [[ -n "$DUA_BIN" && -x "$DUA_BIN" ]]; then
-  # A dua built against a newer glibc than the host still resolves through
-  # command -v but dies on startup, so require a probe to succeed first.
+if [[ -n "$DUA_BIN" ]]; then
+  # Probe the resolved path first, then any other dua on PATH. A stale env.sh
+  # pin used to win over /usr/bin/dua forever; wrong-glibc prefix builds need
+  # the same escape hatch.
   _dua_err=$(mktemp 2>/dev/null || echo /tmp/ic-dua-probe.$$)
   _dua_st=0
-  _dua_help=$("$DUA_BIN" aggregate --help 2>"$_dua_err") || _dua_st=$?
-  if [[ -n "$_dua_help" ]]; then
-    DUA_OK=1
-    # Apparent size keeps dua on the harness's byte convention (du -sb, ecrawl
-    # logical bytes) instead of allocated blocks.
-    case "$_dua_help" in
-      *--apparent-size*) DUA_AGG_ARGS+=(--apparent-size) ;;
-    esac
-    case "$_dua_help" in
-      *--stay-on-filesystem*) DUA_AGG_ARGS+=(--stay-on-filesystem) ;;
-    esac
-    case "$_dua_help" in
-      *--format*)
-        DUA_AGG_ARGS+=(--format bytes)
-        DUA_HAS_BYTES=1
-        ;;
-    esac
-    case "$_dua_help" in
-      *--no-sort*) DUA_AGG_ARGS+=(--no-sort) ;;
-    esac
-    case "$_dua_help" in
-      *--no-total*) DUA_AGG_ARGS+=(--no-total) ;;
-    esac
-    case "$_dua_help" in
-      *--threads*) DUA_AGG_ARGS+=(--threads "$THREADS") ;;
-    esac
-  else
-    DUA_WHY=$(grep -m1 '.' "$_dua_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
-    if [[ -z "$DUA_WHY" ]]; then
-      DUA_WHY=$(_probe_loader_hint "$DUA_BIN" "$_dua_err")
+  _dua_help=""
+  _dua_path=$(command -v dua 2>/dev/null || true)
+  _dua_candidates=("$DUA_BIN")
+  [[ -n "$_dua_path" && "$_dua_path" != "$DUA_BIN" ]] && _dua_candidates+=("$_dua_path")
+  for _dua_cand in "${_dua_candidates[@]}"; do
+    [[ -x "$_dua_cand" ]] || continue
+    _dua_help=$("$_dua_cand" aggregate --help 2>"$_dua_err") || _dua_st=$?
+    if [[ -n "$_dua_help" ]]; then
+      DUA_BIN=$_dua_cand
+      DUA_OK=1
+      break
     fi
-    [[ -n "$DUA_WHY" ]] || \
-      DUA_WHY="aggregate --help exited ${_dua_st} with empty stdout/stderr"
+  done
+  if [[ "$DUA_OK" == "1" ]]; then
+    _dua_apply_help_flags "$_dua_help"
+  else
+    if [[ -x "$DUA_BIN" ]]; then
+      DUA_WHY=$(grep -m1 '.' "$_dua_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+      if [[ -z "$DUA_WHY" ]]; then
+        DUA_WHY=$(_probe_loader_hint "$DUA_BIN" "$_dua_err")
+      fi
+      [[ -n "$DUA_WHY" ]] || \
+        DUA_WHY="aggregate --help exited ${_dua_st} with empty stdout/stderr"
+    else
+      DUA_WHY=$(_unexecutable_why "$DUA_BIN" "$DUA_FIX_HINT")
+    fi
   fi
   rm -f "$_dua_err"
-  unset _dua_err _dua_help _dua_st
-elif [[ -n "$DUA_BIN" ]]; then
-  DUA_WHY=$(_unexecutable_why "$DUA_BIN" "$DUA_FIX_HINT")
+  unset _dua_err _dua_help _dua_st _dua_path _dua_candidates _dua_cand
 fi
 
 # The skipped rows say why in the tool's own words, so a prefix built on another
@@ -898,6 +954,11 @@ time_cmd() {
       printf 'Elapsed (wall clock) time (h:mm:ss or m:ss): 0:%d.%06d\n' \
         $((us / 1000000)) $((us % 1000000)) >"$out_time"
     printf 'elapsed_sec=%d.%06d\n' $((us / 1000000)) $((us % 1000000)) >>"$out_time"
+    # One quiet progress line per timed binary so a multi-hour run shows what
+    # just finished without dumping argv. fd 9 is the harness console (see
+    # harness_warn); tool stderr may be redirected elsewhere.
+    printf '    %d.%03ds  %s\n' $((us / 1000000)) $(((us % 1000000) / 1000)) \
+      "${label:-untimed}" >&9
   fi
   return "$rc"
 }

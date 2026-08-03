@@ -687,6 +687,7 @@ do_run() {
 
   log "4/5 benchmarking (reps=$(reps_summary) DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
   info "results: $results"
+  info "each timed binary prints one line: <seconds>  <label>"
   SKIP_PREPARE=1 REPS="$REPS" DROP_CACHES="$DROP_CACHES" DROP_DB_CACHE="$DROP_DB_CACHE" \
     DO_NOWRITE="$nowrite" WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
     WITH_EXTERNALS="${WITH_EXTERNALS:-0}" \
