@@ -58,6 +58,40 @@ So the columnar encode is a few percent, and the **catalog** is the larger consu
 - A crawl run by a normal user produces **one** uid shard, because records shard by uid. The per-shard column buffers only multiply on a multi-uid tree (the benchmark tree is generated as root with random owners), so a single-uid reproduction cannot exercise writer memory pressure at all. Peak RSS on the real runs was 499 MB for v8 against 354 MB for v6.
 - Rewriting the writer to stage records row-major and transpose them at flush was tried and measured: instructions moved -0.2%, cycles +2.8%, `dTLB-load-misses` -25%, capture size +0.06%. No wall-clock win on a single-shard tree, so it was not kept. Append into fourteen parallel column arrays is already prefetch-friendly when few shards are open; the trade only plausibly pays with hundreds of shards live, which needs a root-generated multi-uid tree to demonstrate.
 
+### Rejected: widening the stat pool with core count
+
+A 96-core production profile showed `single_huge_dir` spending 96.4% of its CPU inside `fstatat` with the stat pool at its default of 8 threads, which reads like an obvious case for scaling `ECRAWL_STAT_THREADS` with the machine. Measuring it says otherwise.
+
+Sweeping 8/16/32/64 stat threads over a 4M-file `single_huge_dir` on local XFS, 15 interleaved reps per cell, with **two cells declared identically at 8 threads as an A/A control**:
+
+| stat threads | median sec | vs 8 |
+|---|---:|---:|
+| 8 | 2.228 | — |
+| 16 | 2.082 | −6.6% |
+| 8 (A/A control) | 1.806 | −18.9% |
+| 32 | 3.124 | +40.2% |
+
+The control is the result. Two runs of the same configuration differ by 18.9% depending only on where they sit in the rep cycle, so the 6.6% that 16 threads appears to win is not measurable here. What does clear the noise floor is that 32 threads is consistently worse — its *fastest* run is slower than the median at 8. Two earlier sweeps, one under a small memory allocation to force dentry reclaim, agreed on that.
+
+`DEFAULT_STAT_THREADS` stays at 8. The profile's 96% is blocking syscall time, so the useful pool width is set by inode-read latency, not by core count, and a warm local filesystem is not the regime the production number came from — anyone revisiting this needs a cold, high-latency metadata path and an A/A control in the harness.
+
+Stat *ordering* is the same story: `ECRAWL_STAT_INODE_ORDER` and `ECRAWL_STAT_RANDOM_QUEUE` were measured in all four combinations against the 24.3% the profile spends in `xfs_iget_cache_miss`, and every combination landed inside the same noise band. Both defaults stand. Reordering can only pay when the inode cache is cold, and dropping caches needs root.
+
+### Rejected: reading inodes with `XFS_IOC_BULKSTAT`
+
+A production profile (96-core EPYC, XFS) put **66.9%** of `ecrawl` inside `xfs_vn_lookup` — resolving names that `getdents64` had already returned with `d_ino` — and another 24.3% in `xfs_iget_cache_miss`. `XFS_IOC_BULKSTAT` reads inode metadata straight from the inode btree in inode order with no directory lookup at all, which looks like the obvious way to delete that work.
+
+It is not usable here. The kernel gates the ioctl on `CAP_SYS_ADMIN`, and `ecrawl` runs as an ordinary user — it is a tool for looking at your own data, and it shards output by uid. A probe on an XFS scratch filesystem (kernel 5.14, `scripts/` under the automated-testing scratch tree) returns `EPERM` on the first call, before any of the performance questions can be asked. Running the crawler as root to avoid a lookup is not a trade worth making.
+
+The same probe does bound what the lookups cost, by walking a 10,050-entry tree twice:
+
+| pass | µs per entry |
+|---|---:|
+| `getdents64`, names only | 0.23 |
+| `getdents64` + `fstatat` | 1.48 |
+
+So inode reads are roughly 6x the cost of the walk that finds the names, which is the same gap `ecrawl --no-stat` exploits and the ceiling any lookup-avoiding scheme could aim at. Reaching it needs a mechanism an unprivileged process can actually call.
+
 ### `ereport`: reports from crawl bins
 
 - Parallel chunk mapping — Uses `*.ckpt` to build chunk lists (byte ranges that align with record starts). Chunk count scales with file size, so `EREPORT_THREADS` has enough units of work.
@@ -76,6 +110,25 @@ So the columnar encode is a few percent, and the **catalog** is the larger consu
 - Merge phase — Temp bucket files are sorted (radix on packed records), optionally merged with parallel workers subject to a RAM budget, with large buffered I/O and `mmap` where helpful — separate from index-phase throughput but tuned for large disks.
 
 Together, these choices aim to keep CPU, mutexes, and syscalls off the critical path per byte of crawl data, and to use disk bandwidth (especially on NVMe) with large buffered writes instead of tiny random appends per logical record.
+
+### Measured: profile-driven round two
+
+Five changes taken from the 2026-08-02 fixture profiles, each A/B'd against the previous commit on one node with one set of inputs and alternating reps. Where a result was small, the harness declares the same configuration twice as an A/A control, so the noise floor is measured rather than assumed — that control is what turned two of these from "looks like a win" into a decision.
+
+| change | fixture | effect |
+|---|---|---:|
+| size-gate the catalog `mmap` | 8,000-shard corpus | **−23.8%** |
+| parent-map arena + `dir_id` keying | 4M-record whole tree | **−58.5%** |
+| entry-driven work donation | `depth_slash_profile` | **−45.7%** |
+| `wb_arena` chunk freelist | 4M-record index build | **−4.1%** |
+| path length in `path_row_t` | `ereport --bucket-details 4` | within noise |
+
+Notes on the two that need them:
+
+- **Catalog `mmap` gate.** Mapping every catalog regardless of size was a regression on many-small-shard corpora: `munmap` in a multi-threaded process sends a TLB shootdown IPI to every CPU the process has touched, and that cost is per call, not per byte. Below 1 MiB the catalog now loads with plain reads. Measured on 8,000 shards of ~27 KB each: 0.21 s → 0.16 s with no overlap between the two distributions, and byte-identical reports.
+- **Work donation on entries.** Donation used to key only off the local stack growing, which a deep narrow chain never does — one subdirectory per directory never reaches the floor of 8. `depth_slash_profile` ran with `tasks_popped=2` and `donated_dirs=6`; it now reports 6 and 16, and on the whole tree `avg_active_workers` rose from 6–13 to 15–31 at unchanged wall time.
+
+Two items from the same round were measured and **not** taken: the stat-pool width and stat ordering defaults, both above.
 
 ## Synthetic adversarial trees
 

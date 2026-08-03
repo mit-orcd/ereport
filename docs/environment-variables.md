@@ -41,6 +41,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_STAT_RANDOM_QUEUE` | `ecrawl` | `0` = FIFO stat-batch dequeue; non-zero (default `1`) = pseudo-random. |
 | `ECRAWL_STAT_INODE_ORDER` | `ecrawl` | `1` = sort each stat batch by inode before statting (default `0`). |
 | `ECRAWL_DONATE_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in `DT_DIR` pushes (default 64). |
+| `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in dirents, so a deep chain that pushes one subdirectory per directory still sheds work to idle peers (default 4096; `0` disables). |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | `ecrawl` | Max dirs donated per queue push on force spill (default 2048). |
 | `ECRAWL_FORCE_DONATE_AT` | `ecrawl` | Local stack size that triggers force donation (default 4096). |
 | `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | `ecrawl` | Min local stack depth before donating when every crawl thread holds a task (default 64). |
@@ -56,12 +57,13 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `EREPORT_INDEX_THREADS` | `ereport_index --make` / `--search` | Parallel chunk-boundary mapping, index parse workers, and (for `--search`) parallel postings load + path filtering when the query and candidate set are large enough (default 32). Does not set merge worker count. Trigram temp writers default to this count unless `EREPORT_INDEX_TRIGRAM_THREADS` is set. |
 | `EREPORT_INDEX_TRIGRAM_THREADS` | `ereport_index --make` | Parallel writers to `tmp_trigrams_*.bin` (default: same as `EREPORT_INDEX_THREADS` when unset). |
 | `EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH` | `ereport_index --make` | Bounded queue between paths writer and trigram workers (default scales with trigram thread count; range 512…262144). |
+| `EREPORT_INDEX_TRIGRAM_FRAME_BYTES` | `ereport_index --make` | Source bytes per frame written to `tmp_trigrams_*.bin`, rounded down to whole records (default 65536, range 4096…16777216). One frame is buffered per *open* (worker × bucket) shard, so this multiplies with `EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`: larger frames mean fewer, better-compressing writes and fewer reads at merge, at more resident buffer. |
 | `EREPORT_INDEX_WRITE_BATCH_PATHS` | `ereport_index --make` | Base paths-per-batch to the writer (default 4096, range 512…65536; scaled when thread count is high). |
 | `EREPORT_INDEX_WRITEQ_MAX_BATCHES` | `ereport_index --make` | Max depth of batches waiting on the paths writer (default scales with thread count). |
 | `EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS` | `ereport_index --make` | Per-worker LRU cap on `tmp_trigrams_*` shard `FILE*` handles (32…4096; default 4096). Use a high `ulimit -n` for large `--make`. |
 | `EREPORT_INDEX_MERGE_MEMORY_MB` | `ereport_index --make` / merge / resume-merge | Explicit merge RAM budget (MiB) for limiting parallel merge workers (optional). |
 | `EREPORT_INDEX_MERGE_RAM_FRAC` | `ereport_index --make` / merge / resume-merge | Fraction of `min(MemAvailable, cgroup memory.max)` used as that budget (default 0.55). |
-| `EREPORT_INDEX_MERGE_WORKERS` | `ereport_index --make` / merge / resume-merge | Cap on concurrent merge workers (1…4096; default 16, and never more than online CPUs). RAM admission still decides how many run at once, so raising this only helps when the budget has room. |
+| `EREPORT_INDEX_MERGE_WORKERS` | `ereport_index --make` / merge / resume-merge | Cap on concurrent merge workers (1…4096; default 16, and never more than online CPUs or nonempty buckets). RAM admission still decides how many run at once, so raising this only helps when the budget has room. Measured on 8M paths in one directory (34 nonempty buckets, 64 CPUs), `merge_phase_sec` improved from 4.31 s to 2.87 s between 8 and 16 workers and then stopped moving: past 16 the merge is bound by per-bucket decode and sort, not pool size. |
 | `EREPORT_INDEX_MERGE_SORT_THREADS` | `ereport_index --make` / merge / resume-merge | Per-bucket cap on threads for the within-bucket parallel sort (1…4096; default 1 = serial). Worth setting only when the merge is CPU-bound rather than temp-read-bound: on local NVMe it cut `merge_phase_sec` from 0.70 s to 0.33 s at 16, but on a 953M-path build it made the merge slower. |
 | `EREPORT_INDEX_BIN` | `eserve.py` | Absolute path to `ereport_index` if not on `PATH` / next to `eserve.py`. |
 | `EREPORT_SEARCH_INDEX_DIR` | `eserve.py` | Trigram index directory (`tri_keys.bin`). Overridden by `--index-dir`. |
