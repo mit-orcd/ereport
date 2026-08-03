@@ -168,24 +168,55 @@ typedef struct parent_node {
  * plus the merge threads' 23.9%). Sharing the map instead means a parent that spans chunks is simply found
  * by the second worker, and the report reads the map the workers filled.
  */
+/*
+ * Nodes and their path bytes are bump-allocated per worker.
+ *
+ * A node is never freed on its own: it lives until parent_map_free, so the only thing malloc was
+ * buying was a per-node header and a trip through the allocator. On a flat tree that trip dominated
+ * -- 782 K parents across 32 workers meant ~1.5 M glibc allocations, and parent_map_get_or_add came
+ * out at 57.9% of the run with malloc 47.1% of its children and 29.9% self time in osq_lock, which
+ * is threads queueing on the arena locks inside glibc. Bumping a per-worker block removes both the
+ * contention and the matching frees.
+ */
+#define PARENT_ARENA_BLOCK_BYTES ((size_t)1 << 20)
+
+typedef struct parent_arena_block {
+    struct parent_arena_block *next;
+    size_t used;
+    size_t cap;
+    unsigned char data[];
+} parent_arena_block_t;
+
+typedef struct parent_arena {
+    parent_arena_block_t *cur;
+    struct parent_arena *reg_next; /* registered with the map, which owns the blocks */
+} parent_arena_t;
+
 typedef struct {
     _Atomic(parent_node_t *) buckets[ANALYZE_HASH_BUCKETS];
     pthread_mutex_t *stripes;
-    size_t stripe_count; /* power of two; stripe = bucket & (stripe_count - 1) */
+    size_t stripe_count;            /* power of two; stripe = bucket & (stripe_count - 1) */
+    _Atomic(parent_arena_t *) arenas; /* every worker arena, so free() can walk them all */
 } parent_map_t;
 
 /*
- * Per-catalog memo indexed by on-disk parent_dir_id: maps a directory id to its resolved parent node and
- * depth bin. Within one shard catalog, parent_dir_id uniquely identifies a directory (and thus a fixed
- * parent path and slash-count), so repeated child records reuse the result instead of rebuilding the path,
- * hashing it, and walking the bucket chain. Allocation is skipped when a shard's dir-id space is very large.
+ * Memo from a shard's dir_id to the parent node its children belong to: one slot per directory,
+ * shared by every worker on that shard and living exactly as long as the shard's catalog.
+ *
+ * A record's parent is its parent_dir_id's directory, and within one catalog that dir_id names a
+ * fixed path, so the answer is a property of the shard rather than of the worker that asked. On a
+ * hit the whole string path disappears -- no path rebuild, no hash, no strcmp, no bucket walk --
+ * which is what parent_map_get_or_add was charging 57.9% of a flat-tree run for.
+ *
+ * This replaces a per-worker direct-mapped cache. That cache cost 2 MiB of calloc per worker, threw
+ * away everything another worker had already resolved, and on the workload that needed it most --
+ * 782 K directories against 64 K slots -- missed nearly every time. One array per shard is smaller
+ * in total (8 bytes per directory, not per worker), exact, and needs no key or eviction.
+ *
+ * Only the catalog branch writes here: it is the one that proves the parent is pid's directory.
+ * Writers race but agree, since they all resolve the same dir_id to the same node.
  */
-#define ANALYZE_DIR_CACHE_MAX_ENTRIES (4U * 1000U * 1000U)
-typedef struct {
-    parent_node_t *node; /* resolved parent node; NULL if parent could not be derived */
-    unsigned depth_bin;  /* cached depth-histogram bin for entries under this directory */
-    unsigned char state; /* 0=unseen, 1=seen with depth, 2=seen without depth */
-} analyze_dir_cache_ent_t;
+typedef _Atomic(parent_node_t *) analyze_dir_memo_t;
 
 /*
  * Where --subtree lands in one shard's catalog. Membership is the DFS range test
@@ -277,6 +308,7 @@ typedef struct {
      * memory stays bounded for many-shard corpora.
      */
     crawl_bin_catalog_t *shard_cat;       /* array[name_count] */
+    analyze_dir_memo_t **shard_pnode;     /* array[name_count]; per-shard dir_id -> parent node */
     shard_subtree_t *shard_sub;           /* array[name_count]; query mode with --subtree only */
     unsigned char *shard_cat_state;       /* SHARD_CAT_* */
     _Atomic uint64_t *shard_chunks_left;  /* per shard; catalog freed when it reaches 0 */
@@ -651,18 +683,62 @@ static parent_map_t *parent_map_new(unsigned nthreads) {
     return m;
 }
 
+/*
+ * One arena per worker, registered with the map so the map can release the blocks at the end. The
+ * arena is only ever bumped by its owning thread; the registry push is the single shared step.
+ */
+static parent_arena_t *parent_map_arena_new(parent_map_t *m) {
+    parent_arena_t *a;
+
+    if (!m) return NULL;
+    a = (parent_arena_t *)calloc(1, sizeof(*a));
+    if (!a) return NULL;
+    a->reg_next = atomic_load_explicit(&m->arenas, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(&m->arenas, &a->reg_next, a, memory_order_release,
+                                                  memory_order_relaxed)) {
+    }
+    return a;
+}
+
+static void *parent_arena_alloc(parent_arena_t *a, size_t sz) {
+    parent_arena_block_t *b = a->cur;
+    size_t need = (sz + 7U) & ~(size_t)7U; /* keep the next node 8-aligned for its atomics */
+    void *p;
+
+    if (!b || b->cap - b->used < need) {
+        size_t cap = PARENT_ARENA_BLOCK_BYTES > need ? PARENT_ARENA_BLOCK_BYTES : need;
+
+        b = (parent_arena_block_t *)malloc(sizeof(*b) + cap);
+        if (!b) return NULL;
+        b->next = a->cur;
+        b->used = 0;
+        b->cap = cap;
+        a->cur = b;
+    }
+    p = b->data + b->used;
+    b->used += need;
+    return p;
+}
+
 static void parent_map_free(parent_map_t *m) {
+    parent_arena_t *a;
     size_t bi;
 
     if (!m) return;
-    for (bi = 0; bi < ANALYZE_HASH_BUCKETS; bi++) {
-        parent_node_t *n = atomic_load_explicit(&m->buckets[bi], memory_order_relaxed);
-        while (n) {
-            parent_node_t *nx = atomic_load_explicit(&n->next, memory_order_relaxed);
-            free(n->path);
-            free(n);
-            n = nx;
+    /* Nodes and path bytes live in the arenas; the bucket chains are just pointers into them. */
+    a = atomic_load_explicit(&m->arenas, memory_order_acquire);
+    while (a) {
+        parent_arena_t *anext = a->reg_next;
+        parent_arena_block_t *b = a->cur;
+
+        while (b) {
+            parent_arena_block_t *bnext = b->next;
+
+            free(b);
+            b = bnext;
         }
+        free(a);
+        a = anext;
     }
     for (bi = 0; bi < m->stripe_count; bi++) pthread_mutex_destroy(&m->stripes[bi]);
     free(m->stripes);
@@ -704,25 +780,30 @@ static parent_node_t *parent_chain_find(parent_node_t *from, const parent_node_t
  * its nodes are immutable, so a reader either misses a concurrent insert or sees it complete. The stripe
  * lock is held only to publish, and only across the part of the chain that grew since the unlocked walk;
  * the node itself is built before the lock is taken.
+ *
+ * The node comes from the caller's arena in one bump, node and path together. Losing the publish race
+ * rewinds that bump, so the bytes are handed to the next insert rather than freed.
  */
-static parent_node_t *parent_map_get_or_add(parent_map_t *m, const char *parent) {
+static parent_node_t *parent_map_get_or_add(parent_map_t *m, parent_arena_t *arena, const char *parent) {
     uint32_t hx = analyze_hash_parent(parent);
     size_t bi = (size_t)(hx % ANALYZE_HASH_BUCKETS);
     pthread_mutex_t *lock = &m->stripes[bi & (m->stripe_count - 1U)];
     parent_node_t *head = atomic_load_explicit(&m->buckets[bi], memory_order_acquire);
     parent_node_t *node = parent_chain_find(head, NULL, hx, parent);
+    parent_arena_block_t *mark_blk;
+    size_t mark_used;
     size_t path_sz;
 
     if (node) return node;
+    if (!arena) return NULL;
+
+    mark_blk = arena->cur;
+    mark_used = mark_blk ? mark_blk->used : 0U;
 
     path_sz = strlen(parent) + 1U;
-    node = (parent_node_t *)malloc(sizeof(*node));
+    node = (parent_node_t *)parent_arena_alloc(arena, sizeof(*node) + path_sz);
     if (!node) return NULL;
-    node->path = (char *)malloc(path_sz);
-    if (!node->path) {
-        free(node);
-        return NULL;
-    }
+    node->path = (char *)node + sizeof(*node);
     memcpy(node->path, parent, path_sz);
     node->hash = hx;
     atomic_init(&node->nfile, 0ULL);
@@ -737,8 +818,9 @@ static parent_node_t *parent_map_get_or_add(parent_map_t *m, const char *parent)
 
         if (raced) {
             pthread_mutex_unlock(lock);
-            free(node->path);
-            free(node);
+            /* Give the bytes back unless the allocation opened a new block, which is rare enough
+             * that carrying the hole is cheaper than tracking blocks to unwind. */
+            if (arena->cur == mark_blk && mark_blk) mark_blk->used = mark_used;
             return raced;
         }
         atomic_store_explicit(&node->next, cur, memory_order_relaxed);
@@ -1071,8 +1153,8 @@ fail:
 
 static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_exclusive, uint64_t file_sz,
                                  const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
-                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
-                                 analyze_dir_cache_ent_t *dir_cache, uint64_t dir_cache_max, uint64_t *nrec_out) {
+                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, parent_arena_t *arena,
+                                 uint64_t *depth_hist, analyze_dir_memo_t *pnode, uint64_t *nrec_out) {
     uint64_t nrec = 0;
     crawl_bin_block_reader_t br;
     crawl_bin_chunk_stdio_t bio;
@@ -1096,6 +1178,7 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
         bin_record_hdr_t rh;
         const unsigned char *rec_name = NULL;
         uint64_t pid;
+        int by_dir_id;
         int got = crawl_bin_block_reader_next(&br, &rh, &rec_name);
 
         if (got == 0) break;
@@ -1110,64 +1193,61 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
             return -1;
         }
 
-        if (dir_cache && pid <= dir_cache_max && dir_cache[pid].state != 0) {
-            analyze_dir_cache_ent_t *ce = &dir_cache[pid];
+        /*
+         * Every record under pid has pid's directory as its parent and sits one level below it, so the
+         * catalog's own path and depth answer both questions — materialising the record's full path only
+         * to split the parent back off it was the same work twice. A name that is empty or itself holds a
+         * '/' would not split that way, so those still go the long way round.
+         */
+        by_dir_id = (rh.name_len > 0 && memchr(rec_name, '/', rh.name_len) == NULL && pid <= cat->max_dir_id);
 
-            if (ce->state == 1) {
-                depth_hist[ce->depth_bin]++;
-                if (ce->node) parent_node_bump(ce->node, rh.type);
-            }
-        } else {
-            parent_node_t *node = NULL;
-            unsigned db = 0;
-            unsigned char st = 2; /* default: no depth recorded */
-            size_t parent_len = 0;
+        if (by_dir_id) {
+            analyze_dir_memo_t *slot = pnode ? &pnode[pid] : NULL;
+            parent_node_t *node = slot ? atomic_load_explicit(slot, memory_order_acquire) : NULL;
+            unsigned d, db;
 
-            /*
-             * Every record under pid has pid's directory as its parent and sits one level below it, so the
-             * catalog's own path and depth answer both questions — materialising the record's full path only
-             * to split the parent back off it was the same work twice. A name that is empty or itself holds a
-             * '/' would not split that way, so those still go the long way round.
-             */
-            if (rh.name_len > 0 && memchr(rec_name, '/', rh.name_len) == NULL &&
-                crawl_bin_catalog_dir_path_len(cat, pid, parentbuf, 65536U, &parent_len) == 0) {
-                unsigned d = (unsigned)cat->depth[pid] + 1U;
+            if (!node) {
+                size_t parent_len = 0;
 
-                if (parent_len == 0) {
-                    /* pid is the synthetic root: its children are /<name>, whose parent is "/". */
-                    parentbuf[0] = '/';
-                    parentbuf[1] = '\0';
+                if (crawl_bin_catalog_dir_path_len(cat, pid, parentbuf, 65536U, &parent_len) != 0) {
+                    by_dir_id = 0; /* no path for this dir_id; fall through to the full-path route */
+                } else {
+                    if (parent_len == 0) {
+                        /* pid is the synthetic root: its children are /<name>, whose parent is "/". */
+                        parentbuf[0] = '/';
+                        parentbuf[1] = '\0';
+                    }
+                    node = parent_map_get_or_add(map, arena, parentbuf);
+                    if (node && slot) atomic_store_explicit(slot, node, memory_order_release);
                 }
+            }
+            if (by_dir_id) {
+                d = (unsigned)cat->depth[pid] + 1U;
                 db = d >= ANALYZE_DEPTH_BINS ? ANALYZE_DEPTH_BINS - 1U : d;
                 depth_hist[db]++;
-                st = 1;
-                node = parent_map_get_or_add(map, parentbuf);
                 if (node) parent_node_bump(node, rh.type);
-            } else {
-                if (crawl_bin_catalog_entry_path(cat, pid, (char *)rec_name, rh.name_len, fullpath_buf,
-                                                 fullpath_sz) != 0) {
-                    crawl_bin_block_reader_free(&br);
-                    return -1;
-                }
-                {
-                    size_t flen = strlen(fullpath_buf);
-                    uint16_t pl = flen > 65535U ? 65535U : (uint16_t)flen;
-
-                    if (flen > 0) {
-                        db = analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl);
-                        depth_hist[db]++;
-                        st = 1;
-                        if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, 65536U) == 0) {
-                            node = parent_map_get_or_add(map, parentbuf);
-                            if (node) parent_node_bump(node, rh.type);
-                        }
-                    }
-                }
             }
-            if (dir_cache && pid <= dir_cache_max) {
-                dir_cache[pid].node = node;
-                dir_cache[pid].depth_bin = db;
-                dir_cache[pid].state = st;
+        }
+
+        if (!by_dir_id) {
+            size_t flen;
+            uint16_t pl;
+
+            if (crawl_bin_catalog_entry_path(cat, pid, (char *)rec_name, rh.name_len, fullpath_buf, fullpath_sz) !=
+                0) {
+                crawl_bin_block_reader_free(&br);
+                return -1;
+            }
+            flen = strlen(fullpath_buf);
+            pl = flen > 65535U ? 65535U : (uint16_t)flen;
+            if (flen > 0) {
+                parent_node_t *node;
+
+                depth_hist[analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl)]++;
+                if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, 65536U) == 0) {
+                    node = parent_map_get_or_add(map, arena, parentbuf);
+                    if (node) parent_node_bump(node, rh.type);
+                }
             }
         }
         nrec++;
@@ -1523,6 +1603,12 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
         if (g_query.have_gid) proj |= CRAWL_COL_BIT(CRAWL_COL_GID);
         if (g_query.perm_mode) proj |= CRAWL_COL_BIT(CRAWL_COL_MODE);
         (void)crawl_bin_block_reader_set_projection(br, proj);
+        /* The dedup triple is consulted only under `nlink > 1` below, so row groups whose NLINK zone
+         * map tops out at 1 need none of it -- on a tree without hardlinks, that is every group and
+         * three of the seven columns this scan would otherwise decompress. */
+        (void)crawl_bin_block_reader_set_hardlink_columns(br, CRAWL_COL_BIT(CRAWL_COL_INODE) |
+                                                                  CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
+                                                                  CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR));
     }
     if (g_query.block_skip) {
         (void)crawl_bin_block_reader_set_filter(br, g_query.have_size_gt, g_query.size_gt, g_query.type_filter);
@@ -1689,6 +1775,11 @@ static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, s
                     st = SHARD_CAT_READY;
                 /* The loader already frees + re-inits the struct on failure. */
             }
+            /* The dir_id -> parent node memo has the catalog's lifetime and its dir_id space. Running
+             * without it only costs speed, so an allocation failure is not a load failure. */
+            if (st == SHARD_CAT_READY && p->shard_pnode)
+                p->shard_pnode[fi] = (analyze_dir_memo_t *)calloc((size_t)p->shard_cat[fi].max_dir_id + 1U,
+                                                                  sizeof(analyze_dir_memo_t));
             /* Subtree membership belongs to the catalog: same lifetime, built once. */
             if (st == SHARD_CAT_READY && p->shard_sub) {
                 if (subtree_build(&p->shard_cat[fi], &p->shard_sub[fi]) != 0) {
@@ -1722,6 +1813,10 @@ static void analyze_release_shard_chunk(analyze_pool_t *p, size_t fi) {
         if (p->shard_cat_state[fi] == SHARD_CAT_READY) {
             crawl_bin_catalog_free(&p->shard_cat[fi]);
             if (p->shard_sub) subtree_free(&p->shard_sub[fi]);
+            if (p->shard_pnode) {
+                free(p->shard_pnode[fi]);
+                p->shard_pnode[fi] = NULL;
+            }
             p->shard_cat_state[fi] = SHARD_CAT_FREED;
         }
         pthread_mutex_unlock(&p->shard_cat_lock);
@@ -1739,8 +1834,12 @@ static void analyze_free_shard_catalogs(analyze_pool_t *p, size_t name_count) {
                 if (p->shard_sub) subtree_free(&p->shard_sub[fi]);
             }
     }
+    if (p->shard_pnode)
+        for (fi = 0; fi < name_count; fi++) free(p->shard_pnode[fi]);
     free(p->shard_sub);
     p->shard_sub = NULL;
+    free(p->shard_pnode);
+    p->shard_pnode = NULL;
     free(p->shard_cat);
     free(p->shard_cat_state);
     free((void *)p->shard_chunks_left);
@@ -1751,8 +1850,8 @@ static void analyze_free_shard_catalogs(analyze_pool_t *p, size_t name_count) {
 
 static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
                                  const crawl_bin_catalog_t *cat, unsigned char *pathbuf, char *parentbuf,
-                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, uint64_t *depth_hist,
-                                 uint64_t *nrec_out) {
+                                 char *fullpath_buf, size_t fullpath_sz, parent_map_t *map, parent_arena_t *arena,
+                                 uint64_t *depth_hist, analyze_dir_memo_t *pnode, uint64_t *nrec_out) {
     FILE *fp;
     int rc;
 
@@ -1770,18 +1869,8 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
         crawl_fpcache_fclose(fp);
         return -1;
     }
-    {
-        analyze_dir_cache_ent_t *dir_cache = NULL;
-        uint64_t dir_cache_max = cat->max_dir_id;
-
-        /* Memo for repeated parent_dir_id within this chunk; skip when the dir-id space is too large to be worth it. */
-        if (dir_cache_max > 0ULL && dir_cache_max < (uint64_t)ANALYZE_DIR_CACHE_MAX_ENTRIES)
-            dir_cache = (analyze_dir_cache_ent_t *)calloc((size_t)dir_cache_max + 1U, sizeof(*dir_cache));
-
-        rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, cat, pathbuf, parentbuf, fullpath_buf,
-                                   fullpath_sz, map, depth_hist, dir_cache, dir_cache_max, nrec_out);
-        free(dir_cache);
-    }
+    rc = analyze_scan_fp_until(fp, start_off, end_off, file_sz, cat, pathbuf, parentbuf, fullpath_buf, fullpath_sz,
+                               map, arena, depth_hist, pnode, nrec_out);
     crawl_fpcache_fclose(fp);
     return rc;
 }
@@ -2150,8 +2239,10 @@ static void *analyze_worker_main(void *arg) {
     unsigned char *pathbuf = (unsigned char *)malloc(65536);
     char *parentbuf = (char *)malloc(65536);
     char *fullpath_buf = (char *)malloc(PATH_MAX);
+    /* Owned by the map, which frees its blocks once the report has read the nodes out of them. */
+    parent_arena_t *arena = parent_map_arena_new(map);
 
-    if (!map || !dh || !pathbuf || !parentbuf || !fullpath_buf) {
+    if (!map || !dh || !pathbuf || !parentbuf || !fullpath_buf || !arena) {
         free(fullpath_buf);
         free(pathbuf);
         free(parentbuf);
@@ -2177,8 +2268,10 @@ static void *analyze_worker_main(void *arg) {
         {
             const crawl_bin_catalog_t *cat = analyze_get_shard_catalog(p, c->file_index, c->path);
 
+            analyze_dir_memo_t *pnode = p->shard_pnode ? p->shard_pnode[c->file_index] : NULL;
+
             ar = cat ? analyze_process_chunk(c->path, c->start_offset, c->end_offset, fsz, cat, pathbuf, parentbuf,
-                                             fullpath_buf, PATH_MAX, map, dh, &nrec)
+                                             fullpath_buf, PATH_MAX, map, arena, dh, pnode, &nrec)
                      : -1;
             analyze_release_shard_chunk(p, c->file_index);
         }
@@ -2572,11 +2665,15 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     pool.shard_cat = (crawl_bin_catalog_t *)calloc(name_count, sizeof(*pool.shard_cat));
     pool.shard_cat_state = (unsigned char *)calloc(name_count, sizeof(*pool.shard_cat_state));
     pool.shard_chunks_left = (_Atomic uint64_t *)calloc(name_count, sizeof(*pool.shard_chunks_left));
-    if (!pool.shard_cat || !pool.shard_cat_state || !pool.shard_chunks_left) {
+    /* Only the shape pass resolves parents; query mode never reads the memo. */
+    if (!g_query.active) pool.shard_pnode = (analyze_dir_memo_t **)calloc(name_count, sizeof(*pool.shard_pnode));
+    if (!pool.shard_cat || !pool.shard_cat_state || !pool.shard_chunks_left ||
+        (!g_query.active && !pool.shard_pnode)) {
         perror("ecrawl_analyze: alloc");
         free(pool.shard_sub);
         free(pool.shard_cat);
         free(pool.shard_cat_state);
+        free(pool.shard_pnode);
         free(pool.shard_chunks_left);
         analyze_shard_cat_sync_destroy(&pool);
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
