@@ -51,6 +51,20 @@
 #define ALLOC_PREFAULT_MIN_BYTES (1u * 1024u * 1024u)
 #endif
 
+/*
+ * jemalloc reads this global once at init, when it is interposed. It is the same argument as
+ * M_TRIM_THRESHOLD above: the default purges dirty pages after 10 s and muzzy pages immediately, so a
+ * phase that frees and reallocates at the same size keeps handing pages back and faulting them in
+ * again. Holding both for 30 s keeps that memory in the process for the length of a phase.
+ *
+ * Harmless under glibc, which has no such symbol and simply leaves it unused, and jemalloc still lets
+ * MALLOC_CONF in the environment override it, so before/after profiling needs no rebuild. Defined in
+ * a header only because each binary includes this from exactly one translation unit.
+ */
+#ifndef EREPORT_NO_MALLOC_CONF
+const char *malloc_conf = "dirty_decay_ms:30000,muzzy_decay_ms:30000";
+#endif
+
 static inline void tune_allocator(void) {
 #ifdef __GLIBC__
     const char *off = getenv("EREPORT_ALLOC_TUNE");
