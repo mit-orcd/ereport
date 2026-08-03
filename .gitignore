@@ -14,6 +14,7 @@ __pycache__/
 /ecrawl_repair
 /ecrawl_analyze
 /test_crawl_block_filter
+/test_crawl_catalog
 /test_crawl_codec
 /edelete
 /ecrawl_mount

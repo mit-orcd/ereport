@@ -130,6 +130,29 @@ Notes on the two that need them:
 
 Two items from the same round were measured and **not** taken: the stat-pool width and stat ordering defaults, both above.
 
+### Rejected: catalog slot defaulting, and a cap on the fpcache buffer
+
+The 2026-08-03 `ecrawl_analyze` profile put `catalog_ensure_slots` at 5.97% self time on `neutral_flat` and `crawl_fpcache_fopen` at ~31% inclusive on a many-shard capture. Neither converted into recoverable time. Both attempts are recorded here because the instruction counts show precisely *why*, and because the same reasoning would otherwise be tried again.
+
+Setup for every number below: one exclusive node (`node5103`, `mit_preemptable`, AMD EPYC 9654, Rocky 8.10), 32 threads, the `r6/binroot` v8 captures on NFS, page cache warmed once per build, 31 alternating reps, default allocator. The baseline is the working tree with *only* the change under test reversed — not `HEAD`, because the tree already carried unrelated edits to `crawl_bin_block.c`, `ecrawl.c` and `ecrawl_analyze.c` that an A/B against `HEAD` would have credited here. `diff -r` confirmed the two trees differed in one file. "Noise" means the gap did not exceed twice the standard error of the difference; with 31 reps that threshold is about 1.2% of task-clock, so an effect larger than that would have been visible.
+
+`catalog_ensure_slots` defaulted 18 arrays one `dir_id` at a time and `catalog_store_entry` then overwrote all 18, so on a dense shard every one of those stores is dead. Two ways to stop paying for them were measured on `neutral_flat` (782,402 parents, one shard):
+
+| | instructions | task-clock | cycles | page-faults | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| bulk `memset` per array | **−14,085,195 (−1.43%)** | +1.12% | +1.31% | −0.01% | +0.15% |
+| skip the slot entirely | **−15,675,222 (−1.60%)** | −0.72% | +0.13% | −0.00% | +0.05% |
+
+Every column but the first is noise. The instruction column is not: its spread is ±0.011%, and the first row lands within 0.014% of the arithmetic (782,402 directories × 18 arrays = 14,083,236 stores). The mechanism is exactly as described, and it is worth nothing.
+
+The first attempt bulk-defaulted slots `1..n` up front, which both loaders can do because they know the entry count before they parse. That only *vectorized* the stores — the same bytes are still written, as one AVX-512 `memset` per array instead of scalar stores striped across 18 — so the page-fault count does not move and neither does the time. The second attempt stopped writing them at all: defaulting only the gap strictly below `dir_id`, on the contract that the caller stores that entry immediately. It removes 1.6% of all instructions the program executes and still does not move the clock, because `catalog_store_entry` pulls those same cache lines in regardless. The defaulting stores were never the cost — they were absorbed by lines that the very next instruction was going to dirty anyway. What the pass is actually bound by is visible in its profile: `__memmove_avx512` at 27.5% and `analyze_scan_fp_until` at 21.6%, with `crawl_bin_catalog_load_sel` at 7.2%.
+
+On `wide_shallow` and `single_huge_dir` the instruction delta is under 13,000 and every metric is noise, which is the expected shape — 491 parents have no defaulting worth skipping.
+
+**The fpcache buffer cap is rejected outright.** `ecrawl_analyze` requests a 1 MiB `setvbuf` buffer on every real open; capping it at the file's own size was expected to cut resident memory on a many-shard capture. Measured on 1,000 synthetic 12 KB shards it changed nothing: instructions +0.01%, task-clock +1.01%, page-faults +0.14%, peak RSS +3.76%, all noise. The premise was wrong twice over. A 1 MiB buffer that stdio only fills to 12 KB costs 12 KB of resident memory rather than 1 MiB, because the untouched pages never become resident — peak RSS for that entire run is ~10 MB. And the `munmap` TLB-shootdown cost that motivated it cannot arise, because `tune_allocator()` raises glibc's `mmap` threshold from 128 KiB to 32 MiB and nothing in the tree sets `EREPORT_ALLOC_TUNE=0`.
+
+What survives from this round is `test_crawl_catalog`, 390 checks wired into `make check`. It drives synthetic catalog blobs through both the mapped and the stdio loader and asserts that a slot no entry ever claims still reads as unwritten — in particular that `imm_child_min_eff_time` stays `UINT64_MAX` instead of becoming the epoch, which is the one default that is not zero and the one failure that would be silent rather than a crash. It covers sparse ids, ids arriving out of order, ids past the entry count, all four `CRAWL_CAT_*` gate combinations, and a reused catalog struct, and it passes identically on the baseline and on both attempts. `ecrawl_analyze`'s own key=value output was byte-identical across all three fixtures as well.
+
 ## Synthetic adversarial trees
 
 `scripts/fixtures/generate-ecrawl-adversarial-tree.sh` builds stress layouts for `ecrawl` (flat megadir, optional depth chain, wide fan-out, optional `ecrawl_analyze` depth slices, optional ereport badge fixtures). Choose scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).

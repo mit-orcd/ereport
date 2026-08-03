@@ -160,6 +160,9 @@ test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
 test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS)
 
+test_crawl_catalog: test_crawl_catalog.c crawl_bin_catalog.o
+	$(CC) $(CFLAGS) -o $@ test_crawl_catalog.c crawl_bin_catalog.o
+
 ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
@@ -212,7 +215,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter test_crawl_codec *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -223,9 +226,10 @@ serve-public:
 	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
-check: $(TARGETS) test_crawl_codec test_crawl_block_filter
+check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog
 	./test_crawl_codec
 	./test_crawl_block_filter
+	./test_crawl_catalog
 	./scripts/test/test.sh
 
 # Larger fixture under ./test (see scripts/test/test_setup.sh), then same correlation as check
