@@ -28,7 +28,17 @@ typedef struct crawl_bin_catalog {
     uint64_t *parent_dir_id; /* index by dir_id; 0 unused */
     uint32_t *depth;
     uint16_t *name_len;
-    char **name_comp; /* owned strdup per component; NULL if name_len==0 */
+    /*
+     * Component name, exactly name_len bytes. NULL if name_len == 0.
+     *
+     * NOT NUL-terminated when names_borrowed is set: the load path maps the shard and points these
+     * straight at the mapped bytes, so a shard with a million directories costs one mapping instead
+     * of a million small allocations. Always read these with name_len; never strlen/strcmp them.
+     */
+    char **name_comp;
+    int names_borrowed; /* name_comp points into map_base and must not be freed per entry */
+    void *map_base;     /* mapping backing the borrowed names; munmap'd by crawl_bin_catalog_free */
+    size_t map_len;
 
     /*
      * Per-directory rollups over immediate child records (records whose on-disk

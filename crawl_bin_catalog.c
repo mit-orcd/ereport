@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 void crawl_bin_catalog_init_empty(crawl_bin_catalog_t *c) {
     if (!c) return;
@@ -23,10 +25,13 @@ void crawl_bin_catalog_free(crawl_bin_catalog_t *c) {
     if (c->depth) free(c->depth);
     if (c->name_len) free(c->name_len);
     if (c->name_comp) {
-        /* Slot 0 is unused (dir_ids are 1-based); never initialized by catalog_ensure_slots. */
-        for (i = 1; i <= c->max_dir_id; i++) free(c->name_comp[i]);
+        /* Borrowed names live in the mapping released below, so only owned ones are freed here.
+         * Slot 0 is unused (dir_ids are 1-based); never initialized by catalog_ensure_slots. */
+        if (!c->names_borrowed)
+            for (i = 1; i <= c->max_dir_id; i++) free(c->name_comp[i]);
         free(c->name_comp);
     }
+    if (c->map_base) munmap(c->map_base, c->map_len);
     free(c->imm_child_bytes);
     free(c->imm_child_count);
     free(c->imm_child_ctime_led_count);
@@ -146,6 +151,123 @@ int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, 
     return crawl_bin_catalog_load_sel(fp, catalog_offset, file_sz, CRAWL_CAT_ALL, out);
 }
 
+/* Copy one parsed entry's fields into the catalog arrays. Shared by the mapped and stdio loaders so
+ * the two paths cannot drift; the name is stored by the caller, which knows if it owns the bytes. */
+static void catalog_store_entry(crawl_bin_catalog_t *out, uint64_t did, const bin_dir_catalog_entry_t *ent) {
+    out->parent_dir_id[did] = ent->parent_dir_id;
+    out->depth[did] = ent->depth;
+    out->name_len[did] = ent->name_len;
+    if (out->fields & CRAWL_CAT_IMM_CHILD) {
+        out->imm_child_bytes[did] = ent->imm_child_bytes;
+        out->imm_child_count[did] = ent->imm_child_count;
+        out->imm_child_ctime_led_count[did] = ent->imm_child_ctime_led_count;
+        out->imm_child_min_eff_time[did] = ent->imm_child_min_eff_time;
+        out->imm_child_max_eff_time[did] = ent->imm_child_max_eff_time;
+    }
+    if (out->fields & CRAWL_CAT_SUBTREE) {
+        out->dfs_index[did] = ent->dfs_index;
+        out->dfs_subtree_dirs[did] = ent->dfs_subtree_dirs;
+        out->subtree_bytes[did] = ent->subtree_bytes;
+        out->subtree_count[did] = ent->subtree_count;
+        out->subtree_nlink_gt1_count[did] = ent->subtree_nlink_gt1_count;
+        out->subtree_files[did] = ent->subtree_files;
+        out->subtree_dirs[did] = ent->subtree_dirs;
+        out->subtree_symlinks[did] = ent->subtree_symlinks;
+        out->self_bytes[did] = ent->self_bytes;
+        out->self_present[did] = (ent->flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1U : 0U;
+    }
+}
+
+/*
+ * Below this many catalog bytes, read with stdio instead of mapping.
+ *
+ * A mapping is not free to take down: munmap in a multi-threaded process sends a TLB shootdown IPI
+ * to every CPU the process has run on, and that cost does not shrink with the mapping. On a crawl
+ * split into 1019 small shards, ecrawl_analyze spent 22.5% of the run inside
+ * crawl_bin_catalog_load_sel and crawl_bin_catalog_free -- 8.4% in munmap alone, with
+ * smp_call_function_many_cond, tlb_is_not_lazy and flush_tlb_func together near a third of all
+ * samples on a 32-thread run across 96 CPUs. One large catalog still wins from mapping, so gate on
+ * size rather than dropping the path.
+ */
+#define CATALOG_MMAP_MIN_BYTES (1ULL << 20)
+
+/*
+ * Parse the catalog straight out of a read-only mapping of the shard.
+ *
+ * Two costs disappear versus the stdio walk: the per-entry fread/ftello pair, and the malloc+copy
+ * that gave every directory name its own heap block. Names instead point into the mapping, so a
+ * shard with a million directories holds one VMA of page cache rather than a million allocations --
+ * which is also why they are not NUL-terminated (see name_comp in the header).
+ *
+ * Returns 0 on success, -1 with the catalog left empty so the caller can fall back to stdio.
+ */
+static int catalog_load_mapped(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, uint64_t n,
+                               crawl_bin_catalog_t *out) {
+    long page = sysconf(_SC_PAGESIZE);
+    uint64_t base_off, map_len;
+    unsigned char *map, *p, *end;
+    uint64_t i;
+    int fd;
+
+    if (page <= 0) return -1;
+    fd = fileno(fp);
+    if (fd < 0) return -1;
+
+    base_off = catalog_offset & ~((uint64_t)page - 1ULL);
+    map_len = file_sz - base_off;
+    if (map_len > (uint64_t)SIZE_MAX) return -1;
+
+    map = (unsigned char *)mmap(NULL, (size_t)map_len, PROT_READ, MAP_PRIVATE, fd, (off_t)base_off);
+    if (map == MAP_FAILED) return -1;
+
+    /* The walk is a single forward pass, so tell the kernel to read ahead instead of faulting it in
+     * one page at a time. Advisory: a failure here costs speed, never correctness. */
+    (void)madvise(map, (size_t)map_len, MADV_WILLNEED);
+    (void)madvise(map, (size_t)map_len, MADV_SEQUENTIAL);
+
+    end = map + map_len;
+    p = map + (catalog_offset - base_off) + sizeof(uint64_t); /* skip the entry count */
+
+    /* dir_ids are handed out densely from 1, so the entry count sizes the arrays: reserving up front
+     * collapses the doubling walk into one allocation per array. A sparse shard still grows. */
+    if (catalog_reserve_cap(out, n) != 0) goto fail;
+
+    for (i = 0; i < n; i++) {
+        bin_dir_catalog_entry_t ent;
+        uint64_t did;
+        size_t nl;
+
+        if ((size_t)(end - p) < sizeof(ent)) goto fail;
+        memcpy(&ent, p, sizeof(ent)); /* the on-disk struct is packed; copy out to stay aligned */
+        p += sizeof(ent);
+
+        did = ent.dir_id;
+        if (did == 0) goto fail;
+        if (catalog_ensure_slots(out, did) != 0) goto fail;
+
+        nl = (size_t)ent.name_len;
+        if ((size_t)(end - p) < nl) goto fail;
+        out->name_comp[did] = (nl > 0) ? (char *)p : NULL;
+        p += nl;
+
+        catalog_store_entry(out, did, &ent);
+    }
+
+    out->names_borrowed = 1;
+    out->map_base = map;
+    out->map_len = (size_t)map_len;
+    /* Leave the stream where the stdio loader would have left it, since callers reuse the handle. */
+    (void)fseeko(fp, (off_t)(base_off + (uint64_t)(p - map)), SEEK_SET);
+    return 0;
+
+fail:
+    /* Drop the arrays before unmapping: they may hold pointers into the mapping. */
+    out->names_borrowed = 1;
+    crawl_bin_catalog_free(out);
+    munmap(map, (size_t)map_len);
+    return -1;
+}
+
 int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, unsigned fields,
                                crawl_bin_catalog_t *out) {
     uint64_t n, i;
@@ -165,6 +287,16 @@ int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_
     if (n > (uint64_t)(1ULL << 28)) {
         errno = EINVAL;
         return -1;
+    }
+
+    if (n > 0 && (file_sz - catalog_offset) >= CATALOG_MMAP_MIN_BYTES) {
+        unsigned saved_fields = out->fields;
+
+        if (catalog_load_mapped(fp, catalog_offset, file_sz, n, out) == 0) return 0;
+        /* Mapping failed or the blob did not parse; retry with plain reads. */
+        crawl_bin_catalog_init_empty(out);
+        out->fields = saved_fields;
+        if (fseeko(fp, (off_t)(catalog_offset + sizeof(uint64_t)), SEEK_SET) != 0) return -1;
     }
 
     /* ecrawl hands out dir_ids densely from 1, so the entry count is the array size: reserving it up
@@ -203,28 +335,7 @@ int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_
             if (!out->name_comp[did]) goto fail;
             memcpy(out->name_comp[did], tmp_name, nl + 1);
         }
-        out->parent_dir_id[did] = ent.parent_dir_id;
-        out->depth[did] = ent.depth;
-        out->name_len[did] = ent.name_len;
-        if (out->fields & CRAWL_CAT_IMM_CHILD) {
-            out->imm_child_bytes[did] = ent.imm_child_bytes;
-            out->imm_child_count[did] = ent.imm_child_count;
-            out->imm_child_ctime_led_count[did] = ent.imm_child_ctime_led_count;
-            out->imm_child_min_eff_time[did] = ent.imm_child_min_eff_time;
-            out->imm_child_max_eff_time[did] = ent.imm_child_max_eff_time;
-        }
-        if (out->fields & CRAWL_CAT_SUBTREE) {
-            out->dfs_index[did] = ent.dfs_index;
-            out->dfs_subtree_dirs[did] = ent.dfs_subtree_dirs;
-            out->subtree_bytes[did] = ent.subtree_bytes;
-            out->subtree_count[did] = ent.subtree_count;
-            out->subtree_nlink_gt1_count[did] = ent.subtree_nlink_gt1_count;
-            out->subtree_files[did] = ent.subtree_files;
-            out->subtree_dirs[did] = ent.subtree_dirs;
-            out->subtree_symlinks[did] = ent.subtree_symlinks;
-            out->self_bytes[did] = ent.self_bytes;
-            out->self_present[did] = (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1U : 0U;
-        }
+        catalog_store_entry(out, did, &ent);
     }
 
     free(tmp_name);
