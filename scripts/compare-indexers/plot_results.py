@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create paper-style Figure 1 and Figure 3 from comparison CSV results.
+"""Create the comparison figures from the harness CSV results.
 
 Usage:
   plot_results.py <smoke-results> [<smoke-results> ...] [--out-dir DIR]
@@ -32,32 +32,44 @@ except ImportError:
     raise SystemExit(2)
 
 
-# Each indexer is one or more measured phases. Naming the phases beats a single
-# opaque "suite" bar: a reader comparing against a one-shot indexer needs the
-# total, and a reader tuning ecrawl needs to know which half to attack.
+# gufi_dir2index runs twice per repetition: once for the plain index, and once
+# more into a second directory so the rollup pass has something to chew on
+# without destroying the first. Identical command either way (see the run's
+# COMMANDS.txt), so the two variants are one measurement with twice the
+# repetitions, not two builds to be charted side by side.
+GUFI_DIR2INDEX = (("gufi", "plain"), ("gufi", "rollup_index"))
+
+# Each indexer is one or more measured phases, and a phase pools every variant
+# that ran the same command. Naming the phases beats a single opaque "suite"
+# bar: a reader comparing against a one-shot indexer needs the total, and a
+# reader tuning ecrawl needs to know which half to attack.
 PIPELINES = [
     (
         "ecrawl + ereport_index",
-        [(("ecrawl", "write"), "crawl"), (("ereport_index", "make"), "trigram index")],
+        [
+            ((("ecrawl", "write"),), "crawl"),
+            ((("ereport_index", "make"),), "trigram index"),
+        ],
         "ecrawl",  # label when only the first phase ran
     ),
-    ("Robinhood", [(("robinhood", "scan"), "scan")], None),
-    ("GUFI", [(("gufi", "plain"), "dir2index")], None),
+    ("Robinhood", [((("robinhood", "scan"),), "scan")], None),
+    ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "dir2index")], None),
     (
-        "GUFI rollup",
-        [(("gufi", "rollup_index"), "dir2index"), (("gufi", "rollup_step"), "rollup")],
+        # An alternative to the row above, never an addition to it: rollup is a
+        # second pass over the index that copies each directory's rows up into
+        # its ancestors so a query opens fewer databases.
+        "GUFI + rollup",
+        [(GUFI_DIR2INDEX, "dir2index"), ((("gufi", "rollup_step"),), "rollup")],
         None,
     ),
-    # Runs before this fix timed dir2index only and called it the rollup.
-    ("GUFI rollup", [(("gufi", "rollup"), "dir2index + rollup")], None),
-    ("XDU", [(("xdu", "index"), "index")], None),
+    ("XDU", [((("xdu", "index"),), "index")], None),
 ]
 INDEX_ORDER = [
     "ecrawl + ereport_index",
     "ecrawl",
     "Robinhood",
-    "GUFI",
-    "GUFI rollup",
+    "GUFI (dir2index)",
+    "GUFI + rollup",
     "XDU",
 ]
 
@@ -74,14 +86,7 @@ WALK_LABELS = {
     ("dua", "walk"): "dua",
 }
 
-# Figure 1 also carries the capture itself, so the walk everything here shares
-# can be read directly against what it costs to keep what that walk found.
-# Deliberately not a WALK_VARIANT: the traversal floor on Figure 3 has to be
-# the fastest *bare* walk, and a run that also writes cannot be allowed to set
-# it.
-CAPTURE_ROW = ("ecrawl", "write")
-CAPTURE_LABEL = "ecrawl"
-WALK_CHART_ORDER = ["ecrawl", "ecrawl --no-write", "fd", "find", "du", "dua"]
+WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua"]
 QUERY_ORDER = [
     "ecrawl_analyze",
     "ereport",
@@ -109,16 +114,14 @@ QUERY_TITLES = {
 COLORS = {
     "ecrawl + ereport_index": "#0072B2",
     "ecrawl": "#0072B2",
-    # Its own hue rather than ecrawl's blue: it is a diagnostic mode that
-    # appears on Figure 1 alone, and on that figure it sits directly beside the
-    # real ecrawl. Sharing a colour there would read as one tool measured twice.
-    "ecrawl --no-write": "#E69F00",
+    "ecrawl --no-write": "#0072B2",
     "ereport": "#0072B2",
     "ecrawl_analyze": "#0072B2",
     "ereport_index": "#56B4E9",
     "Robinhood": "#D55E00",
     "GUFI": "#009E73",
-    "GUFI rollup": "#8FA01F",
+    "GUFI (dir2index)": "#009E73",
+    "GUFI + rollup": "#8FA01F",
     "XDU": "#CC79A7",
     "find": "#7A7A7A",
     "fd": "#B09070",
@@ -214,6 +217,21 @@ def dataset_label(root, index_csv, explicit):
     return name
 
 
+def query_index_note(query_csv):
+    """Which build answered the queries, when the run indexed the same tree
+    more than one way. GUFI's query times belong to whichever index the harness
+    pointed gufi_find at, and a rolled-up index costs several times what the
+    plain one did to build -- so the query figure has to say which it was."""
+    if not query_csv:
+        return ""
+    root = kv_file(query_csv.parent / "env.txt").get("gufi_index_root", "")
+    if not root:
+        return ""
+    name = Path(root).name
+    kind = "rolled-up" if "rollup" in name else "plain"
+    return "GUFI answered from its {} index ({}).".format(kind, name)
+
+
 def run_conditions(env, reps):
     """One line of the conditions a reader needs to judge the numbers."""
     bits = []
@@ -279,16 +297,56 @@ def group_index(rows):
     return grouped
 
 
+def phase_rows(grouped, keys):
+    """Every repetition of a phase, pooling variants that ran the same command."""
+    selected = []
+    for key in keys:
+        selected.extend(grouped.get(key, []))
+    return selected
+
+
+def row_file_count(rows):
+    """How many files the run walked. The same for every row, since every tool
+    was pointed at the same tree."""
+    for row in rows:
+        try:
+            count = int(row.get("file_count") or 0)
+        except ValueError:
+            continue
+        if count > 0:
+            return count
+    return 0
+
+
+def rate_stats(count, mean, std):
+    """Files per second, with the spread carried across from the seconds.
+
+    The rate is one measured quantity inverted, so a 2% spread in seconds is a
+    2% spread in files per second; recomputing it per repetition would say the
+    same thing with more arithmetic.
+    """
+    if not count or not mean:
+        return None, None
+    rate = count / mean
+    return rate, rate * (std / mean) if std else 0.0
+
+
+def mib(rows):
+    return [value / (1024.0 * 1024.0) for value in floats(rows, "index_bytes")]
+
+
 def index_metrics(rows):
-    """Per pipeline: the total, plus every phase that was measured separately."""
+    """Per pipeline: elapsed time, the rate it works out to, what it left on
+    disk, and every phase that was measured separately."""
     grouped = group_index(rows)
+    count = row_file_count(rows)
     result = {}
     for label, phases, solo_label in PIPELINES:
         present = []
-        for key, phase_name in phases:
-            selected = grouped.get(key, [])
-            times = floats(selected, "sec_per_1M_files")
-            sizes = floats(selected, "mib_per_1M_files")
+        for keys, phase_name in phases:
+            selected = phase_rows(grouped, keys)
+            times = floats(selected, "elapsed_sec")
+            sizes = mib(selected)
             if times or sizes:
                 present.append((phase_name, times, sizes))
         if not present:
@@ -299,14 +357,19 @@ def index_metrics(rows):
             label = solo_label
         if label in result:
             continue
-        entry = {
-            "time": combine_stats([p[1] for p in present])
+        time = (
+            combine_stats([p[1] for p in present])
             if all(p[1] for p in present)
-            else mean_std(present[0][1]),
-            "size": combine_stats([p[2] for p in present])
+            else mean_std(present[0][1])
+        )
+        size = (
+            combine_stats([p[2] for p in present])
             if all(p[2] for p in present)
-            else mean_std(present[0][2]),
-        }
+            else mean_std(present[0][2])
+        )
+        entry = {"time": time, "size": size, "rate": rate_stats(count, *time)}
+        if size[0] and count:
+            entry["per_file"] = size[0] * 1024.0 * 1024.0 / count
         if len(present) > 1:
             entry["components"] = [
                 (name, mean_std(times)[0], mean_std(sizes)[0])
@@ -323,7 +386,7 @@ def walk_floor(rows):
     for (tool, variant), selected in grouped.items():
         if variant not in WALK_VARIANTS:
             continue
-        times = floats(selected, "sec_per_1M_files")
+        times = floats(selected, "elapsed_sec")
         if not times:
             continue
         mean = statistics.mean(times)
@@ -334,89 +397,20 @@ def walk_floor(rows):
 
 
 def walk_metrics(rows):
-    """Traversal rows as their own ranking rather than a single floor line: the
-    bare walkers, plus ecrawl's capture so the walk and the price of storing
-    what it found are on one axis.
-
-    Each entry carries what the tool left on disk, which is what separates the
-    two classes on the chart. A walker's zero is a measurement rather than a
-    missing value, so it is recorded as one.
-    """
+    """Traversal rows: every tool here walks the whole tree and stores nothing,
+    which makes them the one group that compares with no asterisk at all."""
     grouped = group_index(rows)
+    count = row_file_count(rows)
     result = {}
     for (tool, variant), selected in grouped.items():
-        if (tool, variant) == CAPTURE_ROW:
-            label = CAPTURE_LABEL
-        elif variant in WALK_VARIANTS:
-            label = WALK_LABELS.get((tool, variant)) or "{} {}".format(tool, variant)
-        else:
+        if variant not in WALK_VARIANTS:
             continue
-        times = floats(selected, "sec_per_1M_files")
+        label = WALK_LABELS.get((tool, variant)) or "{} {}".format(tool, variant)
+        times = floats(selected, "elapsed_sec")
         if not times:
             continue
-        stored, _ = mean_std(floats(selected, "mib_per_1M_files"))
-        result[label] = {"time": mean_std(times), "stored": stored or 0.0}
-    return result
-
-
-def measured_build_only(rows):
-    """The build cost of the suite with its own traversal removed, which is the
-    one pipeline here where both halves are known.
-
-    The two halves are known in different ways, and the difference matters
-    enough to carry: writing the capture is fused into ecrawl's walk exactly as
-    GUFI's write is fused into its own, so it can only be inferred by
-    subtraction; the trigram build is a separate command reading the shards
-    rather than the tree, so it is timed outright and needs no subtraction.
-    """
-    grouped = group_index(rows)
-    write = floats(grouped.get(("ecrawl", "write"), []), "sec_per_1M_files")
-    nowrite = floats(grouped.get(("ecrawl", "nowrite"), []), "sec_per_1M_files")
-    if not write or not nowrite:
-        return None
-    store = statistics.mean(write) - statistics.mean(nowrite)
-    if store <= 0:
-        # The walk measured slower than the walk that also wrote, so the two
-        # runs differ by less than the noise between them. On a tree small
-        # enough for that to happen there is no capture cost to report, and
-        # quoting a negative one as "measured" would be worse than saying
-        # nothing.
-        return None
-    parts = [("capture write", store, "inferred")]
-    trigram = floats(grouped.get(("ereport_index", "make"), []), "sec_per_1M_files")
-    if trigram:
-        parts.append(("trigram index", statistics.mean(trigram), "timed directly"))
-    return {"total": sum(value for _, value, _ in parts), "parts": parts}
-
-
-def build_only_metrics(index_entries, floor, rows):
-    """Index construction with the traversal floor taken off the total.
-
-    Only ecrawl was timed both ways, so for every other tool this is an
-    estimate -- and specifically an upper bound, since subtracting the *fastest*
-    walk anyone managed removes no more than that tool's own traversal did.
-    The exact figure is carried alongside where it is known, so the chart can
-    show what was measured next to what was inferred.
-    """
-    if not floor:
-        return {}
-    floor_value = floor[1]
-    exact = measured_build_only(rows)
-    result = {}
-    for label, entry in index_entries.items():
-        mean, std = entry.get("time", (None, None))
-        if mean is None:
-            continue
-        remainder = mean - floor_value
-        if remainder <= 0:
-            # The tool indexed in less than the fastest bare walk, so the floor
-            # says nothing about it; showing a zero-length bar would be a claim.
-            continue
-        item = {"time": (remainder, std)}
-        if label.startswith("ecrawl") and exact is not None:
-            item["exact"] = exact["total"]
-            item["exact_parts"] = exact["parts"]
-        result[label] = item
+        time = mean_std(times)
+        result[label] = {"time": time, "rate": rate_stats(count, *time)}
     return result
 
 
@@ -545,6 +539,26 @@ def fmt_mib(value):
     return "{:.2f} MiB".format(value)
 
 
+def fmt_rate(value):
+    """Files per second. Two significant figures is all these deserve: the run
+    to run spread is percents, and a reader is comparing magnitudes."""
+    if value >= 1e6:
+        return "{:.1f}M files/s".format(value / 1e6)
+    if value >= 1e5:
+        return "{:.0f}k files/s".format(value / 1e3)
+    if value >= 1e3:
+        return "{:.1f}k files/s".format(value / 1e3)
+    return "{:.0f} files/s".format(value)
+
+
+def fmt_bytes(value):
+    if value >= 1024 * 1024:
+        return "{:.1f} MiB".format(value / (1024 * 1024))
+    if value >= 1024:
+        return "{:.1f} KiB".format(value / 1024)
+    return "{:.0f} B".format(value)
+
+
 def wrap_caption(text, fig_width_in, fontsize=8.5):
     """Fold the caption to the figure width. Captions carry the qualifications
     that keep a figure honest, so one running off the canvas loses exactly the
@@ -626,13 +640,27 @@ def index_figure(datasets, out_dir, spec):
     key = spec["key"]
     metric = spec.get("metric", "time")
     formatter = spec.get("formatter", fmt_seconds)
+    # Rates go the other way round: the best bar is the longest one, not the
+    # shortest, and everything that assumes "less is better" has to be told.
+    higher_better = spec.get("better") == "higher"
+
     tools = ordered_keys(spec["order"], datasets, key)
+    # A tool with no value for *this* column would otherwise take a row label
+    # and draw nothing beside it, which reads as a zero rather than a gap.
+    tools = [
+        tool
+        for tool in tools
+        if any(
+            dataset[key].get(tool, {}).get(metric, (None, None))[0] is not None
+            for dataset in datasets
+        )
+    ]
     if not tools:
         return []
     multi = len(datasets) > 1
 
-    # Slowest at the top so the eye lands on the winner at the bottom, the way a
-    # ranking reads. Rank on the slowest dataset that has the tool, so one
+    # Worst at the top so the eye lands on the winner at the bottom, the way a
+    # ranking reads. Rank on the worst dataset that has the tool, so one
     # dataset missing a tool does not banish it to the bottom.
     def sort_key(tool):
         means = [
@@ -640,25 +668,24 @@ def index_figure(datasets, out_dir, spec):
             for dataset in datasets
         ]
         means = [m for m in means if m is not None]
-        return -max(means) if means else 0.0
+        if not means:
+            return 0.0
+        return min(means) if higher_better else -max(means)
 
     tools = sorted(tools, key=sort_key)
     shades = [0.0, 0.45, 0.68, 0.8][: len(datasets)]
     while len(shades) < len(datasets):
         shades.append(0.8)
 
-    # A phase split, or a measured value quoted under an estimate, adds a second
-    # line of text per bar, which needs the room.
-    split_rows = any(
-        {"components", "exact"}.intersection(dataset[key].get(tool, {}))
+    # A phase split adds a second line of text per bar, which needs the room.
+    split_rows = spec.get("split", True) and any(
+        "components" in dataset[key].get(tool, {})
         for dataset in datasets
         for tool in tools
     )
-    # A storing bar gets what it kept printed under its time, which needs the
-    # same extra room a phase split does.
-    if spec.get("storage"):
+    if spec.get("per_file"):
         split_rows = split_rows or any(
-            dataset[key].get(tool, {}).get("stored")
+            dataset[key].get(tool, {}).get("per_file")
             for dataset in datasets
             for tool in tools
         )
@@ -690,6 +717,10 @@ def index_figure(datasets, out_dir, spec):
     log = bool(positive) and max(positive) / min(positive) >= LOG_RANGE
     part_index = 0 if metric == "time" else 1
     pending = []
+    # Whether the phases ended up anywhere a reader can see them. A bar whose
+    # label slot went to something else keeps its phases to itself, and the
+    # caption must not promise them.
+    split_shown = False
     for dataset_index, dataset in enumerate(datasets):
         offset = (dataset_index - (len(datasets) - 1) / 2.0) * bar_h
         for row, tool in enumerate(tools):
@@ -699,39 +730,18 @@ def index_figure(datasets, out_dir, spec):
             if mean is None:
                 continue
             base = shade(COLORS.get(tool, "#4C72B0"), shades[dataset_index])
+            # Rates do not add, so a rate figure never segments its bars: two
+            # phases at 400k and 1.7M files/s do not make a 2.1M files/s
+            # pipeline, and drawing them end to end would say they do.
             parts = [
                 (name, values[part_index])
                 for name, *values in entry.get("components", [])
-            ]
+            ] if spec.get("split", True) else []
             parts = parts if all(v is not None for _, v in parts) else []
-            known = entry.get("exact")
-            if spec.get("estimated"):
-                # Two tone: the bar runs out to the upper bound, and the solid
-                # part marks how much of that is actually known. Unlike a phase
-                # split this survives a log axis, because the meaning is carried
-                # by where the boundary sits, not by how long each piece is.
-                axis.barh(
-                    y,
-                    mean,
-                    height=bar_h * 0.86,
-                    color=shade(base, 0.66),
-                    edgecolor="white",
-                    linewidth=0.6,
-                    zorder=3,
-                )
-                if known and known < mean:
-                    axis.barh(
-                        y,
-                        known,
-                        height=bar_h * 0.86,
-                        color=base,
-                        edgecolor="white",
-                        linewidth=0.6,
-                        zorder=3.5,
-                    )
             # A log axis cannot be read additively, so the phases go in the
             # label there instead of pretending the segments sum by length.
-            elif parts and not log:
+            if parts and not log:
+                split_shown = True
                 left = 0.0
                 for part_no, (_, value) in enumerate(parts):
                     axis.barh(
@@ -746,13 +756,6 @@ def index_figure(datasets, out_dir, spec):
                     )
                     left += value
             else:
-                # Stippling marks the bars that keep nothing. It reads as
-                # porous, which is the point: the tool ran, answered, and left
-                # no trace to query a second time. Deliberately dots and not the
-                # diagonals Figure 5 uses, because there hatching flags a wrong
-                # answer; storing nothing is a trade, not a defect, and the two
-                # must not look alike across the set.
-                stores = bool(entry.get("stored")) if spec.get("storage") else True
                 axis.barh(
                     y,
                     mean,
@@ -760,7 +763,6 @@ def index_figure(datasets, out_dir, spec):
                     color=base,
                     edgecolor="white",
                     linewidth=0.6,
-                    hatch=None if stores else "...",
                     zorder=3,
                 )
             if std:
@@ -775,39 +777,17 @@ def index_figure(datasets, out_dir, spec):
                 )
             text = formatter(mean) if mean else "0"
             note = None
-            if spec.get("storage") and entry.get("stored"):
-                # The size turns the hatching from a category into a quantity:
-                # the reader sees not just that this bar kept something, but
-                # what the extra time bought.
-                note = "{} kept on disk".format(fmt_mib(entry["stored"]))
-            if spec.get("estimated"):
-                # Every bar on an estimated panel is an upper bound, and saying
-                # so on the bar keeps a reader from taking the panel for
-                # measurement once it is separated from its caption.
-                text = "\u2264 {}".format(text)
-                if known:
-                    # Kept outside the bar, unlike a phase split: printed inside
-                    # it would read as a segment of the bound rather than as the
-                    # smaller true value.
-                    note = "measured: {}".format(formatter(known))
-                    # How the two halves were arrived at differs, and without
-                    # this the whole bar reads as inferred when half of it was
-                    # timed on its own.
-                    breakdown = " + ".join(
-                        "{} {} ({})".format(formatter(value), name, how)
-                        for name, value, how in entry.get("exact_parts", [])
-                    )
-                    if breakdown:
-                        note += " = " + breakdown
+            if spec.get("per_file") and entry.get("per_file"):
+                # The total says what the index costs to keep; this says what it
+                # costs per file, which is the number that carries to a tree of
+                # a different size.
+                note = "{} per file".format(fmt_bytes(entry["per_file"]))
             # Labels are placed once the axis limits are final, because whether
             # a split fits inside its bar depends on them.
             pending.append((y, mean, std, text, split, note))
 
     axis.set_yticks(positions)
-    # A figure that has taken something out of the bar says so in the row label,
-    # rather than naming commands whose cost is no longer all there.
-    label_map = spec.get("label_map", {})
-    axis.set_yticklabels([label_map.get(tool, tool) for tool in tools], fontsize=10)
+    axis.set_yticklabels(tools, fontsize=10)
     # The walk-only line is annotated above the first bar, so it needs a band of
     # its own up there.
     axis.set_ylim(-(1.0 if floor else 0.7), len(tools) - 0.3)
@@ -842,15 +822,18 @@ def index_figure(datasets, out_dir, spec):
         axis.set_xlim(low, high * (1.55 if split_rows else 1.22))
 
     for y, mean, std, text, split, note in pending:
+        end = mean + (std or 0)
         if note:
-            bar_label(axis, y, mean + (std or 0), text, log, sub=note)
+            bar_label(axis, y, end, text, log, sub=note)
             continue
         # On a linear panel the bar is already segmented, so the numbers go
         # underneath where they cannot fight the segment boundary.
         if split and (not log or not fits_inside(fig, axis, mean, split)):
-            bar_label(axis, y, mean + (std or 0), text, log, sub=split)
+            split_shown = True
+            bar_label(axis, y, end, text, log, sub=split)
             continue
         if split:
+            split_shown = True
             axis.annotate(
                 split,
                 xy=(0.008, y),
@@ -861,53 +844,7 @@ def index_figure(datasets, out_dir, spec):
                 color="white",
                 zorder=5,
             )
-        bar_label(axis, y, mean + (std or 0), text, log)
-
-    if spec.get("estimated") and any(
-        "exact" in dataset[key].get(tool, {}) for dataset in datasets for tool in tools
-    ):
-        # Without this the two tones are just a colour, and a reader has no way
-        # to know the pale part of a bar is the part nobody measured. It sits
-        # above the panel rather than inside it: the free space in the plot is
-        # bottom right, which is where the fastest bar's own labels go.
-        axis.legend(
-            handles=[
-                Patch(facecolor="#555555", edgecolor="white", label="measured"),
-                Patch(facecolor=shade("#555555", 0.66), edgecolor="white",
-                      label="bound (not measured)"),
-            ],
-            loc="lower right",
-            bbox_to_anchor=(1.0, 1.0),
-            ncol=2,
-            frameon=False,
-            fontsize=8,
-            handlelength=1.4,
-            columnspacing=1.4,
-        )
-
-    if spec.get("storage") and any(
-        dataset[key].get(tool, {}).get("stored")
-        for dataset in datasets
-        for tool in tools
-    ):
-        # Without this the hatching is just a texture. Neutral swatches, because
-        # the bars carry each tool's own hue and a coloured key would suggest a
-        # mapping that is not there.
-        axis.legend(
-            handles=[
-                Patch(facecolor="#555555", edgecolor="white",
-                      label="stores an index"),
-                Patch(facecolor="#555555", edgecolor="white", hatch="...",
-                      label="stores nothing"),
-            ],
-            loc="lower right",
-            bbox_to_anchor=(1.0, 1.0),
-            ncol=2,
-            frameon=False,
-            fontsize=8,
-            handlelength=1.4,
-            columnspacing=1.4,
-        )
+        bar_label(axis, y, end, text, log)
 
     if floor:
         name, value = floor
@@ -927,27 +864,21 @@ def index_figure(datasets, out_dir, spec):
 
     subtitle = datasets[0]["label"] if not multi else "; ".join(d["label"] for d in datasets)
     conditions = datasets[0].get("conditions", "")
-    caption = "Means over repetitions; whiskers one standard deviation. Lower is better."
+    caption = "Means over repetitions; whiskers one standard deviation. {} is better.".format(
+        "Higher" if higher_better else "Lower"
+    )
     if spec.get("caption"):
         caption += "\n" + spec["caption"]
-    if spec.get("caption_if_exact") and any(
-        "exact" in dataset[key].get(tool, {}) for dataset in datasets for tool in tools
-    ):
-        caption += " " + spec["caption_if_exact"]
-    # Only when phases are actually drawn: an estimated panel also carries a
-    # second line per bar, but that one is a measured value, not a phase.
-    has_components = any(
-        "components" in dataset[key].get(tool, {})
-        for dataset in datasets
-        for tool in tools
-    )
-    if has_components:
+    if split_shown:
         # No gloss on what each phase is: the bar already names them in place.
         caption += "\nTwo-command pipelines give their phases in the bar label."
-    # Last, so it reads as a footnote about the set rather than interrupting
-    # what this particular figure is saying.
-    if spec.get("decomposition"):
-        caption += "\n" + DECOMPOSITION_NOTE
+    if multi and metric != "rate":
+        # Two datasets on one axis are usually two trees, and elapsed seconds do
+        # not survive that: the rate figures are the ones to read across them.
+        caption += (
+            "\nElapsed time only compares within one tree; for two datasets of "
+            "different sizes, read the files-per-second figure."
+        )
     caption = wrap_caption(caption, fig.get_figwidth())
     caveat = datasets[0].get("caveat", "")
     header_in = 0.95 if conditions else 0.75
@@ -1011,94 +942,96 @@ def index_figure(datasets, out_dir, spec):
     return outputs
 
 
-# The three time figures are one quantity cut in two and then put back
-# together, not three takes on the same chart. Saying so on each of them is the
-# only thing that stops the shared phases -- the trigram build appears in both
-# the total and the build-only figure -- from reading as double counting.
-DECOMPOSITION_NOTE = (
-    "Nested, not alternatives: Figure 1's walk-only bars + Figure 2 = Figure 3, "
-    "so a phase in two of them is not counted twice."
+# Two questions, each asked twice: how long did it take, and how fast is that.
+# The pair is deliberate -- elapsed seconds are what actually happened and what
+# the summary table prints, while files per second is the number that means
+# anything on a tree of a different size -- and every figure is the same
+# picture with a different column of numbers behind it.
+WALK_CAPTION = (
+    "Every tool here traverses the whole tree and keeps nothing, which makes "
+    "this the one group that compares with no asterisk at all. find and fd only "
+    "read directories; du, dua and ecrawl also stat every entry."
+)
+BUILD_CAPTION = (
+    "The whole cost from an unindexed tree to a queryable index, as run, for "
+    "every tool measured end to end. GUFI appears twice because rollup is an "
+    "optional second pass over the index it built: the two are alternatives, "
+    "never a sum."
 )
 
-# The four index figures. Same renderer, different column of numbers, so a
-# reader can lay them side by side and have the bars mean the same thing.
 INDEX_FIGURES = [
     {
-        "name": "figure1_walk",
+        "name": "figure1_walk_time",
         "number": 1,
-        "heading": "walking",
-        "panel_title": "Traversal time, and which tools keep the result",
+        "heading": "walking, elapsed time",
+        "panel_title": "How long it takes to see every file",
         "key": "walk",
         "order": WALK_CHART_ORDER,
         "metric": "time",
         "formatter": fmt_seconds,
-        "xlabel": "Seconds per 1M files",
-        "storage": True,
-        "caption": (
-            "Stippled bars answer their question and forget the tree, so they "
-            "time the walk alone. ecrawl is that same walk plus a capture you "
-            "can query later: the gap to ecrawl --no-write is what storing costs."
-        ),
-        "decomposition": True,
+        "xlabel": "Elapsed seconds",
+        "caption": WALK_CAPTION,
     },
     {
-        "name": "figure2_build",
+        "name": "figure2_walk_rate",
         "number": 2,
-        "heading": "building",
-        "panel_title": "Index construction only, with the walk taken out",
-        "key": "build_only",
-        "order": INDEX_ORDER,
-        # The bar no longer holds everything those two commands cost, so naming
-        # them would overstate it. What is left is the work after the walk.
-        "label_map": {"ecrawl + ereport_index": "capture write + trigram index"},
-        "metric": "time",
-        "formatter": fmt_seconds,
-        "xlabel": "Seconds per 1M files",
-        "estimated": True,
-        "caption": (
-            "MOSTLY ESTIMATE: bars run to the end-to-end build minus the fastest "
-            "walk in the run, so the end is an upper bound (\u2264), not a "
-            "measurement."
-        ),
-        "decomposition": True,
-        # Only true when a pipeline was timed both ways and the two runs
-        # differed by more than the noise between them.
-        "caption_if_exact": (
-            "Only ecrawl was timed both ways: its solid part is measured, the "
-            "pale remainder is the walk the subtraction failed to remove."
-        ),
+        "heading": "walking, throughput",
+        "panel_title": "Files seen per second",
+        "key": "walk",
+        "order": WALK_CHART_ORDER,
+        "metric": "rate",
+        "better": "higher",
+        "formatter": fmt_rate,
+        "xlabel": "Files per second",
+        "caption": WALK_CAPTION,
     },
     {
-        "name": "figure3_index_total",
+        "name": "figure3_build_time",
         "number": 3,
-        "heading": "walking and building",
-        "panel_title": "Everything, as run against a cold tree",
+        "heading": "building, elapsed time",
+        "panel_title": "How long it takes to build a queryable index",
         "key": "index",
         "order": INDEX_ORDER,
         "metric": "time",
         "formatter": fmt_seconds,
-        "xlabel": "Seconds per 1M files",
+        "xlabel": "Elapsed seconds",
         "floor": True,
         "caption": (
-            "The whole cost from an unindexed tree, and the only time figure "
-            "measured end to end for every tool. The dashed line is the fastest "
-            "walk, the floor no indexer can go below."
+            BUILD_CAPTION
+            + " The dashed line is the fastest bare walk in the run, the floor "
+            "no indexer can go below."
         ),
-        "decomposition": True,
     },
     {
-        "name": "figure4_index_size",
+        "name": "figure4_build_rate",
         "number": 4,
+        "heading": "building, throughput",
+        "panel_title": "Files indexed per second",
+        "key": "index",
+        "order": INDEX_ORDER,
+        "metric": "rate",
+        "better": "higher",
+        "formatter": fmt_rate,
+        "xlabel": "Files per second",
+        # Rates do not add, so the phases stay off this one: the bar is the
+        # whole pipeline's throughput, and Figure 3 is where its parts live.
+        "split": False,
+        "caption": BUILD_CAPTION + " Phases are in Figure 3: rates do not add.",
+    },
+    {
+        "name": "figure5_index_size",
+        "number": 5,
         "heading": "index storage",
-        "panel_title": "Bytes kept on disk per 1M files",
+        "panel_title": "What the index costs to keep",
         "key": "index",
         "order": INDEX_ORDER,
         "metric": "size",
         "formatter": fmt_mib,
-        "xlabel": "MiB per 1M files",
+        "xlabel": "MiB kept on disk",
+        "per_file": True,
         "caption": (
-            "Walk-only tools are absent because they store nothing \u2014 the "
-            "stippled bars in Figure 1, and the trade behind their times there."
+            "Walk-only tools are absent because they store nothing, which is "
+            "the trade behind their times in Figure 1."
         ),
     },
 ]
@@ -1258,7 +1191,7 @@ def plot_queries(datasets, out_dir):
         else "; ".join(d["label"] for d in usable)
     )
     caveat = usable[0].get("caveat", "")
-    fig.text(0.011, 1 - 0.30 / fig_height, "Figure 5: query performance",
+    fig.text(0.011, 1 - 0.30 / fig_height, "Figure 6: query performance",
              fontsize=15, fontweight="bold", va="top")
     fig.text(
         0.011,
@@ -1280,6 +1213,9 @@ def plot_queries(datasets, out_dir):
         )
 
     caption = "Mean wall time; whiskers one standard deviation. Shorter is better."
+    index_note = usable[0].get("query_index_note", "")
+    if index_note:
+        caption += "\n" + index_note
     if any_mismatch:
         caption += (
             "\nHatched bars disagreed with the reference tool, so their timing "
@@ -1302,7 +1238,7 @@ def plot_queries(datasets, out_dir):
     fig.subplots_adjust(hspace=0.42)
     outputs = []
     for suffix in ("png", "pdf"):
-        path = out_dir / ("figure5_queries." + suffix)
+        path = out_dir / ("figure6_queries." + suffix)
         fig.savefig(str(path), dpi=200 if suffix == "png" else None)
         outputs.append(path)
     plt.close(fig)
@@ -1346,8 +1282,6 @@ def main():
         index_rows = read_csv(index_csv) if index_csv else []
         env = find_kv(root, "env.txt")
         reps = env.get("reps")
-        pipelines = index_metrics(index_rows)
-        floor = walk_floor(index_rows)
         datasets.append(
             {
                 "label": dataset_label(
@@ -1355,10 +1289,11 @@ def main():
                 ),
                 "conditions": run_conditions(env, reps),
                 "caveat": too_small_caveat(tree_file_count(index_csv)),
-                "index": pipelines,
+                "file_count": tree_file_count(index_csv),
+                "index": index_metrics(index_rows),
                 "walk": walk_metrics(index_rows),
-                "build_only": build_only_metrics(pipelines, floor, index_rows),
-                "walk_floor": floor,
+                "walk_floor": walk_floor(index_rows),
+                "query_index_note": query_index_note(query_csv),
                 "queries": (
                     query_metrics(read_csv(query_csv))
                     if query_csv

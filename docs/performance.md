@@ -31,7 +31,7 @@ See [tools.md#edelete](tools.md#edelete) for the unlink-contention tuning note (
 
 ### ERCBIN08 capture-write cost
 
-Compare-indexers Figure 1 times `ecrawl` both ways. The gap `write − nowrite` is the inferred **capture-write** cost (column encode + per-column zstd + catalog finalize). Walk-only rows (`fd`, `find`, `du`, `ecrawl --no-write`) share the same crawl/stat path and skip that producer work.
+The compare-indexers harness times `ecrawl` both ways, as the `ecrawl/write` and `ecrawl/nowrite` rows of `SUMMARY_TABLE.txt`. The gap `write − nowrite` is the inferred **capture-write** cost (column encode + per-column zstd + catalog finalize). Walk-only rows (`fd`, `find`, `du`, `ecrawl --no-write`) share the same crawl/stat path and skip that producer work.
 
 On the same host and cold-cache protocol (`node9901`, 16-thread budget, `drop_caches=1`, ~3.5M-file synth tree):
 
@@ -40,7 +40,7 @@ On the same host and cold-cache protocol (`node9901`, 16-thread budget, `drop_ca
 | `ERCBIN06_shards` (2026-07-31) | 3.545 | 2.519 | ~1.03 | 25.6 |
 | `ERCBIN08_shards` (2026-08-02) | 5.086 | 2.307 | ~2.78 | 43.2 |
 
-`fd` / `find` / `du` stayed within noise across those two runs. The solid `ecrawl` bar in Figure 1 therefore moved because the capture format got more expensive to produce, not because the machine or the walk got colder. Layout rationale (1 MiB row groups, per-column codecs) is in [binary-format.md](binary-format.md).
+`fd` / `find` / `du` stayed within noise across those two runs. `ecrawl`'s write row therefore moved because the capture format got more expensive to produce, not because the machine or the walk got colder. Layout rationale (1 MiB row groups, per-column codecs) is in [binary-format.md](binary-format.md).
 
 Where that time actually goes is not where the layout description suggests. A `perf record` of a write-mode crawl (Rocky 8 compute node, ~3.3M files, 8 crawl + 4 stat + 4 writer threads) attributes user-space cycles roughly as:
 

@@ -272,52 +272,91 @@ def partial_marker(ok_rows):
 # Tools that need more than one command to produce a queryable index. Each phase
 # is timed on its own, so the table above stays a record of what ran; the total
 # is what compares against a one-shot indexer.
+#
+# gufi_dir2index runs twice per repetition -- the same command into two
+# directories, so the rollup pass has its own copy to chew on -- and pooling
+# both variants here is what keeps GUFI to one build row per pipeline instead
+# of three rows a reader might add up.
+GUFI_DIR2INDEX = [("gufi", "plain"), ("gufi", "rollup_index")]
 PIPELINE_PHASES = [
-    ("ecrawl + ereport_index", [("ecrawl", "write"), ("ereport_index", "make")]),
-    ("GUFI rollup", [("gufi", "rollup_index"), ("gufi", "rollup_step")]),
+    (
+        "ecrawl + ereport_index",
+        [("crawl", [("ecrawl", "write")]), ("trigram index", [("ereport_index", "make")])],
+    ),
+    ("GUFI (dir2index)", [("dir2index", GUFI_DIR2INDEX)]),
+    (
+        "GUFI + rollup",
+        [("dir2index", GUFI_DIR2INDEX), ("rollup", [("gufi", "rollup_step")])],
+    ),
 ]
+
+
+def phase_rows(groups, keys):
+    ok = []
+    for key in keys:
+        ok.extend(r for r in groups.get(key, []) if r.get("status") == "ok")
+    return ok
+
+
+def file_count(rows):
+    """How many files the run walked. One number for the whole run: every tool
+    was pointed at the same tree."""
+    for r in rows:
+        try:
+            count = int(r.get("file_count") or 0)
+        except ValueError:
+            continue
+        if count > 0:
+            return count
+    return 0
 
 
 def pipeline_totals(groups):
     lines = []
     for label, phases in PIPELINE_PHASES:
         parts = []
-        for tool, variant in phases:
-            ok = [r for r in groups.get((tool, variant), []) if r.get("status") == "ok"]
-            sec = [float(r["sec_per_1M_files"]) for r in ok if r.get("sec_per_1M_files")]
-            mib = [float(r["mib_per_1M_files"]) for r in ok if r.get("mib_per_1M_files")]
+        for name, keys in phases:
+            ok = phase_rows(groups, keys)
+            sec = [float(r["elapsed_sec"]) for r in ok if r.get("elapsed_sec")]
+            nbytes = [int(r["index_bytes"]) for r in ok if r.get("index_bytes")]
             if not sec:
                 parts = []
                 break
-            parts.append((variant, statistics.mean(sec), statistics.mean(mib) if mib else 0.0))
+            size = statistics.mean(nbytes) / (1024 * 1024) if nbytes else 0.0
+            parts.append((name, statistics.mean(sec), size))
         if not parts:
             continue
         if not lines:
             lines.append("")
             lines.append("pipeline totals (tools that build in more than one command):")
+        total = sum(p[1] for p in parts)
+        count = file_count(r for rs in groups.values() for r in rs)
         lines.append(
-            "  {0:<24} {1:>10} sec/1M  {2:>10} MiB/1M   = {3}".format(
+            "  {0:<24} {1:>10} s  {2:>12} files/s  {3:>10} MiB   = {4}".format(
                 label,
-                fmt(sum(p[1] for p in parts)),
-                fmt(sum(p[2] for p in parts)),
-                " + ".join(
-                    "{0} {1} sec/1M".format(name, fmt(sec)) for name, sec, _ in parts
-                ),
+                fmt(total),
+                fmt(count / total, 0) if count else "-",
+                fmt(sum(p[2] for p in parts), 2),
+                " + ".join("{0} {1} s".format(name, fmt(sec)) for name, sec, _ in parts),
             )
         )
+    if lines:
+        lines.append("  GUFI's two rows are alternative builds, not stages: rollup is a second")
+        lines.append("  pass over the index dir2index just wrote. Do not add them together.")
     return lines
 
 
 def summarize_index(rows):
     lines = [
-        "== INDEX BUILD (paper units: sec/1M files, MiB/1M files) ==",
+        "== INDEX BUILD ==",
         f"{'tool':<16} {'variant':<12} {'n':>3} {'status':<8} {'elapsed_s':>12} {'±':>8} "
-        f"{'sec/1M':>10} {'MiB/1M':>10} {'index_MiB':>10}",
+        f"{'files/s':>12} {'index_MiB':>12} {'bytes/file':>10}",
         "-" * 100,
     ]
     groups = defaultdict(list)
     for r in rows:
         groups[(r["tool"], r["variant"])].append(r)
+    count = file_count(rows)
 
     for (tool, variant), rs in sorted(groups.items()):
         ok = [r for r in rs if r.get("status") == "ok"]
@@ -325,31 +364,33 @@ def summarize_index(rows):
         failed = [r for r in rs if r.get("status") == "fail"]
         if ok:
             el = [float(r["elapsed_sec"]) for r in ok if r.get("elapsed_sec")]
-            sec = [float(r["sec_per_1M_files"]) for r in ok if r.get("sec_per_1M_files")]
-            mib = [float(r["mib_per_1M_files"]) for r in ok if r.get("mib_per_1M_files")]
             nbytes = [int(r["index_bytes"]) for r in ok if r.get("index_bytes")]
             m_el, s_el = mean_std(el)
-            m_sec, _ = mean_std(sec)
-            m_mib, _ = mean_std(mib)
+            rate = count / m_el if count and m_el else None
             idx_mib = (statistics.mean(nbytes) / (1024 * 1024)) if nbytes else None
+            per_file = (
+                statistics.mean(nbytes) / count if nbytes and count else None
+            )
             lines.append(
                 f"{tool:<16} {variant:<12} {len(ok):>3} {'ok':<8} {fmt(m_el):>12} {fmt(s_el):>8} "
-                f"{fmt(m_sec):>10} {fmt(m_mib):>10} {fmt(idx_mib, 2):>10}"
+                f"{fmt(rate, 0):>12} {fmt(idx_mib, 2):>12} {fmt(per_file, 0):>10}"
                 f"{partial_marker(ok)}"
             )
         elif skipped:
             note = skipped[0].get("notes", "")
             lines.append(f"{tool:<16} {variant:<12} {len(skipped):>3} {'skipped':<8} {'-':>12} {'-':>8} "
-                         f"{'-':>10} {'-':>10} {'-':>10}  # {note}")
+                         f"{'-':>12} {'-':>12} {'-':>10}  # {note}")
         elif failed:
             lines.append(f"{tool:<16} {variant:<12} {len(failed):>3} {'fail':<8} {'-':>12} {'-':>8} "
-                         f"{'-':>10} {'-':>10} {'-':>10}")
+                         f"{'-':>12} {'-':>12} {'-':>10}")
 
     lines.extend(pipeline_totals(groups))
 
     # Rows with index_MiB 0 walked the tree and stored nothing, so they measure
-    # traversal alone and are not indexers. Keeping them in one table makes the
-    # cost of capture visible, which is the same comparison Figure 1 draws.
+    # traversal alone and are not indexers. Keeping them in one table is what
+    # makes the cost of the capture visible: the charts put the walkers and the
+    # indexers on separate figures, so this is the only place the gap between
+    # ecrawl's two rows can be read directly.
     walkers = sorted(
         "{0}/{1}".format(tool, variant)
         for (tool, variant) in groups
@@ -413,7 +454,19 @@ def answer_marker(tool, query, count_text, reference):
     return "  # DISAGREES: {} reports {:,}".format(ref_tool, ref_value)
 
 
-def summarize_queries(rows):
+def gufi_query_index(dirs):
+    """Which GUFI index answered the queries. The run builds two -- plain and
+    rolled up -- and they cost very different amounts to make, so a query time
+    means nothing until you know which one it was read from."""
+    for d in dirs:
+        base = d if d.is_dir() else d.parent
+        root = load_kv([base], "env.txt").get("gufi_index_root")
+        if root:
+            return root
+    return ""
+
+
+def summarize_queries(rows, gufi_index=""):
     lines = [
         "",
         "== QUERIES Q1–Q5 (mean elapsed_sec ± pstdev over reps; result_count from last ok) ==",
@@ -460,6 +513,14 @@ def summarize_queries(rows):
             "  a query that returns nothing is fast for reasons that have nothing to do"
         )
         lines.append("  with the index. Charts hatch these bars for the same reason.")
+    if gufi_index:
+        name = Path(gufi_index).name
+        lines.append("")
+        lines.append(
+            "gufi rows were answered from {0} ({1} index), not the other build.".format(
+                name, "rolled-up" if "rollup" in name else "plain"
+            )
+        )
     return lines
 
 
@@ -821,7 +882,7 @@ def main():
     if query_rows:
         lines.append("")
         lines.extend(summarize_query_defs(load_kv(dirs, "query_params.txt")))
-        lines.extend(summarize_queries(query_rows))
+        lines.extend(summarize_queries(query_rows, gufi_query_index(dirs)))
     else:
         lines.append("")
         lines.append("(no query_results.csv found)")

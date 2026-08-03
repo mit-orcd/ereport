@@ -2,7 +2,7 @@
 
 Paper reference: [docs/A Comparison of Three Open-source File Indexers Robinhood, GUFI, XDU.pdf](../../docs/A%20Comparison%20of%20Three%20Open-source%20File%20Indexers%20Robinhood,%20GUFI,%20XDU.pdf) (Bjornson, PEARC ’26). Paper versions: Robinhood 3.2.0, GUFI 0.6.10, XDU 0.4.1.
 
-**Fairness note:** `ecrawl` is a capture tool (ERCBIN08 uid shards). Query parity uses the **ecrawl suite**: `ecrawl` writes the capture, `ereport_index` adds a path trigram index and answers Q1/Q2, and `ecrawl_analyze` reads the capture for Q3/Q4/Q5. Figure 5 names the binary that ran, not the suite, so each panel says which part did the work.
+**Fairness note:** `ecrawl` is a capture tool (ERCBIN08 uid shards). Query parity uses the **ecrawl suite**: `ecrawl` writes the capture, `ereport_index` adds a path trigram index and answers Q1/Q2, and `ecrawl_analyze` reads the capture for Q3/Q4/Q5. The query figure names the binary that ran, not the suite, so each panel says which part did the work.
 
 ## Roles
 
