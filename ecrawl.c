@@ -153,6 +153,9 @@
  * displayed numbers are never more than one stats tick behind whatever N is. */
 #define GLOBAL_PERF_FLUSH_EVERY 8192U
 #define DEFAULT_STAT_THREADS 8
+/* Workers resolving distinct uids/gids to names at finalize. The work is one blocking NSS call per
+ * distinct id, so the useful width is set by round-trip latency, not by core count. */
+#define DEFAULT_ID_RESOLVE_THREADS 16
 #define DEFAULT_STAT_RANDOM_QUEUE 1
 #define DEFAULT_STAT_BATCH_ENTRIES 1024U
 #define DEFAULT_STAT_QUEUE_BATCHES 64U
@@ -173,6 +176,9 @@
 #define DONATE_CHUNK_FORCE_MAX 2048U
 /* During readdir, check whether to donate local stack every N DT_DIR pushes (not every push). */
 #define DEFAULT_DONATE_CHECK_EVERY 64U
+/* And every N dirents, regardless of how many of them were directories: the check above is driven by
+ * subdirectories, so it never fires inside a deep narrow chain (see donate_spill_on_entries). */
+#define DEFAULT_DONATE_ENTRY_CHECK_EVERY 4096U
 #define DONATE_QUEUE_TARGET_PER_IDLE 4
 /* When every crawl thread holds a popped task (active == started), legacy policy refused all proactive
  * donation until force_donate_at — uneven local stacks could not rebalance. Spill anyway if the local
@@ -323,7 +329,8 @@ typedef struct {
     int has_sentinel;     /* whether the literal ID_SLOT_EMPTY id value was inserted */
     pthread_mutex_t mutex;
     FILE *fp;
-    id_name_resolver_fn resolve; /* run once per distinct id at teardown, never during the crawl */
+    id_name_resolver_fn resolve; /* run once per distinct id at finalize, never during the crawl */
+    int finalized;               /* names already resolved and written; destroy must not repeat it */
     char path[PATH_MAX];
 } id_registry_t;
 
@@ -781,6 +788,7 @@ static size_t g_stat_batch_after_reliable_nondirs_cfg = DEFAULT_STAT_BATCH_AFTER
 static size_t g_stat_batch_min_offload_cfg          = DEFAULT_STAT_BATCH_MIN_OFFLOAD;
 static size_t g_stat_queue_max_batches_cfg = DEFAULT_STAT_QUEUE_BATCHES;
 static size_t g_donate_check_every_cfg     = DEFAULT_DONATE_CHECK_EVERY;
+static size_t g_donate_entry_check_every_cfg = DEFAULT_DONATE_ENTRY_CHECK_EVERY;
 static size_t g_donate_chunk_force_max_cfg = DONATE_CHUNK_FORCE_MAX;
 static size_t g_force_donate_count_cfg     = LOCAL_STACK_FORCE_DONATE_COUNT;
 static size_t g_donate_all_busy_min_stack_cfg              = DEFAULT_DONATE_ALL_BUSY_MIN_STACK;
@@ -805,6 +813,11 @@ static char g_start_path_canon[PATH_MAX];
 static id_registry_t g_uid_registry;
 static id_registry_t g_gid_registry;
 static inode_registry_t g_hardlink_registry;
+/* Distinct-owner counts and the wall time their NSS lookups took, captured before the registries are
+ * torn down so the summary can attribute a slow finalize to owner count rather than to the crawl. */
+static size_t g_uid_distinct = 0;
+static size_t g_gid_distinct = 0;
+static double g_id_resolve_sec = 0.0;
 
 static FILE *ecrawl_pfopen(const char *path, const char *mode);
 static int ecrawl_pfclose(FILE *fp);
@@ -1222,6 +1235,19 @@ static int parse_ecrawl_stat_threads(void) {
     return (int)t;
 }
 
+/* Workers used to resolve uid/gid names at finalize. Env: ECRAWL_ID_RESOLVE_THREADS (1 = serial). */
+static int parse_ecrawl_id_resolve_threads(void) {
+    const char *e = getenv("ECRAWL_ID_RESOLVE_THREADS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_ID_RESOLVE_THREADS;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > 1024) return DEFAULT_ID_RESOLVE_THREADS;
+    return (int)t;
+}
+
 /* Raw getdents64 read-buffer size in bytes (0 = use libc opendir/readdir). Env: ECRAWL_GETDENTS_BUF.
  * Out-of-range values clamp to [MIN_GETDENTS_BUF, MAX_GETDENTS_BUF]; an explicit 0 disables the raw path. */
 static size_t parse_ecrawl_getdents_buf(void) {
@@ -1302,6 +1328,19 @@ static size_t parse_ecrawl_donate_check_every(void) {
     v = strtoul(e, &end, 10);
     if (errno || end == e || *end || v < 1UL || v > 65536UL) return DEFAULT_DONATE_CHECK_EVERY;
     return (size_t)v;
+}
+
+/* 0 disables the entry-driven check, leaving only the subdirectory-driven one. */
+static size_t parse_ecrawl_donate_entry_check_every(void) {
+    const char *e = getenv("ECRAWL_DONATE_ENTRY_CHECK_EVERY");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_DONATE_ENTRY_CHECK_EVERY;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v > 16777216UL) return DEFAULT_DONATE_ENTRY_CHECK_EVERY;
+    return v == 0UL ? (size_t)SIZE_MAX : (size_t)v;
 }
 
 static size_t parse_ecrawl_donate_chunk_force_max(void) {
@@ -1647,16 +1686,49 @@ static int cmp_u32_asc(const void *a, const void *b) {
     return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
-/* Resolve and write every id the crawl collected. Doing this once at teardown instead of on first
+#define ID_NAME_MAX 256
+
+/* Resolving one id is a blocking NSS call, so workers claim ids one at a time: the atomic is free
+ * next to a lookup that may leave the process entirely. Every worker writes to its own names[i], so
+ * the result array needs no locking and stays in the sorted order the caller built. */
+typedef struct {
+    const uint32_t *ids;
+    char (*names)[ID_NAME_MAX];
+    size_t n;
+    id_name_resolver_fn resolve;
+    atomic_size_t cursor;
+} id_resolve_job_t;
+
+static void id_resolve_run(id_resolve_job_t *j) {
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&j->cursor, 1, memory_order_relaxed);
+
+        if (i >= j->n) return;
+        j->resolve(j->ids[i], j->names[i], ID_NAME_MAX);
+    }
+}
+
+static void *id_resolve_worker_main(void *arg) {
+    id_resolve_run((id_resolve_job_t *)arg);
+    return NULL;
+}
+
+/* Resolve and write every id the crawl collected. Doing this once at finalize instead of on first
  * sight of each id keeps NSS off the crawl's hot path: getpwuid_r/getgrgid_r can mean a socket
  * round-trip to nss-systemd or sssd, and on a tree with thousands of distinct owners those lookups
  * showed up as ~10% of the write-mode profile, plus they hold up the stat worker that drew the
- * unlucky entry. The id set is tiny (one entry per distinct owner), so the deferred pass costs the
- * same lookups with none of the latency in the crawl. Emitted in ascending id order so the file is
- * reproducible across runs rather than following whatever order the workers happened to see. */
+ * unlucky entry.
+ *
+ * The lookups are latency-bound rather than CPU-bound, so they run across a small pool: a serial
+ * pass over ~1000 owners cost 8.4s on a fixture whose crawl took 0.9s. Emitted in ascending id order
+ * so the file is reproducible across runs rather than following whatever order the workers saw. */
 static void id_registry_write_names(id_registry_t *r) {
     uint32_t *ids;
+    char (*names)[ID_NAME_MAX];
     size_t n = 0, i;
+    id_resolve_job_t job;
+    pthread_t *threads = NULL;
+    int nthreads, started = 0;
 
     if (!r->fp || !r->resolve || r->count == 0) return;
 
@@ -1672,18 +1744,60 @@ static void id_registry_write_names(id_registry_t *r) {
 
     qsort(ids, n, sizeof(*ids), cmp_u32_asc);
 
-    for (i = 0; i < n; i++) {
-        char namebuf[256];
+    names = (char (*)[ID_NAME_MAX])malloc(n * ID_NAME_MAX);
+    if (!names) {
+        /* Fall back to resolving and writing one id at a time rather than failing the run. */
+        for (i = 0; i < n; i++) {
+            char namebuf[ID_NAME_MAX];
 
-        r->resolve(ids[i], namebuf, sizeof(namebuf));
-        fprintf(r->fp, "%u %s\n", (unsigned int)ids[i], namebuf);
+            r->resolve(ids[i], namebuf, sizeof(namebuf));
+            fprintf(r->fp, "%u %s\n", (unsigned int)ids[i], namebuf);
+        }
+        free(ids);
+        return;
     }
 
+    job.ids = ids;
+    job.names = names;
+    job.n = n;
+    job.resolve = r->resolve;
+    atomic_init(&job.cursor, 0);
+
+    nthreads = parse_ecrawl_id_resolve_threads();
+    if ((size_t)nthreads > n) nthreads = (int)n;
+    if (nthreads > 1) {
+        threads = (pthread_t *)malloc((size_t)(nthreads - 1) * sizeof(*threads));
+        if (threads) {
+            int t;
+
+            for (t = 0; t < nthreads - 1; t++) {
+                if (pthread_create(&threads[t], NULL, id_resolve_worker_main, &job) != 0) break;
+                started++;
+            }
+        }
+    }
+
+    /* The caller participates, so a failed pthread_create just means less width, never lost work. */
+    id_resolve_run(&job);
+    for (i = 0; i < (size_t)started; i++) pthread_join(threads[i], NULL);
+    free(threads);
+
+    for (i = 0; i < n; i++) fprintf(r->fp, "%u %s\n", (unsigned int)ids[i], names[i]);
+
+    free(names);
     free(ids);
 }
 
-static void id_registry_destroy(id_registry_t *r) {
+/* Resolve names and write the file, leaving the registry otherwise intact. Split out from destroy so
+ * the crawl can pay this cost inside its measured window instead of after the summary has printed. */
+static void id_registry_finalize(id_registry_t *r) {
+    if (r->finalized) return;
+    r->finalized = 1;
     id_registry_write_names(r);
+}
+
+static void id_registry_destroy(id_registry_t *r) {
+    id_registry_finalize(r);
     if (r->fp) ecrawl_io_fclose(r->fp);  /* fclose flushes the buffered id->name lines */
     free(r->slots);
     r->fp = NULL;
@@ -2064,6 +2178,7 @@ static void print_usage(const char *prog) {
             "ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE), "
             "ECRAWL_STAT_THREADS (parallel stat workers, default %d; 0=off), "
+            "ECRAWL_ID_RESOLVE_THREADS (uid/gid name lookups at finalize, default %d; 1=serial), "
             "ECRAWL_GETDENTS_BUF (raw getdents64 read-buffer bytes per crawl thread, default %u, "
             "range %u..%u; 0=use libc opendir/readdir), "
             "ECRAWL_STAT_BATCH_ENTRIES (default %u, range 64..65536), "
@@ -2075,7 +2190,9 @@ static void print_usage(const char *prog) {
             "ECRAWL_STAT_INODE_ORDER (default 0; 1=sort each stat batch by inode before statting, which can help "
             "on a cold XFS where dirents come back in name-hash order).\n"
             "Donation (reduce task-queue mutex traffic): ECRAWL_DONATE_CHECK_EVERY (default %u: donate check every N "
-            "DT_DIR pushes during readdir), ECRAWL_DONATE_CHUNK_FORCE_MAX (default %u: max dirs per queue push when "
+            "DT_DIR pushes during readdir), ECRAWL_DONATE_ENTRY_CHECK_EVERY (default %u: also check every N dirents, "
+            "which is what lets a deep narrow chain shed work; 0 disables), "
+            "ECRAWL_DONATE_CHUNK_FORCE_MAX (default %u: max dirs per queue push when "
             "stack exceeds force threshold), ECRAWL_FORCE_DONATE_AT (default %u: spill stack to global queue above "
             "this depth), ECRAWL_DONATE_ALL_BUSY_MIN_STACK (default %u: when all crawl threads hold a task, still "
             "donate if local stack is at least this deep and queue is below started*MULT), "
@@ -2088,6 +2205,7 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS,
             DEFAULT_STAT_THREADS,
+            DEFAULT_ID_RESOLVE_THREADS,
             (unsigned)DEFAULT_GETDENTS_BUF,
             (unsigned)MIN_GETDENTS_BUF,
             (unsigned)MAX_GETDENTS_BUF,
@@ -2096,6 +2214,7 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_STAT_BATCH_MIN_OFFLOAD,
             (unsigned)DEFAULT_STAT_QUEUE_BATCHES,
             (unsigned)DEFAULT_DONATE_CHECK_EVERY,
+            (unsigned)DEFAULT_DONATE_ENTRY_CHECK_EVERY,
             (unsigned)DONATE_CHUNK_FORCE_MAX,
             (unsigned)LOCAL_STACK_FORCE_DONATE_COUNT,
             (unsigned)DEFAULT_DONATE_ALL_BUSY_MIN_STACK,
@@ -2463,7 +2582,9 @@ static int shard_cat_load_from_disk_catalog(shard_cat_t *c, const crawl_bin_cata
         c->depth[id] = L->depth[id];
         c->name_len[id] = L->name_len[id];
         if (L->name_len[id] > 0 && L->name_comp[id]) {
-            c->name_comp[id] = strdup(L->name_comp[id]);
+            /* Bounded by name_len: a loaded catalog may borrow its names from a mapping, where they
+             * sit back to back with no NUL. ecrawl's own copy stays owned and terminated. */
+            c->name_comp[id] = strndup(L->name_comp[id], L->name_len[id]);
             if (!c->name_comp[id]) {
                 free(key);
                 shard_cat_destroy(c);
@@ -3731,27 +3852,11 @@ static int should_donate_work(const shared_state_t *shared, const dir_stack_t *l
     return 1;
 }
 
-static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, worker_aux_stats_t *aux) {
+/* Move the top `count` directories off the local stack and onto the global queue. */
+static int donate_stack_take(dir_stack_t *local_stack, task_queue_t *queue, worker_aux_stats_t *aux, size_t count) {
     dir_stack_t donated;
-    size_t count, start;
-    int force_spill;
+    size_t start;
 
-    if (!local_stack || local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
-
-    tls_donate_calls_inc();
-    force_spill = (local_stack->count >= g_force_donate_count_cfg);
-    if (force_spill) {
-        size_t target = g_force_donate_count_cfg - (g_force_donate_count_cfg / 4U);
-
-        if (target < (size_t)LOCAL_STACK_DONATE_FLOOR) target = (size_t)LOCAL_STACK_DONATE_FLOOR;
-        count = (local_stack->count > target) ? (local_stack->count - target) : 0U;
-        if (count > g_donate_chunk_force_max_cfg) count = g_donate_chunk_force_max_cfg;
-    } else {
-        count = local_stack->count / 2;
-        if (count < (size_t)DONATE_CHUNK_MIN) count = (size_t)DONATE_CHUNK_MIN;
-        if (count > (size_t)DONATE_CHUNK_MAX) count = (size_t)DONATE_CHUNK_MAX;
-    }
-    if (count >= local_stack->count) count = local_stack->count - 1;
     if (count == 0) return 0;
 
     dir_stack_init(&donated);
@@ -3774,6 +3879,29 @@ static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, wor
 
     stats_add_donated_dirs_local(aux, count);
     return 0;
+}
+
+static int donate_stack_chunk(dir_stack_t *local_stack, task_queue_t *queue, worker_aux_stats_t *aux) {
+    size_t count;
+    int force_spill;
+
+    if (!local_stack || local_stack->count < LOCAL_STACK_DONATE_FLOOR) return 0;
+
+    tls_donate_calls_inc();
+    force_spill = (local_stack->count >= g_force_donate_count_cfg);
+    if (force_spill) {
+        size_t target = g_force_donate_count_cfg - (g_force_donate_count_cfg / 4U);
+
+        if (target < (size_t)LOCAL_STACK_DONATE_FLOOR) target = (size_t)LOCAL_STACK_DONATE_FLOOR;
+        count = (local_stack->count > target) ? (local_stack->count - target) : 0U;
+        if (count > g_donate_chunk_force_max_cfg) count = g_donate_chunk_force_max_cfg;
+    } else {
+        count = local_stack->count / 2;
+        if (count < (size_t)DONATE_CHUNK_MIN) count = (size_t)DONATE_CHUNK_MIN;
+        if (count > (size_t)DONATE_CHUNK_MAX) count = (size_t)DONATE_CHUNK_MAX;
+    }
+    if (count >= local_stack->count) count = local_stack->count - 1;
+    return donate_stack_take(local_stack, queue, aux, count);
 }
 
 /* Drain local stack to global queue while donation policy says spill (bounded iterations per call). */
@@ -3803,6 +3931,50 @@ static void donate_spill_periodic(shared_state_t *shared, dir_stack_t *stack, ta
         *dirs_since_check = 0;
     }
     if (should_donate_work(shared, stack)) donate_spill_if_needed(shared, stack, queue, aux);
+}
+
+/*
+ * The other donation trigger: entries read, not subdirectories found.
+ *
+ * Everything above keys off the local stack growing, which is exactly what a deep narrow chain
+ * never does. depth_slash_profile is 411,892 entries and ran at avg_active_workers=1.00 with
+ * tasks_popped=2 -- one thread walked the chain while the rest of the pool waited, because each
+ * directory yields one subdirectory and the stack never reached the donation floor of 8.
+ *
+ * A worker part-way through a large directory has work in hand regardless of its stack, so when
+ * peers are actually idle it can hand over every directory it is holding and lose nothing. That
+ * is only worth doing when someone is waiting: with no idle peer this would push work through the
+ * queue for nothing, so the queue-depth-against-idle-count test still gates it.
+ */
+static int should_donate_to_idle(const shared_state_t *shared, const dir_stack_t *stack) {
+    int started = (int)shared->crawl_threads_started;
+    int idle;
+
+    if (started <= 1 || stack->count == 0) return 0;
+    idle = started - atomic_load(&g_active_workers);
+    if (idle <= 0) return 0;
+    return ATOMIC_LOAD_RELAXED(&g_queue_depth) < (uint64_t)idle;
+}
+
+static void donate_spill_on_entries(shared_state_t *shared, dir_stack_t *stack, task_queue_t *queue,
+                                    worker_aux_stats_t *aux, size_t *entries_since_check) {
+    size_t want;
+
+    if (*entries_since_check < g_donate_entry_check_every_cfg) return;
+    *entries_since_check = 0;
+    if (!should_donate_to_idle(shared, stack)) return;
+
+    /* One per idle peer, capped by what is on the stack: enough to wake them, not so much that a
+     * later burst of subdirectories has nothing left to balance with. */
+    want = (size_t)(shared->crawl_threads_started - atomic_load(&g_active_workers));
+    if (want > stack->count) want = stack->count;
+    if (want > (size_t)DONATE_CHUNK_MAX) want = (size_t)DONATE_CHUNK_MAX;
+
+    tls_donate_calls_inc();
+    if (donate_stack_take(stack, queue, aux, want) != 0) {
+        fprintf(stderr, "ERROR worker donate to idle: %s\n", strerror(errno));
+        stats_add_error(shared);
+    }
 }
 
 /* d_type==DT_DIR: fstatat once under dir_fd (skip later lstat on pop), push onto local stack; account+emit on pop.
@@ -4699,12 +4871,15 @@ static int process_directory_iterative(dir_stack_t *stack,
 
             if (g_no_stat) {
                 size_t dirs_since_donate_check = 0;
+                size_t entries_since_donate_check = 0;
 
                 while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     size_t child_name_len;
                     unsigned char child_d_type = ent_dtype;
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
+                    entries_since_donate_check++;
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
                     child_name_len = strlen(ent_name);
 
                     /* Filesystems without d_type support report DT_UNKNOWN, and we cannot recurse
@@ -4783,6 +4958,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                     size_t reliable_nondir_seen_in_dir = 0;
                     size_t readdir_drain_counter       = 0;
                     size_t dirs_since_donate_check     = 0;
+                    size_t entries_since_donate_check  = 0;
 
                 while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     readdir_drain_counter++;
@@ -4796,6 +4972,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                     unsigned char child_d_type = ent_dtype;
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
+                    entries_since_donate_check++;
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
 
                     child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
@@ -4912,6 +5090,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                 }
             } else {
                 size_t dirs_since_donate_check = 0;
+                size_t entries_since_donate_check = 0;
 
                 while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
                     size_t child_name_len;
@@ -4919,6 +5098,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                     unsigned char child_d_type = ent_dtype;
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
+                    entries_since_donate_check++;
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
 
                     child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
@@ -6077,12 +6258,17 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "manifest=%s\n", g_no_write ? "(disabled)" : "crawl_manifest.txt");
     fprintf(fp, "uid_output=%s\n", g_no_write ? "(disabled)" : g_uid_registry.path);
     fprintf(fp, "gid_output=%s\n", g_no_write ? "(disabled)" : g_gid_registry.path);
+    fprintf(fp, "uid_distinct=%zu\n", g_uid_distinct);
+    fprintf(fp, "gid_distinct=%zu\n", g_gid_distinct);
+    fprintf(fp, "id_resolve_threads=%d\n", g_no_write ? 0 : parse_ecrawl_id_resolve_threads());
+    fprintf(fp, "id_resolve_sec=%.3f\n", g_id_resolve_sec);
     fprintf(fp, "ops_window_sec=%d\n", WINDOW_SECONDS);
     fprintf(fp, "avg_ops_per_sec=%s\n", avg_ops_buf);
     fprintf(fp, "mean_ops_per_sec=%s\n", mean_ops_buf);
     fprintf(fp, "max_ops_per_sec=%s\n", max_ops_buf);
     fprintf(fp, "min_ops_per_sec=%s\n", min_ops_buf);
     fprintf(fp, "donate_check_every=%zu\n", g_donate_check_every_cfg);
+    fprintf(fp, "donate_entry_check_every=%zu\n", g_donate_entry_check_every_cfg);
     fprintf(fp, "force_donate_at=%zu\n", g_force_donate_count_cfg);
     fprintf(fp, "donate_chunk_force_max=%zu\n", g_donate_chunk_force_max_cfg);
     fprintf(fp, "donate_all_busy_min_stack=%zu\n", g_donate_all_busy_min_stack_cfg);
@@ -6286,6 +6472,7 @@ int main(int argc, char **argv) {
     g_stat_random_queue_dequeue = parse_ecrawl_stat_random_queue();
     g_stat_inode_order = parse_ecrawl_stat_inode_order();
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
+    g_donate_entry_check_every_cfg = parse_ecrawl_donate_entry_check_every();
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
     g_force_donate_count_cfg     = parse_ecrawl_force_donate_at();
     g_donate_all_busy_min_stack_cfg              = parse_ecrawl_donate_all_busy_min_stack();
@@ -6682,6 +6869,20 @@ int main(int argc, char **argv) {
         pthread_join(stats_thread, NULL);
         clear_status_line();
     }
+
+    /* Resolve uid/gid names here rather than leaving it to id_registry_destroy at the end of main.
+     * It is real work whose cost scales with distinct owners, so it belongs inside t0..t1 where
+     * elapsed_sec and the ops rate can see it. */
+    if (uid_registry_ready || gid_registry_ready) {
+        double id_t0 = now_sec();
+
+        g_uid_distinct = uid_registry_ready ? g_uid_registry.count : 0;
+        g_gid_distinct = gid_registry_ready ? g_gid_registry.count : 0;
+        if (uid_registry_ready) id_registry_finalize(&g_uid_registry);
+        if (gid_registry_ready) id_registry_finalize(&g_gid_registry);
+        g_id_resolve_sec = now_sec() - id_t0;
+    }
+
     t1 = now_sec();
 
     {
@@ -6764,5 +6965,10 @@ int main(int argc, char **argv) {
     if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
     if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
     if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+
+    /* Everything after t1 is invisible to elapsed_sec, which is exactly how a serial uid/gid resolve
+     * once hid 8.4s of a 9.3s run. Report the gap so the next such regression shows up in the
+     * summary instead of only in wall-clock time. */
+    if (g_verbose) fprintf(g_no_stat ? stderr : stdout, "teardown_sec=%.3f\n", now_sec() - t1);
     return atomic_load(&g_writer_failed) ? 1 : 0;
 }
