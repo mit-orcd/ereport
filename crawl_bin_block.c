@@ -296,6 +296,8 @@ int crawl_bin_block_reader_reinit(crawl_bin_block_reader_t *r, const crawl_bin_c
     r->pos = start_off;
     r->end = end_off;
     r->projection = CRAWL_PROJECTION_ALL;
+    r->rg_projection = CRAWL_PROJECTION_ALL;
+    r->hardlink_only = 0;
     r->rg_records = 0;
     r->rg_cursor = 0;
     r->names_len = 0;
@@ -317,6 +319,18 @@ int crawl_bin_block_reader_set_projection(crawl_bin_block_reader_t *r, uint32_t 
      * where one record's name ends and the next begins. */
     if (projection & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)) projection |= CRAWL_COL_BIT(CRAWL_COL_NAME_LEN);
     r->projection = projection;
+    r->hardlink_only &= projection;
+    /* Until a group is loaded, everything projected is nominally available. */
+    r->rg_projection = projection;
+    return 0;
+}
+
+int crawl_bin_block_reader_set_hardlink_columns(crawl_bin_block_reader_t *r, uint32_t mask) {
+    if (!r) return -1;
+    /* NLINK is the evidence the pruning rests on, and the name columns are unrelated to hardlinks. */
+    mask &= ~(CRAWL_COL_BIT(CRAWL_COL_NLINK) | CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) |
+              CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
+    r->hardlink_only = mask & r->projection;
     return 0;
 }
 
@@ -393,6 +407,7 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
     uint64_t group_total;
     uint32_t ci;
     uint64_t skip_run = 0; /* payload bytes to seek past before the next wanted column */
+    uint32_t want;         /* columns to decode for this group; see hardlink_only */
     int rc = -1;
     int have_name_len = 0;
 
@@ -444,10 +459,21 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
         goto done;
     r->names_len = 0;
 
+    want = r->projection;
+    if (r->hardlink_only) {
+        /* Drop the hardlink-only columns when the NLINK zone map proves this group has no hardlink.
+         * No NLINK chunk means no evidence, so keep them: guessing wrong here loses data. */
+        for (ci = 0; ci < rg.column_count; ci++) {
+            if (dir[ci].column_id != (uint8_t)CRAWL_COL_NLINK) continue;
+            if (dir[ci].max_value <= 1ULL) want &= ~r->hardlink_only;
+            break;
+        }
+    }
+
     for (ci = 0; ci < rg.column_count; ci++) {
         const bin_colchunk_hdr_t *ch = &dir[ci];
         int col = (int)ch->column_id;
-        int wanted = (col >= 0 && col < CRAWL_COL__COUNT) && (r->projection & CRAWL_COL_BIT(col));
+        int wanted = (col >= 0 && col < CRAWL_COL__COUNT) && (want & CRAWL_COL_BIT(col));
         size_t raw_len = 0;
 
         if (!wanted) {
@@ -490,9 +516,10 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
             off += r->col[CRAWL_COL_NAME_LEN][i];
         }
         r->name_off[rg.record_count] = off;
-        if ((r->projection & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)) && off != (uint64_t)r->names_len) goto done;
+        if ((want & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)) && off != (uint64_t)r->names_len) goto done;
     }
 
+    r->rg_projection = want;
     r->pos += group_total;
     r->rg_records = rg.record_count;
     r->rg_cursor = 0;
@@ -525,7 +552,7 @@ const unsigned char *crawl_bin_block_reader_name(const crawl_bin_block_reader_t 
 
     if (len_out) *len_out = 0;
     if (!r || i >= r->rg_records) return NULL;
-    if (!(r->projection & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES))) return NULL;
+    if (!(r->rg_projection & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES))) return NULL;
     if (!r->name_off) return NULL;
     start = r->name_off[i];
     len = r->name_off[i + 1] - start;
@@ -547,7 +574,7 @@ int crawl_bin_block_reader_next(crawl_bin_block_reader_t *r, bin_record_hdr_t *h
     i = r->rg_cursor++;
 
     memset(hdr, 0, sizeof(*hdr));
-#define COL_AT(c) ((r->projection & CRAWL_COL_BIT(c)) && r->col[c] ? r->col[c][i] : 0ULL)
+#define COL_AT(c) ((r->rg_projection & CRAWL_COL_BIT(c)) && r->col[c] ? r->col[c][i] : 0ULL)
     hdr->parent_dir_id = COL_AT(CRAWL_COL_PARENT_DIR_ID);
     hdr->name_len = (uint16_t)COL_AT(CRAWL_COL_NAME_LEN);
     hdr->type = (uint8_t)COL_AT(CRAWL_COL_TYPE);

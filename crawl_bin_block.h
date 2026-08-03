@@ -95,6 +95,12 @@ typedef struct {
     uint64_t end; /* exclusive end file offset of this range */
 
     uint32_t projection; /* bitmask of CRAWL_COL_BIT(); columns to decode */
+    /* Subset of projection needed only when a row group contains a hardlink; see
+     * crawl_bin_block_reader_set_hardlink_columns. */
+    uint32_t hardlink_only;
+    /* Columns actually decoded for the current row group: projection minus any hardlink_only
+     * columns this group did not need. Read it, not projection, when consuming decoded data. */
+    uint32_t rg_projection;
 
     /* Decoded columns for the current row group. Only those in the projection
      * are allocated and populated, so a two-column scan never pays for the
@@ -177,6 +183,18 @@ int crawl_bin_block_reader_set_filter(crawl_bin_block_reader_t *r, int have_size
                                       int type_filter);
 
 /*
+ * Mark projected columns as needed only by hardlink handling. A row group whose NLINK zone map has
+ * max_value <= 1 holds no hardlink, so INODE and DEV_MAJOR/DEV_MINOR exist there only to be ignored;
+ * on a tree with no hardlinks that is three of the widest columns decompressed for nothing.
+ *
+ * Such a column reads back as absent for those groups: NULL from _column(), 0 in the _next() row,
+ * and cleared from rg_projection. Only pass columns whose value the caller ignores unless nlink > 1.
+ * NLINK itself must stay projected, since it is what proves a group can be pruned; if the group has
+ * no NLINK chunk the columns are decoded as usual. Must be re-applied after each reinit.
+ */
+int crawl_bin_block_reader_set_hardlink_columns(crawl_bin_block_reader_t *r, uint32_t mask);
+
+/*
  * Yield the next record, reconstructing a row from the decoded columns. Fields
  * outside the projection are zero. *name points at the name bytes inside the
  * reader's buffer (valid only until the next call) and is NULL when
@@ -196,7 +214,9 @@ int crawl_bin_block_reader_next_group(crawl_bin_block_reader_t *r, uint32_t *rec
 
 static inline const uint64_t *crawl_bin_block_reader_column(const crawl_bin_block_reader_t *r, int column_id) {
     if (column_id < 0 || column_id >= CRAWL_COL__COUNT) return NULL;
-    if (!(r->projection & CRAWL_COL_BIT(column_id))) return NULL;
+    /* rg_projection, not projection: a hardlink-only column is absent from groups that had no
+     * hardlink, and its array still holds whatever the last group that did need it decoded. */
+    if (!(r->rg_projection & CRAWL_COL_BIT(column_id))) return NULL;
     return r->col[column_id];
 }
 

@@ -21,7 +21,8 @@ static int fail(const char *what) {
     return 1;
 }
 
-static int append_record(crawl_bin_block_writer_t *w, uint8_t type, uint64_t size, const char *name) {
+static int append_record_nlink(crawl_bin_block_writer_t *w, uint8_t type, uint64_t size, const char *name,
+                               uint64_t nlink, uint64_t inode) {
     bin_record_hdr_t h;
 
     memset(&h, 0, sizeof(h));
@@ -32,9 +33,20 @@ static int append_record(crawl_bin_block_writer_t *w, uint8_t type, uint64_t siz
     h.uid = 1000;
     h.gid = 100;
     h.mode = 0100644;
-    h.nlink = 1;
+    h.nlink = nlink;
+    h.inode = inode;
+    /* Keep dev zero for the plain records the other cases measure, so their column sizes are
+     * unchanged; the hardlink case needs a non-zero dev to prove it is decoded. */
+    if (inode != 0) {
+        h.dev_major = 8;
+        h.dev_minor = 2;
+    }
     h.mtime = 1750000000ULL + size;
     return crawl_bin_block_writer_append_record(w, &h, name);
+}
+
+static int append_record(crawl_bin_block_writer_t *w, uint8_t type, uint64_t size, const char *name) {
+    return append_record_nlink(w, type, size, name, 1, 0);
 }
 
 static int flush_group(crawl_bin_block_writer_t *w, FILE *fp, uint64_t *off) {
@@ -237,6 +249,132 @@ out:
     return rc;
 }
 
+/*
+ * Hardlink-only columns must vanish from groups the NLINK zone map clears, and come back for groups
+ * that hold a hardlink. Both halves matter: skipping too little wastes the optimization, skipping too
+ * much silently breaks hardlink dedup, which would show up only as inflated capacity totals.
+ */
+static int check_hardlink_gating(void) {
+    char path[] = "/tmp/test_crawl_hlgate.XXXXXX";
+    int fd = mkstemp(path);
+    crawl_bin_chunk_stdio_t io = {NULL, stdio_fread, NULL};
+    crawl_bin_block_writer_t w;
+    crawl_bin_block_reader_t r;
+    bin_file_header_t fh;
+    FILE *fp;
+    uint64_t off = sizeof(bin_file_header_t);
+    uint64_t gated_read = 0, full_read = 0;
+    int groups = 0, rc = -1;
+    int i;
+    /* Enough records with distinct inodes that the inode column is real compressed payload rather
+     * than a CONST chunk with no bytes, which is what makes the saving measurable. */
+    const int per_group = 64;
+
+    if (fd < 0) return -1;
+    fp = fdopen(fd, "wb+");
+    if (!fp) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    memset(&fh, 0, sizeof(fh));
+    if (fwrite(&fh, sizeof(fh), 1, fp) != 1) goto out_unlink;
+    if (crawl_bin_block_writer_init(&w) != 0) goto out_unlink;
+
+    /* Group 1: no hardlink anywhere, so inode/dev are dead weight. */
+    for (i = 0; i < per_group; i++) {
+        char nm[32];
+
+        snprintf(nm, sizeof(nm), "plain_%d", i);
+        if (append_record_nlink(&w, 'f', (uint64_t)(10 + i), nm, 1, 100000ULL + (uint64_t)i * 7ULL) != 0) {
+            crawl_bin_block_writer_free(&w);
+            goto out_unlink;
+        }
+    }
+    if (flush_group(&w, fp, &off) != 0) {
+        crawl_bin_block_writer_free(&w);
+        goto out_unlink;
+    }
+    /* Group 2: one hardlinked record, so the whole group must decode inode/dev. */
+    if (append_record_nlink(&w, 'f', 30, "linked", 3, 4242) != 0) {
+        crawl_bin_block_writer_free(&w);
+        goto out_unlink;
+    }
+    for (i = 1; i < per_group; i++) {
+        char nm[32];
+
+        snprintf(nm, sizeof(nm), "other_%d", i);
+        if (append_record_nlink(&w, 'f', (uint64_t)(30 + i), nm, 1, 200000ULL + (uint64_t)i * 7ULL) != 0) {
+            crawl_bin_block_writer_free(&w);
+            goto out_unlink;
+        }
+    }
+    if (flush_group(&w, fp, &off) != 0) {
+        crawl_bin_block_writer_free(&w);
+        goto out_unlink;
+    }
+    crawl_bin_block_writer_free(&w);
+    if (fclose(fp) != 0) {
+        unlink(path);
+        return -1;
+    }
+
+    fp = fopen(path, "rb");
+    if (!fp) goto out_unlink;
+    if (crawl_bin_block_reader_init(&r, &io, fp, sizeof(bin_file_header_t), off) != 0) goto out_close;
+    if (crawl_bin_block_reader_set_hardlink_columns(&r, CRAWL_COL_BIT(CRAWL_COL_INODE) |
+                                                            CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
+                                                            CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR)) != 0)
+        goto out_close;
+
+    for (;;) {
+        uint32_t recs = 0;
+        const uint64_t *nlink_col;
+        const uint64_t *inode_col;
+        int grc = crawl_bin_block_reader_next_group(&r, &recs);
+
+        if (grc == 0) break;
+        if (grc < 0) goto out_close;
+        groups++;
+        nlink_col = crawl_bin_block_reader_column(&r, CRAWL_COL_NLINK);
+        inode_col = crawl_bin_block_reader_column(&r, CRAWL_COL_INODE);
+        if (!nlink_col || recs != (uint32_t)per_group) goto out_close;
+
+        if (groups == 1) {
+            /* No hardlink here: the gated columns must read as absent, not as stale bytes. */
+            if (nlink_col[0] != 1ULL || nlink_col[per_group - 1] != 1ULL) goto out_close;
+            if (inode_col != NULL) goto out_close;
+            if (crawl_bin_block_reader_column(&r, CRAWL_COL_DEV_MAJOR) != NULL) goto out_close;
+            if (crawl_bin_block_reader_column(&r, CRAWL_COL_DEV_MINOR) != NULL) goto out_close;
+        } else {
+            const uint64_t *devmaj = crawl_bin_block_reader_column(&r, CRAWL_COL_DEV_MAJOR);
+
+            if (nlink_col[0] != 3ULL || !inode_col || !devmaj) goto out_close;
+            if (inode_col[0] != 4242ULL || inode_col[1] != 200007ULL) goto out_close;
+            if (devmaj[0] != 8ULL) goto out_close;
+        }
+    }
+    if (groups != 2) goto out_close;
+    gated_read = r.column_bytes_read;
+    crawl_bin_block_reader_free(&r);
+    fclose(fp);
+
+    /* The gating has to actually save reads, or it is only a correctness risk. */
+    if (measure_full_read(path, off, &full_read) != 0 || gated_read >= full_read) {
+        unlink(path);
+        return -1;
+    }
+    unlink(path);
+    return 0;
+
+out_close:
+    crawl_bin_block_reader_free(&r);
+    fclose(fp);
+out_unlink:
+    unlink(path);
+    return rc;
+}
+
 int main(void) {
     char path[] = "/tmp/test_crawl_block_filter.XXXXXX";
     int fd = mkstemp(path);
@@ -310,6 +448,8 @@ int main(void) {
     if (measure_full_read(path, off, &full_bytes) != 0 || full_bytes == 0ULL)
         return fail("could not measure full-projection read");
     if (check_projection(path, off, full_bytes) != 0) return fail("column projection failed");
+
+    if (check_hardlink_gating() != 0) return fail("hardlink-only column gating failed");
 
     /* A predicate with no usable term must leave the reader unfiltered. */
     fp = fopen(path, "rb");
