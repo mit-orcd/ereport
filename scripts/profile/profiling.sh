@@ -25,12 +25,12 @@ idx_dir="$report_dir/index"
 # The profilers only auto-detect ./<tool>, /tmp/<tool> and $PATH — none of which
 # match a $bin_root deploy — so name the binaries for them explicitly.
 export ECRAWL_BIN="$bin_root/ecrawl"
-export ECRAWL_ANALYZE_BIN="$bin_root/ecrawl_analyze"
+export ECRAWL_QUERY_BIN="$bin_root/ecrawl_query"
 export EREPORT_BIN="$bin_root/ereport"
 export EREPORT_INDEX_BIN="$bin_root/ereport_index"
 
 # Fail once, up front, instead of once per profiler deep into the run.
-for f in "$bin_root"/{edelete,ecrawl,ecrawl_analyze,ereport,ereport_index}; do
+for f in "$bin_root"/{edelete,ecrawl,ecrawl_query,ereport,ereport_index}; do
   [[ -f "$f" && -x "$f" ]] || { echo "ERROR: not an executable: $f (set EREPORT_BIN_DIR)" >&2; exit 2; }
 done
 for d in "$scripts_root"/{fixtures,profile}; do
@@ -48,14 +48,14 @@ function step1() {
   # so the quiet run is the one whose capture and timing the later steps use.
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "$data_dir" "$bin_dir"
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "$data_dir" "$bin_dir"
-  ECRAWL_ANALYZE_THREADS=64 "$bin_root/ecrawl_analyze" --top 10 "$bin_dir"
+  ECRAWL_QUERY_THREADS=64 "$bin_root/ecrawl_query" --top 10 "$bin_dir"
   EREPORT_THREADS=64 "$bin_root/ereport" --bucket-details 4 --report-dir "$report_dir" mtime "$bin_dir"
   EREPORT_INDEX_THREADS=64 "$bin_root/ereport_index" --make --index-dir "$idx_dir" "$bin_dir"
 }
 
 function step2() {
   DO_STRACE=0 DO_PERF=1 DO_SCHED=1 "$scripts_root/profile/ecrawl-fixtures.sh" "$data_dir" "$report_dir"
-  DO_STRACE=0 DO_PERF=1 DO_SCHED=1 "$scripts_root/profile/ecrawl_analyze-fixtures.sh" "$report_dir"
+  DO_STRACE=0 DO_PERF=1 DO_SCHED=1 "$scripts_root/profile/ecrawl_query-fixtures.sh" "$report_dir"
   DO_STRACE=0 DO_PERF=1 DO_SCHED=1 "$scripts_root/profile/ereport-fixtures.sh" "$report_dir"
   DO_STRACE=0 DO_PERF=1 DO_SCHED=1 "$scripts_root/profile/ereport_index-fixtures.sh" "$report_dir"
 }

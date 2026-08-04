@@ -7,7 +7,7 @@
  * glibc registers every stream on one process-wide list and takes a single lock
  * (_IO_list_all) in _IO_link_in and _IO_un_link, so fopen and fclose serialize
  * across all threads no matter which file they touch. On a capture with a
- * thousand uid shards that dominated the readers: 56% of ecrawl_analyze's cycles
+ * thousand uid shards that dominated the readers: 56% of ecrawl_query's cycles
  * on the 1019-shard fixture sat in native_queued_spin_lock_slowpath under
  * __fopen_internal and fclose, because each shard is opened once for its catalog
  * and again for its records.

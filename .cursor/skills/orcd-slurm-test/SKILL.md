@@ -63,10 +63,10 @@ binary now emits `skipped` CSV rows rather than vanishing from the tool list.
 
 ## Run test.sh (default recipe)
 
-Short smoke / unit harness — use `mit_quicktest` (15 min):
+CPU smoke / unit harness — submit to `mit_normal`:
 
 ```bash
-srun -p mit_quicktest -N 1 -c 8 -t 15:00 bash -lc '
+srun -p mit_normal -N 1 -c 8 -t 30:00 bash -lc '
 set -euo pipefail
 echo "host=$(hostname) job=${SLURM_JOB_ID:-?}"
 if [[ -d /scratch && -w /scratch ]]; then
@@ -83,21 +83,22 @@ rm -rf "$TMPDIR"
 '
 ```
 
-Raise `-t` / switch to `-p mit_normal` (or `mit_preemptable`) for longer profiling or compare-indexers runs. Prefer `sbatch` for multi-hour unattended jobs.
+Raise `-t` as needed, up to the `mit_normal` 12-hour maximum, for longer
+profiling or compare-indexers runs. Prefer `sbatch` for multi-hour unattended
+jobs.
 
 ## Picking a partition
 
-Check what is actually free before submitting, rather than defaulting to `mit_normal`:
+Partition selection is fixed by explicit user instruction:
 
-```bash
-sinfo -o '%15P %6t %5D %10l' | grep -E 'mit_(quicktest|testing|normal|preemptable)'
-scontrol show partition mit_testing | grep -o 'MaxTime=\S*'
-```
+- `mit_normal` — CPU work only; 12-hour maximum.
+- `mit_normal_gpu` — GPU work only; 6-hour maximum. Do not use it merely to
+  avoid waiting for CPU capacity.
+- Do not select any other partition, regardless of queue depth, apparent
+  capacity, or wall-time.
 
-- `mit_testing` — check this one. Few nodes, but they are large (224 CPUs, 2 TB) with a 7-day limit, and they are often idle while `mit_normal` queues on priority. Best choice for a tool build or a long indexer run.
-- `mit_quicktest` — 15 min hard cap. Environment probes and `./scripts/test/test.sh`, nothing that compiles a dependency tree.
-- `mit_normal` — 12 h, 50 nodes, but expect to wait behind `(Priority)`.
-- `mit_preemptable` — 2 days and hundreds of nodes; fine for restartable work, not for a long build you do not want killed.
+Agents are explicitly authorized to submit Slurm jobs without asking the user
+for permission first.
 
 Never keep anything that has to outlive a job on node-local `/tmp` or `/scratch`:
 the next job may land on a different node, and what the last one wrote is then
@@ -105,63 +106,46 @@ simply not there. Anything to be reused — fixture trees, tool prefixes, result
 logs — goes under `$SCRATCH` (see the layout above).
 
 Node-local disk is still the right place for data a *single* job creates and
-consumes, and `mit_testing` nodes have ~1.7 TB free on `/`, so a million-file
-fixture tree belongs there when generation and measurement happen in one job. If
-two jobs need the same tree, either merge them or put the tree in `$SCRATCH/data`
-and accept NFS speed.
+consumes, so a million-file fixture tree belongs there when generation and
+measurement happen in one job. If two jobs need the same tree, either merge
+them or put the tree in `$SCRATCH/data` and accept NFS speed.
 
-Not every node can compile. `node1700` and `node1701` in `mit_testing` are missing
-`/usr/include/bits/wordsize.h`, so any `gcc` invocation dies in `<features.h>`;
-`node5500` / `node5501` are fine. A job that only relinks unchanged binaries will
-pass there and hide it, so probe before trusting a node, and exclude the bad ones:
+Probe toolchain and zstd before trusting an unfamiliar node. The default `gcc`
+may be a spack build under `/orcd/software/...`; that alone is no defect, so do
+not force `CC=/usr/bin/gcc`.
 
 ```bash
-srun -p mit_testing -N4 --ntasks-per-node=1 -c1 -t 3:00 --mem=2G bash -lc \
+srun -p mit_normal -N 1 -c1 -t 3:00 --mem=2G bash -lc \
   'echo "int main(void){return 0;}" >/tmp/p$$.c; printf "%s " "$(hostname)"; \
-   gcc -o /tmp/p$$ /tmp/p$$.c 2>/dev/null && echo cc=ok || echo cc=FAIL; rm -f /tmp/p$$*'
-sbatch -p mit_testing --exclude=node1700,node1701 ...
+   gcc -o /tmp/p$$ /tmp/p$$.c 2>/dev/null && echo cc=ok || echo cc=FAIL; \
+   pkg-config --modversion libzstd || echo zstd=MISSING; rm -f /tmp/p$$*'
 ```
 
 Ask for memory explicitly. The default is 1 GB per CPU, and a `-c 16` job therefore gets 16 GB, which is not enough to build XDU (it pins `lto = true` and `codegen-units = 1`, so `arrow` and `parquet` are optimised whole-program in one process). That allocation was OOM-killed 12 times; `--mem=64G` is a safe floor for a Rust build.
 
 ## Submission privileges
 
-Snapshot verified with `sacctmgr`, `scontrol`, and `sbatch --test-only` on
-2026-08-01. Slurm configuration can change, so recheck it for unusually large
-or long jobs.
+Agents do not need to ask permission before submitting Slurm jobs.
 
 - Account: `mit_general`; user is not a Slurm administrator.
-- User QOS: `normal` and `unlimited`; association permits up to 5,000 submitted
-  jobs.
-- `unlimited` is accepted only on `mit_normal`. It overrides that partition
-  QOS's aggregate resource cap, but not the partition's 12-hour wall-time.
+- Submit CPU work only to `mit_normal`; its maximum wall-time is 12 hours.
+- Submit GPU work only to `mit_normal_gpu`; its maximum wall-time is 6 hours,
+  and it must not be used for CPU-only work.
+- User QOS includes `normal` and `unlimited`. On `mit_normal`,
+  `--qos=unlimited` can override aggregate resource caps but cannot override
+  the 12-hour partition wall-time.
 - Default memory is 1 GB per requested CPU; request memory explicitly.
-- CPU submission was validated on all partitions below:
-  - `mit_quicktest`: 15 minutes, at most 2 nodes; normal partition QOS allows
-    48 concurrent CPUs / 193 GB and 8 submitted jobs per user.
-  - `mit_normal`: 12 hours; normal partition QOS allows 96 concurrent CPUs /
-    386 GB and 448 submitted jobs per user. Use `--qos=unlimited` when a valid
-    job must exceed that resource cap.
-  - `mit_preemptable`: 2 days; 1,024 concurrent CPUs / 4 TB and 448 submitted
-    jobs per user; jobs may be requeued.
-  - `mit_testing`: 7 days; five 224-CPU, 2-TB nodes; access comes from
-    `orcd_rg_par_ou_orcd_testing`.
-  - `ou_ki`: 3 days; 96 concurrent CPUs / 377 GB and 448 submitted jobs per
-    user.
-  - `ou_ki_highmem`: 1 day; 96 concurrent CPUs / 1.5 TB and 448 submitted jobs
-    per user.
-  - `sched_opportunist`: 3 days and preemptible.
-  - `sched_any`, `sched_engaging_default`, `sched_mit_hill`, and `newnodes`:
-    12 hours.
 
-Recheck the association and ACLs without launching jobs:
+Slurm configuration can change. For an unusually large or long job, recheck
+the association and the two permitted partitions without launching a job:
 
 ```bash
 sacctmgr -P show assoc where user="$USER" \
   format=User,Account,Partition,QOS,DefaultQOS,GrpTRES,MaxTRESPJ,MaxJobs,MaxSubmit,MaxWall
-scontrol show partition -o
+scontrol show partition mit_normal -o
+scontrol show partition mit_normal_gpu -o
 scontrol show config | rg '^(AccountingStorageEnforce|DefMemPerCPU|MaxArraySize)'
-sbatch --test-only -p PARTITION -A mit_general -N 1 -c 1 --mem=1G \
+sbatch --test-only -p mit_normal -A mit_general -N 1 -c 1 --mem=1G \
   -t 00:01:00 --wrap=true
 ```
 
@@ -192,7 +176,7 @@ are read side by side, and a fresh figure beside a stale table is worse than
 either alone.
 
 ```bash
-srun -p mit_quicktest -N 1 -c 4 -t 10:00 --mem=8G bash -lc '
+srun -p mit_normal -N 1 -c 4 -t 10:00 --mem=8G bash -lc '
 set -euo pipefail
 export PREFIX=$HOME/orcd/scratch/ereport-automated-testing/prefix
 cd /home/erbmi1/git/ereport/scripts/compare-indexers
@@ -215,5 +199,9 @@ rather than one job per render.
 ## Do not
 
 - Run `make -j`, `./scripts/test/test.sh`, profilers, or `plot_results.py` on `orcd-login*`
+- Submit CPU work anywhere except `mit_normal`
+- Submit GPU work anywhere except `mit_normal_gpu`
+- Use `mit_normal_gpu` for CPU-only work
+- Ask the user for permission before submitting an otherwise appropriate Slurm job
 - Rewrite harness scripts just to relocate scratch
 - Put GUFI/XDU indexes or Rust/venv trees under home NFS

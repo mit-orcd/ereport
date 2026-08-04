@@ -8,8 +8,8 @@
 #
 # Env:
 #   CHECK_TOOLS=          space-separated. Defaults to the suite (find, ecrawl,
-#                         ecrawl_analyze) plus every external that is installed.
-#                         ecrawl_analyze reuses the capture the ecrawl check
+#                         ecrawl_query) plus every external that is installed.
+#                         ecrawl_query reuses the capture the ecrawl check
 #                         wrote, so keep it after ecrawl.
 #   ECRAWL_BIN=...
 #
@@ -30,12 +30,12 @@ OUT=$(cd "$OUT" && pwd)
 # Deliberately not $TOOLS: everywhere else in this suite that name means "the
 # externals to install and benchmark", and benchmark.sh exports it. Reading it
 # here replaced the suite checks with a list of externals, so a --smoke run with
-# TOOLS="gufi xdu dua" checked neither ecrawl nor ecrawl_analyze and then failed
+# TOOLS="gufi xdu dua" checked neither ecrawl nor ecrawl_query and then failed
 # on dua as an unknown tool -- silently skipping the checks in the very mode
 # meant to exercise them.
 CHECK_TOOLS=${CHECK_TOOLS:-}
 if [[ -z "$CHECK_TOOLS" ]]; then
-  CHECK_TOOLS="find ecrawl ecrawl_analyze"
+  CHECK_TOOLS="find ecrawl ecrawl_query"
   for _t in gufi xdu dua; do
     tool_available "$_t" && CHECK_TOOLS+=" $_t"
   done
@@ -129,35 +129,35 @@ check_ecrawl() {
 
 # The query path the benchmark reports for Q3/Q4/Q5 is only worth timing if it
 # returns the right answer, so check it against du and find on the same tree.
-check_ecrawl_analyze() {
+check_ecrawl_query() {
   local bin_dir="$OUT/ecrawl_bin"
-  if ! tool_available ecrawl_analyze; then
-    echo "ecrawl_analyze: skipped (binary missing)" | tee -a "$SUMMARY"
+  if ! tool_available ecrawl_query; then
+    echo "ecrawl_query: skipped (binary missing)" | tee -a "$SUMMARY"
     return 0
   fi
   if [[ ! -d "$bin_dir" ]]; then
-    echo "ecrawl_analyze: skipped (no capture; run the ecrawl check first)" | tee -a "$SUMMARY"
+    echo "ecrawl_query: skipped (no capture; run the ecrawl check first)" | tee -a "$SUMMARY"
     return 0
   fi
   local want_bytes got_bytes want_files got_files
   want_bytes=$(du -sb "$TREE" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
-  "$ECRAWL_ANALYZE_BIN" --subtree "$TREE" "$bin_dir" \
-    >"$OUT/ecrawl_analyze.subtree.txt" 2>"$OUT/ecrawl_analyze.stderr.txt" || {
-    echo "ecrawl_analyze: FAIL (nonzero exit)" | tee -a "$SUMMARY"
+  "$ECRAWL_QUERY_BIN" --subtree "$TREE" "$bin_dir" \
+    >"$OUT/ecrawl_query.subtree.txt" 2>"$OUT/ecrawl_query.stderr.txt" || {
+    echo "ecrawl_query: FAIL (nonzero exit)" | tee -a "$SUMMARY"
     FAIL=1
     return 0
   }
-  got_bytes=$(sed -n 's/^bytes=//p' "$OUT/ecrawl_analyze.subtree.txt" | tail -1 || true)
+  got_bytes=$(sed -n 's/^bytes=//p' "$OUT/ecrawl_query.subtree.txt" | tail -1 || true)
   want_files=$(kv_get "$OUT/find.baseline.txt" files)
-  got_files=$("$ECRAWL_ANALYZE_BIN" --subtree "$TREE" --type f --list "$bin_dir" 2>/dev/null | grep -c '.' || true)
+  got_files=$("$ECRAWL_QUERY_BIN" --subtree "$TREE" --type f --list "$bin_dir" 2>/dev/null | grep -c '.' || true)
 
   local ok=1
   if [[ -n "$want_bytes" && "$got_bytes" != "$want_bytes" ]]; then
-    echo "ecrawl_analyze subtree bytes mismatch: got=$got_bytes want=$want_bytes (du -sb)" | tee -a "$SUMMARY"
+    echo "ecrawl_query subtree bytes mismatch: got=$got_bytes want=$want_bytes (du -sb)" | tee -a "$SUMMARY"
     ok=0
   fi
   if [[ "$got_files" != "$want_files" ]]; then
-    echo "ecrawl_analyze subtree files mismatch: got=$got_files want=$want_files (find -type f)" | tee -a "$SUMMARY"
+    echo "ecrawl_query subtree files mismatch: got=$got_files want=$want_files (find -type f)" | tee -a "$SUMMARY"
     ok=0
   fi
 
@@ -167,21 +167,21 @@ check_ecrawl_analyze() {
   # Run the other explicitly and require they agree: that is the whole contract of
   # the fast path, and this is the only place it gets tested against a real tree.
   local answered exact_bytes
-  answered=$(sed -n 's/^answered_from=//p' "$OUT/ecrawl_analyze.subtree.txt" | tail -1 || true)
-  if "$ECRAWL_ANALYZE_BIN" --subtree "$TREE" --exact "$bin_dir" \
-    >"$OUT/ecrawl_analyze.subtree.exact.txt" 2>"$OUT/ecrawl_analyze.exact.stderr.txt"; then
-    exact_bytes=$(sed -n 's/^bytes=//p' "$OUT/ecrawl_analyze.subtree.exact.txt" | tail -1 || true)
+  answered=$(sed -n 's/^answered_from=//p' "$OUT/ecrawl_query.subtree.txt" | tail -1 || true)
+  if "$ECRAWL_QUERY_BIN" --subtree "$TREE" --exact "$bin_dir" \
+    >"$OUT/ecrawl_query.subtree.exact.txt" 2>"$OUT/ecrawl_query.exact.stderr.txt"; then
+    exact_bytes=$(sed -n 's/^bytes=//p' "$OUT/ecrawl_query.subtree.exact.txt" | tail -1 || true)
     if [[ "$got_bytes" != "$exact_bytes" ]]; then
-      echo "ecrawl_analyze rollup/scan disagree: ${answered:-?}=$got_bytes --exact=$exact_bytes" | tee -a "$SUMMARY"
+      echo "ecrawl_query rollup/scan disagree: ${answered:-?}=$got_bytes --exact=$exact_bytes" | tee -a "$SUMMARY"
       ok=0
     fi
   else
-    echo "ecrawl_analyze: FAIL (--exact nonzero exit)" | tee -a "$SUMMARY"
+    echo "ecrawl_query: FAIL (--exact nonzero exit)" | tee -a "$SUMMARY"
     ok=0
   fi
 
   if [[ $ok -eq 1 ]]; then
-    echo "ecrawl_analyze: OK bytes=$got_bytes (= du -sb, = --exact) files=$got_files (= find -type f)" \
+    echo "ecrawl_query: OK bytes=$got_bytes (= du -sb, = --exact) files=$got_files (= find -type f)" \
       " [answered_from=${answered:-?}]" | tee -a "$SUMMARY"
   else
     FAIL=1
@@ -321,7 +321,7 @@ for t in $CHECK_TOOLS; do
   case "$t" in
     find) echo "find: baseline written" | tee -a "$SUMMARY" ;;
     ecrawl) check_ecrawl ;;
-    ecrawl_analyze) check_ecrawl_analyze ;;
+    ecrawl_query) check_ecrawl_query ;;
     gufi) check_gufi ;;
     xdu) check_xdu ;;
     dua) check_dua ;;

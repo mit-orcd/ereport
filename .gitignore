@@ -12,7 +12,7 @@ __pycache__/
 /ereport
 /ereport_index
 /ecrawl_repair
-/ecrawl_analyze
+/ecrawl_query
 /test_crawl_block_filter
 /test_crawl_catalog
 /test_crawl_codec

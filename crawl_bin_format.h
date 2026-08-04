@@ -136,7 +136,7 @@ static inline uint64_t crawl_bin_rowgroup_total_bytes(const bin_rowgroup_hdr_t *
 /*
  * Stable bit per record type code, for bin_rowgroup_hdr_t.type_mask. The codes
  * are the find(1)-style letters ecrawl stores in bin_record_hdr_t.type and
- * ecrawl_analyze accepts for --type. Returns 0 for an unknown code, which the
+ * ecrawl_query accepts for --type. Returns 0 for an unknown code, which the
  * writer treats as an error rather than recording an incomplete mask.
  */
 static inline uint16_t crawl_bin_type_bit(uint8_t type) {
@@ -301,6 +301,158 @@ static inline int crawl_bin_record_ctime_led(const bin_record_hdr_t *r) {
     if (r->mtime > tam) tam = r->mtime;
     if (r->ctime <= tam) return 0;
     return (r->ctime - tam) >= CTIME_LED_MIN_DELTA_SEC;
+}
+
+/* ---------------------------------------------------------------------------
+ * Directory-index sidecars: dirs.idx (EDIRX001) and rowgroups.idx (ERGIX001)
+ *
+ * Written by `ereport_index --make` into the index dir, read by
+ * `ecrawl_query --index-dir`. Neither is part of a shard: they are derived,
+ * rebuildable artifacts that let a reader *locate* a directory instead of
+ * materializing every catalog row to find one.
+ *
+ * Everything in them is keyed per shard, because dir_id is per shard while
+ * every other artifact in the index dir is global. Each shard's descriptor
+ * therefore carries an identity binding -- basename, st_size, mtime,
+ * catalog_offset, the catalog's entry count and max_dir_id -- and a reader
+ * that cannot match all of it on every shard must ignore the sidecar entirely
+ * and fall back to reading the catalogs. A sidecar is the first thing in the
+ * index dir bound to specific shards, and nothing else there is staleness
+ * checked, so this is the whole safety story: reject, never repair.
+ *
+ * Both files share the same skeleton:
+ *
+ *     crawl_sidecar_hdr_t                  (48 B, at offset 0)
+ *     <per-shard payloads, in shard order>
+ *     <shard descriptor array>             (at shard_dir_off)
+ *     <shard basename blob>                (at names_off)
+ *
+ * The descriptor array trails the payloads so the writer can append each
+ * shard's payload as its worker finishes and only then record where it landed.
+ * Shards are stored sorted by basename, matching the order a reader gets from
+ * sorting its own directory listing.
+ * ------------------------------------------------------------------------- */
+
+#define CRAWL_DIRX_MAGIC "EDIRX001"
+#define CRAWL_RGIX_MAGIC "ERGIX001"
+#define CRAWL_SIDECAR_MAGIC_LEN 8
+#define CRAWL_SIDECAR_VERSION 1u
+
+typedef struct __attribute__((packed)) {
+    char magic[8];
+    uint32_t version;
+    uint32_t shard_count;
+    uint64_t shard_dir_off; /* file offset of the shard descriptor array */
+    uint64_t names_off;     /* file offset of the basename blob */
+    uint64_t names_bytes;
+    /* dirs.idx: total hash entries. rowgroups.idx: total row groups. Informational. */
+    uint64_t entry_total;
+} crawl_sidecar_hdr_t;
+
+/*
+ * What binds one descriptor to one shard file. A reader re-stats the shard and
+ * re-reads its 32-byte header plus the uint64 entry count at catalog_offset;
+ * five cheap facts, and any mismatch retires the whole sidecar.
+ */
+typedef struct __attribute__((packed)) {
+    uint64_t name_off; /* offset into the basename blob */
+    uint32_t name_len;
+    uint32_t reserved32;
+    uint64_t shard_size;
+    uint64_t shard_mtime_sec;
+    uint64_t shard_mtime_nsec;
+    uint64_t catalog_offset;
+    uint64_t catalog_entries; /* the uint64 that opens the catalog blob */
+    uint64_t max_dir_id;
+} crawl_sidecar_shard_id_t;
+
+/*
+ * dirs.idx per-shard payload: a hash table over full stored paths, plus the
+ * dir_id -> catalog row offset map that makes a hit usable.
+ *
+ * The hash entries are sorted by (path_hash, dir_id) so a lookup is a binary
+ * search, and they carry no path bytes: a hit names a dir_id, and the answer is
+ * only accepted once the row at rows[dir_id] has been read and its parent chain
+ * walked back into a path that compares equal to the query. A 64-bit collision
+ * therefore costs one wasted row read, never a wrong answer.
+ *
+ * rows[] is indexed by dir_id (slot 0 unused) and is what makes that walk
+ * possible at all: catalog rows are variable length, so an ancestor's offset
+ * cannot be computed from its id. 16 B per directory in the table plus 8 B in
+ * rows[] is the ~24 B/dir this costs.
+ */
+typedef struct __attribute__((packed)) {
+    uint64_t path_hash; /* crawl_sidecar_path_hash() of the full stored path */
+    uint64_t dir_id;
+} crawl_dirx_entry_t;
+
+typedef struct __attribute__((packed)) {
+    crawl_sidecar_shard_id_t id;
+    uint64_t hash_count; /* entries at hash_off */
+    uint64_t hash_off;
+    uint64_t rows_off;   /* uint64 row_offset[0 .. max_dir_id], slot 0 unused */
+} crawl_dirx_shard_t;
+
+/*
+ * rowgroups.idx per-shard payload: one sketch per row group of where that
+ * group's records sit in the shard's DFS order.
+ *
+ * dir_id is handed out in crawl arrival order, which correlates with DFS
+ * position only loosely, so two sketches are stored and a reader may use
+ * either or both: the [dfs_min, dfs_max] interval (16 B) and a 1024-bit bucket
+ * bitmap (128 B) over the shard's DFS domain. A subtree is a contiguous DFS
+ * range, so a group is prunable when the range misses the interval, or when no
+ * bucket the range covers is set.
+ *
+ * file_offset/group_bytes are the group's byte span in the shard, so a survivor
+ * list turns straight into scan chunks. group_bytes may cover a run of adjacent
+ * groups when the writer coalesced empty ones; the span always starts and ends
+ * on a row-group boundary, which is all a chunked reader requires.
+ *
+ * CRAWL_RGIX_GRP_UNKNOWN means the sketch could not be completed (a record named
+ * a dir_id the catalog does not have). Such a group must always be kept.
+ */
+#define CRAWL_RGIX_BUCKET_BITS 1024u
+#define CRAWL_RGIX_BUCKET_BYTES (CRAWL_RGIX_BUCKET_BITS / 8u)
+#define CRAWL_RGIX_GRP_UNKNOWN 0x1u
+
+typedef struct __attribute__((packed)) {
+    uint64_t file_offset;
+    uint64_t group_bytes;
+    uint32_t record_count;
+    uint32_t flags;
+    uint64_t dfs_min; /* dfs_min > dfs_max means the group has no in-catalog parents */
+    uint64_t dfs_max;
+    unsigned char buckets[CRAWL_RGIX_BUCKET_BYTES];
+} crawl_rgix_group_t;
+
+typedef struct __attribute__((packed)) {
+    crawl_sidecar_shard_id_t id;
+    uint64_t dfs_domain; /* dfs_index values live in [0, dfs_domain); sizes the buckets */
+    uint64_t group_count;
+    uint64_t groups_off;
+} crawl_rgix_shard_t;
+
+/* FNV-1a over the full stored path, exactly as crawl_bin_catalog_dir_path() spells it
+ * (absolute, no trailing slash; the synthetic root is the empty string). */
+static inline uint64_t crawl_sidecar_path_hash(const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = 14695981039346656037ULL;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Which of the 1024 buckets a DFS position falls in. Writer and reader must agree
+ * exactly, so the mapping lives here rather than in either of them. */
+static inline unsigned crawl_rgix_bucket_of(uint64_t dfs, uint64_t dfs_domain) {
+    if (dfs_domain <= 1ULL) return 0U;
+    if (dfs >= dfs_domain) dfs = dfs_domain - 1ULL;
+    return (unsigned)((dfs * (uint64_t)CRAWL_RGIX_BUCKET_BITS) / dfs_domain);
 }
 
 #endif /* CRAWL_BIN_FORMAT_H */

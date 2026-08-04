@@ -1,7 +1,7 @@
 /*
  * crawl_bin_block — columnar row-group (de)serialization for v8 uid_shard_*.bin
  * record regions. Shared by the writer (ecrawl), the chunker, and every reader
- * (ereport, ereport_index, ecrawl_analyze, ecrawl_repair, ecrawl_mount).
+ * (ereport, ereport_index, ecrawl_query, ecrawl_repair, ecrawl_mount).
  *
  * The file keeps its historical name because it still owns "the record region",
  * but a v8 group is a set of per-column chunks rather than one interleaved
@@ -173,7 +173,7 @@ int crawl_bin_block_reader_set_projection(crawl_bin_block_reader_t *r, uint32_t 
 int crawl_bin_block_reader_add_range(crawl_bin_block_reader_t *r, int column_id, uint64_t lo, uint64_t hi);
 
 /*
- * Convenience wrapper for the two predicates ecrawl_analyze exposes: size_gt is
+ * Convenience wrapper for the two predicates ecrawl_query exposes: size_gt is
  * the strict lower bound from --size-gt (a range on the size column) and
  * type_filter is a record type code, which uses the row group's type_mask -- an
  * exact set membership test, so strictly sharper than a range on the type

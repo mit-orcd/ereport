@@ -19,7 +19,8 @@
  */
 #define CRAWL_CAT_IMM_CHILD (1u << 0) /* imm_child_* */
 #define CRAWL_CAT_SUBTREE (1u << 1)   /* dfs_* and subtree_* */
-#define CRAWL_CAT_ALL (CRAWL_CAT_IMM_CHILD | CRAWL_CAT_SUBTREE)
+#define CRAWL_CAT_ROW_OFFSET (1u << 2) /* row_offset */
+#define CRAWL_CAT_ALL (CRAWL_CAT_IMM_CHILD | CRAWL_CAT_SUBTREE | CRAWL_CAT_ROW_OFFSET)
 
 typedef struct crawl_bin_catalog {
     uint64_t max_dir_id; /* highest dir_id with valid data (arrays valid for 1..max_dir_id) */
@@ -66,6 +67,17 @@ typedef struct crawl_bin_catalog {
     uint64_t *subtree_symlinks;
     uint64_t *self_bytes;
     unsigned char *self_present; /* CRAWL_DIR_FLAG_SELF_RECORD, unpacked */
+
+    /*
+     * Byte offset from the start of the shard file to this directory's
+     * bin_dir_catalog_entry_t. Requested with CRAWL_CAT_ROW_OFFSET.
+     *
+     * It is what lets a consumer come back later and read one directory's row
+     * with a pread instead of parsing the whole catalog: rows are variable
+     * length (the name follows the struct), so the offset cannot be computed
+     * from dir_id. Zero for a dir_id no entry was seen for.
+     */
+    uint64_t *row_offset;
 } crawl_bin_catalog_t;
 
 void crawl_bin_catalog_init_empty(crawl_bin_catalog_t *c);
@@ -94,6 +106,15 @@ static inline int crawl_bin_catalog_in_subtree(const crawl_bin_catalog_t *c, uin
     lo = c->dfs_index[root];
     return c->dfs_index[d] >= lo && c->dfs_index[d] < lo + c->dfs_subtree_dirs[root];
 }
+
+/*
+ * Components crawl_bin_catalog_dir_path_len will walk before it stops.
+ *
+ * A directory deeper than this comes back with its leading components missing rather than as an
+ * error. Callers that reconstruct a path any other way have to match that, or the same directory
+ * gets two different names depending on which route reached it.
+ */
+#define CRAWL_BIN_CATALOG_MAX_PATH_PARTS 128
 
 /*
  * Build absolute stored path for directory dir_id into out (NUL-terminated).

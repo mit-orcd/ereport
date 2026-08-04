@@ -13,12 +13,14 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
+ *     --index-dir DIR (optional): dirs.idx / rowgroups.idx from `ereport_index --make`. Only --subtree uses them,
+ *     and only as a shortcut to the same answer; anything unusable about them falls back silently.
  *     --verbose [minutes] (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
  *     no I/O counter atomics on hot paths). Optional integer after --verbose is accepted for compatibility but does not
  *     enable extra output. While verbose, stderr prints ecrawl-style `key=value` progress about every 30s (idle counters
@@ -65,6 +67,7 @@
 #include "crawl_bin_chunks.h"
 #include "crawl_ckpt.h"
 #include "crawl_fpcache.h"
+#include "crawl_sidecar.h"
 #include "path_canon.h"
 #include "path_utils.h"
 
@@ -565,6 +568,17 @@ typedef struct {
 typedef struct {
     atomic_uint remaining_chunks;
     crawl_bin_catalog_t *catalog;
+    /*
+     * --subtree via dirs.idx. subtree_bits has one bit per dir_id, set when that directory is at
+     * or under the subtree root *in this shard*; the scan then tests a record's parent_dir_id
+     * against it instead of rebuilding the record's path. NULL when the sidecar route is not in
+     * use, which is what the scan reads to decide between the two.
+     *
+     * subtree_root_parent is the root directory's own parent_dir_id here, because the root's own
+     * record hangs off that parent -- outside the bitmap -- and `path == prefix` is in scope.
+     */
+    unsigned char *subtree_bits;
+    uint64_t subtree_root_parent;
 } file_state_t;
 
 typedef struct {
@@ -896,6 +910,32 @@ static int g_ereport_verbose = 0;
  * even when --bucket-details is off (the skip_paths fast path needs the path to test the prefix). */
 static const char *g_subtree_prefix = NULL;
 static size_t g_subtree_prefix_len = 0;
+/* Derived once from the prefix: the last component (the subtree's own directory name) and the
+ * directory holding it ("" when that is the capture root). Both are what the dirs.idx route needs
+ * and neither depends on any shard, so they are computed where the option is parsed. */
+static const char *g_subtree_base = NULL;
+static size_t g_subtree_base_len = 0;
+static char g_subtree_parent[PATH_MAX];
+/* --subtree "/" matches every absolute path, so there is nothing for an index to narrow. */
+static int g_subtree_is_root = 0;
+
+/*
+ * --index-dir DIR: where `ereport_index --make` left dirs.idx / rowgroups.idx.
+ *
+ * Only --subtree uses them, and only as a shortcut to what the scan already computes: the root is
+ * resolved once per shard, row groups whose DFS sketch cannot reach it are never opened, and
+ * membership becomes a bit test on the record's parent_dir_id instead of a rebuilt path and a
+ * string compare. A missing, stale or truncated sidecar, or one that does not name every shard
+ * being read, is ignored outright -- the run then does exactly what it did before sidecars
+ * existed, to the byte.
+ */
+static const char *g_index_dir = NULL;
+/* What rowgroups.idx removed from this run's scan. Reported, never acted on twice. */
+static crawl_rgix_prune_stats_t g_rgix_stats;
+/* Set once the per-shard bitmaps are in place, which is the point of no return: from here the scan
+ * answers --subtree from parent_dir_id. Separate from g_rgix_stats.used, since a capture small
+ * enough that every row group survives still takes this route. */
+static int g_subtree_from_index = 0;
 
 /* --path-rewrite OLD=NEW: when g_rewrite_from is non-NULL, every reconstructed path at or under OLD has its
  * OLD prefix replaced with NEW (directory-boundary match), purely at read time — the on-disk bins are never
@@ -8277,6 +8317,8 @@ static void ereport_free_file_states(file_state_t *fs, size_t n) {
             free(fs[i].catalog);
             fs[i].catalog = NULL;
         }
+        free(fs[i].subtree_bits);
+        fs[i].subtree_bits = NULL;
     }
     free(fs);
 }
@@ -8297,6 +8339,9 @@ static void ereport_free_shard_catalogs(file_state_t *fs, size_t n) {
             free(fs[i].catalog);
             fs[i].catalog = NULL;
         }
+        /* Same lifetime, same reason: the subtree bitmaps are read only by the scan. */
+        free(fs[i].subtree_bits);
+        fs[i].subtree_bits = NULL;
     }
 }
 
@@ -8368,6 +8413,43 @@ fail:
     crawl_bin_catalog_free(cat);
     free(cat);
     return -1;
+}
+
+/*
+ * One bit per dir_id, set when that directory is at or under `root`.
+ *
+ * The catalog ereport loads has the parent pointers but not the DFS permutation
+ * (CRAWL_CAT_SUBTREE is ten more per-directory arrays, and this route exists to
+ * spend less, not more), so descent is closed here instead: dir_ids are handed
+ * out parent-first -- crawl_bin_format's writer interns a directory's parent
+ * before the directory -- so one forward pass settles every descendant, and a
+ * catalog that does not hold to that is reported as unusable rather than
+ * half-believed. root == 0 means the subtree is not in this shard at all, which
+ * is an all-zero bitmap: every record here is out of scope.
+ *
+ * 1 bit per directory, so ~85 KB for a shard with 680k of them.
+ */
+static unsigned char *ereport_subtree_bits(const crawl_bin_catalog_t *cat, uint64_t root) {
+    uint64_t n = cat->max_dir_id;
+    unsigned char *bits;
+    uint64_t d;
+
+    if (root > n) return NULL;
+    bits = (unsigned char *)calloc((size_t)(n / 8ULL) + 1U, 1U);
+    if (!bits) return NULL;
+    if (root == 0ULL) return bits;
+    bits[root >> 3] |= (unsigned char)(1U << (root & 7U));
+
+    for (d = 2ULL; d <= n; d++) {
+        uint64_t p = cat->parent_dir_id[d];
+
+        if (p >= d) {
+            free(bits);
+            return NULL;
+        }
+        if (p != 0ULL && ((bits[p >> 3] >> (p & 7U)) & 1U)) bits[d >> 3] |= (unsigned char)(1U << (d & 7U));
+    }
+    return bits;
 }
 
 /*
@@ -8515,6 +8597,29 @@ static int read_one_chunk(const file_chunk_t *chunk,
     int shape_parent_ok = 0;
     const char *shape_parent_interned = NULL; /* interned form of shape_parent, recomputed per distinct parent_id */
 
+    /* --subtree through dirs.idx: membership is a bit test on parent_dir_id, so no path is built
+     * for a record the subtree filter is going to drop. NULL means the sidecar was absent, stale
+     * or not applicable and the prefix compare below is the filter. */
+    const unsigned char *sub_bits = file_states[chunk->file_index].subtree_bits;
+    const uint64_t sub_root_parent = file_states[chunk->file_index].subtree_root_parent;
+    const uint64_t sub_max_dir_id =
+        file_states[chunk->file_index].catalog ? file_states[chunk->file_index].catalog->max_dir_id : 0ULL;
+
+    /*
+     * Key for the per-worker last-hit caches below (pintern, the dense and fanout maps). Those
+     * caches take a parent_id as a stand-in for the parent path and do not re-check the string, so
+     * the key has to be unique across every record the *worker* sees -- and parent_dir_id is only
+     * unique within one shard, so shard 3's directory 7 and shard 9's directory 7 would otherwise
+     * be the same directory as far as the cache is concerned. Chunk order decides whether that
+     * ever lands two such records next to each other, which makes it the kind of wrong answer that
+     * appears when something unrelated changes how the file is cut up.
+     *
+     * Salted with the input file index. Directory counts stay far below 2^40 (a capture with a
+     * trillion directories is not a thing) and captures have tens of shards, not millions.
+     */
+    const uint64_t parent_key_salt = (uint64_t)chunk->file_index << 40;
+#define PARENT_KEY(pid) (parent_key_salt | ((pid) & ((1ULL << 40) - 1ULL)))
+
     for (;;) {
         bin_record_hdr_t r;
         const unsigned char *rec_name = NULL;
@@ -8563,7 +8668,23 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
-        if (skip_paths && !g_subtree_prefix) {
+        /* --subtree via dirs.idx: decide membership from the record's parent_dir_id, before any path
+         * exists. Same set of records as the prefix compare below -- the bitmap is the descendants of
+         * the directory the sidecar resolved, and the subtree's own record, which starts_with_dir_prefix
+         * accepts because path == prefix. That record lives in exactly one shard, hanging off the
+         * parent outside the bitmap, and is recognised there by its name. */
+        if (sub_bits) {
+            uint64_t p = r.parent_dir_id;
+            int in_scope = (p <= sub_max_dir_id) && ((sub_bits[p >> 3] >> (p & 7U)) & 1U);
+
+            if (!in_scope && p == sub_root_parent && sub_root_parent != 0ULL &&
+                (size_t)r.name_len == g_subtree_base_len && rec_name &&
+                memcmp(rec_name, g_subtree_base, (size_t)r.name_len) == 0)
+                in_scope = 1;
+            if (!in_scope) continue;
+        }
+
+        if (skip_paths && (!g_subtree_prefix || sub_bits)) {
             pathbuf = NULL;
         } else {
             /* --subtree forces reconstruction even on the skip_paths fast path: we need the full path to
@@ -8589,7 +8710,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
         /* --subtree: keep only records at or under the requested directory (full absolute path retained).
          * Filter before any accounting so totals/heat-map/distinct-uids reflect just the subtree. */
-        if (g_subtree_prefix && !(pathbuf && starts_with_dir_prefix(pathbuf, g_subtree_prefix))) {
+        if (g_subtree_prefix && !sub_bits && !(pathbuf && starts_with_dir_prefix(pathbuf, g_subtree_prefix))) {
             continue;
         }
 
@@ -8617,7 +8738,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             size_t plen;
             const char *leaf;
             path_split_pl(src, &plen, &leaf);
-            stored_parent = pintern_get(pintern, r.parent_dir_id, src, plen);
+            stored_parent = pintern_get(pintern, PARENT_KEY(r.parent_dir_id), src, plen);
             stored_leaf = path_arena_dup(matched_records->arena, leaf);
             if (!stored_parent || !stored_leaf) {
                 fprintf(stderr, "warn: path arena alloc failed in %s\n", chunk->path);
@@ -8651,7 +8772,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
                      * fanout/fanout-stat copy it on their own and are unaffected. */
                     if (!shape_parent_interned) {
                         size_t sl = strlen(shape_parent);
-                        shape_parent_interned = pintern_get(dense_pintern, r.parent_dir_id, shape_parent, sl);
+                        shape_parent_interned =
+                            pintern_get(dense_pintern, PARENT_KEY(r.parent_dir_id), shape_parent, sl);
                         if (!shape_parent_interned) {
                             fprintf(stderr, "warn: dense parent arena alloc failed in %s\n", chunk->path);
                             sum->bad_input_files++;
@@ -8705,7 +8827,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
 
             if (pathbuf && bucket_detail_levels > 0) {
                 path_shape_accumulate_file(sum, &dense_maps[ab][sb], ab, sb, pathbuf,
-                                           r.parent_dir_id, accounted_size, shp, shp_h);
+                                           PARENT_KEY(r.parent_dir_id), accounted_size, shp, shp_h);
             }
 
             if (!skip_paths) {
@@ -8750,12 +8872,13 @@ static int read_one_chunk(const file_chunk_t *chunk,
         }
 
         if (pathbuf && bucket_detail_levels > 0 && parent_fanout) {
-            path_fanout_accumulate(parent_fanout, pathbuf, r.parent_dir_id, shp, shp_h);
+            path_fanout_accumulate(parent_fanout, pathbuf, PARENT_KEY(r.parent_dir_id), shp, shp_h);
             if (parent_fanout_stats)
-                fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, r.parent_dir_id, r.type,
-                                              rec_time, sum, shp, shp_h);
+                fanout_parent_stat_accumulate(parent_fanout_stats, pathbuf, PARENT_KEY(r.parent_dir_id),
+                                              r.type, rec_time, sum, shp, shp_h);
         }
     }
+#undef PARENT_KEY
 
 out:
     crawl_bin_block_reader_free(&br);
@@ -10452,6 +10575,12 @@ static void emit_run_stats(const char *username,
     printf("bucket_pages_written=%d\n", bucket_pages_written);
     printf("scanned_input_files=%" PRIu64 "\n", sum->scanned_input_files);
     printf("scanned_records=%" PRIu64 "\n", sum->scanned_records);
+    if (g_subtree_from_index) printf("subtree_from=dir_index\n");
+    if (g_rgix_stats.used) {
+        printf("rowgroups_kept=%" PRIu64 "\n", g_rgix_stats.kept);
+        printf("rowgroups_total=%" PRIu64 "\n", g_rgix_stats.total);
+        printf("rowgroup_records_kept=%" PRIu64 "\n", g_rgix_stats.records_kept);
+    }
     printf("matched_records=%" PRIu64 "\n", sum->matched_records);
     printf("files=%" PRIu64 "\n", sum->total_files);
     printf("directories=%" PRIu64 "\n", sum->total_dirs);
@@ -10599,6 +10728,10 @@ int main(int argc, char **argv) {
     ereport_crawl_timing_t crawl_timing;
     ereport_manifest_disk_t manifest_disk;
     path_shape_view_t path_shape;
+    crawl_sidecar_t sidecar;
+    crawl_sidecar_scope_t *sidecar_scope = NULL; /* one per shard; NULL when --index-dir is not in play */
+
+    memset(&sidecar, 0, sizeof(sidecar));
 
     tune_allocator();
     crawl_fpcache_set_bufsz(EREPORT_PARSE_STDIO_BUFSZ);
@@ -10636,11 +10769,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10656,6 +10789,12 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW in the "
                 "report/heat-map at read time (bins unchanged), e.g. /data1/group=/orcd/data. Applied before --subtree.\n");
+        fprintf(stderr,
+                "Optional --index-dir DIR: use the dirs.idx / rowgroups.idx sidecars `ereport_index --make` wrote "
+                "there to speed up --subtree — the root is resolved once per shard, row groups that cannot hold a "
+                "descendant are never read, and membership becomes a bit test on the record's parent directory "
+                "instead of a rebuilt path. The report is identical either way; a sidecar that is absent, stale, or "
+                "does not name every shard is ignored.\n");
         fprintf(stderr,
                 "Optional --verbose [minutes]: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics). Optional integer 1…10080 is accepted for compatibility; stderr "
@@ -10770,10 +10909,42 @@ int main(int argc, char **argv) {
                 /* Strip trailing '/' (but keep a lone "/") so prefix matching is on a directory boundary. */
                 {
                     size_t sl = strlen(subtree_buf);
+                    const char *slash;
+
                     while (sl > 1 && subtree_buf[sl - 1] == '/') subtree_buf[--sl] = '\0';
                     g_subtree_prefix = subtree_buf;
                     g_subtree_prefix_len = sl;
+                    g_subtree_is_root = (sl == 1U);
+                    /* Split once: the directory's own name, and the directory holding it. Both are
+                     * what the dirs.idx route looks up; the capture root's parent is the empty
+                     * string, which is the path catalogs give dir_id 1. */
+                    slash = strrchr(subtree_buf, '/');
+                    g_subtree_base = slash ? slash + 1 : subtree_buf;
+                    g_subtree_base_len = strlen(g_subtree_base);
+                    if (slash && slash != subtree_buf) {
+                        size_t pl = (size_t)(slash - subtree_buf);
+
+                        memcpy(g_subtree_parent, subtree_buf, pl);
+                        g_subtree_parent[pl] = '\0';
+                    } else {
+                        g_subtree_parent[0] = '\0';
+                    }
                 }
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--index-dir") == 0) {
+                if (g_index_dir != NULL) {
+                    fprintf(stderr, "ereport: duplicate --index-dir\n");
+                    return 2;
+                }
+                if (ac < 3 || av[2][0] == '\0') {
+                    fprintf(stderr, "ereport: --index-dir requires a directory path\n");
+                    return 2;
+                }
+                g_index_dir = av[2];
                 memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
                 ac -= 2;
                 argc = ac;
@@ -11059,6 +11230,45 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ereport: found %zu matching bin file(s).\n", path_count);
     fflush(stderr);
 
+    /*
+     * --index-dir: resolve the subtree in each shard before anything is read.
+     *
+     * Declined outright for --subtree / (every absolute path matches, so there is nothing to
+     * narrow) and under --path-rewrite (the filter then runs in the rewritten namespace, which the
+     * catalogs and therefore the sidecar know nothing about). Anything the sidecar cannot account
+     * for -- a shard it does not name, an identity that has moved, a subtree it cannot place in any
+     * shard -- leaves sidecar_scope NULL and the run takes the path-prefix route unchanged.
+     */
+    if (g_index_dir && g_subtree_prefix && !g_subtree_is_root && !g_rewrite_from) {
+        uint64_t rows_read = 0;
+
+        if (crawl_sidecar_open(g_index_dir, (const char *const *)paths, path_count, &sidecar) == 0) {
+            int placed = 0;
+
+            sidecar_scope = (crawl_sidecar_scope_t *)calloc(path_count, sizeof(*sidecar_scope));
+            if (sidecar_scope &&
+                crawl_sidecar_scope_subtree(&sidecar, g_subtree_prefix, g_subtree_prefix_len, g_subtree_parent,
+                                            sidecar_scope, &rows_read) == 0) {
+                size_t k;
+
+                /* dirs.idx holds directories only. A --subtree naming a file or a symlink resolves
+                 * nowhere here, yet starts_with_dir_prefix would still match that one record on
+                 * path == prefix, so an unresolved name is a reason to fall back rather than to
+                 * report an empty subtree. */
+                for (k = 0; k < path_count; k++)
+                    if (sidecar_scope[k].root != 0ULL) placed = 1;
+            }
+            if (!placed) {
+                free(sidecar_scope);
+                sidecar_scope = NULL;
+                crawl_sidecar_close(&sidecar);
+            } else if (g_ereport_verbose) {
+                fprintf(stderr, "ereport: dirs.idx resolved %s from %" PRIu64 " directory row(s)\n",
+                        g_subtree_prefix, rows_read);
+            }
+        }
+    }
+
     file_states = (file_state_t *)calloc(path_count, sizeof(*file_states));
     if (!file_states) {
         size_t k;
@@ -11118,6 +11328,40 @@ int main(int argc, char **argv) {
             return 1;
         }
         stats_thread_started = 1;
+
+        if (g_ereport_verbose) vt_chunk0 = now_sec();
+
+        /*
+         * --index-dir: rowgroups.idx already knows which row groups can hold a descendant of the
+         * subtree, and a group boundary is a legal chunk boundary, so the survivors are the job
+         * list. That also retires the boundary-mapping pass below, whose whole job is to find those
+         * same boundaries by walking every group header in the record region.
+         *
+         * Purely a reduction of the same byte ranges: both sketches are conservative supersets, so
+         * no record the scan would have matched can be in a group that was dropped.
+         */
+        if (sidecar_scope) {
+            uint64_t pruned_bytes = 0;
+
+            if (crawl_rgix_build_chunks(&sidecar, (const char *const *)paths, path_count, sidecar_scope, threads,
+                                        4U, PARSE_CHUNK_MIN_BYTES, PARSE_CHUNK_BYTES, &chunks, &chunk_count,
+                                        &pruned_bytes, &g_rgix_stats) == 0) {
+                size_t ci;
+
+                for (ci = 0; ci < chunk_count; ci++)
+                    atomic_fetch_add(&file_states[chunks[ci].file_index].remaining_chunks, 1U);
+                if (g_ereport_verbose) {
+                    fprintf(stderr,
+                            "rowgroups_kept=%" PRIu64 "\nrowgroups_total=%" PRIu64
+                            "\nrowgroup_records_kept=%" PRIu64 "\nrowgroup_records_total=%" PRIu64
+                            "\nrowgroup_bytes_kept=%" PRIu64 "\nrowgroup_chunks=%zu\n",
+                            g_rgix_stats.kept, g_rgix_stats.total, g_rgix_stats.records_kept,
+                            g_rgix_stats.records_total, pruned_bytes, chunk_count);
+                    fflush(stderr);
+                }
+                goto chunks_ready;
+            }
+        }
 
         /*
          * Two levels: one scanner per input file, and inside each file the .ckpt
@@ -11192,7 +11436,6 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if (g_ereport_verbose) vt_chunk0 = now_sec();
         for (i = 0; i < prep_threads; i++) {
             prep_args[i].pool = &pool;
             prep_args[i].slot = (int)i;
@@ -11280,6 +11523,7 @@ int main(int argc, char **argv) {
             chunks = merged;
         }
 
+chunks_ready:
         free(chunk_targets);
         free(prep_rc);
         free(prep_chunks);
@@ -11289,6 +11533,10 @@ int main(int argc, char **argv) {
         run_stats.chunk_prep_files_total = 0;
         atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
     }
+
+    /* The mappings and shard fds have served their purpose; the resolved per-shard roots in
+     * sidecar_scope are all the scan still needs. */
+    crawl_sidecar_close(&sidecar);
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
@@ -11322,6 +11570,41 @@ int main(int argc, char **argv) {
             ereport_free_file_states(file_states, path_count);
             return 1;
         }
+    }
+
+    /*
+     * --index-dir: close the subtree over each shard's parent pointers, once, so the scan can
+     * answer "is this record's parent inside?" with a bit test.
+     *
+     * All or nothing. A shard whose catalog will not yield a bitmap leaves every shard on the
+     * path-prefix route, which is the same answer by a slower road -- and one already-pruned chunk
+     * list stays correct either way, because a pruned group held no matching record to begin with.
+     */
+    if (sidecar_scope) {
+        size_t fi;
+        int ok = 1;
+
+        for (fi = 0; fi < path_count && ok; fi++) {
+            if (!file_states[fi].catalog) continue;
+            file_states[fi].subtree_bits = ereport_subtree_bits(file_states[fi].catalog, sidecar_scope[fi].root);
+            file_states[fi].subtree_root_parent = sidecar_scope[fi].root_parent;
+            if (!file_states[fi].subtree_bits) ok = 0;
+        }
+        if (!ok) {
+            fprintf(stderr, "ereport: dir index unusable for this capture; --subtree falls back to path matching\n");
+            for (fi = 0; fi < path_count; fi++) {
+                free(file_states[fi].subtree_bits);
+                file_states[fi].subtree_bits = NULL;
+                file_states[fi].subtree_root_parent = 0ULL;
+            }
+            /* g_rgix_stats stays: the chunk list is already pruned, and the record credit below is
+             * what keeps "Scanned records" meaning the same thing it did. */
+        } else {
+            g_subtree_from_index = 1;
+        }
+        /* Everything the scan needs is now in the per-shard bitmaps. */
+        free(sidecar_scope);
+        sidecar_scope = NULL;
     }
 
     /* Now that the catalogs are in, the number of directories across the shards being read is known, and
@@ -11503,6 +11786,15 @@ int main(int argc, char **argv) {
 
             if (g_ereport_verbose) __vt = now_sec();
             summary_reduce_from_worker_args(&final_sum, args, threads_used);
+            /*
+             * Credit the records in the row groups pruning removed. "Scanned records" is the size
+             * of what the run had to account for, not how much of it happened to be decoded; a
+             * --subtree report has to read the same whether or not an index dir was handed to it,
+             * and the pruned groups are exactly the ones proven to hold nothing in scope. What the
+             * pruning actually saved is reported on stderr and under --verbose.
+             */
+            if (g_rgix_stats.used && g_rgix_stats.records_total > g_rgix_stats.records_kept)
+                final_sum.scanned_records += g_rgix_stats.records_total - g_rgix_stats.records_kept;
             if (g_ereport_verbose && __vt > 0.0) run_stats.vt_fini_summaries_sec += now_sec() - __vt;
         }
     }

@@ -13,7 +13,7 @@ make ecrawl
 make ereport
 make ereport_index
 make ecrawl_repair
-make ecrawl_analyze
+make ecrawl_query
 make edelete
 make ecrawl_mount      # optional; needs FUSE headers (see below)
 ```
@@ -50,7 +50,7 @@ The header version is pinned to the distro's `libfuse.so.2` so the ABI matches e
 
 ### Optional: link native binaries against jemalloc
 
-The Makefile auto-detects jemalloc via `pkg-config` and, when `jemalloc-devel` / `libjemalloc-dev` is installed, links all native targets built by `make all` — `ereport`, `ereport_index`, `ecrawl`, `edelete`, `ecrawl_repair`, `ecrawl_analyze`, `ecrawl_mount`, and `enfsprobe` / `enfsprobe-dist` — against `-ljemalloc`. `enfsprobe-static` is unchanged (fully static link + jemalloc is fragile). Install the dev package so `pkg-config` can find it:
+The Makefile auto-detects jemalloc via `pkg-config` and, when `jemalloc-devel` / `libjemalloc-dev` is installed, links all native targets built by `make all` — `ereport`, `ereport_index`, `ecrawl`, `edelete`, `ecrawl_repair`, `ecrawl_query`, `ecrawl_mount`, and `enfsprobe` / `enfsprobe-dist` — against `-ljemalloc`. `enfsprobe-static` is unchanged (fully static link + jemalloc is fragile). Install the dev package so `pkg-config` can find it:
 
 ```bash
 sudo dnf install jemalloc-devel    # RHEL / Fedora / EL8+ (EPEL)

@@ -93,7 +93,7 @@
 #   SYNTH_REAL_LARGE_COUNT=10  # number of fully-written files (allocated ≈ logical, not sparse)
 #   SYNTH_REAL_LARGE_MIB=16    # size of each in MiB (zeros via dd; counts against DISK_BUDGET_BYTES)
 #
-# Optional depth/slash profile (matches ecrawl_analyze "depth_bin_*" = count of '/' in stored path
+# Optional depth/slash profile (matches ecrawl_query "depth_bin_*" = count of '/' in stored path
 # relative to crawl root — one leading segment depth_slash_profile/ adds one slash):
 #   DEPTH_SLICE_ENABLE=0       # set 1 to create depth_slash_profile/…
 #   DEPTH_PEAK_LO=12 DEPTH_PEAK_HI=16     # "mass" bins (inclusive)
@@ -1477,7 +1477,7 @@ fi
 if [[ "$DEPTH_SLICE_ENABLE" == "1" ]]; then
   echo "  depth_slash_profile: peak bins ${DEPTH_PEAK_LO}-${DEPTH_PEAK_HI} × ${DEPTH_PEAK_FILES_PER_BIN} files/bin;"
   echo "                       plateau bins ${DEPTH_PLATEAU_LO}-${DEPTH_PLATEAU_HI} × ${DEPTH_PLATEAU_FILES_PER_BIN} files/bin"
-  echo "                       (stored paths have exactly B slashes for bin B — same rule as ecrawl_analyze depth_bin_B)"
+  echo "                       (stored paths have exactly B slashes for bin B — same rule as ecrawl_query depth_bin_B)"
 else
   echo "  depth_slash_profile: (skipped; DEPTH_SLICE_ENABLE=1 to mimic analyze depth histogram shapes)"
 fi
@@ -2977,7 +2977,7 @@ Why this is adversarial for ecrawl:
   - deep_skinny_chain: mostly a single path of subdirectories (limited breadth until
     you fan back into other trees).
   - wide_shallow (default on): many top-level buckets — workers can donate sibling dirs.
-  - depth_slash_profile (optional): paths sized so stored slash counts match ecrawl_analyze
+  - depth_slash_profile (optional): paths sized so stored slash counts match ecrawl_query
     depth_bin_* (see DEPTH_PEAK_* / DEPTH_PLATEAU_*): peak mass + deep plateau.
   - links_and_specials (default on): symlinks (relative/absolute/to-directory/broken/symlink-to-symlink)
     that ecrawl records but never follows, plus many hard links to shared inodes (st_nlink>1) so

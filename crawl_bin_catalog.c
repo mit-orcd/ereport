@@ -47,6 +47,7 @@ void crawl_bin_catalog_free(crawl_bin_catalog_t *c) {
     free(c->subtree_symlinks);
     free(c->self_bytes);
     free(c->self_present);
+    free(c->row_offset);
     crawl_bin_catalog_init_empty(c);
 }
 
@@ -71,6 +72,7 @@ static int catalog_reserve_cap(crawl_bin_catalog_t *c, uint64_t want_cap) {
     uint64_t new_cap;
     int want_imm = (c->fields & CRAWL_CAT_IMM_CHILD) != 0;
     int want_sub = (c->fields & CRAWL_CAT_SUBTREE) != 0;
+    int want_row = (c->fields & CRAWL_CAT_ROW_OFFSET) != 0;
 
     if (want_cap <= c->cap) return 0;
     {
@@ -97,7 +99,8 @@ static int catalog_reserve_cap(crawl_bin_catalog_t *c, uint64_t want_cap) {
             cat_opt_grow(&c->subtree_files, want_sub, new_cap + 1ULL) != 0 ||
             cat_opt_grow(&c->subtree_dirs, want_sub, new_cap + 1ULL) != 0 ||
             cat_opt_grow(&c->subtree_symlinks, want_sub, new_cap + 1ULL) != 0 ||
-            cat_opt_grow(&c->self_bytes, want_sub, new_cap + 1ULL) != 0)
+            cat_opt_grow(&c->self_bytes, want_sub, new_cap + 1ULL) != 0 ||
+            cat_opt_grow(&c->row_offset, want_row, new_cap + 1ULL) != 0)
             return -1;
         if (want_sub) {
             unsigned char *sp = (unsigned char *)realloc(c->self_present, (size_t)(new_cap + 1ULL));
@@ -114,6 +117,7 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
     uint64_t i;
     int want_imm = (c->fields & CRAWL_CAT_IMM_CHILD) != 0;
     int want_sub = (c->fields & CRAWL_CAT_SUBTREE) != 0;
+    int want_row = (c->fields & CRAWL_CAT_ROW_OFFSET) != 0;
 
     if (dir_id <= c->max_dir_id) return 0;
     if (catalog_reserve_cap(c, dir_id) != 0) return -1;
@@ -142,6 +146,7 @@ static int catalog_ensure_slots(crawl_bin_catalog_t *c, uint64_t dir_id) {
             c->self_bytes[i] = 0;
             c->self_present[i] = 0;
         }
+        if (want_row) c->row_offset[i] = 0;
     }
     c->max_dir_id = dir_id;
     return 0;
@@ -152,8 +157,10 @@ int crawl_bin_catalog_load(FILE *fp, uint64_t catalog_offset, uint64_t file_sz, 
 }
 
 /* Copy one parsed entry's fields into the catalog arrays. Shared by the mapped and stdio loaders so
- * the two paths cannot drift; the name is stored by the caller, which knows if it owns the bytes. */
-static void catalog_store_entry(crawl_bin_catalog_t *out, uint64_t did, const bin_dir_catalog_entry_t *ent) {
+ * the two paths cannot drift; the name is stored by the caller, which knows if it owns the bytes.
+ * row_off is the entry's byte offset in the shard file, which only the caller can know. */
+static void catalog_store_entry(crawl_bin_catalog_t *out, uint64_t did, const bin_dir_catalog_entry_t *ent,
+                                uint64_t row_off) {
     out->parent_dir_id[did] = ent->parent_dir_id;
     out->depth[did] = ent->depth;
     out->name_len[did] = ent->name_len;
@@ -176,6 +183,7 @@ static void catalog_store_entry(crawl_bin_catalog_t *out, uint64_t did, const bi
         out->self_bytes[did] = ent->self_bytes;
         out->self_present[did] = (ent->flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1U : 0U;
     }
+    if (out->fields & CRAWL_CAT_ROW_OFFSET) out->row_offset[did] = row_off;
 }
 
 /*
@@ -183,7 +191,7 @@ static void catalog_store_entry(crawl_bin_catalog_t *out, uint64_t did, const bi
  *
  * A mapping is not free to take down: munmap in a multi-threaded process sends a TLB shootdown IPI
  * to every CPU the process has run on, and that cost does not shrink with the mapping. On a crawl
- * split into 1019 small shards, ecrawl_analyze spent 22.5% of the run inside
+ * split into 1019 small shards, ecrawl_query spent 22.5% of the run inside
  * crawl_bin_catalog_load_sel and crawl_bin_catalog_free -- 8.4% in munmap alone, with
  * smp_call_function_many_cond, tlb_is_not_lazy and flush_tlb_func together near a third of all
  * samples on a 32-thread run across 96 CPUs. One large catalog still wins from mapping, so gate on
@@ -235,9 +243,11 @@ static int catalog_load_mapped(FILE *fp, uint64_t catalog_offset, uint64_t file_
     for (i = 0; i < n; i++) {
         bin_dir_catalog_entry_t ent;
         uint64_t did;
+        uint64_t row_off;
         size_t nl;
 
         if ((size_t)(end - p) < sizeof(ent)) goto fail;
+        row_off = base_off + (uint64_t)(p - map);
         memcpy(&ent, p, sizeof(ent)); /* the on-disk struct is packed; copy out to stay aligned */
         p += sizeof(ent);
 
@@ -250,7 +260,7 @@ static int catalog_load_mapped(FILE *fp, uint64_t catalog_offset, uint64_t file_
         out->name_comp[did] = (nl > 0) ? (char *)p : NULL;
         p += nl;
 
-        catalog_store_entry(out, did, &ent);
+        catalog_store_entry(out, did, &ent, row_off);
     }
 
     out->names_borrowed = 1;
@@ -307,8 +317,17 @@ int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_
     for (i = 0; i < n; i++) {
         bin_dir_catalog_entry_t ent;
         uint64_t did;
+        uint64_t row_off = 0;
         size_t nl;
 
+        /* Only pay for the position when someone asked for it: ftello is a
+         * syscall-free lseek in glibc but still not free per directory. */
+        if (out->fields & CRAWL_CAT_ROW_OFFSET) {
+            off_t here = ftello(fp);
+
+            if (here < 0) goto fail;
+            row_off = (uint64_t)here;
+        }
         if (fread(&ent, sizeof(ent), 1, fp) != 1) goto fail;
         did = ent.dir_id;
         if (did == 0) goto fail;
@@ -335,7 +354,7 @@ int crawl_bin_catalog_load_sel(FILE *fp, uint64_t catalog_offset, uint64_t file_
             if (!out->name_comp[did]) goto fail;
             memcpy(out->name_comp[did], tmp_name, nl + 1);
         }
-        catalog_store_entry(out, did, &ent);
+        catalog_store_entry(out, did, &ent, row_off);
     }
 
     free(tmp_name);
@@ -351,8 +370,8 @@ fail:
 int crawl_bin_catalog_dir_path_len(const crawl_bin_catalog_t *c, uint64_t dir_id, char *out, size_t out_sz,
                                    size_t *len_out) {
     size_t nparts = 0;
-    size_t parts_len[128];
-    const char *parts_ptr[128];
+    size_t parts_len[CRAWL_BIN_CATALOG_MAX_PATH_PARTS];
+    const char *parts_ptr[CRAWL_BIN_CATALOG_MAX_PATH_PARTS];
     uint64_t cur = dir_id;
     size_t tot = 0;
     size_t pi;
@@ -362,7 +381,7 @@ int crawl_bin_catalog_dir_path_len(const crawl_bin_catalog_t *c, uint64_t dir_id
     out[0] = '\0';
     if (dir_id == 0 || dir_id > c->max_dir_id) return -1;
 
-    while (cur != 0 && nparts < 128) {
+    while (cur != 0 && nparts < CRAWL_BIN_CATALOG_MAX_PATH_PARTS) {
         if (cur > c->max_dir_id) return -1;
         if (cur == 1ULL) break;
         parts_len[nparts] = (size_t)c->name_len[cur];

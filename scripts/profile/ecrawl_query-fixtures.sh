@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# profile/ecrawl_analyze-fixtures.sh
+# profile/ecrawl_query-fixtures.sh
 #
 # SPDX-License-Identifier: MIT
 #
-# Profile `ecrawl_analyze` (read-only directory-shape stats over crawl shards)
+# Profile `ecrawl_query` (read-only directory-shape stats over crawl shards)
 # over the shared per-fixture crawl output produced by
 # profile/ecrawl-fixtures.sh, the same way profile/ereport-fixtures.sh profiles
 # `ereport`.
@@ -14,21 +14,21 @@
 # those shards and hard-errors if a selected fixture has none.
 #
 # Per fixture (see generate-ecrawl-adversarial-tree.sh):
-#   ANALYZE phase — run `ecrawl_analyze --verbose` over <bin-root>/<fixture>/bin
+#   ANALYZE phase — run `ecrawl_query --verbose` over <bin-root>/<fixture>/bin
 #                   and capture a full profile.
 #
 # The ANALYZE phase runs up to four instrumented passes:
-#   clean   — /usr/bin/time -v + ecrawl_analyze key=value stats on stdout
+#   clean   — /usr/bin/time -v + ecrawl_query key=value stats on stdout
 #             (records_total, distinct_parent_directories, ...) + our own wall
 #             timer. Only trustworthy timing.
 #   strace  — strace -f -c syscall histogram (timing NOT representative).
 #   perf    — perf record --call-graph dwarf + perf report (CPU profile, plus a
-#             per-thread CPU split; build ecrawl_analyze with `make debug` for
+#             per-thread CPU split; build ecrawl_query with `make debug` for
 #             best symbols).
 #   sched   — optional `perf sched` pass (per-thread runtime / switch / delay)
 #             for the big fixtures, to confirm per-section thread concurrency.
 #
-# NOTE on thread use: ecrawl_analyze parallelises per parse chunk (a .ckpt
+# NOTE on thread use: ecrawl_query parallelises per parse chunk (a .ckpt
 # segment), not per shard file — it caps its worker count at the number of
 # chunks. A single big single-UID shard is split into multiple chunks, so it
 # now spreads across cores (each shard's catalog is loaded once and shared by
@@ -36,23 +36,23 @@
 # per-thread perf views below make the actual spread visible.
 #
 # Usage:
-#   scripts/profile/ecrawl_analyze-fixtures.sh <bin-root> [results-dir]
+#   scripts/profile/ecrawl_query-fixtures.sh <bin-root> [results-dir]
 #
 # Required:
 #   <bin-root>     dir produced by profile/ecrawl-fixtures.sh; for each fixture
 #                  it must contain <bin-root>/<fixture>/bin/uid_shard_*.bin.
-#                  ecrawl_analyze is read-only, so it produces no kept output.
+#                  ecrawl_query is read-only, so it produces no kept output.
 #
 # Optional positional:
 #   [results-dir]  where profiling logs/tarball go (default:
-#                  ./ecrawl_analyze-profile-<timestamp>); kept separate from data.
+#                  ./ecrawl_query-profile-<timestamp>); kept separate from data.
 #
 # Environment knobs (all optional):
-#   ECRAWL_ANALYZE_BIN=./ecrawl_analyze  analyzer binary (auto: ./, /tmp/, PATH).
-#   ECRAWL_ANALYZE_THREADS=32  worker threads (passed through; tool caps at the
+#   ECRAWL_QUERY_BIN=./ecrawl_query  analyzer binary (auto: ./, /tmp/, PATH).
+#   ECRAWL_QUERY_THREADS=32    worker threads (passed through; tool caps at the
 #                              shard count, and falls back to ECRAWL_REPAIR_THREADS
-#                              if ECRAWL_ANALYZE_THREADS is unset).
-#   ANALYZE_TOP=               if set to N, pass `--top N` to ecrawl_analyze.
+#                              if ECRAWL_QUERY_THREADS is unset).
+#   ANALYZE_TOP=               if set to N, pass `--top N` to ecrawl_query.
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).
 #   INCLUDE_ROOT=0             also analyze the whole-tree _ALL_ROOT_ bin set if
@@ -68,7 +68,7 @@
 #   PERF_FREQ=997              perf sampling frequency (Hz).
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
 #   REPS=1                     repetitions of the clean analyze pass per fixture.
-#   ECRAWL_ANALYZE_VERBOSE_ARGS=...  extra args appended to ecrawl_analyze.
+#   ECRAWL_QUERY_VERBOSE_ARGS=...  extra args appended to ecrawl_query.
 #   DO_QUERY=1                 also profile the selective hot-path queries.
 #   QUERY_SIZE_GT=524288000    strict byte threshold substituted for @SIZE@.
 #   QUERY_TYPE=f               record type substituted for @TYPE@.
@@ -86,8 +86,8 @@
 #
 # Profiling-log layout (under <results-dir>):
 #   env.txt                                    host/build/env snapshot
-#   <fixture>/analyze/clean.stats.txt          ecrawl_analyze key=value (stdout)
-#   <fixture>/analyze/clean.progress.txt       ecrawl_analyze progress (stderr)
+#   <fixture>/analyze/clean.stats.txt          ecrawl_query key=value (stdout)
+#   <fixture>/analyze/clean.progress.txt       ecrawl_query progress (stderr)
 #   <fixture>/analyze/clean.time.txt           /usr/bin/time -v
 #   <fixture>/analyze/strace.txt               strace -f -c histogram
 #   <fixture>/analyze/perf.report.txt          perf report --stdio
@@ -108,7 +108,7 @@
 #
 #   SUMMARY_TABLE.txt                          at-a-glance table
 #   COMBINED_REPORT.txt                        everything concatenated
-#   ecrawl_analyze-profile-<timestamp>.tar.gz  tarball (upload this)
+#   ecrawl_query-profile-<timestamp>.tar.gz  tarball (upload this)
 #
 set -uo pipefail
 
@@ -129,16 +129,16 @@ fi
 BIN_ROOT=$(cd "$BIN_ROOT" && pwd)
 
 TS=$(date +%Y%m%d-%H%M%S)
-RESULTS_DIR=${2:-"./ecrawl_analyze-profile-$TS"}
+RESULTS_DIR=${2:-"./ecrawl_query-profile-$TS"}
 mkdir -p "$RESULTS_DIR" || { echo "ERROR: cannot create results dir '$RESULTS_DIR'" >&2; exit 1; }
 RESULTS_DIR=$(cd "$RESULTS_DIR" && pwd)
 
 # ---- locate binaries -------------------------------------------------------
-ECRAWL_ANALYZE_BIN=$(find_bin ecrawl_analyze ECRAWL_ANALYZE_BIN) || exit 1
+ECRAWL_QUERY_BIN=$(find_bin ecrawl_query ECRAWL_QUERY_BIN) || exit 1
 
 # ---- config ----------------------------------------------------------------
-ECRAWL_ANALYZE_THREADS=${ECRAWL_ANALYZE_THREADS:-32}
-export ECRAWL_ANALYZE_THREADS
+ECRAWL_QUERY_THREADS=${ECRAWL_QUERY_THREADS:-32}
+export ECRAWL_QUERY_THREADS
 ANALYZE_TOP=${ANALYZE_TOP:-}
 DO_STRACE=${DO_STRACE:-1}
 DO_PERF=${DO_PERF:-1}
@@ -148,7 +148,7 @@ PERF_FREQ=${PERF_FREQ:-997}
 PERF_CALLGRAPH=${PERF_CALLGRAPH:-dwarf}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
-ECRAWL_ANALYZE_VERBOSE_ARGS=${ECRAWL_ANALYZE_VERBOSE_ARGS:-}
+ECRAWL_QUERY_VERBOSE_ARGS=${ECRAWL_QUERY_VERBOSE_ARGS:-}
 DO_QUERY=${DO_QUERY:-1}
 QUERY_SIZE_GT=${QUERY_SIZE_GT:-524288000}
 QUERY_TYPE=${QUERY_TYPE:-f}
@@ -189,7 +189,7 @@ QUERY_VARIANTS_DEFAULT=(
   "size-skipall|| --size-gt @SIZE@ --type @TYPE@ --list"
   "size-matchall|| --size-gt 0 --type @TYPE@ --list"
   "size-matchall-nolist|| --size-gt 0 --type @TYPE@"
-  "size-matchall-noskip|ECRAWL_ANALYZE_BLOCK_SKIP=0| --size-gt 0 --type @TYPE@"
+  "size-matchall-noskip|ECRAWL_QUERY_BLOCK_SKIP=0| --size-gt 0 --type @TYPE@"
   "subtree-rollup|| --subtree @ROOT@"
   "subtree-exact|| --subtree @ROOT@ --exact"
   "subtree-list|| --subtree @ROOT@ --type @TYPE@ --list"
@@ -236,13 +236,13 @@ fi
 
 # ---- helpers ---------------------------------------------------------------
 
-# Build ecrawl_analyze argv into RUN_ARGV.
+# Build ecrawl_query argv into RUN_ARGV.
 build_argv() {
   local bindir=$1
-  RUN_ARGV=("$ECRAWL_ANALYZE_BIN" --verbose)
+  RUN_ARGV=("$ECRAWL_QUERY_BIN" --verbose)
   [[ -n "$ANALYZE_TOP" ]] && RUN_ARGV+=(--top "$ANALYZE_TOP")
   # shellcheck disable=SC2206
-  [[ -n "$ECRAWL_ANALYZE_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_ANALYZE_VERBOSE_ARGS)
+  [[ -n "$ECRAWL_QUERY_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_QUERY_VERBOSE_ARGS)
   RUN_ARGV+=("$bindir")
 }
 
@@ -269,7 +269,7 @@ build_variant_argv() {
   args=${args//@TYPE@/$QUERY_TYPE}
   # shellcheck disable=SC2206 - deliberate word splitting of the variant's args
   local parts=($args)
-  QUERY_ARGV=("$ECRAWL_ANALYZE_BIN" "${parts[@]}" "$bindir")
+  QUERY_ARGV=("$ECRAWL_QUERY_BIN" "${parts[@]}" "$bindir")
   # Without --list the key=value totals are on stdout; with it they move to
   # stderr and stdout carries the matched paths. Capture the totals either way,
   # or a variant silently reports nothing.
@@ -345,7 +345,7 @@ run_clean() {
   local sfx=""; [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
   build_argv "$bindir"
   echo "    analyze clean${sfx}: ${RUN_ARGV[*]}"
-  # Own monotonic wall timer: /usr/bin/time may be absent, and ecrawl_analyze
+  # Own monotonic wall timer: /usr/bin/time may be absent, and ecrawl_query
   # does not print its own elapsed_sec.
   local t0 t1
   t0=$(date +%s.%N)
@@ -470,13 +470,13 @@ profile_one() {
 
 # ---- env snapshot ----------------------------------------------------------
 {
-  echo "# ecrawl_analyze fixture profile"
+  echo "# ecrawl_query fixture profile"
   echo "timestamp=$TS"
   echo "bin_root=$BIN_ROOT"
   echo "bin_root_fstype=$(fs_type "$BIN_ROOT")"
   echo "results_dir=$RESULTS_DIR"
-  echo "ecrawl_analyze_bin=$ECRAWL_ANALYZE_BIN"
-  echo "config: analyze_threads=$ECRAWL_ANALYZE_THREADS analyze_top=${ANALYZE_TOP:-off}"
+  echo "ecrawl_query_bin=$ECRAWL_QUERY_BIN"
+  echo "config: analyze_threads=$ECRAWL_QUERY_THREADS analyze_top=${ANALYZE_TOP:-off}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
   echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE gid=$QUERY_GID sink=$QUERY_OUTPUT_SINK"
   echo "query_variants: $(printf '%s ' "${QVARIANTS[@]%%|*}")"
@@ -497,11 +497,11 @@ profile_one() {
   [[ "$HAVE_STRACE" == "1" ]] && echo "strace_version=$(strace -V 2>&1 | head -n1)"
   [[ "$HAVE_PERF"   == "1" ]] && echo "perf_version=$(perf --version 2>&1 | head -n1)"
   echo
-  echo "## ecrawl_analyze-related env"
-  env | grep -E '^ECRAWL_ANALYZE_|^ECRAWL_REPAIR_' | sort || true
+  echo "## ecrawl_query-related env"
+  env | grep -E '^ECRAWL_QUERY_|^ECRAWL_REPAIR_' | sort || true
 } >"$RESULTS_DIR/env.txt"
 
-echo "ecrawl_analyze profile starting; results -> $RESULTS_DIR"
+echo "ecrawl_query profile starting; results -> $RESULTS_DIR"
 sed 's/^/  /' "$RESULTS_DIR/env.txt"
 echo
 
@@ -524,7 +524,7 @@ fi
 COMBINED="$RESULTS_DIR/COMBINED_REPORT.txt"
 {
   echo "########################################################################"
-  echo "# ecrawl_analyze fixture profile — combined report"
+  echo "# ecrawl_query fixture profile — combined report"
   echo "########################################################################"
   echo
   cat "$RESULTS_DIR/env.txt"
@@ -708,7 +708,7 @@ def fmt(v, kind="int"):
 
 lines = []
 hdr = kv(root / "env.txt")
-lines.append("ecrawl_analyze profile — SUMMARY TABLE")
+lines.append("ecrawl_query profile — SUMMARY TABLE")
 lines.append(f"  timestamp={hdr.get('timestamp','?')}  bin_root={hdr.get('bin_root','?')}")
 lines.append(f"  host: nproc={hdr.get('nproc','?')} ulimit_n={hdr.get('ulimit_n','?')} fstype={hdr.get('bin_root_fstype','?')}")
 for key in ("config:", "modes:"):
@@ -751,7 +751,7 @@ for fx in fixtures:
 lines.append("")
 
 # --- selective query variants ---------------------------------------------
-# blks_dec/blks_skip come from ecrawl_analyze's own counters: a skipped row group
+# blks_dec/blks_skip come from ecrawl_query's own counters: a skipped row group
 # is one whose column zone maps proved no record inside could match, so it was
 # seeked past instead of decompressed. skip% is the share of groups avoided.
 # answered says whether the catalog rollups or a record scan produced the answer.
@@ -843,7 +843,7 @@ if ab:
 
 # --- per-thread on-CPU spread (perf) --------------------------------------
 # threads_>=1% = how many distinct threads each carried >=1% of CPU samples.
-# ecrawl_analyze caps workers at the parse-chunk count, so a single big shard
+# ecrawl_query caps workers at the parse-chunk count, so a single big shard
 # (many .ckpt chunks) still spreads across threads; a single-chunk shard shows 1.
 lines.append("== PER-THREAD ON-CPU SPREAD (perf; whole run) ==")
 lines.append("   threads>=1% (workers capped at parse-chunk count); top% = busiest threads")

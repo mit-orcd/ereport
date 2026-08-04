@@ -21,7 +21,7 @@
 # and write mode (exposes uid-shard writer churn) unless disabled.
 #
 # This is also the PRODUCER of the shared per-fixture shard sets reused by the
-# follow-up profilers (profile-ereport*, profile-ecrawl_analyze). The write-mode
+# follow-up profilers (profile-ereport*, profile-ecrawl_query). The write-mode
 # clean pass (rep 1) crawls each fixture into a persistent, kept bin dir:
 #       <bin-root>/<fixture>/bin/uid_shard_*.bin
 # Point those follow-up scripts at the same <bin-root>; they consume these bins

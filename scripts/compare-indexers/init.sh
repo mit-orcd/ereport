@@ -46,6 +46,9 @@
 #                          that default; /etc changes then go unrecorded by
 #                          etckeeper as usual.
 #   SETUP_MARIADB=0        1: provision a disposable Robinhood database
+#   RBH_DB_DATADIR=        where MariaDB keeps that database's tables; defaults
+#                          to a sibling of the benchmark tree, so they land on
+#                          the filesystem under test like every other index
 #   SETUP_CHARTS=1         0: skip providing a matplotlib interpreter
 #   RBH_FS_PATH=           tree configured for Robinhood when SETUP_MARIADB=1
 #   SUDO=sudo              use "" when already root
@@ -669,7 +672,11 @@ setup_mariadb() {
   fi
   [[ -z "${configured:-}" ]] ||
     log "Robinhood config points at $configured, not $RBH_FS_PATH; reprovisioning"
+  # RBH_DB_DATADIR decides where MariaDB keeps the tables, which for a fair
+  # comparison is the storage under test rather than the operating system's disk.
+  # benchmark.sh exports it; a bare init.sh leaves mariadb.sh to its default.
   PREFIX="$PREFIX" SUDO="$SUDO" INSTALL_MARIADB_PACKAGES=1 \
+    RBH_DB_DATADIR="${RBH_DB_DATADIR:-}" \
     "$SCRIPT_DIR/mariadb.sh" setup "$RBH_FS_PATH"
 }
 

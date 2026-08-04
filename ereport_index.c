@@ -505,6 +505,14 @@ typedef struct {
     uint64_t chunk_path_bytes_total; /* sum strlen(chunk.path); for backlog estimate */
     size_t chunk_total_count;
     atomic_uint_fast64_t merge_bucket_ram_peak; /* ~2× largest bucket file during merge */
+    /* Dir-index sidecar phase (dirs.idx / rowgroups.idx); zero when it did not run. */
+    int dir_index_built;
+    int rowgroup_index_built;
+    uint64_t dir_index_dirs;
+    uint64_t dir_index_groups;
+    uint64_t dir_index_bytes;
+    uint64_t rowgroup_index_bytes;
+    double dir_index_sec;
 } build_ctx_t;
 
 typedef struct {
@@ -2027,7 +2035,7 @@ static int argv_skip_verbose_prefix(int argc, char **argv) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [username|uid] [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [--no-dir-index] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
             "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
             "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
@@ -2046,6 +2054,10 @@ static void die_usage(const char *argv0) {
             "    that directory (full absolute paths kept), mirroring `ereport --subtree` so search covers just that subtree.\n"
             "    Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW while indexing\n"
             "    (bins unchanged), e.g. /data1/group=/orcd/data; applied before --subtree.\n"
+            "    Also writes the directory-index sidecars dirs.idx and rowgroups.idx (~24 bytes per directory)\n"
+            "    that `ecrawl_query --index-dir` uses to answer a subtree rollup without reading every catalog\n"
+            "    row, and to scan only the row groups that can hold the subtree. --no-dir-index skips that phase;\n"
+            "    they are rebuildable, and a reader that cannot find or verify them falls back to the catalogs.\n"
             "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
             "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
             "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
@@ -4326,6 +4338,530 @@ static uint32_t meta_read_paths_level(const char *index_dir) {
     return level;
 }
 
+/* ---------------------------------------------------------------------------
+ * Dir-index sidecars (dirs.idx / rowgroups.idx)
+ *
+ * A phase of its own, run once the trigram merge has finished and every shard
+ * catalog the index phase held has been freed. Two reasons it is not folded
+ * into the chunk workers: process_chunk_make has no row-group identity to hang
+ * a sketch on, and it attaches catalogs with fields=0U, so neither the DFS
+ * permutation nor the row offsets these need are loaded there. Perturbing the
+ * trigram pipeline to carry them would cost every build, including the ones
+ * that pass --no-dir-index.
+ *
+ * Failure here is never fatal: the trigram index is complete and usable, the
+ * sidecars are derived and rebuildable, and a reader that does not find them
+ * behaves exactly as it did before they existed. So a bad shard warns, unlinks
+ * the partial output and leaves the build succeeding.
+ * ------------------------------------------------------------------------- */
+
+/* Sidecars are built by default; --no-dir-index turns the phase off. */
+static int g_dir_index = 1;
+
+/* A stored path is bounded by the catalog's component limit (128 components of
+ * up to 255 bytes), not by PATH_MAX, and none of those components had to have
+ * come from one filesystem. Heap-allocated per worker, not on the stack. */
+#define DIRX_PATH_BUF_BYTES 65536u
+
+typedef struct {
+    uint64_t prefix_dir; /* dir_id whose path fills buf; 0 when there is none */
+    size_t prefix_len;
+    char *buf; /* DIRX_PATH_BUF_BYTES */
+} dirx_path_cache_t;
+
+/*
+ * Rebuild one directory's stored path, reusing the previous parent's.
+ *
+ * dir_ids are handed out as the crawl meets directories, so a walk in ascending
+ * id order visits siblings together and one cached prefix absorbs nearly every
+ * parent-chain walk. The result must be byte-identical to
+ * crawl_bin_catalog_dir_path_len -- readers compare the query against that
+ * spelling -- which is why a directory past the component limit is handed
+ * straight to it: there the two routes genuinely differ, and the walk's answer
+ * (leading components dropped) is the one that counts.
+ */
+static int dirx_dir_path(const crawl_bin_catalog_t *cat, dirx_path_cache_t *pc, uint64_t d, char *out,
+                         size_t out_sz, size_t *len_out) {
+    uint64_t par;
+    size_t nl, end;
+
+    if (!cat || d == 0ULL || d > cat->max_dir_id) return -1;
+    if (d == 1ULL) {
+        /* The synthetic root reconstructs to the empty string. */
+        if (out_sz < 1U) return -1;
+        out[0] = '\0';
+        *len_out = 0;
+        return 0;
+    }
+    if (cat->depth[d] > CRAWL_BIN_CATALOG_MAX_PATH_PARTS)
+        return crawl_bin_catalog_dir_path_len(cat, d, out, out_sz, len_out);
+
+    par = cat->parent_dir_id[d];
+    if (par == 0ULL) return -1;
+    if (par != pc->prefix_dir) {
+        if (crawl_bin_catalog_dir_path_len(cat, par, pc->buf, DIRX_PATH_BUF_BYTES, &pc->prefix_len) != 0) {
+            pc->prefix_dir = 0;
+            return -1;
+        }
+        pc->prefix_dir = par;
+    }
+
+    nl = (size_t)cat->name_len[d];
+    if (nl > 0 && !cat->name_comp[d]) return -1;
+    end = pc->prefix_len + 1U + nl;
+    if (end + 1U > out_sz) return -1;
+    memcpy(out, pc->buf, pc->prefix_len);
+    out[pc->prefix_len] = '/';
+    if (nl > 0) memcpy(out + pc->prefix_len + 1U, cat->name_comp[d], nl);
+    out[end] = '\0';
+    *len_out = end;
+    return 0;
+}
+
+typedef struct {
+    const char *path; /* full shard path, borrowed from the caller */
+    const char *base; /* basename inside path */
+    crawl_sidecar_shard_id_t id; /* name_off/name_len filled by the writer */
+    crawl_dirx_entry_t *entries;
+    uint64_t entry_count;
+    uint64_t *rows; /* row_offset[0 .. max_dir_id] */
+    uint64_t rows_len;
+    crawl_rgix_group_t *groups;
+    uint64_t group_count;
+    uint64_t dfs_domain;
+    uint64_t unindexed_dirs; /* directories whose path would not rebuild */
+    int rc;
+} dirx_job_t;
+
+static void dirx_job_release(dirx_job_t *j) {
+    free(j->entries);
+    j->entries = NULL;
+    free(j->rows);
+    j->rows = NULL;
+    free(j->groups);
+    j->groups = NULL;
+}
+
+static int dirx_cmp_entry(const void *a, const void *b) {
+    const crawl_dirx_entry_t *x = (const crawl_dirx_entry_t *)a;
+    const crawl_dirx_entry_t *y = (const crawl_dirx_entry_t *)b;
+
+    if (x->path_hash != y->path_hash) return x->path_hash < y->path_hash ? -1 : 1;
+    if (x->dir_id != y->dir_id) return x->dir_id < y->dir_id ? -1 : 1;
+    return 0;
+}
+
+static int dirx_cmp_job_base(const void *a, const void *b) {
+    return strcmp(((const dirx_job_t *)a)->base, ((const dirx_job_t *)b)->base);
+}
+
+/*
+ * One pass over the record region decoding PARENT_DIR_ID alone, summarising each
+ * row group by where its records' parents sit in DFS order.
+ *
+ * Both sketches are recorded. dir_id follows crawl arrival order, which tracks
+ * DFS position only loosely, so the plain [min, max] interval can be far looser
+ * than the set it stands for; the 1024-bit bitmap costs 128 bytes per group and
+ * says which parts of the interval are actually occupied.
+ */
+static int dirx_scan_rowgroups(FILE *fp, uint64_t rec_lo, uint64_t rec_hi, const crawl_bin_catalog_t *cat,
+                               uint64_t dfs_domain, crawl_rgix_group_t **out, uint64_t *out_n) {
+    crawl_bin_block_reader_t br;
+    crawl_bin_chunk_stdio_t bio;
+    crawl_rgix_group_t *arr = NULL;
+    size_t n = 0, cap = 0;
+
+    *out = NULL;
+    *out_n = 0;
+    if (rec_hi <= rec_lo) return 0;
+
+    memset(&br, 0, sizeof(br));
+    bio.fopen = NULL;
+    bio.fread = ei_fread;
+    bio.fclose = NULL;
+    if (crawl_bin_block_reader_init(&br, &bio, fp, rec_lo, rec_hi) != 0) return -1;
+    (void)crawl_bin_block_reader_set_projection(&br, CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID));
+
+    for (;;) {
+        uint64_t start = br.pos;
+        uint32_t nrec = 0;
+        const uint64_t *pid;
+        crawl_rgix_group_t *g;
+        uint32_t k;
+        int got = crawl_bin_block_reader_next_group(&br, &nrec);
+
+        if (got == 0) break;
+        if (got < 0) goto fail;
+
+        if (n == cap) {
+            size_t nc = cap ? cap * 2 : 256;
+            crawl_rgix_group_t *p = (crawl_rgix_group_t *)realloc(arr, nc * sizeof(*p));
+
+            if (!p) goto fail;
+            arr = p;
+            cap = nc;
+        }
+        g = &arr[n++];
+        memset(g, 0, sizeof(*g));
+        /* [start, br.pos) is the span the reader consumed. It can cover a run of
+         * groups when empty ones were stepped over; both ends are still group
+         * boundaries, which is all a chunked reader needs. */
+        g->file_offset = start;
+        g->group_bytes = br.pos - start;
+        g->record_count = nrec;
+        g->dfs_min = UINT64_MAX;
+        g->dfs_max = 0;
+
+        pid = crawl_bin_block_reader_column(&br, CRAWL_COL_PARENT_DIR_ID);
+        if (!pid) {
+            g->flags |= CRAWL_RGIX_GRP_UNKNOWN;
+            continue;
+        }
+        for (k = 0; k < nrec; k++) {
+            uint64_t d = pid[k];
+            uint64_t dfs;
+            unsigned bit;
+
+            if (d == 0ULL || d > cat->max_dir_id) {
+                g->flags |= CRAWL_RGIX_GRP_UNKNOWN;
+                continue;
+            }
+            dfs = cat->dfs_index[d];
+            if (dfs < g->dfs_min) g->dfs_min = dfs;
+            if (dfs > g->dfs_max) g->dfs_max = dfs;
+            bit = crawl_rgix_bucket_of(dfs, dfs_domain);
+            g->buckets[bit >> 3] |= (unsigned char)(1U << (bit & 7U));
+        }
+    }
+
+    crawl_bin_block_reader_free(&br);
+    *out = arr;
+    *out_n = (uint64_t)n;
+    return 0;
+
+fail:
+    crawl_bin_block_reader_free(&br);
+    free(arr);
+    return -1;
+}
+
+static int dirx_build_shard(dirx_job_t *j) {
+    FILE *fp = NULL;
+    struct stat st;
+    bin_file_header_t fh;
+    crawl_bin_catalog_t cat;
+    dirx_path_cache_t pc;
+    char *pathbuf = NULL;
+    uint64_t n_entries = 0;
+    uint64_t did;
+    uint64_t dfs_domain = 1;
+    int rc = -1;
+
+    crawl_bin_catalog_init_empty(&cat);
+    memset(&pc, 0, sizeof(pc));
+
+    if (stat(j->path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    fp = ei_shard_fopen(j->path, "rb");
+    if (!fp) return -1;
+    if (mk_fread(&fh, sizeof(fh), 1, fp) != 1) goto out;
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) goto out;
+    if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset > (uint64_t)st.st_size) goto out;
+    if ((uint64_t)st.st_size - fh.catalog_offset < sizeof(uint64_t)) goto out;
+    if (fseeko(fp, (off_t)fh.catalog_offset, SEEK_SET) != 0) goto out;
+    if (mk_fread(&n_entries, sizeof(n_entries), 1, fp) != 1) goto out;
+
+    /* The sketch needs the DFS permutation; the row offsets are what make a hash
+     * hit answerable without re-reading the catalog. Nothing else is loaded. */
+    if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size,
+                                   CRAWL_CAT_SUBTREE | CRAWL_CAT_ROW_OFFSET, &cat) != 0)
+        goto out;
+    if (!cat.dfs_index || !cat.row_offset) goto out;
+
+    j->id.shard_size = (uint64_t)st.st_size;
+    j->id.shard_mtime_sec = (uint64_t)st.st_mtim.tv_sec;
+    j->id.shard_mtime_nsec = (uint64_t)st.st_mtim.tv_nsec;
+    j->id.catalog_offset = fh.catalog_offset;
+    j->id.catalog_entries = n_entries;
+    j->id.max_dir_id = cat.max_dir_id;
+
+    j->rows_len = cat.max_dir_id + 1ULL;
+    j->rows = (uint64_t *)malloc((size_t)j->rows_len * sizeof(uint64_t));
+    pathbuf = (char *)malloc(DIRX_PATH_BUF_BYTES);
+    pc.buf = (char *)malloc(DIRX_PATH_BUF_BYTES);
+    j->entries = (crawl_dirx_entry_t *)malloc((size_t)j->rows_len * sizeof(crawl_dirx_entry_t));
+    if (!j->rows || !pathbuf || !pc.buf || !j->entries) goto out;
+
+    memcpy(j->rows, cat.row_offset, (size_t)j->rows_len * sizeof(uint64_t));
+
+    for (did = 1; did <= cat.max_dir_id; did++) {
+        size_t plen = 0;
+
+        if (cat.dfs_index[did] >= dfs_domain) dfs_domain = cat.dfs_index[did] + 1ULL;
+        if (cat.row_offset[did] == 0ULL) continue; /* a dir_id with no entry in this catalog */
+        if (dirx_dir_path(&cat, &pc, did, pathbuf, DIRX_PATH_BUF_BYTES, &plen) != 0) {
+            /* subtree_find_dirs skips a directory whose path will not rebuild too,
+             * so leaving it out of the table keeps the two routes in agreement. */
+            j->unindexed_dirs++;
+            continue;
+        }
+        j->entries[j->entry_count].path_hash = crawl_sidecar_path_hash(pathbuf, plen);
+        j->entries[j->entry_count].dir_id = did;
+        j->entry_count++;
+    }
+    qsort(j->entries, (size_t)j->entry_count, sizeof(*j->entries), dirx_cmp_entry);
+    j->dfs_domain = dfs_domain;
+
+    if (dirx_scan_rowgroups(fp, (uint64_t)sizeof(fh), fh.catalog_offset, &cat, dfs_domain, &j->groups,
+                            &j->group_count) != 0)
+        goto out;
+
+    rc = 0;
+
+out:
+    free(pathbuf);
+    free(pc.buf);
+    crawl_bin_catalog_free(&cat);
+    if (fp) ei_shard_fclose(fp);
+    if (rc != 0) dirx_job_release(j);
+    return rc;
+}
+
+typedef struct {
+    dirx_job_t *jobs;
+    size_t lo, hi; /* half-open batch bounds */
+    _Atomic size_t next;
+} dirx_pool_t;
+
+static void *dirx_worker_main(void *arg) {
+    dirx_pool_t *p = (dirx_pool_t *)arg;
+
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+
+        if (i >= p->hi) break;
+        p->jobs[i].rc = dirx_build_shard(&p->jobs[i]);
+    }
+    mk_io_tls_flush();
+    return NULL;
+}
+
+static int dirx_write_all(FILE *fp, const void *buf, size_t bytes, uint64_t *off) {
+    if (bytes == 0U) return 0;
+    if (mk_fwrite(buf, 1, bytes, fp) != bytes) return -1;
+    *off += (uint64_t)bytes;
+    return 0;
+}
+
+/*
+ * Build both sidecars. Returns 0 when they were written, -1 when the phase was
+ * abandoned (the caller treats that as a warning, not a build failure).
+ *
+ * Shards are processed in batches of `nthreads` and each batch's payload is
+ * appended as soon as it is ready, so peak memory is one batch of catalogs plus
+ * one batch of tables rather than the whole crawl's. That is also why the shard
+ * descriptor arrays trail the payloads: their offsets are only known afterwards.
+ */
+static int build_dir_index_sidecars(build_ctx_t *ctx, char **paths, size_t path_count, int nthreads) {
+    dirx_job_t *jobs = NULL;
+    crawl_dirx_shard_t *dsh = NULL;
+    crawl_rgix_shard_t *rsh = NULL;
+    char *names = NULL;
+    size_t names_len = 0;
+    FILE *dfp = NULL, *rfp = NULL;
+    char dtmp[PATH_MAX], rtmp[PATH_MAX], dfin[PATH_MAX], rfin[PATH_MAX];
+    crawl_sidecar_hdr_t dh, rh;
+    uint64_t doff = 0, roff = 0;
+    uint64_t dirs_total = 0, groups_total = 0, unindexed_total = 0;
+    size_t i, base;
+    int rc = -1;
+
+    if (path_count == 0) return -1;
+    if (nthreads < 1) nthreads = 1;
+    if ((size_t)nthreads > path_count) nthreads = (int)path_count;
+
+    if (build_path(dtmp, sizeof(dtmp), ctx->index_dir, "dirs.idx.tmp") != 0 ||
+        build_path(rtmp, sizeof(rtmp), ctx->index_dir, "rowgroups.idx.tmp") != 0 ||
+        build_path(dfin, sizeof(dfin), ctx->index_dir, "dirs.idx") != 0 ||
+        build_path(rfin, sizeof(rfin), ctx->index_dir, "rowgroups.idx") != 0)
+        return -1;
+
+    jobs = (dirx_job_t *)calloc(path_count, sizeof(*jobs));
+    dsh = (crawl_dirx_shard_t *)calloc(path_count, sizeof(*dsh));
+    rsh = (crawl_rgix_shard_t *)calloc(path_count, sizeof(*rsh));
+    if (!jobs || !dsh || !rsh) goto out;
+
+    for (i = 0; i < path_count; i++) {
+        const char *slash = strrchr(paths[i], '/');
+
+        jobs[i].path = paths[i];
+        jobs[i].base = slash ? slash + 1 : paths[i];
+    }
+    /* Readers sort their own directory listing, so store shards the same way and
+     * the identity check becomes a straight index-wise comparison. */
+    qsort(jobs, path_count, sizeof(*jobs), dirx_cmp_job_base);
+    for (i = 1; i < path_count; i++) {
+        if (strcmp(jobs[i - 1].base, jobs[i].base) != 0) continue;
+        /* Two input directories contributing the same shard name: a reader keyed
+         * on basename could not tell the two apart, so do not claim to index them. */
+        fprintf(stderr, "ereport_index: dir index skipped: duplicate shard name %s across input dirs\n",
+                jobs[i].base);
+        goto out;
+    }
+
+    dfp = mk_fopen(dtmp, "wb");
+    rfp = mk_fopen(rtmp, "wb");
+    if (!dfp || !rfp) goto out;
+    if (setvbuf(dfp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) { /* speed only */
+    }
+    if (setvbuf(rfp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
+    }
+
+    memset(&dh, 0, sizeof(dh));
+    memset(&rh, 0, sizeof(rh));
+    if (dirx_write_all(dfp, &dh, sizeof(dh), &doff) != 0) goto out;
+    if (dirx_write_all(rfp, &rh, sizeof(rh), &roff) != 0) goto out;
+
+    for (base = 0; base < path_count; base += (size_t)nthreads) {
+        size_t hi = base + (size_t)nthreads;
+        dirx_pool_t pool;
+        pthread_t *tids;
+        int started = 0;
+        int t;
+
+        if (hi > path_count) hi = path_count;
+        pool.jobs = jobs;
+        pool.lo = base;
+        pool.hi = hi;
+        atomic_init(&pool.next, base);
+
+        tids = (pthread_t *)calloc((size_t)nthreads, sizeof(*tids));
+        if (!tids) goto out;
+        for (t = 0; t < nthreads; t++) {
+            if (pthread_create(&tids[t], NULL, dirx_worker_main, &pool) != 0) break;
+            started++;
+        }
+        if (started == 0) {
+            /* No worker started: run the batch here rather than silently skipping it. */
+            dirx_worker_main(&pool);
+        }
+        for (t = 0; t < started; t++) pthread_join(tids[t], NULL);
+        free(tids);
+
+        for (i = base; i < hi; i++) {
+            if (jobs[i].rc != 0) {
+                fprintf(stderr, "ereport_index: dir index skipped: cannot summarise %s\n", jobs[i].path);
+                goto out;
+            }
+            dsh[i].id = jobs[i].id;
+            dsh[i].hash_count = jobs[i].entry_count;
+            dsh[i].hash_off = doff;
+            if (dirx_write_all(dfp, jobs[i].entries, (size_t)jobs[i].entry_count * sizeof(crawl_dirx_entry_t),
+                               &doff) != 0)
+                goto out;
+            dsh[i].rows_off = doff;
+            if (dirx_write_all(dfp, jobs[i].rows, (size_t)jobs[i].rows_len * sizeof(uint64_t), &doff) != 0)
+                goto out;
+
+            rsh[i].id = jobs[i].id;
+            rsh[i].dfs_domain = jobs[i].dfs_domain;
+            rsh[i].group_count = jobs[i].group_count;
+            rsh[i].groups_off = roff;
+            if (dirx_write_all(rfp, jobs[i].groups, (size_t)jobs[i].group_count * sizeof(crawl_rgix_group_t),
+                               &roff) != 0)
+                goto out;
+
+            dirs_total += jobs[i].entry_count;
+            groups_total += jobs[i].group_count;
+            unindexed_total += jobs[i].unindexed_dirs;
+            dirx_job_release(&jobs[i]);
+        }
+    }
+
+    for (i = 0; i < path_count; i++) names_len += strlen(jobs[i].base);
+    names = (char *)malloc(names_len ? names_len : 1U);
+    if (!names) goto out;
+    {
+        size_t at = 0;
+
+        for (i = 0; i < path_count; i++) {
+            size_t nl = strlen(jobs[i].base);
+
+            memcpy(names + at, jobs[i].base, nl);
+            dsh[i].id.name_off = (uint64_t)at;
+            dsh[i].id.name_len = (uint32_t)nl;
+            rsh[i].id.name_off = (uint64_t)at;
+            rsh[i].id.name_len = (uint32_t)nl;
+            at += nl;
+        }
+    }
+
+    memcpy(dh.magic, CRAWL_DIRX_MAGIC, CRAWL_SIDECAR_MAGIC_LEN);
+    dh.version = CRAWL_SIDECAR_VERSION;
+    dh.shard_count = (uint32_t)path_count;
+    dh.shard_dir_off = doff;
+    if (dirx_write_all(dfp, dsh, path_count * sizeof(*dsh), &doff) != 0) goto out;
+    dh.names_off = doff;
+    dh.names_bytes = (uint64_t)names_len;
+    if (dirx_write_all(dfp, names, names_len, &doff) != 0) goto out;
+    dh.entry_total = dirs_total;
+
+    memcpy(rh.magic, CRAWL_RGIX_MAGIC, CRAWL_SIDECAR_MAGIC_LEN);
+    rh.version = CRAWL_SIDECAR_VERSION;
+    rh.shard_count = (uint32_t)path_count;
+    rh.shard_dir_off = roff;
+    if (dirx_write_all(rfp, rsh, path_count * sizeof(*rsh), &roff) != 0) goto out;
+    rh.names_off = roff;
+    rh.names_bytes = (uint64_t)names_len;
+    if (dirx_write_all(rfp, names, names_len, &roff) != 0) goto out;
+    rh.entry_total = groups_total;
+
+    /* The header is last because it names offsets only the payload can settle. A
+     * reader never sees the placeholder: the file is renamed into place after. */
+    if (fseeko(dfp, 0, SEEK_SET) != 0 || mk_fwrite(&dh, sizeof(dh), 1, dfp) != 1) goto out;
+    if (fseeko(rfp, 0, SEEK_SET) != 0 || mk_fwrite(&rh, sizeof(rh), 1, rfp) != 1) goto out;
+    if (mk_fclose(dfp) != 0) {
+        dfp = NULL;
+        goto out;
+    }
+    dfp = NULL;
+    if (mk_fclose(rfp) != 0) {
+        rfp = NULL;
+        goto out;
+    }
+    rfp = NULL;
+    if (rename(dtmp, dfin) != 0) goto out;
+    if (rename(rtmp, rfin) != 0) {
+        (void)unlink(dfin);
+        goto out;
+    }
+
+    ctx->dir_index_built = 1;
+    ctx->rowgroup_index_built = 1;
+    ctx->dir_index_dirs = dirs_total;
+    ctx->dir_index_groups = groups_total;
+    ctx->dir_index_bytes = doff;
+    ctx->rowgroup_index_bytes = roff;
+    if (unindexed_total && g_verbose)
+        fprintf(stderr, "ereport_index: dir index: %" PRIu64 " directory(ies) had no reconstructable path\n",
+                unindexed_total);
+    rc = 0;
+
+out:
+    if (dfp) mk_fclose(dfp);
+    if (rfp) mk_fclose(rfp);
+    if (rc != 0) {
+        (void)unlink(dtmp);
+        (void)unlink(rtmp);
+    }
+    if (jobs)
+        for (i = 0; i < path_count; i++) dirx_job_release(&jobs[i]);
+    free(jobs);
+    free(dsh);
+    free(rsh);
+    free(names);
+    return rc;
+}
+
 static int write_meta_file(const build_ctx_t *ctx) {
     char path[PATH_MAX];
     FILE *fp;
@@ -4351,6 +4887,13 @@ static int write_meta_file(const build_ctx_t *ctx) {
     fprintf(fp, "unique_trigrams=%" PRIu64 "\n", ctx->unique_trigrams);
     fprintf(fp, "bucket_bits=%d\n", TRIGRAM_BUCKET_BITS);
     fprintf(fp, "bucket_count=%u\n", TRIGRAM_BUCKET_COUNT);
+    /* Advisory only: the sidecars carry their own per-shard identity binding, and a
+     * reader validates that rather than trusting these. No INDEX_VERSION bump —
+     * old readers ignore the lines, new ones fall back when the files are absent. */
+    fprintf(fp, "dir_index=%d\n", ctx->dir_index_built ? 1 : 0);
+    if (ctx->dir_index_built) fprintf(fp, "dir_index_dirs=%" PRIu64 "\n", ctx->dir_index_dirs);
+    fprintf(fp, "rowgroup_index=%d\n", ctx->rowgroup_index_built ? 1 : 0);
+    if (ctx->rowgroup_index_built) fprintf(fp, "rowgroup_index_groups=%" PRIu64 "\n", ctx->dir_index_groups);
 
     if (mk_fclose(fp) != 0) return -1;
     return 0;
@@ -6561,6 +7104,17 @@ static int build_index_dir(const char *user_spec,
         if (getrusage(RUSAGE_SELF, &ru_after_merge) == 0) ru_have_merge = 1;
 
         memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+
+        /* Sidecars last: the trigram catalogs are gone by now, so the phase has the
+         * machine to itself, and a failure here still leaves a complete index. */
+        if (merge_rc == 0 && g_dir_index) {
+            double t_dirx = now_sec();
+
+            if (build_dir_index_sidecars(&ctx, paths, path_count, threads) != 0)
+                fprintf(stderr, "ereport_index: dir index sidecars not written; queries fall back to the catalogs\n");
+            ctx.dir_index_sec = now_sec() - t_dirx;
+        }
+
         if (merge_rc != 0 || write_meta_file(&ctx) != 0) {
             fprintf(stderr, "failed to finalize index in %s\n", ctx.index_dir);
             free(tids);
@@ -6608,6 +7162,14 @@ static int build_index_dir(const char *user_spec,
     printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
     printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
     printf("merge_workers=%d\n", ctx.merge_workers_used);
+    printf("dir_index=%d\n", ctx.dir_index_built ? 1 : 0);
+    if (ctx.dir_index_built) {
+        printf("dir_index_dirs=%" PRIu64 "\n", ctx.dir_index_dirs);
+        printf("dir_index_bytes=%" PRIu64 "\n", ctx.dir_index_bytes);
+        printf("rowgroup_index_groups=%" PRIu64 "\n", ctx.dir_index_groups);
+        printf("rowgroup_index_bytes=%" PRIu64 "\n", ctx.rowgroup_index_bytes);
+    }
+    printf("dir_index_sec=%.3f\n", ctx.dir_index_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
     if (g_verbose) {
         printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
@@ -7659,6 +8221,11 @@ int main(int argc, char **argv) {
                 }
                 if (set_path_rewrite(argv[ai + 1]) != 0) return 2;
                 ai += 2;
+                continue;
+            }
+            if (strcmp(argv[ai], "--no-dir-index") == 0) {
+                g_dir_index = 0;
+                ai++;
                 continue;
             }
             break;

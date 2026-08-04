@@ -11,7 +11,7 @@ SERVE_BIND ?= 127.0.0.1
 SERVE_INDEX_DIR ?=
 
 # Targets
-TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_analyze edelete
+TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_query edelete
 
 # zstd: required for the v6 uid_shard_*.bin block-compressed record format.
 # Auto-detected via pkg-config; falls back to a bare -lzstd link (libzstd.so is a
@@ -151,6 +151,10 @@ crawl_fpcache.o: crawl_fpcache.c crawl_fpcache.h
 crawl_bin_codec.o: crawl_bin_codec.c crawl_bin_codec.h crawl_bin_format.h
 	$(CC) $(CFLAGS) -c crawl_bin_codec.c -o crawl_bin_codec.o
 
+# dirs.idx / rowgroups.idx reader, shared by ecrawl_query --index-dir and ereport --index-dir.
+crawl_sidecar.o: crawl_sidecar.c crawl_sidecar.h crawl_bin_format.h crawl_bin_catalog.h crawl_bin_chunks.h
+	$(CC) $(CFLAGS) -c crawl_sidecar.c -o crawl_sidecar.o
+
 crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_codec.h crawl_bin_format.h crawl_bin_chunks.h
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_bin_block.c -o crawl_bin_block.o
 
@@ -172,11 +176,11 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
-ecrawl_analyze: ecrawl_analyze.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_analyze.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ecrawl_query: ecrawl_query.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_query.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
@@ -225,7 +229,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).

@@ -11,10 +11,10 @@ Harness implementing the plan in `.cursor/plans/indexer_comparison_plan_*.plan.m
 | [benchmark.sh](benchmark.sh) | One-command install + run, and full teardown |
 | [capability-matrix.md](capability-matrix.md) | Feature / privilege / predicate gaps |
 | [prod-protocol.md](prod-protocol.md) | Read-only production-scale runbook |
-| [prepare-synth.sh](prepare-synth.sh) | Medium synthetic tree + Q1–Q5 seeds |
+| [prepare-synth.sh](prepare-synth.sh) | Medium synthetic tree + Q1–Q6 seeds, three argument sets each |
 | [check_correctness.sh](check_correctness.sh) | `find` vs `ecrawl` counts |
-| [run_index.sh](run_index.sh) | Index/capture timing + size (paper units) |
-| [run_queries.sh](run_queries.sh) | Q1–Q5 wrappers (3 reps) |
+| [run_index.sh](run_index.sh) | Index/capture timing + size, cold and hot |
+| [run_queries.sh](run_queries.sh) | Q1–Q6 wrappers (3 reps × cold/hot) |
 | [summarize.py](summarize.py) | `SUMMARY_TABLE.txt` + `FAILURES.txt` |
 | [plot_results.py](plot_results.py) | Paper-style Figures 1–5 (PNG/PDF) |
 | [run_smoke.sh](run_smoke.sh) | End-to-end synthetic smoke |
@@ -86,28 +86,29 @@ mode a shared prefix produces.
 ### Fast test cycle (`--small`)
 
 A full run takes hours, which is the wrong loop to be in while editing the C
-code. `--small` asks the other question — does the suite still answer Q1–Q5
+code. `--small` asks the other question — does the suite still answer Q1–Q6
 correctly — and answers it in well under a minute:
 
 ```bash
 scripts/compare-indexers/benchmark.sh --do /tmp/small --small
 ```
 
-It rebuilds `ecrawl`, `ereport`, `ereport_index`, `ecrawl_analyze` and `edelete`
+It rebuilds `ecrawl`, `ereport`, `ereport_index`, `ecrawl_query` and `edelete`
 from the working tree (so a cycle always tests what you just edited), generates
 `SYNTH_PROFILE=tiny` (~2.5k entries in a second, one of every shape including
 hard links, symlinks, specials and sparse files), checks correctness over the
 whole tree rather than the seeded subtree, and compares against `find` and `du`
 only. No external indexers are built, no packages are installed, MariaDB is
-skipped, `REPS=1`, caches are left warm. Results land in `results/small`, reused
+skipped, `REPS=1`, one cache pass instead of two, caches left warm. Results land
+in `results/small`, reused
 each cycle so the path stays stable. First cycle ~40 s including the compile,
 later cycles ~17 s.
 
 Read the `result` column, not the timings: at this size every elapsed figure is
 process start-up, and the summary and both figures lead with a banner saying so.
 Every default it picks — `SYNTH_PROFILE`, `REPS`, `TOOLS`, `DROP_CACHES`,
-`INSTALL_PACKAGES` — yields to the same variable set explicitly, so
-`REPS=3 ... --small` does three repetitions.
+`CACHE_MODES`, `INSTALL_PACKAGES` — yields to the same variable set explicitly,
+so `REPS=3 ... --small` does three repetitions.
 
 ### The external tools on the tiny tree (`--smoke`)
 
@@ -130,9 +131,11 @@ it is missing.
 It rebuilds the suite *and* runs `init.sh`, so the GUFI reinstall and the `dua`
 rebuild are part of what is being tested, provisions MariaDB when Robinhood is
 in `TOOLS`, keeps GUFI's rollup (instant at this size), runs one repetition with
-warm caches, and writes to `results/smoke`. The pass condition is not a timing:
-it is every tool answering Q1–Q5 with the same numbers as the `find` and `du`
-rows, and an empty `WRONG ANSWER` section in `FAILURES.txt`.
+warm caches (one pass, not two), and writes to `results/smoke`. The pass
+condition is not a timing: it is every tool answering Q1–Q6 with the same numbers
+as the `find` and `du` rows, and an empty `WRONG ANSWER` section in
+`FAILURES.txt`. Robinhood's indexes are created and dropped here too, so that
+wiring is under test at a size where it costs nothing.
 
 ### Correctness pass with the real tools (`--quick`)
 
@@ -149,9 +152,12 @@ index phase took 1.6 hours and GUFI's rollup was 91% of it — 29 minutes per
 repetition against 33 seconds for `gufi_dir2index` — before counting the untimed
 `du` over the resulting 580 GB index tree and the delete of the previous
 repetition's copy. None of that tells you anything new about correctness, so
-`--quick` sets `REPS=1` and `GUFI_DO_ROLLUP=0`, leaves caches warm, and writes to
-`results/quick`. Its timings are real, just single-sample: check the `result`
-column against the `find` and `du` rows, then start the measured run.
+`--quick` sets `REPS=1` and `GUFI_DO_ROLLUP=0`, leaves caches warm and makes one
+pass rather than a cold and a hot one, and writes to `results/quick`. Its timings
+are real, just single-sample: check the `result` column against the `find` and
+`du` rows, then start the measured run. Note what dropping the rollup costs you
+here: with no rolled-up index there is no `gufi_rollup` query series and no GUFI
+Q4 at all, so that row's correctness goes unchecked until the measured run.
 
 Before the timed loop, every external tool is asked whether it accepts the shape
 of each query — a name match, a size filter, a type filter, an aggregate —
@@ -166,8 +172,9 @@ Read the wrong-answer section first. It is the only one that catches a tool
 which exits 0 and is believed: XDU reported 0 files over 500 MB and 0 bytes in a
 subtree where `find` and `du` found 174,711 files and 1.68 GB, because its index
 held `st_blocks` and the tree's large files are sparse. Any query row whose
-result differs from the reference (`find` for Q1-Q3 and Q5, `du` for Q4, within
-0.5% for byte totals) lands there with both numbers side by side.
+result differs from the reference (`find` for Q1–Q3, Q5 and Q6, `du` for Q4,
+within 0.5% for byte totals) lands there with both numbers side by side. The
+comparison is per argument set, since each set has its own right answer.
 
 ### The three paths a run uses
 
@@ -232,15 +239,20 @@ Tools are still visited repetition-major, so each one meets the same cache state
 it would have met at a flat `REPS`; a tool that has had its repetitions simply
 drops out of the later passes. `REPS_EREPORT_INDEX` defaults to 1 — it indexes
 the capture `ecrawl` just wrote, so a second pass re-measures identical input —
-and is capped by `REPS_ECRAWL`.
+and is capped by `REPS_ECRAWL`. Its repetitions are `ecrawl`'s *last* ones, not
+its first: each `ecrawl` repetition overwrites the capture pointer and prunes the
+one before it, so only the final capture is still there to be queried, and an
+index built from any earlier one is paired with a crawl that no longer exists.
 
 When any tool differs, `env.txt` records `reps_per_tool=`, and both
 `SUMMARY_TABLE.txt` and the chart captions name the exceptions rather than
 claiming one sample size for rows that do not share it.
 
 `--undo` prints exactly what it will remove and asks first (`--yes` to skip the
-prompt, which is mandatory off a terminal). It drops the benchmark database,
-deletes the tree, and removes the built tools and their clones, while **keeping
+prompt, which is mandatory off a terminal). It drops the benchmark database and
+moves MariaDB back to its packaged data directory before deleting the copy the
+run made under `--work`, deletes the tree, and removes the built tools and their
+clones, while **keeping
 the results** unless `--purge-results` is given; `--keep-tools` keeps the built
 binaries. It refuses to delete a tree that lacks the `.indexer-compare-run`
 state file written by `--do`, and refuses any top-level path, so a mistyped or
@@ -311,12 +323,12 @@ python3 scripts/compare-indexers/summarize.py scripts/compare-indexers/results/i
 
 `SYNTH_PROFILE=medium` is the default for `prepare-synth.sh` (reuse [generate-ecrawl-adversarial-tree.sh](../fixtures/generate-ecrawl-adversarial-tree.sh)). Raise to `heavy` / `extreme` for stress shapes (`mega_dir1`, etc.).
 
-A second run against the same synth root does not rebuild the tree. The generator leaves a `FIXTURE_MANIFEST.txt` recording the parameters it built from, and skips when a later run asks for the same ones — so only the first benchmark against a given root pays the generation cost. Asking for a *different* profile against that root is an error rather than an overlay, because the two trees would be laid over each other; `rm -rf` the root, or point at a different one. `FORCE=1` rebuilds in place. `prepare-synth.sh` still recreates `query_seeds/` on every run, which is cheap and keeps Q1's unique basename fresh.
+A second run against the same synth root does not rebuild the tree. The generator leaves a `FIXTURE_MANIFEST.txt` recording the parameters it built from, and skips when a later run asks for the same ones — so only the first benchmark against a given root pays the generation cost. Asking for a *different* profile against that root is an error rather than an overlay, because the two trees would be laid over each other; `rm -rf` the root, or point at a different one. `FORCE=1` rebuilds in place. `prepare-synth.sh` still recreates `query_seeds/` on every run, which is cheap, keeps Q1's unique basenames fresh and plants all three argument sets; `benchmark.sh --do` reseeds on its own when it finds a manifest from before the sets existed.
 
 ### Checking a code change (`SYNTH_PROFILE=tiny`)
 
-For proving that a change to `ecrawl`, `ereport_index` or `ecrawl_analyze` still
-answers Q1–Q5 correctly, the benchmark trees are the wrong tool: they take
+For proving that a change to `ecrawl`, `ereport_index` or `ecrawl_query` still
+answers Q1–Q6 correctly, the benchmark trees are the wrong tool: they take
 hours, and the external indexers add nothing to a correctness question. The
 `tiny` profile builds ~2.5k entries in about a second, still with one of every
 shape that matters (a flat directory, a deep chain, a wide fan-out, hard links,
@@ -379,7 +391,10 @@ Each run writes two audit files alongside the summary:
 `SUMMARY_TABLE.txt` opens with a provenance block so a result stays
 interpretable later: host and OS, kernel, libc, compiler, the `ereport` commit
 (with a `-dirty` marker), CPU count, thread and repetition settings, cache
-policy, the filesystem holding the results, and a version line per tool. Tools
+policy and which passes ran, how many argument sets the queries rotated through,
+where Robinhood's tables lived, the filesystem holding the results, and a version
+line per tool. Every table below it is grouped by cache state as well as by tool,
+so a cold and a hot measurement never share a row. Tools
 that print no version banner — GUFI, and the suite binaries, which have no
 `--version` — fall back to the tag `init.sh` pinned and to the build commit plus
 binary timestamp respectively. The same keys are in each run's `env.txt`.
@@ -394,6 +409,20 @@ Each smoke run writes six figures, each as both PNG and PDF:
 | `charts/figure4_build_rate` | building, throughput | How many files per second is *that*? |
 | `charts/figure5_index_size` | index storage | What does the index cost to keep? |
 | `charts/figure6_queries` | query performance | How fast is each query, and did it answer correctly? |
+
+Figure 6 is paged three query panels at a time — Q1–Q3, then Q4–Q6 — because six
+panels of up to seven bars on one sheet is a page nobody can read.
+`figure6_queries.pdf` is a single file with one page per group; the PNGs, which
+cannot be paged, are written one per page as `figure6_queries_p1.png` and
+`figure6_queries_p2.png`. Every page shares one time axis, so a bar on page two
+compares directly with a bar on page one.
+
+The two rate figures use the same words as everything else here: a tool either
+**walks** the tree (Figures 1 and 2) or **builds** an index from it (Figures 3
+and 4), the denominator of both rates is the same file count, and both say
+*files per second*. Phase names inside a bar — `crawl`, `scan`, `dir2index`,
+`rollup`, `indexes`, `trigram index` — are the tools' own names for their own
+commands, and are the one place the vocabulary varies on purpose.
 
 Two questions, each asked twice. **Elapsed seconds** are what actually happened
 and are exactly the `elapsed_s` column of `SUMMARY_TABLE.txt` — no conversion,
@@ -426,7 +455,8 @@ because a run that also writes an index does not belong beside four that do not.
 
 **Figures 3 and 4** are the build figures: everything it takes to go from an
 unindexed tree to something queryable, as run, measured end to end for every
-tool. `ecrawl + ereport_index` and `GUFI + rollup` take two commands, and
+tool. `ecrawl + ereport_index`, `GUFI + rollup` and `Robinhood (scan + indexes)`
+take two commands each, and
 Figure 3 gives their phases in the bar (or in the label, on a log axis) so the
 total that compares against a one-shot indexer does not hide which half the time
 went to. Figure 4 does not split its bars: rates do not add, and a segmented
@@ -444,40 +474,74 @@ a much longer build for faster queries. `GUFI + rollup` is therefore the
 cost. The harness runs `gufi_dir2index` twice per repetition — the same command
 into two directories, so the rollup has its own copy to work on — and both
 figures pool those runs into the single `dir2index` measurement rather than
-charting the same command twice. Note that the query figure's GUFI bars were
-answered from the **rolled-up** index, which its caption and the summary table
-now both say: those query times belong to the 244 s build, not the 38 s one.
+charting the same command twice.
+
+Robinhood is a sum, not a choice: its scan fills index-free tables, which is not a
+database anyone queries, and the second phase builds the three indexes its queries
+need. `Robinhood (scan only)` is drawn as well, so it is visible how much of the
+total is crawl and how much is `CREATE INDEX`, but the row that compares against a
+one-shot indexer is the sum.
+
+The queries follow suit: **GUFI is two query series**, `GUFI` reading what
+`gufi_dir2index` wrote and `GUFI + rollup` reading what `gufi_rollup` then made of
+it. Charting one GUFI let the cheap index take credit for the expensive one's
+query times, and worse, for a capability it does not have: `gufi_du -s` answers
+Q4 from treesummary rows that only `gufi_rollup` writes, and on a plain index it
+warns, prints 0 and still exits 0. So the plain series has **no Q4 row at all** —
+skipped with `rollup_required`, which Figure 6 labels *needs the rolled-up index*
+rather than *no equivalent query*, and which `SUMMARY_TABLE.txt` spells out. A
+GUFI Q4 time is a time against the 244 s build, never the 38 s one.
 
 **Figure 5** is index storage: the total kept on disk, with bytes per file in
 the bar label so the number carries to another tree. `GUFI + rollup` counts the
 `dir2index` databases *and* the rolled-up copies, since both are on disk. The
 `ecrawl + ereport_index` bar counts the capture alongside the trigram index as
 one footprint, because **the capture is itself a queried index, not scratch on
-the way to one**: `ecrawl_analyze` answers Q3, Q4 and Q5 straight from the
-ERCBIN shards without the trigram index. The like-for-like pairing is GUFI's
+the way to one**: `ecrawl_query` answers Q3 straight from the ERCBIN shards,
+and Q4 and Q5 from those shards plus the dir-index sidecars in the same build.
+The like-for-like pairing is GUFI's
 SQLite replica against `ecrawl`'s capture, with the trigram index as a layer
 GUFI has no equivalent to. Walk-only tools are absent because they store
 nothing, which is the trade behind their times in Figure 1.
 
-**Figure 6** gives each query its own panel, ranked fastest-last, on a shared log
-time axis. Two things the earlier layout hid are now explicit:
+Robinhood's bar there **includes its three indexes**, since its index is a
+database rather than a directory and the question is easy to get wrong. The
+number is `du` of the relocated, benchmark-only MariaDB datadir after the scan,
+plus the growth the three `CREATE INDEX` statements caused, which the
+`Robinhood (scan only)` bar shows as its own row: 3.06 GiB of tables and 508 MiB
+of indexes in the production run. Because it is the datadir, it also carries
+InnoDB's own system tablespace and redo logs, a few hundred MiB that no other
+tool has an equivalent of; `data_length + index_length` for the benchmark schema
+alone is recorded per repetition in the `tables_and_indexes=` note of the
+`robinhood/indexes` row.
+
+**Figure 6** gives each query a panel, ranked fastest-last, on a shared log time
+axis, with **Q6 titled *[extra]*** so nobody reads it as one of the paper's five.
+Three things the earlier layout hid are now explicit:
 
 - **Wrong answers are marked.** Each tool's result count is checked against a
-  reference (`find` for Q1–Q3 and Q5, `du` for Q4, with a 0.5% tolerance on Q4's
-  byte totals for hard-link and sentinel differences). A tool that disagrees is
-  hatched and labelled, because a query that returns nothing is fast for reasons
-  that have nothing to do with its index. `SUMMARY_TABLE.txt` marks the same rows
-  `DISAGREES`. This is not hypothetical: XDU answers Q3 with 0 of 84,840 matches
-  in 83 ms, which would otherwise read as a win.
+  reference (`find` for Q1–Q3, Q5 and Q6, `du` for Q4, with a 0.5% tolerance on
+  Q4's byte totals for hard-link and sentinel differences), per argument set. A
+  tool that disagrees is hatched and labelled, because a query that returns
+  nothing is fast for reasons that have nothing to do with its index.
+  `SUMMARY_TABLE.txt` marks the same rows `DISAGREES`. This is not hypothetical:
+  XDU answers Q3 with 0 of 84,840 matches in 83 ms, which would otherwise read as
+  a win.
 - **Missing bars are explained**, distinguishing "no equivalent query" (`du`
-  cannot search by name) from "failed" (the tool errored), which an empty slot
-  cannot convey.
+  cannot search by name) from "needs the rolled-up index" (GUFI's Q4) and from
+  "failed" (the tool errored), which an empty slot cannot convey.
+- **Cold and hot are separate bars**, so a query's warm latency is never reported
+  as its cost against untouched storage, or the other way round.
 
 Every figure carries the run's conditions — host, cpus, threads per tool, cache
 state, repetitions — so a chart lifted into a document stays interpretable.
-Traditional walkers are drawn in neutral greys and indexers in colour. With
-several result directories, each becomes a column in Figure 6 and a lighter
-shade of the same tool colour in Figures 1–5.
+Captions stop there: they say what the bars are means of, which direction is
+better, and anything the picture cannot show, and they leave the rest to this
+file. A bar that names its own phases, a legend that names its own series and a
+line annotated where it is drawn do not also get a sentence underneath.
+Traditional walkers are drawn in neutral greys and indexers in colour. Each cache
+state is its own series, and with several result directories each becomes a column
+in Figure 6 and a lighter shade of the same tool colour in Figures 1–5.
 
 Charts need matplotlib, which often belongs to a different interpreter than the
 `python3` on `PATH`. `init.sh` installs the distribution package when available
@@ -501,11 +565,29 @@ python3 scripts/compare-indexers/plot_results.py \
 |----|---------|------|----|----|-----|-------|------|-----|
 | Q1 | unique name | `-name` | `-g` glob | – | – | `ereport_index --search` \| `grep` | `gufi_find -name` | `xdu-find -p` |
 | Q2 | `slurm-*.out` | `-name` glob | `-g` glob | – | – | `ereport_index --search slurm-` \| `grep` | `gufi_find` | regex |
-| Q3 | size > 500MB | `-size` | `--size` | – | – | `ecrawl_analyze --size-gt --type f --list` | `-size` | `--min-size` |
-| Q4 | subtree disk usage | – | – | `du -sb` | `dua aggregate -A` | `ecrawl_analyze --subtree` → `bytes=` | `gufi_du -s` | sum sizes |
-| Q5 | subtree file count | `-type f` | `-t f` | – | – | `ecrawl_analyze --subtree --type f --list` | `gufi_find` | `--count` |
+| Q3 | size > 500MB | `-size` | `--size` | – | – | `ecrawl_query --size-gt --type f --list` | `-size` | `--min-size` |
+| Q4 | subtree bytes, apparent | – | – | `du -sb` | `dua aggregate -A` | `ecrawl_query --subtree` → `bytes=` | `gufi_du -s` (rollup only) | sum sizes |
+| Q5 | subtree file count | `-type f` | `-t f` | – | – | `ecrawl_query --subtree --type f --list` | `gufi_find` | `--count` |
+| Q6 | `*token*.dat` **[extra]** | `-name` glob | `-g` glob | – | – | `ereport_index --search token` \| `grep` | `gufi_find` | regex |
 
-The suite answers Q1 and Q2 in two stages, and the row times both. The trigram
+### Q6 is extra
+
+Q6 is not one of the paper's five and is marked *extra* wherever it appears. It
+asks for a token with nothing anchored at either end — `*token*.dat`, or
+`%token%` in SQL — which is the one shape a B-tree on names cannot seek into: the
+index is there, Robinhood's `name_index` included, and the optimiser still has to
+read every row. A trigram index has no such trouble; the longest literal run of
+`*token*.dat` is the token itself, so `ereport_index --search` is handed the most
+selective term the query contains and does not care that it sits in the middle of
+the name. Q6 and Q2 run the same predicate shape with one anchor's difference
+between them, and the difference between the two rows is the whole point.
+
+The seeds plant a control alongside the matches: a *directory* whose name carries
+the token, and a file with the token but the wrong extension. A tool that indexes
+directories as well as files, or that matches on the path rather than the
+basename, will over-report, and the correctness check catches it.
+
+The suite answers Q1, Q2 and Q6 in two stages, and the row times both. The trigram
 index matches a literal substring anywhere in the path, which is a superset of
 what `-name` means, so the harness searches for the longest literal run in the
 pattern — the smallest candidate set the index can produce — and pipes it
@@ -513,13 +595,80 @@ through a basename-anchored `grep -E` that reproduces the glob. The answer is
 `find`'s, not an approximation of it; `query_params.txt` records the term and
 the regex, and `COMMANDS.txt` shows the pipeline as it ran.
 
-Q3, Q4 and Q5 go to `ecrawl_analyze`, which selects records straight out of the
+Q3, Q4 and Q5 go to `ecrawl_query`, which selects records straight out of the
 capture: `--size-gt N` for the size predicate, `--subtree DIR` for the two
 subtree questions, `--type f` for regular files, and `--list` to print paths the
-way `find` does. It has no path index to prune with, so every one of these costs
-a full pass over the shards — a small subtree is not cheaper than the whole
-tree, which is the honest shape of a capture-only design. `--subtree` totals
-count each multiply-linked inode once, so `bytes=` matches `du -sb` exactly.
+way `find` does. `--subtree` totals count each multiply-linked inode once, so
+`bytes=` matches `du -sb` exactly.
+
+### Q4 and Q5 depend on the `ereport_index --make` phase
+
+Both are handed `--index-dir`, the same directory the Q1/Q2/Q6 rows search, and
+read the dir-index sidecars that build writes beside the trigram index: Q4 looks
+its subtree root up instead of materialising every directory row, and Q5 skips
+the row groups whose DFS sketch cannot hold a descendant. Nothing there is free —
+the build's elapsed time and its size, sidecars included, are already a row of
+their own and a bar in Figures 3–5. Q3 has no subtree to resolve, is not given
+the index, and still costs a full pass over the shards.
+
+The sidecars are **bound to the exact capture they were built from** — per shard
+the name, size, mtime, catalog offset and highest directory id — so an index
+paired with a different crawl is rejected rather than believed, and the query
+falls back to the catalog. The index phase therefore builds from `ecrawl`'s
+*last* repetition, the one whose capture survives the run and gets queried; the
+`ereport_index`/`make` row records that capture in its `input=` note.
+`answered_from=` in the Q4 row's note says which path actually ran: `dir_index`,
+`catalog_rollup`, or `record_scan` when a hard link under the subtree forces the
+full scan.
+
+### Why the tools disagree on Q3 and Q4
+
+Some tools return a different number for the size questions, and none of them
+are broken. A count or a byte total only compares when everyone is asked for the
+same thing, so this comparison pins one definition — **Q4 is apparent bytes
+including directory inodes, which is `du -sb`, and a match count is per name,
+so a file with four hard links counts four times** — and then reports, per row,
+where a tool's index answers something else. Those rows are still run, still
+timed and still charted. They are marked, not dropped: a tool that cannot
+express the question is a finding, and a blank cell hides it.
+
+Three axes, each verified against the seeded tree:
+
+**Unit: apparent bytes against allocated blocks.** The seeds plant their large
+files with `truncate`, so they are all hole and allocate nothing —
+`results/correctness/ecrawl.stdout.txt` records `total_bytes=3984591872` beside
+`total_allocated_bytes=0` and `files_sparse_heuristic=8`. `rbh-du -s` reports
+that subtree as `80`, its directory blocks in KiB, where `du -sb`, `dua`,
+`gufi_du --apparent-size` and `ecrawl_query` all report 3,984,641,243. That is
+not a Robinhood defect: the paper's Q4 is literally *"disk usage of large
+subdirectory"*, which is what `rbh-du` answers, and Robinhood 3.2.0's `rbh-du`
+documents no byte flag to switch it (`env.txt` records the probe as
+`rbh_du_args=`). XDU has the same split and can be told: without
+`--apparent-size` at index time its records hold `st_blocks`, its Q3 matches
+nothing and its Q4 comes out at zero, so `init.sh` pins the flag when the build
+has it and the harness skips both size queries when it does not — a number in
+blocks printed beside `du -sb` reads as a bug in XDU rather than as a gap in the
+build.
+
+**Scope: files against files and directories.** `gufi_du` and `xdu-find` total
+their file records; `du -sb` also counts the apparent size of every directory
+inode. On the main subtree that is the 49,371-byte gap between GUFI's
+3,984,591,872 and `du`'s 3,984,641,243. On the `bulk/` subtree, whose 2,000
+files are all empty, directories are the entire answer: `du -sb` says 49,152 and
+both GUFI and XDU say 0.
+
+**Identity: names against inodes.** Robinhood's `ENTRIES` is keyed by inode and
+`rbh-find` prints one path per entry, so a hard-linked file is one row for it and
+one row per link for `find`. Over the 500 MB threshold `find` lists eight names
+in `links_and_specials/`, Robinhood lists two — a constant six-row shortfall at
+every threshold, which is how it was told apart from a size problem. Robinhood's
+size column itself is `st_size`: it matched exactly the seeded sparse fixtures at
+each of the three thresholds (5, 7 and 2), which an index holding `st_blocks`
+could not do.
+
+Where a difference is definitional, `SUMMARY_TABLE.txt` names it under the
+DISAGREES tally, `FAILURES.txt` gives it a `by definition:` line, and Figure 6
+puts it on the bar next to the two numbers.
 
 ### Traditional baselines
 
@@ -529,15 +678,17 @@ approach can do:
 
 | Tool | Pair | Answers |
 |------|------|---------|
-| `find` | serial search | Q1–Q3, Q5 |
-| `fd` | parallel search | Q1–Q3, Q5 |
+| `find` | serial search | Q1–Q3, Q5, Q6 |
+| `fd` | parallel search | Q1–Q3, Q5, Q6 |
 | `du` | serial aggregate | Q4 |
 | `dua` ([dua-cli](https://github.com/Byron/dua-cli)) | parallel aggregate | Q4 |
 
 A dash above means the tool has no primitive for that query, not that it lost:
 `find`/`fd` cannot total a subtree, and `du`/`dua` have no name, type or size
 predicates. Q4 therefore moved off the `find` rows onto `du`, which measures the
-identical `du -sb` call.
+identical `du -sb` call. `find` is also the reference every other tool's count is
+checked against, Q6 included — an unanchored glob costs it exactly what an
+anchored one does, since it was reading every name either way.
 
 `fd` follows the [test.sh](../test/test.sh) convention (`--hidden --no-ignore`,
 plus `--one-file-system` when supported, matching `find -xdev`); Debian's
@@ -595,7 +746,11 @@ older result sets and the paper's own tables remain comparable.
 **Separate rows:**
 
 1. `ecrawl` / `write` — ERCBIN08 shards (+ ckpts)
-2. `ereport_index` / `make` — trigram index **on top of** crawl bins
+2. `ereport_index` / `make` — trigram index **on top of** crawl bins, plus the
+   dir-index sidecars `ecrawl_query` answers Q4 and Q5 from. Built from
+   `ecrawl`'s last repetition, because that is the capture the query phase reads
+   and the sidecars only work with the capture they were made from; the `input=`
+   note names it.
 3. `ecrawl` / `nowrite` — walk only, storing nothing. This is the like-for-like
    row against `find`, `fd`, `du` and `dua`, and the gap to `ecrawl`/`write` is
    the cost of writing the capture. Not comparable to the full indexers, so it
@@ -609,7 +764,11 @@ older result sets and the paper's own tables remain comparable.
    its `index_bytes` is what the rollup adds on top of the replica, so the two
    rows sum to what is on disk.
 5. XDU parquet
-6. Robinhood (site-configured via `RBH_SCAN` + `RBH_SCAN_ARGS`)
+6. Robinhood `scan` and `indexes` — two stages, not alternatives. The scan
+   (site-configured via `RBH_SCAN` + `RBH_SCAN_ARGS`) crawls into index-free
+   tables, which is not a database anyone queries; `indexes` times the three
+   `CREATE INDEX` statements that make them queryable. Both are what Robinhood
+   costs, and the charts and the summary add them.
 7. `find` / `fd` / `du` / `dua` `walk` — live walks with `index_bytes=0`
 
 The walk rows time the same metadata sweep the indexers perform, only discarded
@@ -663,9 +822,9 @@ Defaults can be overridden with `PREFIX`, `SRC_ROOT`, `JOBS`, `TOOLS`, and
 place instead of tripping over build output from the previous run.
 
 The generated database is named `rbh_indexer_compare`. `run_index.sh` resets
-only this marked database before each Robinhood repetition and obtains index
-bytes from MariaDB. After benchmarking, remove the database, its dedicated
-user, password file, config, and logs:
+only this marked database before each Robinhood repetition and sizes its index by
+measuring MariaDB's data directory. After benchmarking, remove the database, its
+dedicated user, password file, config, and logs:
 
 ```bash
 PREFIX=$HOME/.local/indexer-compare \
@@ -682,6 +841,50 @@ helper refuses to drop a database unless its private provision marker matches.
 
 Overrides: see `lib.sh` (`GUFI_DIR2INDEX`, `XDU_BIN`, `ECRAWL_BIN`, …).
 
+### Robinhood's tables live on the storage under test
+
+Every other tool writes its index under `--work`, on the filesystem being
+benchmarked. A packaged MariaDB keeps its tables in `/var/lib/mysql`, on the
+operating system's disk — a different filesystem, usually a different class of
+device — so a Robinhood row measured there is not comparable with the rest of the
+table. `mariadb.sh setup` therefore **moves the data directory** to
+`RBH_DB_DATADIR`, which `benchmark.sh --do` points at `<work>/mariadb`, and asks
+for the move on every `--do` rather than only at provisioning time: a database set
+up before this existed, or one whose `--work` has changed, would otherwise keep
+writing to the OS disk for the rest of its life.
+
+The move is a copy of the packaged datadir plus a `datadir=` drop-in, with the
+SELinux label copied from the original and a systemd drop-in relaxing
+`ProtectHome`/`ProtectSystem` — which is what actually blocks a datadir under
+`/home`, whatever its permissions say. `mariadb.sh cleanup` puts the server back
+on its packaged directory and deletes the copy; `mariadb.sh datadir` prints where
+the tables are now, and `--do` reports it in step 0 beside the other paths.
+`SUMMARY_TABLE.txt` records
+the path with its filesystem, so a run that could not move them says so.
+`RBH_DB_RELOCATE=0` keeps the packaged location and warns that the rows are not
+comparable.
+
+### Robinhood is never measured without its indexes
+
+Nobody runs a relational database unindexed, so the harness never measures one.
+The scan fills index-free tables and is timed; then the three indexes its queries
+need are created as a **timed phase of their own**:
+
+```sql
+CREATE INDEX name_index ON NAMES (name);
+CREATE INDEX size_index ON ENTRIES (size);
+CREATE INDEX type_index ON ENTRIES (type);
+```
+
+The queries then run against them, and the query phase **drops them again** when
+it is done, so the next `--do` crawls index-free tables and pays for creating them
+once more. That is what makes the two runs comparable. `run_queries.sh` creates
+them itself, untimed, if the index phase did not run — a standalone query run, or
+a results directory whose crawl predates this — and notes that it did in
+`harness.log`. `name_index` is what Q1 and Q2 need, `size_index` is Q3,
+`type_index` is the `-type f` in Q3 and Q5; nothing there helps Q6, which is the
+point of Q6.
+
 ## Production
 
 See [prod-protocol.md](prod-protocol.md).
@@ -690,22 +893,67 @@ See [prod-protocol.md](prod-protocol.md).
 
 | Setting | Effect |
 |---------|--------|
-| `DROP_CACHES=1` | `sync` + `drop_caches` before each timed command (needs root) |
+| `CACHE_MODES="cold hot"` | which passes each repetition makes; `CACHE_MODES=cold` restores the old single-pass behaviour |
+| `DROP_CACHES=1` | `sync` + `drop_caches` before each timed command on a cold pass (needs root) |
 | `DROP_CACHES_SCOPE=first-rep` | only rep 1 is cold, so later reps show warm latency as in the paper |
 | `DROP_DB_CACHE=1` | also restart MariaDB, since `drop_caches` leaves InnoDB's buffer pool warm |
+| `ARG_SETS=3` | ceiling on how many query argument sets the hot passes rotate through |
 
-`DROP_CACHES=1` alone makes **every** query repetition cold, which reports
-higher query times than the paper's warm series and leaves Robinhood warm
-relative to the file-based tools. For paper-comparable query numbers use
-`DROP_CACHES=1 DROP_CACHES_SCOPE=first-rep DROP_DB_CACHE=1`. Remote filesystem
-and storage-controller caches are still outside this harness's control.
+### Cold and hot are both measured
+
+Cold and hot answer different questions, and a run that reports only one of them
+is answering the other by accident. So every repetition runs twice:
+
+- **cold** — caches dropped before each timed command (and MariaDB restarted for
+  the rows that read it), which is what the work costs against storage nobody
+  has touched.
+- **hot** — nothing dropped, which is what it costs when the metadata is already
+  in memory: the state a second query on a live system meets.
+
+The `cache` column of both CSVs says which pass a row belongs to, and it is
+`warm` rather than `cold` when the run wanted a cold pass but had no privileges
+to drop anything — a claim the run cannot make should not be in the data. The
+summary table and the charts key on that column, so cold and hot appear as two
+series rather than being averaged into a number neither of them measured.
+
+In the index phase each tool's **whole pipeline** runs cold and then hot, so a
+hot `ereport_index` reads the shards a hot `ecrawl` just wrote and a hot
+`gufi_rollup` the tree its own `dir2index` wrote. The hot pass rebuilds into the
+same directory, so the disk footprint is unchanged.
+
+### Query argument sets
+
+A hot query that asks exactly what the cold one just asked is measuring the
+answer it already has. `prepare-synth.sh` therefore plants **three argument sets**
+per query — three unique basenames, three glob families with their own literals,
+three size thresholds, three subtrees, three infix tokens — and each repetition
+asks:
+
+1. cold, set 1
+2. hot, set 1 — the same work, so the cold/hot delta is a clean comparison
+3. hot, set 2 and hot, set 3 — different questions, so no later bar is a
+   re-answer
+
+Set 1 is what the manifest's unindexed keys name, so a seed file written by hand,
+or by a `prepare-synth.sh` from before the sets existed, still resolves as set 1.
+An exported `Q2_GLOB` (or any other query variable) pins that value for every
+set. Correctness is checked per (query, argument set): each set has its own right
+answer, so checking one against another's reference would report every tool as
+disagreeing. `benchmark.sh --do` reseeds a tree whose manifest predates the sets,
+which recreates `query_seeds/` and leaves the tree itself alone.
+
+Remote filesystem and storage-controller caches are still outside this harness's
+control.
 
 ## Fairness checklist
 
 - Same tree, host, and thread budget
 - `THREADS` is the total per tool and covers ecrawl, `ereport_index`, ereport, GUFI, XDU, `fd`, `dua` and Robinhood; `env.txt` records the resolved split plus `fd_args` / `dua_args`
 - `RLIMIT_NOFILE` raised to 128k, so no tool is throttled by a limit another one escaped
-- Cold vs warm noted; first query rep may be an outlier
+- Every index and every query measured cold **and** hot, recorded per row in the `cache` column and never averaged together
+- Hot queries rotate through three argument sets, so no hot number is a re-answer of the question the pass before it asked
+- Robinhood's tables on the same filesystem as every other tool's index, and always queried with the three indexes its queries need
+- GUFI's two indexes charted as two series, so the cheap one cannot borrow the expensive one's query times or its capabilities
 - Byte totals: unique-inode logical (as `test.sh`)
 - Do not force foreign indexes through `scripts/profile/ereport*` (ecrawl-bin only)
 - See [capability-matrix.md](capability-matrix.md) for predicate gaps

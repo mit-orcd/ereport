@@ -29,7 +29,7 @@ fi
 ECRAWL_BIN=${ECRAWL_BIN:-$REPO_ROOT/ecrawl}
 EREPORT_BIN=${EREPORT_BIN:-$REPO_ROOT/ereport}
 EREPORT_INDEX_BIN=${EREPORT_INDEX_BIN:-$REPO_ROOT/ereport_index}
-ECRAWL_ANALYZE_BIN=${ECRAWL_ANALYZE_BIN:-$REPO_ROOT/ecrawl_analyze}
+ECRAWL_QUERY_BIN=${ECRAWL_QUERY_BIN:-$REPO_ROOT/ecrawl_query}
 
 # External indexers — set when installed (paper-ish names; actual PATH may vary).
 GUFI_DIR2INDEX=${GUFI_DIR2INDEX:-$(command -v gufi_dir2index 2>/dev/null || true)}
@@ -120,9 +120,9 @@ _t_trigram=$((THREADS - _t_half))
 ((_t_trigram >= 1)) || _t_trigram=1
 export EREPORT_INDEX_THREADS=${EREPORT_INDEX_THREADS:-$_t_half}
 export EREPORT_INDEX_TRIGRAM_THREADS=${EREPORT_INDEX_TRIGRAM_THREADS:-$_t_trigram}
-# ereport and ecrawl_analyze queries each run one pool.
+# ereport and ecrawl_query queries each run one pool.
 export EREPORT_THREADS=${EREPORT_THREADS:-$THREADS}
-export ECRAWL_ANALYZE_THREADS=${ECRAWL_ANALYZE_THREADS:-$THREADS}
+export ECRAWL_QUERY_THREADS=${ECRAWL_QUERY_THREADS:-$THREADS}
 unset _t_crawl _t_writer _t_stat _t_half _t_trigram
 
 # gufi_dir2index and gufi_rollup take a thread count on the command line, but
@@ -208,10 +208,10 @@ gufi_rel_path() {
 # Reported in the summary so an unpinnable tool is visible rather than a silent
 # asymmetry in the numbers.
 thread_plan() {
-  printf 'budget=%s ecrawl=%s+%s+%s(crawl+stat+writer) ecrawl_nostat=%s(crawl) ereport_index=%s+%s(parse+trigram) ereport=%s ecrawl_analyze=%s' \
+  printf 'budget=%s ecrawl=%s+%s+%s(crawl+stat+writer) ecrawl_nostat=%s(crawl) ereport_index=%s+%s(parse+trigram) ereport=%s ecrawl_query=%s' \
     "$THREADS" "$ECRAWL_CRAWL_THREADS" "$ECRAWL_STAT_THREADS" "$ECRAWL_WRITER_THREADS" \
     "$ECRAWL_NOSTAT_CRAWL_THREADS" \
-    "$EREPORT_INDEX_THREADS" "$EREPORT_INDEX_TRIGRAM_THREADS" "$EREPORT_THREADS" "$ECRAWL_ANALYZE_THREADS"
+    "$EREPORT_INDEX_THREADS" "$EREPORT_INDEX_TRIGRAM_THREADS" "$EREPORT_THREADS" "$ECRAWL_QUERY_THREADS"
 }
 
 # find -name matches a glob against the basename; the trigram index matches a
@@ -682,11 +682,92 @@ rbh_du_args() {
     # It exists but means something else (blocks, backend); leave it off and
     # report the default unit so a mismatch is attributable.
     printf -- '\n'
-    printf 'rbh-du_-s_default_unit(-b_is_not_bytes_here)\n'
+    printf 'rbh-du_-s_default_unit(-b_is_not_bytes_here); disk_usage_not_apparent_bytes\n'
   else
+    # Robinhood 3.2.0's rbh-du documents no byte flag at all, and what it does
+    # report is allocated space: on the seeded subtree, which is sparse by
+    # construction, it answers ~80 KiB where du -sb answers 3.7 GiB. That is the
+    # paper's Q4 ("disk usage of large subdirectory") answered exactly, and a
+    # different question from the one this harness asks, so the row says so.
     printf -- '\n'
-    printf 'rbh-du_-s_default_unit\n'
+    printf 'rbh-du_-s_default_unit; disk_usage_not_apparent_bytes\n'
   fi
+}
+
+# A relational database is not run without indexes, so the harness never
+# measures one: the crawl fills index-free tables, these three are created as a
+# timed phase of their own, the queries run against them, and the query phase
+# drops them again so the next run's crawl is index-free and pays for creating
+# them once more. name_index is what Q1 and Q2 need; size_index is Q3; type_index
+# is the -type f in Q3 and Q5. Nothing here helps Q6, which is the point of Q6.
+RBH_INDEX_NAMES=(name_index size_index type_index)
+RBH_INDEX_CREATE=(
+  "CREATE INDEX name_index ON NAMES (name);"
+  "CREATE INDEX size_index ON ENTRIES (size);"
+  "CREATE INDEX type_index ON ENTRIES (type);"
+)
+RBH_INDEX_DROP=(
+  "DROP INDEX IF EXISTS name_index ON NAMES;"
+  "DROP INDEX IF EXISTS size_index ON ENTRIES;"
+  "DROP INDEX IF EXISTS type_index ON ENTRIES;"
+)
+
+# How many of the three exist. Robinhood recreates its tables from scratch on
+# every reset, so this is asked rather than remembered.
+rbh_indexes_present() {
+  local n
+  n=$(rbh_sql "SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics
+       WHERE table_schema = DATABASE() AND index_name IN ('name_index','size_index','type_index');" ||
+    printf '')
+  printf '%s' "${n:-0}"
+}
+
+# Create or drop them outside a timed region, for the standalone run_queries.sh
+# path: a query measured against an unindexed database is not a configuration
+# anyone runs, and dropping them at the end is what makes the next crawl
+# comparable to this one. Prints nothing; returns nonzero if any statement fails.
+rbh_apply_index_sql() {
+  local -n statements=$1
+  local sql ok=0
+  for sql in "${statements[@]}"; do
+    rbh_sql "$sql" >/dev/null 2>&1 || ok=1
+  done
+  return "$ok"
+}
+rbh_create_indexes() { rbh_apply_index_sql RBH_INDEX_CREATE; }
+rbh_drop_indexes() { rbh_apply_index_sql RBH_INDEX_DROP; }
+
+# A timed command has to be a command, and the password must not become part of
+# one: log_command copies argv into COMMANDS.txt, which lives in the results
+# directory. So write a one-purpose runner that reads the password from the file
+# Robinhood's own config names, and time that. It prints one stmt_sec= line per
+# statement, so the row's total can be read back as its parts.
+rbh_write_sql_runner() {
+  local path=$1 cfg=${RBH_CONFIG:-} cli db user pwfile
+  [[ -n "$cfg" && -f "$cfg" ]] || return 1
+  cli=$(mysql_client_bin)
+  [[ -n "$cli" ]] || return 1
+  db=$(rbh_conf_value db "$cfg" || true)
+  user=$(rbh_conf_value user "$cfg" || true)
+  pwfile=$(rbh_conf_value password_file "$cfg" || true)
+  [[ -n "$db" && -n "$user" && -n "$pwfile" && -r "$pwfile" ]] || return 1
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Written by the compare-indexers harness. Runs each SQL argument\n'
+    printf '# against Robinhood'\''s database and prints what each one took.\n'
+    printf 'set -uo pipefail\n'
+    printf 'pw=$(tr -d "[:space:]" <%q) || exit 1\n' "$pwfile"
+    printf 'rc=0\n'
+    printf 'for sql in "$@"; do\n'
+    printf '  s=$(date +%%s.%%N)\n'
+    printf '  MYSQL_PWD="$pw" %q --protocol=socket -u %q %q --batch --skip-column-names -e "$sql" || rc=$?\n' \
+      "$cli" "$user" "$db"
+    printf '  e=$(date +%%s.%%N)\n'
+    printf '  awk -v a="$s" -v b="$e" -v q="$sql" '\''BEGIN { printf "stmt_sec=%%.3f %%s\\n", b - a, q }'\''\n'
+    printf 'done\n'
+    printf 'exit "$rc"\n'
+  } >"$path" || return 1
+  chmod 700 "$path"
 }
 
 RBH_READY_STATE=""
@@ -717,6 +798,115 @@ DROP_CACHES_SCOPE=${DROP_CACHES_SCOPE:-all}
 DROP_DB_CACHE=${DROP_DB_CACHE:-0}
 REPS=${REPS:-3}
 SIZE_GT_BYTES=${SIZE_GT_BYTES:-$((500 * 1024 * 1024))}
+
+# Both states are worth measuring and they answer different questions: a cold
+# pass is what the work costs against storage nobody has touched, a hot one what
+# it costs once the metadata is already in memory. Which pass is running lives
+# in CACHE_STATE; which passes a phase makes lives in CACHE_MODES.
+CACHE_STATE=${CACHE_STATE:-cold}
+CACHE_MODES=${CACHE_MODES:-"cold hot"}
+# Set by maybe_drop_caches, and the reason the label is not simply CACHE_STATE:
+# without root nothing is dropped, and calling that pass "cold" would put a
+# claim in the CSV that the run cannot make.
+CACHE_DROPPED=0
+
+# What the row records: cold when a drop actually happened, warm when the first
+# pass ran without one, hot for a pass that deliberately kept the caches.
+cache_label() {
+  if [[ "$CACHE_STATE" == "hot" ]]; then
+    printf 'hot'
+  elif [[ "$CACHE_DROPPED" == "1" ]]; then
+    printf 'cold'
+  else
+    printf 'warm'
+  fi
+}
+
+# Query arguments come in sets so the hot passes are not re-answering the
+# question the cold pass just answered. Set 1 is what the manifest's unindexed
+# keys name, so a seed file written by hand -- or by a prepare-synth.sh from
+# before the sets existed -- still resolves as set 1.
+ARG_SETS=${ARG_SETS:-3}
+ARG_SET=${ARG_SET:-1}
+
+# An exported Q2_GLOB means that glob for every set, so it has to outrank the
+# manifest. Recorded before the first select_arg_set, which overwrites the very
+# variables it would otherwise read back.
+declare -A ARG_FORCED=()
+record_arg_overrides() {
+  local var
+  for var in Q1_NAME Q1_PATH Q2_GLOB Q2_TERM Q4_SUBTREE Q5_SUBTREE Q6_GLOB; do
+    [[ -z "${!var:-}" ]] || ARG_FORCED[$var]=${!var}
+  done
+  # Spelled Q3_MIN_BYTES on the way in and Q3_MIN once resolved.
+  [[ -z "${Q3_MIN_BYTES:-}" ]] || ARG_FORCED[Q3_MIN]=$Q3_MIN_BYTES
+}
+
+# One seed value for one argument set.
+seed_value() {
+  local base=$1 set_no=$2 var value
+  var="${base}_${set_no}"
+  value=${!var:-}
+  if [[ -z "$value" && "$set_no" == "1" ]]; then
+    # Only set 1 aliases the unindexed key. Letting sets 2 and 3 fall back to it
+    # would measure one argument three times and report it as three.
+    value=${!base:-}
+  fi
+  printf '%s' "$value"
+}
+
+# How many sets the seed manifest actually planted, capped by ARG_SETS.
+arg_sets_available() {
+  local have=${arg_sets:-1}
+  [[ "$have" =~ ^[0-9]+$ ]] && ((have >= 1)) || have=1
+  ((have <= ARG_SETS)) || have=$ARG_SETS
+  printf '%s' "$have"
+}
+
+# Re-export Q1-Q6 for one argument set, along with the two search terms and
+# basename anchors the trigram pipeline needs. Derived here, once, so nothing is
+# computed inside a timed region.
+select_arg_set() {
+  local n=${1:-1}
+  ARG_SET=$n
+  Q1_NAME=${ARG_FORCED[Q1_NAME]:-$(seed_value q1_unique_name "$n")}
+  Q1_PATH=${ARG_FORCED[Q1_PATH]:-$(seed_value q1_unique_path "$n")}
+  Q2_GLOB=${ARG_FORCED[Q2_GLOB]:-$(seed_value q2_glob "$n")}
+  Q2_TERM=${ARG_FORCED[Q2_TERM]:-$(seed_value q2_term "$n")}
+  Q3_MIN=${ARG_FORCED[Q3_MIN]:-$(seed_value q3_min_bytes "$n")}
+  Q4_SUBTREE=${ARG_FORCED[Q4_SUBTREE]:-$(seed_value q4_subtree "$n")}
+  Q5_SUBTREE=${ARG_FORCED[Q5_SUBTREE]:-$(seed_value q5_subtree "$n")}
+  Q6_GLOB=${ARG_FORCED[Q6_GLOB]:-$(seed_value q6_glob "$n")}
+  # A tree with no manifest at all still has to ask something.
+  [[ -n "$Q2_GLOB" ]] || Q2_GLOB="slurm-*.out"
+  [[ -n "$Q2_TERM" ]] || Q2_TERM="slurm-"
+  [[ -n "$Q3_MIN" ]] || Q3_MIN=$SIZE_GT_BYTES
+  [[ -n "$Q4_SUBTREE" ]] || Q4_SUBTREE=${TREE:-}
+  [[ -n "$Q5_SUBTREE" ]] || Q5_SUBTREE=$Q4_SUBTREE
+
+  Q1_ERE=""
+  [[ -z "$Q1_NAME" ]] || Q1_ERE=$(name_basename_ere "$Q1_NAME")
+  Q2_INDEX_TERM=""
+  Q2_ERE=""
+  if [[ -n "$Q2_GLOB" ]]; then
+    { read -r Q2_INDEX_TERM; read -r Q2_ERE; } < <(glob_index_filter "$Q2_GLOB")
+    # Below three characters there is no trigram to look up, so the index cannot
+    # narrow the candidates and the seed term (if any) is the better prefilter.
+    if [[ ${#Q2_INDEX_TERM} -lt 3 && -n "$Q2_TERM" ]]; then
+      Q2_INDEX_TERM=$Q2_TERM
+    fi
+    [[ ${#Q2_INDEX_TERM} -ge 3 ]] || Q2_INDEX_TERM=""
+  fi
+  # Q6 is Q2 with the anchors removed, so it needs no machinery of its own: the
+  # longest literal run of '*token*.dat' is the token itself, which is exactly
+  # the term a trigram index wants and the one a B-tree on names cannot use.
+  Q6_INDEX_TERM=""
+  Q6_ERE=""
+  if [[ -n "$Q6_GLOB" ]]; then
+    { read -r Q6_INDEX_TERM; read -r Q6_ERE; } < <(glob_index_filter "$Q6_GLOB")
+    [[ ${#Q6_INDEX_TERM} -ge 3 ]] || Q6_INDEX_TERM=""
+  fi
+}
 
 # Repetitions are per tool, because their costs are not comparable: a GUFI
 # rollup is 29 minutes a repetition on a 4.4M-entry tree while `find` is
@@ -823,7 +1013,7 @@ tool_available() {
     ecrawl) have_cmd "$ECRAWL_BIN" ;;
     ereport) have_cmd "$EREPORT_BIN" ;;
     ereport_index) have_cmd "$EREPORT_INDEX_BIN" ;;
-    ecrawl_analyze) have_cmd "$ECRAWL_ANALYZE_BIN" ;;
+    ecrawl_query) have_cmd "$ECRAWL_QUERY_BIN" ;;
     gufi) have_cmd "$GUFI_DIR2INDEX" ;;
     gufi_find) have_cmd "$GUFI_FIND" ;;
     gufi_du) have_cmd "$GUFI_DU" ;;
@@ -858,6 +1048,13 @@ harness_warn() {
 DB_DOWN=0
 
 maybe_drop_caches() {
+  CACHE_DROPPED=0
+  # The hot pass is defined by not dropping anything, including MariaDB's buffer
+  # pool: it is measuring what the work costs when the metadata is already in
+  # memory, which is the state a second query on a live system meets.
+  if [[ "$CACHE_STATE" == "hot" ]]; then
+    return 0
+  fi
   if [[ "$DROP_CACHES" != "1" ]]; then
     return 0
   fi
@@ -881,8 +1078,11 @@ maybe_drop_caches() {
       harness_warn "MariaDB did not come back after a restart; remaining database rows are skipped"
     fi
   fi
-  sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null ||
+  if sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+    CACHE_DROPPED=1
+  else
     harness_warn "drop_caches failed"
+  fi
 }
 
 # Exact argv of every timed command, quoted so a line can be pasted back into a
@@ -1186,6 +1386,11 @@ write_env_snapshot() {
     echo "drop_caches=$DROP_CACHES"
     echo "drop_caches_scope=$DROP_CACHES_SCOPE"
     echo "drop_db_cache=$DROP_DB_CACHE"
+    # Which passes this phase made, and how many argument sets its queries had.
+    # Both are per-row facts in the CSVs; recorded here so the summary can say
+    # what the run intended even when a pass produced nothing.
+    echo "cache_modes=$CACHE_MODES"
+    echo "arg_sets=$(arg_sets_available)"
     echo "reps=$REPS"
     # Only when some tool disagrees with REPS, so a uniform run reads exactly as
     # it always did. Without it a mixed run claims one repetition count for rows
@@ -1211,12 +1416,25 @@ write_env_snapshot() {
     # rather than argv, so which file was in effect is part of the run. Only
     # worth recording for a tool that is actually installed.
     [[ -z "${GUFI_FIND:-}${GUFI_DIR2INDEX:-}" ]] || echo "gufi_config=$(gufi_config_path)"
-    echo "gufi_index_root=${GUFI_INDEX_DIR:-}"
+    # Two indexes, two series: what gufi_dir2index wrote, and what gufi_rollup
+    # then made of it. Recording only one made a query time unattributable, since
+    # the two cost very different amounts to build and answer different questions.
+    echo "gufi_index_root=${GUFI_PLAIN_INDEX_DIR:-${GUFI_INDEX_DIR:-}}"
+    [[ -z "${GUFI_ROLLUP_INDEX_DIR:-}" ]] ||
+      echo "gufi_rollup_index_root=$GUFI_ROLLUP_INDEX_DIR"
     # A GUFI query is a Python wrapper, so where its modules were found is as
     # much part of the run as the binary path.
     [[ -z "${GUFI_FIND:-}${GUFI_DIR2INDEX:-}" ]] || echo "gufi_pythonpath=${PYTHONPATH:-}"
     echo "rbh_config=${RBH_CONFIG:-}"
     echo "rbh_config_fs_path=$(rbh_conf_value fs_path "${RBH_CONFIG:-/nonexistent}" 2>/dev/null || echo '')"
+    # Where MariaDB keeps the tables. Every other tool writes its index under
+    # --work, so a Robinhood row measured against the OS drive is not comparable
+    # with the rest of the table; this is how the summary can say it was not.
+    if [[ -n "${RBH_DB_DATADIR:-}" ]]; then
+      echo "rbh_datadir=$RBH_DB_DATADIR"
+      df -T "$RBH_DB_DATADIR" 2>/dev/null | tail -1 |
+        awk '{print "rbh_datadir_fstype="$2; print "rbh_datadir_mount="$NF}' || true
+    fi
     # Robinhood's tables come from its first scan, so whether they existed when
     # the queries ran is the difference between an answer and a hard failure.
     if [[ -n "${RBH_CONFIG:-}" ]]; then

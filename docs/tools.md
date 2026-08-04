@@ -2,7 +2,7 @@
 
 Full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`. For a brief overview and quick start, see the [README](../README.md). Tuning knobs are collected in [environment-variables.md](environment-variables.md); design rationale is in [performance.md](performance.md).
 
-Contents: [`ecrawl`](#ecrawl) · [`ecrawl_repair`](#ecrawl_repair) · [`ecrawl_analyze`](#ecrawl_analyze) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
+Contents: [`ecrawl`](#ecrawl) · [`ecrawl_repair`](#ecrawl_repair) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
 
 ## `ecrawl`
 
@@ -141,14 +141,14 @@ Usage:
 ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
 ```
 
-## `ecrawl_analyze`
+## `ecrawl_query`
 
-`ecrawl_analyze` reads `uid_shard_*.bin` shards in a crawl output directory (read-only—no shard or `.ckpt` writes) and prints aggregate directory-shape metrics on stdout.
+`ecrawl_query` reads `uid_shard_*.bin` shards in a crawl output directory (read-only—no shard or `.ckpt` writes) and prints aggregate directory-shape metrics on stdout.
 
 Behavior highlights:
 
 - Chunk boundaries — Parse jobs follow `*.bin.ckpt` segment boundaries when sidecars are valid (same spirit as `ereport` / `ereport_index` chunk mapping). If a checkpoint is missing or unusable, that shard is scanned as a single range from after the file header through EOF.
-- Parallelism — Worker count comes from `ECRAWL_ANALYZE_THREADS` (default 16, range 1…4096). If `ECRAWL_ANALYZE_THREADS` is unset, `ECRAWL_REPAIR_THREADS` is used when set, so existing repair-tuning scripts can drive analyze without a second variable.
+- Parallelism — Worker count comes from `ECRAWL_QUERY_THREADS` (default 16, range 1…4096). If `ECRAWL_QUERY_THREADS` is unset, `ECRAWL_REPAIR_THREADS` is used when set, so existing repair-tuning scripts can drive analyze without a second variable.
 - Progress — When stderr is a TTY, a one-line status (bytes scanned, chunk and record rates, elapsed time, ETA) updates about once per second; the final report is always plain text on stdout.
 - `--top N` — List the top `N` parent directories (1…100000; default 32). The default dimension is `dense` (most regular files); each row shows `nfile`, `ndir`, `nsym`, `nother`, and the parent path. Select dimensions with `--top,DIM[,DIM] N` (order-independent): `dense` = top parents by regular-file count, `deep` = deepest parent directories by path slash count. For example `--top,deep 20` lists only the deepest directories, `--top,dense,deep 20` prints both lists. The `deep` table adds a leading `depth` column.
 - `--verbose` / `-v` — While scanning, prints one line per successfully parsed chunk (shard path, byte range, record count), mutex-serialized so lines are not interleaved mid-line; chunk failures are reported on stderr (often corrupt data or checkpoint mismatch).
@@ -158,18 +158,18 @@ Stdout summary (stable `key=value` / section headers) includes: shard and chunk 
 Usage:
 
 ```bash
-./ecrawl_analyze [--verbose] [--top[,dim...] N] <crawl-output-dir>
-./ecrawl_analyze [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--perm MODE] [--list] [--exact] <crawl-output-dir>
+./ecrawl_query [--verbose] [--top[,dim...] N] <crawl-output-dir>
+./ecrawl_query [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--perm MODE] [--list] [--exact] [--index-dir DIR] <crawl-output-dir>
 ```
 
 Examples:
 
 ```bash
-./ecrawl_analyze /path/to/crawl-out
-./ecrawl_analyze --top 100 /path/to/crawl-out
-./ecrawl_analyze --top,deep 50 /path/to/crawl-out          # deepest directories only
-./ecrawl_analyze --top,dense,deep 50 /path/to/crawl-out    # both top lists
-ECRAWL_ANALYZE_THREADS=32 ./ecrawl_analyze -v /path/to/crawl-out
+./ecrawl_query /path/to/crawl-out
+./ecrawl_query --top 100 /path/to/crawl-out
+./ecrawl_query --top,deep 50 /path/to/crawl-out          # deepest directories only
+./ecrawl_query --top,dense,deep 50 /path/to/crawl-out    # both top lists
+ECRAWL_QUERY_THREADS=32 ./ecrawl_query -v /path/to/crawl-out
 ```
 
 ### Query form
@@ -183,17 +183,31 @@ Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--perm` / `--li
 - `--perm MODE` — octal permission bits in the three `find -perm` forms: `0644` exactly these bits, `-0002` all of these bits, `/0022` any of these bits.
 - `--list` — print each matching path on stdout; the totals move to stderr.
 - `--exact` — never answer from the catalog rollups; always scan the records.
+- `--index-dir DIR` — use the `dirs.idx` / `rowgroups.idx` sidecars an `ereport_index --make --index-dir DIR` run left there. Optional and advisory: see below.
 
 ```bash
-./ecrawl_analyze --size-gt 524288000 --type f --list /path/to/crawl-out   # files over 500 MB
-./ecrawl_analyze --subtree /data/lab/jones /path/to/crawl-out             # bytes + counts under a subtree
-./ecrawl_analyze --type f --perm -0002 --list /path/to/crawl-out          # world-writable files
-./ecrawl_analyze --type f --gid 2001 /path/to/crawl-out                   # files owned by a group
+./ecrawl_query --size-gt 524288000 --type f --list /path/to/crawl-out   # files over 500 MB
+./ecrawl_query --subtree /data/lab/jones /path/to/crawl-out             # bytes + counts under a subtree
+./ecrawl_query --type f --perm -0002 --list /path/to/crawl-out          # world-writable files
+./ecrawl_query --type f --gid 2001 /path/to/crawl-out                   # files owned by a group
 ```
 
-Two v8 storage features do the work here. Row groups whose column zone maps cannot match the `--size-gt` / `--type` / `--gid` filters are skipped without decompressing, and only the columns a query names are decoded — `ECRAWL_ANALYZE_BLOCK_SKIP=0` disables the skipping for comparison.
+Two v8 storage features do the work here. Row groups whose column zone maps cannot match the `--size-gt` / `--type` / `--gid` filters are skipped without decompressing, and only the columns a query names are decoded — `ECRAWL_QUERY_BLOCK_SKIP=0` disables the skipping for comparison.
 
 More importantly, a bare `--subtree DIR` aggregate is answered from the per-directory rollups the crawl already computed, reading no records at all (`records_scanned=0`), so its cost is O(directories) rather than O(files). That shortcut is taken only when it provably equals the scan; in particular it is skipped when any record in the subtree has `nlink > 1`, because crawl-time hardlink credit is attributed to the first link seen anywhere in the tree while a scan dedups within the subtree. `answered_from=catalog_rollup` or `answered_from=record_scan` says which ran, and `--exact` forces the scan. See [binary-format.md](binary-format.md#dfs-ordering-and-subtree-rollups-v8).
+
+#### `--index-dir`: answering from the directory-index sidecars
+
+Both routes above are still linear in the capture rather than the subtree. The rollup has to parse every catalog row in every shard to reach the one row holding the answer, and a filtered scan splits work on `.ckpt` boundaries, which know nothing about which directories a byte range covers. `--index-dir DIR` points `ecrawl_query` at the `dirs.idx` and `rowgroups.idx` an `ereport_index --make` run wrote there and removes both:
+
+- A bare `--subtree` aggregate becomes a hash lookup in `dirs.idx` plus a short chain of `pread`s up the parent chain — 8 rows read where the catalog route examined 21726 directories, on the tree these were measured against. It reports `answered_from=dir_index`.
+- A filtered `--subtree` scan builds its parse jobs from the row groups whose DFS sketch can reach the subtree, instead of from every checkpoint segment. On the same capture, a single mid-level directory kept 5 of 129 row groups and scanned 44129 of 1134121 records. `rowgroups_total`, `rowgroups_kept`, `rowgroups_kept_interval`, `rowgroups_kept_bitmap`, `rowgroup_bytes_total` and `rowgroup_bytes_kept` report what pruning did.
+
+Two properties make this safe to point at an index dir you are not sure about. Every hash hit is confirmed by rebuilding the directory's path from its parent chain and comparing it byte-for-byte to the query, so a hash collision costs a wasted read rather than a wrong answer. And the sidecars are bound to the exact shards they were built from — basename, size, mtime, catalog offset, catalog entry count — so a sidecar that is absent, truncated, or describing shards that have since changed is dropped silently and the query runs as it would have without the flag. Nothing here changes an answer, only how long it takes.
+
+The `nlink > 1` bail-out still applies: a subtree containing a hardlink falls through to the record scan whichever route located it. `--exact` continues to force the scan, and agrees with the sidecar answer.
+
+`ereport --index-dir DIR` reads the same two files through the same reader (`crawl_sidecar.c`, linked into both binaries). It has no aggregate to look up, so it uses `dirs.idx` only to place the subtree root in each shard, and then decides membership from the record's `parent_dir_id` instead of rebuilding a path per record — see [`ereport`](#ereport) subtree scoping.
 
 ## `ecrawl_mount`
 
@@ -223,7 +237,7 @@ The consequences worth knowing:
 - `du --apparent-size`, `wc -c`, and `dd` are byte-exact; `cat`, `grep`, and `md5sum` see a file of NUL bytes.
 - Real `st_ino` and `st_nlink` mean `du` deduplicates hardlinks the same way it does on the live tree.
 - `find -type l` is correct, but `ls -l` prints an I/O error for each symlink because the target was never captured.
-- Permissions are uniform, so `find -perm` is meaningless **on the mount**. The capture does record real `mode` and `gid`; the mount's in-memory index omits them, because it holds the whole namespace resident and two more fields per entry is a cost paid on every mount for a read-only view that cannot honour the bits anyway. Use `ecrawl_analyze --perm` / `--gid` to query them from the capture directly.
+- Permissions are uniform, so `find -perm` is meaningless **on the mount**. The capture does record real `mode` and `gid`; the mount's in-memory index omits them, because it holds the whole namespace resident and two more fields per entry is a cost paid on every mount for a read-only view that cannot honour the bits anyway. Use `ecrawl_query --perm` / `--gid` to query them from the capture directly.
 
 ### The index
 
@@ -272,7 +286,7 @@ Without root, use the binary directly as shown above; it needs only the setuid `
 
 ### Performance
 
-Metadata fidelity is exact and index lookups are fast (~1.4 µs per entry served), but FUSE 2.x protocol overhead dominates directory traversal: about 130 µs fixed cost per `readdir` regardless of directory size, and ~15 µs per `getattr`. A full `find` over a 192k-entry mount takes ~5 s versus ~0.8 s on the warm live tree. FUSE 2.x cannot cache directory listings in the kernel (that arrived with FUSE 3's `cache_readdir`), so repeated traversals re-enter the filesystem each time. For bulk analytics `ereport` and `ecrawl_analyze` remain far faster; `ecrawl_mount` is for ad-hoc exploration with familiar tools, and for reaching a crawl whose source filesystem is gone.
+Metadata fidelity is exact and index lookups are fast (~1.4 µs per entry served), but FUSE 2.x protocol overhead dominates directory traversal: about 130 µs fixed cost per `readdir` regardless of directory size, and ~15 µs per `getattr`. A full `find` over a 192k-entry mount takes ~5 s versus ~0.8 s on the warm live tree. FUSE 2.x cannot cache directory listings in the kernel (that arrived with FUSE 3's `cache_readdir`), so repeated traversals re-enter the filesystem each time. For bulk analytics `ereport` and `ecrawl_query` remain far faster; `ecrawl_mount` is for ad-hoc exploration with familiar tools, and for reaching a crawl whose source filesystem is gone.
 
 ### FUSE support (optional)
 
@@ -377,8 +391,8 @@ Heat map (`index.html`):
 Usage:
 
 ```bash
-./ereport [--bucket-details N] [--subtree PATH] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
-./ereport [--bucket-details N] [--subtree PATH] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
+./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
 ```
 
 If you omit every `bin_dir`, `ereport` reads crawl `.bin` files from the current working directory (`./`).
@@ -420,7 +434,9 @@ Bucket drill-down:
 Subtree scoping:
 
 - `--subtree PATH` (absolute) restricts the whole analysis to records at or under `PATH`, as if only that directory had been crawled — useful for zooming into one lab/group inside a larger `--record-root` crawl without re-crawling. Place it before the username (if any) and time basis. The subtree directory itself is included, and matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
-- Full absolute paths are kept in the report (records are filtered, not rewritten); all heat-map totals, badges, distinct-user counts, and bucket-detail tables are scoped to the subtree. It forces per-record path reconstruction, so it is a bit slower than the default histogram-only fast path even without `--bucket-details`.
+- Full absolute paths are kept in the report (records are filtered, not rewritten); all heat-map totals, badges, distinct-user counts, and bucket-detail tables are scoped to the subtree. On its own it forces per-record path reconstruction, so it is a bit slower than the default histogram-only fast path even without `--bucket-details`.
+- `--index-dir DIR` — where `ereport_index --make` left `dirs.idx` / `rowgroups.idx` (see [dir-index sidecars](#index-dir-answering-from-the-directory-index-sidecars)). Only `--subtree` uses them, and only as a shortcut to what the scan already computes: the subtree root is resolved once per shard from `dirs.idx`, row groups whose DFS sketch cannot reach it are never opened, and membership becomes a bit test on the record's `parent_dir_id` instead of a rebuilt path and a string compare — which also retires the reconstruction the histogram-only path was forced into. The report is byte-identical either way; `subtree_from=dir_index` plus `rowgroups_kept` / `rowgroups_total` / `rowgroup_records_kept` on stdout say the route was taken. A missing, stale or truncated sidecar, one that does not name every shard being read, or a `--subtree` that names something other than a directory falls back to the path-prefix behaviour with the same output. Ignored under `--path-rewrite` (the filter then runs in a namespace the catalogs know nothing about) and for `--subtree /`.
+- `Scanned records` counts the whole capture either way. Pruning changes how much of it is decoded, not what the report stands for, so the records in dropped row groups are credited back; `rowgroup_records_kept` is what was actually read.
 - `manifest_*` lines (e.g. `total_allocated_bytes`) come from `crawl_manifest.txt` and still describe the whole crawl, not the subtree.
 
 Runtime behavior:
@@ -469,7 +485,7 @@ Queries must be at least three characters (trigram filtering).
 Usage:
 
 ```bash
-./ereport_index --make [--index-dir <path>] [--subtree <abs-path>] [username|uid] [bin_dir ...]
+./ereport_index --make [--index-dir <path>] [--subtree <abs-path>] [--no-dir-index] [username|uid] [bin_dir ...]
 ./ereport_index --resume-merge --index-dir <path>
 ./ereport_index --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]
 ```
@@ -479,6 +495,8 @@ Usage:
 `--subtree <abs-path>` (may precede or follow `--index-dir`, must come before the username/`bin_dir` arguments) indexes only records whose reconstructed full path is at or under that absolute directory, mirroring `ereport --subtree`. Full absolute paths are kept in the index, so a search over a subtree index returns the same paths as the full index would, just restricted to that directory. Matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
 
 You can pass multiple `bin_dir` paths (same merged crawl directories as for `ereport`); they are merged into one index.
+
+`--no-dir-index` skips the directory-index sidecars. They are built by default, described under [index format](#index-format-and-on-disk-layout) below.
 
 Examples:
 
@@ -596,6 +614,17 @@ Current files under `<username>/index/`:
 - `paths.bin`
 - `tri_keys.bin`
 - `tri_postings.bin`
+- `dirs.idx`, `rowgroups.idx` — the directory-index sidecars, unless `--no-dir-index` was passed
+
+#### Directory-index sidecars (`dirs.idx`, `rowgroups.idx`)
+
+Unlike the five files above, these two have nothing to do with trigram search. They are a lookup structure over the *shards*, written into the same directory because that is where a build already has every shard open and a place to put derived state. `ecrawl_query --index-dir DIR` reads them to answer a `--subtree` query without parsing every catalog row, and to scan only the row groups a subtree can touch; see [`ecrawl_query`](#index-dir-answering-from-the-directory-index-sidecars) and the [format reference](binary-format.md#directory-index-sidecars-dirsidx-rowgroupsidx).
+
+They are written in a phase of their own after the trigram merge, which is why `--make` reports `dir_index_sec` separately. The phase is not allowed to fail a build: a shard it cannot summarise makes it warn, remove the partial files and leave the trigram index complete. Nothing else reads them, and no index version was bumped for them — an older reader ignores the extra `meta.txt` lines and the extra files.
+
+Cost, measured on a 1.13M-record capture of 21726 directories: `dirs.idx` 509 KiB (24.0 bytes per directory, 7.1% of the capture), `rowgroups.idx` 21 KiB (169 bytes per row group, 0.3%), written in 0.013 s. `dirs.idx` scales with directory count and `rowgroups.idx` with capture size, so the ratio between them shifts with how file-dense the tree is.
+
+`--make` reports `dir_index=1`, `dir_index_dirs`, `dir_index_bytes`, `rowgroup_index_groups`, `rowgroup_index_bytes` and `dir_index_sec` on stdout, and `meta.txt` records `dir_index`, `dir_index_dirs`, `rowgroup_index` and `rowgroup_index_groups`. Those are advisory: a reader validates the sidecars against the shards themselves, not against `meta.txt`.
 
 #### Compression (index version 2)
 
@@ -687,7 +716,7 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 ## Source layout
 
 - `edelete.c` — standalone parallel walker / deletion utility (`path_canon.h` only).
-- `ecrawl_analyze.c` — read-only `uid_shard_*.bin` analyzer (parent and depth histograms, plus the record query form); links `crawl_bin_chunks.o` for shared chunk parsing.
+- `ecrawl_query.c` — read-only `uid_shard_*.bin` analyzer (parent and depth histograms, plus the record query form); links `crawl_bin_chunks.o` for shared chunk parsing.
 - `crawl_bin_format.h` — magic, format version, `bin_file_header_t`, the columnar `bin_rowgroup_hdr_t` / `bin_colchunk_hdr_t`, `bin_record_hdr_t`, `bin_dir_catalog_entry_t` (immediate-child aggregates plus the v8 DFS ordering and subtree rollups).
 - `crawl_bin_block.h` / `crawl_bin_block.c` — columnar row-group writer and reader: encoding choice per column, zone-map skipping, column projection, and the row-reconstruction shim.
 - `crawl_bin_codec.h` / `crawl_bin_codec.c` — the per-column encoders and decoders (`RAW`, `FOR_BITPACK`, `RLE`, `CONST`); round-trip tested by `test_crawl_codec.c`.
@@ -695,5 +724,5 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 - `crawl_bin_chunks.h` / `crawl_bin_chunks.c` — checkpoint-driven chunk boundaries (`crawl_bin_load_ckpt()`, `crawl_bin_build_chunks_for_file()`).
 - `crawl_result.h` / `crawl_result.c` — open a crawl directory: parse `crawl_manifest.txt`, enumerate finalized `uid_shard_*.bin` (skipping shards still being written), validate headers. Used by `ecrawl_mount`; `ereport` and `ereport_index` still carry their own uid-filtered copies of this logic and could migrate onto it.
 - `ecrawl_mount.c` — read-only FUSE view of a crawl (in-memory namespace index + libfuse 2.x high-level ops); optional target, built only when FUSE headers are present.
-- `crawl_ckpt.h` — shared on-disk checkpoint layout for `uid_shard_*.bin.ckpt` sidecars; included by `ecrawl`, `ereport`, `ereport_index`, `ecrawl_repair`, and `ecrawl_analyze`.
+- `crawl_ckpt.h` — shared on-disk checkpoint layout for `uid_shard_*.bin.ckpt` sidecars; included by `ecrawl`, `ereport`, `ereport_index`, `ecrawl_repair`, and `ecrawl_query`.
 - HTML emitters in `ereport.c` follow a common argument order where practical: output path / `FILE*` target first, then `username`, `all_users`, `distinct_uids`, `basis_str`, then function-specific fields (e.g. age/size bucket indices, detail levels).

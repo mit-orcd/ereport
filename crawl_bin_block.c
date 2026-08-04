@@ -506,8 +506,10 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
     if (skip_run && fseeko(r->fp, (off_t)skip_run, SEEK_CUR) != 0) goto done;
 
     /* Name offsets are the prefix sum of the lengths, so no offsets column is
-     * stored on disk. */
-    if (have_name_len) {
+     * stored on disk. Only crawl_bin_block_reader_name reads them, and it refuses
+     * without the name bytes, so a consumer that projects the lengths alone (to
+     * tell an empty name from a real one) does not pay for the sum. */
+    if (have_name_len && (want & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES))) {
         uint64_t off = 0;
         uint32_t i;
 
@@ -516,7 +518,7 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
             off += r->col[CRAWL_COL_NAME_LEN][i];
         }
         r->name_off[rg.record_count] = off;
-        if ((want & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)) && off != (uint64_t)r->names_len) goto done;
+        if (off != (uint64_t)r->names_len) goto done; /* lengths must tile the blob exactly */
     }
 
     r->rg_projection = want;

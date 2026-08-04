@@ -26,7 +26,7 @@
 #                     binaries, generate a ~2.5k-entry tree, and compare against
 #                     find and du only. No external indexers, no MariaDB, no
 #                     package installs, one repetition, ~30 seconds end to end.
-#                     For checking that a code change still answers Q1-Q5; the
+#                     For checking that a code change still answers Q1-Q6; the
 #                     timings mean nothing at that size and say so.
 #   --smoke           --small's tiny tree, but with every installed external
 #                     indexer running against it, MariaDB included when
@@ -37,7 +37,7 @@
 #                     a real tree. Not a measurement.
 #   --quick           a full run with the external indexers, but one repetition
 #                     and no GUFI rollup variant: minutes instead of hours, for
-#                     checking that every tool answers Q1-Q5 correctly before
+#                     checking that every tool answers Q1-Q6 correctly before
 #                     spending a night on the measured run. Results land in
 #                     results/quick. Timings are real but single-sample.
 #   --work <dir>      scratch storage for the indexes every tool builds and for
@@ -82,9 +82,9 @@
 #
 # Env (all optional, passed through to the underlying scripts):
 #   PREFIX, SRC_ROOT, JOBS, TOOLS, PKG_ARGS, INSTALL_PACKAGES, SETUP_CHARTS,
-#   WORK_ROOT, RESULTS_ROOT, SYNTH_PROFILE, REPS, REPS_<TOOL>, DROP_CACHES,
-#   DROP_CACHES_SCOPE, DROP_DB_CACHE, KEEP_ALL_INDEXES, TOOLS_INDEX, TOOLS_QUERY,
-#   EDELETE_BIN, EDELETE_THREADS
+#   WORK_ROOT, RESULTS_ROOT, SYNTH_PROFILE, REPS, REPS_<TOOL>, CACHE_MODES,
+#   DROP_CACHES, DROP_CACHES_SCOPE, DROP_DB_CACHE, ARG_SETS, KEEP_ALL_INDEXES,
+#   TOOLS_INDEX, TOOLS_QUERY, RBH_DB_DATADIR, EDELETE_BIN, EDELETE_THREADS
 #
 # REPS_<TOOL> is the env spelling of --reps: REPS_GUFI=1 and --reps gufi=1 do
 # the same thing. REPS_EREPORT_INDEX defaults to 1 because it indexes ecrawl's
@@ -95,8 +95,16 @@
 # gets a tmp/ for TMPDIR.
 #
 # Every default --small changes can still be overridden by setting the variable:
-# SYNTH_PROFILE, REPS, TOOLS, DROP_CACHES and INSTALL_PACKAGES are only defaulted
-# when they are unset.
+# SYNTH_PROFILE, REPS, TOOLS, DROP_CACHES, CACHE_MODES and INSTALL_PACKAGES are
+# only defaulted when they are unset.
+#
+# CACHE_MODES is "cold hot" for a measured run: every repetition of every phase
+# is timed once against dropped caches and once warm, since the two answer
+# different questions. --small, --smoke and --quick cut back to one pass, because
+# they check answers rather than measure them.
+#
+# RBH_DB_DATADIR puts MariaDB's tables on the storage under test, defaulting to
+# <work>/mariadb, so Robinhood's index is not the only one on the OS disk.
 #
 # REPS defaults to 3 here (run_smoke.sh alone defaults to 1) because the charts
 # need repetitions to show error bars. DROP_CACHES defaults to 1 when running as
@@ -138,11 +146,15 @@ FROM_ENV_TOOLS=${TOOLS+1}
 FROM_ENV_REPS=${REPS+1}
 FROM_ENV_PROFILE=${SYNTH_PROFILE+1}
 FROM_ENV_DROP=${DROP_CACHES+1}
+FROM_ENV_CACHE_MODES=${CACHE_MODES+1}
 FROM_ENV_INSTALL=${INSTALL_PACKAGES+1}
 # An explicit empty TOOLS means "install nothing external", so honour it rather
 # than falling back to the default set.
 TOOLS=${TOOLS-"gufi xdu robinhood dua"}
 REPS=${REPS:-3}
+# Cold and hot both get measured; the correctness modes below drop back to one
+# pass. Defaulted here as well as in lib.sh so this script can report it.
+CACHE_MODES=${CACHE_MODES:-"cold hot"}
 # The per-tool thread budget, shared with lib.sh's default and baked into the
 # Robinhood config by mariadb.sh, which is why it is set here rather than left
 # to each script.
@@ -188,7 +200,7 @@ QUICK=0
 # The suite under test. Built by --small so a cycle always measures the working
 # tree rather than whatever was compiled last; edelete is included because
 # --undo uses it.
-SUITE_TARGETS="ecrawl ereport ereport_index ecrawl_analyze edelete"
+SUITE_TARGETS="ecrawl ereport ereport_index ecrawl_query edelete"
 
 log() { printf '\n=== %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -442,14 +454,18 @@ rbh_status() {
 }
 
 # --small is a different question, not a smaller benchmark: does the code still
-# answer Q1-Q5 correctly. So it drops everything that only matters for
+# answer Q1-Q6 correctly. So it drops everything that only matters for
 # measurement -- the external indexers, their packages, MariaDB, repetitions,
-# cold caches -- and keeps the references that are always installed.
+# cold caches, the second cache pass -- and keeps the references that are always
+# installed.
 apply_small_defaults() {
   [[ -z "$FROM_ENV_PROFILE" ]] && SYNTH_PROFILE=tiny
   [[ -z "$FROM_ENV_REPS" ]] && REPS=1
   [[ -z "$FROM_ENV_TOOLS" ]] && TOOLS=""
   [[ -z "$FROM_ENV_DROP" ]] && DROP_CACHES=0
+  # One pass, not two: a second pass exists to measure the cost of a warm cache,
+  # and this mode is not measuring anything.
+  [[ -z "$FROM_ENV_CACHE_MODES" ]] && CACHE_MODES=cold
   # Nothing here needs a system package, and a prompt would defeat the point.
   [[ -z "$FROM_ENV_INSTALL" ]] && INSTALL_PACKAGES=0
   export SYNTH_PROFILE INSTALL_PACKAGES
@@ -465,6 +481,7 @@ apply_small_defaults() {
 apply_quick_defaults() {
   [[ -z "$FROM_ENV_REPS" ]] && REPS=1
   [[ -z "$FROM_ENV_DROP" ]] && DROP_CACHES=0
+  [[ -z "$FROM_ENV_CACHE_MODES" ]] && CACHE_MODES=cold
   [[ -n "${GUFI_DO_ROLLUP:-}" ]] || GUFI_DO_ROLLUP=0
   export GUFI_DO_ROLLUP
   RESULTS_DEFAULT="$SCRIPT_DIR/results/quick"
@@ -481,6 +498,7 @@ apply_smoke_defaults() {
   [[ -z "$FROM_ENV_PROFILE" ]] && SYNTH_PROFILE=tiny
   [[ -z "$FROM_ENV_REPS" ]] && REPS=1
   [[ -z "$FROM_ENV_DROP" ]] && DROP_CACHES=0
+  [[ -z "$FROM_ENV_CACHE_MODES" ]] && CACHE_MODES=cold
   WITH_EXTERNALS=1
   export SYNTH_PROFILE WITH_EXTERNALS
   RESULTS_DEFAULT="$SCRIPT_DIR/results/smoke"
@@ -508,6 +526,13 @@ do_run() {
   local started=$SECONDS
 
   resolve_scratch "$tree"
+  # Robinhood's index is MariaDB's data directory, and it belongs on the storage
+  # under test like every other tool's. Set before init.sh, which provisions the
+  # database on a first run and would otherwise put the tables wherever the
+  # package does -- the operating system's disk.
+  if want_robinhood; then
+    export RBH_DB_DATADIR="$SCRATCH_ROOT/mariadb"
+  fi
   raise_nofile
   log "0/5 paths and limits"
   if [[ "$SMALL" == "1" ]]; then
@@ -529,8 +554,10 @@ do_run() {
   info "scratch: $SCRATCH_ROOT  ($(fs_note "$SCRATCH_ROOT"); $(space_note "$SCRATCH_ROOT"))"
   info "  indexes -> $SCRATCH_INDEXES"
   info "  TMPDIR  -> $SCRATCH_TMP"
+  [[ -z "${RBH_DB_DATADIR:-}" ]] || info "  mariadb -> $RBH_DB_DATADIR"
   info "threads: $THREADS per tool (every tool that can be told)"
   info "reps:    $(reps_summary)"
+  info "cache:   $CACHE_MODES per repetition"
   # These modes each want a single repetition, but only when REPS was not set.
   # An exported REPS=3 left over from a measured run therefore made a "quick"
   # check take three times as long with nothing to say why.
@@ -602,7 +629,8 @@ do_run() {
       # init.sh normally does this; this covers a prefix built before --do
       # learned to ask for it.
       log "2/5 provisioning MariaDB and the Robinhood config for $tree"
-      PREFIX="$PREFIX" THREADS="$THREADS" "$SCRIPT_DIR/mariadb.sh" setup "$tree"
+      PREFIX="$PREFIX" THREADS="$THREADS" RBH_DB_DATADIR="$RBH_DB_DATADIR" \
+        "$SCRIPT_DIR/mariadb.sh" setup "$tree"
       export RBH_CONFIG="$rbh_config"
       export RBH_SCAN_ARGS="-f $rbh_config --scan --once --alter-db"
       export RBH_AUTO_RESET=1
@@ -613,7 +641,13 @@ do_run() {
       # here is a no-op when they are already there.
       PREFIX="$PREFIX" RBH_CONFIG="$rbh_config" "$SCRIPT_DIR/mariadb.sh" schema ||
         info "  could not create the Robinhood schema; the index step will try again"
+      # Asked on every run, not only when provisioning: a database set up before
+      # the move existed, or one whose --work has changed, would otherwise keep
+      # writing to the operating system's disk for the rest of its life.
+      PREFIX="$PREFIX" "$SCRIPT_DIR/mariadb.sh" datadir "$RBH_DB_DATADIR" ||
+        info "  could not move MariaDB's data directory to $RBH_DB_DATADIR; its rows are not on the storage under test"
     fi
+    info "robinhood datadir: $(PREFIX="$PREFIX" "$SCRIPT_DIR/mariadb.sh" datadir 2>/dev/null || echo unknown)"
     # Whether it was provisioned now or five runs ago, the run is only fair if
     # Robinhood can actually reach its database. Finding that out here costs one
     # query; finding it out later costs a whole run of failing rows.
@@ -630,9 +664,16 @@ do_run() {
     log "2/5 skipping MariaDB and Robinhood"
   fi
 
-  if [[ -f "$tree/QUERY_SEEDS.txt" ]]; then
+  if [[ -f "$tree/QUERY_SEEDS.txt" ]] && grep -q '^arg_sets=' "$tree/QUERY_SEEDS.txt"; then
     log "3/5 reusing the existing tree at $tree"
     info "delete it with '$0 --undo $tree' to build a fresh one"
+  elif [[ -f "$tree/QUERY_SEEDS.txt" ]]; then
+    # A tree seeded before the queries had argument sets. Reseeding recreates
+    # query_seeds/ -- a few thousand small files -- and leaves the tree itself
+    # alone: prepare-synth.sh reuses a generated tree whose parameters match.
+    log "3/5 reseeding the query arguments at $tree"
+    info "its manifest predates the three argument sets the hot passes need"
+    "$SCRIPT_DIR/prepare-synth.sh" "$tree"
   else
     log "3/5 building the synthetic tree at $tree"
     "$SCRIPT_DIR/prepare-synth.sh" "$tree"
@@ -671,6 +712,9 @@ do_run() {
     printf 'prefix=%s\n' "$PREFIX"
     printf 'src_root=%s\n' "$SRC_ROOT"
     printf 'mariadb=%s\n' "$(want_robinhood && echo 1 || echo 0)"
+    # Removed by 'mariadb.sh cleanup', not by the file sweep: the server has to
+    # be off it first.
+    [[ -z "${RBH_DB_DATADIR:-}" ]] || printf 'rbh_datadir=%s\n' "$RBH_DB_DATADIR"
     printf 'work_root=%s\n' "$SCRATCH_INDEXES"
     printf 'tmp_root=%s\n' "$SCRATCH_TMP"
   } >"$tree/$STATE_NAME.tmp"
@@ -685,10 +729,11 @@ do_run() {
   # extra traversal per rep, which is the cheapest walk in the table.
   local nowrite=${DO_NOWRITE:-1}
 
-  log "4/5 benchmarking (reps=$(reps_summary) DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
+  log "4/5 benchmarking (reps=$(reps_summary) cache=$CACHE_MODES DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
   info "results: $results"
   info "each timed binary prints one line: <seconds>  <label>"
   SKIP_PREPARE=1 REPS="$REPS" DROP_CACHES="$DROP_CACHES" DROP_DB_CACHE="$DROP_DB_CACHE" \
+    CACHE_MODES="$CACHE_MODES" \
     DO_NOWRITE="$nowrite" WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
     WITH_EXTERNALS="${WITH_EXTERNALS:-0}" \
     "$SCRIPT_DIR/run_smoke.sh" "$tree" "$results"
@@ -848,7 +893,7 @@ undo_run() {
     printf '         %s --adopt %s' "$0" "$tree"
   )"
 
-  local s_prefix="" s_src="" s_work="" s_tmp="" s_mariadb=0
+  local s_prefix="" s_src="" s_work="" s_tmp="" s_mariadb=0 s_datadir=""
   local s_results=()
   local key value
   while IFS='=' read -r key value; do
@@ -858,6 +903,7 @@ undo_run() {
       work_root) s_work=$value ;;
       tmp_root) s_tmp=$value ;;
       mariadb) s_mariadb=$value ;;
+      rbh_datadir) s_datadir=$value ;;
       # Every --do appends its results path, and --small reuses one, so the same
       # directory is normally in there once per cycle.
       results)
@@ -869,7 +915,13 @@ undo_run() {
   s_src=${s_src:-$SRC_ROOT}
 
   log "teardown plan for $tree"
-  [[ "$s_mariadb" != "1" ]] || info "drop the benchmark database and its generated Robinhood config"
+  if [[ "$s_mariadb" == "1" ]]; then
+    info "drop the benchmark database and its generated Robinhood config"
+    # Part of the database cleanup rather than the file sweep below: MariaDB has
+    # to be pointed back at its packaged data directory before this can go.
+    [[ -z "$s_datadir" ]] ||
+      info "put MariaDB's data directory back and delete the copy at $s_datadir"
+  fi
   if [[ -n "$s_work" ]]; then
     check_removable "$s_work" "index working directory"
     info "delete index working directory $s_work"

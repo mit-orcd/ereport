@@ -72,14 +72,14 @@ A single O(directories) post-pass at the end of the crawl fills the remaining fi
 dfs_index[D] <= dfs_index[X] < dfs_index[D] + dfs_subtree_dirs[D]
 ```
 
-with no per-shard bitmap and without touching a single record. `ecrawl_analyze` uses it in place of the bitmap `--subtree` previously built.
+with no per-shard bitmap and without touching a single record. `ecrawl_query` uses it in place of the bitmap `--subtree` previously built.
 
 `subtree_bytes` / `subtree_count` are `imm_child_bytes` / `imm_child_count` summed over that DFS range, with `subtree_files` / `subtree_dirs` / `subtree_symlinks` breaking the count down by record type. So a `--subtree` aggregate becomes a lookup: cost is O(directories) instead of O(files), and no record is read at all.
 
 Two subtleties are worth stating plainly:
 
 - The `subtree_*` sums cover records *under* the directory and exclude the directory's own record, which by construction hangs off its parent. `self_bytes` carries that one record's credit on the directory's own row so a query can add it back and match `du -sb`, which counts the directory it was given. The `CRAWL_DIR_FLAG_SELF_RECORD` flag says this shard actually holds that record — a shard is per-uid, so a directory owned by another user still gets a catalog row here to give its children a path, and without the flag a cross-uid subtree would count its root once per shard.
-- `subtree_nlink_gt1_count` is the number of records in the subtree with `nlink > 1`. **When it is zero, `subtree_bytes` provably equals what a full scan would compute.** When it is nonzero the two can legitimately differ, because crawl-time hardlink credit is attributed to the first link visited anywhere in the tree while a scan dedups within the queried subtree. Readers must fall back to the scan rather than present the rollup as exact; `ecrawl_analyze` does, and reports which ran via `answered_from=`.
+- `subtree_nlink_gt1_count` is the number of records in the subtree with `nlink > 1`. **When it is zero, `subtree_bytes` provably equals what a full scan would compute.** When it is nonzero the two can legitimately differ, because crawl-time hardlink credit is attributed to the first link visited anywhere in the tree while a scan dedups within the queried subtree. Readers must fall back to the scan rather than present the rollup as exact; `ecrawl_query` does, and reports which ran via `answered_from=`.
 
 Note `dfs_subtree_dirs` counts *catalog* directories (path components) while `subtree_dirs` counts directory *records* in this shard; they differ for the per-uid reason above.
 
@@ -90,6 +90,60 @@ Note `dfs_subtree_dirs` counts *catalog* directories (path components) while `su
 ## Checkpoint sidecars (`*.bin.ckpt`)
 
 While crawling, `ecrawl` records block-aligned byte offsets at a fixed stride into `uid_shard_*.bin.ckpt`. Readers load those offsets to split each shard into valid segments without a preliminary full-file scan for boundaries, which lets many threads work on different byte ranges of the same file safely with no record torn across workers. Checkpoint offsets apply only to the record region (from just after the file header up to `catalog_offset` on finalized shards). If sidecars are missing or stale — for example after an interrupted crawl — run [`ecrawl_repair`](tools.md#ecrawl_repair) on the crawl output directory to rebuild them, and to truncate an incomplete last record when possible.
+
+## Directory-index sidecars (`dirs.idx`, `rowgroups.idx`)
+
+Two derived files that `ereport_index --make` writes into its `--index-dir`, and `ecrawl_query --index-dir DIR` reads. They are not part of a shard and hold no data of their own: everything in them can be recomputed from the shards, and a reader that cannot find or verify them behaves exactly as it did before they existed. `--no-dir-index` skips writing them.
+
+They exist because both routes to a subtree answer were linear in the *capture*, not in the subtree. The v8 catalog rollups already reduce a bare `--subtree` aggregate to O(directories), but reaching the one row that holds the answer still meant parsing every catalog row in every shard — 21726 directories examined to answer with 2 on the tree these were measured against. A filtered subtree scan had the same shape one level down: chunk boundaries came from the `.ckpt` stride, which knows nothing about which directories a byte range covers, so every record was decoded and tested.
+
+### Shared skeleton
+
+Both files are little-endian, packed, and laid out the same way:
+
+| | |
+|---|---|
+| `crawl_sidecar_hdr_t` | 48 bytes at offset 0: magic, version, `shard_count`, `shard_dir_off`, `names_off`, `names_bytes`, `entry_total` |
+| per-shard payloads | in shard order, appended as each shard's worker finishes |
+| shard descriptor array | at `shard_dir_off` |
+| shard basename blob | at `names_off`, `names_bytes` long, not NUL-separated (each descriptor carries its own length) |
+
+The descriptor array trails the payloads because the writer only knows where a payload landed after writing it. Shards are stored sorted by basename, which is the order a reader gets from sorting its own directory listing, so the identity check is an index-wise comparison. A build whose input directories contribute two shards with the same basename writes no sidecars at all: a reader keyed on basename could not tell them apart.
+
+### Identity binding
+
+Every descriptor opens with a `crawl_sidecar_shard_id_t` recording five facts about the shard it was built from: basename, `st_size`, mtime (sec and nsec), the `catalog_offset` from the shard's own header, and the `n_entries` count that opens the catalog blob — plus the `max_dir_id` the catalog reached. A reader re-stats each shard, re-reads its 32-byte header and that one `uint64`, and compares. Any mismatch on any shard retires the sidecar for the whole run.
+
+This matters more than it looks. `dir_id` is per shard and is handed out in crawl arrival order, so a sidecar's dir_ids, row offsets and DFS positions are meaningless against a different file — and nothing else in the index dir is staleness-checked. The rule is therefore reject, never repair.
+
+### `dirs.idx` — `EDIRX001`
+
+Per shard: a hash table over full stored paths, and the `dir_id → catalog row offset` map that makes a hit usable.
+
+- `crawl_dirx_shard_t`: the identity binding, then `hash_count`, `hash_off`, `rows_off`.
+- At `hash_off`: `hash_count` × `crawl_dirx_entry_t` (`path_hash`, `dir_id`), sorted by `(path_hash, dir_id)`.
+- At `rows_off`: `max_dir_id + 1` × `uint64` byte offsets of each directory's `bin_dir_catalog_entry_t` in the shard. Slot 0 is unused; 0 means no entry for that id.
+
+`path_hash` is FNV-1a over the path exactly as `crawl_bin_catalog_dir_path()` spells it: absolute, no trailing slash, the synthetic root as the empty string. No path bytes are stored. A lookup binary-searches to the hash, and each candidate is only accepted after its row has been read and its parent chain walked back into a path that compares byte-equal to the query — so a 64-bit collision costs one wasted read and can never produce a wrong answer.
+
+`rows_off` is what makes that walk possible: catalog rows are variable length (the name follows the struct), so an ancestor's offset cannot be computed from its id. The pair costs about 24 bytes per directory, measured at 24.0 B/dir over 21726 directories, or 7% of that capture.
+
+Directories whose path will not rebuild — a broken parent chain — are left out of the table. `subtree_find_dirs` skips them too, so the two routes still agree about which directories exist.
+
+### `rowgroups.idx` — `ERGIX001`
+
+Per shard: one sketch per row group of where that group's records sit in the shard's DFS order.
+
+- `crawl_rgix_shard_t`: the identity binding, then `dfs_domain` (DFS positions live in `[0, dfs_domain)`), `group_count`, `groups_off`.
+- At `groups_off`: `group_count` × `crawl_rgix_group_t` — `file_offset`, `group_bytes`, `record_count`, `flags`, `dfs_min`, `dfs_max`, and a 1024-bit bucket bitmap (128 bytes), 168 bytes per group.
+
+A subtree is a contiguous DFS range, so a group can be skipped when the range misses `[dfs_min, dfs_max]`, or when no bucket the range covers is set. Bucket assignment is `dfs * 1024 / dfs_domain` (`crawl_rgix_bucket_of`), shared by writer and reader.
+
+Both sketches are stored because `dir_id` follows crawl arrival order and correlates with DFS position only loosely, which makes the plain interval very wide in practice. Measured on a 21726-directory, 1.13M-record capture with 129 row groups, for a single leaf directory the interval kept 73 groups and the bitmap kept 2; for one mid-level directory, 74 against 5. Neither test implies the other — a bucket can be lit by a directory just outside the range, and an interval can straddle a range it never actually visits — so keeping only the groups both accept prunes more than either alone (92 and 82 individually, 76 together, on a large subtree). Both are conservative supersets, so the intersection is still a superset and pruning cannot drop a record the scan should have seen.
+
+`flags & CRAWL_RGIX_GRP_UNKNOWN` marks a group whose sketch is incomplete because a record named a `dir_id` the catalog does not have. Such a group proves nothing and is always kept. `dfs_min > dfs_max` means the group had no in-catalog parents at all.
+
+`group_bytes` may span a run of adjacent groups when the writer stepped over empty ones; both ends are always row-group boundaries, which is all a chunked reader requires, so a survivor list turns straight into scan chunks.
 
 ## Operational notes
 

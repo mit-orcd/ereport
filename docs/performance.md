@@ -25,6 +25,7 @@ See [tools.md#edelete](tools.md#edelete) for the unlink-contention tuning note (
 
 - Parallel crawl threads feed a task queue; multiple threads traverse the tree concurrently while respecting directory boundaries.
 - Parallel stat pool (when `ECRAWL_STAT_THREADS` > 0, default 8) — Each crawl worker does one `readdir` per open directory; trusted non-directory names are batched to stat workers (see [tools.md#directory-scanning-and-stat-workers](tools.md#directory-scanning-and-stat-workers)). Set `ECRAWL_STAT_THREADS=0` for legacy inline-only `fstatat` (often faster on very low-latency metadata).
+- Stat workers can also take crawl tasks when their own queue is empty (`ECRAWL_STAT_HELPS_CRAWL`, default 0), lifting the fixed split between the two pools. Off because it measured no faster — see [letting stat workers also crawl](#rejected-letting-stat-workers-also-crawl), which is also where the stat pool's zero-batch case on small-directory trees is documented.
 - Uid-sharded output — Records hash to many `uid_shard_*.bin` files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
 - Separate writer threads — Crawl threads batch work to bounded writer queues; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record. `ECRAWL_WRITER_QUEUE_BATCHES` caps pending record batches per writer (default 64, range 4…4096).
 - Checkpoint rows during write — Sidecars capture sparse offsets so later tools can parallel-read without rescanning from zero.
@@ -57,6 +58,67 @@ So the columnar encode is a few percent, and the **catalog** is the larger consu
 
 - A crawl run by a normal user produces **one** uid shard, because records shard by uid. The per-shard column buffers only multiply on a multi-uid tree (the benchmark tree is generated as root with random owners), so a single-uid reproduction cannot exercise writer memory pressure at all. Peak RSS on the real runs was 499 MB for v8 against 354 MB for v6.
 - Rewriting the writer to stage records row-major and transpose them at flush was tried and measured: instructions moved -0.2%, cycles +2.8%, `dTLB-load-misses` -25%, capture size +0.06%. No wall-clock win on a single-shard tree, so it was not kept. Append into fourteen parallel column arrays is already prefetch-friendly when few shards are open; the trade only plausibly pays with hundreds of shards live, which needs a root-generated multi-uid tree to demonstrate.
+
+### Rejected: letting stat workers also crawl
+
+`ecrawl` runs three fixed thread pools and picks the crawl/stat split before anything is known about the tree, so it seemed likely that some tree shape would leave one pool starved. One does, and dramatically. From a 1.3M-entry `neutral_flat` run (782K directories, two or three entries each) with `ECRAWL_STAT_THREADS` at its default of 8:
+
+```
+stat_batches_enqueued=0
+stat_batches_tail_inlined=520000
+```
+
+The stat pool receives **zero** batches for the entire run. Every batch is an end-of-directory batch below `ECRAWL_STAT_BATCH_MIN_OFFLOAD` (32), so it is deliberately statted on the crawl thread instead of paying a queue round-trip for three names — the right call per batch, but the consequence is that eight threads exist and are handed nothing while crawl threads do 520,000 inline stat batches.
+
+Letting an idle stat worker take a crawl task fixes the imbalance and changes no wall-clock time. Six fixtures on the extreme tree, seven reps per cell **interleaved** off/off/on rather than grouped, with **two cells declared identically as an A/A control**:
+
+| fixture | off | off (A/A) | helpers on | A/A gap | apparent gain |
+|---|---:|---:|---:|---:|---:|
+| mega_dir1 | 10.206 | 10.625 | 10.356 | 4.1% | −1.5% |
+| mega_dir2 | 3.647 | 3.597 | 3.571 | 1.4% | 2.1% |
+| single_huge_dir | 2.056 | 1.945 | 2.042 | 5.4% | 0.7% |
+| neutral_flat | 0.787 | 0.701 | 0.749 | 10.9% | 4.8% |
+| wide_shallow | 0.501 | 0.539 | 0.515 | 7.6% | −2.8% |
+| depth_slash_profile | 0.128 | 0.123 | 0.129 | 3.9% | −0.8% |
+
+Every difference is inside the control gap, and the raw reps overlap almost completely — on `neutral_flat` the two identical configs span 0.668–0.815 and 0.624–0.816, wider than any gap to the helpers-on cell. Helpers were doing real work while this happened: 2,146 crawl tasks taken on `neutral_flat`, 47,836 on `mega_dir2`.
+
+An earlier run on the medium tree did show 18.6% and 11.2% gains against A/A gaps of 4.3% and 3.6%, and it was wrong: that harness ran all reps of one config before moving to the next, so config differences absorbed any drift in machine state. Grouped reps are the same trap the stat-thread sweep below documents. Interleaving reversed the answer, which is worth remembering — a harness bug here looks exactly like a win.
+
+The framing was the real mistake. "Eight idle threads" is not wasted capacity when cores are spare: a thread parked in `pthread_cond_wait` costs nothing, and the run is bound by I/O and by the pending-batch drain, neither of which more crawlers relieve. Thread idleness only becomes a cost when runnable threads exceed cores.
+
+The code is kept behind `ECRAWL_STAT_HELPS_CRAWL`, **default 0**, for the case these measurements cannot reach: crawl threads configured at or below the core count while the stat pool sits idle, where the extra crawlers would be real parallelism rather than surplus. It is verified rather than merely present — `entries`, `dirs`, `total_bytes`, and `errors` identical across configs on eight fixtures in write mode; the recorded path set, read back out of the capture with `ereport_index --make` plus `--search`, byte-identical between configs on five directory-heavy fixtures (1,302,401 paths on `neutral_flat` with 378 helper tasks); and `scripts/test/test.sh` green with the switch both ways.
+
+Two details make it safe to turn on:
+
+- A helper stats **inline** while crawling (`tls_stat_inline_only`) rather than queueing batches. If every stat worker were crawling and waiting for the pool to drain its own batches, those batches would have no one left to run them. Statting inline makes a helper independent of the pool it came from.
+- `should_donate_work` derives idle capacity from `crawl_threads_started`. Helpers count in `g_active_workers`, so without counting them in the denominator too, `idle` goes negative and the conservative all-busy branch is selected permanently — throttling donation exactly when there are *more* threads available to consume it.
+
+Shutdown is the risk worth naming, since quiescence is "seeding done, queue empty, nobody active". A helper takes tasks through the same `g_active_workers` increment as a crawl worker, so the queue cannot latch closed while one holds work, and stat batches are always drained inside the directory that created them, so nothing can push after the last thread goes idle. `discovered_dir_batch_flush` already reports a push to a closed queue as an error instead of dropping it, so a flaw in that reasoning surfaces as a visible error rather than a missing subtree.
+
+One trap for anyone re-testing this: comparing `ecrawl --no-stat | sort` against `find | sort` is the obvious path-set check and it cannot see this change at all, because `--no-stat` forces `ECRAWL_STAT_THREADS` to 0 — no stat pool, no helpers.
+
+### Rejected: statting inline when the stat queue is full
+
+The other direction of the same imbalance looked just as plausible: a crawl thread reading a megadirectory should be able to outrun the stat pool, fill the bounded queue, and block in `stat_batch_enqueue` waiting for a slot. Since inode reads cost roughly 6x a dirent read (see the [`BULKSTAT` probe](#rejected-reading-inodes-with-xfs_ioc_bulkstat) below), a single reader ought to saturate several statters easily.
+
+It never happens. Sweeping the stat pool from 1 to 16 threads over `mega_dir1` — 12,000,001 files in one directory, so exactly one crawl thread feeding the whole pool — `wait_stat_enqueue` is **0** in every cell, and the queue never reaches its 64 slots even when a single stat thread stretches the run past 10s:
+
+| stat threads | sec | `stat_queue_depth_max` | `wait_stat_enqueue` |
+|---|---:|---:|---:|
+| 1 | 10.54 | 59 | 0 |
+| 2 | 6.39 | 54 | 0 |
+| 4 | 4.87 | 51 | 0 |
+| 8 | 5.88 | 48 | 0 |
+| 16 | 5.04 | 48 | 0 |
+
+The reason is `STAT_PENDING_DRAIN_EVERY_READDIRS`: every 65536 dirents, a crawl thread waits for all of its outstanding batches. At the default batch size of 1024 names that is 64 batches — exactly `ECRAWL_STAT_QUEUE_BATCHES`. The reader is stopped by its own drain before the queue it feeds can fill, so the blocking enqueue is structurally unreachable rather than merely rare, and a change that avoids blocking there has nothing to avoid. Across eight fixtures the inline path fired 11 times in total.
+
+The code is kept behind `ECRAWL_STAT_FULL_INLINE`, **default 0**, for cold or remote metadata, where a stat costs far more than a dirent read and the queue plausibly does fill. Turn it on only with `wait_stat_enqueue > 0` as evidence.
+
+The sweep does expose a real bottleneck, just not that one: the drain is a *barrier* rather than backpressure, because the reader waits for all 64 batches to finish instead of enough of them to make room, then refills from empty. Hence the plateau above — one reader on one directory sees no benefit past 4 stat threads, and 16 threads is no better than 2. Compare `single_huge_dir`, the same 12M entries spread over 2,931 directories so several crawl threads read at once, which goes from 10.81s to 1.13s across the same sweep. Draining only as far as the next free slot is the more promising thing to attack next.
+
+Caveat on all of the above: these runs are warm-cache on node-local RAID, because `drop_caches` needs root. Warm cache is the regime where coordination overhead is visible and storage latency is not, which is what makes it the right place to measure a *scheduling* change — and the wrong place to conclude anything about cold, high-latency metadata.
 
 ### Rejected: widening the stat pool with core count
 
@@ -130,11 +192,35 @@ Notes on the two that need them:
 
 Two items from the same round were measured and **not** taken: the stat-pool width and stat ordering defaults, both above.
 
+### Measured: `ecrawl_query`'s per-directory cost
+
+Round two's profiles showed `ecrawl_query` paying by the directory, not by the record: `single_huge_dir` did 2,000,490 records over 491 parents in 0.02 s, while `neutral_flat` did 1,302,401 records over 782,402 parents in 0.36 s. That is ~16 ns per record against ~1.9 us per distinct directory, and the difference was one string-keyed hash map — `parent_map_get_or_add` at 26% self time, `pthread_mutex_lock` at 22%.
+
+The map was there to merge the same directory across shards. Inside a single shard it buys nothing, because `dir_id` is already a bijection with the path (`ecrawl.c` hands ids out one per directory as it meets them), and `neutral_flat` is one shard. So the work went in two tiers: first six edits that only remove work, then a restructure that keys the scan on `dir_id` and defers paths.
+
+| fixture | tier 1 | tier 2 on top | total | A/A control |
+|---|---:|---:|---:|---:|
+| `neutral_flat` (782 K parents, 1 shard) | **−41.9%** | **−17.6%** | **−52.1%** | 0.0% |
+| `single_huge_dir` (2 M records, 491 parents) | **−50.6%** | −4.9% | **−53.0%** | 7.3% |
+| 1000-shard corpus | **−25.6%** | +2.4% | **−23.8%** | 4.1% |
+| `wide_shallow` | **−38.3%** | −3.4% | **−40.4%** | 8.5% |
+| `deep_skinny_chain` | **−16.7%** | −2.9% | **−19.0%** | 2.4% |
+
+One node, 32 threads, five interleaved reps of ten runs each, with the baseline declared a second time as an A/A control. Only `neutral_flat` clears that control on the tier 2 column, which is the expected shape: tier 2 removes per-directory cost, and `neutral_flat` is the only corpus here that is dominated by distinct directories. On the others tier 2 is worth roughly nothing on its own and the total is tier 1's. Every build printed a byte-identical report on every fixture and every rep.
+
+**Tier 1, six edits that only remove work.** The shape pass loaded `CRAWL_CAT_SUBTREE` — nine `uint64_t` arrays and a byte array, ~73 B per directory — and read none of it, so it now asks for it only when `--subtree` will actually use it. It projected the name bytes column and used them for one `memchr` looking for a slash that `crawl_bin_format.h` promises is not there; dropping the column turns the largest column on disk into part of a coalesced skip seek and removed the 5.5% `__memmove_avx512` that was copying it. The path length that `crawl_bin_catalog_dir_path_len` already computed was thrown away and re-derived with `strlen`. The hash was byte-at-a-time FNV-1a over an ~80-byte path, an 80-long dependent multiply chain per insert. The bucket array was a fixed 262,144 entries, which at 782 K parents is load factor 3.0 and three random arena chases per lookup; it is now sized from the record count. And the counter bump was one atomic per record on a line every worker shares, where records arrive in runs sharing a parent — counting the run in plain locals and flushing on change is what `single_huge_dir` and `wide_shallow` were paying for.
+
+**Tier 2, `dir_id` on the hot path.** The scan now bumps `counts[parent_dir_id]` in a dense per-shard array and touches no hash table, no lock and no string: after this, `pthread_mutex_lock` is gone from the profile entirely. Paths are built exactly once, in a fold that walks a shard's counters in ascending `dir_id` after the last chunk of it has been scanned. Ascending order is what makes that cheap — a parent always has a lower id than its children, so a path is its parent's path plus one component, and caching the last parent's prefix turns a run of siblings into one chain walk instead of one per directory. A single-shard corpus skips the map entirely, since its `dir_id` is already the key and every node the fold produces is unique by construction.
+
+Two things this round had to get right rather than improve on. `crawl_bin_catalog_dir_path_len` silently drops the components it did not reach past a 128-component limit, so "parent's path plus a name" gives a 129-component path where the direct walk gives 128 — `deep_skinny_chain` is exactly that shape, and the fold now defers to the walk past the limit rather than print a better answer than the baseline.
+
+The other was the fold's own scheduling, and it cost the thousand-shard corpus its whole tier 1 win: as a phase of its own it is a serial tail after work that tier 1 had spread across the scan, measuring **+29.4%** against tier 1 where the shipped version measures +2.4%. A shard small enough to fold in one pass is now folded by the worker that finishes its last chunk, so that work is overlapped again and the catalog goes back to the allocator immediately rather than every catalog being held until the end. Bigger shards still wait for the post-scan fold, which can split one of them across threads — which is what `neutral_flat`, a single 782 K-directory shard, needs.
+
 ### Rejected: catalog slot defaulting, and a cap on the fpcache buffer
 
-The 2026-08-03 `ecrawl_analyze` profile put `catalog_ensure_slots` at 5.97% self time on `neutral_flat` and `crawl_fpcache_fopen` at ~31% inclusive on a many-shard capture. Neither converted into recoverable time. Both attempts are recorded here because the instruction counts show precisely *why*, and because the same reasoning would otherwise be tried again.
+The 2026-08-03 `ecrawl_query` profile put `catalog_ensure_slots` at 5.97% self time on `neutral_flat` and `crawl_fpcache_fopen` at ~31% inclusive on a many-shard capture. Neither converted into recoverable time. Both attempts are recorded here because the instruction counts show precisely *why*, and because the same reasoning would otherwise be tried again.
 
-Setup for every number below: one exclusive node (`node5103`, `mit_preemptable`, AMD EPYC 9654, Rocky 8.10), 32 threads, the `r6/binroot` v8 captures on NFS, page cache warmed once per build, 31 alternating reps, default allocator. The baseline is the working tree with *only* the change under test reversed — not `HEAD`, because the tree already carried unrelated edits to `crawl_bin_block.c`, `ecrawl.c` and `ecrawl_analyze.c` that an A/B against `HEAD` would have credited here. `diff -r` confirmed the two trees differed in one file. "Noise" means the gap did not exceed twice the standard error of the difference; with 31 reps that threshold is about 1.2% of task-clock, so an effect larger than that would have been visible.
+Setup for every number below: one exclusive node (`node5103`, `mit_preemptable`, AMD EPYC 9654, Rocky 8.10), 32 threads, the `r6/binroot` v8 captures on NFS, page cache warmed once per build, 31 alternating reps, default allocator. The baseline is the working tree with *only* the change under test reversed — not `HEAD`, because the tree already carried unrelated edits to `crawl_bin_block.c`, `ecrawl.c` and `ecrawl_query.c` that an A/B against `HEAD` would have credited here. `diff -r` confirmed the two trees differed in one file. "Noise" means the gap did not exceed twice the standard error of the difference; with 31 reps that threshold is about 1.2% of task-clock, so an effect larger than that would have been visible.
 
 `catalog_ensure_slots` defaulted 18 arrays one `dir_id` at a time and `catalog_store_entry` then overwrote all 18, so on a dense shard every one of those stores is dead. Two ways to stop paying for them were measured on `neutral_flat` (782,402 parents, one shard):
 
@@ -149,7 +235,7 @@ The first attempt bulk-defaulted slots `1..n` up front, which both loaders can d
 
 On `wide_shallow` and `single_huge_dir` the instruction delta is under 13,000 and every metric is noise, which is the expected shape — 491 parents have no defaulting worth skipping.
 
-**The fpcache buffer cap is rejected outright.** `ecrawl_analyze` requests a 1 MiB `setvbuf` buffer on every real open; capping it at the file's own size was expected to cut resident memory on a many-shard capture. Measured on 1,000 synthetic 12 KB shards it changed nothing: instructions +0.01%, task-clock +1.01%, page-faults +0.14%, peak RSS +3.76%, all noise. The premise was wrong twice over. A 1 MiB buffer that stdio only fills to 12 KB costs 12 KB of resident memory rather than 1 MiB, because the untouched pages never become resident — peak RSS for that entire run is ~10 MB. And the `munmap` TLB-shootdown cost that motivated it cannot arise, because `tune_allocator()` raises glibc's `mmap` threshold from 128 KiB to 32 MiB and nothing in the tree sets `EREPORT_ALLOC_TUNE=0`.
+**The fpcache buffer cap is rejected outright.** `ecrawl_query` requests a 1 MiB `setvbuf` buffer on every real open; capping it at the file's own size was expected to cut resident memory on a many-shard capture. Measured on 1,000 synthetic 12 KB shards it changed nothing: instructions +0.01%, task-clock +1.01%, page-faults +0.14%, peak RSS +3.76%, all noise. The premise was wrong twice over. A 1 MiB buffer that stdio only fills to 12 KB costs 12 KB of resident memory rather than 1 MiB, because the untouched pages never become resident — peak RSS for that entire run is ~10 MB. And the `munmap` TLB-shootdown cost that motivated it cannot arise, because `tune_allocator()` raises glibc's `mmap` threshold from 128 KiB to 32 MiB and nothing in the tree sets `EREPORT_ALLOC_TUNE=0`.
 
 **Replicated on a second machine, against the repo's own captures.** Both changes were rebuilt from a frozen pair of trees and re-measured on `node5500` (`mit_testing`, Intel Xeon Platinum 8570, Rocky 8.10, glibc 2.28, gcc 12.2), 32 threads, the `r6/binroot` captures copied to node-local XFS, 11 alternating reps for wall clock and 7 for `perf stat` and peak RSS, default allocator. `diff -r` over the two source trees, before either was built, listed exactly four files: `crawl_fpcache.c`, `crawl_fpcache.h`, `crawl_bin_catalog.c`, `crawl_bin_catalog.h` — the pre-existing `CRAWL_BIN_CATALOG_MAX_PATH_PARTS` work sits in both copies unchanged. Every corpus printed a byte-identical report from both builds.
 
@@ -157,11 +243,35 @@ On `neutral_flat` the bulk-`memset` form takes instructions from 982,238,454 to 
 
 The buffer cap can only bind on a shard smaller than the 1 MiB request, and of the captures here only `deep_skinny_chain` (30,570 B) is; `ereport_badge_fixtures` is 2.7 MiB and `neutral_flat` 120 MiB, so on those the cap is a no-op by construction and both measure 0.0%. On 1,019 links of the small shard the cap takes the buffer to 32 KiB and still changes nothing: wall +0.6%, instructions −0.2%, page-faults −0.3%, peak RSS 8,480 → 8,840 KiB, every one of them inside a 9–13% spread. Forcing the case the cap was meant to foreclose — `EREPORT_ALLOC_TUNE=0`, so glibc's 128 KiB threshold is back and a 1 MiB buffer really is its own `mmap` — moved it −3.0% against a 9.5% spread, which is still nothing. A 1,019-link badge corpus says where the time in a many-shard run actually goes: 66% `crawl_bin_block_reader_next` and 26% `analyze_scan_fp_until`, both record decode, with no `open`-side symbol above 0.15%. Those links share one inode on local disk, which is the cheapest `open` there is, so this bounds the buffer question rather than the per-shard `open` cost on a real multi-user capture.
 
-What survives from this round is `test_crawl_catalog`, 390 checks wired into `make check`. It drives synthetic catalog blobs through both the mapped and the stdio loader and asserts that a slot no entry ever claims still reads as unwritten — in particular that `imm_child_min_eff_time` stays `UINT64_MAX` instead of becoming the epoch, which is the one default that is not zero and the one failure that would be silent rather than a crash. It covers sparse ids, ids arriving out of order, ids past the entry count, all four `CRAWL_CAT_*` gate combinations, and a reused catalog struct, and it passes identically on the baseline and on both attempts. `ecrawl_analyze`'s own key=value output was byte-identical across all three fixtures as well.
+What survives from this round is `test_crawl_catalog`, 390 checks wired into `make check`. It drives synthetic catalog blobs through both the mapped and the stdio loader and asserts that a slot no entry ever claims still reads as unwritten — in particular that `imm_child_min_eff_time` stays `UINT64_MAX` instead of becoming the epoch, which is the one default that is not zero and the one failure that would be silent rather than a crash. It covers sparse ids, ids arriving out of order, ids past the entry count, all four `CRAWL_CAT_*` gate combinations, and a reused catalog struct, and it passes identically on the baseline and on both attempts. `ecrawl_query`'s own key=value output was byte-identical across all three fixtures as well.
+
+### Rejected: reading the catalog's `imm_child_*` rollups instead of rebuilding them
+
+`ecrawl` already writes per-directory child rollups into every shard catalog — `imm_child_files`, `imm_child_dirs`, `imm_child_symlinks`, `imm_child_bytes`, `imm_child_min/max_eff_time`, `imm_child_ctime_led_count` — and `ereport` under `--bucket-details` builds what looks like the same thing from scratch: `fanout_parent_stat_accumulate` hashes every matched record's reconstructed parent path and accumulates the same counts. Reading columns that are already on disk instead of recomputing them from 9.75M records is the obvious trade. It is exact in one case and worth nothing in that case, and it cannot be done at all in the others.
+
+**Where it is exact.** The rollups are unconditional: `ecrawl` counts every child of a directory, with no notion of uid, of a subtree, or of which time basis the report will pick. So they answer `ereport`'s question only for an all-users run with no `--subtree` on the effective-time basis. Any uid filter, any `--subtree`, or `--time-basis mtime`/`atime` makes the on-disk number a different quantity than the one the table prints, so those runs keep the record-side accumulation regardless. That is most runs.
+
+**What it measures in the case where it is legal.** Three fixtures on `node5103`, seven interleaved reps per cell, four builds from the same tree differing only in which side computes the numbers. `fanoutonly` deletes the record-side accumulation and leaves the table wrong (a correctness ceiling, not a candidate); `statsonly` deletes it and drops the table; `catfanout` deletes it and rebuilds the table from the catalog, which is the actual proposal:
+
+| fixture | base wall | catfanout | delta | base spread |
+|---|---:|---:|---:|---:|
+| neutral_flat (782,402 parents) | 2.189 | 2.159 | **−1.4%** | 6.3% |
+| wide_shallow | 0.317 | 0.315 | −0.6% | 5.1% |
+| single_huge_dir | 0.939 | 0.929 | −1.0% | 7.6% |
+
+The most directory-heavy fixture in the set moves 1.4% inside a 6.3% run-to-run spread; the others do not move at all. Peak RSS goes the wrong way on `neutral_flat`, 1,182 MB to 1,188 MB. The reports are byte-identical (`catfanout: IDENTICAL` on all three fixtures, against `DIFFERS` for the two ceiling builds, which is what confirms the arithmetic agrees).
+
+The ceiling explains the outcome. Deleting the record-side map outright is worth **−19.0%** on `neutral_flat` — `fini_dirmaps_dense` alone goes 0.438 s to 0.276 s — so there is real time there. Rebuilding the same table from 782 K catalog rows costs all of it back, because the Dense-parents table is keyed by *path* and the catalog is keyed by `dir_id`: recovering the key means walking each directory's parent chain and materializing its path, which is the same work the record side was doing, just moved and no longer amortized over the runs of consecutive same-parent records that make the record-side version cheap.
+
+**Two structural blockers, either of which is fatal on its own.** `shard_cat_finalize` (`ecrawl.c:2920`) rolls `subtree_files` / `subtree_dirs` / `subtree_symlinks` *up the tree in place*, so what reaches disk is the subtree total, not the immediate per-type breakdown the Dense-parents table prints. The immediate counts exist only in memory during the crawl. `fanout_parent_stat_accumulate` therefore cannot be removed at all, only duplicated. And `ereport` frees each shard catalog the moment its parse workers join, precisely to bound peak RSS; reading rollups after the scan means holding every catalog to the end of the run, which is the memory regression the early free was added to prevent.
+
+One column is dead on arrival regardless: `imm_child_ctime_led_count` has no consumer even in principle. `ereport` tracks ctime-led records per age-by-size cell, never per directory, so there is no report in which a per-directory ctime-led count is the number being printed.
+
+Raw data: `~/orcd/scratch/ereport-automated-testing/results/ereport-rollups3-19608592` (`SUMMARY.txt`, `PARITY.txt`, `runs.csv`), with the two earlier rounds alongside it.
 
 ## Synthetic adversarial trees
 
-`scripts/fixtures/generate-ecrawl-adversarial-tree.sh` builds stress layouts for `ecrawl` (flat megadir, optional depth chain, wide fan-out, optional `ecrawl_analyze` depth slices, optional ereport badge fixtures). Choose scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).
+`scripts/fixtures/generate-ecrawl-adversarial-tree.sh` builds stress layouts for `ecrawl` (flat megadir, optional depth chain, wide fan-out, optional `ecrawl_query` depth slices, optional ereport badge fixtures). Choose scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).
 
 `SYNTH_PROFILE=extreme` layers two extra megadirs on top of the heavy-class baseline:
 
@@ -190,7 +300,7 @@ They live in [`scripts/profile/`](../scripts/profile/) and share one set of craw
 - `scripts/profile/ecrawl-fixtures.sh <synth-root> <bin-root> [results-dir]` — runs `ecrawl` against each fixture in `--no-write` and write modes, isolating crawl/`readdir`/donation cost vs. uid-shard writer churn. The write-mode pass keeps each fixture's shards at `<bin-root>/<fixture>/bin/` for the consumers below (needs `DO_WRITE=1`, the default). Knobs: `DO_NOWRITE` / `DO_WRITE` / `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, and any inherited `ECRAWL_*` (e.g. `ECRAWL_MAX_OPEN_SHARDS`).
 - `scripts/profile/ereport-fixtures.sh <bin-root> [results-dir]` — profiles `ereport` (all-users, `--bucket-details 4`) over `<bin-root>/<fixture>/bin/`, writing HTML to `<bin-root>/<fixture>/all_users/`. Knobs: `BUCKET_DETAILS`, `EREPORT_THREADS`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, `KEEP_REPORTS`.
 - `scripts/profile/ereport_index-fixtures.sh <bin-root> [results-dir]` — profiles `ereport_index --make` (all-users) over `<bin-root>/<fixture>/bin/`, writing the index to `<bin-root>/<fixture>/index/`. The summary splits time into `chunk_prep` / `index_phase` / `merge_phase` and tabulates the `make_f{open,read,write}` I/O counters that usually drive index-build cost. Knobs: `EREPORT_INDEX_THREADS`, `EREPORT_INDEX_TRIGRAM_THREADS`, `RAISE_ULIMIT`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`, `KEEP_INDEX`.
-- `scripts/profile/ecrawl_analyze-fixtures.sh <bin-root> [results-dir]` — profiles the read-only `ecrawl_analyze` directory-shape stats over `<bin-root>/<fixture>/bin/` (produces no kept output). Knobs: `ECRAWL_ANALYZE_THREADS`, `ANALYZE_TOP`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`.
+- `scripts/profile/ecrawl_query-fixtures.sh <bin-root> [results-dir]` — profiles the read-only `ecrawl_query` directory-shape stats over `<bin-root>/<fixture>/bin/` (produces no kept output). Knobs: `ECRAWL_QUERY_THREADS`, `ANALYZE_TOP`, `DO_STRACE` / `DO_PERF` / `DO_SCHED`, `REPS`, `FIXTURES`, `SCHED_FIXTURES`.
 
 ```bash
 # 1) ecrawl (producer): profile every fixture, both modes, with perf — keeps bins under <bin-root>
@@ -199,7 +309,7 @@ DO_PERF=1 ./scripts/profile/ecrawl-fixtures.sh /tmp/ecrawl-adversarial /data1/ec
 # 2) consumers: reuse the same <bin-root>; no recrawl
 ./scripts/profile/ereport-fixtures.sh        /data1/ecrawl-bins
 ./scripts/profile/ereport_index-fixtures.sh  /data1/ecrawl-bins
-./scripts/profile/ecrawl_analyze-fixtures.sh /data1/ecrawl-bins
+./scripts/profile/ecrawl_query-fixtures.sh /data1/ecrawl-bins
 ```
 
 Each run prints the results dir and a `…tar.gz` to upload; full options are in each script's comment header. For `perf`, run as root or lower `kernel.perf_event_paranoid`.
@@ -214,7 +324,7 @@ perf report -i perf.data --stdio --no-children --sort comm,pid > report.bythread
 
 ### Indexer comparison (Robinhood / GUFI / XDU)
 
-To compare open-source file indexers against the ecrawl suite using the same paper methodology (index time/size per 1M files, queries Q1–Q5), use [`scripts/compare-indexers/`](../scripts/compare-indexers/README.md). It reuses the adversarial tree generator and reports a `SUMMARY_TABLE.txt`. For fixture-level `perf`/`strace` on ecrawl alone, keep using `scripts/profile/ecrawl-fixtures.sh` below.
+To compare open-source file indexers against the ecrawl suite using the same paper methodology (build time and index size, queries Q1–Q6 cold and hot), use [`scripts/compare-indexers/`](../scripts/compare-indexers/README.md). It reuses the adversarial tree generator and reports a `SUMMARY_TABLE.txt`. For fixture-level `perf`/`strace` on ecrawl alone, keep using `scripts/profile/ecrawl-fixtures.sh` below.
 
 ### Test- and data-driven development
 

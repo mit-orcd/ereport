@@ -18,6 +18,7 @@
 #   TOOLS_INDEX=...      default: ecrawl find du (+ fd/dua/gufi/xdu if installed)
 #   TOOLS_QUERY=...      explicit query tool list (disables auto-detection)
 #   REPS=1               keep smoke fast (queries use same REPS)
+#   CACHE_MODES="cold hot"  passes per repetition; one name for a single pass
 #   DROP_CACHES=0        1: drop page cache before each timed command (root)
 #   DROP_CACHES_SCOPE=all        all | first-rep
 #   DROP_DB_CACHE=0      1: also restart MariaDB when dropping caches
@@ -46,7 +47,7 @@ SKIP_PREPARE=${SKIP_PREPARE:-0}
 SKIP_CORRECTNESS=${SKIP_CORRECTNESS:-0}
 SEED_QUERY_DIR=${SEED_QUERY_DIR:-query_seeds}
 REPS=${REPS:-1}
-export REPS DROP_CACHES DROP_CACHES_SCOPE DROP_DB_CACHE
+export REPS DROP_CACHES DROP_CACHES_SCOPE DROP_DB_CACHE CACHE_MODES
 
 echo "==> results: $RESULTS_ROOT"
 

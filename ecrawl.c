@@ -11,17 +11,20 @@
  *   - Worker threads consume queued batches of directory work.
  *   - Workers traverse directories iteratively with a local stack.
  *   - Workers may donate batches of accumulated subdirectories back to the global queue.
- *   - Crawl workers only crawl and enqueue record batches.
  *   - Parallel stat pool (ECRAWL_STAT_THREADS, default 8; set 0 to disable): one readdir hop per directory while
  *     crawl workers batch only direntries whose d_type is a trusted non-directory (DT_REG/LNK/FIFO/SOCK/CHR/BLK)
  *     and stat threads run fstatat concurrently (bounded queue + chunk size). Per directory, the first N such
- *     entries are handled inline on the crawl thread (ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS, default 512; 0 = batch
- *     from the first entry). Trusted DT_DIR children are fstatat'd once under the parent dirfd (st cached on
+ *     entries are handled inline on the crawl thread (ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS, default 0, i.e.
+ *     batch from the first entry). Trusted DT_DIR children are fstatat'd once under the parent dirfd (st cached on
  *     the work item so pop skips lstat), pushed on the crawl thread's local stack, and spilled to the global
  *     queue when the stack grows large or idle workers need work.
  *     DT_DIR and DT_UNKNOWN are never handed to the parallel stat batch pool;
  *     if fstatat still finds a directory inside a batch (rare race / wrong d_type), ecrawl warns and does not crawl it.
  *     Default ECRAWL_STAT_RANDOM_QUEUE=1 dequeues pending batches in pseudo-random order (set 0 for FIFO).
+ *   - Optionally the two pools are not a fixed partition: a stat worker with an empty queue can take
+ *     crawl tasks (ECRAWL_STAT_HELPS_CRAWL, default 0 -- measured as no faster; see docs/performance.md).
+ *     A helper stats inline while crawling, so it never waits on the pool it came from -- which is what
+ *     keeps mutual helping from deadlocking. See tls_stat_inline_only.
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output; each batch is sorted by
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
@@ -164,6 +167,27 @@
  * sync to stat workers for sparse trees). Mid-directory flushes at stat_batch_entries always offload.
  * 0 = always enqueue tail batches to the stat pool. Env: ECRAWL_STAT_BATCH_MIN_OFFLOAD. */
 #define DEFAULT_STAT_BATCH_MIN_OFFLOAD 32U
+/* When the stat queue is full, stat the batch on the crawl thread instead of waiting for a free slot.
+ * Off by default because measurement could not find a case where the queue fills: on warm local disk it
+ * peaked at 50 of 64 batches even with a single stat thread on a 12M-entry directory, because reading
+ * dirents costs about as much as statting them, so producer and consumer rates track each other.
+ * It is kept for cold or remote storage, where a stat costs far more than a dirent read and the queue
+ * plausibly does fill -- turn it on only with wait_stat_enqueue > 0 as evidence.
+ * Env: ECRAWL_STAT_FULL_INLINE. */
+#define DEFAULT_STAT_FULL_INLINE 0
+/* Let stat workers take crawl tasks when their own queue is empty. On trees of small directories the
+ * stat pool really does receive zero batches (crawl threads stat those inline), so this looked like eight
+ * wasted threads -- but off by default, because it buys nothing measurable: with spare cores, a thread
+ * parked in pthread_cond_wait costs nothing, and adding crawlers does not move a run that is bound by
+ * I/O and by the pending-batch drain. Interleaved A/B on six fixtures put every difference inside the
+ * A/A control gap. Kept for the case the measurements cannot cover -- crawl threads configured at or
+ * below the core count while the stat pool sits idle. See docs/performance.md.
+ * Env: ECRAWL_STAT_HELPS_CRAWL. */
+#define DEFAULT_STAT_HELPS_CRAWL 0
+/* How long a stat worker that could also crawl sleeps on an empty stat queue before looking at the
+ * crawl queue again. Nothing wakes it when a crawl task is pushed, so this bounds that blind spot;
+ * short enough not to matter, long enough not to spin. */
+#define STAT_HELPER_POLL_NS 1000000L
 #define DISK_SPACE_CHECK_INTERVAL_SEC 30
 #define DISK_MIN_FREE_BYTES ((uint64_t)(10ULL * 1024 * 1024 * 1024))
 
@@ -599,6 +623,9 @@ static atomic_ullong g_stat_batches_enqueued   = 0;
 static atomic_ullong g_stat_batches_completed  = 0;
 static atomic_ullong g_stat_batches_dup_fallback = 0;
 static atomic_ullong g_stat_batches_tail_inlined = 0;
+static atomic_ullong g_stat_batches_self_processed = 0;
+static atomic_ullong g_stat_batches_helper_inlined = 0;
+static atomic_ullong g_stat_crawl_tasks_helped = 0;
 static atomic_ullong g_wait_stat_pop      = 0;
 static atomic_ullong g_wait_stat_enqueue  = 0;
 static atomic_ullong g_stat_queue_depth_max = 0;
@@ -617,6 +644,17 @@ static atomic_ullong g_task_queue_pushes    = 0;
 static atomic_ullong g_queue_lock_waits     = 0;
 static atomic_ullong g_donate_calls         = 0;
 static atomic_ullong g_writer_queue_wait_ns = 0;
+
+/* Wall time slept, not wakeup counts: the counters above cannot distinguish a thread that woke a million
+ * times from one that lost half the run to a single wait. Summed across a pool's threads, so the ceiling
+ * is nthreads * elapsed and the ratio is that pool's idle fraction (see print_verbose_full_stats).
+ *   crawl_idle_ns       - crawl workers with no task to pop (pool wider than the tree can feed)
+ *   stat_idle_ns        - stat workers with no batch to take (crawl threads are stat'ing inline instead)
+ *   stat_enqueue_block_ns - crawl workers stalled on a full stat queue (the stat pool is the bottleneck)
+ * The last two moving in opposite directions is the whole reason the split cannot be picked up front. */
+static atomic_ullong g_crawl_idle_ns          = 0;
+static atomic_ullong g_stat_idle_ns           = 0;
+static atomic_ullong g_stat_enqueue_block_ns  = 0;
 
 static atomic_ullong g_io_lstat_calls      = 0;
 static atomic_ullong g_io_stat_calls       = 0;
@@ -652,6 +690,14 @@ static _Thread_local uint32_t tls_wait_stat_pop_pending;
 static _Thread_local uint32_t tls_wait_stat_enqueue_pending;
 static _Thread_local uint32_t tls_donate_calls_pending;
 static _Thread_local uint64_t tls_writer_queue_wait_ns_pending;
+/* Set while a stat worker is running a crawl task. Such a thread must stat everything itself rather
+ * than queue batches: if every stat worker were crawling and waiting on the pool to drain its own
+ * batches, the batches would have nobody left to run them. Statting inline keeps a helper's progress
+ * independent of the pool it came from, which is what makes the helping deadlock-free. */
+static _Thread_local int tls_stat_inline_only;
+static _Thread_local uint64_t tls_crawl_idle_ns_pending;
+static _Thread_local uint64_t tls_stat_idle_ns_pending;
+static _Thread_local uint64_t tls_stat_enqueue_block_ns_pending;
 
 static uint64_t monotonic_ns(void) {
     struct timespec ts;
@@ -668,12 +714,30 @@ static void tls_donate_calls_inc(void) {
     }
 }
 
-static void tls_writer_queue_wait_add_ns(uint64_t ns) {
-    tls_writer_queue_wait_ns_pending += ns;
-    if (tls_writer_queue_wait_ns_pending >= 1000000ULL) {
-        atomic_fetch_add_explicit(&g_writer_queue_wait_ns, tls_writer_queue_wait_ns_pending, memory_order_relaxed);
-        tls_writer_queue_wait_ns_pending = 0;
+/* Nanosecond accumulators flush per millisecond rather than per N events: a wait is already long enough
+ * that the atomic is free, but a pool of idle threads would still contend on one cache line every wakeup. */
+static void tls_wait_ns_add(uint64_t *pending, atomic_ullong *total, uint64_t ns) {
+    *pending += ns;
+    if (*pending >= 1000000ULL) {
+        atomic_fetch_add_explicit(total, *pending, memory_order_relaxed);
+        *pending = 0;
     }
+}
+
+static void tls_writer_queue_wait_add_ns(uint64_t ns) {
+    tls_wait_ns_add(&tls_writer_queue_wait_ns_pending, &g_writer_queue_wait_ns, ns);
+}
+
+static void tls_crawl_idle_add_ns(uint64_t ns) {
+    tls_wait_ns_add(&tls_crawl_idle_ns_pending, &g_crawl_idle_ns, ns);
+}
+
+static void tls_stat_idle_add_ns(uint64_t ns) {
+    tls_wait_ns_add(&tls_stat_idle_ns_pending, &g_stat_idle_ns, ns);
+}
+
+static void tls_stat_enqueue_block_add_ns(uint64_t ns) {
+    tls_wait_ns_add(&tls_stat_enqueue_block_ns_pending, &g_stat_enqueue_block_ns, ns);
 }
 
 static void tls_wait_crawl_inc(void) {
@@ -759,6 +823,18 @@ static void tls_flush_thread_batch_counters(void) {
         atomic_fetch_add_explicit(&g_writer_queue_wait_ns, tls_writer_queue_wait_ns_pending, memory_order_relaxed);
         tls_writer_queue_wait_ns_pending = 0;
     }
+    if (tls_crawl_idle_ns_pending) {
+        atomic_fetch_add_explicit(&g_crawl_idle_ns, tls_crawl_idle_ns_pending, memory_order_relaxed);
+        tls_crawl_idle_ns_pending = 0;
+    }
+    if (tls_stat_idle_ns_pending) {
+        atomic_fetch_add_explicit(&g_stat_idle_ns, tls_stat_idle_ns_pending, memory_order_relaxed);
+        tls_stat_idle_ns_pending = 0;
+    }
+    if (tls_stat_enqueue_block_ns_pending) {
+        atomic_fetch_add_explicit(&g_stat_enqueue_block_ns, tls_stat_enqueue_block_ns_pending, memory_order_relaxed);
+        tls_stat_enqueue_block_ns_pending = 0;
+    }
 }
 
 static int g_split_depth = 2;
@@ -795,6 +871,10 @@ static size_t g_donate_all_busy_min_stack_cfg              = DEFAULT_DONATE_ALL_
 static unsigned g_donate_all_busy_max_qdepth_mult_cfg = DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT;
 static size_t g_discovered_dir_enqueue_batch_cfg = DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH;
 static int g_stat_random_queue_dequeue = 0;
+static int g_stat_full_inline = DEFAULT_STAT_FULL_INLINE;
+static int g_stat_helps_crawl = DEFAULT_STAT_HELPS_CRAWL;
+/* Stat threads that may also take crawl tasks; 0 when helping is off. Set before any thread starts. */
+static int g_crawl_helper_threads = 0;
 static stat_pool_t g_stat_pool;
 static int g_stat_pool_ready = 0;
 static atomic_uint g_fd_pressure = 0;
@@ -1424,6 +1504,34 @@ static int parse_ecrawl_stat_random_queue(void) {
     return v != 0 ? 1 : 0;
 }
 
+/* Stat a batch on the crawl thread when the pool queue is full instead of waiting for a slot:
+ * non-zero = on (default); 0 = block as before. Env: ECRAWL_STAT_FULL_INLINE. */
+static int parse_ecrawl_stat_full_inline(void) {
+    const char *e = getenv("ECRAWL_STAT_FULL_INLINE");
+    long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_FULL_INLINE;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno || end == e || *end) return DEFAULT_STAT_FULL_INLINE;
+    return v != 0 ? 1 : 0;
+}
+
+/* Let stat workers run crawl tasks when their queue is empty: non-zero = on (default); 0 = off.
+ * Env: ECRAWL_STAT_HELPS_CRAWL. */
+static int parse_ecrawl_stat_helps_crawl(void) {
+    const char *e = getenv("ECRAWL_STAT_HELPS_CRAWL");
+    long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_STAT_HELPS_CRAWL;
+    errno = 0;
+    v = strtol(e, &end, 10);
+    if (errno || end == e || *end) return DEFAULT_STAT_HELPS_CRAWL;
+    return v != 0 ? 1 : 0;
+}
+
 /* Sort each stat batch by inode before statting: 1 = on, 0 = off (default). Env: ECRAWL_STAT_INODE_ORDER. */
 static int parse_ecrawl_stat_inode_order(void) {
     const char *e = getenv("ECRAWL_STAT_INODE_ORDER");
@@ -1492,7 +1600,7 @@ static void configure_max_open_shards(void) {
 
     soft = lim.rlim_cur;
     reserve = FD_RESERVE_BASE +
-              (rlim_t)g_crawl_threads * FD_RESERVE_PER_CRAWL_THREAD +
+              (rlim_t)(g_crawl_threads + g_crawl_helper_threads) * FD_RESERVE_PER_CRAWL_THREAD +
               (rlim_t)g_writer_threads * FD_RESERVE_PER_WRITER;
     if (soft <= reserve + (rlim_t)g_writer_threads) {
         g_max_open_shards = 1U;
@@ -2186,6 +2294,10 @@ static void print_usage(const char *prog) {
             "ECRAWL_STAT_BATCH_MIN_OFFLOAD (tail batches smaller than this many names use crawl-thread fstatat; "
             "default %u; 0=always offload tails to stat pool), "
             "ECRAWL_STAT_QUEUE_BATCHES (pending stat batches cap, default %u), "
+            "ECRAWL_STAT_FULL_INLINE (default 0; 1=a full stat queue makes the crawl thread stat the batch "
+            "itself instead of waiting for a slot, for cold/remote storage where the queue can fill), "
+            "ECRAWL_STAT_HELPS_CRAWL (default 0; 1=stat workers take crawl tasks when their queue is empty, "
+            "which measured no faster but helps if crawl threads are configured below the core count), "
             "ECRAWL_STAT_RANDOM_QUEUE (default 1: random stat-batch dequeue; 0=FIFO), "
             "ECRAWL_STAT_INODE_ORDER (default 0; 1=sort each stat batch by inode before statting, which can help "
             "on a cold XFS where dirents come back in name-hash order).\n"
@@ -3363,27 +3475,12 @@ static int discovered_dir_batch_push(discovered_dir_batch_t *b, char *path_owned
     return 0;
 }
 
-static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
-    task_node_t *node;
+/* Detach the head task and release q->mutex. Call with the mutex held and q->head non-NULL. Counts the
+ * caller into g_active_workers, which is what keeps the queue from latching closed underneath it, so
+ * every caller owes a matching decrement once the task is done (see crawl_run_task). */
+static void queue_take_head_and_unlock(task_queue_t *q, dir_stack_t *task) {
+    task_node_t *node = q->head;
 
-    pthread_mutex_lock(&q->mutex);
-    for (;;) {
-        if (q->head) break;
-        if (q->closed) {
-            pthread_mutex_unlock(&q->mutex);
-            return -1;
-        }
-        if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
-            q->closed = 1;
-            pthread_cond_broadcast(&q->cond);
-            pthread_mutex_unlock(&q->mutex);
-            return -1;
-        }
-        pthread_cond_wait(&q->cond, &q->mutex);
-        tls_wait_crawl_inc();
-    }
-
-    node = q->head;
     q->head = node->next;
     if (!q->head) q->tail = NULL;
     if (q->queued_tasks > 0) q->queued_tasks--;
@@ -3397,6 +3494,45 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
     task->count = node->count;
     task->cap = node->cap;
     task_node_recycle(q, node);
+}
+
+static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
+    pthread_mutex_lock(&q->mutex);
+    for (;;) {
+        if (q->head) break;
+        if (q->closed) {
+            pthread_mutex_unlock(&q->mutex);
+            return -1;
+        }
+        if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
+            q->closed = 1;
+            pthread_cond_broadcast(&q->cond);
+            pthread_mutex_unlock(&q->mutex);
+            return -1;
+        }
+        {
+            uint64_t t0 = monotonic_ns();
+
+            pthread_cond_wait(&q->cond, &q->mutex);
+            if (t0) tls_crawl_idle_add_ns(monotonic_ns() - t0);
+        }
+        tls_wait_crawl_inc();
+    }
+
+    queue_take_head_and_unlock(q, task);
+    return 0;
+}
+
+/* Take a task only if one is already queued. Deliberately does not decide the crawl is over the way
+ * queue_pop_wait does: this is for a thread whose real job is elsewhere, so an empty queue means
+ * "nothing to help with right now", never "everyone can go home". */
+static int queue_try_pop(task_queue_t *q, dir_stack_t *task) {
+    pthread_mutex_lock(&q->mutex);
+    if (!q->head || q->closed) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    queue_take_head_and_unlock(q, task);
     return 0;
 }
 
@@ -3778,6 +3914,75 @@ static int emit_context_flush_all(emit_context_t *ctx) {
     return 0;
 }
 
+/* ----- crawl identity -----------------------------------------------------------------------------
+ * The per-thread state process_directory_iterative needs: writer-batch buffers, the --no-stat path
+ * buffer, and one getdents64 buffer (a thread reads one directory at a time, so one buffer suffices;
+ * NULL/0 falls back to libc readdir). Only crawl workers used to need this, but a stat worker that can
+ * take a crawl task needs exactly the same thing, so it lives here rather than inside either loop. */
+typedef struct {
+    emit_context_t emit;
+    char *dirbuf;
+    size_t dirbuf_cap;
+} crawl_identity_t;
+
+static int crawl_identity_init(crawl_identity_t *ci, worker_arg_t *arg) {
+    ci->dirbuf = NULL;
+    ci->dirbuf_cap = g_getdents_buf_bytes;
+
+    if (emit_context_init(&ci->emit, arg->writer_queues, arg->writer_threads, &arg->perf,
+                          &arg->emit_stats_lock) != 0) {
+        fprintf(stderr, "ERROR worker %" PRIu64 " failed to initialize emit context\n", arg->worker_index);
+        stats_add_error(arg->shared);
+        return -1;
+    }
+    if (nostat_ctx_init(&arg->nostat) != 0) {
+        fprintf(stderr, "ERROR worker %" PRIu64 " failed to allocate path output buffer\n", arg->worker_index);
+        stats_add_error(arg->shared);
+        emit_context_destroy(&ci->emit);
+        return -1;
+    }
+    if (ci->dirbuf_cap > 0) {
+        ci->dirbuf = malloc(ci->dirbuf_cap);
+        if (!ci->dirbuf) ci->dirbuf_cap = 0; /* fall back to libc readdir on OOM */
+    }
+    return 0;
+}
+
+static int process_directory_iterative(dir_stack_t *stack, worker_arg_t *wa, emit_context_t *emit,
+                                       task_queue_t *queue, char *dirbuf, size_t dirbuf_cap);
+
+/* Run one task popped from the global queue, then account for no longer holding it. The pop already
+ * counted this thread into g_active_workers, and quiescence is "seeding done, queue empty, nobody
+ * active", so the thread that drops the last active count has to wake the sleepers that can now exit.
+ * Shared because a stat worker taking a crawl task has to follow the same discipline exactly. */
+static void crawl_run_task(dir_stack_t *task, worker_arg_t *arg, crawl_identity_t *ci) {
+    process_directory_iterative(task, arg, &ci->emit, arg->queue, ci->dirbuf, ci->dirbuf_cap);
+    atomic_fetch_sub(&g_active_workers, 1);
+
+    if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
+        pthread_mutex_lock(&arg->queue->mutex);
+        pthread_cond_broadcast(&arg->queue->cond);
+        pthread_mutex_unlock(&arg->queue->mutex);
+    }
+
+    dir_stack_destroy(task);
+}
+
+static void crawl_identity_destroy(crawl_identity_t *ci, worker_arg_t *arg) {
+    /* Last fold for this owner: its stat workers are done with these counters by now, but they share the
+     * lock with it, so keep the fold inside it like every other one. */
+    pthread_mutex_lock(&arg->emit_stats_lock);
+    perf_flush_local(&arg->perf);
+    pthread_mutex_unlock(&arg->emit_stats_lock);
+    if (emit_context_flush_all(&ci->emit) != 0) stats_add_error(arg->shared);
+    emit_context_destroy(&ci->emit);
+    if (pathout_flush(&arg->nostat) != 0) stats_add_error(arg->shared);
+    nostat_ctx_destroy(&arg->nostat);
+    free(ci->dirbuf);
+    ci->dirbuf = NULL;
+    ci->dirbuf_cap = 0;
+}
+
 static int dir_stack_init(dir_stack_t *s) {
     s->items = NULL;
     s->count = 0;
@@ -3829,7 +4034,11 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
     uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
     int active = atomic_load(&g_active_workers);
-    int started = (int)shared->crawl_threads_started;
+    /* Stat helpers take crawl tasks too, so they count in g_active_workers and have to count here as
+     * well; leaving them out drives idle negative and permanently selects the all-busy branch below.
+     * A helper busy statting is still counted as a possible taker, which errs toward donating -- the
+     * cheaper mistake, since the cost is queue mutex traffic rather than an idle thread. */
+    int started = (int)shared->crawl_threads_started + g_crawl_helper_threads;
     int idle = started - active;
     uint64_t max_q_idle;
     uint64_t max_q_all_busy;
@@ -4442,40 +4651,108 @@ static size_t stat_queue_pick_dequeue_idx(size_t n) {
                     ((unsigned long long)RAND_MAX + 1ULL));
 }
 
+/* Take the next batch, waiting according to wait_ns: negative waits until one arrives, 0 does not wait
+ * at all, positive waits at most that many nanoseconds. Sets *stopping when the pool is shutting down.
+ * The check and the wait share one lock acquisition so a batch enqueued in between cannot be missed. */
+static stat_batch_t *stat_batch_take(long wait_ns, int *stopping) {
+    stat_batch_t *batch = NULL;
+
+    *stopping = 0;
+    pthread_mutex_lock(&g_stat_pool.mutex);
+    for (;;) {
+        if (g_stat_pool.q_count > 0) {
+            size_t n = g_stat_pool.q_count;
+            size_t idx = stat_queue_pick_dequeue_idx(n);
+
+            batch = g_stat_pool.slots[idx];
+            if (g_stat_random_queue_dequeue && n > 1) {
+                g_stat_pool.slots[idx] = g_stat_pool.slots[n - 1];
+            } else if (n > 1) {
+                memmove(g_stat_pool.slots, g_stat_pool.slots + 1, (n - 1) * sizeof(stat_batch_t *));
+            }
+            g_stat_pool.q_count--;
+            pthread_cond_signal(&g_stat_pool.cond_nonfull);
+            break;
+        }
+        if (g_stat_pool.stop) {
+            *stopping = 1;
+            break;
+        }
+        if (wait_ns == 0) break;
+
+        tls_wait_stat_pop_inc();
+        {
+            uint64_t t0 = monotonic_ns();
+
+            if (wait_ns > 0) {
+                struct timespec ts;
+
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += wait_ns;
+                while (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_nsec -= 1000000000L;
+                    ts.tv_sec++;
+                }
+                pthread_cond_timedwait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex, &ts);
+                if (t0) tls_stat_idle_add_ns(monotonic_ns() - t0);
+                /* Whether or not a batch landed, go back to the caller: a crawl-queue push does not
+                 * signal this condvar, so returning is the only way that queue gets looked at again. */
+                if (g_stat_pool.q_count == 0) {
+                    if (g_stat_pool.stop) *stopping = 1;
+                    break;
+                }
+                continue;
+            }
+            pthread_cond_wait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex);
+            if (t0) tls_stat_idle_add_ns(monotonic_ns() - t0);
+        }
+    }
+    pthread_mutex_unlock(&g_stat_pool.mutex);
+    return batch;
+}
+
 static void *stat_worker_main(void *arg) {
-    (void)arg;
+    /* Non-NULL only when this pool may also take crawl tasks, in which case it is this thread's own
+     * crawl identity -- never a crawl worker's, whose stats and buffers belong to that worker. */
+    worker_arg_t *wa = (worker_arg_t *)arg;
+    crawl_identity_t ci;
+    int can_crawl = 0;
+    long wait_ns;
+
+    if (wa && crawl_identity_init(&ci, wa) == 0) can_crawl = 1;
+    wait_ns = can_crawl ? 0 : -1;
 
     for (;;) {
-        stat_batch_t *batch = NULL;
+        int stopping = 0;
+        stat_batch_t *batch = stat_batch_take(wait_ns, &stopping);
+        dir_stack_t task;
 
-        pthread_mutex_lock(&g_stat_pool.mutex);
-        for (;;) {
-            if (g_stat_pool.q_count > 0) {
-                size_t n = g_stat_pool.q_count;
-                size_t idx = stat_queue_pick_dequeue_idx(n);
-
-                batch = g_stat_pool.slots[idx];
-                if (g_stat_random_queue_dequeue && n > 1) {
-                    g_stat_pool.slots[idx] = g_stat_pool.slots[n - 1];
-                } else if (n > 1) {
-                    memmove(g_stat_pool.slots, g_stat_pool.slots + 1, (n - 1) * sizeof(stat_batch_t *));
-                }
-                g_stat_pool.q_count--;
-                pthread_cond_signal(&g_stat_pool.cond_nonfull);
-                break;
-            }
-            if (g_stat_pool.stop) {
-                pthread_mutex_unlock(&g_stat_pool.mutex);
-                tls_flush_thread_batch_counters();
-                return NULL;
-            }
-            tls_wait_stat_pop_inc();
-            pthread_cond_wait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex);
+        /* Batches come first: each one holds a dup'd fd and a crawl thread parked in the drain that
+         * ends its directory, so it is the more urgent of the two queues. */
+        if (batch) {
+            process_stat_batch_worker(batch);
+            wait_ns = can_crawl ? 0 : -1;
+            continue;
         }
-        pthread_mutex_unlock(&g_stat_pool.mutex);
+        if (stopping) break;
+        if (!can_crawl) continue;
 
-        process_stat_batch_worker(batch);
+        if (queue_try_pop(wa->queue, &task) == 0) {
+            atomic_fetch_add_explicit(&g_stat_crawl_tasks_helped, 1ULL, memory_order_relaxed);
+            tls_stat_inline_only = 1;
+            crawl_run_task(&task, wa, &ci);
+            tls_stat_inline_only = 0;
+            wait_ns = 0;
+            continue;
+        }
+        /* Both queues empty, so sleeping is finally worth it -- but only briefly, since nothing wakes
+         * this thread when a crawl task appears. */
+        wait_ns = STAT_HELPER_POLL_NS;
     }
+
+    if (can_crawl) crawl_identity_destroy(&ci, wa);
+    tls_flush_thread_batch_counters();
+    return NULL;
 }
 
 static void stat_queue_track_depth_max_locked(size_t depth) {
@@ -4489,15 +4766,26 @@ static void stat_queue_track_depth_max_locked(size_t depth) {
                                                      memory_order_relaxed));
 }
 
-static int stat_batch_enqueue(stat_batch_t *batch) {
+/* 0 = queued, 1 = queue full (only returned when may_block is 0), -1 = pool stopped.
+ * A crawl thread that cannot queue has a better option than sleeping until a slot frees: the batch is
+ * self-contained, so it can stat it itself (see stat_flush_builder). may_block preserves the old
+ * behaviour for ECRAWL_STAT_FULL_INLINE=0. */
+static int stat_batch_enqueue(stat_batch_t *batch, int may_block) {
     pthread_mutex_lock(&g_stat_pool.mutex);
-    while (g_stat_pool.q_count >= g_stat_pool.q_max && !g_stat_pool.stop) {
+    while (may_block && g_stat_pool.q_count >= g_stat_pool.q_max && !g_stat_pool.stop) {
+        uint64_t t0 = monotonic_ns();
+
         tls_wait_stat_enqueue_inc();
         pthread_cond_wait(&g_stat_pool.cond_nonfull, &g_stat_pool.mutex);
+        if (t0) tls_stat_enqueue_block_add_ns(monotonic_ns() - t0);
     }
     if (g_stat_pool.stop) {
         pthread_mutex_unlock(&g_stat_pool.mutex);
         return -1;
+    }
+    if (g_stat_pool.q_count >= g_stat_pool.q_max) {
+        pthread_mutex_unlock(&g_stat_pool.mutex);
+        return 1;
     }
     batch->queue_next = NULL;
     g_stat_pool.slots[g_stat_pool.q_count++] = batch;
@@ -4507,7 +4795,9 @@ static int stat_batch_enqueue(stat_batch_t *batch) {
     return 0;
 }
 
-static int stat_pool_start(void) {
+/* helper_args is one worker_arg_t per stat thread when they may also crawl, else NULL. They are owned
+ * by main alongside the crawl workers' so that stats merging and lock teardown stay in one place. */
+static int stat_pool_start(worker_arg_t *helper_args) {
     size_t i;
 
     if (g_stat_threads_configured <= 0) return 0;
@@ -4542,7 +4832,8 @@ static int stat_pool_start(void) {
         return -1;
     }
     for (i = 0; i < (size_t)g_stat_threads_configured; i++) {
-        if (pthread_create(&g_stat_pool.threads[i], NULL, stat_worker_main, NULL) != 0) {
+        if (pthread_create(&g_stat_pool.threads[i], NULL, stat_worker_main,
+                           helper_args ? &helper_args[i] : NULL) != 0) {
             pthread_mutex_lock(&g_stat_pool.mutex);
             g_stat_pool.stop = 1;
             pthread_cond_broadcast(&g_stat_pool.cond_nonempty);
@@ -4610,9 +4901,20 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
                               worker_aux_stats_t *aux, stat_pending_vec_t *pend) {
     stat_batch_t *b;
     int dfd;
+    int rc;
     shared_state_t *shared = wa->shared;
 
     if (!nb || nb->count == 0) return 0;
+
+    if (tls_stat_inline_only) {
+        /* A stat worker on loan to the crawl side: it must not queue work to the pool it belongs to. */
+        if (stat_nb_process_inline_crawl(dir_fd, parent_path, parent_len, nb, wa, emit, stack, queue, aux) != 0) {
+            stats_add_error(shared);
+            return -1;
+        }
+        atomic_fetch_add_explicit(&g_stat_batches_helper_inlined, 1ULL, memory_order_relaxed);
+        return 0;
+    }
     stat_names_builder_seal(nb);
 
     dfd = dup(dir_fd);
@@ -4651,12 +4953,21 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
         stat_batch_destroy(b);
         return -1;
     }
-    if (stat_batch_enqueue(b) != 0) {
+    rc = stat_batch_enqueue(b, !g_stat_full_inline);
+    if (rc < 0) {
         fprintf(stderr, "ERROR stat enqueue (pool stopped)\n");
         stats_add_error(shared);
         pend->count--;
         stat_batch_destroy(b);
         return -1;
+    }
+    if (rc > 0) {
+        /* Queue full. Every stat worker is busy, so waiting for a slot would idle the one thread still
+         * free to stat: do the batch here instead. It stays in pend, so the drain that ends this
+         * directory finds it already finished and releases the dup'd fd and blob on the same schedule. */
+        atomic_fetch_add_explicit(&g_stat_batches_self_processed, 1ULL, memory_order_relaxed);
+        process_stat_batch_worker(b);
+        return 0;
     }
     atomic_fetch_add_explicit(&g_stat_batches_enqueued, 1ULL, memory_order_relaxed);
     return 0;
@@ -5371,59 +5682,20 @@ static void *stats_thread_main(void *arg) {
 
 static void *worker_thread_main(void *arg_void) {
     worker_arg_t *arg = (worker_arg_t *)arg_void;
-    emit_context_t emit;
-    /* One reusable getdents64 buffer per crawl thread (a worker iterates one directory at a time, so a
-     * single buffer suffices). NULL/0 => process_directory_iterative falls back to libc readdir. */
-    size_t dirbuf_cap = g_getdents_buf_bytes;
-    char *dirbuf = NULL;
+    crawl_identity_t ci;
 
-    if (emit_context_init(&emit, arg->writer_queues, arg->writer_threads, &arg->perf,
-                          &arg->emit_stats_lock) != 0) {
-        fprintf(stderr, "ERROR worker %" PRIu64 " failed to initialize emit context\n", arg->worker_index);
-        stats_add_error(arg->shared);
-        return NULL;
-    }
-
-    if (nostat_ctx_init(&arg->nostat) != 0) {
-        fprintf(stderr, "ERROR worker %" PRIu64 " failed to allocate path output buffer\n", arg->worker_index);
-        stats_add_error(arg->shared);
-        emit_context_destroy(&emit);
-        return NULL;
-    }
-
-    if (dirbuf_cap > 0) {
-        dirbuf = malloc(dirbuf_cap);
-        if (!dirbuf) dirbuf_cap = 0; /* fall back to libc readdir on OOM */
-    }
+    if (crawl_identity_init(&ci, arg) != 0) return NULL;
 
     for (;;) {
         dir_stack_t task;
 
         if (queue_pop_wait(arg->queue, &task) != 0) break;
 
-        process_directory_iterative(&task, arg, &emit, arg->queue, dirbuf, dirbuf_cap);
-        atomic_fetch_sub(&g_active_workers, 1);
-
-        if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
-            pthread_mutex_lock(&arg->queue->mutex);
-            pthread_cond_broadcast(&arg->queue->cond);
-            pthread_mutex_unlock(&arg->queue->mutex);
-        }
-
-        dir_stack_destroy(&task);
+        crawl_run_task(&task, arg, &ci);
     }
 
-    /* Last fold for this owner: its stat workers are done with these counters by now, but they share the
-     * lock with it, so keep the fold inside it like every other one. */
-    pthread_mutex_lock(&arg->emit_stats_lock);
-    perf_flush_local(&arg->perf);
-    pthread_mutex_unlock(&arg->emit_stats_lock);
-    if (emit_context_flush_all(&emit) != 0) stats_add_error(arg->shared);
-    emit_context_destroy(&emit);
-    if (pathout_flush(&arg->nostat) != 0) stats_add_error(arg->shared);
-    nostat_ctx_destroy(&arg->nostat);
+    crawl_identity_destroy(&ci, arg);
     tls_flush_thread_batch_counters();
-    free(dirbuf);
     return NULL;
 }
 
@@ -6144,6 +6416,9 @@ static void print_queue_wait_metrics_to(FILE *fp) {
     fprintf(fp, "wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
     fprintf(fp, "wait_stat_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_pop));
     fprintf(fp, "wait_stat_enqueue=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_enqueue));
+    fprintf(fp, "crawl_idle_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_crawl_idle_ns));
+    fprintf(fp, "stat_idle_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_idle_ns));
+    fprintf(fp, "stat_enqueue_block_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_enqueue_block_ns));
 }
 
 /* What a names-only walk can and cannot report. Byte totals, hardlink dedup and the uid/gid
@@ -6197,9 +6472,36 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "stat_batches_completed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_completed));
     fprintf(fp, "stat_batches_dup_fallback=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_dup_fallback));
     fprintf(fp, "stat_batches_tail_inlined=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_tail_inlined));
+    fprintf(fp, "stat_full_inline=%d\n", g_stat_full_inline);
+    fprintf(fp, "stat_batches_self_processed=%" PRIu64 "\n",
+            (uint64_t)atomic_load(&g_stat_batches_self_processed));
+    fprintf(fp, "stat_helps_crawl=%d\n", g_stat_helps_crawl);
+    fprintf(fp, "stat_crawl_tasks_helped=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_crawl_tasks_helped));
+    fprintf(fp, "stat_batches_helper_inlined=%" PRIu64 "\n",
+            (uint64_t)atomic_load(&g_stat_batches_helper_inlined));
     fprintf(fp, "stat_batch_unexpected_dir_total=%" PRIu64 "\n",
             (uint64_t)atomic_load(&g_stat_batch_unexpected_dir_total));
     fprintf(fp, "stat_queue_depth_max=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_queue_depth_max));
+    /* Idle time as a fraction of each pool's thread-seconds, which is what decides whether the fixed
+     * crawl/stat split fits this tree. crawl_idle high means the crawl pool is wider than the tree can
+     * feed; stat_enqueue_block high means the reverse, crawl threads paying for a saturated stat pool.
+     * Both are charged against the crawl pool's threads because both are crawl threads sitting still. */
+    {
+        double crawl_thread_sec = (double)shared->crawl_threads_started * elapsed_sec;
+        double stat_thread_sec = (double)g_stat_threads_configured * elapsed_sec;
+        double crawl_idle_sec = (double)atomic_load(&g_crawl_idle_ns) / 1e9;
+        double stat_idle_sec = (double)atomic_load(&g_stat_idle_ns) / 1e9;
+        double enq_block_sec = (double)atomic_load(&g_stat_enqueue_block_ns) / 1e9;
+
+        fprintf(fp, "crawl_idle_sec=%.3f\n", crawl_idle_sec);
+        fprintf(fp, "stat_idle_sec=%.3f\n", stat_idle_sec);
+        fprintf(fp, "stat_enqueue_block_sec=%.3f\n", enq_block_sec);
+        if (crawl_thread_sec > 0.0) {
+            fprintf(fp, "crawl_idle_pct=%.1f\n", 100.0 * crawl_idle_sec / crawl_thread_sec);
+            fprintf(fp, "stat_enqueue_block_pct=%.1f\n", 100.0 * enq_block_sec / crawl_thread_sec);
+        }
+        if (stat_thread_sec > 0.0) fprintf(fp, "stat_idle_pct=%.1f\n", 100.0 * stat_idle_sec / stat_thread_sec);
+    }
     fprintf(fp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
     fprintf(fp, "writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
     fprintf(fp, "record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
@@ -6299,6 +6601,8 @@ int main(int argc, char **argv) {
     writer_queue_t *writer_queues = NULL;
     pthread_t *workers = NULL;
     worker_arg_t *worker_args = NULL;
+    int stat_helper_args = 0;
+    int worker_arg_count = 0;
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
@@ -6470,6 +6774,11 @@ int main(int argc, char **argv) {
     g_stat_batch_min_offload_cfg          = parse_ecrawl_stat_batch_min_offload();
     g_stat_queue_max_batches_cfg = parse_ecrawl_stat_queue_batches();
     g_stat_random_queue_dequeue = parse_ecrawl_stat_random_queue();
+    g_stat_full_inline = parse_ecrawl_stat_full_inline();
+    g_stat_helps_crawl = parse_ecrawl_stat_helps_crawl();
+    /* Set here rather than at thread start so configure_max_open_shards below reserves descriptors for
+     * the helpers as well: while crawling, each holds a dirfd exactly like a crawl worker. */
+    g_crawl_helper_threads = (g_stat_helps_crawl && g_stat_threads_configured > 0) ? g_stat_threads_configured : 0;
     g_stat_inode_order = parse_ecrawl_stat_inode_order();
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_entry_check_every_cfg = parse_ecrawl_donate_entry_check_every();
@@ -6624,6 +6933,9 @@ int main(int argc, char **argv) {
     atomic_store(&g_stat_batches_completed, 0);
     atomic_store(&g_stat_batches_dup_fallback, 0);
     atomic_store(&g_stat_batches_tail_inlined, 0);
+    atomic_store(&g_stat_batches_self_processed, 0);
+    atomic_store(&g_stat_batches_helper_inlined, 0);
+    atomic_store(&g_stat_crawl_tasks_helped, 0);
     atomic_store(&g_wait_stat_pop, 0);
     atomic_store(&g_wait_stat_enqueue, 0);
     atomic_store(&g_stat_queue_depth_max, 0);
@@ -6634,6 +6946,9 @@ int main(int argc, char **argv) {
     atomic_store(&g_queue_lock_waits, 0);
     atomic_store(&g_donate_calls, 0);
     atomic_store(&g_writer_queue_wait_ns, 0);
+    atomic_store(&g_crawl_idle_ns, 0);
+    atomic_store(&g_stat_idle_ns, 0);
+    atomic_store(&g_stat_enqueue_block_ns, 0);
     atomic_store(&g_io_lstat_calls, 0);
     atomic_store(&g_io_stat_calls, 0);
     atomic_store(&g_io_mkdir_calls, 0);
@@ -6723,8 +7038,13 @@ int main(int argc, char **argv) {
     }
     stats_thread_started = 1;
 
+    /* Crawl workers first, then one per stat thread when the stat pool may also crawl. Keeping them in
+     * one array means the stats merge and the lock teardown below cover both pools unchanged. */
+    stat_helper_args = g_crawl_helper_threads;
+    worker_arg_count = g_crawl_threads + stat_helper_args;
+
     workers = (pthread_t *)calloc((size_t)g_crawl_threads, sizeof(*workers));
-    worker_args = (worker_arg_t *)calloc((size_t)g_crawl_threads, sizeof(*worker_args));
+    worker_args = (worker_arg_t *)calloc((size_t)worker_arg_count, sizeof(*worker_args));
     if (!workers || !worker_args) {
         free(workers);
         free(worker_args);
@@ -6754,7 +7074,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    for (i = 0; i < g_crawl_threads; i++) {
+    for (i = 0; i < worker_arg_count; i++) {
         if (pthread_mutex_init(&worker_args[i].emit_stats_lock, NULL) != 0) {
             fprintf(stderr, "ERROR crawl worker mutex init failed\n");
             while (i > 0) pthread_mutex_destroy(&worker_args[--i].emit_stats_lock);
@@ -6786,9 +7106,21 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (stat_pool_start() != 0) {
+    /* Before stat_pool_start, not after: a helper thread reads these the moment it runs. */
+    for (i = 0; i < worker_arg_count; i++) {
+        worker_args[i].shared = &shared;
+        worker_args[i].queue = &queue;
+        worker_args[i].writer_queues = writer_queues;
+        worker_args[i].writer_threads = writer_threads_used;
+        worker_args[i].worker_index = (uint64_t)(i + 1);
+        memset(&worker_args[i].stats, 0, sizeof(worker_args[i].stats));
+        memset(&worker_args[i].perf, 0, sizeof(worker_args[i].perf));
+        memset(&worker_args[i].aux, 0, sizeof(worker_args[i].aux));
+    }
+
+    if (stat_pool_start(stat_helper_args > 0 ? &worker_args[g_crawl_threads] : NULL) != 0) {
         fprintf(stderr, "ERROR failed to start stat worker pool\n");
-        for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
+        for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
         free(workers);
         free(worker_args);
         stats_stop_request();
@@ -6817,15 +7149,6 @@ int main(int argc, char **argv) {
     }
 
     for (i = 0; i < g_crawl_threads; i++) {
-        worker_args[i].shared = &shared;
-        worker_args[i].queue = &queue;
-        worker_args[i].writer_queues = writer_queues;
-        worker_args[i].writer_threads = writer_threads_used;
-        worker_args[i].worker_index = (uint64_t)(i + 1);
-        memset(&worker_args[i].stats, 0, sizeof(worker_args[i].stats));
-        memset(&worker_args[i].perf, 0, sizeof(worker_args[i].perf));
-        memset(&worker_args[i].aux, 0, sizeof(worker_args[i].aux));
-
         if (pthread_create(&workers[i], NULL, worker_thread_main, &worker_args[i]) != 0) {
             fprintf(stderr, "ERROR failed to create worker %d\n", i + 1);
             stats_add_error(&shared);
@@ -6854,6 +7177,12 @@ int main(int argc, char **argv) {
     for (i = 0; i < worker_count_started; i++) {
         stats_merge(&shared, &worker_args[i].stats);
         stats_merge_aux(&shared, &worker_args[i].aux);
+    }
+    /* Stat helpers accumulate into their own slots when they crawl, and stat_pool_stop above has already
+     * joined them, so their counts are final and would otherwise be dropped. */
+    for (i = 0; i < stat_helper_args; i++) {
+        stats_merge(&shared, &worker_args[g_crawl_threads + i].stats);
+        stats_merge_aux(&shared, &worker_args[g_crawl_threads + i].aux);
     }
 
     if (!g_no_write) {
@@ -6949,7 +7278,7 @@ int main(int argc, char **argv) {
         print_stat_batch_unexpected_dir_warnings(stderr);
     }
 
-    for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
+    for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
 
     free(workers);
     free(worker_args);

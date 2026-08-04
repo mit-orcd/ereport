@@ -1,21 +1,35 @@
 #!/usr/bin/env bash
 #
-# Run paper queries Q1–Q5 against available tools.
+# Run queries Q1–Q6 against available tools. Q1-Q5 are the paper's; Q6 is this
+# comparison's own addition, an unanchored substring match.
 #
 # Usage:
 #   scripts/compare-indexers/run_queries.sh <synth-root-or-tree> [results-dir]
 #
 # Expects QUERY_SEEDS.txt from prepare-synth.sh under <synth-root>, or set:
 #   Q1_NAME=... Q2_TERM=slurm- Q2_GLOB='slurm-*.out' Q3_MIN_BYTES=... Q4_SUBTREE=... Q5_SUBTREE=...
+#   Q6_GLOB='*token*.dat'
+# An exported value applies to every argument set; the manifest's <key>_1..3 are
+# what the sets are otherwise taken from.
 #
 # For the ecrawl suite, set:
 #   ECRAWL_BIN_DIR=...          crawl output with uid_shard_*.bin
-#   EREPORT_INDEX_DIR=...       trigram index from ereport_index --make
+#   EREPORT_INDEX_DIR=...       ereport_index --make output: the trigram index
+#                     Q1/Q2/Q6 search, and the dir-index sidecars Q4 and Q5 look
+#                     up their subtree in. Both are bound to the capture they
+#                     were built from, so the two must be the same run's pair.
 # For GUFI/XDU:
-#   GUFI_INDEX_DIR=... XDU_INDEX_DIR=...
+#   GUFI_PLAIN_INDEX_DIR=...    dir2index output (GUFI_INDEX_DIR is still read)
+#   GUFI_ROLLUP_INDEX_DIR=...   the same index after gufi_rollup
+#   XDU_INDEX_DIR=...
 #
 # Env: TOOLS="find fd du dua ecrawl_suite gufi xdu robinhood" REPS=3
 #      REPS_<TOOL>=n overrides REPS for one tool, e.g. REPS_ROBINHOOD=1
+#      CACHE_MODES="cold hot"  which passes each repetition makes. The cold pass
+#                     uses argument set 1; the hot pass repeats set 1, so the
+#                     cache delta is measured on identical work, and then runs
+#                     the remaining sets so no bar is a re-answer.
+#      ARG_SETS=3     ceiling on how many argument sets the hot pass uses
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -37,20 +51,45 @@ TOOLS=${TOOLS:-"find fd du dua ecrawl_suite gufi xdu robinhood"}
 echo "==> threads: $(thread_plan)"
 raise_nofile
 echo "==> $NOFILE_NOW"
-write_env_snapshot "$OUT/env.txt"
+
+# GUFI is queried once per index the run built, because the two are not the same
+# capability: gufi_dir2index alone answers the name, size and type questions,
+# while the byte total needs the treesummary rows only gufi_rollup writes -- at
+# several times the build cost. The index phase leaves a pointer file per index.
+gufi_pointer() {
+  local file="${INDEX_RESULTS_DIR:-}/$1"
+  [[ -n "${INDEX_RESULTS_DIR:-}" && -f "$file" ]] || return 0
+  cat "$file"
+}
+GUFI_PLAIN_INDEX_DIR=${GUFI_PLAIN_INDEX_DIR:-$(gufi_pointer gufi_plain_index_dir.txt)}
+GUFI_ROLLUP_INDEX_DIR=${GUFI_ROLLUP_INDEX_DIR:-$(gufi_pointer gufi_rollup_index_dir.txt)}
+# A caller that only knows the old single-index variable (prod-protocol.md, an
+# earlier results directory) still gets one series out of it. Which one it is
+# depends on what the index phase did, so it stands in for whichever is missing.
+if [[ -n "${GUFI_INDEX_DIR:-}" ]]; then
+  [[ -n "$GUFI_PLAIN_INDEX_DIR" || -n "$GUFI_ROLLUP_INDEX_DIR" ]] ||
+    GUFI_PLAIN_INDEX_DIR=$GUFI_INDEX_DIR
+fi
 
 # gufi_find and gufi_du take no thread flag and no index argument: both come
-# from a config file whose path is compiled into them. Write it now, against the
-# index this run built, so the wrappers query that index with the same thread
-# budget as every other tool.
+# from a config file whose path is compiled into them. q_gufi_index rewrites it
+# per series; write it once here too, so the probe pass below and the banner
+# have an index to speak about.
 GUFI_CONFIG_NOTE=""
-if have_cmd "${GUFI_FIND:-}" && [[ -n "${GUFI_INDEX_DIR:-}" && -d "${GUFI_INDEX_DIR:-}" ]]; then
-  if GUFI_CONFIG_NOTE=$(gufi_write_config "$GUFI_INDEX_DIR"); then
-    echo "==> gufi config: $(gufi_config_path) (IndexRoot=$GUFI_INDEX_DIR, Threads=$THREADS)"
+GUFI_PROBE_INDEX_DIR=${GUFI_PLAIN_INDEX_DIR:-$GUFI_ROLLUP_INDEX_DIR}
+if have_cmd "${GUFI_FIND:-}" && [[ -n "$GUFI_PROBE_INDEX_DIR" && -d "$GUFI_PROBE_INDEX_DIR" ]]; then
+  if GUFI_CONFIG_NOTE=$(gufi_write_config "$GUFI_PROBE_INDEX_DIR"); then
+    echo "==> gufi config: $(gufi_config_path) (IndexRoot=$GUFI_PROBE_INDEX_DIR, Threads=$THREADS)"
+    [[ -z "$GUFI_ROLLUP_INDEX_DIR" ]] ||
+      echo "==> gufi rollup index: $GUFI_ROLLUP_INDEX_DIR (queried as gufi_rollup)"
   else
     echo "WARN: could not write the GUFI config ($GUFI_CONFIG_NOTE); its queries will be skipped" >&2
   fi
 fi
+
+# After the GUFI indexes are resolved, so env.txt names both of them: the summary
+# reads which index each series was answered from out of this file.
+write_env_snapshot "$OUT/env.txt"
 
 # Which unit rbh-du reports in, resolved once from the installed binary.
 RBH_DU_ARGS=()
@@ -72,6 +111,9 @@ HARNESS_LOG="$OUT/harness.log"
 export HARNESS_LOG
 printf '# harness diagnostics, not tool output\n' >"$HARNESS_LOG"
 
+# Whatever the caller pinned, before the manifest or a set can overwrite it.
+record_arg_overrides
+
 # Load seeds
 SEEDS="$TREE/QUERY_SEEDS.txt"
 if [[ -f "$SEEDS" ]]; then
@@ -87,38 +129,57 @@ if [[ -f "$SEEDS" ]]; then
   set +a
 fi
 
-Q1_NAME=${Q1_NAME:-${q1_unique_name:-}}
-Q1_PATH=${Q1_PATH:-${q1_unique_path:-}}
-Q2_TERM=${Q2_TERM:-${q2_term:-slurm-}}
-Q2_GLOB=${Q2_GLOB:-${q2_glob:-slurm-*.out}}
-Q3_MIN=${Q3_MIN_BYTES:-${q3_min_bytes:-$SIZE_GT_BYTES}}
-Q4_SUBTREE=${Q4_SUBTREE:-${q4_subtree:-$TREE}}
-Q5_SUBTREE=${Q5_SUBTREE:-${q5_subtree:-$Q4_SUBTREE}}
+# How many argument sets the manifest planted, and the passes each repetition
+# makes over them: cold on set 1, then hot on set 1 (so the cache delta is
+# measured on identical work) and on every remaining set (so no later bar is a
+# re-answer of a question just answered).
+ARG_SETS_AVAILABLE=$(arg_sets_available)
+QUERY_PASSES=()
+for _mode in $CACHE_MODES; do
+  if [[ "$_mode" == "cold" ]]; then
+    QUERY_PASSES+=("cold:1")
+  else
+    for ((_s = 1; _s <= ARG_SETS_AVAILABLE; _s++)); do
+      QUERY_PASSES+=("$_mode:$_s")
+    done
+  fi
+done
+unset _mode _s
+((${#QUERY_PASSES[@]} > 0)) || QUERY_PASSES=("cold:1")
 
+select_arg_set 1
 if [[ -z "$Q1_NAME" ]]; then
   echo "WARN: Q1_NAME unset; Q1 may be empty. Run prepare-synth.sh or export seeds." >&2
 fi
 
-# Derived once, outside the timed region: the literal the trigram index searches
-# for, and the regex that trims its substring matches down to find -name's answer.
-Q1_ERE=""
-[[ -z "$Q1_NAME" ]] || Q1_ERE=$(name_basename_ere "$Q1_NAME")
-Q2_INDEX_TERM=""
-Q2_ERE=""
-if [[ -n "$Q2_GLOB" ]]; then
-  { read -r Q2_INDEX_TERM; read -r Q2_ERE; } < <(glob_index_filter "$Q2_GLOB")
-  # Below three characters there is no trigram to look up, so the index cannot
-  # narrow the candidates and the seed term (if any) is the better prefilter.
-  if [[ ${#Q2_INDEX_TERM} -lt 3 && -n "$Q2_TERM" ]]; then
-    Q2_INDEX_TERM=$Q2_TERM
-  fi
-  [[ ${#Q2_INDEX_TERM} -ge 3 ]] || Q2_INDEX_TERM=""
-fi
-
-# The resolved parameters, not just the seed file: overrides and defaults are
-# applied above, and the summary explains Q1-Q5 in terms of what actually ran.
+# The resolved parameters of every set, not just the seed file: overrides and
+# defaults are applied by select_arg_set, and the summary explains Q1-Q6 in terms
+# of what actually ran. Set 1 is also written unindexed, which is the shape the
+# reporting scripts read for a single-set run.
 {
   printf 'tree=%s\n' "$TREE"
+  printf 'arg_sets=%s\n' "$ARG_SETS_AVAILABLE"
+  for _s in $(seq 1 "$ARG_SETS_AVAILABLE"); do
+    select_arg_set "$_s"
+    printf 'q1_name_%s=%s\n' "$_s" "${Q1_NAME:-}"
+    printf 'q1_path_%s=%s\n' "$_s" "${Q1_PATH:-}"
+    printf 'q2_glob_%s=%s\n' "$_s" "${Q2_GLOB:-}"
+    printf 'q2_term_%s=%s\n' "$_s" "${Q2_TERM:-}"
+    printf 'q1_exact_filter_%s=%s\n' "$_s" "${Q1_ERE:-}"
+    printf 'q2_index_term_%s=%s\n' "$_s" "${Q2_INDEX_TERM:-}"
+    printf 'q2_exact_filter_%s=%s\n' "$_s" "${Q2_ERE:-}"
+    printf 'q3_min_bytes_%s=%s\n' "$_s" "${Q3_MIN:-}"
+    printf 'q4_subtree_%s=%s\n' "$_s" "${Q4_SUBTREE:-}"
+    printf 'q5_subtree_%s=%s\n' "$_s" "${Q5_SUBTREE:-}"
+    printf 'q6_glob_%s=%s\n' "$_s" "${Q6_GLOB:-}"
+    printf 'q6_index_term_%s=%s\n' "$_s" "${Q6_INDEX_TERM:-}"
+    printf 'q6_exact_filter_%s=%s\n' "$_s" "${Q6_ERE:-}"
+    for _key in q2_expected q3_expected q6_expected; do
+      _want=$(seed_value "$_key" "$_s")
+      [[ -z "$_want" ]] || printf '%s_%s=%s\n' "$_key" "$_s" "$_want"
+    done
+  done
+  select_arg_set 1
   printf 'q1_name=%s\n' "${Q1_NAME:-}"
   printf 'q1_path=%s\n' "${Q1_PATH:-}"
   printf 'q2_glob=%s\n' "${Q2_GLOB:-}"
@@ -129,27 +190,40 @@ fi
   printf 'q3_min_bytes=%s\n' "${Q3_MIN:-}"
   printf 'q4_subtree=%s\n' "${Q4_SUBTREE:-}"
   printf 'q5_subtree=%s\n' "${Q5_SUBTREE:-}"
+  printf 'q6_glob=%s\n' "${Q6_GLOB:-}"
+  printf 'q6_index_term=%s\n' "${Q6_INDEX_TERM:-}"
+  printf 'q6_exact_filter=%s\n' "${Q6_ERE:-}"
   [[ -z "${q2_expected:-}" ]] || printf 'q2_expected=%s\n' "$q2_expected"
   [[ -z "${q3_expected:-}" ]] || printf 'q3_expected=%s\n' "$q3_expected"
+  [[ -z "${q6_expected:-}" ]] || printf 'q6_expected=%s\n' "$q6_expected"
 } >"$OUT/query_params.txt"
+unset _s _key _want
 
 CSV="$OUT/query_results.csv"
-echo "tool,query,rep,status,elapsed_sec,result_count,notes" >"$CSV"
+echo "tool,query,rep,cache,arg_set,status,elapsed_sec,result_count,notes" >"$CSV"
+
+# Appended to every per-pass filename so four passes in one repetition do not
+# overwrite each other's output. Empty for the first pass, which keeps the name
+# summarize.py looks for first when it quotes a command's output.
+RUN_TAG=""
 
 append_q() {
-  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY' >>"$CSV"
+  # The pass a row belongs to is a property of the run, not something each of the
+  # forty call sites below should have to remember to pass in.
+  python3 - "$1" "$2" "$3" "$(cache_label)" "$ARG_SET" "$4" "$5" "$6" "$7" <<'PY' >>"$CSV"
 import sys, csv
 w = csv.writer(sys.stdout)
-w.writerow(sys.argv[1:8])
+w.writerow(sys.argv[1:10])
 PY
 }
 
-# A tool that cannot run at all still owes the table five rows: recording only
-# Q1 leaves the others missing, which reads as "not attempted" rather than "not
-# possible", and the reason is then nowhere.
+# A tool that cannot run at all still owes the table one row per query: recording
+# only Q1 leaves the others missing, which reads as "not attempted" rather than
+# "not possible", and the reason is then nowhere.
+QUERY_LIST="Q1 Q2 Q3 Q4 Q5 Q6"
 skip_all_queries() {
   local tool=$1 rep=$2 reason=$3 q
-  for q in Q1 Q2 Q3 Q4 Q5; do
+  for q in $QUERY_LIST; do
     append_q "$tool" "$q" "$rep" skipped "" 0 "$reason"
   done
 }
@@ -158,9 +232,10 @@ time_count() {
   # Args: tool query rep cmd...  — runs cmd, counts non-empty stdout lines, times via TIMEFORMAT
   local tool=$1 query=$2 rep=$3
   shift 3
-  local tfile="$OUT/${tool}_${query}_r${rep}.time.txt"
-  local ofile="$OUT/${tool}_${query}_r${rep}.out.txt"
-  local efile="$OUT/${tool}_${query}_r${rep}.err.txt"
+  local stem="${tool}_${query}_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
+  local ofile="$OUT/${stem}.out.txt"
+  local efile="$OUT/${stem}.err.txt"
   set +e
   time_cmd "$tfile" "$@" >"$ofile" 2>"$efile"
   local st=$?
@@ -190,21 +265,30 @@ q_find() {
   # find has no aggregate primitive; the `du` rows carry Q4 for this pairing.
   append_q find Q4 "$rep" skipped "" 0 "no_aggregate_primitive_see_du_row"
   time_count find Q5 "$rep" find "$Q5_SUBTREE" -xdev -type f
+  # Q6 is Q2 with the leading anchor removed, so find does exactly the same work
+  # for it: a full walk either way. That is the reference the indexes are read
+  # against, and the difference between Q2 and Q6 is what the indexes make of it.
+  if [[ -n "$Q6_GLOB" ]]; then
+    time_count find Q6 "$rep" find "$TREE" -xdev -name "$Q6_GLOB"
+  else
+    append_q find Q6 "$rep" skipped "" 0 "no_q6_glob_in_the_seed_manifest"
+  fi
 }
 
 # du/dua answer Q4 only: they total bytes and have no name, type or size
 # predicates, so the remaining queries are genuinely out of scope for them.
 q_du() {
   local rep=$1
-  local tfile="$OUT/du_Q4_r${rep}.time.txt"
+  local stem="du_Q4_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
   set +e
   time_cmd "$tfile" du -sb "$Q4_SUBTREE" \
-    >"$OUT/du_Q4_r${rep}.out.txt" 2>"$OUT/du_Q4_r${rep}.err.txt"
+    >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
   local st=$?
   set -e
   local el bytes
   el=$(elapsed_from_time_v "$tfile" || echo "")
-  bytes=$(awk 'NR == 1 { print $1 }' "$OUT/du_Q4_r${rep}.out.txt")
+  bytes=$(awk 'NR == 1 { print $1 }' "$OUT/${stem}.out.txt")
   if [[ $st -eq 0 ]]; then
     append_q du Q4 "$rep" ok "${el:-}" "${bytes:-0}" "du_sb_bytes"
   elif [[ $st -eq 1 ]]; then
@@ -213,7 +297,7 @@ q_du() {
     append_q du Q4 "$rep" fail "${el:-}" 0 "exit=$st"
   fi
   local q
-  for q in Q1 Q2 Q3 Q5; do
+  for q in Q1 Q2 Q3 Q5 Q6; do
     append_q du "$q" "$rep" skipped "" 0 "du_totals_bytes_only_no_search_predicates"
   done
 }
@@ -226,15 +310,16 @@ q_dua() {
   fi
   local sentinel
   sentinel=$(dua_sentinel "$OUT")
-  local tfile="$OUT/dua_Q4_r${rep}.time.txt"
+  local stem="dua_Q4_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
   set +e
   time_cmd "$tfile" "$DUA_BIN" "${DUA_AGG_ARGS[@]}" "$Q4_SUBTREE" "$sentinel" \
-    >"$OUT/dua_Q4_r${rep}.out.txt" 2>"$OUT/dua_Q4_r${rep}.err.txt"
+    >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
   local st=$?
   set -e
   local el bytes note
   el=$(elapsed_from_time_v "$tfile" || echo "")
-  bytes=$(dua_bytes_for_path "$OUT/dua_Q4_r${rep}.out.txt" "$Q4_SUBTREE")
+  bytes=$(dua_bytes_for_path "$OUT/${stem}.out.txt" "$Q4_SUBTREE")
   note="dua_apparent_bytes"
   [[ "$DUA_HAS_BYTES" == "1" ]] || note="dua_build_lacks_--format_bytes_count_unparsed"
   if [[ $st -eq 0 ]]; then
@@ -243,7 +328,7 @@ q_dua() {
     append_q dua Q4 "$rep" fail "${el:-}" 0 "exit=$st"
   fi
   local q
-  for q in Q1 Q2 Q3; do
+  for q in Q1 Q2 Q3 Q6; do
     append_q dua "$q" "$rep" skipped "" 0 "dua_totals_bytes_only_no_search_predicates"
   done
   # --stats reports entries traversed (files plus directories), which is not the
@@ -263,8 +348,10 @@ search_filter_script() {
 # Q1/Q2 run the trigram index for the smallest candidate set it can produce, then
 # a basename-anchored regex to land on find's exact answer: the index matches a
 # literal substring anywhere in the path, which is a superset of what -name means.
-# Q3/Q4/Q5 read the capture with ecrawl_analyze, which selects records without
-# rebuilding a path for each one.
+# Q3/Q4/Q5 read the capture with ecrawl_query, which selects records without
+# rebuilding a path for each one; Q4 and Q5 also read the dir-index sidecars the
+# same ereport_index --make build wrote, so both halves of the suite depend on
+# that phase and on it having indexed this exact capture.
 q_suite() {
   local rep=$1
   local idx=${EREPORT_INDEX_DIR:-}
@@ -289,26 +376,49 @@ q_suite() {
     else
       append_q ereport_index Q2 "$rep" skipped "" 0 "glob_has_no_literal_run_for_the_trigram_index"
     fi
+    # Q6 needs no new machinery: the longest literal run of '*token*.dat' is the
+    # token, so the index is handed the most selective term the query contains
+    # and does not care that it sits in the middle of the name. That is the
+    # difference this query exists to show.
+    if [[ -n "$Q6_INDEX_TERM" ]]; then
+      time_count ereport_index Q6 "$rep" bash -c \
+        "$(search_filter_script "$idx" "$Q6_INDEX_TERM" "$Q6_ERE")"
+    else
+      append_q ereport_index Q6 "$rep" skipped "" 0 "glob_has_no_literal_run_for_the_trigram_index"
+    fi
   else
     append_q ereport_index Q1 "$rep" skipped "" 0 "need_EREPORT_INDEX_DIR"
     append_q ereport_index Q2 "$rep" skipped "" 0 "need_EREPORT_INDEX_DIR"
+    append_q ereport_index Q6 "$rep" skipped "" 0 "need_EREPORT_INDEX_DIR"
   fi
   TOLERATE_EXIT1=0
   EXIT1_NOTE=""
   NOTE=""
 
-  if [[ -z "$bins" || ! -d "$bins" ]] || ! tool_available ecrawl_analyze; then
+  if [[ -z "$bins" || ! -d "$bins" ]] || ! tool_available ecrawl_query; then
     local q
     for q in Q3 Q4 Q5; do
-      append_q ecrawl_analyze "$q" "$rep" skipped "" 0 "need_ECRAWL_BIN_DIR_and_ecrawl_analyze"
+      append_q ecrawl_query "$q" "$rep" skipped "" 0 "need_ECRAWL_BIN_DIR_and_ecrawl_query"
     done
     return 0
   fi
 
+  # The two subtree queries read the dir-index sidecars ereport_index --make
+  # writes beside the trigram index: Q4 looks its root up instead of
+  # materialising every directory row, Q5 additionally scans only the row groups
+  # whose DFS sketch can hold a descendant. Not a variant of its own -- the build
+  # is already a timed, sized row of its own -- so the rows use it outright, and
+  # a run without an index phase still answers both, from the catalog. Q3 has no
+  # subtree to resolve and is left alone. The sidecars are bound to the shards
+  # they were built from, so this is the same directory the Q1/Q2/Q6 rows search.
+  local analyze_idx=()
+  [[ -z "$idx" || ! -d "$idx" ]] || analyze_idx=(--index-dir "$idx")
+
   # Q3 and Q5 print paths, exactly as find does, so the line count is the answer.
   NOTE="capture_scan"
-  time_count ecrawl_analyze Q3 "$rep" "$ECRAWL_ANALYZE_BIN" --size-gt "$Q3_MIN" --type f --list "$bins"
-  time_count ecrawl_analyze Q5 "$rep" "$ECRAWL_ANALYZE_BIN" --subtree "$Q5_SUBTREE" --type f --list "$bins"
+  time_count ecrawl_query Q3 "$rep" "$ECRAWL_QUERY_BIN" --size-gt "$Q3_MIN" --type f --list "$bins"
+  time_count ecrawl_query Q5 "$rep" "$ECRAWL_QUERY_BIN" "${analyze_idx[@]}" \
+    --subtree "$Q5_SUBTREE" --type f --list "$bins"
   NOTE=""
 
   # Q4 is one number: apparent bytes with each multiply-linked inode counted
@@ -316,44 +426,55 @@ q_suite() {
   #
   # Since ERCBIN08 this is the one query that may not read records at all: a bare
   # --subtree aggregate is answered from the catalog's subtree prefix sums, which
-  # is O(directories) instead of O(files). It falls back to a full scan when any
-  # record under $Q4_SUBTREE has nlink > 1, because crawl-time hardlink credit is
-  # attributed to the first link seen anywhere in the tree while a scan dedups
-  # within the subtree. The two paths differ by orders of magnitude, and which one
-  # runs is a property of the fixture, so record answered_from in the note rather
-  # than leaving an unexplained swing between trees.
-  local tfile="$OUT/ecrawl_analyze_Q4_r${rep}.time.txt"
+  # is O(directories) instead of O(files), and with --index-dir from the one
+  # directory row the sidecar points at, which is O(1). It falls back to a full
+  # scan when any record under $Q4_SUBTREE has nlink > 1, because crawl-time
+  # hardlink credit is attributed to the first link seen anywhere in the tree
+  # while a scan dedups within the subtree. The three paths differ by orders of
+  # magnitude, and which one runs is a property of the fixture and of whether the
+  # index phase ran, so record answered_from (dir_index, catalog_rollup or
+  # record_scan) in the note rather than leaving an unexplained swing between
+  # trees.
+  local stem="ecrawl_query_Q4_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
   set +e
-  time_cmd "$tfile" "$ECRAWL_ANALYZE_BIN" --subtree "$Q4_SUBTREE" "$bins" \
-    >"$OUT/ecrawl_analyze_Q4_r${rep}.out.txt" 2>"$OUT/ecrawl_analyze_Q4_r${rep}.err.txt"
+  time_cmd "$tfile" "$ECRAWL_QUERY_BIN" "${analyze_idx[@]}" --subtree "$Q4_SUBTREE" "$bins" \
+    >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
   local st=$?
   set -e
   local el bytes answered scanned
   el=$(elapsed_from_time_v "$tfile" || echo "")
-  bytes=$(sed -n 's/^bytes=//p' "$OUT/ecrawl_analyze_Q4_r${rep}.out.txt" | tail -1 || true)
-  answered=$(sed -n 's/^answered_from=//p' "$OUT/ecrawl_analyze_Q4_r${rep}.out.txt" | tail -1 || true)
-  scanned=$(sed -n 's/^records_scanned=//p' "$OUT/ecrawl_analyze_Q4_r${rep}.out.txt" | tail -1 || true)
+  bytes=$(sed -n 's/^bytes=//p' "$OUT/${stem}.out.txt" | tail -1 || true)
+  answered=$(sed -n 's/^answered_from=//p' "$OUT/${stem}.out.txt" | tail -1 || true)
+  scanned=$(sed -n 's/^records_scanned=//p' "$OUT/${stem}.out.txt" | tail -1 || true)
   if [[ $st -ne 0 ]]; then
-    append_q ecrawl_analyze Q4 "$rep" fail "${el:-}" 0 "exit=$st"
+    append_q ecrawl_query Q4 "$rep" fail "${el:-}" 0 "exit=$st"
   else
-    append_q ecrawl_analyze Q4 "$rep" ok "${el:-}" "${bytes:-0}" \
+    append_q ecrawl_query Q4 "$rep" ok "${el:-}" "${bytes:-0}" \
       "${answered:-answered_from_unknown}; records_scanned=${scanned:-?}; du_sb_semantics"
   fi
 }
 
-q_gufi() {
-  local rep=$1
-  local gidx=${GUFI_INDEX_DIR:-}
+# One GUFI series per index the run built. rolled_up=1 is the index gufi_rollup
+# post-processed, which is the only one gufi_du can answer Q4 from -- and the one
+# that cost several times as much to build. Charting both under one name made a
+# cheap index look like it answered a question only the expensive one can.
+q_gufi_index() {
+  local tool=$1 gidx=$2 rolled_up=$3 rep=$4
   if [[ -z "$gidx" || ! -d "$gidx" ]]; then
-    skip_all_queries gufi "$rep" "need_GUFI_INDEX_DIR"
+    skip_all_queries "$tool" "$rep" "need_GUFI_INDEX_DIR"
     return 0
   fi
   if ! have_cmd "$GUFI_FIND"; then
-    skip_all_queries gufi "$rep" "gufi_find_missing"
+    skip_all_queries "$tool" "$rep" "gufi_find_missing"
     return 0
   fi
-  if [[ -n "$GUFI_CONFIG_NOTE" ]]; then
-    skip_all_queries gufi "$rep" "no_gufi_config: $GUFI_CONFIG_NOTE"
+  # IndexRoot is compiled into the wrappers' config file, so switching index
+  # means rewriting it. Done here, before the queries, rather than once at
+  # startup: the two series read two different trees.
+  local why
+  if ! why=$(gufi_write_config "$gidx"); then
+    skip_all_queries "$tool" "$rep" "no_gufi_config: $why"
     return 0
   fi
   # Every path below is relative to IndexRoot, which gufi_find prepends and
@@ -363,45 +484,76 @@ q_gufi() {
   if ! rel_tree=$(gufi_rel_path "$TREE" "$TREE") ||
     ! rel_q4=$(gufi_rel_path "$Q4_SUBTREE" "$TREE") ||
     ! rel_q5=$(gufi_rel_path "$Q5_SUBTREE" "$TREE"); then
-    skip_all_queries gufi "$rep" "query_paths_outside_the_indexed_tree"
+    skip_all_queries "$tool" "$rep" "query_paths_outside_the_indexed_tree"
     return 0
   fi
 
-  local NOTE="index_relative_to_$(gufi_config_path)"
-  if [[ -n "$Q1_NAME" ]] && ! blocked gufi Q1 "$rep"; then
-    time_count gufi Q1 "$rep" "$GUFI_FIND" "$rel_tree" -name "$Q1_NAME"
+  local NOTE
+  NOTE="index_relative_to_$(gufi_config_path)"
+  [[ "$rolled_up" == "1" ]] || NOTE="$NOTE; dir2index_only_no_rollup"
+  if [[ -n "$Q1_NAME" ]] && ! blocked "$tool" Q1 "$rep"; then
+    time_count "$tool" Q1 "$rep" "$GUFI_FIND" "$rel_tree" -name "$Q1_NAME"
   fi
-  blocked gufi Q2 "$rep" ||
-    time_count gufi Q2 "$rep" "$GUFI_FIND" "$rel_tree" -name "$Q2_GLOB"
-  blocked gufi Q3 "$rep" ||
-    time_count gufi Q3 "$rep" "$GUFI_FIND" "$rel_tree" -type f -size "+${Q3_MIN}c"
-  if blocked gufi Q4 "$rep"; then
+  blocked "$tool" Q2 "$rep" ||
+    time_count "$tool" Q2 "$rep" "$GUFI_FIND" "$rel_tree" -name "$Q2_GLOB"
+  blocked "$tool" Q3 "$rep" ||
+    time_count "$tool" Q3 "$rep" "$GUFI_FIND" "$rel_tree" -type f -size "+${Q3_MIN}c"
+  if blocked "$tool" Q4 "$rep"; then
     :
-  elif have_cmd "$GUFI_DU"; then
-    local tfile="$OUT/gufi_Q4_r${rep}.time.txt"
+  elif ! have_cmd "$GUFI_DU"; then
+    append_q "$tool" Q4 "$rep" skipped "" 0 "gufi_du_missing"
+  elif [[ "$rolled_up" != "1" ]]; then
+    # gufi_du -s answers from treesummary rows, and only gufi_rollup writes
+    # them: on a plain index it warns, prints 0 and still exits 0. Recording
+    # that as an answer would credit the cheap index with the expensive one's
+    # capability, so this is a skip with its own reason.
+    append_q "$tool" Q4 "$rep" skipped "" 0 \
+      "rollup_required_gufi_du_reads_treesummary_rows_only_gufi_rollup_writes"
+  else
+    local stem="${tool}_Q4_r${rep}${RUN_TAG}"
+    local tfile="$OUT/${stem}.time.txt"
     set +e
     # --block-size 1 with --apparent-size is du -sb: file lengths, unrounded,
     # which is the convention every other Q4 row reports.
     time_cmd "$tfile" "$GUFI_DU" -s --apparent-size --block-size 1 "$rel_q4" \
-      >"$OUT/gufi_Q4_r${rep}.out.txt" 2>"$OUT/gufi_Q4_r${rep}.err.txt"
+      >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
     local st=$?
     set -e
     local el bytes
     el=$(elapsed_from_time_v "$tfile" || echo "")
     # `<bytes> <path>`, as du prints it.
-    bytes=$(awk 'NF && $1 ~ /^[0-9]+$/ { print $1; exit }' "$OUT/gufi_Q4_r${rep}.out.txt" 2>/dev/null || true)
+    bytes=$(awk 'NF && $1 ~ /^[0-9]+$/ { print $1; exit }' "$OUT/${stem}.out.txt" 2>/dev/null || true)
     if [[ $st -ne 0 ]]; then
-      append_q gufi Q4 "$rep" fail "${el:-}" 0 "exit=$st"
+      append_q "$tool" Q4 "$rep" fail "${el:-}" 0 "exit=$st"
     elif [[ -z "$bytes" ]]; then
-      append_q gufi Q4 "$rep" fail "${el:-}" 0 "gufi_du_printed_no_byte_total"
+      append_q "$tool" Q4 "$rep" fail "${el:-}" 0 "gufi_du_printed_no_byte_total"
     else
-      append_q gufi Q4 "$rep" ok "${el:-}" "$bytes" "gufi_du_-s_--apparent-size"
+      append_q "$tool" Q4 "$rep" ok "${el:-}" "$bytes" "gufi_du_-s_--apparent-size"
     fi
-  else
-    append_q gufi Q4 "$rep" skipped "" 0 "gufi_du_missing"
   fi
-  blocked gufi Q5 "$rep" || time_count gufi Q5 "$rep" "$GUFI_FIND" "$rel_q5" -type f
+  blocked "$tool" Q5 "$rep" || time_count "$tool" Q5 "$rep" "$GUFI_FIND" "$rel_q5" -type f
+  if [[ -z "$Q6_GLOB" ]]; then
+    append_q "$tool" Q6 "$rep" skipped "" 0 "no_q6_glob_in_the_seed_manifest"
+  else
+    blocked "$tool" Q6 "$rep" ||
+      time_count "$tool" Q6 "$rep" "$GUFI_FIND" "$rel_tree" -name "$Q6_GLOB"
+  fi
   NOTE=""
+}
+
+q_gufi() {
+  local rep=$1 ran=0
+  if [[ -n "$GUFI_PLAIN_INDEX_DIR" ]]; then
+    q_gufi_index gufi "$GUFI_PLAIN_INDEX_DIR" 0 "$rep"
+    ran=1
+  fi
+  if [[ -n "$GUFI_ROLLUP_INDEX_DIR" ]]; then
+    q_gufi_index gufi_rollup "$GUFI_ROLLUP_INDEX_DIR" 1 "$rep"
+    ran=1
+  fi
+  # No pointer from the index phase and no override: say so once under the plain
+  # name rather than twice under two.
+  ((ran)) || q_gufi_index gufi "" 0 "$rep"
 }
 
 q_xdu() {
@@ -416,8 +568,15 @@ q_xdu() {
   if [[ -n "$Q1_NAME" ]] && ! blocked xdu Q1 "$rep"; then
     time_count xdu Q1 "$rep" "$XDU_FIND" -i "$xidx" -p "/${Q1_NAME}\$"
   fi
-  blocked xdu Q2 "$rep" ||
-    time_count xdu Q2 "$rep" "$XDU_FIND" -i "$xidx" -p 'slurm-[^/]*\.out$'
+  # Q2_ERE is the glob translated to a path-anchored regex, which is the only
+  # form xdu-find takes. Spelling one glob's regex out by hand here worked while
+  # there was one argument set and answered the wrong question once there were
+  # three.
+  if [[ -z "$Q2_ERE" ]]; then
+    append_q xdu Q2 "$rep" skipped "" 0 "glob_does_not_translate_to_a_path_regex"
+  elif ! blocked xdu Q2 "$rep"; then
+    time_count xdu Q2 "$rep" "$XDU_FIND" -i "$xidx" -p "$Q2_ERE"
+  fi
   # Q3 and Q4 are the two size questions, and this index only holds a size the
   # rest of the comparison would recognise if it was built with
   # --apparent-size. Without it the records carry st_blocks, so a sparse 500 MB
@@ -448,18 +607,19 @@ q_xdu() {
   if [[ "$xdu_blocks_only" == "1" ]]; then
     append_q xdu Q4 "$rep" skipped "" 0 "$unit_skip"
   elif ! blocked xdu Q4 "$rep"; then
-    local tfile="$OUT/xdu_Q4_r${rep}.time.txt"
+    local stem4="xdu_Q4_r${rep}${RUN_TAG}"
+    local tfile="$OUT/${stem4}.time.txt"
     set +e
     time_cmd "$tfile" "$XDU_FIND" -i "$xidx" -p "^${pref}/" -f size \
-      >"$OUT/xdu_Q4_r${rep}.out.txt" 2>"$OUT/xdu_Q4_r${rep}.err.txt"
+      >"$OUT/${stem4}.out.txt" 2>"$OUT/${stem4}.err.txt"
     local st=$?
     set -e
     local el sum
     el=$(elapsed_from_time_v "$tfile" || echo "")
-    sum=$(size_field_sum "$OUT/xdu_Q4_r${rep}.out.txt")
+    sum=$(size_field_sum "$OUT/${stem4}.out.txt")
     if [[ $st -ne 0 ]]; then
       append_q xdu Q4 "$rep" fail "${el:-}" 0 "exit=$st"
-    elif [[ -z "$sum" && ! -s "$OUT/xdu_Q4_r${rep}.out.txt" ]]; then
+    elif [[ -z "$sum" && ! -s "$OUT/${stem4}.out.txt" ]]; then
       # Empty and unparsable are different faults: no records under the prefix
       # points at the prefix, not at how xdu prints a size.
       append_q xdu Q4 "$rep" fail "${el:-}" 0 "xdu-find_matched_no_records_under_${pref}"
@@ -473,15 +633,16 @@ q_xdu() {
   # --count prints the total, so the answer is the number it printed, not the
   # one line it printed it on.
   if ! blocked xdu Q5 "$rep"; then
-    local tfile5="$OUT/xdu_Q5_r${rep}.time.txt"
+    local stem5="xdu_Q5_r${rep}${RUN_TAG}"
+    local tfile5="$OUT/${stem5}.time.txt"
     set +e
     time_cmd "$tfile5" "$XDU_FIND" -i "$xidx" -p "^${pref}/" --count \
-      >"$OUT/xdu_Q5_r${rep}.out.txt" 2>"$OUT/xdu_Q5_r${rep}.err.txt"
+      >"$OUT/${stem5}.out.txt" 2>"$OUT/${stem5}.err.txt"
     local st5=$?
     set -e
     local el5 count
     el5=$(elapsed_from_time_v "$tfile5" || echo "")
-    count=$(grep -oE '[0-9][0-9,]*' "$OUT/xdu_Q5_r${rep}.out.txt" 2>/dev/null | head -1 | tr -d ',' || true)
+    count=$(grep -oE '[0-9][0-9,]*' "$OUT/${stem5}.out.txt" 2>/dev/null | head -1 | tr -d ',' || true)
     if [[ $st5 -ne 0 ]]; then
       append_q xdu Q5 "$rep" fail "${el5:-}" 0 "exit=$st5"
     elif [[ -z "$count" ]]; then
@@ -489,6 +650,15 @@ q_xdu() {
     else
       append_q xdu Q5 "$rep" ok "${el5:-}" "$count" "xdu-find_--count"
     fi
+  fi
+
+  # Q6 is the same predicate shape as Q2 with the leading anchor dropped, which
+  # for a regex over full paths is one character of difference and no help from
+  # the index either way.
+  if [[ -z "$Q6_ERE" ]]; then
+    append_q xdu Q6 "$rep" skipped "" 0 "no_q6_glob_in_the_seed_manifest"
+  elif ! blocked xdu Q6 "$rep"; then
+    time_count xdu Q6 "$rep" "$XDU_FIND" -i "$xidx" -p "$Q6_ERE"
   fi
   NOTE=""
 }
@@ -511,6 +681,31 @@ q_fd() {
   fi
   append_q fd Q4 "$rep" skipped "" 0 "fd_has_no_du_equivalent"
   time_count fd Q5 "$rep" "$FD_BIN" "${FD_COMMON_ARGS[@]}" -t f . "$Q5_SUBTREE"
+  if [[ -n "$Q6_GLOB" ]]; then
+    time_count fd Q6 "$rep" "$FD_BIN" "${FD_COMMON_ARGS[@]}" -t f -g "$Q6_GLOB" "$TREE"
+  else
+    append_q fd Q6 "$rep" skipped "" 0 "no_q6_glob_in_the_seed_manifest"
+  fi
+}
+
+# Runs once per query phase, not once per repetition: creating an index that is
+# already there costs a failed statement and a confusing log line.
+RBH_INDEX_STATE=""
+rbh_ensure_indexes_for_queries() {
+  [[ -z "$RBH_INDEX_STATE" ]] || return 0
+  local have
+  have=$(rbh_indexes_present)
+  if [[ "$have" == "3" ]]; then
+    RBH_INDEX_STATE="from_the_index_phase"
+    return 0
+  fi
+  if rbh_create_indexes; then
+    RBH_INDEX_STATE="created_here_untimed"
+    harness_warn "robinhood: created the three query indexes ($have/3 were present); the index phase did not"
+  else
+    RBH_INDEX_STATE="incomplete"
+    harness_warn "robinhood: could not create all three query indexes; rows may reflect table scans"
+  fi
 }
 
 q_robinhood() {
@@ -528,6 +723,16 @@ q_robinhood() {
   local cfg_args=(-f "$RBH_CONFIG")
   # Robinhood's own restart is the only cache this row has; see maybe_drop_caches.
   local USES_DB=1
+  # The index phase creates the three indexes and times it. When it did not run
+  # -- a standalone run_queries.sh, or a results directory whose crawl predates
+  # this -- create them here instead, untimed: nobody runs a relational database
+  # unindexed, so measuring one would report a configuration that does not exist.
+  rbh_ensure_indexes_for_queries
+  # ENTRIES is keyed by inode and rbh-find prints one path per entry, so a file
+  # with four links is one row here and four for find. On the seeded tree that is
+  # a constant six-row shortfall at every Q3 threshold, and it is an accounting
+  # difference rather than a miss: every one of the six is a hard link.
+  local NOTE="one_name_per_inode"
   if [[ -n "$Q1_NAME" ]] && ! blocked robinhood Q1 "$rep"; then
     time_count robinhood Q1 "$rep" "$RBH_FIND" "${cfg_args[@]}" "$TREE" -name "$Q1_NAME"
   fi
@@ -541,15 +746,16 @@ q_robinhood() {
   elif have_cmd "${RBH_DU:-}"; then
     # Q4 is one number, not a list, so the line count time_count records would
     # be 1 whatever the answer was.
-    local tfile="$OUT/robinhood_Q4_r${rep}.time.txt"
+    local stem="robinhood_Q4_r${rep}${RUN_TAG}"
+    local tfile="$OUT/${stem}.time.txt"
     set +e
     time_cmd "$tfile" "$RBH_DU" "${cfg_args[@]}" -s "${RBH_DU_ARGS[@]}" "$Q4_SUBTREE" \
-      >"$OUT/robinhood_Q4_r${rep}.out.txt" 2>"$OUT/robinhood_Q4_r${rep}.err.txt"
+      >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
     local st=$?
     set -e
     local el bytes
     el=$(elapsed_from_time_v "$tfile" || echo "")
-    bytes=$(grep -oE '[0-9]+' "$OUT/robinhood_Q4_r${rep}.out.txt" 2>/dev/null | head -1 || true)
+    bytes=$(grep -oE '[0-9]+' "$OUT/${stem}.out.txt" 2>/dev/null | head -1 || true)
     if [[ $st -ne 0 ]]; then
       append_q robinhood Q4 "$rep" fail "${el:-}" 0 "exit=$st"
     elif [[ -z "$bytes" ]]; then
@@ -562,6 +768,17 @@ q_robinhood() {
   fi
   blocked robinhood Q5 "$rep" ||
     time_count robinhood Q5 "$rep" "$RBH_FIND" "${cfg_args[@]}" "$Q5_SUBTREE" -type f
+  # Q6 asks for a substring with nothing anchored at the front, which is the one
+  # shape a B-tree on NAMES.name cannot narrow: name_index is there and the
+  # optimiser still has to read every row. Same predicate as Q2, same index, and
+  # the difference between the two rows is the whole reason Q6 exists.
+  NOTE="$NOTE; name_index_cannot_seek_an_unanchored_substring"
+  if [[ -z "$Q6_GLOB" ]]; then
+    append_q robinhood Q6 "$rep" skipped "" 0 "no_q6_glob_in_the_seed_manifest"
+  elif ! blocked robinhood Q6 "$rep"; then
+    time_count robinhood Q6 "$rep" "$RBH_FIND" "${cfg_args[@]}" "$TREE" -name "$Q6_GLOB"
+  fi
+  NOTE=""
 }
 
 # ---- probe pass ----
@@ -612,13 +829,23 @@ probe_gufi() {
   have_cmd "$GUFI_FIND" || return 0
   local rel_q5
   rel_q5=$(gufi_rel_path "$Q5_SUBTREE" "$TREE") || return 0
-  probe_for gufi "Q1 Q2" gufi_name "$GUFI_FIND" "$rel_q5" -name "$PROBE_NO_MATCH"
-  probe_for gufi "Q3" gufi_size "$GUFI_FIND" "$rel_q5" -type f -size "+${Q3_MIN}c"
-  probe_for gufi "Q5" gufi_type "$GUFI_FIND" "$rel_q5" -type f
-  if have_cmd "$GUFI_DU"; then
+  # Whether gufi_find accepts a predicate is a property of the binary, not of
+  # the index behind it, so one probe speaks for both series.
+  local series
+  for series in gufi gufi_rollup; do
+    probe_for "$series" "Q1 Q2 Q6" gufi_name "$GUFI_FIND" "$rel_q5" -name "$PROBE_NO_MATCH"
+    probe_for "$series" "Q3" gufi_size "$GUFI_FIND" "$rel_q5" -type f -size "+${Q3_MIN}c"
+    probe_for "$series" "Q5" gufi_type "$GUFI_FIND" "$rel_q5" -type f
+  done
+  # Q4 is only asked of the rolled-up series, and only that index can answer it,
+  # so probing it against the plain one would report a capability the run then
+  # refuses to use.
+  if have_cmd "$GUFI_DU" && [[ -n "$GUFI_ROLLUP_INDEX_DIR" ]]; then
     local rel_q4
     rel_q4=$(gufi_rel_path "$Q4_SUBTREE" "$TREE") || return 0
-    probe_for gufi "Q4" gufi_du "$GUFI_DU" -s --apparent-size --block-size 1 "$rel_q4"
+    gufi_write_config "$GUFI_ROLLUP_INDEX_DIR" >/dev/null || return 0
+    probe_for gufi_rollup "Q4" gufi_du "$GUFI_DU" -s --apparent-size --block-size 1 "$rel_q4"
+    gufi_write_config "$GUFI_PROBE_INDEX_DIR" >/dev/null || true
   fi
   return 0
 }
@@ -628,7 +855,7 @@ probe_robinhood() {
   # Probing a schema-less database would only rediscover the missing tables and
   # blame the predicate for it.
   rbh_schema_ready || return 0
-  probe_for robinhood "Q1 Q2" rbh_name "$RBH_FIND" -f "$RBH_CONFIG" "$Q5_SUBTREE" -name "$PROBE_NO_MATCH"
+  probe_for robinhood "Q1 Q2 Q6" rbh_name "$RBH_FIND" -f "$RBH_CONFIG" "$Q5_SUBTREE" -name "$PROBE_NO_MATCH"
   probe_for robinhood "Q3" rbh_size "$RBH_FIND" -f "$RBH_CONFIG" "$Q5_SUBTREE" -type f \
     -size "$(rbh_size_arg "$Q3_MIN")"
   probe_for robinhood "Q5" rbh_type "$RBH_FIND" -f "$RBH_CONFIG" "$Q5_SUBTREE" -type f
@@ -642,7 +869,7 @@ probe_xdu() {
   local xidx=${XDU_INDEX_DIR:-}
   [[ -n "$xidx" && -d "$xidx" ]] || return 0
   have_cmd "$XDU_FIND" || return 0
-  probe_for xdu "Q1 Q2 Q5" xdu_regex "$XDU_FIND" -i "$xidx" -p "$PROBE_NO_MATCH"
+  probe_for xdu "Q1 Q2 Q5 Q6" xdu_regex "$XDU_FIND" -i "$xidx" -p "$PROBE_NO_MATCH"
   # No point asking whether the predicate parses when the sizes behind it are in
   # the wrong unit; q_xdu skips both size queries for that reason instead.
   if ((${#XDU_SIZE_ARGS[@]} > 0)); then
@@ -677,28 +904,57 @@ blocked() {
 
 REPS_MAX=$(max_tool_reps $TOOLS)
 echo "==> repetitions: $(reps_plan $TOOLS)"
+printf '==> passes per rep: %s\n' "${QUERY_PASSES[*]}"
+
+run_one_tool() {
+  local t=$1 rep=$2
+  case "$t" in
+    find) q_find "$rep" ;;
+    fd) q_fd "$rep" ;;
+    du) q_du "$rep" ;;
+    dua) q_dua "$rep" ;;
+    ecrawl_suite|suite) q_suite "$rep" ;;
+    gufi) q_gufi "$rep" ;;
+    xdu) q_xdu "$rep" ;;
+    robinhood) q_robinhood "$rep" ;;
+    *) echo "WARN: unknown tool $t" >&2 ;;
+  esac
+}
 
 for ((rep = 1; rep <= REPS_MAX; rep++)); do
   export CURRENT_REP=$rep
-  for t in $TOOLS; do
-    t_reps=$(tool_reps "$t")
-    # A tool that has had its repetitions still leaves the others running, so
-    # the query series each one sees is unchanged.
-    ((rep <= t_reps)) || continue
-    printf '==> rep %d/%d: %s Q1-Q5 (%s)\n' "$rep" "$t_reps" "$t" "$(date +%H:%M:%S)"
-    case "$t" in
-      find) q_find "$rep" ;;
-      fd) q_fd "$rep" ;;
-      du) q_du "$rep" ;;
-      dua) q_dua "$rep" ;;
-      ecrawl_suite|suite) q_suite "$rep" ;;
-      gufi) q_gufi "$rep" ;;
-      xdu) q_xdu "$rep" ;;
-      robinhood) q_robinhood "$rep" ;;
-      *) echo "WARN: unknown tool $t" >&2 ;;
-    esac
+  for pass in "${QUERY_PASSES[@]}"; do
+    CACHE_STATE=${pass%%:*}
+    select_arg_set "${pass#*:}"
+    # One filename set per pass. The cold pass keeps the untagged names, which
+    # is what summarize.py reaches for first when it quotes a command's output.
+    if [[ "$pass" == "${QUERY_PASSES[0]}" ]]; then
+      RUN_TAG=""
+    else
+      RUN_TAG="_${CACHE_STATE}_a${ARG_SET}"
+    fi
+    for t in $TOOLS; do
+      t_reps=$(tool_reps "$t")
+      # A tool that has had its repetitions still leaves the others running, so
+      # the query series each one sees is unchanged.
+      ((rep <= t_reps)) || continue
+      printf '==> rep %d/%d %s set %d: %s Q1-Q6 (%s)\n' \
+        "$rep" "$t_reps" "$CACHE_STATE" "$ARG_SET" "$t" "$(date +%H:%M:%S)"
+      run_one_tool "$t" "$rep"
+    done
   done
 done
+
+# Robinhood's indexes are part of what a run costs, so they do not survive it:
+# the next --do crawls index-free tables, times creating them again, and the two
+# runs are comparable. Nothing else here leaves state behind for the next run.
+if [[ -n "$RBH_INDEX_STATE" ]] && rbh_schema_ready; then
+  if rbh_drop_indexes; then
+    echo "==> robinhood: dropped the three query indexes (next crawl starts index-free)"
+  else
+    harness_warn "robinhood: could not drop the query indexes; the next crawl will not be index-free"
+  fi
+fi
 
 echo "Wrote $CSV"
 echo "results=$OUT"

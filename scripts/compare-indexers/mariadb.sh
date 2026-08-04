@@ -15,7 +15,12 @@
 #                                       setup/reset/cleanup work again
 #   mariadb.sh reset
 #   mariadb.sh restart
-#   mariadb.sh bytes
+#   mariadb.sh datadir [dir]            with an argument: move MariaDB's data
+#                                       directory there, which setup does too.
+#                                       Without one: print where it is now
+#   mariadb.sh bytes                    bytes in the data directory
+#   mariadb.sh table-bytes              bytes information_schema attributes to
+#                                       Robinhood's own tables and indexes
 #   mariadb.sh cleanup
 #
 # Environment:
@@ -23,6 +28,9 @@
 #   RBH_DB_NAME=rbh_indexer_compare
 #   RBH_DB_USER=rbh_indexer_compare
 #   RBH_DB_PASSWORD=<generated when omitted>
+#   RBH_DB_DATADIR=<benchmark-tree>-work/mariadb   where the tables live
+#   RBH_DB_RELOCATE=1                              0: leave them where the
+#                                                  package put them
 #   INSTALL_MARIADB_PACKAGES=1
 #   PKG_ARGS=                                  extra dnf/apt-get arguments;
 #                                              defaults to
@@ -36,11 +44,20 @@
 # start rate limit, because a cold-cache run restarts the server before every
 # database query. cleanup removes it.
 #
+# It moves the data directory as well. Every other tool in the comparison writes
+# its index to the storage under test, while a packaged MariaDB keeps its tables
+# on the operating system's disk: that is not the same filesystem, usually not
+# the same class of device, and a Robinhood row measured against it is not
+# comparable with the rest of the table. The move is a copy of the packaged
+# datadir plus a datadir= drop-in, so cleanup can put it back.
+#
 set -euo pipefail
 
 PREFIX=${PREFIX:-"$HOME/.local/indexer-compare"}
 RBH_DB_NAME=${RBH_DB_NAME:-rbh_indexer_compare}
 RBH_DB_USER=${RBH_DB_USER:-rbh_indexer_compare}
+RBH_DB_DATADIR=${RBH_DB_DATADIR:-}
+RBH_DB_RELOCATE=${RBH_DB_RELOCATE:-1}
 INSTALL_MARIADB_PACKAGES=${INSTALL_MARIADB_PACKAGES:-1}
 # See init.sh: etckeeper's dnf plugin can block a transaction on an ssh password
 # prompt, so it is skipped by default. Setting PKG_ARGS (even to empty) replaces
@@ -62,6 +79,9 @@ CONF_DIR="$PREFIX/etc/robinhood.d"
 PASSWORD_FILE="$CONF_DIR/.dbpassword"
 CONFIG_FILE="$CONF_DIR/indexer-compare.conf"
 MARKER_FILE="$CONF_DIR/.indexer-compare-db"
+# Where the tables were before this helper moved them, and where they are now.
+# Read by cleanup to put the server back the way the package left it.
+DATADIR_STATE="$CONF_DIR/.datadir"
 LOG_DIR="$PREFIX/var/log"
 
 if [[ "$(id -u)" -eq 0 ]]; then
@@ -177,6 +197,236 @@ restart_server() {
     sleep 1
   done
   die "MariaDB did not accept connections within 60s of restarting"
+}
+
+# Where the tables go when the caller does not say: beside the benchmark tree,
+# on the filesystem under test, in the same place benchmark.sh puts the indexes
+# every other tool builds. Never inside the tree, which the tools would then
+# index as they walked it.
+default_datadir() {
+  local tree=${1%/}
+  [[ -z "$RBH_DB_DATADIR" ]] || { printf '%s' "${RBH_DB_DATADIR%/}"; return 0; }
+  printf '%s' "${tree}-work/mariadb"
+}
+
+# ---- data directory ----
+#
+# The whole point of moving it: every other tool writes its index to the storage
+# under test. A packaged MariaDB keeps its tables under /var/lib/mysql on the
+# operating system's disk, so a Robinhood row measured there answers a different
+# question from the rest of the table.
+MY_CNF_DROPIN=""
+DATADIR_DROPIN="$SYSTEMD_DROPIN_DIR/indexer-compare-datadir.conf"
+
+# Which include directory this distribution's server actually reads.
+my_cnf_dropin_path() {
+  [[ -z "$MY_CNF_DROPIN" ]] || { printf '%s' "$MY_CNF_DROPIN"; return 0; }
+  local d
+  for d in /etc/my.cnf.d /etc/mysql/mariadb.conf.d /etc/mysql/conf.d; do
+    if [[ -d "$d" ]]; then
+      MY_CNF_DROPIN="$d/zz-indexer-compare-datadir.cnf"
+      printf '%s' "$MY_CNF_DROPIN"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# What the running server says, which outranks any file: an include directory
+# this helper does not know about could be overriding all of them.
+running_datadir() {
+  local d
+  d=$(admin_sql --batch --skip-column-names -e 'SELECT @@datadir;' 2>/dev/null) || return 1
+  printf '%s' "${d%/}"
+}
+
+# systemd hardening, not permissions, is what stops a relocated datadir from
+# working: RHEL's unit sets ProtectHome=true, so a datadir anywhere under /home
+# (which is where a cluster's scratch often lives) is invisible to the server
+# however it is chowned, and ProtectSystem hides the rest.
+allow_datadir_access() {
+  local target=$1
+  command -v systemctl >/dev/null 2>&1 || return 0
+  run_root mkdir -p "$SYSTEMD_DROPIN_DIR" || return 0
+  run_root tee "$DATADIR_DROPIN" >/dev/null <<EOF
+# Added by scripts/compare-indexers/mariadb.sh. The benchmark keeps MariaDB's
+# tables on the filesystem under test, which the packaged unit's ProtectHome and
+# ProtectSystem settings would hide from the server. Removed by 'cleanup'.
+[Service]
+ProtectHome=false
+ProtectSystem=false
+ReadWritePaths=$target
+EOF
+  run_root systemctl daemon-reload || true
+}
+
+remove_datadir_access() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  [[ -f "$DATADIR_DROPIN" ]] || return 0
+  run_root rm -f "$DATADIR_DROPIN"
+  run_root rmdir --ignore-fail-on-non-empty "$SYSTEMD_DROPIN_DIR" 2>/dev/null || true
+  run_root systemctl daemon-reload || true
+}
+
+stop_server() {
+  if command -v systemctl >/dev/null 2>&1; then
+    run_root systemctl stop mariadb || true
+  elif command -v service >/dev/null 2>&1; then
+    run_root service mariadb stop || true
+  fi
+}
+
+# SELinux labels the datadir, not just its path: without mysqld_db_t the server
+# is denied its own files and the failure reads as corruption.
+label_datadir() {
+  local target=$1 source=$2
+  command -v getenforce >/dev/null 2>&1 || return 0
+  [[ "$(getenforce 2>/dev/null || true)" != "Disabled" ]] || return 0
+  if command -v semanage >/dev/null 2>&1; then
+    run_root semanage fcontext -a -e "$source" "$target" >/dev/null 2>&1 ||
+      run_root semanage fcontext -m -e "$source" "$target" >/dev/null 2>&1 || true
+  fi
+  if command -v restorecon >/dev/null 2>&1; then
+    run_root restorecon -R "$target" >/dev/null 2>&1 || true
+  elif command -v chcon >/dev/null 2>&1; then
+    run_root chcon -R --reference="$source" "$target" >/dev/null 2>&1 || true
+  fi
+}
+
+# A directory holding the system schema is a datadir; anything else is either
+# empty (fresh) or not ours to point a server at.
+datadir_populated() {
+  run_root test -d "$1/mysql" 2>/dev/null
+}
+
+write_datadir_state() {
+  {
+    printf 'datadir=%s\n' "$1"
+    printf 'original=%s\n' "$2"
+  } >"$DATADIR_STATE"
+}
+
+datadir_state_value() {
+  [[ -f "$DATADIR_STATE" ]] || return 1
+  sed -n "s/^$1=//p" "$DATADIR_STATE" | sed -n '1p'
+}
+
+# Point the server at $1, copying the current datadir there the first time. Safe
+# to call on a server that is already using it, which is what makes it something
+# --do can insist on for every run rather than only at provisioning time.
+relocate_datadir() {
+  local target=${1%/} current owner
+  [[ "$target" == /* ]] || die "RBH_DB_DATADIR must be an absolute path, not '$target'"
+  [[ "$target" != *\"* && "$target" != *$'\n'* ]] ||
+    die "the data directory path cannot contain a quote or newline"
+  case "$target" in
+    /|/etc|/etc/*|/usr|/usr/*|/bin/*|/sbin/*|/boot/*)
+      die "refusing to put MariaDB's data directory in $target" ;;
+  esac
+
+  start_server
+  current=$(running_datadir) ||
+    die "cannot ask MariaDB where its data directory is; is the server running?"
+  if [[ "$current" == "$target" ]]; then
+    # Already moved, by this run or an earlier one. Keep whatever the packaged
+    # location was; recording $current as the original would tell cleanup that
+    # this directory is where the package put it, and it would then be neither
+    # restored nor removed.
+    local original
+    original=$(datadir_state_value original 2>/dev/null || true)
+    write_datadir_state "$target" "${original:-$current}"
+    log "MariaDB data directory is already $target"
+    return 0
+  fi
+
+  local dropin
+  dropin=$(my_cnf_dropin_path) ||
+    die "no MariaDB include directory found (/etc/my.cnf.d or /etc/mysql/mariadb.conf.d); cannot set datadir"
+
+  # mkdir as the invoking user first, so a path the benchmark cannot even create
+  # fails here rather than after the server has been stopped.
+  mkdir -p "$target" ||
+    die "cannot create $target; pass a data directory on the benchmark filesystem"
+  target=$(cd "$target" && pwd)
+
+  log "moving MariaDB's data directory from $current to $target"
+  stop_server
+  if datadir_populated "$target"; then
+    # A previous run's datadir. Reusing it keeps a provisioned database across
+    # runs, which is what setup's own skip-if-configured behaviour assumes.
+    log "reusing the data directory already at $target"
+  elif command -v rsync >/dev/null 2>&1; then
+    run_root rsync -aHAX --delete "$current/" "$target/" ||
+      die "copying $current to $target failed"
+  else
+    run_root cp -a "$current/." "$target/" ||
+      die "copying $current to $target failed"
+  fi
+  # Ownership and mode of the packaged datadir, whatever the distribution chose.
+  owner=$(run_root stat -c '%U:%G' "$current" 2>/dev/null || printf 'mysql:mysql')
+  run_root chown -R "$owner" "$target" || true
+  run_root chmod 700 "$target" || true
+  label_datadir "$target" "$current"
+  allow_datadir_access "$target"
+
+  run_root tee "$dropin" >/dev/null <<EOF
+# Added by scripts/compare-indexers/mariadb.sh. The benchmark keeps MariaDB's
+# tables on the filesystem under test so that Robinhood's index is measured on
+# the same storage as every other tool's. Removed by 'cleanup'.
+[mysqld]
+datadir=$target
+EOF
+
+  write_datadir_state "$target" "$current"
+  start_server
+  local now
+  now=$(running_datadir) || now=""
+  if [[ "$now" != "$target" ]]; then
+    # Leave the server usable rather than half-moved: without this the run that
+    # follows fails on a server that will not start, which is far harder to read
+    # than a message saying the move did not take.
+    run_root rm -f "$dropin"
+    remove_datadir_access
+    rm -f "$DATADIR_STATE"
+    start_server
+    die "MariaDB came back on ${now:-no datadir at all} instead of $target; the copy is still at $target, the server is back on $current"
+  fi
+  log "MariaDB data directory is now $target (was $current)"
+}
+
+# Undo it: back to the packaged location, and the copy this helper made goes with
+# the rest of the benchmark's storage.
+restore_datadir() {
+  local dropin target original
+  target=$(datadir_state_value datadir || true)
+  original=$(datadir_state_value original || true)
+  [[ -n "$target" ]] || return 0
+  if dropin=$(my_cnf_dropin_path) && [[ -f "$dropin" ]]; then
+    run_root rm -f "$dropin"
+  fi
+  remove_datadir_access
+  if [[ -n "$original" && "$original" != "$target" ]]; then
+    stop_server
+    start_server || true
+    log "MariaDB data directory restored to $original"
+    # Only a directory this helper recorded, and only after the server has left
+    # it: everything in it was copied from $original or written by this
+    # benchmark's own database.
+    run_root rm -rf "$target" || log "WARN: could not remove $target"
+  fi
+  rm -f "$DATADIR_STATE"
+}
+
+# Where the tables are, for the harness to record and to size.
+report_datadir() {
+  local d
+  if d=$(running_datadir) && [[ -n "$d" ]]; then
+    printf '%s\n' "$d"
+    return 0
+  fi
+  d=$(datadir_state_value datadir || true)
+  [[ -n "$d" ]] || die "cannot determine MariaDB's data directory"
+  printf '%s\n' "$d"
 }
 
 mysql_client() {
@@ -311,6 +561,15 @@ setup() {
   install_server
   allow_frequent_restarts
   start_server
+  # Before the database is created, so its tables are written on the benchmark
+  # filesystem from the start rather than copied there afterwards.
+  if [[ "$RBH_DB_RELOCATE" == "1" ]]; then
+    mkdir -p "$CONF_DIR"
+    relocate_datadir "$(default_datadir "$fs_path")"
+  else
+    log "WARN: RBH_DB_RELOCATE=0, so MariaDB keeps its tables at $(running_datadir || echo 'its packaged location')"
+    log "      that is a different filesystem from the one under test; the Robinhood rows are not comparable"
+  fi
   require_names_available_or_marked
   password=$(generate_password)
 
@@ -479,15 +738,38 @@ reset_database() {
   log "reset MariaDB database '$RBH_DB_NAME'"
 }
 
+# What the index costs on disk, measured the way GUFI's and XDU's are: bytes in
+# the directory the tool wrote. information_schema knows only what it attributes
+# to Robinhood's own tables, which leaves out the undo log, the redo log and the
+# shared tablespace that the server had to write to hold them.
+datadir_bytes() {
+  local dir
+  dir=$(report_datadir) || return 1
+  run_root du -sb --one-file-system "$dir" 2>/dev/null | awk 'NR == 1 { print $1; exit }'
+}
+
 database_bytes() {
   require_marker
+  local out
+  out=$(datadir_bytes || true)
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  table_bytes
+}
+
+table_bytes() {
   admin_sql --batch --skip-column-names -e \
     "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.tables WHERE table_schema = '$RBH_DB_NAME';"
 }
 
 cleanup() {
   require_marker
+  # Dropped while the server is still on the relocated datadir, so the files go
+  # with the database rather than being left behind in a directory nobody owns.
   drop_database
+  restore_datadir
   remove_frequent_restarts
   rm -f "$PASSWORD_FILE" "$CONFIG_FILE" "$MARKER_FILE"
   rm -f "$LOG_DIR"/robinhood.log "$LOG_DIR"/robinhood-actions.log "$LOG_DIR"/robinhood-alerts.log
@@ -502,7 +784,16 @@ case "${1:-}" in
   adopt) shift; [[ $# -eq 0 ]] || die "usage: $0 adopt"; adopt ;;
   reset) shift; [[ $# -eq 0 ]] || die "usage: $0 reset"; reset_database ;;
   restart) shift; [[ $# -eq 0 ]] || die "usage: $0 restart"; restart_server ;;
+  datadir)
+    shift
+    case $# in
+      0) report_datadir ;;
+      1) require_marker; relocate_datadir "$1" ;;
+      *) die "usage: $0 datadir [dir]" ;;
+    esac
+    ;;
   bytes) shift; [[ $# -eq 0 ]] || die "usage: $0 bytes"; database_bytes ;;
+  table-bytes) shift; [[ $# -eq 0 ]] || die "usage: $0 table-bytes"; table_bytes ;;
   cleanup) shift; [[ $# -eq 0 ]] || die "usage: $0 cleanup"; cleanup ;;
-  *) die "usage: $0 {setup <benchmark-tree>|schema|adopt|reset|restart|bytes|cleanup}" ;;
+  *) die "usage: $0 {setup <benchmark-tree>|schema|adopt|reset|restart|datadir [dir]|bytes|table-bytes|cleanup}" ;;
 esac

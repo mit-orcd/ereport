@@ -11,7 +11,8 @@ When on ORCD (`orcd-login*`), do **not** compile or run heavy tests on the login
 - **Compute node:** `make`, `./scripts/test/test.sh`, `scripts/profile/profiling.sh`, compare-indexers runs, anything CPU/I/O heavy.
 - "Light inspection" is reading files, `git` and `rg` — not *any* script that looks small. A Python job that imports matplotlib/numpy is a compute job: re-rendering the five comparison figures with `plot_results.py` is ~15 s per invocation and about a minute of CPU for the set.
 - **Do not change** `test.sh`, `profiling.sh`, or other harness scripts for this — run them as-is under Slurm.
-- Prefer `srun` / `salloc` (short: `mit_quicktest`; longer: `mit_normal` / `mit_preemptable`). Batch via `sbatch` for unattended work.
+- **Partition policy:** submit CPU work only to `mit_normal` (12-hour maximum) and GPU work only to `mit_normal_gpu` (6-hour maximum). Use `mit_normal_gpu` only when the work actually requires GPUs. Never select any other partition, even if another queue appears shorter or has more capacity.
+- Agents are explicitly authorized to submit Slurm jobs without asking the user for permission first. Prefer `srun` / `salloc` for attended work and `sbatch` for unattended work.
 - On the node, set `TMPDIR` to local `/scratch/$USER/...` when writable (else fall back and note it).
 - Shared durable artifacts live under `~/orcd/scratch/ereport-automated-testing` (binaries, trees, indexes, toolchains). Point existing env vars / `PREFIX` / `--work` there — do not invent new script APIs.
 - Toolchains (Python venv, `CARGO_HOME`, `RUSTUP_HOME`, compare-indexers `PREFIX`) go under that scratch dir, not `~/.local` or `~/.cargo` on home.

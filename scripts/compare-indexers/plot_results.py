@@ -22,6 +22,7 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.patches import Patch
     from matplotlib.ticker import FuncFormatter, LogLocator
 except ImportError:
@@ -52,7 +53,18 @@ PIPELINES = [
         ],
         "ecrawl",  # label when only the first phase ran
     ),
-    ("Robinhood", [((("robinhood", "scan"),), "scan")], None),
+    (
+        # Two stages, not two alternatives: the scan crawls into index-free
+        # tables, which is not a database anyone queries, and the three CREATE
+        # INDEX statements are what make them queryable. Charting the scan alone
+        # billed Robinhood for half of what it costs.
+        "Robinhood",
+        [
+            ((("robinhood", "scan"),), "scan"),
+            ((("robinhood", "indexes"),), "indexes"),
+        ],
+        "Robinhood (scan only)",
+    ),
     ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "dir2index")], None),
     (
         # An alternative to the row above, never an addition to it: rollup is a
@@ -68,6 +80,7 @@ INDEX_ORDER = [
     "ecrawl + ereport_index",
     "ecrawl",
     "Robinhood",
+    "Robinhood (scan only)",
     "GUFI (dir2index)",
     "GUFI + rollup",
     "XDU",
@@ -88,24 +101,29 @@ WALK_LABELS = {
 
 WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua"]
 QUERY_ORDER = [
-    "ecrawl_analyze",
+    "ecrawl_query",
     "ereport",
     "ereport_index",
     "Robinhood",
     "GUFI",
+    "GUFI + rollup",
     "XDU",
     "find",
     "fd",
     "du",
     "dua",
 ]
-QUERIES = ["Q1", "Q2", "Q3", "Q4", "Q5"]
+# Q6 is not one of the paper's five. It asks for a substring with nothing
+# anchored at either end, which is the shape a B-tree on names cannot seek into,
+# and its title says so wherever it is drawn.
+QUERIES = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]
 QUERY_TITLES = {
     "Q1": "exact-name lookup",
     "Q2": "name pattern across the tree",
     "Q3": "files over a size threshold",
     "Q4": "total bytes in a subtree",
     "Q5": "list files in a subtree",
+    "Q6": "name contains a token anywhere  [extra, not in the paper]",
 }
 
 # Indexers get saturated colour; the traditional walkers stay neutral, so the
@@ -116,9 +134,10 @@ COLORS = {
     "ecrawl": "#0072B2",
     "ecrawl --no-write": "#0072B2",
     "ereport": "#0072B2",
-    "ecrawl_analyze": "#0072B2",
+    "ecrawl_query": "#0072B2",
     "ereport_index": "#56B4E9",
     "Robinhood": "#D55E00",
+    "Robinhood (scan only)": "#D55E00",
     "GUFI": "#009E73",
     "GUFI (dir2index)": "#009E73",
     "GUFI + rollup": "#8FA01F",
@@ -147,6 +166,66 @@ LOG_RANGE = 10.0
 def read_csv(path):
     with path.open(newline="") as stream:
         return list(csv.DictReader(stream))
+
+
+# Reading order rather than alphabetical: cold is what the work costs against
+# untouched storage, hot what it costs once the metadata is in memory, and warm a
+# cold pass the run had no privileges to actually drop caches for.
+CACHE_ORDER = {"cold": 0, "warm": 1, "hot": 2}
+
+
+def cache_states(rows):
+    """Which passes these rows came from, in reading order. A single empty string
+    for a CSV written before the column existed."""
+    return sorted(
+        {row.get("cache") or "" for row in rows},
+        key=lambda name: (CACHE_ORDER.get(name, 3), name),
+    ) or [""]
+
+
+def rows_for_cache(rows, cache):
+    return [row for row in rows if (row.get("cache") or "") == cache]
+
+
+def multiple_trees(datasets):
+    """Whether the series are different trees rather than different passes over
+    one. Elapsed seconds do not carry across trees; across passes they are the
+    whole point of the comparison."""
+    return len({d.get("source") for d in datasets}) > 1
+
+
+def subtitle_for(datasets):
+    """The tree and the passes over it. One tree measured twice is one name and
+    two states, not the same name printed twice."""
+    if len(datasets) == 1:
+        return datasets[0]["label"]
+    if not multiple_trees(datasets):
+        states = [d["cache"] for d in datasets if d.get("cache")]
+        if states:
+            return "{0} · {1}".format(
+                datasets[0].get("base_label", datasets[0]["label"]), " and ".join(states)
+            )
+    return "; ".join(d["label"] for d in datasets)
+
+
+def series_label(dataset, datasets):
+    """How a series is named in the key. With one tree the only thing that
+    distinguishes the series is the pass, and repeating the tree's name in front
+    of each of them says nothing."""
+    if not multiple_trees(datasets) and dataset.get("cache"):
+        return dataset["cache"]
+    return dataset["label"]
+
+
+def series_title(datasets):
+    """What the shading means, in the reader's terms."""
+    trees = multiple_trees(datasets)
+    passes = len({d.get("cache") for d in datasets}) > 1
+    if trees and passes:
+        return "Dataset and cache state (lighter shade = later)"
+    if trees:
+        return "Dataset (lighter shade = later)"
+    return "Cache state (lighter shade = later)"
 
 
 def locate_csv(root, name):
@@ -218,18 +297,20 @@ def dataset_label(root, index_csv, explicit):
 
 
 def query_index_note(query_csv):
-    """Which build answered the queries, when the run indexed the same tree
-    more than one way. GUFI's query times belong to whichever index the harness
-    pointed gufi_find at, and a rolled-up index costs several times what the
-    plain one did to build -- so the query figure has to say which it was."""
+    """Which GUFI index answered which series. A rolled-up index costs several
+    times what the plain one did to build, and it can answer the byte total the
+    plain one cannot, so a GUFI query time means nothing without this."""
     if not query_csv:
         return ""
-    root = kv_file(query_csv.parent / "env.txt").get("gufi_index_root", "")
-    if not root:
+    env = kv_file(query_csv.parent / "env.txt")
+    plain = env.get("gufi_index_root", "")
+    rollup = env.get("gufi_rollup_index_root", "")
+    if rollup:
+        return "GUFI reads the plain index, GUFI + rollup the rolled-up one."
+    if not plain:
         return ""
-    name = Path(root).name
-    kind = "rolled-up" if "rollup" in name else "plain"
-    return "GUFI answered from its {} index ({}).".format(kind, name)
+    kind = "rolled-up" if "rollup" in Path(plain).name else "plain"
+    return "GUFI answered from its {} index.".format(kind)
 
 
 def run_conditions(env, reps):
@@ -420,9 +501,16 @@ QUERY_TOOL_LABELS = {
     "ecrawl_suite": "ereport",
     "ereport_index": "ereport_index",
     "ereport": "ereport",
-    "ecrawl_analyze": "ecrawl_analyze",
+    "ecrawl_query": "ecrawl_query",
+    # ecrawl_query was called ecrawl_analyze until the rename; results recorded
+    # under the old name draw as the same series rather than not at all.
+    "ecrawl_analyze": "ecrawl_query",
     "robinhood": "Robinhood",
     "gufi": "GUFI",
+    # The same wrappers reading the index gufi_rollup produced. A separate series
+    # because it is a separate index, built at several times the cost, and it can
+    # answer a question the plain one cannot.
+    "gufi_rollup": "GUFI + rollup",
     "xdu": "XDU",
     "find": "find",
     "fd": "fd",
@@ -431,11 +519,33 @@ QUERY_TOOL_LABELS = {
 }
 
 
+# Why a bar's answer differs from the reference when the difference is
+# definitional. Keyed by the chart's own labels. These rows are drawn and timed
+# like any other -- the tool answered the question its index can answer -- and
+# the phrase goes on the bar so the hatching is never read as a defect.
+# summarize.py carries the same table at length; README.md has the numbers.
+ANSWER_SEMANTICS = {
+    ("Robinhood", "Q4"): "disk usage, not apparent bytes",
+    ("GUFI", "Q4"): "file bytes only, no directory inodes",
+    ("GUFI + rollup", "Q4"): "file bytes only, no directory inodes",
+    ("XDU", "Q4"): "file bytes only, no directory inodes",
+}
+for _query in ("Q1", "Q2", "Q3", "Q5", "Q6"):
+    ANSWER_SEMANTICS[("Robinhood", _query)] = "counts inodes, not names"
+
+
+def row_arg_set(row):
+    """Which argument set a row answered. Blank in a CSV written before the sets
+    existed, which is set 1 by definition."""
+    return (row.get("arg_set") or "1").strip() or "1"
+
+
 def query_metrics(rows):
-    """Per (tool, query): timing, the answer returned, and why it is missing."""
+    """Per (tool, query): timing, the answers returned, and why it is missing."""
     timings = {}
     counts = {}
     states = {}
+    notes = {}
     for row in rows:
         label = QUERY_TOOL_LABELS.get(row.get("tool"))
         query = row.get("query")
@@ -446,38 +556,66 @@ def query_metrics(rows):
             # A tool that is merely unsuited to a query is not a failure, and
             # the figure should not imply that it is.
             states.setdefault((label, query), status)
+            notes.setdefault((label, query), row.get("notes") or "")
             continue
         states[(label, query)] = "ok"
         try:
             timings.setdefault((label, query), []).append(float(row["elapsed_sec"]))
         except (KeyError, ValueError):
             pass
+        # One answer per argument set: each set asks for a different name and a
+        # different threshold, so a single count per tool would be checked
+        # against another set's reference and read as a disagreement.
         try:
-            counts[(label, query)] = int(row["result_count"])
+            counts[(label, query, row_arg_set(row))] = int(row["result_count"])
         except (KeyError, ValueError, TypeError):
             pass
 
     stats = {key: mean_std(values) for key, values in timings.items()}
-    return {"stats": stats, "counts": counts, "states": states}
+    return {"stats": stats, "counts": counts, "states": states, "notes": notes}
+
+
+REFERENCE_PREFERENCE = {
+    "Q1": ["find", "fd"],
+    "Q2": ["find", "fd"],
+    "Q3": ["find", "fd"],
+    "Q4": ["du", "dua"],
+    "Q5": ["find", "fd"],
+    "Q6": ["find", "fd"],
+}
 
 
 def reference_counts(queries):
-    """What the answer should be, taken from the tool the paper treats as truth."""
+    """What the answer should be, per query and argument set, taken from the tool
+    the paper treats as truth."""
     counts = queries["counts"]
-    preferred = {
-        "Q1": ["find", "fd"],
-        "Q2": ["find", "fd"],
-        "Q3": ["find", "fd"],
-        "Q4": ["du", "dua"],
-        "Q5": ["find", "fd"],
-    }
+    arg_sets = {key[2] for key in counts} or {"1"}
     reference = {}
     for query in QUERIES:
-        for tool in preferred[query]:
-            if (tool, query) in counts:
-                reference[query] = (tool, counts[(tool, query)])
-                break
+        for arg_set in arg_sets:
+            for tool in REFERENCE_PREFERENCE[query]:
+                if (tool, query, arg_set) in counts:
+                    reference[(query, arg_set)] = (tool, counts[(tool, query, arg_set)])
+                    break
     return reference
+
+
+def wrong_answer(queries, reference, tool, query):
+    """The first argument set this tool got wrong, as (answered, expected, ref).
+
+    Checked per set because each one has its own right answer; one wrong set is
+    enough to make the timing next to it meaningless.
+    """
+    counts = queries["counts"]
+    for (label, q, arg_set), value in sorted(counts.items()):
+        if label != tool or q != query:
+            continue
+        expected = reference.get((query, arg_set))
+        if not expected or expected[0] == tool:
+            continue
+        if count_disagrees(query, value, expected[1]):
+            return value, expected[1], expected[0]
+    return None
 
 
 def count_disagrees(query, value, expected):
@@ -717,10 +855,6 @@ def index_figure(datasets, out_dir, spec):
     log = bool(positive) and max(positive) / min(positive) >= LOG_RANGE
     part_index = 0 if metric == "time" else 1
     pending = []
-    # Whether the phases ended up anywhere a reader can see them. A bar whose
-    # label slot went to something else keeps its phases to itself, and the
-    # caption must not promise them.
-    split_shown = False
     for dataset_index, dataset in enumerate(datasets):
         offset = (dataset_index - (len(datasets) - 1) / 2.0) * bar_h
         for row, tool in enumerate(tools):
@@ -741,7 +875,6 @@ def index_figure(datasets, out_dir, spec):
             # A log axis cannot be read additively, so the phases go in the
             # label there instead of pretending the segments sum by length.
             if parts and not log:
-                split_shown = True
                 left = 0.0
                 for part_no, (_, value) in enumerate(parts):
                     axis.barh(
@@ -829,11 +962,9 @@ def index_figure(datasets, out_dir, spec):
         # On a linear panel the bar is already segmented, so the numbers go
         # underneath where they cannot fight the segment boundary.
         if split and (not log or not fits_inside(fig, axis, mean, split)):
-            split_shown = True
             bar_label(axis, y, end, text, log, sub=split)
             continue
         if split:
-            split_shown = True
             axis.annotate(
                 split,
                 xy=(0.008, y),
@@ -862,23 +993,24 @@ def index_figure(datasets, out_dir, spec):
             ha="left",
         )
 
-    subtitle = datasets[0]["label"] if not multi else "; ".join(d["label"] for d in datasets)
+    subtitle = subtitle_for(datasets)
     conditions = datasets[0].get("conditions", "")
-    caption = "Means over repetitions; whiskers one standard deviation. {} is better.".format(
+    caption = "Means over repetitions; whiskers \u00b11 s.d. {} is better.".format(
         "Higher" if higher_better else "Lower"
     )
     if spec.get("caption"):
-        caption += "\n" + spec["caption"]
-    if split_shown:
-        # No gloss on what each phase is: the bar already names them in place.
-        caption += "\nTwo-command pipelines give their phases in the bar label."
-    if multi and metric != "rate":
-        # Two datasets on one axis are usually two trees, and elapsed seconds do
-        # not survive that: the rate figures are the ones to read across them.
-        caption += (
-            "\nElapsed time only compares within one tree; for two datasets of "
-            "different sizes, read the files-per-second figure."
-        )
+        caption += " " + spec["caption"]
+    # A note about two rows belongs on a figure that drew both of them: with the
+    # rollup switched off, or a results dir from before Robinhood's indexes were
+    # timed, the sentence would describe a bar that is not there.
+    for labels, note in spec.get("tool_notes", ()):
+        if all(label in tools for label in labels):
+            caption += " " + note
+    if multi and metric != "rate" and multiple_trees(datasets):
+        # Two trees on one axis: elapsed seconds do not survive that, so the rate
+        # figures are the ones to read across them. Two passes over one tree are
+        # a different matter -- comparing their seconds is the point.
+        caption += " Across trees compare the rate figure, not seconds."
     caption = wrap_caption(caption, fig.get_figwidth())
     caveat = datasets[0].get("caveat", "")
     header_in = 0.95 if conditions else 0.75
@@ -920,12 +1052,12 @@ def index_figure(datasets, out_dir, spec):
         # would suggest a mapping that does not exist.
         proxies = [
             Patch(facecolor=shade("#555555", shades[i]), edgecolor="white",
-                  label=dataset["label"])
+                  label=series_label(dataset, datasets))
             for i, dataset in enumerate(datasets)
         ]
         fig.legend(
             handles=proxies,
-            title="Dataset (lighter shade = later)",
+            title=series_title(datasets),
             frameon=False,
             fontsize=9,
             loc="lower left",
@@ -947,24 +1079,36 @@ def index_figure(datasets, out_dir, spec):
 # the summary table prints, while files per second is the number that means
 # anything on a tree of a different size -- and every figure is the same
 # picture with a different column of numbers behind it.
+#
+# Captions carry only what the picture cannot: a bar that names its own phases,
+# a legend that names its own series and a title that says what is plotted do
+# not get a sentence repeating them.
 WALK_CAPTION = (
-    "Every tool here traverses the whole tree and keeps nothing, which makes "
-    "this the one group that compares with no asterisk at all. find and fd only "
-    "read directories; du, dua and ecrawl also stat every entry."
+    "Every row walks the whole tree and keeps nothing. find and fd read "
+    "directories only; du, dua and ecrawl stat every file."
 )
-BUILD_CAPTION = (
-    "The whole cost from an unindexed tree to a queryable index, as run, for "
-    "every tool measured end to end. GUFI appears twice because rollup is an "
-    "optional second pass over the index it built: the two are alternatives, "
-    "never a sum."
-)
+BUILD_CAPTION = "Unindexed tree to queryable index, end to end."
+# Added only when the figure actually draws those bars: a caption explaining a
+# row that is not there sends the reader looking for it.
+GUFI_BUILD_NOTE = "GUFI's two rows are alternatives, not a sum."
+# Robinhood needs no such line: its bar names its own two stages in place.
+BUILD_TOOL_NOTES = [
+    (("GUFI (dir2index)", "GUFI + rollup"), GUFI_BUILD_NOTE),
+]
+# What Robinhood's bar in the storage figure is a measure of. Its index lives in
+# MariaDB's datadir, not in a directory of its own, so unlike every other row
+# here it needs saying whether the three indexes are in the number.
+SIZE_TOOL_NOTES = [
+    (("Robinhood",), "Robinhood is its database with the three indexes built."),
+    (("Robinhood (scan only)",), "Robinhood is its database before any index."),
+]
 
 INDEX_FIGURES = [
     {
         "name": "figure1_walk_time",
         "number": 1,
         "heading": "walking, elapsed time",
-        "panel_title": "How long it takes to see every file",
+        "panel_title": "How long a full walk of the tree takes",
         "key": "walk",
         "order": WALK_CHART_ORDER,
         "metric": "time",
@@ -976,7 +1120,7 @@ INDEX_FIGURES = [
         "name": "figure2_walk_rate",
         "number": 2,
         "heading": "walking, throughput",
-        "panel_title": "Files seen per second",
+        "panel_title": "Files per second, walking",
         "key": "walk",
         "order": WALK_CHART_ORDER,
         "metric": "rate",
@@ -996,17 +1140,15 @@ INDEX_FIGURES = [
         "formatter": fmt_seconds,
         "xlabel": "Elapsed seconds",
         "floor": True,
-        "caption": (
-            BUILD_CAPTION
-            + " The dashed line is the fastest bare walk in the run, the floor "
-            "no indexer can go below."
-        ),
+        # The dashed line explains itself where it is drawn.
+        "caption": BUILD_CAPTION,
+        "tool_notes": BUILD_TOOL_NOTES,
     },
     {
         "name": "figure4_build_rate",
         "number": 4,
         "heading": "building, throughput",
-        "panel_title": "Files indexed per second",
+        "panel_title": "Files per second, building the index",
         "key": "index",
         "order": INDEX_ORDER,
         "metric": "rate",
@@ -1016,7 +1158,8 @@ INDEX_FIGURES = [
         # Rates do not add, so the phases stay off this one: the bar is the
         # whole pipeline's throughput, and Figure 3 is where its parts live.
         "split": False,
-        "caption": BUILD_CAPTION + " Phases are in Figure 3: rates do not add.",
+        "caption": BUILD_CAPTION + " Rates do not add; phases are in Figure 3.",
+        "tool_notes": BUILD_TOOL_NOTES,
     },
     {
         "name": "figure5_index_size",
@@ -1029,10 +1172,8 @@ INDEX_FIGURES = [
         "formatter": fmt_mib,
         "xlabel": "MiB kept on disk",
         "per_file": True,
-        "caption": (
-            "Walk-only tools are absent because they store nothing, which is "
-            "the trade behind their times in Figure 1."
-        ),
+        "caption": "Walk-only tools store nothing, so they are not here.",
+        "tool_notes": SIZE_TOOL_NOTES,
     },
 ]
 
@@ -1044,26 +1185,13 @@ def plot_index(datasets, out_dir):
     return outputs
 
 
-def plot_queries(datasets, out_dir):
-    usable = [d for d in datasets if d["queries"]["stats"]]
-    if not usable:
-        return []
+def query_figure(usable, queries, rows_per_query, bounds, page, pages):
+    """One page of query panels: the queries given, one row each.
 
-    # One panel per query, each only as tall as it has bars, so a query answered
-    # by three tools does not get the same space as one answered by six. With
-    # several datasets each becomes a column, the paper's Set 1 / Set 2 layout.
-    rows_per_query = {}
-    for query in QUERIES:
-        depth = max(
-            len([t for t in QUERY_ORDER if (t, query) in d["queries"]["stats"]])
-            for d in usable
-        )
-        if depth:
-            rows_per_query[query] = depth
-    if not rows_per_query:
-        return []
-    queries = [q for q in QUERIES if q in rows_per_query]
-
+    Split across pages rather than run down one tall sheet, because six panels
+    of six bars is a figure nobody can put on a page and still read.
+    """
+    lo, hi = bounds
     heights = [rows_per_query[q] for q in queries]
     fig_height = 0.72 * len(queries) + 0.38 * sum(heights) + 2.3
     fig, axes = plt.subplots(
@@ -1078,18 +1206,13 @@ def plot_queries(datasets, out_dir):
         squeeze=False,
     )
 
-    everything = [
-        m for d in usable for (m, _s) in d["queries"]["stats"].values() if m
-    ]
-    lo = min(everything) / 3.0
-    hi = max(everything) * 3.0
     any_mismatch = False
     walkers_seen = set()
 
     for column, dataset in enumerate(usable):
         stats = dataset["queries"]["stats"]
-        counts = dataset["queries"]["counts"]
         states = dataset["queries"]["states"]
+        notes_by_key = dataset["queries"].get("notes", {})
         reference = reference_counts(dataset["queries"])
 
         for row, query in enumerate(queries):
@@ -1100,12 +1223,13 @@ def plot_queries(datasets, out_dir):
                 key=lambda t: -stats[(t, query)][0],
             )
             positions = list(range(len(entries)))
+            # Reason -> the tools it applies to, for the bars that missed the
+            # reference because they answer a different question.
+            semantics = {}
             for y, tool in zip(positions, entries):
                 mean, std = stats[(tool, query)]
-                expected = reference.get(query)
-                wrong = expected is not None and count_disagrees(
-                    query, counts.get((tool, query)), expected[1]
-                )
+                mismatch = wrong_answer(dataset["queries"], reference, tool, query)
+                wrong = mismatch is not None
                 any_mismatch = any_mismatch or wrong
                 if tool in WALKERS:
                     walkers_seen.add(tool)
@@ -1127,9 +1251,16 @@ def plot_queries(datasets, out_dir):
                     )
                 text = fmt_seconds(mean)
                 if wrong:
+                    answered, expected_value, ref_tool = mismatch
                     text += "   \u2717 answered {:,}, not {:,} (per {})".format(
-                        counts.get((tool, query), 0), expected[1], expected[0]
+                        answered, expected_value, ref_tool
                     )
+                    # The reason goes in the panel note rather than here: the bar
+                    # label already runs past the axis, and in the right-hand
+                    # column another clause runs off the sheet.
+                    why = ANSWER_SEMANTICS.get((tool, query))
+                    if why:
+                        semantics.setdefault(why, []).append(tool)
                 bar_label(
                     axis,
                     y,
@@ -1156,42 +1287,60 @@ def plot_queries(datasets, out_dir):
 
             # Say why a tool has no bar. Unsupported and broken are different
             # findings, and a gap alone cannot tell them apart.
-            missing = {"unsupported": [], "failed": []}
+            missing = {"unsupported": [], "failed": [], "rollup": []}
             for tool in QUERY_ORDER:
                 state = states.get((tool, query))
                 if state in (None, "ok"):
                     continue
-                missing["failed" if state == "fail" else "unsupported"].append(tool)
+                if state == "fail":
+                    missing["failed"].append(tool)
+                elif "rollup_required" in (notes_by_key.get((tool, query)) or ""):
+                    # Not "no equivalent query": the tool has the query, and the
+                    # index this series was built by cannot serve it. Reading that
+                    # as a missing feature is exactly how the cheap GUFI index
+                    # came to look like it answered the aggregate.
+                    missing["rollup"].append(tool)
+                else:
+                    missing["unsupported"].append(tool)
             notes = []
+            for why, who in semantics.items():
+                notes.append("{}: {}".format(", ".join(who), why))
+            if missing["rollup"]:
+                notes.append(
+                    "needs the rolled-up index: " + ", ".join(missing["rollup"])
+                )
             if missing["unsupported"]:
                 notes.append("no equivalent query: " + ", ".join(missing["unsupported"]))
             if missing["failed"]:
                 notes.append("failed: " + ", ".join(missing["failed"]))
             if notes:
-                # Top right, opposite the title: below the panel it would land
-                # on the shared tick labels of the bottom-most axis.
+                # Inside the panel, top right: the bars are sorted longest at
+                # the bottom, so that corner is the empty one. Above the panel
+                # it collided with the title, and below it with the shared tick
+                # labels of the bottom-most axis.
+                # One reason per line: a Q4 panel can carry three, and strung
+                # together they reach past the panel and into the next column.
                 axis.annotate(
-                    "   \u00b7   ".join(notes),
-                    xy=(1, 1),
+                    "\n".join(notes),
+                    xy=(0.995, 0.94),
                     xycoords="axes fraction",
-                    xytext=(0, 6),
-                    textcoords="offset points",
                     fontsize=8,
                     color="#888888",
-                    va="bottom",
+                    va="top",
                     ha="right",
                 )
 
         axes[-1][column].set_xlabel("Elapsed time (log scale)", fontsize=10, labelpad=8)
 
     conditions = usable[0].get("conditions", "")
-    subtitle = (
-        usable[0]["label"]
-        if len(usable) == 1
-        else "; ".join(d["label"] for d in usable)
-    )
+    subtitle = subtitle_for(usable)
     caveat = usable[0].get("caveat", "")
-    fig.text(0.011, 1 - 0.30 / fig_height, "Figure 6: query performance",
+    heading = "Figure 6: query performance"
+    if pages > 1:
+        heading += "  ({} of {}, {})".format(page, pages, "\u2013".join(
+            [queries[0], queries[-1]] if len(queries) > 1 else [queries[0]]
+        ))
+    fig.text(0.011, 1 - 0.30 / fig_height, heading,
              fontsize=15, fontweight="bold", va="top")
     fig.text(
         0.011,
@@ -1212,20 +1361,17 @@ def plot_queries(datasets, out_dir):
             va="top",
         )
 
-    caption = "Mean wall time; whiskers one standard deviation. Shorter is better."
+    # Short enough to read: anything a bar, a title or a panel note already says
+    # is not repeated here.
+    caption = "Mean wall time; whiskers \u00b11 s.d. Lower is better."
     index_note = usable[0].get("query_index_note", "")
     if index_note:
-        caption += "\n" + index_note
+        caption += " " + index_note
     if any_mismatch:
-        caption += (
-            "\nHatched bars disagreed with the reference tool, so their timing "
-            "does not measure the same work."
-        )
+        caption += " Hatched bars missed the reference; the panel note says which are definitional."
     if walkers_seen:
-        caption += (
-            "\nWalkers in neutral grey and tan ({}) search live, not from an "
-            "index.".format(", ".join(t for t in QUERY_ORDER if t in walkers_seen))
-        )
+        caption += " Grey and tan tools search live, with no index."
+    caption = wrap_caption(caption, fig.get_figwidth())
     fig.text(0.011, 0.16 / fig_height, caption, fontsize=8.5, color="#555555", va="bottom")
 
     # Room for the two header lines plus the first panel's title.
@@ -1236,12 +1382,65 @@ def plot_queries(datasets, out_dir):
     # Each panel carries a title above and a note to its right, so they need
     # more air between them than tight_layout leaves.
     fig.subplots_adjust(hspace=0.42)
+    return fig
+
+
+# Three panels to a page. Six on one sheet is either unreadably small in print
+# or a page nobody can see the bottom of on screen.
+QUERIES_PER_PAGE = 3
+
+
+def plot_queries(datasets, out_dir):
+    usable = [d for d in datasets if d["queries"]["stats"]]
+    if not usable:
+        return []
+
+    # One panel per query, each only as tall as it has bars, so a query answered
+    # by three tools does not get the same space as one answered by six. With
+    # several datasets each becomes a column, the paper's Set 1 / Set 2 layout.
+    rows_per_query = {}
+    for query in QUERIES:
+        depth = max(
+            len([t for t in QUERY_ORDER if (t, query) in d["queries"]["stats"]])
+            for d in usable
+        )
+        if depth:
+            rows_per_query[query] = depth
+    if not rows_per_query:
+        return []
+    queries = [q for q in QUERIES if q in rows_per_query]
+
+    # One x-axis for every page, or a query on page two would look faster than
+    # one on page one for no reason but its own axis.
+    everything = [
+        m for d in usable for (m, _s) in d["queries"]["stats"].values() if m
+    ]
+    bounds = (min(everything) / 3.0, max(everything) * 3.0)
+
+    pages = [
+        queries[start:start + QUERIES_PER_PAGE]
+        for start in range(0, len(queries), QUERIES_PER_PAGE)
+    ]
+    figures = [
+        query_figure(usable, page, rows_per_query, bounds, number, len(pages))
+        for number, page in enumerate(pages, start=1)
+    ]
+
     outputs = []
-    for suffix in ("png", "pdf"):
-        path = out_dir / ("figure6_queries." + suffix)
-        fig.savefig(str(path), dpi=200 if suffix == "png" else None)
+    for number, fig in enumerate(figures, start=1):
+        stem = "figure6_queries" if len(figures) == 1 else "figure6_queries_p{}".format(number)
+        path = out_dir / (stem + ".png")
+        fig.savefig(str(path), dpi=200)
         outputs.append(path)
-    plt.close(fig)
+    # The PDF stays one file with one page per group, which is what a reader
+    # scrolling a paper expects and what a printer needs.
+    pdf_path = out_dir / "figure6_queries.pdf"
+    with PdfPages(str(pdf_path)) as pdf:
+        for fig in figures:
+            pdf.savefig(fig)
+    outputs.append(pdf_path)
+    for fig in figures:
+        plt.close(fig)
     return outputs
 
 
@@ -1280,28 +1479,31 @@ def main():
         if not index_csv and not query_csv:
             parser.error("{} contains no benchmark CSV files".format(root))
         index_rows = read_csv(index_csv) if index_csv else []
+        query_rows = read_csv(query_csv) if query_csv else []
         env = find_kv(root, "env.txt")
         reps = env.get("reps")
-        datasets.append(
-            {
-                "label": dataset_label(
-                    root, index_csv, labels[index] if labels else None
-                ),
-                "conditions": run_conditions(env, reps),
-                "caveat": too_small_caveat(tree_file_count(index_csv)),
-                "file_count": tree_file_count(index_csv),
-                "index": index_metrics(index_rows),
-                "walk": walk_metrics(index_rows),
-                "walk_floor": walk_floor(index_rows),
-                "query_index_note": query_index_note(query_csv),
-                "queries": (
-                    query_metrics(read_csv(query_csv))
-                    if query_csv
-                    else {"stats": {}, "counts": {}, "states": {}}
-                ),
-                "source": str(root),
-            }
-        )
+        base_label = dataset_label(root, index_csv, labels[index] if labels else None)
+        # A cold pass and a hot one are two measurements of two situations, so
+        # they are two series -- the same machinery two input trees use. A CSV
+        # written before the column existed has one unlabelled state, which keeps
+        # its figures exactly as they were.
+        for cache in cache_states(index_rows + query_rows):
+            datasets.append(
+                {
+                    "label": base_label if not cache else "{} · {}".format(base_label, cache),
+                    "base_label": base_label,
+                    "cache": cache,
+                    "conditions": run_conditions(env, reps),
+                    "caveat": too_small_caveat(tree_file_count(index_csv)),
+                    "file_count": tree_file_count(index_csv),
+                    "index": index_metrics(rows_for_cache(index_rows, cache)),
+                    "walk": walk_metrics(rows_for_cache(index_rows, cache)),
+                    "walk_floor": walk_floor(rows_for_cache(index_rows, cache)),
+                    "query_index_note": query_index_note(query_csv),
+                    "queries": query_metrics(rows_for_cache(query_rows, cache)),
+                    "source": str(root),
+                }
+            )
 
     out_dir = args.out_dir
     if out_dir is None:
