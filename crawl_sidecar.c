@@ -44,7 +44,10 @@ void crawl_sidecar_close(crawl_sidecar_t *sc) {
             if (sc->fd[i] >= 0) close(sc->fd[i]);
         free(sc->fd);
     }
-    free(sc->dirs);
+    if (sc->dirs) {
+        for (i = 0; i < sc->shard_count; i++) crawl_bin_catalog_map_free(&sc->dirs[i].cmap);
+        free(sc->dirs);
+    }
     free(sc->groups);
     if (sc->dmap) munmap(sc->dmap, sc->dlen);
     if (sc->rmap) munmap(sc->rmap, sc->rlen);
@@ -89,8 +92,8 @@ static int sidecar_map(const char *index_dir, const char *fname, const char *mag
  * Does this descriptor still describe the shard on disk? Five facts, all cheap:
  * the basename, st_size, mtime, the catalog offset in the shard's own header,
  * and the entry count that opens the catalog blob. Anything moved and the
- * dir_ids, row offsets and DFS positions the sidecar recorded may name
- * something else entirely, so the answer has to be no.
+ * dir_ids and DFS positions the sidecar recorded may name something else
+ * entirely, so the answer has to be no.
  */
 static int sidecar_shard_matches(const crawl_sidecar_shard_id_t *id, const unsigned char *names,
                                  uint64_t names_bytes, const char *shard_name, int fd) {
@@ -179,21 +182,23 @@ int crawl_sidecar_open(const char *index_dir, const char *const *shard_paths, si
         size_t si = sidecar_find_shard(sc->dmap + dh->names_off, dh->names_bytes, &dsh[0].id,
                                        sizeof(crawl_dirx_shard_t), (size_t)dh->shard_count, base);
         const crawl_dirx_shard_t *s;
-        uint64_t rows_len;
 
         if (si >= (size_t)dh->shard_count) goto fail;
         s = &dsh[si];
-        rows_len = s->id.max_dir_id + 1ULL;
         if (!sidecar_shard_matches(&s->id, sc->dmap + dh->names_off, dh->names_bytes, base, sc->fd[fi]))
             goto fail;
-        if (s->hash_count > rows_len) goto fail;
+        if (s->hash_count > s->id.max_dir_id + 1ULL) goto fail;
         if (!sidecar_span_ok(s->hash_off, s->hash_count * sizeof(crawl_dirx_entry_t), sc->dlen)) goto fail;
-        if (rows_len > (uint64_t)sc->dlen / sizeof(uint64_t)) goto fail;
-        if (!sidecar_span_ok(s->rows_off, rows_len * sizeof(uint64_t), sc->dlen)) goto fail;
+        /* Rows come out of the shard, so the shard's own chunk table is what a
+         * hit is resolved through; a catalog that will not describe itself
+         * retires the sidecar exactly as a moved shard does. */
+        if (crawl_bin_catalog_map_read(sc->fd[fi], s->id.catalog_offset, s->id.shard_size,
+                                       &sc->dirs[fi].cmap) != 0)
+            goto fail;
+        if (sc->dirs[fi].cmap.n_entries != s->id.catalog_entries) goto fail;
 
         sc->dirs[fi].ents = (const crawl_dirx_entry_t *)(sc->dmap + s->hash_off);
         sc->dirs[fi].ent_count = s->hash_count;
-        sc->dirs[fi].rows = (const uint64_t *)(sc->dmap + s->rows_off);
         sc->dirs[fi].max_dir_id = s->id.max_dir_id;
         sc->dirs[fi].shard_size = s->id.shard_size;
         sc->dirs[fi].catalog_entries = s->id.catalog_entries;
@@ -242,34 +247,43 @@ fail:
 }
 
 crawl_dirx_walk_t *crawl_dirx_walk_new(void) {
-    return (crawl_dirx_walk_t *)malloc(sizeof(crawl_dirx_walk_t));
+    crawl_dirx_walk_t *w = (crawl_dirx_walk_t *)malloc(sizeof(crawl_dirx_walk_t));
+
+    if (w) {
+        crawl_bin_catalog_chunk_init(&w->chunk);
+        w->chunk_view = NULL;
+    }
+    return w;
+}
+
+void crawl_dirx_walk_free(crawl_dirx_walk_t *w) {
+    if (!w) return;
+    crawl_bin_catalog_chunk_free(&w->chunk);
+    free(w);
 }
 
 /*
- * ent->dir_id is checked against the id we asked for: the row offset came from
- * a file that is only advisory, so a row that does not identify itself as the
- * one requested is treated as a miss rather than believed.
+ * The row is read out of the shard rather than out of the sidecar, and the
+ * sidecar is only advisory, so a dir_id it names that the catalog does not have
+ * is a miss rather than something to believe.
  */
-int crawl_dirx_read_row(const crawl_dirx_view_t *v, uint64_t did, bin_dir_catalog_entry_t *ent,
-                        unsigned char *name, size_t name_cap, size_t *name_len_out, uint64_t *rows_read) {
-    unsigned char buf[sizeof(bin_dir_catalog_entry_t) + 256];
-    uint64_t off;
-    ssize_t got;
-    size_t nl;
+int crawl_dirx_read_row(const crawl_dirx_view_t *v, crawl_dirx_walk_t *w, uint64_t did, unsigned fields,
+                        bin_dir_catalog_entry_t *ent, unsigned char *name, size_t name_cap,
+                        size_t *name_len_out, uint64_t *rows_read) {
+    const unsigned char *nb = NULL;
+    size_t nl = 0;
 
     if (did == 0ULL || did > v->max_dir_id) return -1;
-    off = v->rows[did];
-    if (off == 0ULL) return -1;
-    if (!sidecar_span_ok(off, sizeof(*ent), (size_t)v->shard_size)) return -1;
-
-    got = pread(v->fd, buf, sizeof(buf), (off_t)off);
-    if (got < (ssize_t)sizeof(*ent)) return -1;
-    memcpy(ent, buf, sizeof(*ent));
-    if (ent->dir_id != did) return -1;
-    nl = (size_t)ent->name_len;
-    if ((size_t)got < sizeof(*ent) + nl) return -1;
+    if (w->chunk_view != (const void *)v) {
+        /* The cache belongs to whichever shard filled it, and chunk offsets do
+         * not survive the move. */
+        crawl_bin_catalog_chunk_free(&w->chunk);
+        w->chunk_view = (const void *)v;
+    }
+    if (crawl_bin_catalog_read_row(v->fd, &v->cmap, &w->chunk, did, fields, ent, &nb, &nl, NULL) != 0)
+        return -1;
     if (nl > name_cap) return -1;
-    if (nl > 0) memcpy(name, buf + sizeof(*ent), nl);
+    if (nl > 0) memcpy(name, nb, nl);
     if (name_len_out) *name_len_out = nl;
     if (rows_read) (*rows_read)++;
     return 0;
@@ -299,7 +313,7 @@ int crawl_dirx_path_of(const crawl_dirx_view_t *v, uint64_t did, crawl_dirx_walk
 
         if (cur > v->max_dir_id) return -1;
         if (cur == 1ULL) break;
-        if (crawl_dirx_read_row(v, cur, &ent, w->comp[nparts], sizeof(w->comp[0]), &nl, rows_read) != 0)
+        if (crawl_dirx_read_row(v, w, cur, 0U, &ent, w->comp[nparts], sizeof(w->comp[0]), &nl, rows_read) != 0)
             return -1;
         w->clen[nparts] = nl;
         tot += nl + 1U; /* one leading '/' per component (paths are absolute) */
@@ -373,7 +387,8 @@ int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, 
         if (parent == 0ULL && sub_parent[0] == '\0' && v->max_dir_id >= 1ULL) parent = 1ULL;
 
         if (sp->root != 0ULL) {
-            if (crawl_dirx_read_row(v, sp->root, &ent, namebuf, sizeof(namebuf), NULL, rows_read) != 0)
+            if (crawl_dirx_read_row(v, walk, sp->root, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                    rows_read) != 0)
                 goto done;
             sp->root_parent = ent.parent_dir_id;
             sp->dfs_lo = ent.dfs_index;
@@ -381,7 +396,8 @@ int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, 
             sp->self_record = (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1 : 0;
         }
         if (parent != 0ULL) {
-            if (crawl_dirx_read_row(v, parent, &ent, namebuf, sizeof(namebuf), NULL, rows_read) != 0)
+            if (crawl_dirx_read_row(v, walk, parent, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                    rows_read) != 0)
                 goto done;
             sp->dfs_par = ent.dfs_index;
             sp->have_par = 1;
@@ -391,7 +407,7 @@ int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, 
     rc = 0;
 
 done:
-    free(walk);
+    crawl_dirx_walk_free(walk);
     return rc;
 }
 

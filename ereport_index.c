@@ -4424,8 +4424,6 @@ typedef struct {
     crawl_sidecar_shard_id_t id; /* name_off/name_len filled by the writer */
     crawl_dirx_entry_t *entries;
     uint64_t entry_count;
-    uint64_t *rows; /* row_offset[0 .. max_dir_id] */
-    uint64_t rows_len;
     crawl_rgix_group_t *groups;
     uint64_t group_count;
     uint64_t dfs_domain;
@@ -4436,8 +4434,6 @@ typedef struct {
 static void dirx_job_release(dirx_job_t *j) {
     free(j->entries);
     j->entries = NULL;
-    free(j->rows);
-    j->rows = NULL;
     free(j->groups);
     j->groups = NULL;
 }
@@ -4570,12 +4566,11 @@ static int dirx_build_shard(dirx_job_t *j) {
     if (fseeko(fp, (off_t)fh.catalog_offset, SEEK_SET) != 0) goto out;
     if (mk_fread(&n_entries, sizeof(n_entries), 1, fp) != 1) goto out;
 
-    /* The sketch needs the DFS permutation; the row offsets are what make a hash
-     * hit answerable without re-reading the catalog. Nothing else is loaded. */
-    if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size,
-                                   CRAWL_CAT_SUBTREE | CRAWL_CAT_ROW_OFFSET, &cat) != 0)
+    /* The sketch needs the DFS permutation, and the paths the hash table is over
+     * need the tree columns. Nothing else is loaded. */
+    if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, (uint64_t)st.st_size, CRAWL_CAT_SUBTREE, &cat) != 0)
         goto out;
-    if (!cat.dfs_index || !cat.row_offset) goto out;
+    if (!cat.dfs_index) goto out;
 
     j->id.shard_size = (uint64_t)st.st_size;
     j->id.shard_mtime_sec = (uint64_t)st.st_mtim.tv_sec;
@@ -4584,20 +4579,15 @@ static int dirx_build_shard(dirx_job_t *j) {
     j->id.catalog_entries = n_entries;
     j->id.max_dir_id = cat.max_dir_id;
 
-    j->rows_len = cat.max_dir_id + 1ULL;
-    j->rows = (uint64_t *)malloc((size_t)j->rows_len * sizeof(uint64_t));
     pathbuf = (char *)malloc(DIRX_PATH_BUF_BYTES);
     pc.buf = (char *)malloc(DIRX_PATH_BUF_BYTES);
-    j->entries = (crawl_dirx_entry_t *)malloc((size_t)j->rows_len * sizeof(crawl_dirx_entry_t));
-    if (!j->rows || !pathbuf || !pc.buf || !j->entries) goto out;
-
-    memcpy(j->rows, cat.row_offset, (size_t)j->rows_len * sizeof(uint64_t));
+    j->entries = (crawl_dirx_entry_t *)malloc((size_t)(cat.max_dir_id + 1ULL) * sizeof(crawl_dirx_entry_t));
+    if (!pathbuf || !pc.buf || !j->entries) goto out;
 
     for (did = 1; did <= cat.max_dir_id; did++) {
         size_t plen = 0;
 
         if (cat.dfs_index[did] >= dfs_domain) dfs_domain = cat.dfs_index[did] + 1ULL;
-        if (cat.row_offset[did] == 0ULL) continue; /* a dir_id with no entry in this catalog */
         if (dirx_dir_path(&cat, &pc, did, pathbuf, DIRX_PATH_BUF_BYTES, &plen) != 0) {
             /* subtree_find_dirs skips a directory whose path will not rebuild too,
              * so leaving it out of the table keeps the two routes in agreement. */
@@ -4757,9 +4747,6 @@ static int build_dir_index_sidecars(build_ctx_t *ctx, char **paths, size_t path_
             dsh[i].hash_off = doff;
             if (dirx_write_all(dfp, jobs[i].entries, (size_t)jobs[i].entry_count * sizeof(crawl_dirx_entry_t),
                                &doff) != 0)
-                goto out;
-            dsh[i].rows_off = doff;
-            if (dirx_write_all(dfp, jobs[i].rows, (size_t)jobs[i].rows_len * sizeof(uint64_t), &doff) != 0)
                 goto out;
 
             rsh[i].id = jobs[i].id;

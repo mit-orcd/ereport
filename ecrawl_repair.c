@@ -18,8 +18,8 @@
  * Other corrupt uid_shard_*.bin shards are renamed into <crawl-dir>/corrupt_shards/ (and matching
  * .bin.ckpt sidecars when present). Dry-run does not truncate, move, or write.
  *
- * If the 16-byte file header magic/version is not the current v4 (or known ERCBIN02 v2), we still run a full
- * record-structure scan. When that scan succeeds, the header is rewritten to ERCBIN03 / v3 before writing .ckpt
+ * If the 32-byte file header magic/version is not the current one (or the known ERCBIN02 v2), we still run a
+ * full record-structure scan. When that scan succeeds, the header is rewritten to the current magic and version
  * (same reserved field as read from disk). If the header is wrong and the scan fails, the shard is quarantined.
  *
  * After a normal run, every remaining top-level uid_shard_*.bin is checked for a sidecar compatible with

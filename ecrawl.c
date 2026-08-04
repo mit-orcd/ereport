@@ -2935,8 +2935,7 @@ done:
 }
 
 static int shard_cat_write_tail(shard_cat_t *c, FILE *fp, uint64_t *catalog_start_out) {
-    uint64_t n;
-    uint64_t id;
+    crawl_bin_catalog_src_t src;
     off_t st;
 
     if (!c || !fp || !catalog_start_out) return -1;
@@ -2948,43 +2947,35 @@ static int shard_cat_write_tail(shard_cat_t *c, FILE *fp, uint64_t *catalog_star
         errno = EINVAL;
         return -1;
     }
-    n = c->next_dir_id - 1ULL;
-    if (fwrite(&n, sizeof(n), 1, fp) != 1) return -1;
 
-    for (id = 1; id < c->next_dir_id; id++) {
-        bin_dir_catalog_entry_t ent;
-
-        memset(&ent, 0, sizeof(ent));
-        ent.dir_id = id;
-        ent.parent_dir_id = c->parent_dir_id[id];
-        ent.depth = c->depth[id];
-        ent.name_len = c->name_len[id];
-        ent.imm_child_bytes = c->imm_child_bytes[id];
-        ent.imm_child_count = c->imm_child_count[id];
-        ent.imm_child_ctime_led_count = c->imm_child_ctime_led_count[id];
-        ent.imm_child_min_eff_time = c->imm_child_min_eff_time[id];
-        ent.imm_child_max_eff_time = c->imm_child_max_eff_time[id];
-        ent.subtree_nlink_gt1_count = c->subtree_nlink_gt1_count[id];
-        ent.subtree_files = c->subtree_files[id];
-        ent.subtree_dirs = c->subtree_dirs[id];
-        ent.subtree_symlinks = c->subtree_symlinks[id];
-        ent.self_bytes = c->self_bytes[id];
-        if (c->self_present[id]) ent.flags |= (uint16_t)CRAWL_DIR_FLAG_SELF_RECORD;
-        /* Zero until the final close runs the post-pass. An interim tail written
-         * on LRU eviction is only ever read back by the reopen path, which uses
-         * the imm_child_* fields and the raw nlink counter above. */
-        if (c->finalized) {
-            ent.dfs_index = c->dfs_index[id];
-            ent.dfs_subtree_dirs = c->dfs_subtree_dirs[id];
-            ent.subtree_bytes = c->subtree_bytes[id];
-            ent.subtree_count = c->subtree_count[id];
-        }
-        if (fwrite(&ent, sizeof(ent), 1, fp) != 1) return -1;
-        if (ent.name_len > 0 && c->name_comp[id]) {
-            if (fwrite(c->name_comp[id], 1, ent.name_len, fp) != ent.name_len) return -1;
-        }
+    memset(&src, 0, sizeof(src));
+    src.n_entries = c->next_dir_id - 1ULL;
+    src.parent_dir_id = c->parent_dir_id;
+    src.depth = c->depth;
+    src.name_len = c->name_len;
+    src.name_comp = c->name_comp;
+    src.imm_child_bytes = c->imm_child_bytes;
+    src.imm_child_count = c->imm_child_count;
+    src.imm_child_ctime_led_count = c->imm_child_ctime_led_count;
+    src.imm_child_min_eff_time = c->imm_child_min_eff_time;
+    src.imm_child_max_eff_time = c->imm_child_max_eff_time;
+    src.self_present = c->self_present;
+    src.self_bytes = c->self_bytes;
+    src.subtree_nlink_gt1_count = c->subtree_nlink_gt1_count;
+    src.subtree_files = c->subtree_files;
+    src.subtree_dirs = c->subtree_dirs;
+    src.subtree_symlinks = c->subtree_symlinks;
+    /* NULL until the final close runs the post-pass, which the writer turns into
+     * a column of zeroes. An interim tail written on LRU eviction is only ever
+     * read back by the reopen path, which uses the imm_child_* fields and the
+     * raw nlink counter above. */
+    if (c->finalized) {
+        src.dfs_index = c->dfs_index;
+        src.dfs_subtree_dirs = c->dfs_subtree_dirs;
+        src.subtree_bytes = c->subtree_bytes;
+        src.subtree_count = c->subtree_count;
     }
-    return 0;
+    return crawl_bin_catalog_write(&src, fp, ecrawl_io_fwrite);
 }
 
 static int patch_bin_header_catalog_offset(FILE *fp, uint64_t catalog_off) {

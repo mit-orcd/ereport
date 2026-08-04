@@ -9,9 +9,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CRAWL_BIN_MAGIC "ERCBIN08"
+#define CRAWL_BIN_MAGIC "ERCBIN09"
 #define CRAWL_BIN_MAGIC_LEN 8
-#define CRAWL_BIN_FORMAT_VERSION 8u
+#define CRAWL_BIN_FORMAT_VERSION 9u
 
 /* Aliases used by ecrawl / readers */
 #define FILE_MAGIC_LEN CRAWL_BIN_MAGIC_LEN
@@ -28,8 +28,8 @@
  * Fixed file header (32 bytes). The record region occupies
  * [sizeof(bin_file_header_t), catalog_offset) and, since format v8, holds a
  * sequence of columnar row groups (see bin_rowgroup_hdr_t below) rather than
- * row-major compressed blocks. Catalog blob is [catalog_offset, EOF): uint64_t
- * n_entries then packed bin_dir_catalog_entry_t rows.
+ * row-major compressed blocks. The catalog is [catalog_offset, EOF) and, since
+ * v9, is itself columnar and compressed (see bin_catalog_hdr_t below).
  * catalog_offset == 0 means an incomplete shard (still being written); readers must reject.
  */
 typedef struct __attribute__((packed)) {
@@ -111,7 +111,11 @@ enum {
     CRAWL_ENC_FOR_BITPACK = 1, /* (value - min_value) packed at bit_width bits each */
     CRAWL_ENC_RLE = 2,         /* (uint64 value, uint64 run_length) pairs */
     CRAWL_ENC_CONST = 3,       /* every value == min_value; payload is empty */
-    CRAWL_ENC_BYTES = 4        /* opaque byte blob (CRAWL_COL_NAME_BYTES) */
+    CRAWL_ENC_BYTES = 4,       /* opaque byte blob (CRAWL_COL_NAME_BYTES) */
+    /* Byte blob stored verbatim, with no zstd frame around it, so a reader that
+     * has the bytes mapped can point straight at them. Only the catalog name
+     * column uses it; see CRAWL_BIN_CATALOG_COMPRESS_NAMES. */
+    CRAWL_ENC_BYTES_STORED = 5
 };
 
 typedef struct __attribute__((packed)) {
@@ -155,6 +159,10 @@ static inline uint16_t crawl_bin_type_bit(uint8_t type) {
  */
 #define CRAWL_BIN_ROWGROUP_RAW_TARGET (1u << 20)
 #define CRAWL_BIN_ROWGROUP_MAX_RECORDS 65536u
+
+/* zstd compression level for column chunks, in the record region and the
+ * catalog alike (override with ECRAWL_ZSTD_LEVEL). */
+#define CRAWL_BIN_ZSTD_DEFAULT_LEVEL 3
 
 /* Alias: ecrawl sizes its flush threshold from this. */
 #define CRAWL_BIN_BLOCK_RAW_TARGET CRAWL_BIN_ROWGROUP_RAW_TARGET
@@ -223,6 +231,11 @@ static inline uint16_t crawl_bin_type_bit(uint8_t type) {
  */
 #define CRAWL_DIR_FLAG_SELF_RECORD 0x0001u
 
+/*
+ * One catalog row, as the writer, the readers and the sidecar exchange it. Like
+ * bin_record_hdr_t this is no longer written to disk verbatim: since v9 each
+ * field is its own column chunk (see below), and dir_id is not stored at all.
+ */
 typedef struct __attribute__((packed)) {
     uint64_t dir_id;
     uint64_t parent_dir_id;
@@ -244,8 +257,93 @@ typedef struct __attribute__((packed)) {
     uint64_t subtree_dirs;
     uint64_t subtree_symlinks;
     uint64_t self_bytes;
-    /* Followed by name_len UTF-8 bytes (component only). */
 } bin_dir_catalog_entry_t;
+
+/* ---------------------------------------------------------------------------
+ * v9 columnar catalog
+ *
+ * v8 wrote the catalog as 136 raw bytes plus a name per directory, uncompressed,
+ * which on a directory-heavy capture was four fifths of the file. v9 encodes it
+ * the way the record region is already encoded:
+ *
+ *     uint64_t n_entries                     (dir_ids are dense 1..n_entries)
+ *     bin_catalog_hdr_t
+ *     <chunk 0> ... <chunk chunk_count-1>
+ *     uint64_t chunk_off[chunk_count]        (absolute file offsets)
+ *
+ * and each chunk is
+ *
+ *     bin_catchunk_hdr_t
+ *     bin_colchunk_hdr_t[column_count]       (the column directory)
+ *     <column 0 payload> ... <column n-1 payload>
+ *
+ * exactly like a row group, so the same codec and the same skip-what-you-did-
+ * not-ask-for reader logic apply. Chunk k holds dir_ids
+ * [k*chunk_dirs + 1, (k+1)*chunk_dirs], which is what lets the dir_id column
+ * be dropped: it is the row's position.
+ *
+ * Columns are ordered so the always-loaded tree group is a contiguous prefix and
+ * a consumer that only reconstructs paths never touches the rollup payloads.
+ *
+ * The chunk offset table trails the chunks because the writer only knows where
+ * a chunk landed once it has written it, and lives at the very end of the file
+ * because the catalog is by definition the file's tail.
+ * ------------------------------------------------------------------------- */
+
+typedef struct __attribute__((packed)) {
+    uint32_t chunk_count;
+    uint32_t chunk_dirs; /* dir_ids per chunk; the last chunk may hold fewer */
+    uint64_t reserved64;
+} bin_catalog_hdr_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t dir_count;
+    uint32_t column_count;
+    uint64_t comp_bytes; /* payload bytes following the column directory */
+    uint64_t raw_bytes;  /* total decoded payload bytes (informational) */
+} bin_catchunk_hdr_t;
+
+/* Catalog columns. Values are on-disk identifiers: never renumber, only append. */
+enum {
+    CRAWL_CATCOL_PARENT_DIR_ID = 0,
+    CRAWL_CATCOL_DEPTH = 1,
+    CRAWL_CATCOL_NAME_LEN = 2,
+    CRAWL_CATCOL_NAME_BYTES = 3, /* concatenated component names; sliced by NAME_LEN */
+    CRAWL_CATCOL_IMM_CHILD_BYTES = 4,
+    CRAWL_CATCOL_IMM_CHILD_COUNT = 5,
+    CRAWL_CATCOL_IMM_CHILD_CTIME_LED_COUNT = 6,
+    CRAWL_CATCOL_IMM_CHILD_MIN_EFF_TIME = 7,
+    CRAWL_CATCOL_IMM_CHILD_MAX_EFF_TIME = 8,
+    CRAWL_CATCOL_FLAGS = 9,
+    CRAWL_CATCOL_DFS_INDEX = 10,
+    CRAWL_CATCOL_DFS_SUBTREE_DIRS = 11,
+    CRAWL_CATCOL_SUBTREE_BYTES = 12,
+    CRAWL_CATCOL_SUBTREE_COUNT = 13,
+    CRAWL_CATCOL_SUBTREE_NLINK_GT1_COUNT = 14,
+    CRAWL_CATCOL_SUBTREE_FILES = 15,
+    CRAWL_CATCOL_SUBTREE_DIRS = 16,
+    CRAWL_CATCOL_SUBTREE_SYMLINKS = 17,
+    CRAWL_CATCOL_SELF_BYTES = 18,
+    CRAWL_CATCOL__COUNT = 19
+};
+
+/*
+ * Directories per catalog chunk.
+ *
+ * Larger chunks compress better; smaller ones make a single-row read cheaper,
+ * and the dirs.idx path reads one row per path component. 4096 keeps the tree
+ * columns of a chunk at ~64 KB decoded, so resolving a directory costs tens of
+ * microseconds, while the chunk headers and column directories cost 0.15 bytes
+ * per directory.
+ */
+#define CRAWL_BIN_CATALOG_CHUNK_DIRS 4096u
+
+/*
+ * Whether the catalog name blob gets a zstd frame. When it does not, the column
+ * is CRAWL_ENC_BYTES_STORED and a reader with the catalog mapped points
+ * name_comp straight into the mapping instead of decompressing into an arena.
+ */
+#define CRAWL_BIN_CATALOG_COMPRESS_NAMES 1
 
 /*
  * The record header. gid and mode are carried because columnar storage makes
@@ -304,7 +402,7 @@ static inline int crawl_bin_record_ctime_led(const bin_record_hdr_t *r) {
 }
 
 /* ---------------------------------------------------------------------------
- * Directory-index sidecars: dirs.idx (EDIRX001) and rowgroups.idx (ERGIX001)
+ * Directory-index sidecars: dirs.idx (EDIRX002) and rowgroups.idx (ERGIX001)
  *
  * Written by `ereport_index --make` into the index dir, read by
  * `ecrawl_query --index-dir`. Neither is part of a shard: they are derived,
@@ -333,7 +431,7 @@ static inline int crawl_bin_record_ctime_led(const bin_record_hdr_t *r) {
  * sorting its own directory listing.
  * ------------------------------------------------------------------------- */
 
-#define CRAWL_DIRX_MAGIC "EDIRX001"
+#define CRAWL_DIRX_MAGIC "EDIRX002"
 #define CRAWL_RGIX_MAGIC "ERGIX001"
 #define CRAWL_SIDECAR_MAGIC_LEN 8
 #define CRAWL_SIDECAR_VERSION 1u
@@ -367,19 +465,19 @@ typedef struct __attribute__((packed)) {
 } crawl_sidecar_shard_id_t;
 
 /*
- * dirs.idx per-shard payload: a hash table over full stored paths, plus the
- * dir_id -> catalog row offset map that makes a hit usable.
+ * dirs.idx per-shard payload: a hash table over full stored paths.
  *
  * The hash entries are sorted by (path_hash, dir_id) so a lookup is a binary
  * search, and they carry no path bytes: a hit names a dir_id, and the answer is
- * only accepted once the row at rows[dir_id] has been read and its parent chain
- * walked back into a path that compares equal to the query. A 64-bit collision
- * therefore costs one wasted row read, never a wrong answer.
+ * only accepted once that row has been read and its parent chain walked back
+ * into a path that compares equal to the query. A 64-bit collision therefore
+ * costs one wasted row read, never a wrong answer.
  *
- * rows[] is indexed by dir_id (slot 0 unused) and is what makes that walk
- * possible at all: catalog rows are variable length, so an ancestor's offset
- * cannot be computed from its id. 16 B per directory in the table plus 8 B in
- * rows[] is the ~24 B/dir this costs.
+ * Locating that row needs nothing from the sidecar: v9 hands out dense dir_ids
+ * and stores the catalog in fixed-size chunks, so dir_id names its chunk and
+ * the shard's own chunk table names the bytes. Under v8 rows were variable
+ * length and an ancestor's offset could not be derived from its id, which cost
+ * a uint64 per directory here.
  */
 typedef struct __attribute__((packed)) {
     uint64_t path_hash; /* crawl_sidecar_path_hash() of the full stored path */
@@ -390,7 +488,7 @@ typedef struct __attribute__((packed)) {
     crawl_sidecar_shard_id_t id;
     uint64_t hash_count; /* entries at hash_off */
     uint64_t hash_off;
-    uint64_t rows_off;   /* uint64 row_offset[0 .. max_dir_id], slot 0 unused */
+    uint64_t reserved64;
 } crawl_dirx_shard_t;
 
 /*

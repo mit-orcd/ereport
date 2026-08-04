@@ -1,6 +1,6 @@
 /*
  * Reader for the dir-index sidecars `ereport_index --make` writes: dirs.idx
- * (EDIRX001) and rowgroups.idx (ERGIX001). See crawl_bin_format.h for the
+ * (EDIRX002) and rowgroups.idx (ERGIX001). See crawl_bin_format.h for the
  * layouts.
  *
  * Shared by ecrawl_query and ereport. Both need the same three things from a
@@ -44,11 +44,11 @@
 typedef struct {
     const crawl_dirx_entry_t *ents; /* sorted by path_hash */
     uint64_t ent_count;
-    const uint64_t *rows; /* row_offset[dir_id], slot 0 unused */
+    crawl_bin_catalog_map_t cmap; /* the shard's catalog chunk table, read at open */
     uint64_t max_dir_id;
     uint64_t shard_size;
     uint64_t catalog_entries;
-    int fd; /* the shard, open read-only, for the row preads */
+    int fd; /* the shard, open read-only, for the row reads */
 } crawl_dirx_view_t;
 
 /* One shard's slice of rowgroups.idx. */
@@ -82,11 +82,18 @@ typedef struct {
 /*
  * Scratch for one path rebuild. ~100 KB, so heap-allocate it once per thread
  * rather than putting it on a stack.
+ *
+ * `chunk` is the last catalog chunk this walk decoded. A parent chain climbs
+ * towards smaller dir_ids and ids are handed out parent-before-child, so
+ * consecutive components usually land in the chunk already in hand and the walk
+ * decodes once rather than once per level.
  */
 typedef struct {
     unsigned char comp[CRAWL_BIN_CATALOG_MAX_PATH_PARTS][256];
     size_t clen[CRAWL_BIN_CATALOG_MAX_PATH_PARTS];
     char path[CRAWL_SIDECAR_PATH_MAX];
+    crawl_bin_catalog_chunk_t chunk;
+    const void *chunk_view; /* which view `chunk` was decoded from */
 } crawl_dirx_walk_t;
 
 /* Where one shard's subtree sits, resolved once per shard. */
@@ -131,14 +138,18 @@ int crawl_sidecar_open(const char *index_dir, const char *const *shard_paths, si
 void crawl_sidecar_close(crawl_sidecar_t *sc);
 
 crawl_dirx_walk_t *crawl_dirx_walk_new(void);
+void crawl_dirx_walk_free(crawl_dirx_walk_t *w);
 
 /*
- * Read one catalog row plus its name with a single pread. rows_read, when
- * non-NULL, is incremented per row actually read, which is what the diagnostics
- * report as directories_examined.
+ * Read one catalog row plus its name, decoding the row's catalog chunk into the
+ * walk when it is not already there. `fields` names the optional column groups
+ * the caller will read; the rest are left zero rather than decoded. rows_read,
+ * when non-NULL, is incremented per row actually read, which is what the
+ * diagnostics report as directories_examined.
  */
-int crawl_dirx_read_row(const crawl_dirx_view_t *v, uint64_t did, bin_dir_catalog_entry_t *ent,
-                        unsigned char *name, size_t name_cap, size_t *name_len_out, uint64_t *rows_read);
+int crawl_dirx_read_row(const crawl_dirx_view_t *v, crawl_dirx_walk_t *w, uint64_t did, unsigned fields,
+                        bin_dir_catalog_entry_t *ent, unsigned char *name, size_t name_cap,
+                        size_t *name_len_out, uint64_t *rows_read);
 
 /* Rebuild dir_id's stored path from its parent chain, one row read per level. */
 int crawl_dirx_path_of(const crawl_dirx_view_t *v, uint64_t did, crawl_dirx_walk_t *w, char *out, size_t out_sz,

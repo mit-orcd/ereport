@@ -4,11 +4,11 @@ Each `uid_shard_*.bin` file uses this layout. The authoritative definition is [`
 
 ## Version
 
-Shards are format version 8, magic `ERCBIN08`. Readers require an exact magic and version match and there is no upgrade path: a capture written by an older build must be re-crawled. Nothing in the tree reads an earlier version, so this page describes v8 only.
+Shards are format version 9, magic `ERCBIN09`. Readers require an exact magic and version match and there is no upgrade path: a capture written by an older build must be re-crawled. Nothing in the tree reads an earlier version, so this page describes v9 only.
 
 ## File header (32 bytes, packed)
 
-`magic[8]` (`ERCBIN08`), `version` (`uint32_t`, must equal 8), `reserved` `uint32_t`, `catalog_offset` `uint64_t` (byte offset from BOF to the catalog blob), `reserved64` `uint64_t`.
+`magic[8]` (`ERCBIN09`), `version` (`uint32_t`, must equal 9), `reserved` `uint32_t`, `catalog_offset` `uint64_t` (byte offset from BOF to the catalog blob), `reserved64` `uint64_t`.
 
 `catalog_offset` is the finalization marker. On a completed crawl `ecrawl` sets it to the first byte of the catalog (≥ header size, ≤ file size). `catalog_offset == 0` means the shard was never finalized — still being written, or interrupted — and readers must reject it.
 
@@ -43,6 +43,7 @@ Every chunk is encoded and then zstd-compressed; the encoding says what the fram
 | `CRAWL_ENC_FOR_BITPACK` | `value - min_value` packed at `bit_width` bits | `atime`/`mtime`/`ctime`, `parent_dir_id` |
 | `CRAWL_ENC_RAW` | `record_count` little-endian `uint64` | high-entropy columns such as `inode` |
 | `CRAWL_ENC_BYTES` | opaque blob | `name_bytes` only |
+| `CRAWL_ENC_BYTES_STORED` | opaque blob with no zstd frame around it | catalog `name_bytes` only, when name compression is off |
 
 ### Zone maps and projection
 
@@ -56,7 +57,24 @@ Projection is the other half: `crawl_bin_block_reader_set_projection()` decodes 
 
 ## Catalog tail: `[catalog_offset, EOF)`
 
-Begins with `uint64_t n_entries`, then `n_entries` packed `bin_dir_catalog_entry_t` rows: `dir_id`, `parent_dir_id`, `depth`, `name_len`, `flags`, then the `imm_child_*` aggregates, then the v8 `dfs_*` / `subtree_*` / `self_bytes` fields described below. Each row ends with `name_len` UTF-8 bytes (directory component only). `crawl_bin_catalog_load_sel()` lets a reader load only the groups it needs — the tree fields alone, plus `CRAWL_CAT_IMM_CHILD` and/or `CRAWL_CAT_SUBTREE` — which matters at a billion files, where the optional arrays are 40 and 72 bytes per directory. `ereport`, `ereport_index` and `ecrawl_mount` load none of them.
+Since v9 the catalog is columnar and compressed, the same way the record region is:
+
+```
+uint64_t n_entries                    dir_ids are dense, 1 … n_entries
+bin_catalog_hdr_t                     chunk_count, chunk_dirs
+<chunk 0> … <chunk chunk_count-1>
+uint64_t chunk_off[chunk_count]       absolute file offsets
+```
+
+and each chunk is a `bin_catchunk_hdr_t` (`dir_count`, `column_count`, `comp_bytes`, `raw_bytes`), then a `bin_colchunk_hdr_t[column_count]` directory, then the payloads in directory order — a row group in all but name, so the codec, the zone maps and the skip-what-you-did-not-ask-for reader logic are shared. `CRAWL_BIN_CATALOG_CHUNK_DIRS` (4096) directories go in a chunk; only the last may hold fewer.
+
+v8 wrote this region as 136 raw bytes plus a name per directory, uncompressed, which on a directory-heavy capture was four fifths of the file.
+
+Chunk *k* holds dir_ids `[k*chunk_dirs + 1, (k+1)*chunk_dirs]`, which is what lets the `dir_id` column be dropped: it is the row's position. The other nineteen columns are `parent_dir_id`, `depth`, `name_len`, `name_bytes`, the five `imm_child_*`, `flags`, and the nine `dfs_*` / `subtree_*` / `self_bytes` fields described below. `name_bytes` is the concatenated component names, sliced by `name_len`, exactly as in the record region.
+
+Columns are ordered so the always-loaded tree group is a contiguous prefix, and `crawl_bin_catalog_load_sel()` lets a reader load only the groups it needs — the tree fields alone, plus `CRAWL_CAT_IMM_CHILD` and/or `CRAWL_CAT_SUBTREE`. A group it did not ask for is skipped by its `comp_bytes` and never decompressed. `ereport`, `ereport_index` and `ecrawl_mount` ask for neither.
+
+Two readers exist. `crawl_bin_catalog_load_sel()` materializes whole columns into per-`dir_id` arrays, and walks the chunks back to back rather than through `chunk_off[]`, so it does not depend on where the file ends. `crawl_bin_catalog_read_row()` reads one row: `chunk_off[]` locates the row's chunk from its `dir_id` alone, and the decoded chunk is cached in the caller's walk, so climbing a parent chain usually decodes nothing after the first level. That is the path `dirs.idx` uses, and the reason the chunk offset table exists at all; it trails the chunks because the writer only knows where a chunk landed once it has written it.
 
 `dir_id` is 1-based and unique per shard; `parent_dir_id == 0` only for the synthetic root row (`dir_id == 1`). A directory gets a row when it is the recorded parent of at least one entry, so a directory with no children of its own may have no row. Directory identity is per shard, so the same logical path has different `dir_id`s in different shards — merging them into one namespace is the bulk of the work in [`ecrawl_mount`](tools.md#ecrawl_mount).
 
@@ -114,19 +132,18 @@ The descriptor array trails the payloads because the writer only knows where a p
 
 Every descriptor opens with a `crawl_sidecar_shard_id_t` recording five facts about the shard it was built from: basename, `st_size`, mtime (sec and nsec), the `catalog_offset` from the shard's own header, and the `n_entries` count that opens the catalog blob — plus the `max_dir_id` the catalog reached. A reader re-stats each shard, re-reads its 32-byte header and that one `uint64`, and compares. Any mismatch on any shard retires the sidecar for the whole run.
 
-This matters more than it looks. `dir_id` is per shard and is handed out in crawl arrival order, so a sidecar's dir_ids, row offsets and DFS positions are meaningless against a different file — and nothing else in the index dir is staleness-checked. The rule is therefore reject, never repair.
+This matters more than it looks. `dir_id` is per shard and is handed out in crawl arrival order, so a sidecar's dir_ids and DFS positions are meaningless against a different file — and nothing else in the index dir is staleness-checked. The rule is therefore reject, never repair.
 
-### `dirs.idx` — `EDIRX001`
+### `dirs.idx` — `EDIRX002`
 
-Per shard: a hash table over full stored paths, and the `dir_id → catalog row offset` map that makes a hit usable.
+Per shard: a hash table over full stored paths.
 
-- `crawl_dirx_shard_t`: the identity binding, then `hash_count`, `hash_off`, `rows_off`.
+- `crawl_dirx_shard_t`: the identity binding, then `hash_count`, `hash_off`.
 - At `hash_off`: `hash_count` × `crawl_dirx_entry_t` (`path_hash`, `dir_id`), sorted by `(path_hash, dir_id)`.
-- At `rows_off`: `max_dir_id + 1` × `uint64` byte offsets of each directory's `bin_dir_catalog_entry_t` in the shard. Slot 0 is unused; 0 means no entry for that id.
 
 `path_hash` is FNV-1a over the path exactly as `crawl_bin_catalog_dir_path()` spells it: absolute, no trailing slash, the synthetic root as the empty string. No path bytes are stored. A lookup binary-searches to the hash, and each candidate is only accepted after its row has been read and its parent chain walked back into a path that compares byte-equal to the query — so a 64-bit collision costs one wasted read and can never produce a wrong answer.
 
-`rows_off` is what makes that walk possible: catalog rows are variable length (the name follows the struct), so an ancestor's offset cannot be computed from its id. The pair costs about 24 bytes per directory, measured at 24.0 B/dir over 21726 directories, or 7% of that capture.
+Rows come out of the shard itself. `EDIRX001` also stored a `dir_id → catalog row offset` map, because a v8 catalog row was variable length and an ancestor's offset could not be computed from its id; it cost about 8 bytes per directory. In v9 a `dir_id` names its own chunk, so the map is gone and `crawl_bin_catalog_read_row()` resolves the hit against the shard's chunk table.
 
 Directories whose path will not rebuild — a broken parent chain — are left out of the table. `subtree_find_dirs` skips them too, so the two routes still agree about which directories exist.
 
@@ -147,7 +164,7 @@ Both sketches are stored because `dir_id` follows crawl arrival order and correl
 
 ## Operational notes
 
-- The code assumes local filesystem crawl data in `ERCBIN08` / format version 8 (nonzero `catalog_offset` and a trailing catalog). Use `ecrawl_repair` to regenerate missing sidecars without re-crawling.
+- The code assumes local filesystem crawl data in `ERCBIN09` / format version 9 (nonzero `catalog_offset` and a trailing catalog). Use `ecrawl_repair` to regenerate missing sidecars without re-crawling.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - Shards are assigned by `uid & (uid_shards - 1)`, so one directory's children scatter across many shard files whenever its entries have different owners.
 - For per-user runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. All-users runs load every shard file, as do merged full-cluster crawls.

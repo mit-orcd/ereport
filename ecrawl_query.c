@@ -2673,7 +2673,9 @@ static int query_try_rollup_sidecar(const crawl_sidecar_t *sc, query_rollup_t *o
 
         root = crawl_dirx_lookup(v, g_query.subtree, g_query.subtree_len, walk, &rows_read);
         if (root == 0ULL) continue;
-        if (crawl_dirx_read_row(v, root, &ent, namebuf, sizeof(namebuf), NULL, &rows_read) != 0) goto done;
+        if (crawl_dirx_read_row(v, walk, root, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                &rows_read) != 0)
+            goto done;
         if (ent.subtree_nlink_gt1_count != 0ULL) {
             /* Crawl-time hardlink credit lands with the first link seen anywhere in
              * the tree; a scan dedups within the subtree. With one in scope the two
@@ -2702,7 +2704,7 @@ static int query_try_rollup_sidecar(const crawl_sidecar_t *sc, query_rollup_t *o
     }
 
 done:
-    free(walk);
+    crawl_dirx_walk_free(walk);
     return rc;
 }
 

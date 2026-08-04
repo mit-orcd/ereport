@@ -19,9 +19,6 @@
 #include "crawl_bin_chunks.h" /* crawl_bin_chunk_stdio_t */
 #include "crawl_bin_format.h"
 
-/* zstd compression level for column chunks (override with ECRAWL_ZSTD_LEVEL). */
-#define CRAWL_BIN_ZSTD_DEFAULT_LEVEL 3
-
 /* ----------------------------------------------------------------------------
  * Writer side: accumulate records column-wise, flush them as a row group.
  * -------------------------------------------------------------------------- */

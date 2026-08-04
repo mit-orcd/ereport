@@ -136,8 +136,8 @@ fuse-headers:
 path_utils.o: path_utils.c path_utils.h
 	$(CC) $(CFLAGS) -c path_utils.c -o path_utils.o
 
-crawl_bin_catalog.o: crawl_bin_catalog.c crawl_bin_catalog.h crawl_bin_format.h
-	$(CC) $(CFLAGS) -c crawl_bin_catalog.c -o crawl_bin_catalog.o
+crawl_bin_catalog.o: crawl_bin_catalog.c crawl_bin_catalog.h crawl_bin_codec.h crawl_bin_format.h
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_bin_catalog.c -o crawl_bin_catalog.o
 
 crawl_result.o: crawl_result.c crawl_result.h crawl_bin_format.h
 	$(CC) $(CFLAGS) -c crawl_result.c -o crawl_result.o
@@ -164,8 +164,8 @@ test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
 test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_block_filter.c crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS)
 
-test_crawl_catalog: test_crawl_catalog.c crawl_bin_catalog.o
-	$(CC) $(CFLAGS) -o $@ test_crawl_catalog.c crawl_bin_catalog.o
+test_crawl_catalog: test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o $(ZSTD_LIBS)
 
 ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
@@ -173,7 +173,7 @@ ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_util
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
 
-ecrawl_repair: ecrawl_repair.c crawl_ckpt.h path_canon.h
+ecrawl_repair: ecrawl_repair.c crawl_ckpt.h crawl_bin_format.h path_canon.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
 ecrawl_query: ecrawl_query.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
