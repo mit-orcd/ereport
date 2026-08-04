@@ -1877,6 +1877,7 @@ write_env_snapshot() {
     echo "sort_window=${SORT_WINDOW:-<tool default: 1024 names, as ECRAWL_STAT_INODE_ORDER>}"
     echo "stat_threads=$(observed_key stat_threads) (observed; the tool's own summary, not a flag this script passes)"
     echo "stat_min_offload=<tool default: 32 names, as ECRAWL_STAT_BATCH_MIN_OFFLOAD>"
+    echo "dir_enqueue_batch=$(observed_key dir_enqueue_batch) (observed; discovered directories published per acquisition of the global queue lock, as ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH. 1 is the one-lock-per-directory form: on a 200,000-directory shape that is bimodal at 0.395 s or 1.100 s, so a 1 here means the timing rows are two populations and their median is an artefact of the split. queue_push_ops in each row is what the batch actually achieved.)"
     echo "locality_counters=$(observed_key locality_counters) (observed; 1 = chunk_reuse_rate, median_ino_delta and distinct_ino_buckets were counted)"
     echo "stat_pool: stat_threads=0 is the inline path logs/ewalk-strategy-manual-567654 was measured with; a nonzero value measures a different walker, so the two sets of rows are not comparable"
     echo "aging: jobs=$AGE_JOBS seed=$AGE_SEED churn_frac=$AGE_CHURN_FRAC churn_rounds=$AGE_CHURN_ROUNDS timeout_sec=$AGE_TIMEOUT_SEC aged_asc_max=$AGED_ASC_MAX"

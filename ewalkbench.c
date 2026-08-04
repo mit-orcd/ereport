@@ -24,6 +24,15 @@
  * was produced, so those results stay reproducible rather than merely
  * remembered.
  *
+ * Discovered directories reach the global queue in batches of
+ * --dir-enqueue-batch (ecrawl's ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH default of
+ * 48), for the same reason the stat pool exists: a benchmark that enqueues
+ * differently from the tool it models measures itself. Publishing one
+ * directory per lock made the 200,000-directory shape bimodal — 0.395 s or
+ * 1.100 s, decided by whether the producer stayed ahead of the consumers —
+ * which is a distribution no strategy difference could have been read
+ * through. --dir-enqueue-batch 1 restores that form for comparison.
+ *
  * --no-stat and --no-locality exist so the walk can be compared against tools
  * that do less: --no-stat is ecrawl's own names-only mode, which is the only
  * fair comparison against a traversal-only tool like fd, and --no-locality
@@ -113,6 +122,16 @@
  * once the stack is at least this deep, which is how the other workers get
  * work without giving up depth-first order locally. */
 #define DONATE_AT 16
+
+/* --dir-enqueue-batch: how many discovered directories a worker publishes per
+ * acquisition of the global queue lock. ecrawl's
+ * ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH default, and therefore this one: a
+ * benchmark that enqueues differently from the tool it models is measuring
+ * itself. 1 reproduces the one-directory-per-lock form this file had before
+ * the batch existed, which is what makes the cost of that form measurable
+ * rather than remembered. */
+#define DEFAULT_DIR_ENQUEUE_BATCH 48
+#define DIR_ENQUEUE_BATCH_MAX     4096
 
 /* chunk_reuse_rate: an XFS inode chunk is 64 inodes, so ino>>6 names the chunk
  * one inode read pulls in. "Recently" is the last CHUNK_WINDOW stats on the
@@ -260,6 +279,52 @@ static int workq_push(workq_t *wq, dirtask_t t, int to_front) {
     return rc;
 }
 
+/*
+ * Move up to n tasks from a worker-private deque into the global queue, taking
+ * wq->mu once for all of them.
+ *
+ * Measured on many_dirs (200,000 directories, 5 files each, 16 threads, warm
+ * node-local XFS): the one-push-per-directory form this replaces spent the
+ * walk parking and waking on wq->cv — 426,000 voluntary context switches per
+ * run, about two per directory — and the run came out bimodal, 0.395 s or
+ * 1.100 s depending on whether the producer happened to stay ahead of the
+ * consumers. Publishing a group leaves the queue non-empty for long enough
+ * that a consumer usually finds work without sleeping for it.
+ *
+ * from_back and to_front are the caller's, so the queue ends up in the order a
+ * run of single pushes would have left it in: batching changes how often the
+ * lock is taken and nothing else about the traversal.
+ *
+ * One broadcast rather than one signal per task. A signal per task would put
+ * the wakeups back, and the herd is bounded by the number of walk threads.
+ */
+static int workq_push_take(workq_t *wq, taskdeq_t *src, size_t n, int from_back, int to_front) {
+    size_t moved = 0;
+    int rc = 0;
+
+    if (n == 0) return 0;
+    pthread_mutex_lock(&wq->mu);
+    while (moved < n) {
+        dirtask_t t;
+
+        if ((from_back ? taskdeq_pop_back(src, &t) : taskdeq_pop_front(src, &t)) != 0)
+            break;
+        if ((to_front ? taskdeq_push_front(&wq->q, t) : taskdeq_push_back(&wq->q, t)) != 0) {
+            free(t.path);
+            wq->oom = 1;
+            rc = -1;
+            break;
+        }
+        moved++;
+    }
+    if (moved == 1)
+        pthread_cond_signal(&wq->cv);
+    else if (moved > 1)
+        pthread_cond_broadcast(&wq->cv);
+    pthread_mutex_unlock(&wq->mu);
+    return rc;
+}
+
 /* 0 = got work, -1 = queue empty right now (caller still has its own work). */
 static int workq_trypop(workq_t *wq, dirtask_t *out) {
     int rc;
@@ -306,13 +371,18 @@ static void workq_fail(workq_t *wq) {
  * still held entries that can turn out to be directories.
  *
  * The wakeup invariant is that every transition which can make the loop
- * predicate true also signals wq->cv while holding wq->mu: workq_push signals
- * after enqueuing (including pushes from a stat thread), workq_batch_done
- * broadcasts when inflight reaches zero, and workq_fail broadcasts when it
- * sets done. A batch pushes its discovered directories before its inflight
- * count is dropped, so inflight == 0 implies the queue already holds whatever
- * that batch found. With the pool off inflight is always zero and the
- * condition is the original one.
+ * predicate true also signals wq->cv while holding wq->mu: workq_push and
+ * workq_push_take signal after enqueuing (including pushes from a stat
+ * thread), workq_batch_done broadcasts when inflight reaches zero, and
+ * workq_fail broadcasts when it sets done. A batch pushes its discovered
+ * directories before its inflight count is dropped, so inflight == 0 implies
+ * the queue already holds whatever that batch found. With the pool off
+ * inflight is always zero and the condition is the original one.
+ *
+ * The condition counts two places work can be: this queue, and a stat batch.
+ * A worker's unflushed enqueue buffer is a third, and it is invisible to both,
+ * so the rule that keeps this sound is that the buffer is empty whenever its
+ * owner could be counted as parked or finished — see worker_flush_dirs.
  */
 static int workq_pop(workq_t *wq, dirtask_t *out) {
     int rc = -1;
@@ -708,6 +778,12 @@ typedef struct {
 
     taskdeq_t local;   /* DFS local stack (front = top) */
 
+    /* Discovered directories bound for the global queue, held back until
+     * enqueue_batch of them have accumulated. Empty at every point where this
+     * worker could be counted as parked or finished. */
+    taskdeq_t pending;
+    size_t    enqueue_batch;
+
     uint64_t  getdents_calls;
     uint64_t  fstatat_calls;
     uint64_t  dirs;
@@ -715,6 +791,7 @@ typedef struct {
     uint64_t  errors;
     uint64_t  batches_offloaded;
     uint64_t  batches_inlined;
+    uint64_t  queue_push_ops;  /* acquisitions of wq->mu to publish directories */
     uint64_t  max_dir_names;
     uint64_t  unknown_stats;   /* entries classified by inode rather than by d_type */
 
@@ -828,12 +905,42 @@ static char *join_path(const char *dir, size_t dir_len, const char *name, size_t
     return p;
 }
 
-/* DFS keeps discovered directories local (LIFO); BFS publishes them straight
- * to the tail of the global queue, which is what makes the frontier wide.
+/*
+ * Publish everything this worker has discovered and not yet enqueued.
+ *
+ * Termination rests on this. A directory sitting in w->pending is in neither
+ * the global queue nor the in-flight batch count, so workq_pop would be
+ * entitled to declare the walk over while a subtree was still buffered, and
+ * the run would report a plausible short count with errors=0. The buffer is
+ * therefore drained at every point where its owner stops being visible as
+ * work in progress: before a walk thread can block in workq_pop, and before a
+ * stat thread drops its in-flight count. Both of those go through here, and
+ * nothing else can park a thread.
+ *
+ * Not called on the fatal path: the walk is being abandoned there, and
+ * taskdeq_destroy frees what is left.
+ */
+static void worker_flush_dirs(worker_t *w) {
+    size_t n = w->pending.count;
+
+    if (n == 0) return;
+    w->queue_push_ops++;
+    if (workq_push_take(w->wq, &w->pending, n, 0, w->order == ORDER_DFS) != 0)
+        w->fatal = 1;
+}
+
+/* DFS keeps discovered directories local (LIFO); BFS publishes them to the
+ * tail of the global queue, which is what makes the frontier wide.
  *
  * A stat thread has no local stack to walk, so whatever it discovers has to
  * reach the global queue or it would never be visited. It pushes to the LIFO
- * end under DFS so the frontier keeps its depth-first shape. */
+ * end under DFS so the frontier keeps its depth-first shape.
+ *
+ * Publication is by batch, not by directory. The frontier is the same set of
+ * directories in the same order either way — a BFS batch still goes to the
+ * FIFO tail in discovery order — and only the moment of publication moves,
+ * by at most enqueue_batch discoveries. That is what ecrawl does with
+ * ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH. */
 static void worker_push_dir(worker_t *w, char *path_owned, size_t path_len) {
     dirtask_t t;
 
@@ -847,39 +954,49 @@ static void worker_push_dir(worker_t *w, char *path_owned, size_t path_len) {
         }
         return;
     }
-    if (workq_push(w->wq, t, w->order == ORDER_DFS) != 0) {
+    if (taskdeq_push_back(&w->pending, t) != 0) {
         free(path_owned);
         w->fatal = 1;
+        return;
     }
+    if (w->pending.count >= w->enqueue_batch)
+        worker_flush_dirs(w);
 }
 
-/* Hand the shallow half of the local stack to the other workers. */
+/* Hand the shallow half of the local stack to the other workers, in batches
+ * for the same reason worker_push_dir publishes in batches. In chunks rather
+ * than one splice: the first chunk is what wakes the other threads, and on
+ * this shape the donated half is 100,000 directories, so a single critical
+ * section would hold every other thread off the queue until all of them were
+ * copied. */
 static void worker_donate(worker_t *w) {
     size_t n;
 
     if (w->order != ORDER_DFS || w->local.count < DONATE_AT) return;
     n = w->local.count / 2;
-    while (n-- > 0) {
-        dirtask_t t;
+    while (n > 0 && !w->fatal) {
+        size_t chunk = (n < w->enqueue_batch) ? n : w->enqueue_batch;
 
-        if (taskdeq_pop_back(&w->local, &t) != 0) break;
-        if (workq_push(w->wq, t, 1) != 0) {
-            free(t.path);
+        w->queue_push_ops++;
+        if (workq_push_take(w->wq, &w->local, chunk, 1, 1) != 0) {
             w->fatal = 1;
             break;
         }
+        n -= chunk;
     }
 }
 
 static int worker_try_next_dir(worker_t *w, dirtask_t *out) {
     if (w->order == ORDER_DFS && taskdeq_pop_front(&w->local, out) == 0)
         return 0;
+    worker_flush_dirs(w);
     return workq_trypop(w->wq, out);
 }
 
 static int worker_next_dir(worker_t *w, dirtask_t *out) {
     if (w->order == ORDER_DFS && taskdeq_pop_front(&w->local, out) == 0)
         return 0;
+    worker_flush_dirs(w);
     return workq_pop(w->wq, out);
 }
 
@@ -1281,6 +1398,7 @@ out:
     for (i = 0; i < nbufs; i++)
         free(bufs[i]);
     taskdeq_destroy(&w->local);
+    taskdeq_destroy(&w->pending);
     return NULL;
 }
 
@@ -1312,8 +1430,11 @@ static void *stat_main(void *arg) {
             stat_one(w, it.dir, it.batch, &it.batch->ents[i]);
         dirref_release(it.dir);
         batchpool_put(w->bpool, it.batch);
-        /* After the pushes, never before: a walk thread may end the walk the
-         * moment this reaches zero. */
+        /* After the pushes and after the buffer holding them is drained,
+         * never before: a walk thread may end the walk the moment this
+         * reaches zero, and anything still buffered here would be a subtree
+         * nobody ever visits. */
+        worker_flush_dirs(w);
         workq_batch_done(w->wq);
         if (w->fatal)
             workq_fail(w->wq);
@@ -1321,6 +1442,7 @@ static void *stat_main(void *arg) {
 
     if (w->fatal)
         workq_fail(w->wq);
+    taskdeq_destroy(&w->pending);
     return NULL;
 }
 
@@ -1330,8 +1452,8 @@ static void usage(FILE *fp) {
     fprintf(fp,
         "usage: ewalkbench [--order dfs|bfs] [--stat hash|ino|spread] [--threads N]\n"
         "                  [--sort-window N|all] [--stat-threads N]\n"
-        "                  [--stat-min-offload N] [--no-stat] [--no-dtype]\n"
-        "                  [--no-locality] <root>\n"
+        "                  [--stat-min-offload N] [--dir-enqueue-batch N]\n"
+        "                  [--no-stat] [--no-dtype] [--no-locality] <root>\n"
         "\n"
         "  --order dfs      depth-first: LIFO local stack per thread plus a global queue (default)\n"
         "  --order bfs      breadth-first: every directory goes to a shared FIFO frontier\n"
@@ -1358,6 +1480,13 @@ static void usage(FILE *fp) {
         "                   rather than queued, 0..%u (default %d, which is what\n"
         "                   ecrawl's ECRAWL_STAT_BATCH_MIN_OFFLOAD does; 0 queues\n"
         "                   every batch). Only meaningful with --stat-threads.\n"
+        "  --dir-enqueue-batch N  discovered directories published per acquisition\n"
+        "                   of the global queue lock, 1..%u (default %d, which is\n"
+        "                   ecrawl's ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH). 1 is one\n"
+        "                   lock and one condvar signal per directory, the form\n"
+        "                   this file had before the batch existed; on a\n"
+        "                   200,000-directory tree that is bimodal, 0.395 s or\n"
+        "                   1.100 s per run. Reported as queue_push_ops.\n"
         "  --no-stat        walk names only and read no inode, as ecrawl --no-stat\n"
         "                   does: d_type classifies each entry and only DT_UNKNOWN\n"
         "                   still costs an fstatat (reported as dtype_unknown_stats).\n"
@@ -1383,7 +1512,8 @@ static void usage(FILE *fp) {
         "Summary is printed to stdout as key=value lines.\n",
         SPREAD_SLOTS, STAT_SORT_WINDOW_CAP, STAT_BATCH_NAMES,
         STAT_SORT_WINDOW_CAP, STAT_BATCH_NAMES,
-        DEFAULT_STAT_THREADS, STAT_SORT_WINDOW_CAP, DEFAULT_STAT_MIN_OFFLOAD);
+        DEFAULT_STAT_THREADS, STAT_SORT_WINDOW_CAP, DEFAULT_STAT_MIN_OFFLOAD,
+        DIR_ENQUEUE_BATCH_MAX, DEFAULT_DIR_ENQUEUE_BATCH);
 }
 
 static int parse_threads(const char *s, int *out) {
@@ -1461,6 +1591,7 @@ int main(int argc, char **argv) {
     int stat_threads = DEFAULT_STAT_THREADS;
     int stat_threads_req = 0;
     int min_offload = DEFAULT_STAT_MIN_OFFLOAD;
+    int enqueue_batch = DEFAULT_DIR_ENQUEUE_BATCH;
     int no_stat = 0;
     int no_dtype = 0;
     int locality = 1;
@@ -1478,6 +1609,7 @@ int main(int argc, char **argv) {
     uint64_t stats_done = 0, chunk_hits = 0;
     uint64_t rd_pairs = 0, rd_asc = 0;
     uint64_t batches_offloaded = 0, batches_inlined = 0, max_dir_names = 0;
+    uint64_t queue_push_ops = 0;
     uint64_t unknown_stats = 0;
     uint64_t *deltas = NULL;
     size_t ndeltas = 0, deltas_cap = 0;
@@ -1554,6 +1686,15 @@ int main(int argc, char **argv) {
 
             if (!v || parse_bounded(v, 0, (long)STAT_SORT_WINDOW_CAP, &min_offload) != 0) {
                 fprintf(stderr, "ewalkbench: invalid --stat-min-offload %s\n", v ? v : "(missing)");
+                return 2;
+            }
+            continue;
+        }
+        if (strncmp(a, "--dir-enqueue-batch", 19) == 0 && (a[19] == '\0' || a[19] == '=')) {
+            const char *v = (a[19] == '=') ? a + 20 : (++i < argc ? argv[i] : NULL);
+
+            if (!v || parse_bounded(v, 1, DIR_ENQUEUE_BATCH_MAX, &enqueue_batch) != 0) {
+                fprintf(stderr, "ewalkbench: invalid --dir-enqueue-batch %s\n", v ? v : "(missing)");
                 return 2;
             }
             continue;
@@ -1667,6 +1808,7 @@ int main(int argc, char **argv) {
         workers[i].fill_names = (stat_mode == STAT_SPREAD) ? STAT_BATCH_NAMES : sort_window;
         workers[i].bpool = &bpool;
         workers[i].min_offload = (size_t)min_offload;
+        workers[i].enqueue_batch = (size_t)enqueue_batch;
         workers[i].no_stat = no_stat;
         workers[i].no_dtype = no_dtype;
         workers[i].locality = locality;
@@ -1679,6 +1821,7 @@ int main(int argc, char **argv) {
         stat_workers[i].stat_mode = stat_mode;
         stat_workers[i].sq = &sq;
         stat_workers[i].bpool = &bpool;
+        stat_workers[i].enqueue_batch = (size_t)enqueue_batch;
         stat_workers[i].stat_thread = 1;
         stat_workers[i].no_stat = no_stat;
         stat_workers[i].no_dtype = no_dtype;
@@ -1754,6 +1897,7 @@ int main(int argc, char **argv) {
         rd_asc += w->rd_asc;
         batches_offloaded += w->batches_offloaded;
         batches_inlined += w->batches_inlined;
+        queue_push_ops += w->queue_push_ops;
         unknown_stats += w->unknown_stats;
         if (w->max_dir_names > max_dir_names)
             max_dir_names = w->max_dir_names;
@@ -1853,6 +1997,11 @@ int main(int argc, char **argv) {
     printf("readdir_pairs=%" PRIu64 "\n", rd_pairs);
     printf("stats=%" PRIu64 "\n", stats_done);
     printf("dtype_unknown_stats=%" PRIu64 "\n", unknown_stats);
+    /* queue_push_ops counts what the batch is meant to reduce, so a run can
+     * show that it did rather than be assumed to have done. The root push
+     * from here is not counted: these are the workers' own acquisitions. */
+    printf("dir_enqueue_batch=%d\n", enqueue_batch);
+    printf("queue_push_ops=%" PRIu64 "\n", queue_push_ops);
     printf("stat_batches_offloaded=%" PRIu64 "\n", batches_offloaded);
     printf("stat_batches_inlined=%" PRIu64 "\n", batches_inlined);
     printf("stat_pool_max_inflight=%" PRIu64 "\n", wq.max_inflight);
