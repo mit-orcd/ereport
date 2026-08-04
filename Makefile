@@ -187,6 +187,16 @@ ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h cr
 enfsprobe: enfsprobe.c
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
 
+# Standalone walk benchmark for inode access strategy (scripts/profile/ewalk-strategy-bench.sh).
+# Deliberately not in TARGETS: it is a measurement instrument, not part of the
+# product, so `make` and scripts/test/test.sh stay unaffected. Build with `make ewalkbench`.
+# -g here and not in CFLAGS: the bench's perf pass defaults to PERF_CALLGRAPH=dwarf
+# and has no DWARF to unwind without it. It does not affect codegen, so timings stay
+# comparable to runs built without it. -fno-omit-frame-pointer is deliberately absent
+# for the opposite reason: it does change codegen, and the wall times are the result.
+ewalkbench: ewalkbench.c
+	$(CC) $(CFLAGS) -g $(JEMALLOC_CFLAGS) -o $@ ewalkbench.c $(JEMALLOC_LIBS)
+
 # Fully static libnfs (needs libnfs.a — often unavailable on RHEL; try Fedora or build libnfs from source).
 enfsprobe-static: enfsprobe.c
 	$(CC) $(CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c \
@@ -215,7 +225,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
+	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o
 	rm -rf __pycache__ enfsprobe-dist
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
