@@ -18,9 +18,10 @@
  * Other corrupt uid_shard_*.bin shards are renamed into <crawl-dir>/corrupt_shards/ (and matching
  * .bin.ckpt sidecars when present). Dry-run does not truncate, move, or write.
  *
- * If the 32-byte file header magic/version is not the current one (or the known ERCBIN02 v2), we still run a
- * full record-structure scan. When that scan succeeds, the header is rewritten to the current magic and version
- * (same reserved field as read from disk). If the header is wrong and the scan fails, the shard is quarantined.
+ * The 32-byte file header must carry the current magic and version exactly. A shard written by an older
+ * ecrawl is refused and left where it is: its records may scan cleanly while its catalog tail is in the old
+ * format, so the only fix is a re-crawl. A file whose header is not an ecrawl shard header at all is
+ * quarantined as corrupt.
  *
  * After a normal run, every remaining top-level uid_shard_*.bin is checked for a sidecar compatible with
  * crawl_bin_load_ckpt() in crawl_bin_chunks.c (same rules as ereport / ereport_index). Exit status is 0 only
@@ -51,23 +52,52 @@
 #define PATH_MAX 4096
 #endif
 
-/* Older ecrawl shards: same bin_record_hdr_t as current; ecrawl_repair rewrites header after scan. */
-#define REPAIR_LEGACY_MAGIC_V2 "ERCBIN02"
-#define REPAIR_LEGACY_VERSION_V2 2u
+/* Bytes of CRAWL_BIN_MAGIC that name the format rather than its version, so an ecrawl capture from another
+ * version can be told apart from a file that was never a shard. */
+#define REPAIR_BIN_MAGIC_FAMILY_LEN 6
 
 typedef enum {
-    REPAIR_HDR_REJECT = 0,
-    REPAIR_HDR_CURRENT = 1,
-    REPAIR_HDR_LEGACY_V2 = 2
+    REPAIR_HDR_CURRENT = 0,
+    REPAIR_HDR_OTHER_VERSION,
+    REPAIR_HDR_NOT_A_SHARD
 } repair_bin_hdr_kind_t;
 
 static repair_bin_hdr_kind_t repair_bin_hdr_kind(const bin_file_header_t *h) {
-    if (h->version == FORMAT_VERSION && memcmp(h->magic, CRAWL_BIN_MAGIC, (size_t)CRAWL_BIN_MAGIC_LEN) == 0)
-        return REPAIR_HDR_CURRENT;
-    if (h->version == REPAIR_LEGACY_VERSION_V2 &&
-        memcmp(h->magic, REPAIR_LEGACY_MAGIC_V2, (size_t)CRAWL_BIN_MAGIC_LEN) == 0)
-        return REPAIR_HDR_LEGACY_V2;
-    return REPAIR_HDR_REJECT;
+    if (crawl_bin_hdr_magic_ok(h->magic, h->version, FORMAT_VERSION)) return REPAIR_HDR_CURRENT;
+    if (memcmp(h->magic, CRAWL_BIN_MAGIC, (size_t)REPAIR_BIN_MAGIC_FAMILY_LEN) == 0)
+        return REPAIR_HDR_OTHER_VERSION;
+    return REPAIR_HDR_NOT_A_SHARD;
+}
+
+static void repair_magic_text(const char *magic, char *out, size_t out_sz) {
+    size_t i;
+
+    for (i = 0; i + 1U < out_sz && i < (size_t)CRAWL_BIN_MAGIC_LEN; i++) {
+        unsigned char c = (unsigned char)magic[i];
+        out[i] = isprint(c) ? (char)c : '?';
+    }
+    out[i] = '\0';
+}
+
+/*
+ * 0 when the header is exactly the current magic and version; otherwise says why and returns -1. An older
+ * capture and a file that is not a shard are separate messages because they call for different actions.
+ */
+static int report_header_not_current(const char *path, const bin_file_header_t *h) {
+    char magic_text[CRAWL_BIN_MAGIC_LEN + 1];
+    repair_bin_hdr_kind_t k = repair_bin_hdr_kind(h);
+
+    if (k == REPAIR_HDR_CURRENT) return 0;
+    repair_magic_text(h->magic, magic_text, sizeof(magic_text));
+    if (k == REPAIR_HDR_OTHER_VERSION)
+        fprintf(stderr,
+                "%s: shard header is %s v%u, expected %s v%u — this capture was written by a different ecrawl "
+                "version; re-crawl the tree (ecrawl_repair does not convert captures)\n",
+                path, magic_text, h->version, CRAWL_BIN_MAGIC, FORMAT_VERSION);
+    else
+        fprintf(stderr, "%s: not an ecrawl uid-shard binary (header %s v%u, expected %s v%u)\n", path,
+                magic_text, h->version, CRAWL_BIN_MAGIC, FORMAT_VERSION);
+    return -1;
 }
 
 #define DEFAULT_REPAIR_THREADS 16U
@@ -140,7 +170,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--dry-run] [--verbose] <crawl-output-dir>\n"
             "  Default: writes uid_shard_*.bin.ckpt next to ecrawl v%u shard files (full scan).\n"
-            "  Non-current bin headers are rewritten to %s v%u after a successful record scan.\n"
+            "  Shards whose header is not %s v%u are refused: a capture from another version must be re-crawled.\n"
             "  Parallel threads: ECRAWL_REPAIR_THREADS (default %u).\n"
             "  Truncates tail when the record stream fails at an incomplete last record; else corrupt "
             "shards go to %s/.\n"
@@ -198,47 +228,12 @@ static int read_bin_file_header(const char *path, uint64_t file_sz, bin_file_hea
     return 0;
 }
 
-static int validate_bin_prefix_current_only(const char *path, uint64_t file_sz, int *corrupt_out) {
+static int validate_bin_prefix_current_only(const char *path, uint64_t file_sz) {
     bin_file_header_t hdr;
-    repair_bin_hdr_kind_t k;
+    int corrupt;
 
-    *corrupt_out = 0;
-    if (read_bin_file_header(path, file_sz, &hdr, corrupt_out) != 0) return -1;
-    k = repair_bin_hdr_kind(&hdr);
-    if (k != REPAIR_HDR_CURRENT) {
-        fprintf(stderr, "%s: not an ecrawl uid-shard binary (magic/version)\n", path);
-        *corrupt_out = (k == REPAIR_HDR_REJECT) ? 1 : 0;
-        return -1;
-    }
-    return 0;
-}
-
-static int rewrite_shard_header_to_current(const char *path, const bin_file_header_t *old_hdr) {
-    FILE *fp;
-    bin_file_header_t nh;
-
-    fp = fopen(path, "r+b");
-    if (!fp) {
-        perror(path);
-        return -1;
-    }
-    memset(&nh, 0, sizeof(nh));
-    memcpy(nh.magic, CRAWL_BIN_MAGIC, (size_t)CRAWL_BIN_MAGIC_LEN);
-    nh.version = FORMAT_VERSION;
-    nh.reserved = old_hdr->reserved;
-    nh.catalog_offset = old_hdr->catalog_offset;
-    if (fseeko(fp, (off_t)0, SEEK_SET) != 0 || fwrite(&nh, sizeof(nh), 1, fp) != 1 || fflush(fp) != 0) {
-        int e = errno ? errno : EIO;
-        fclose(fp);
-        errno = e;
-        perror(path);
-        return -1;
-    }
-    if (fclose(fp) != 0) {
-        perror(path);
-        return -1;
-    }
-    return 0;
+    if (read_bin_file_header(path, file_sz, &hdr, &corrupt) != 0) return -1;
+    return report_header_not_current(path, &hdr);
 }
 
 /*
@@ -471,7 +466,6 @@ static int verify_top_level_shards_ereport_ready(const char *dir_path) {
     char full[PATH_MAX];
     struct stat st;
     int bad = 0;
-    int corrupt_flag;
 
     dp = opendir(dir_path);
     if (!dp) {
@@ -492,10 +486,9 @@ static int verify_top_level_shards_ereport_ready(const char *dir_path) {
         }
         if (!S_ISREG(st.st_mode)) continue;
 
-        if (validate_bin_prefix_current_only(full, (uint64_t)st.st_size, &corrupt_flag) != 0) {
-            fprintf(stderr,
-                    "%s: not a readable ecrawl v%u shard (ereport would skip); remove or fix before ereport\n",
-                    full, FORMAT_VERSION);
+        if (validate_bin_prefix_current_only(full, (uint64_t)st.st_size) != 0) {
+            fprintf(stderr, "%s: ereport would skip this shard; remove or re-crawl it before running ereport\n",
+                    full);
             bad++;
             continue;
         }
@@ -652,7 +645,6 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
     int corrupt;
     bin_file_header_t bin_hdr;
     repair_bin_hdr_kind_t hdr_kind;
-    int header_unrecognized;
 
     n = snprintf(full, sizeof(full), "%s/%s", dir_path, name);
     if (n < 0 || (size_t)n >= sizeof(full)) {
@@ -680,7 +672,16 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
         return -1;
     }
     hdr_kind = repair_bin_hdr_kind(&bin_hdr);
-    header_unrecognized = (hdr_kind == REPAIR_HDR_REJECT);
+    if (hdr_kind != REPAIR_HDR_CURRENT) {
+        report_header_not_current(full, &bin_hdr);
+        if (hdr_kind == REPAIR_HDR_NOT_A_SHARD) {
+            quarantine_corrupt_shard(dir_path, full, name);
+            corrupt_quarantine_inc(corrupt_quarantined);
+        } else {
+            ops_fail_inc(ops_fail);
+        }
+        return -1;
+    }
 
     {
         uint64_t salvage_end = 0;
@@ -726,12 +727,6 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
                 if (rebuild_offsets_scan(full, (uint64_t)st.st_size, &offs, &n_off, &corrupt, &salvage_end) !=
                     0) {
                     if (corrupt) {
-                        if (header_unrecognized) {
-                            fprintf(stderr,
-                                    "%s: unrecognized bin header (magic/version) and record scan failed after "
-                                    "truncate — not a repairable shard\n",
-                                    full);
-                        }
                         quarantine_corrupt_shard(dir_path, full, name);
                         corrupt_quarantine_inc(corrupt_quarantined);
                     } else {
@@ -741,12 +736,6 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
                 }
             } else {
                 if (corrupt) {
-                    if (header_unrecognized) {
-                        fprintf(stderr,
-                                "%s: unrecognized bin header (magic/version) and record scan failed — not a "
-                                "repairable shard\n",
-                                full);
-                    }
                     quarantine_corrupt_shard(dir_path, full, name);
                     corrupt_quarantine_inc(corrupt_quarantined);
                 } else {
@@ -761,25 +750,6 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
         pthread_mutex_lock(&g_verbose_mutex);
         printf("%s -> %zu checkpoint offsets\n", full, n_off);
         pthread_mutex_unlock(&g_verbose_mutex);
-    }
-
-    if (hdr_kind == REPAIR_HDR_LEGACY_V2 || header_unrecognized) {
-        if (g_dry_run) {
-            if (hdr_kind == REPAIR_HDR_LEGACY_V2)
-                fprintf(stderr, "%s: would rewrite bin header %s v%u -> %s v%u\n", full, REPAIR_LEGACY_MAGIC_V2,
-                        REPAIR_LEGACY_VERSION_V2, CRAWL_BIN_MAGIC, FORMAT_VERSION);
-            else
-                fprintf(stderr, "%s: would rewrite unrecognized bin header -> %s v%u\n", full, CRAWL_BIN_MAGIC,
-                        FORMAT_VERSION);
-        } else if (rewrite_shard_header_to_current(full, &bin_hdr) != 0) {
-            ops_fail_inc(ops_fail);
-            free(offs);
-            return -1;
-        } else if (g_verbose) {
-            pthread_mutex_lock(&g_verbose_mutex);
-            printf("%s: normalized bin header to %s v%u\n", full, CRAWL_BIN_MAGIC, FORMAT_VERSION);
-            pthread_mutex_unlock(&g_verbose_mutex);
-        }
     }
 
     if (g_dry_run) {
@@ -800,7 +770,7 @@ static int process_one_shard(const char *dir_path, const char *name, _Atomic int
         return -1;
     }
     if (sidecar_ok_for_ereport(full, (uint64_t)st.st_size) != 0) {
-        fprintf(stderr, "%s: wrote .ckpt but ereport compatibility check failed\n", full);
+        fprintf(stderr, "%s: wrote .ckpt but it does not satisfy ereport's sidecar check\n", full);
         ops_fail_inc(ops_fail);
         free(offs);
         return -1;

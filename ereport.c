@@ -13,18 +13,17 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
  *     --index-dir DIR (optional): dirs.idx / rowgroups.idx from `ereport_index --make`. Only --subtree uses them,
  *     and only as a shortcut to the same answer; anything unusable about them falls back silently.
- *     --verbose [minutes] (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
- *     no I/O counter atomics on hot paths). Optional integer after --verbose is accepted for compatibility but does not
- *     enable extra output. While verbose, stderr prints ecrawl-style `key=value` progress about every 30s (idle counters
- *     omitted). Thread count remains EREPORT_THREADS.
+ *     --verbose (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
+ *     no I/O counter atomics on hot paths). While verbose, stderr prints ecrawl-style `key=value` progress
+ *     about every 30s (idle counters omitted). Thread count remains EREPORT_THREADS.
  *     Purple C-led heat-map badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).
  *     Flags must appear first (in any order), before username/time basis.
  *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
@@ -10769,11 +10768,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose [minutes]]] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10796,9 +10795,9 @@ int main(int argc, char **argv) {
                 "instead of a rebuilt path. The report is identical either way; a sidecar that is absent, stale, or "
                 "does not name every shard is ignored.\n");
         fprintf(stderr,
-                "Optional --verbose [minutes]: I/O counters + rolling throughput stats (default quiet: sparse "
-                "progress, no per-read I/O atomics). Optional integer 1…10080 is accepted for compatibility; stderr "
-                "prints ecrawl-style `key=value` progress about every 30s (idle counters omitted).\n");
+                "Optional --verbose: I/O counters + rolling throughput stats (default quiet: sparse "
+                "progress, no per-read I/O atomics); stderr prints ecrawl-style `key=value` progress about "
+                "every 30s (idle counters omitted).\n");
         fprintf(stderr,
                 "C-led badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).\n");
         fprintf(stderr,
@@ -10867,9 +10866,6 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (ac > 1 && strcmp(av[1], "--verbose") == 0) {
-                char *end = NULL;
-                long m;
-
                 if (g_ereport_verbose) {
                     fprintf(stderr, "ereport: duplicate --verbose\n");
                     return 2;
@@ -10878,15 +10874,6 @@ int main(int argc, char **argv) {
                 memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
                 ac -= 1;
                 argc = ac;
-                if (ac > 1) {
-                    errno = 0;
-                    m = strtol(av[1], &end, 10);
-                    if (end != av[1] && *end == '\0' && errno == 0 && m >= 1L && m <= 10080L) {
-                        memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
-                        ac -= 1;
-                        argc = ac;
-                    }
-                }
                 continue;
             }
             if (ac > 1 && strcmp(av[1], "--subtree") == 0) {

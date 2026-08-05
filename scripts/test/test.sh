@@ -853,14 +853,14 @@ run_ecrawl_no_stat_tests() {
     pass "ecrawl --no-stat + --contains"
 }
 
-# ERCBIN08: the catalog rollup fast path must agree with the record scan wherever
+# ERCBIN09: the catalog rollup fast path must agree with the record scan wherever
 # it claims to apply, must decline where it cannot be exact, and the gid/mode
 # columns the columnar format brought back must filter correctly.
 run_v8_rollup_tests() {
     local td=$1
     local tree="${td}/v8_tree" out="${td}/v8_crawl" log="${td}/v8.crawl.log"
 
-    section_int "[integration] ERCBIN08 catalog rollups + gid/perm filters"
+    section_int "[integration] ERCBIN09 catalog rollups + gid/perm filters"
 
     # clean/ has no multiply-linked file anywhere below it, so the rollup is
     # provably exact there. linked/y.txt has its twin outside the subtree, which
@@ -912,7 +912,7 @@ run_v8_rollup_tests() {
         >"$fb" 2>&1 || die "hardlink-subtree query failed"
     expect_eq "subtree spanned by a hardlink falls back to the scan" "record_scan" \
         "$(kv_last answered_from "$fb")"
-    summary_add PASS "ERCBIN08 rollup fast path" "exact-parity+du-parity+hardlink-fallback"
+    summary_add PASS "ERCBIN09 rollup fast path" "exact-parity+du-parity+hardlink-fallback"
 
     # gid and mode are columns the columnar format makes cheap enough to carry.
     local g bogus
@@ -934,7 +934,7 @@ run_v8_rollup_tests() {
         "$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" $psub --type f --perm 0444 --list "$out" 2>/dev/null)"
     expect_eq "--perm /0111 finds the one executable file" "${tree_abs}/perm/ex.bin" \
         "$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" $psub --type f --perm /0111 --list "$out" 2>/dev/null)"
-    summary_add PASS "ERCBIN08 gid/perm filters" "gid-match+gid-miss+perm exact/all/any"
+    summary_add PASS "ERCBIN09 gid/perm filters" "gid-match+gid-miss+perm exact/all/any"
 
     rm -rf "$tree" "$out"
 }

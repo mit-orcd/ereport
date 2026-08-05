@@ -50,8 +50,7 @@
 # Environment knobs (all optional):
 #   ECRAWL_QUERY_BIN=./ecrawl_query  analyzer binary (auto: ./, /tmp/, PATH).
 #   ECRAWL_QUERY_THREADS=32    worker threads (passed through; tool caps at the
-#                              shard count, and falls back to ECRAWL_REPAIR_THREADS
-#                              if ECRAWL_QUERY_THREADS is unset).
+#                              shard count).
 #   ANALYZE_TOP=               if set to N, pass `--top N` to ecrawl_query.
 #   FIXTURES="a b c"           subset of fixtures (default: known set, else all
 #                              immediate subdirs).

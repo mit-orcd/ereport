@@ -4875,8 +4875,8 @@ static int write_meta_file(const build_ctx_t *ctx) {
     fprintf(fp, "bucket_bits=%d\n", TRIGRAM_BUCKET_BITS);
     fprintf(fp, "bucket_count=%u\n", TRIGRAM_BUCKET_COUNT);
     /* Advisory only: the sidecars carry their own per-shard identity binding, and a
-     * reader validates that rather than trusting these. No INDEX_VERSION bump —
-     * old readers ignore the lines, new ones fall back when the files are absent. */
+     * reader validates that rather than trusting these. No INDEX_VERSION bump, because
+     * nothing keys on the lines: a reader falls back when the files are absent. */
     fprintf(fp, "dir_index=%d\n", ctx->dir_index_built ? 1 : 0);
     if (ctx->dir_index_built) fprintf(fp, "dir_index_dirs=%" PRIu64 "\n", ctx->dir_index_dirs);
     fprintf(fp, "rowgroup_index=%d\n", ctx->rowgroup_index_built ? 1 : 0);
@@ -4904,7 +4904,7 @@ static void merge_loaded_bucket_destroy(merge_loaded_bucket_t *L) {
     memset(L, 0, sizeof(*L));
 }
 
-/* Max worker id + 1 from tmp_trigrams_*_w%04u.bin names (0 if only legacy tmp_trigrams_%04u.bin exists). */
+/* Max worker id + 1 from tmp_trigrams_*_w%04u.bin names (0 when there are none). */
 static uint32_t discover_max_trigram_worker_shard(const char *index_dir) {
     DIR *d;
     struct dirent *e;
@@ -4929,15 +4929,11 @@ static void merge_ctx_ensure_trigram_shard_count(build_ctx_t *ctx) {
 }
 
 static void unlink_bucket_tmp_sources(build_ctx_t *ctx, uint32_t bucket) {
-    char path[PATH_MAX], leg[PATH_MAX];
+    char path[PATH_MAX];
     uint32_t w, max_w;
 
     merge_ctx_ensure_trigram_shard_count(ctx);
     max_w = ctx->trigram_tmp_shard_count;
-    if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(leg))
-        goto shards;
-    (void)unlink(leg);
-shards:
     for (w = 0; w < max_w; w++) {
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))
             continue;
@@ -4946,12 +4942,11 @@ shards:
 }
 
 /*
- * Load legacy single-file tmp_trigrams_%04u.bin (if present) plus all tmp_trigrams_%04u_w%04u.bin shards into
- * one buffer. Every tmp file is EITG0002 delta-varint framed; records are decoded and concatenated, then the
- * caller's radix sort fixes global order.
+ * Load all tmp_trigrams_%04u_w%04u.bin shards of a bucket into one buffer. Every tmp file is EITG0002
+ * delta-varint framed; records are decoded and concatenated, then the caller's radix sort fixes global order.
  */
 static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_loaded_bucket_t *out) {
-    char path[PATH_MAX], leg[PATH_MAX];
+    char path[PATH_MAX];
     struct stat st;
     uint64_t total_bytes = 0;
     size_t total_n = 0;
@@ -4963,15 +4958,6 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
     merge_ctx_ensure_trigram_shard_count(ctx);
     max_w = ctx->trigram_tmp_shard_count;
 
-    if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(leg)) return -1;
-    if (stat(leg, &st) == 0 && st.st_size > 0) {
-        size_t nrec = 0;
-        uint64_t ubytes = 0;
-
-        if (tmp_trigram_count_file_records(leg, &nrec, &ubytes) != 0) return -1;
-        total_bytes += ubytes;
-        total_n += nrec;
-    }
     for (w = 0; w < max_w; w++) {
         size_t nrec = 0;
         uint64_t ubytes = 0;
@@ -5000,19 +4986,6 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
         return -1;
     }
 
-    if (stat(leg, &st) == 0 && st.st_size > 0) {
-        trigram_record_t *recs = NULL;
-        size_t nrec = 0;
-
-        if (tmp_trigram_load_file(leg, &recs, &nrec, NULL) != 0) {
-            fprintf(stderr, "ereport_index: merge bucket %04u: failed to load %s\n", bucket, leg);
-            free(buf);
-            return -1;
-        }
-        memcpy(buf + pos, recs, nrec * sizeof(trigram_record_t));
-        pos += nrec * sizeof(trigram_record_t);
-        free(recs);
-    }
     for (w = 0; w < max_w; w++) {
         trigram_record_t *recs = NULL;
         size_t nrec = 0;
@@ -5040,15 +5013,13 @@ static int merge_load_bucket_tmp_files(build_ctx_t *ctx, uint32_t bucket, merge_
 }
 
 static uint64_t bucket_tmp_files_total_bytes(build_ctx_t *ctx, uint32_t bucket) {
-    char path[PATH_MAX], leg[PATH_MAX];
+    char path[PATH_MAX];
     struct stat st;
     uint64_t sum = 0;
     uint32_t w, max_w;
 
     merge_ctx_ensure_trigram_shard_count(ctx);
     max_w = ctx->trigram_tmp_shard_count;
-    if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) >= (int)sizeof(leg)) return 0;
-    if (stat(leg, &st) == 0) sum += (uint64_t)st.st_size;
     for (w = 0; w < max_w; w++) {
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))
             continue;
@@ -5076,7 +5047,7 @@ static size_t merge_collect_nonempty_from_bitset(build_ctx_t *ctx, uint32_t **ou
 
 /* When bucket_nonempty[] was not populated, discover non-empty merge buckets by stat()-ing tmp_trigrams files. */
 static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_t **out_list) {
-    char path[PATH_MAX], leg[PATH_MAX];
+    char path[PATH_MAX];
     struct stat st;
     size_t nb = 0;
     uint32_t i, w, max_w;
@@ -5087,8 +5058,6 @@ static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_
     for (i = 0; i < TRIGRAM_BUCKET_COUNT; i++) {
         uint64_t sz = 0;
 
-        if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, i) >= (int)sizeof(leg)) return 0;
-        if (stat(leg, &st) == 0) sz += (uint64_t)st.st_size;
         for (w = 0; w < max_w; w++) {
             if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, i, w) >= (int)sizeof(path))
                 return 0;
@@ -5102,12 +5071,6 @@ static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_
     for (i = 0; i < TRIGRAM_BUCKET_COUNT; i++) {
         uint64_t sz = 0;
 
-        if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, i) >= (int)sizeof(leg)) {
-            free(*out_list);
-            *out_list = NULL;
-            return 0;
-        }
-        if (stat(leg, &st) == 0) sz += (uint64_t)st.st_size;
         for (w = 0; w < max_w; w++) {
             if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, i, w) >= (int)sizeof(path)) {
                 free(*out_list);
@@ -5127,16 +5090,12 @@ static size_t merge_collect_nonempty_buckets_stat_scan(build_ctx_t *ctx, uint32_
  * is what a merge worker actually allocates: merge_load_bucket_tmp_files mallocs this many bytes for the
  * records buffer and merge_bucket_to_segment_files mallocs an equal-size radix aux buffer (≈2× this). */
 static uint64_t bucket_tmp_files_decompressed_bytes(build_ctx_t *ctx, uint32_t bucket) {
-    char path[PATH_MAX], leg[PATH_MAX];
+    char path[PATH_MAX];
     uint64_t sum = 0;
     uint32_t w, max_w;
 
     merge_ctx_ensure_trigram_shard_count(ctx);
     max_w = ctx->trigram_tmp_shard_count;
-    if (snprintf(leg, sizeof(leg), "%s/tmp_trigrams_%04u.bin", ctx->index_dir, bucket) < (int)sizeof(leg)) {
-        uint64_t ub = 0;
-        if (tmp_trigram_count_file_records(leg, NULL, &ub) == 0) sum += ub;
-    }
     for (w = 0; w < max_w; w++) {
         uint64_t ub = 0;
         if (snprintf(path, sizeof(path), "%s/tmp_trigrams_%04u_w%04u.bin", ctx->index_dir, bucket, w) >= (int)sizeof(path))

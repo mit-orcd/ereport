@@ -28,6 +28,7 @@ import struct
 import sys
 
 MAGIC = b"ERCBIN09"
+FORMAT_VERSION = 9
 HEADER_FMT = "<8sIIQQ"          # magic, version, reserved, catalog_offset, reserved64
 HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 32
 # record_count, column_count, comp_bytes, raw_bytes, type_mask, reserved16, reserved32
@@ -169,8 +170,10 @@ def analyze_shard(path, group_target):
         if len(hdr) < HEADER_SIZE:
             raise ValueError("truncated header")
         magic, version, _res, catalog_off, _res64 = struct.unpack(HEADER_FMT, hdr)
-        if magic != MAGIC:
-            raise ValueError(f"bad magic {magic!r} (expected {MAGIC!r})")
+        if magic != MAGIC or version != FORMAT_VERSION:
+            raise ValueError(
+                f"bad header {magic!r} v{version} (expected {MAGIC!r} v{FORMAT_VERSION})"
+            )
         if catalog_off == 0:
             raise ValueError("incomplete shard (catalog_offset == 0)")
         if catalog_off > st.file_bytes:

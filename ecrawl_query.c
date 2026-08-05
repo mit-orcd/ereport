@@ -12,8 +12,7 @@
  * depth (slash-count) histograms, and top parents by regular-file count on stdout. Live progress
  * on stderr when stderr is a TTY.
  *
- * Parallelism: ECRAWL_QUERY_THREADS (default 16, minimum 1, maximum 4096). If unset,
- * ECRAWL_REPAIR_THREADS is used for compatibility with older workflows. Work is split
+ * Parallelism: ECRAWL_QUERY_THREADS (default 16, minimum 1, maximum 4096). Work is split
  * by chunk, not by shard, so a single huge single-UID shard still scales across cores;
  * each shard's catalog is loaded once and shared read-only by all of its chunks.
  * Checkpoint segments are 32 MiB apart, which is coarser than the thread budget on a
@@ -608,7 +607,7 @@ static void usage(const char *prog) {
             "          [--list] [--index-dir DIR] <crawl-output-dir>\n"
             "  Read-only parallel scan of uid_shard_*.bin shards; directory-shape stats on stdout.\n"
             "  Uses .ckpt segment boundaries when sidecars are valid; else one range per shard.\n"
-            "  Parallel threads: ECRAWL_QUERY_THREADS (default %u), or ECRAWL_REPAIR_THREADS if unset.\n"
+            "  Parallel threads: ECRAWL_QUERY_THREADS (default %u).\n"
             "  Live bytes/chunks/records + ETA on stderr when stderr is a terminal.\n"
             "  --top N: list top N parents by regular-file count (default %u). Same as --top,dense N.\n"
             "  --top,DIM[,DIM] N: choose one or more top lists (order-independent):\n"
@@ -696,7 +695,6 @@ static int parse_top_dims(const char *spec, const char *prog) {
 
 static unsigned parse_analyze_threads_env(void) {
     const char *e = getenv("ECRAWL_QUERY_THREADS");
-    if (!e || e[0] == '\0') e = getenv("ECRAWL_REPAIR_THREADS");
     if (!e || e[0] == '\0') return DEFAULT_ANALYZE_THREADS;
     {
         unsigned long v;
