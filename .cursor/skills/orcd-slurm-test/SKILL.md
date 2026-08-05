@@ -89,13 +89,28 @@ jobs.
 
 ## Picking a partition
 
-Partition selection is fixed by explicit user instruction:
+Partition selection is fixed by explicit user instruction. Two partitions are
+allowed and no others:
 
-- `mit_normal` — CPU work only; 12-hour maximum.
-- `mit_normal_gpu` — GPU work only; 6-hour maximum. Do not use it merely to
-  avoid waiting for CPU capacity.
-- Do not select any other partition, regardless of queue depth, apparent
-  capacity, or wall-time.
+- `mit_quicktest` — 15-minute maximum, at most 4 nodes. Toolchain probes, smoke
+  checks, chart re-renders. Its queue turns over quickly, so prefer it whenever
+  the work honestly fits inside the cap.
+- `mit_normal` — 12-hour maximum, 50 nodes. Everything that cannot finish in 15
+  minutes: full builds, `test.sh`, profiling, compare-indexers, benchmarks.
+
+Do not select any other partition, regardless of queue depth, apparent
+capacity, or wall-time. `mit_normal` is often deep — several hundred pending
+jobs is ordinary — and queueing there is still the instruction rather than a
+reason to look elsewhere.
+
+Size the request honestly: a job that overruns `mit_quicktest`'s 15 minutes is
+killed mid-run, and a serial `make clean && make` followed by `test.sh` does not
+reliably fit. When in doubt use `mit_normal`, because a long queue costs
+latency while a truncated job costs the whole run.
+
+Do not pass `-A` / `--account`. There is a single association, both partitions
+are `AllowAccounts=ALL`, and naming the account can only introduce a way to
+disagree with the default.
 
 Agents are explicitly authorized to submit Slurm jobs without asking the user
 for permission first.
@@ -115,7 +130,7 @@ may be a spack build under `/orcd/software/...`; that alone is no defect, so do
 not force `CC=/usr/bin/gcc`.
 
 ```bash
-srun -p mit_normal -N 1 -c1 -t 3:00 --mem=2G bash -lc \
+srun -p mit_quicktest -N 1 -c1 -t 3:00 --mem=2G bash -lc \
   'echo "int main(void){return 0;}" >/tmp/p$$.c; printf "%s " "$(hostname)"; \
    gcc -o /tmp/p$$ /tmp/p$$.c 2>/dev/null && echo cc=ok || echo cc=FAIL; \
    pkg-config --modversion libzstd || echo zstd=MISSING; rm -f /tmp/p$$*'
@@ -127,10 +142,10 @@ Ask for memory explicitly. The default is 1 GB per CPU, and a `-c 16` job theref
 
 Agents do not need to ask permission before submitting Slurm jobs.
 
-- Account: `mit_general`; user is not a Slurm administrator.
-- Submit CPU work only to `mit_normal`; its maximum wall-time is 12 hours.
-- Submit GPU work only to `mit_normal_gpu`; its maximum wall-time is 6 hours,
-  and it must not be used for CPU-only work.
+- The user is not a Slurm administrator.
+- Submit only to `mit_quicktest` (15-minute maximum, 4 nodes) or `mit_normal`
+  (12-hour maximum, 50 nodes). No other partition, and no GPU partition.
+- Do not pass `-A` / `--account`; the single association is already the default.
 - User QOS includes `normal` and `unlimited`. On `mit_normal`,
   `--qos=unlimited` can override aggregate resource caps but cannot override
   the 12-hour partition wall-time.
@@ -143,11 +158,14 @@ the association and the two permitted partitions without launching a job:
 sacctmgr -P show assoc where user="$USER" \
   format=User,Account,Partition,QOS,DefaultQOS,GrpTRES,MaxTRESPJ,MaxJobs,MaxSubmit,MaxWall
 scontrol show partition mit_normal -o
-scontrol show partition mit_normal_gpu -o
+scontrol show partition mit_quicktest -o
 scontrol show config | rg '^(AccountingStorageEnforce|DefMemPerCPU|MaxArraySize)'
-sbatch --test-only -p mit_normal -A mit_general -N 1 -c 1 --mem=1G \
-  -t 00:01:00 --wrap=true
+sbatch --test-only -p mit_normal -N 1 -c 1 --mem=1G -t 00:01:00 --wrap=true
 ```
+
+Read `MaxTime` out of that output rather than trusting the figures above; the
+caps are the reason a partition gets chosen, so a stale cap in this file is
+worse than no figure at all.
 
 ## profiling.sh / compare-indexers
 
@@ -176,7 +194,7 @@ are read side by side, and a fresh figure beside a stale table is worse than
 either alone.
 
 ```bash
-srun -p mit_normal -N 1 -c 4 -t 10:00 --mem=8G bash -lc '
+srun -p mit_quicktest -N 1 -c 4 -t 10:00 --mem=8G bash -lc '
 set -euo pipefail
 export PREFIX=$HOME/orcd/scratch/ereport-automated-testing/prefix
 cd /home/erbmi1/git/ereport/scripts/compare-indexers
@@ -199,9 +217,9 @@ rather than one job per render.
 ## Do not
 
 - Run `make -j`, `./scripts/test/test.sh`, profilers, or `plot_results.py` on `orcd-login*`
-- Submit CPU work anywhere except `mit_normal`
-- Submit GPU work anywhere except `mit_normal_gpu`
-- Use `mit_normal_gpu` for CPU-only work
+- Submit to any partition other than `mit_quicktest` and `mit_normal`
+- Pass `-A` / `--account` to `srun` or `sbatch`
+- Send work that cannot finish in 15 minutes to `mit_quicktest`
 - Ask the user for permission before submitting an otherwise appropriate Slurm job
 - Rewrite harness scripts just to relocate scratch
 - Put GUFI/XDU indexes or Rust/venv trees under home NFS
