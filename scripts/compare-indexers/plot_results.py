@@ -97,9 +97,10 @@ WALK_LABELS = {
     ("fd", "walk"): "fd",
     ("du", "walk"): "du",
     ("dua", "walk"): "dua",
+    ("dut", "walk"): "dut",
 }
 
-WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua"]
+WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua", "dut"]
 QUERY_ORDER = [
     "ecrawl_query",
     "ereport",
@@ -112,6 +113,7 @@ QUERY_ORDER = [
     "fd",
     "du",
     "dua",
+    "dut",
 ]
 # Q6 is not one of the paper's five. It asks for a substring with nothing
 # anchored at either end, which is the shape a B-tree on names cannot seek into,
@@ -146,8 +148,9 @@ COLORS = {
     "fd": "#B09070",
     "du": "#ADADAD",
     "dua": "#D9B48A",
+    "dut": "#8C7B6B",
 }
-WALKERS = ("find", "fd", "du", "dua")
+WALKERS = ("find", "fd", "du", "dua", "dut")
 
 # Q4 sums bytes rather than counting entries, and the tools disagree slightly
 # on which inodes to include (hard links, the sentinel directory). A fraction
@@ -161,6 +164,39 @@ GRID = {"color": "#CCCCCC", "linestyle": ":", "linewidth": 0.7}
 # span three decades (GUFI's rollup against a trigram index), so without this
 # every fast tool collapses into a sliver at the origin.
 LOG_RANGE = 10.0
+
+# US Letter pages. Index charts (figures 1-5) are landscape: a ranking is wide
+# and short. Query charts (figure 6) stay portrait so three panels stack with
+# room between them. Content is pinned to the top with print margins; the axes
+# grow to fill most of the printable height so short rankings do not leave a
+# large blank band under the legend.
+LETTER_PORTRAIT = (8.5, 11.0)
+LETTER_LANDSCAPE = (11.0, 8.5)
+LETTER_MARGIN = 0.45  # inches of clear paper around the content band
+# Fraction of the printable landscape height the index content band should use.
+INDEX_PAGE_FILL = 0.96
+# Minimum physical inches per tool row. Split labels need a bit more,
+# especially with cold/hot pairs where each bar can carry two annotation lines.
+INDEX_ROW_IN = 0.34
+INDEX_ROW_SPLIT_IN = 0.62
+# Physical inches per bar inside a query panel, plus a fixed pad for its title
+# and the gap that keeps one panel's tick labels out of the next panel's bars.
+QUERY_BAR_IN = 0.28
+QUERY_PANEL_PAD_IN = 0.70
+QUERY_PANEL_GAP_IN = 0.45
+
+
+def _page_band(page, content_in):
+    """Top-aligned content band on a page, as figure-fraction y bounds.
+
+    Returns (y_bottom, y_top, page_height) so callers can place header, axes and
+    caption inside the band and leave the rest of the page empty.
+    """
+    page_h = page[1]
+    content_in = min(content_in, page_h - 2 * LETTER_MARGIN)
+    y_top = 1.0 - LETTER_MARGIN / page_h
+    y_bottom = y_top - content_in / page_h
+    return y_bottom, y_top, page_h
 
 
 def read_csv(path):
@@ -502,9 +538,6 @@ QUERY_TOOL_LABELS = {
     "ereport_index": "ereport_index",
     "ereport": "ereport",
     "ecrawl_query": "ecrawl_query",
-    # ecrawl_query was called ecrawl_analyze until the rename; results recorded
-    # under the old name draw as the same series rather than not at all.
-    "ecrawl_analyze": "ecrawl_query",
     "robinhood": "Robinhood",
     "gufi": "GUFI",
     # The same wrappers reading the index gufi_rollup produced. A separate series
@@ -516,6 +549,7 @@ QUERY_TOOL_LABELS = {
     "fd": "fd",
     "du": "du",
     "dua": "dua",
+    "dut": "dut",
 }
 
 
@@ -730,13 +764,14 @@ def style_axis(axis, xlabel=None, log=False):
         axis.set_xlabel(xlabel)
 
 
-def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None):
+def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None,
+              v_shift=0):
     """Value at the end of the bar, which beats making the reader trace gridlines."""
     offset = x * 1.12 if log else x
     axis.annotate(
         text,
         xy=(offset, y),
-        xytext=(4, -4 if sub else 0),
+        xytext=(4, (-4 if sub else 0) + v_shift),
         textcoords="offset points",
         va="center" if not sub else "bottom",
         ha="left",
@@ -749,7 +784,7 @@ def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None)
         axis.annotate(
             sub,
             xy=(offset, y),
-            xytext=(4, -3),
+            xytext=(4, -3 + v_shift),
             textcoords="offset points",
             va="top",
             ha="left",
@@ -794,7 +829,7 @@ def index_figure(datasets, out_dir, spec):
         )
     ]
     if not tools:
-        return []
+        return [], None
     multi = len(datasets) > 1
 
     # Worst at the top so the eye lands on the winner at the bottom, the way a
@@ -828,17 +863,36 @@ def index_figure(datasets, out_dir, spec):
             for tool in tools
         )
     floor = datasets[0].get("walk_floor") if spec.get("floor") else None
-    row_in = 0.66 if split_rows else 0.52
-    # The constant is the header, the caption and the panel title, none of
-    # which shrink with the number of rows; a one-row figure needs it just as
-    # much as a ten-row one.
-    height = max(3.9, row_in * len(tools) * max(1, len(datasets)) + 2.9)
-    if multi:
-        # The band the dataset key sits in, below the caption.
-        height += 0.55
+    # Letter landscape: rankings are wide and short. Axes start at a
+    # label-driven minimum and grow later to fill the printable page.
+    page = LETTER_LANDSCAPE
+    printable = page[1] - 2 * LETTER_MARGIN
+    # Leave room for the title + subtitle + conditions above the panel title;
+    # landscape used to park that block on top of the axes.
+    header_in = 1.20 if any(d.get("conditions") for d in datasets) else 0.85
     if datasets[0].get("caveat"):
-        height += 0.22
-    fig, axis = plt.subplots(1, 1, figsize=(9.5, height))
+        header_in += 0.18
+    row_in = INDEX_ROW_SPLIT_IN if split_rows else INDEX_ROW_IN
+    min_axes_in = row_in * len(tools) + (0.35 if floor else 0.12)
+    # Tick labels and the x-axis title hang below the axes box; keep a dedicated
+    # band so the caption/legend cannot collide with them on landscape pages.
+    xlabel_band_in = 0.75
+    # Caption/legend room is estimated up front; a long caption grows the band
+    # after wrap_caption runs, just before the axes are placed.
+    caption_guess_in = 0.55 if multi else 0.40
+    band_pad_in = 0.08
+    fixed_in = header_in + xlabel_band_in + caption_guess_in
+    axes_in = max(min_axes_in,
+                  INDEX_PAGE_FILL * printable - fixed_in - band_pad_in)
+    content_in = fixed_in + axes_in + band_pad_in
+    y_bottom, y_top, height = _page_band(page, content_in)
+    fig = plt.figure(figsize=page)
+    axis = fig.add_axes(
+        [0.16,
+         y_bottom + (caption_guess_in + xlabel_band_in) / height,
+         0.78,
+         axes_in / height],
+    )
     bar_h = 0.72 / len(datasets)
     positions = list(range(len(tools)))
 
@@ -867,14 +921,20 @@ def index_figure(datasets, out_dir, spec):
             # Rates do not add, so a rate figure never segments its bars: two
             # phases at 400k and 1.7M files/s do not make a 2.1M files/s
             # pipeline, and drawing them end to end would say they do.
+            rename = spec.get("part_names", {})
             parts = [
-                (name, values[part_index])
+                (rename.get(name, name), values[part_index])
                 for name, *values in entry.get("components", [])
             ] if spec.get("split", True) else []
             parts = parts if all(v is not None for _, v in parts) else []
-            # A log axis cannot be read additively, so the phases go in the
-            # label there instead of pretending the segments sum by length.
-            if parts and not log:
+            # A log axis cannot be read additively, so the phases usually go
+            # in the label there instead of pretending the segments sum by
+            # length. A spec can still ask for the segments (the storage
+            # figure does): each boundary then sits at the phase's own value
+            # on the axis, which stays truthful even though the segment
+            # lengths stop being proportional to the shares.
+            segmented = bool(parts) and (not log or spec.get("segment_log"))
+            if segmented:
                 left = 0.0
                 for part_no, (_, value) in enumerate(parts):
                     axis.barh(
@@ -917,16 +977,18 @@ def index_figure(datasets, out_dir, spec):
                 note = "{} per file".format(fmt_bytes(entry["per_file"]))
             # Labels are placed once the axis limits are final, because whether
             # a split fits inside its bar depends on them.
-            pending.append((y, mean, std, text, split, note))
+            pending.append(
+                (row, dataset_index, y, mean, std, text, split, note, segmented)
+            )
 
     axis.set_yticks(positions)
-    axis.set_yticklabels(tools, fontsize=10)
+    axis.set_yticklabels(tools, fontsize=9)
     # The walk-only line is annotated above the first bar, so it needs a band of
     # its own up there.
     axis.set_ylim(-(1.0 if floor else 0.7), len(tools) - 0.3)
     axis.invert_yaxis()
-    axis.set_title(spec["panel_title"], fontsize=12, fontweight="bold",
-                   loc="left", pad=8)
+    axis.set_title(spec["panel_title"], fontsize=10, fontweight="bold",
+                   loc="left", pad=4)
     if log:
         axis.set_xscale("log")
         axis.xaxis.set_major_locator(LogLocator(base=10.0))
@@ -950,32 +1012,67 @@ def index_figure(datasets, out_dir, spec):
         if floor:
             low = min(low, floor[1] / 1.8)
     if log:
-        axis.set_xlim(low, high * 2.6)
+        # Split / per-file notes are long; give them page width before clip.
+        axis.set_xlim(low, high * (4.2 if split_rows else 2.6))
     else:
         axis.set_xlim(low, high * (1.55 if split_rows else 1.22))
 
-    for y, mean, std, text, split, note in pending:
+    # Cold/hot storage (and similar) often print the same multi-line note twice;
+    # collapse those onto the tool row so the copies cannot stack on each other.
+    draw = []
+    if multi:
+        by_row = {}
+        for item in pending:
+            by_row.setdefault(item[0], []).append(item)
+        for row in sorted(by_row):
+            items = by_row[row]
+            keys = [
+                (text, split, note, segmented)
+                for _, _, _, _, _, text, split, note, segmented in items
+            ]
+            if len(items) > 1 and len(set(keys)) == 1:
+                _, _, _, _, _, text, split, note, segmented = items[0]
+                mean = max(m for _, _, _, m, _, _, _, _, _ in items if m is not None)
+                std = max((s or 0) for _, _, _, _, s, _, _, _, _ in items)
+                # Centered on the tool row; dataset_index 0 keeps v_shift neutral.
+                draw.append(
+                    (positions[row], 0, mean, std, text, split, note, segmented)
+                )
+            else:
+                for _, dataset_index, y, mean, std, text, split, note, segmented in items:
+                    draw.append(
+                        (y, dataset_index, mean, std, text, split, note, segmented)
+                    )
+    else:
+        for _, dataset_index, y, mean, std, text, split, note, segmented in pending:
+            draw.append((y, dataset_index, mean, std, text, split, note, segmented))
+
+    for y, dataset_index, mean, std, text, split, note, segmented in draw:
         end = mean + (std or 0)
-        if note:
-            bar_label(axis, y, end, text, log, sub=note)
-            continue
-        # On a linear panel the bar is already segmented, so the numbers go
-        # underneath where they cannot fight the segment boundary.
-        if split and (not log or not fits_inside(fig, axis, mean, split)):
-            bar_label(axis, y, end, text, log, sub=split)
-            continue
+        sub = note or None
         if split:
-            axis.annotate(
-                split,
-                xy=(0.008, y),
-                xycoords=axis.get_yaxis_transform(),
-                va="center",
-                ha="left",
-                fontsize=7.5,
-                color="white",
-                zorder=5,
-            )
-        bar_label(axis, y, end, text, log)
+            # A segmented bar's numbers go underneath the value, where they
+            # cannot fight the segment boundary; the per-file note takes a
+            # second line there rather than replacing them. On an unsegmented
+            # log bar the split goes inside the bar in white when it fits.
+            if segmented or not log or not fits_inside(fig, axis, mean, split):
+                sub = split if sub is None else "{}\n{}".format(split, sub)
+            else:
+                axis.annotate(
+                    split,
+                    xy=(0.008, y),
+                    xycoords=axis.get_yaxis_transform(),
+                    va="center",
+                    ha="left",
+                    fontsize=7.5,
+                    color="white",
+                    zorder=5,
+                )
+        # When cold/hot labels differ, nudge multi-line notes apart vertically.
+        v_shift = 0
+        if multi and len(datasets) > 1 and sub:
+            v_shift = (0.5 - dataset_index) * 10
+        bar_label(axis, y, end, text, log, sub=sub, v_shift=v_shift)
 
     if floor:
         name, value = floor
@@ -1011,41 +1108,52 @@ def index_figure(datasets, out_dir, spec):
         # figures are the ones to read across them. Two passes over one tree are
         # a different matter -- comparing their seconds is the point.
         caption += " Across trees compare the rate figure, not seconds."
-    caption = wrap_caption(caption, fig.get_figwidth())
+    caption = wrap_caption(caption, page[0] - 2 * LETTER_MARGIN)
     caveat = datasets[0].get("caveat", "")
-    header_in = 0.95 if conditions else 0.75
-    if caveat:
-        header_in += 0.22
-    fig.text(0.011, 1 - 0.30 / height,
+    # Legend title + swatches sit under the caption; size this band from the
+    # legend itself so its title cannot climb into the note above.
+    legend_in = 0.55 if multi else 0.0
+    caption_lines = caption.count("\n") + 1
+    caption_text_in = 0.16 * caption_lines + 0.10
+    caption_in = caption_text_in + legend_in
+    # Recompute with the real caption, then grow the axes so short rankings
+    # (figures 1/2/4) use the same page fill as denser ones (3/5).
+    fixed_in = header_in + xlabel_band_in + caption_in
+    axes_budget = printable - fixed_in - band_pad_in
+    axes_in = max(min_axes_in, min(INDEX_PAGE_FILL * printable - fixed_in - band_pad_in,
+                                   axes_budget))
+    content_in = fixed_in + axes_in + band_pad_in
+    y_bottom, y_top, height = _page_band(page, content_in)
+    axis.set_position(
+        [0.16,
+         y_bottom + (caption_in + xlabel_band_in) / height,
+         0.78,
+         axes_in / height],
+    )
+
+    fig.text(0.05, y_top,
              "Figure {}: {}".format(spec["number"], spec["heading"]),
-             fontsize=15, fontweight="bold", va="top")
+             fontsize=12, fontweight="bold", va="top")
     fig.text(
-        0.011,
-        1 - 0.58 / height,
+        0.05,
+        y_top - 0.28 / height,
         subtitle + ("\n" + conditions if conditions else ""),
-        fontsize=9,
+        fontsize=8,
         color="#555555",
         va="top",
     )
     if caveat:
         fig.text(
-            0.011,
-            1 - (0.58 + (0.30 if conditions else 0.15)) / height,
+            0.05,
+            y_top - (0.28 + (0.28 if conditions else 0.14)) / height,
             caveat,
-            fontsize=9,
+            fontsize=8,
             color="#b2182b",
             fontweight="bold",
             va="top",
         )
-    # A dataset key gets a band of its own beneath the caption. The caption
-    # wraps to nearly the full width and the axis runs to the bottom of the
-    # plot, so there is no gap to tuck a key into; one has to be made.
-    legend_in = 0.55 if multi else 0.0
-    fig.text(0.011, (0.16 + legend_in) / height, caption,
-             fontsize=8.5, color="#555555", va="bottom")
-    # The caption grew a line for every explanation the figure needs, so reserve
-    # room by counting them rather than by guessing at two cases.
-    caption_in = 0.30 + 0.16 * caption.count("\n") + legend_in
+    fig.text(0.05, y_bottom + legend_in / height, caption,
+             fontsize=7.5, color="#555555", va="bottom")
 
     if multi:
         # Neutral swatches: the bars carry the tool's own hue, so a coloured key
@@ -1059,19 +1167,18 @@ def index_figure(datasets, out_dir, spec):
             handles=proxies,
             title=series_title(datasets),
             frameon=False,
-            fontsize=9,
+            fontsize=8,
             loc="lower left",
-            bbox_to_anchor=(0.011, 0.05 / height),
+            bbox_to_anchor=(0.05, y_bottom),
             ncol=len(proxies),
         )
-    fig.tight_layout(rect=(0, caption_in / height, 1, 1 - header_in / height))
     outputs = []
     for suffix in ("png", "pdf"):
         path = out_dir / ("{}.{}".format(spec["name"], suffix))
         fig.savefig(str(path), dpi=200 if suffix == "png" else None)
         outputs.append(path)
-    plt.close(fig)
-    return outputs
+    # Caller closes after the combined PDF has been written.
+    return outputs, fig
 
 
 # Two questions, each asked twice: how long did it take, and how fast is that.
@@ -1085,7 +1192,7 @@ def index_figure(datasets, out_dir, spec):
 # not get a sentence repeating them.
 WALK_CAPTION = (
     "Every row walks the whole tree and keeps nothing. find and fd read "
-    "directories only; du, dua and ecrawl stat every file."
+    "directories only; du, dua, dut and ecrawl stat every file."
 )
 BUILD_CAPTION = "Unindexed tree to queryable index, end to end."
 # Added only when the figure actually draws those bars: a caption explaining a
@@ -1172,7 +1279,14 @@ INDEX_FIGURES = [
         "formatter": fmt_mib,
         "xlabel": "MiB kept on disk",
         "per_file": True,
-        "caption": "Walk-only tools store nothing, so they are not here.",
+        # Storage is where the crawl/index split matters most, so the bars
+        # segment even on the log axis this figure always ends up with.
+        "segment_log": True,
+        "part_names": {"crawl": "crawl metadata"},
+        "caption": "Walk-only tools store nothing, so they are not here. "
+        "Bars are segmented by phase; on the log axis a segment boundary "
+        "sits at that phase's own size, so segment lengths are not "
+        "proportional to shares.",
         "tool_notes": SIZE_TOOL_NOTES,
     },
 ]
@@ -1180,182 +1294,231 @@ INDEX_FIGURES = [
 
 def plot_index(datasets, out_dir):
     outputs = []
+    figures = []
     for spec in INDEX_FIGURES:
-        outputs.extend(index_figure(datasets, out_dir, spec))
-    return outputs
+        paths, fig = index_figure(datasets, out_dir, spec)
+        if not paths or fig is None:
+            continue
+        outputs.extend(paths)
+        figures.append(fig)
+    return outputs, figures
 
 
-def query_figure(usable, queries, rows_per_query, bounds, page, pages):
-    """One page of query panels: the queries given, one row each.
+def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
+    """One Letter portrait page: three query panels for a single cache state.
 
-    Split across pages rather than run down one tall sheet, because six panels
-    of six bars is a figure nobody can put on a page and still read.
+    Cold and hot each get their own page. Panels fill the sheet with enough
+    gap that one panel's tick labels cannot land on the next panel's bars, and
+    only the bottom panel draws an x-axis.
     """
     lo, hi = bounds
-    heights = [rows_per_query[q] for q in queries]
-    fig_height = 0.72 * len(queries) + 0.38 * sum(heights) + 2.3
-    fig, axes = plt.subplots(
+    page = LETTER_PORTRAIT
+    conditions = dataset.get("conditions", "")
+    caveat = dataset.get("caveat", "")
+    header_in = 1.05 if conditions else 0.85
+    if caveat:
+        header_in += 0.20
+    # Caption sits below the xlabel; give it its own band so the two never meet.
+    caption_in = 0.85
+    panel_inches = [
+        QUERY_BAR_IN * rows_per_query[q] + QUERY_PANEL_PAD_IN for q in queries
+    ]
+    gap_in = QUERY_PANEL_GAP_IN * max(0, len(queries) - 1)
+    # Use the full printable height when the panels under-fill it, so three
+    # rankings are spaced rather than glued into the top third of the page.
+    printable = page[1] - 2 * LETTER_MARGIN - header_in - caption_in
+    needed = sum(panel_inches) + gap_in
+    if needed < printable and needed > 0:
+        grow = (printable - needed) / len(panel_inches)
+        panel_inches = [p + grow for p in panel_inches]
+        needed = sum(panel_inches) + gap_in
+    content_in = header_in + needed + caption_in
+    y_bottom, y_top, height = _page_band(page, content_in)
+    fig = plt.figure(figsize=page)
+    avg_panel = sum(panel_inches) / len(panel_inches)
+    gs = fig.add_gridspec(
         len(queries),
-        len(usable),
-        figsize=(11.5 * len(usable), fig_height),
-        # hspace belongs after tight_layout, not here: setting it on the
-        # gridspec marks the axes incompatible with tight_layout, which then
-        # discards the value and warns.
-        gridspec_kw={"height_ratios": heights},
-        sharex=True,
-        squeeze=False,
+        1,
+        height_ratios=panel_inches,
+        left=0.16,
+        right=0.96,
+        top=y_top - header_in / height,
+        bottom=y_bottom + caption_in / height,
+        hspace=QUERY_PANEL_GAP_IN / avg_panel if avg_panel else 0.35,
     )
+    axes = [[fig.add_subplot(gs[i, 0])] for i in range(len(queries))]
+    if len(queries) > 1:
+        for i in range(1, len(queries)):
+            axes[i][0].sharex(axes[0][0])
 
     any_mismatch = False
     walkers_seen = set()
+    stats = dataset["queries"]["stats"]
+    states = dataset["queries"]["states"]
+    notes_by_key = dataset["queries"].get("notes", {})
+    reference = reference_counts(dataset["queries"])
 
-    for column, dataset in enumerate(usable):
-        stats = dataset["queries"]["stats"]
-        states = dataset["queries"]["states"]
-        notes_by_key = dataset["queries"].get("notes", {})
-        reference = reference_counts(dataset["queries"])
-
-        for row, query in enumerate(queries):
-            axis = axes[row][column]
-            # Fastest at the bottom, so each panel reads as a ranking.
-            entries = sorted(
-                (t for t in QUERY_ORDER if (t, query) in stats),
-                key=lambda t: -stats[(t, query)][0],
+    for row, query in enumerate(queries):
+        axis = axes[row][0]
+        # Fastest at the bottom, so each panel reads as a ranking.
+        entries = sorted(
+            (t for t in QUERY_ORDER if (t, query) in stats),
+            key=lambda t: -stats[(t, query)][0],
+        )
+        positions = list(range(len(entries)))
+        # Reason -> the tools it applies to, for the bars that missed the
+        # reference because they answer a different question.
+        semantics = {}
+        mismatch_notes = []
+        for y, tool in zip(positions, entries):
+            mean, std = stats[(tool, query)]
+            mismatch = wrong_answer(dataset["queries"], reference, tool, query)
+            wrong = mismatch is not None
+            any_mismatch = any_mismatch or wrong
+            if tool in WALKERS:
+                walkers_seen.add(tool)
+            axis.barh(
+                y,
+                mean,
+                height=0.62,
+                color=COLORS.get(tool, "#4C72B0"),
+                edgecolor="#B00020" if wrong else "white",
+                linewidth=1.3 if wrong else 0.6,
+                hatch="//" if wrong else None,
+                alpha=0.55 if wrong else 1.0,
+                zorder=3,
             )
-            positions = list(range(len(entries)))
-            # Reason -> the tools it applies to, for the bars that missed the
-            # reference because they answer a different question.
-            semantics = {}
-            for y, tool in zip(positions, entries):
-                mean, std = stats[(tool, query)]
-                mismatch = wrong_answer(dataset["queries"], reference, tool, query)
-                wrong = mismatch is not None
-                any_mismatch = any_mismatch or wrong
-                if tool in WALKERS:
-                    walkers_seen.add(tool)
-                axis.barh(
-                    y,
-                    mean,
-                    height=0.62,
-                    color=COLORS.get(tool, "#4C72B0"),
-                    edgecolor="#B00020" if wrong else "white",
-                    linewidth=1.3 if wrong else 0.6,
-                    hatch="//" if wrong else None,
-                    alpha=0.55 if wrong else 1.0,
-                    zorder=3,
+            if std:
+                axis.errorbar(
+                    mean, y, xerr=min(std, mean * 0.95), fmt="none",
+                    ecolor="#333333", elinewidth=1.0, capsize=2.5, zorder=4,
                 )
-                if std:
-                    axis.errorbar(
-                        mean, y, xerr=min(std, mean * 0.95), fmt="none",
-                        ecolor="#333333", elinewidth=1.0, capsize=2.5, zorder=4,
+            text = fmt_seconds(mean)
+            if wrong:
+                # Keep the bar label short; the full disagreement goes in the
+                # panel note so a long "answered N, not M" cannot run into the
+                # next bar or the panel above.
+                answered, expected_value, ref_tool = mismatch
+                text += "  \u2717"
+                mismatch_notes.append(
+                    "{} answered {:,}, not {:,} (per {})".format(
+                        tool, answered, expected_value, ref_tool
                     )
-                text = fmt_seconds(mean)
-                if wrong:
-                    answered, expected_value, ref_tool = mismatch
-                    text += "   \u2717 answered {:,}, not {:,} (per {})".format(
-                        answered, expected_value, ref_tool
-                    )
-                    # The reason goes in the panel note rather than here: the bar
-                    # label already runs past the axis, and in the right-hand
-                    # column another clause runs off the sheet.
-                    why = ANSWER_SEMANTICS.get((tool, query))
-                    if why:
-                        semantics.setdefault(why, []).append(tool)
-                bar_label(
-                    axis,
-                    y,
-                    mean + (std or 0),
-                    text,
-                    True,
-                    color="#B00020" if wrong else "#222222",
-                    weight="bold" if wrong else "normal",
                 )
-
-            axis.set_yticks(positions)
-            axis.set_yticklabels(entries, fontsize=10)
-            axis.set_ylim(-0.75, max(1, len(entries)) - 0.25)
-            axis.set_xscale("log")
-            axis.set_xlim(lo, hi)
-            style_axis(axis, None, True)
-            axis.xaxis.set_major_formatter(
-                FuncFormatter(lambda v, _: fmt_tick_seconds(v))
+                why = ANSWER_SEMANTICS.get((tool, query))
+                if why:
+                    semantics.setdefault(why, []).append(tool)
+            bar_label(
+                axis,
+                y,
+                mean + (std or 0),
+                text,
+                True,
+                color="#B00020" if wrong else "#222222",
+                weight="bold" if wrong else "normal",
             )
-            title = "{}  \u00b7  {}".format(query, QUERY_TITLES.get(query, ""))
-            if len(usable) > 1:
-                title = "{}   \u2014   {}".format(title, dataset["label"])
-            axis.set_title(title, fontsize=11.5, fontweight="bold", loc="left", pad=6)
 
-            # Say why a tool has no bar. Unsupported and broken are different
-            # findings, and a gap alone cannot tell them apart.
-            missing = {"unsupported": [], "failed": [], "rollup": []}
-            for tool in QUERY_ORDER:
-                state = states.get((tool, query))
-                if state in (None, "ok"):
-                    continue
-                if state == "fail":
-                    missing["failed"].append(tool)
-                elif "rollup_required" in (notes_by_key.get((tool, query)) or ""):
-                    # Not "no equivalent query": the tool has the query, and the
-                    # index this series was built by cannot serve it. Reading that
-                    # as a missing feature is exactly how the cheap GUFI index
-                    # came to look like it answered the aggregate.
-                    missing["rollup"].append(tool)
-                else:
-                    missing["unsupported"].append(tool)
-            notes = []
-            for why, who in semantics.items():
-                notes.append("{}: {}".format(", ".join(who), why))
-            if missing["rollup"]:
-                notes.append(
-                    "needs the rolled-up index: " + ", ".join(missing["rollup"])
-                )
-            if missing["unsupported"]:
-                notes.append("no equivalent query: " + ", ".join(missing["unsupported"]))
-            if missing["failed"]:
-                notes.append("failed: " + ", ".join(missing["failed"]))
-            if notes:
-                # Inside the panel, top right: the bars are sorted longest at
-                # the bottom, so that corner is the empty one. Above the panel
-                # it collided with the title, and below it with the shared tick
-                # labels of the bottom-most axis.
-                # One reason per line: a Q4 panel can carry three, and strung
-                # together they reach past the panel and into the next column.
-                axis.annotate(
-                    "\n".join(notes),
-                    xy=(0.995, 0.94),
-                    xycoords="axes fraction",
-                    fontsize=8,
-                    color="#888888",
-                    va="top",
-                    ha="right",
-                )
+        axis.set_yticks(positions)
+        axis.set_yticklabels(entries, fontsize=9)
+        axis.set_ylim(-0.75, max(1, len(entries)) - 0.25)
+        axis.set_xscale("log")
+        axis.set_xlim(lo, hi)
+        style_axis(axis, None, True)
+        axis.xaxis.set_major_formatter(
+            FuncFormatter(lambda v, _: fmt_tick_seconds(v))
+        )
+        # Only the bottom panel keeps tick labels and the axis name; drawing
+        # them under every panel is what put "10 ms" on top of the bars above.
+        if row < len(queries) - 1:
+            axis.tick_params(axis="x", labelbottom=False, length=3)
+        title = "{}  \u00b7  {}".format(query, QUERY_TITLES.get(query, ""))
 
-        axes[-1][column].set_xlabel("Elapsed time (log scale)", fontsize=10, labelpad=8)
+        # Say why a tool has no bar. Unsupported and broken are different
+        # findings, and a gap alone cannot tell them apart.
+        missing = {"unsupported": [], "failed": [], "rollup": []}
+        for tool in QUERY_ORDER:
+            state = states.get((tool, query))
+            if state in (None, "ok"):
+                continue
+            if state == "fail":
+                missing["failed"].append(tool)
+            elif "rollup_required" in (notes_by_key.get((tool, query)) or ""):
+                # Not "no equivalent query": the tool has the query, and the
+                # index this series was built by cannot serve it. Reading that
+                # as a missing feature is exactly how the cheap GUFI index
+                # came to look like it answered the aggregate.
+                missing["rollup"].append(tool)
+            else:
+                missing["unsupported"].append(tool)
+        notes = list(mismatch_notes)
+        for why, who in semantics.items():
+            notes.append("{}: {}".format(", ".join(who), why))
+        if missing["rollup"]:
+            notes.append(
+                "needs the rolled-up index: " + ", ".join(missing["rollup"])
+            )
+        if missing["unsupported"]:
+            notes.append("no equivalent query: " + ", ".join(missing["unsupported"]))
+        if missing["failed"]:
+            notes.append("failed: " + ", ".join(missing["failed"]))
+        # Notes sit under the title, not in the plot: top-right annotations
+        # collided with short bars' value labels and with long bars that reach
+        # the right edge.
+        axis.set_title(
+            title,
+            fontsize=10,
+            fontweight="bold",
+            loc="left",
+            pad=14 if notes else 6,
+        )
+        if notes:
+            axis.text(
+                0.0,
+                1.01,
+                "  \u00b7  ".join(notes),
+                transform=axis.transAxes,
+                fontsize=7.5,
+                color="#666666",
+                va="bottom",
+                ha="left",
+                clip_on=False,
+            )
 
-    conditions = usable[0].get("conditions", "")
-    subtitle = subtitle_for(usable)
-    caveat = usable[0].get("caveat", "")
+    axes[-1][0].set_xlabel("Elapsed time (log scale)", fontsize=9, labelpad=6)
+
+    cache = dataset.get("cache") or ""
+    # Tree name alone: the cache state is already in the page heading, and
+    # repeating "· cold" under a "cold" title says nothing.
+    subtitle = dataset.get("base_label") or dataset["label"]
+    if cache and subtitle.endswith(" · " + cache):
+        subtitle = subtitle[: -(len(cache) + 3)]
+    query_span = "\u2013".join(
+        [queries[0], queries[-1]] if len(queries) > 1 else [queries[0]]
+    )
     heading = "Figure 6: query performance"
     if pages > 1:
-        heading += "  ({} of {}, {})".format(page, pages, "\u2013".join(
-            [queries[0], queries[-1]] if len(queries) > 1 else [queries[0]]
-        ))
-    fig.text(0.011, 1 - 0.30 / fig_height, heading,
-             fontsize=15, fontweight="bold", va="top")
+        state = cache if cache else "pass"
+        heading += "  ({} of {}, {} \u00b7 {})".format(
+            page_no, pages, state, query_span
+        )
+    elif cache:
+        heading += "  ({})".format(cache)
+    fig.text(0.05, y_top, heading,
+             fontsize=12, fontweight="bold", va="top")
     fig.text(
-        0.011,
-        1 - 0.58 / fig_height,
+        0.05,
+        y_top - 0.28 / height,
         subtitle + ("\n" + conditions if conditions else ""),
-        fontsize=9,
+        fontsize=8,
         color="#555555",
         va="top",
     )
     if caveat:
         fig.text(
-            0.011,
-            1 - (0.58 + (0.30 if conditions else 0.15)) / fig_height,
+            0.05,
+            y_top - (0.28 + (0.28 if conditions else 0.14)) / height,
             caveat,
-            fontsize=9,
+            fontsize=8,
             color="#b2182b",
             fontweight="bold",
             va="top",
@@ -1364,40 +1527,30 @@ def query_figure(usable, queries, rows_per_query, bounds, page, pages):
     # Short enough to read: anything a bar, a title or a panel note already says
     # is not repeated here.
     caption = "Mean wall time; whiskers \u00b11 s.d. Lower is better."
-    index_note = usable[0].get("query_index_note", "")
+    index_note = dataset.get("query_index_note", "")
     if index_note:
         caption += " " + index_note
     if any_mismatch:
         caption += " Hatched bars missed the reference; the panel note says which are definitional."
     if walkers_seen:
         caption += " Grey and tan tools search live, with no index."
-    caption = wrap_caption(caption, fig.get_figwidth())
-    fig.text(0.011, 0.16 / fig_height, caption, fontsize=8.5, color="#555555", va="bottom")
-
-    # Room for the two header lines plus the first panel's title.
-    header_in = 1.30 if conditions else 1.05
-    if caveat:
-        header_in += 0.22
-    fig.tight_layout(rect=(0, 0.72 / fig_height, 1, 1 - header_in / fig_height))
-    # Each panel carries a title above and a note to its right, so they need
-    # more air between them than tight_layout leaves.
-    fig.subplots_adjust(hspace=0.42)
+    caption = wrap_caption(caption, page[0] - 2 * LETTER_MARGIN)
+    fig.text(0.05, y_bottom + 0.08 / height, caption,
+             fontsize=7.5, color="#555555", va="bottom")
     return fig
 
 
-# Three panels to a page. Six on one sheet is either unreadably small in print
-# or a page nobody can see the bottom of on screen.
+# Three query panels to a Letter page. Cold and hot each get their own page,
+# so six queries and two cache states become four printable sheets.
 QUERIES_PER_PAGE = 3
 
 
 def plot_queries(datasets, out_dir):
     usable = [d for d in datasets if d["queries"]["stats"]]
     if not usable:
-        return []
+        return [], []
 
-    # One panel per query, each only as tall as it has bars, so a query answered
-    # by three tools does not get the same space as one answered by six. With
-    # several datasets each becomes a column, the paper's Set 1 / Set 2 layout.
+    # One panel per query, sized by how many tools answered it on that pass.
     rows_per_query = {}
     for query in QUERIES:
         depth = max(
@@ -1407,7 +1560,7 @@ def plot_queries(datasets, out_dir):
         if depth:
             rows_per_query[query] = depth
     if not rows_per_query:
-        return []
+        return [], []
     queries = [q for q in QUERIES if q in rows_per_query]
 
     # One x-axis for every page, or a query on page two would look faster than
@@ -1417,14 +1570,37 @@ def plot_queries(datasets, out_dir):
     ]
     bounds = (min(everything) / 3.0, max(everything) * 3.0)
 
-    pages = [
+    query_chunks = [
         queries[start:start + QUERIES_PER_PAGE]
         for start in range(0, len(queries), QUERIES_PER_PAGE)
     ]
-    figures = [
-        query_figure(usable, page, rows_per_query, bounds, number, len(pages))
-        for number, page in enumerate(pages, start=1)
+    # Chunk first, then cache state: Q1-Q3 cold, Q1-Q3 hot, Q4-Q6 cold,
+    # Q4-Q6 hot. Consecutive pages then compare the same questions cold vs hot.
+    pages = [
+        (dataset, chunk)
+        for chunk in query_chunks
+        for dataset in usable
     ]
+    figures = [
+        query_figure(
+            dataset,
+            chunk,
+            {
+                q: len([t for t in QUERY_ORDER if (t, q) in dataset["queries"]["stats"]])
+                or rows_per_query[q]
+                for q in chunk
+            },
+            bounds,
+            number,
+            len(pages),
+        )
+        for number, (dataset, chunk) in enumerate(pages, start=1)
+    ]
+
+    # Drop stale page PNGs from an earlier layout (e.g. the old two-column pair)
+    # so a four-page render cannot leave a fifth orphan behind.
+    for stale in out_dir.glob("figure6_queries*.png"):
+        stale.unlink()
 
     outputs = []
     for number, fig in enumerate(figures, start=1):
@@ -1432,16 +1608,14 @@ def plot_queries(datasets, out_dir):
         path = out_dir / (stem + ".png")
         fig.savefig(str(path), dpi=200)
         outputs.append(path)
-    # The PDF stays one file with one page per group, which is what a reader
-    # scrolling a paper expects and what a printer needs.
+    # One PDF, one Letter page per group — what a printer and a paper both want.
     pdf_path = out_dir / "figure6_queries.pdf"
     with PdfPages(str(pdf_path)) as pdf:
         for fig in figures:
             pdf.savefig(fig)
     outputs.append(pdf_path)
-    for fig in figures:
-        plt.close(fig)
-    return outputs
+    # Caller closes after the combined PDF has been written.
+    return outputs, figures
 
 
 def main():
@@ -1509,10 +1683,23 @@ def main():
     if out_dir is None:
         out_dir = args.results[0].resolve() / "charts"
     out_dir.mkdir(parents=True, exist_ok=True)
-    outputs = plot_index(datasets, out_dir) + plot_queries(datasets, out_dir)
+    index_outputs, index_figures = plot_index(datasets, out_dir)
+    query_outputs, query_figures = plot_queries(datasets, out_dir)
+    outputs = index_outputs + query_outputs
+    figures = index_figures + query_figures
     if not outputs:
         sys.stderr.write("ERROR: no successful benchmark rows to plot\n")
         return 1
+    # One Letter PDF with every figure in reading order, for a single print job
+    # or a slide deck that should not juggle nine files.
+    if figures:
+        combined = out_dir / "all_charts.pdf"
+        with PdfPages(str(combined)) as pdf:
+            for fig in figures:
+                pdf.savefig(fig)
+        outputs.append(combined)
+    for fig in figures:
+        plt.close(fig)
     for output in outputs:
         print(output)
     return 0
