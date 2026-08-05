@@ -156,6 +156,13 @@ static inline uint16_t crawl_bin_type_bit(uint8_t type) {
  * 1 MiB gives the column codecs enough runway to pay off (a few thousand records
  * is too short for run-length and frame-of-reference to matter) while keeping
  * per-writer memory modest: the writer holds one uint64 array per numeric column.
+ *
+ * Raising the target to 2, 4 or 8 MiB was measured and rejected: see
+ * docs/performance.md#rejected-a-larger-row-group-raw-target. Note also that a
+ * record contributes only (CRAWL_COL__COUNT - 1) * 8 + name_len decoded bytes,
+ * so the record cap below binds at 65536 times that -- 7 MiB for nameless
+ * records, 7.5 to 7.7 MiB on the trees measured there -- and a target past that
+ * point never takes effect: every full group closes on the cap instead.
  */
 #define CRAWL_BIN_ROWGROUP_RAW_TARGET (1u << 20)
 #define CRAWL_BIN_ROWGROUP_MAX_RECORDS 65536u

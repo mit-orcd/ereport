@@ -269,6 +269,78 @@ One column is dead on arrival regardless: `imm_child_ctime_led_count` has no con
 
 Raw data: `~/orcd/scratch/ereport-automated-testing/results/ereport-rollups3-19608592` (`SUMMARY.txt`, `PARITY.txt`, `runs.csv`), with the two earlier rounds alongside it.
 
+### Rejected: a larger row group raw target
+
+Compressing the catalog for v9 moved the cost: the record region is now 93.6% of a mixed capture against the catalog's 5.4%, so `CRAWL_BIN_ROWGROUP_RAW_TARGET` sits on top of essentially all of the remaining space. Raising it should pay twice, by amortizing the per-frame overhead of a zstd frame per column over more records and by lengthening the window each frame gets to find redundancy in. It does pay, by 6.5% at 8 MiB, and every other number moves the wrong way.
+
+Setup for everything below: one node (`node1607`, 32 CPUs requested, `--mem=96G`, `mit_normal`), fixture trees and `TMPDIR` on node-local `/scratch`, `ECRAWL_QUERY_THREADS=16`, medians of 9 reps with the arms **interleaved inside each rep**, on the two Phase 1 trees — `dirheavy` (2M directories, one file each, 4,000,006 records) and `mixed` (600k directories, 8 files each, 5,400,006 records). A **second, independently built 1 MiB tree is declared as an A/A control** (the `A/A` column), so the noise floor is measured rather than assumed. Every arm built with zero warnings, and every query answer is identical across arms: sorted, counter-filtered `ecrawl_query` output over eight query shapes matched the 1 MiB control byte for byte on both trees.
+
+Total capture size, on-disk `bin` + `ckpt`:
+
+| tree | 1 MiB | 2 MiB | 4 MiB | 8 MiB | A/A |
+|---|---:|---:|---:|---:|---:|
+| dirheavy | 31.61 MiB | 31.17 MiB (−1.4%) | 31.33 MiB (−0.9%) | **29.55 MiB (−6.5%)** | 31.60 MiB (−0.03%) |
+| mixed | 31.17 MiB | 30.95 MiB (−0.7%) | 30.86 MiB (−1.0%) | **29.93 MiB (−4.0%)** | 31.13 MiB (−0.1%) |
+
+The curve is not monotone — 4 MiB is *worse* than 2 MiB on `dirheavy` — and the per-column breakdown says why the whole range is so narrow. On `dirheavy`, going from 1 MiB to 8 MiB: `inode` 14.87 → 14.85 MiB, `name_bytes` 4.57 → 4.42 MiB, `parent_dir_id` 3.94 → 2.37 MiB, and no other column exceeds 64 KiB. Practically the entire win is one column, and the ceiling on any win is set by the column that will not move: `inode` is 62.9% of the record region at 1 MiB and 68.2% at 8 MiB, it encodes `FOR_BITPACK` at a 1.06x ratio, and a longer window does nothing for it because a stream of unrelated inode numbers has no redundancy to find at any length. `mixed` is the same shape with `inode` at 68.7% and unmoved.
+
+Query medians, seconds:
+
+| tree | shape | 1 MiB | 2 MiB | 4 MiB | 8 MiB | A/A |
+|---|---|---:|---:|---:|---:|---:|
+| dirheavy | `--subtree` rollup | 0.0715 | 0.0719 | 0.0717 | 0.0725 | 0.0717 |
+| dirheavy | `--top,dense,deep 64` | 0.2359 | 0.2380 | 0.2343 | 0.2323 | 0.2393 |
+| dirheavy | `--subtree --type f --size-gt 100 --list` | 0.0817 | 0.0827 | 0.0836 | 0.0862 | 0.0818 |
+| dirheavy | `--index-dir` subtree | 0.0042 | 0.0042 | 0.0040 | 0.0041 | 0.0040 |
+| dirheavy | `--size-gt 500M` (all groups skip) | 0.0058 | 0.0051 | 0.0049 | 0.0048 | 0.0056 |
+| dirheavy | `--size-gt 63` (partial skip) | 0.0062 | 0.0064 | 0.0073 | **0.0097 (+56%)** | 0.0060 |
+| dirheavy | narrow `--subtree --list` | 0.1470 | 0.1497 | 0.1551 | **0.1585 (+7.8%)** | 0.1483 |
+| dirheavy | same, `ECRAWL_QUERY_BLOCK_SKIP=0` | 0.0192 | 0.0205 | 0.0235 | **0.0263 (+37%)** | 0.0194 |
+| mixed | `--subtree` rollup | 0.0278 | 0.0287 | 0.0283 | 0.0279 | 0.0277 |
+| mixed | `--top,dense,deep 64` | 0.0845 | 0.0832 | 0.0837 | 0.0819 | 0.0840 |
+| mixed | `--subtree --type f --size-gt 100 --list` | 0.0504 | 0.0525 | 0.0566 | **0.0639 (+27%)** | 0.0509 |
+| mixed | `--index-dir` subtree | 0.0041 | 0.0041 | 0.0041 | 0.0040 | 0.0041 |
+| mixed | `--size-gt 500M` (all groups skip) | 0.0058 | 0.0053 | 0.0052 | 0.0048 | 0.0059 |
+| mixed | `--size-gt 25` (partial skip) | 0.0213 | 0.0223 | 0.0246 | **0.0300 (+41%)** | 0.0214 |
+| mixed | narrow `--subtree --list` | 0.0505 | 0.0527 | 0.0574 | **0.0616 (+22%)** | 0.0508 |
+| mixed | same, `ECRAWL_QUERY_BLOCK_SKIP=0` | 0.0219 | 0.0229 | 0.0256 | **0.0314 (+43%)** | 0.0224 |
+
+Two identical builds differ by at most 4.8%, and every row over 1.5% is a query that finishes in under 6 ms where a tenth of a millisecond is already a percent; the bolded regressions are an order of magnitude above that floor, while the two shapes that get *faster* — the fully-skippable `--size-gt 500M` and the whole-catalog `--top,dense,deep` — move by about as much as the control does. The rollup and the sidecar-answered subtree do not touch the record region at all and correctly do not move.
+
+**The regression is not the zone maps going blind, which is what the experiment was designed to catch.** On `dirheavy`'s partial-skip query the skip rate barely falls: 468 of 469 groups skipped at 1 MiB, 61 of 62 at 8 MiB, 99.8% against 98.4%, with `records_scanned` identical at 4,000,006 in every arm. One group survives in both cases. It costs 56% more because that one group is 65,536 records at 8 MiB against 8,544 at 1 MiB — the *granularity of a miss* grew eightfold even though the *fraction* of misses did not. The `ECRAWL_QUERY_BLOCK_SKIP=0` row isolates the rest: with skipping switched off entirely, 8 MiB is still 37% and 43% slower, because `parse_chunk_jobs` falls from 46 to 31 on `dirheavy` and 57 to 42 on `mixed` — the row group is the parallel unit, and coarsening it costs concurrency on top of read amplification. Both effects are structural, and neither is fixed by choosing a better predicate.
+
+Write throughput does not move. `dirheavy` crawl medians are 4.4336 / 4.3974 / 4.5219 / 4.5133 s against 4.4461 s for the A/A arm, and the nine reps of the 1 MiB arm alone span 4.3494–4.4921 s, which covers every cell; `mixed` is 2.1315 / 2.0119 / 2.0735 / 2.0716 against 2.0516, with the control arm the slowest of the five.
+
+**Writer memory is the hard stop, and it is invisible on the obvious fixture.** Peak RSS of the crawl on these trees is 731.8 / 734.6 / 738.1 / 755.9 MiB across the sweep — flat, and meaningless: records shard by uid, both trees are single-uid, and one live shard buffers one row group no matter what the target is. Measuring the real thing needs many uids, which unprivileged means an `LD_PRELOAD` stat shim that takes `st_uid` from a `uNNN_` name prefix, and a fixture where every shard can actually *fill* an 8 MiB group — 1024 owner directories of 22,900 files with 255-byte names, 23,450,625 entries, sized from the 112 + `name_len` accounting so a full group is ~22.9k records. Under-fill the shards and the large targets look free. Peak RSS, MiB, at `--mem=160G` on `node1604`:
+
+| live shards | 1 MiB | 2 MiB | 4 MiB | 8 MiB |
+|---:|---:|---:|---:|---:|
+| 2 | 189.8 | 186.2 | 192.2 | 199.3 |
+| 9 | 339.6 | 357.8 | 378.8 | 446.0 |
+| 33 | 400.6 | 438.2 | 541.2 | 701.2 |
+| 129 | 608.7 | 755.4 | 1100.0 | 1703.0 |
+| 1024 | 2318.4 | 3494.1 | 6179.5 | **10691.8** |
+
+At the default `ECRAWL_UID_SHARDS` of 1024, 8 MiB costs 10.4 GiB of resident memory against 2.3 GiB — 4.6x, and the naive `8 MiB × 1024 = 8 GiB` arithmetic turns out to *understate* it, because `writer_reserve` rounds the column arrays up to a power of two and the name buffer is charged on top. A crawler that needs 10 GiB on a multi-user filesystem is not a capture-size trade, it is a different tool.
+
+**Above ~7.6 MiB the constant stops doing anything at all.** A record contributes `(CRAWL_COL__COUNT - 1) * 8 + name_len` = 112 + `name_len` decoded bytes to the flush accumulator, so `CRAWL_BIN_ROWGROUP_MAX_RECORDS` binds at 65536 × that: exactly 7.0 MiB for nameless records, and 7.67 MiB on `dirheavy` (mean name 10.73 B, 122.73 B per record) or 7.53 MiB on `mixed` (8.54 B, 120.54 B). Walking the group headers confirms the crossover empirically rather than arithmetically — how each group closed, by arm:
+
+| tree | target | groups | closed by record cap | closed by byte target | closed at EOF |
+|---|---:|---:|---:|---:|---:|
+| dirheavy | 1 MiB | 469 | 0 | 468 | 1 |
+| dirheavy | 2 MiB | 235 | 0 | 234 | 1 |
+| dirheavy | 4 MiB | 118 | 0 | 117 | 1 |
+| dirheavy | 8 MiB | 62 | **61** | 0 | 1 |
+| mixed | 8 MiB | 83 | **82** | 0 | 1 |
+
+So the 8 MiB arm is not an 8 MiB arm: every full group closes at 65,536 records, and it is really a 7.67 / 7.53 MiB arm whose behaviour the byte target no longer controls. The 255-byte-name RSS fixture is the other side of the same identity — 366.99 B per record puts its crossover at 22.94 MiB, and there not one group in any arm closed on the cap.
+
+**And `make check` fails at 4 MiB and above.** The dir-index sidecar test crawls a 28,372-record fixture and asserts that it lands in more than one row group, because `rowgroups.idx` pruning is only exercised when there is a group to prune: with a single group the pruned chunk builder never runs and the parity checks around it compare one route with itself. Sweeping the harness as-is: 1 MiB passes with pruning keeping 1 of 4 groups, 2 MiB passes keeping 1 of 2, and 4 MiB and 8 MiB both fail with the fixture collapsed into a single group. That is a gate, not a nuisance — a target that silently deletes the coverage protecting the sketch would have to ship with a bigger fixture, which is more test runtime bought to make a change that is already losing on size-versus-speed.
+
+`CRAWL_BIN_ROWGROUP_RAW_TARGET` stays at 1 MiB. 2 MiB is the only arm that clears the harness, and it buys 1.4% and 0.7% of capture size for 4.2% on `mixed --list`, 3.2% and 4.7% on the two partial-skip queries and 4.6–6.8% with skipping disabled, against an A/A floor near 1% — a small loss for a small win, which is still a loss under "smaller with no regression". What would change the answer is a change to what the row group *is*, not to how big it is: sub-group zone maps or a page index would let a coarse group keep fine-grained skipping, and splitting the parse unit from the compression unit would give back the concurrency the `BLOCK_SKIP=0` row measures. Until one of those exists, the three effects are locked together and 1 MiB is where they balance.
+
+Raw data: `~/orcd/scratch/ereport-automated-testing/results/rgtarget2-sweep-19671435` (per-arm `space-*.txt` column breakdowns, per-rep query output, parity files), `rgtarget2-rss-19671436` (peak-RSS sweep) and `rgtarget2-checks-19672395` (`make check` per target), with the job logs under `logs/`. An earlier pass over the same question — same trees, same eight query shapes, no A/A control and no harness gate — is alongside them as `ercbin09-rgsweep-19662025` and `ercbin09-rgrss-19662026`; it reached the same verdict on the same mechanism, measuring the 8 MiB size win at −6.5% on `dirheavy` against −6.5% here, and the partial-skip regression at +52% against +56% here.
+
 ## Synthetic adversarial trees
 
 `scripts/fixtures/generate-ecrawl-adversarial-tree.sh` builds stress layouts for `ecrawl` (flat megadir, optional depth chain, wide fan-out, optional `ecrawl_query` depth slices, optional ereport badge fixtures). Choose scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).
