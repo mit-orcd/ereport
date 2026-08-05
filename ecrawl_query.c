@@ -213,7 +213,18 @@ typedef struct parent_node {
  * is threads queueing on the arena locks inside glibc. Bumping a per-worker block removes both the
  * contention and the matching frees.
  */
+/*
+ * The first block is PARENT_ARENA_BLOCK_BYTES and each later one doubles up to
+ * PARENT_ARENA_BLOCK_MAX_BYTES. Growing is not about the malloc count, which the bump arena
+ * already made negligible; it is what lets a large arena reach a block big enough to contain a
+ * 2 MiB-aligned span, which is the floor alloc_hint_hugepages() insists on before it will advise
+ * anything. At a flat 1 MiB that hint can never fire, and first-touch faults were 48% of the
+ * neutral_flat analyze -- memmove faulting in a page per 4 KiB as it copied path bytes into
+ * freshly mapped block memory. Starting small is what keeps a capture with few parents at its
+ * present footprint: a worker that fills a single block still asks for only 1 MiB.
+ */
 #define PARENT_ARENA_BLOCK_BYTES ((size_t)1 << 20)
+#define PARENT_ARENA_BLOCK_MAX_BYTES ((size_t)8 << 20)
 
 typedef struct parent_arena_block {
     struct parent_arena_block *next;
@@ -224,6 +235,7 @@ typedef struct parent_arena_block {
 
 typedef struct parent_arena {
     parent_arena_block_t *cur;
+    size_t next_block_bytes;       /* 0 before the first block; thereafter the next size to request */
     struct parent_arena *reg_next; /* registered with the map, which owns the blocks */
 } parent_arena_t;
 
@@ -837,7 +849,8 @@ static void *parent_arena_alloc(parent_arena_t *a, size_t sz) {
     void *p;
 
     if (!b || b->cap - b->used < need) {
-        size_t cap = PARENT_ARENA_BLOCK_BYTES > need ? PARENT_ARENA_BLOCK_BYTES : need;
+        size_t want = a->next_block_bytes ? a->next_block_bytes : PARENT_ARENA_BLOCK_BYTES;
+        size_t cap = want > need ? want : need;
 
         b = (parent_arena_block_t *)malloc(sizeof(*b) + cap);
         if (!b) return NULL;
@@ -845,6 +858,13 @@ static void *parent_arena_alloc(parent_arena_t *a, size_t sz) {
         b->used = 0;
         b->cap = cap;
         a->cur = b;
+        a->next_block_bytes = want < PARENT_ARENA_BLOCK_MAX_BYTES ? want * 2U : PARENT_ARENA_BLOCK_MAX_BYTES;
+        /* Advisory, and self-limiting: a no-op until cap clears the helper's 4 MiB floor, so the
+         * early small blocks are left alone and only an arena that kept growing gets huge pages.
+         * Prefaulting is deliberately not paired with this. The bucket table above is calloc'd
+         * precisely so untouched buckets never fault, and a block is bump-filled front to back,
+         * so the only pages advised here are ones this worker goes on to write. */
+        alloc_hint_hugepages(b->data, cap);
     }
     p = b->data + b->used;
     b->used += need;
@@ -1405,11 +1425,25 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
         &br, CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID) | CRAWL_COL_BIT(CRAWL_COL_TYPE) |
                  CRAWL_COL_BIT(CRAWL_COL_NAME_LEN));
 
+    /*
+     * A group at a time, reading columns, rather than a record at a time through the
+     * row-reconstruction shim. crawl_bin_block_reader_next() rebuilds a whole
+     * bin_record_hdr_t per record -- a memset of the struct plus a projection test and an
+     * indexed load for every one of the fifteen columns -- to hand back the three this pass
+     * actually reads. Taking the group's arrays touches only those three, walking each in
+     * sequence, which is the access pattern a columnar format exists to allow: the shim was
+     * 59% of this scan's cycles on a 12M-record capture. ereport_index's row-group index
+     * build already reads this way.
+     *
+     * A column pointer is NULL when the group did not carry that column -- a hardlink-only
+     * column in a group with no hardlinks, say. The shim reported those as a zero field, and
+     * the reads below keep that, so an absent column still means "0" and not a wild read.
+     */
     for (;;) {
-        bin_record_hdr_t rh;
-        uint64_t pid;
-        int by_dir_id;
-        int got = crawl_bin_block_reader_next(&br, &rh, NULL); /* names are not projected */
+        uint32_t ngrp = 0;
+        const uint64_t *c_pid, *c_type, *c_nlen;
+        uint32_t k;
+        int got = crawl_bin_block_reader_next_group(&br, &ngrp);
 
         if (got == 0) break;
         if (got < 0) {
@@ -1418,77 +1452,87 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
             return -1;
         }
 
-        pid = rh.parent_dir_id;
-        if (pid == 0ULL) {
-            parent_run_flush(&run);
-            crawl_bin_block_reader_free(&br);
-            return -1;
-        }
+        c_pid = crawl_bin_block_reader_column(&br, CRAWL_COL_PARENT_DIR_ID);
+        c_type = crawl_bin_block_reader_column(&br, CRAWL_COL_TYPE);
+        c_nlen = crawl_bin_block_reader_column(&br, CRAWL_COL_NAME_LEN);
 
-        /*
-         * Which directory to charge, and how deep the record sits, are both answers the catalog
-         * already holds under a dir_id. Two shapes of record resolve to one without a string:
-         *
-         *   name_len > 0   an ordinary entry: its parent is pid's directory and it sits one level
-         *                  below, so charge pid and bin at depth[pid] + 1.
-         *
-         *   name_len == 0  the row for a directory itself. Its own path is pid's directory, so its
-         *                  parent is pid's parent and the '/'-count of the path the long route
-         *                  builds ("/a/b/") is depth[pid] + 1 -- the same two answers, without
-         *                  materialising a path only to strip its last component back off.
-         *                  dir 1 is the exception: its path is "/", whose parent is ".", which is
-         *                  no directory in this catalog. That row goes the long way.
-         */
-        by_dir_id = (cnt != NULL && pid <= cat->max_dir_id);
-        if (by_dir_id && rh.name_len == 0) by_dir_id = (pid > 1ULL && cat->parent_dir_id[pid] != 0ULL);
+        for (k = 0; k < ngrp; k++) {
+            uint64_t pid = c_pid ? c_pid[k] : 0ULL;
+            uint16_t nlen = c_nlen ? (uint16_t)c_nlen[k] : 0U;
+            uint8_t rtype = c_type ? (uint8_t)c_type[k] : 0U;
+            int by_dir_id;
 
-        if (by_dir_id) {
-            uint64_t did = rh.name_len > 0 ? pid : cat->parent_dir_id[pid];
-            unsigned d = (unsigned)cat->depth[pid] + 1U;
-            unsigned db = d >= ANALYZE_DEPTH_BINS ? ANALYZE_DEPTH_BINS - 1U : d;
-
-            depth_hist[db]++;
-            parent_run_bump(&run, &cnt[did], rh.type);
-        }
-
-        if (!by_dir_id) {
-            size_t flen;
-            uint16_t pl;
+            if (pid == 0ULL) {
+                parent_run_flush(&run);
+                crawl_bin_block_reader_free(&br);
+                return -1;
+            }
 
             /*
-             * What is left is the row for dir 1 itself -- path "/", parent "." -- and rows naming a
-             * dir_id this catalog does not have. Those already failed the chunk when this branch
-             * rebuilt their path, because dir_path_len refuses an unknown id.
+             * Which directory to charge, and how deep the record sits, are both answers the catalog
+             * already holds under a dir_id. Two shapes of record resolve to one without a string:
              *
-             * A name is needed to go further, and the projection left the name bytes on disk, so a
-             * row that still has a name here cannot be served: fail rather than invent a path from
-             * a length with no bytes behind it.
+             *   name_len > 0   an ordinary entry: its parent is pid's directory and it sits one level
+             *                  below, so charge pid and bin at depth[pid] + 1.
+             *
+             *   name_len == 0  the row for a directory itself. Its own path is pid's directory, so its
+             *                  parent is pid's parent and the '/'-count of the path the long route
+             *                  builds ("/a/b/") is depth[pid] + 1 -- the same two answers, without
+             *                  materialising a path only to strip its last component back off.
+             *                  dir 1 is the exception: its path is "/", whose parent is ".", which is
+             *                  no directory in this catalog. That row goes the long way.
              */
-            if (rh.name_len > 0) {
-                parent_run_flush(&run);
-                crawl_bin_block_reader_free(&br);
-                return -1;
-            }
-            if (crawl_bin_catalog_entry_path(cat, pid, NULL, 0, fullpath_buf, fullpath_sz) != 0) {
-                parent_run_flush(&run);
-                crawl_bin_block_reader_free(&br);
-                return -1;
-            }
-            flen = strlen(fullpath_buf);
-            pl = flen > 65535U ? 65535U : (uint16_t)flen;
-            if (flen > 0) {
-                parent_node_t *node;
-                size_t parent_len;
+            by_dir_id = (cnt != NULL && pid <= cat->max_dir_id);
+            if (by_dir_id && nlen == 0) by_dir_id = (pid > 1ULL && cat->parent_dir_id[pid] != 0ULL);
 
-                depth_hist[analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl)]++;
-                if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf, ANALYZE_PARENT_PATH_MAX,
-                                         &parent_len) == 0) {
-                    node = parent_map_get_or_add(map, arena, parentbuf, parent_len);
-                    if (node) parent_run_bump(&run, &node->c, rh.type);
+            if (by_dir_id) {
+                uint64_t did = nlen > 0 ? pid : cat->parent_dir_id[pid];
+                unsigned d = (unsigned)cat->depth[pid] + 1U;
+                unsigned db = d >= ANALYZE_DEPTH_BINS ? ANALYZE_DEPTH_BINS - 1U : d;
+
+                depth_hist[db]++;
+                parent_run_bump(&run, &cnt[did], rtype);
+            }
+
+            if (!by_dir_id) {
+                size_t flen;
+                uint16_t pl;
+
+                /*
+                 * What is left is the row for dir 1 itself -- path "/", parent "." -- and rows naming a
+                 * dir_id this catalog does not have. Those already failed the chunk when this branch
+                 * rebuilt their path, because dir_path_len refuses an unknown id.
+                 *
+                 * A name is needed to go further, and the projection left the name bytes on disk, so a
+                 * row that still has a name here cannot be served: fail rather than invent a path from
+                 * a length with no bytes behind it.
+                 */
+                if (nlen > 0) {
+                    parent_run_flush(&run);
+                    crawl_bin_block_reader_free(&br);
+                    return -1;
+                }
+                if (crawl_bin_catalog_entry_path(cat, pid, NULL, 0, fullpath_buf, fullpath_sz) != 0) {
+                    parent_run_flush(&run);
+                    crawl_bin_block_reader_free(&br);
+                    return -1;
+                }
+                flen = strlen(fullpath_buf);
+                pl = flen > 65535U ? 65535U : (uint16_t)flen;
+                if (flen > 0) {
+                    parent_node_t *node;
+                    size_t parent_len;
+
+                    depth_hist[analyze_depth_slash_bin((unsigned char *)fullpath_buf, pl)]++;
+                    if (parent_dir_from_path((unsigned char *)fullpath_buf, pl, parentbuf,
+                                             ANALYZE_PARENT_PATH_MAX, &parent_len) == 0) {
+                        node = parent_map_get_or_add(map, arena, parentbuf, parent_len);
+                        if (node) parent_run_bump(&run, &node->c, rtype);
+                    }
                 }
             }
+            nrec++;
         }
-        nrec++;
     }
 
     parent_run_flush(&run);
@@ -1767,7 +1811,10 @@ static const char *query_parent_path(query_path_cache_t *c, const crawl_bin_cata
     return c->arena + e->off;
 }
 
-static int query_hardlink_defer(query_result_t *qr, const bin_record_hdr_t *rh) {
+/* Takes the four values rather than a bin_record_hdr_t: the caller reads columns and no
+ * longer has a header to point at, and these are the only fields this ever wanted. */
+static int query_hardlink_defer(query_result_t *qr, uint32_t dev_major, uint32_t dev_minor, uint64_t inode,
+                                uint64_t size) {
     if (qr->hl_count == qr->hl_cap) {
         size_t nc = qr->hl_cap ? qr->hl_cap * 2U : 1024U;
         query_hardlink_t *np = (query_hardlink_t *)realloc(qr->hl, nc * sizeof(*np));
@@ -1776,10 +1823,10 @@ static int query_hardlink_defer(query_result_t *qr, const bin_record_hdr_t *rh) 
         qr->hl = np;
         qr->hl_cap = nc;
     }
-    qr->hl[qr->hl_count].dev_major = rh->dev_major;
-    qr->hl[qr->hl_count].dev_minor = rh->dev_minor;
-    qr->hl[qr->hl_count].inode = rh->inode;
-    qr->hl[qr->hl_count].size = rh->size;
+    qr->hl[qr->hl_count].dev_major = dev_major;
+    qr->hl[qr->hl_count].dev_minor = dev_minor;
+    qr->hl[qr->hl_count].inode = inode;
+    qr->hl[qr->hl_count].size = size;
     qr->hl_count++;
     return 0;
 }
@@ -1870,98 +1917,140 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
             (void)crawl_bin_block_reader_add_range(br, CRAWL_COL_PARENT_DIR_ID, sub->pid_lo, sub->pid_hi);
     }
 
+    /*
+     * Column-at-a-time; see the note in analyze_scan_fp_until. The row shim rebuilt all
+     * fifteen fields of a bin_record_hdr_t per record to serve the seven to ten this scan
+     * reads, and it sits on the latency path of every query answered by record_scan.
+     *
+     * The hardlink triple is the case that makes the NULL-column handling matter rather
+     * than merely tidy: set_hardlink_columns() clears INODE / DEV_MAJOR / DEV_MINOR from a
+     * group whose NLINK zone map tops out at 1, so those pointers are genuinely NULL on a
+     * capture without hardlinks -- which is most of them. They are only read under
+     * nlink > 1, which such a group cannot produce, so the zero default is never the value
+     * that gets used.
+     */
     for (;;) {
-        bin_record_hdr_t rh;
-        const unsigned char *rec_name = NULL;
-        uint64_t pid;
-        int got = crawl_bin_block_reader_next(br, &rh, &rec_name);
-        int in_scope;
+        uint32_t ngrp = 0;
+        const uint64_t *c_pid, *c_type, *c_nlen, *c_size, *c_gid, *c_mode, *c_nlink;
+        const uint64_t *c_ino, *c_devmaj, *c_devmin;
+        uint32_t k;
+        int got = crawl_bin_block_reader_next_group(br, &ngrp);
 
         if (got == 0) break;
         if (got < 0) return -1;
-        nrec++;
-        pid = rh.parent_dir_id;
-        if (pid == 0ULL) return -1;
 
-        in_scope = 1;
-        if (g_query.subtree && !(sub && sub->whole)) {
-            in_scope = subtree_contains(sub, pid);
-            /*
-             * The subtree's own directory record hangs off its parent, so the
-             * membership array never claims it, yet du counts it. Namesake
-             * check first: comparing one component is far cheaper than
-             * rebuilding a path for every directory in the capture. When names
-             * are not projected the catalog supplies that record instead (see
-             * query_needs_names), so there is nothing to recognise here.
-             */
-            if (!in_scope && rec_name && rh.type == (uint8_t)'d' &&
-                (size_t)rh.name_len == g_query.sub_base_len &&
-                memcmp(rec_name, g_query.sub_base, g_query.sub_base_len) == 0) {
-                const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+        c_pid = crawl_bin_block_reader_column(br, CRAWL_COL_PARENT_DIR_ID);
+        c_type = crawl_bin_block_reader_column(br, CRAWL_COL_TYPE);
+        c_nlen = crawl_bin_block_reader_column(br, CRAWL_COL_NAME_LEN);
+        c_size = crawl_bin_block_reader_column(br, CRAWL_COL_SIZE);
+        c_gid = crawl_bin_block_reader_column(br, CRAWL_COL_GID);
+        c_mode = crawl_bin_block_reader_column(br, CRAWL_COL_MODE);
+        c_nlink = crawl_bin_block_reader_column(br, CRAWL_COL_NLINK);
+        c_ino = crawl_bin_block_reader_column(br, CRAWL_COL_INODE);
+        c_devmaj = crawl_bin_block_reader_column(br, CRAWL_COL_DEV_MAJOR);
+        c_devmin = crawl_bin_block_reader_column(br, CRAWL_COL_DEV_MINOR);
 
-                if (!cat) return -1;
-                if (crawl_bin_catalog_entry_path(cat, pid, (const char *)rec_name, rh.name_len, fullpath_buf,
-                                                 fullpath_sz) == 0 &&
-                    strcmp(fullpath_buf, g_query.subtree) == 0)
-                    in_scope = 1;
+        for (k = 0; k < ngrp; k++) {
+            const unsigned char *rec_name;
+            uint64_t pid = c_pid ? c_pid[k] : 0ULL;
+            uint64_t rsize = c_size ? c_size[k] : 0ULL;
+            uint64_t rnlink = c_nlink ? c_nlink[k] : 0ULL;
+            uint64_t rgid = c_gid ? c_gid[k] : 0ULL;
+            uint32_t rmode = c_mode ? (uint32_t)c_mode[k] : 0U;
+            uint16_t nlen = c_nlen ? (uint16_t)c_nlen[k] : 0U;
+            uint8_t rtype = c_type ? (uint8_t)c_type[k] : 0U;
+            int in_scope;
+
+            /* NULL whenever the name bytes are not projected, exactly as the shim left it.
+             * The length comes from the NAME_LEN column, as it did there. */
+            rec_name = crawl_bin_block_reader_name(br, k, NULL);
+
+            nrec++;
+            if (pid == 0ULL) return -1;
+
+            in_scope = 1;
+            if (g_query.subtree && !(sub && sub->whole)) {
+                in_scope = subtree_contains(sub, pid);
+                /*
+                 * The subtree's own directory record hangs off its parent, so the
+                 * membership array never claims it, yet du counts it. Namesake
+                 * check first: comparing one component is far cheaper than
+                 * rebuilding a path for every directory in the capture. When names
+                 * are not projected the catalog supplies that record instead (see
+                 * query_needs_names), so there is nothing to recognise here.
+                 */
+                if (!in_scope && rec_name && rtype == (uint8_t)'d' &&
+                    (size_t)nlen == g_query.sub_base_len &&
+                    memcmp(rec_name, g_query.sub_base, g_query.sub_base_len) == 0) {
+                    const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+
+                    if (!cat) return -1;
+                    if (crawl_bin_catalog_entry_path(cat, pid, (const char *)rec_name, nlen, fullpath_buf,
+                                                     fullpath_sz) == 0 &&
+                        strcmp(fullpath_buf, g_query.subtree) == 0)
+                        in_scope = 1;
+                }
+                if (!in_scope) continue;
             }
-            if (!in_scope) continue;
-        }
 
-        if (g_query.have_size_gt && rh.size <= g_query.size_gt) continue;
-        if (g_query.type_filter && rh.type != (uint8_t)g_query.type_filter) continue;
-        if (g_query.have_gid && rh.gid != g_query.gid) continue;
-        if (g_query.perm_mode && !query_perm_match(rh.mode)) continue;
+            if (g_query.have_size_gt && rsize <= g_query.size_gt) continue;
+            if (g_query.type_filter && rtype != (uint8_t)g_query.type_filter) continue;
+            if (g_query.have_gid && rgid != g_query.gid) continue;
+            if (g_query.perm_mode && !query_perm_match(rmode)) continue;
 
-        qr->entries++;
-        if (rh.type == (uint8_t)'f')
-            qr->files++;
-        else if (rh.type == (uint8_t)'d')
-            qr->dirs++;
-        else if (rh.type == (uint8_t)'l')
-            qr->symlinks++;
-        else
-            qr->other++;
+            qr->entries++;
+            if (rtype == (uint8_t)'f')
+                qr->files++;
+            else if (rtype == (uint8_t)'d')
+                qr->dirs++;
+            else if (rtype == (uint8_t)'l')
+                qr->symlinks++;
+            else
+                qr->other++;
 
-        /* du credits a multiply-linked inode once; which visit wins is decided
-         * globally, after the workers join, because links can span shards. */
-        if (rh.type != (uint8_t)'d' && rh.nlink > 1ULL) {
-            if (query_hardlink_defer(qr, &rh) != 0) {
-                qr->oom = 1;
-                return -1;
-            }
-        } else {
-            qr->bytes += rh.size;
-        }
+            /* du credits a multiply-linked inode once; which visit wins is decided
+             * globally, after the workers join, because links can span shards. */
+            if (rtype != (uint8_t)'d' && rnlink > 1ULL) {
+                uint32_t devmaj = c_devmaj ? (uint32_t)c_devmaj[k] : 0U;
+                uint32_t devmin = c_devmin ? (uint32_t)c_devmin[k] : 0U;
 
-        if (g_query.list_paths) {
-            size_t fullpath_len = 0;
-            const char *ppath;
-            size_t plen = 0;
-
-            {
-                const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
-
-                if (!cat) return -1;
-                ppath = query_parent_path(pcache, cat, pid, &plen, parent_path, sizeof(parent_path));
-                if (!ppath) return -1;
-            }
-            if (plen == 0U) {
-                if ((size_t)rh.name_len + 2U > fullpath_sz) return -1;
-                fullpath_buf[0] = '/';
-                if (rh.name_len > 0U) memcpy(fullpath_buf + 1, rec_name, rh.name_len);
-                fullpath_len = 1U + (size_t)rh.name_len;
+                if (query_hardlink_defer(qr, devmaj, devmin, c_ino ? c_ino[k] : 0ULL, rsize) != 0) {
+                    qr->oom = 1;
+                    return -1;
+                }
             } else {
-                if (plen + 1U + (size_t)rh.name_len + 1U > fullpath_sz) return -1;
-                memcpy(fullpath_buf, ppath, plen);
-                fullpath_buf[plen] = '/';
-                if (rh.name_len > 0U) memcpy(fullpath_buf + plen + 1U, rec_name, rh.name_len);
-                fullpath_len = plen + 1U + (size_t)rh.name_len;
+                qr->bytes += rsize;
             }
-            fullpath_buf[fullpath_len] = '\0';
-            if (query_out_append(qr, fullpath_buf, fullpath_len) != 0) {
-                qr->oom = 1;
-                return -1;
+
+            if (g_query.list_paths) {
+                size_t fullpath_len = 0;
+                const char *ppath;
+                size_t plen = 0;
+
+                {
+                    const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+
+                    if (!cat) return -1;
+                    ppath = query_parent_path(pcache, cat, pid, &plen, parent_path, sizeof(parent_path));
+                    if (!ppath) return -1;
+                }
+                if (plen == 0U) {
+                    if ((size_t)nlen + 2U > fullpath_sz) return -1;
+                    fullpath_buf[0] = '/';
+                    if (nlen > 0U) memcpy(fullpath_buf + 1, rec_name, nlen);
+                    fullpath_len = 1U + (size_t)nlen;
+                } else {
+                    if (plen + 1U + (size_t)nlen + 1U > fullpath_sz) return -1;
+                    memcpy(fullpath_buf, ppath, plen);
+                    fullpath_buf[plen] = '/';
+                    if (nlen > 0U) memcpy(fullpath_buf + plen + 1U, rec_name, nlen);
+                    fullpath_len = plen + 1U + (size_t)nlen;
+                }
+                fullpath_buf[fullpath_len] = '\0';
+                if (query_out_append(qr, fullpath_buf, fullpath_len) != 0) {
+                    qr->oom = 1;
+                    return -1;
+                }
             }
         }
     }
