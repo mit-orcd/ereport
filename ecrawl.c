@@ -6314,6 +6314,7 @@ static void *writer_thread_main(void *arg_void) {
         }
     }
     free(shards);
+    crawl_bin_block_writer_tls_release();
     tls_flush_thread_batch_counters();
     return NULL;
 }

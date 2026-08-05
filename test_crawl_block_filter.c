@@ -133,11 +133,16 @@ static int check_filter(const char *path, uint64_t end, int have_size, uint64_t 
     return 0;
 }
 
-/* Every field must survive the column round trip, names included. */
+/*
+ * Every field must survive the column round trip, names included. The expected
+ * sequence is each group in stored order, which is (parent_dir_id, name): every
+ * record here shares parent 1, so it is the two groups' names sorted within
+ * each group rather than the order they were appended in.
+ */
 static int check_roundtrip(const char *path, uint64_t end) {
-    static const uint8_t types[] = {'f', 'd', 'l', 'c', 'b', 'p', 's', 'o'};
-    static const uint64_t sizes[] = {500, 999, 10, 20, 30, 40, 50, 60};
-    static const char *names[] = {"equal", "dir", "link", "char", "block", "fifo", "sock", "other"};
+    static const uint8_t types[] = {'d', 'f', 'b', 'c', 'p', 'l', 'o', 's'};
+    static const uint64_t sizes[] = {999, 500, 30, 20, 40, 10, 60, 50};
+    static const char *names[] = {"dir", "equal", "block", "char", "fifo", "link", "other", "sock"};
     crawl_bin_chunk_stdio_t io = {NULL, stdio_fread, NULL};
     crawl_bin_block_reader_t r;
     FILE *fp = fopen(path, "rb");
@@ -170,6 +175,107 @@ static int check_roundtrip(const char *path, uint64_t end) {
     crawl_bin_block_reader_free(&r);
     fclose(fp);
     return (!bad && i == sizeof(types) / sizeof(types[0])) ? 0 : -1;
+}
+
+/*
+ * The writer orders a group by (parent_dir_id, name) before encoding it, so a
+ * directory's records reach the codecs as one run instead of scattered through
+ * crawl arrival order. Names compare byte-wise, so case matters and a name that
+ * is a prefix of another sorts first.
+ *
+ * Ordering must be a pure permutation: the records that come back are exactly
+ * the records that went in, and the zone map still spans the group's true
+ * extremes. A reordering that also moved a value would prune correct answers
+ * away, and only the zone map would show it.
+ */
+static int check_group_order(void) {
+    static const uint64_t in_parent[] = {3, 1, 2, 1, 3, 2, 1, 2};
+    static const char *in_name[] = {"zeta", "b", "ab", "a", "alpha", "a", "ab", "aB"};
+    static const uint64_t in_size[] = {31, 12, 22, 10, 30, 20, 11, 21};
+    static const uint64_t want_parent[] = {1, 1, 1, 2, 2, 2, 3, 3};
+    static const char *want_name[] = {"a", "ab", "b", "a", "aB", "ab", "alpha", "zeta"};
+    static const uint64_t want_size[] = {10, 11, 12, 20, 21, 22, 30, 31};
+    const size_t n = sizeof(in_parent) / sizeof(in_parent[0]);
+    char path[] = "/tmp/test_crawl_grouporder.XXXXXX";
+    int fd = mkstemp(path);
+    crawl_bin_chunk_stdio_t io = {NULL, stdio_fread, NULL};
+    crawl_bin_block_writer_t w;
+    crawl_bin_block_reader_t r;
+    bin_rowgroup_hdr_t rg;
+    bin_colchunk_hdr_t col;
+    bin_file_header_t fh;
+    FILE *fp;
+    uint64_t off = sizeof(bin_file_header_t);
+    size_t i;
+    int rc = -1;
+
+    if (fd < 0) return -1;
+    fp = fdopen(fd, "wb+");
+    if (!fp) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    memset(&fh, 0, sizeof(fh));
+    if (fwrite(&fh, sizeof(fh), 1, fp) != 1) goto out_unlink;
+    if (crawl_bin_block_writer_init(&w) != 0) goto out_unlink;
+
+    for (i = 0; i < n; i++) {
+        bin_record_hdr_t h;
+
+        memset(&h, 0, sizeof(h));
+        h.parent_dir_id = in_parent[i];
+        h.name_len = (uint16_t)strlen(in_name[i]);
+        h.type = 'f';
+        h.size = in_size[i];
+        h.uid = 1000;
+        h.nlink = 1;
+        if (crawl_bin_block_writer_append_record(&w, &h, in_name[i]) != 0) {
+            crawl_bin_block_writer_free(&w);
+            goto out_unlink;
+        }
+    }
+    if (flush_group(&w, fp, &off) != 0) {
+        crawl_bin_block_writer_free(&w);
+        goto out_unlink;
+    }
+    crawl_bin_block_writer_free(&w);
+    if (fclose(fp) != 0) {
+        unlink(path);
+        return -1;
+    }
+
+    if (read_group(path, sizeof(bin_file_header_t), &rg, CRAWL_COL_PARENT_DIR_ID, &col) != 0) goto out_unlink;
+    if (rg.record_count != (uint32_t)n || col.min_value != 1ULL || col.max_value != 3ULL) goto out_unlink;
+    if (read_group(path, sizeof(bin_file_header_t), &rg, CRAWL_COL_SIZE, &col) != 0) goto out_unlink;
+    if (col.min_value != 10ULL || col.max_value != 31ULL) goto out_unlink;
+
+    fp = fopen(path, "rb");
+    if (!fp) goto out_unlink;
+    if (crawl_bin_block_reader_init(&r, &io, fp, sizeof(bin_file_header_t), off) != 0) goto out_close;
+    for (i = 0; i < n; i++) {
+        bin_record_hdr_t h;
+        const unsigned char *name = NULL;
+
+        if (crawl_bin_block_reader_next(&r, &h, &name) != 1) goto out_close;
+        if (h.parent_dir_id != want_parent[i] || h.size != want_size[i] || !name ||
+            h.name_len != (uint16_t)strlen(want_name[i]) || memcmp(name, want_name[i], h.name_len) != 0)
+            goto out_close;
+    }
+    {
+        bin_record_hdr_t h;
+        const unsigned char *name = NULL;
+
+        if (crawl_bin_block_reader_next(&r, &h, &name) != 0) goto out_close;
+    }
+    rc = 0;
+
+out_close:
+    crawl_bin_block_reader_free(&r);
+    fclose(fp);
+out_unlink:
+    unlink(path);
+    return rc;
 }
 
 /*
@@ -437,6 +543,7 @@ int main(void) {
         return fail("constant uid column was not stored as CONST");
 
     if (check_roundtrip(path, off) != 0) return fail("record round trip failed");
+    if (check_group_order() != 0) return fail("row group ordering failed");
 
     if (check_filter(path, off, 0, 0, 0, 8, 8, 2, 0, 0) != 0) return fail("unfiltered scan failed");
     if (check_filter(path, off, 1, 1000, 'f', 0, 0, 0, 2, 8) != 0) return fail("all-group size skip failed");

@@ -63,9 +63,19 @@ static inline size_t crawl_bin_block_writer_records(const crawl_bin_block_writer
  * Encode, compress and write the pending row group via wfwrite, then reset. On
  * success sets *bytes_written_out to the on-disk size of the group, or 0 when
  * nothing was pending. Returns 0 on success, -1 on error.
+ *
+ * The group is ordered by (parent_dir_id, name) on the way out; see the ordering
+ * comment in crawl_bin_block.c for why that is free of on-disk consequences.
  */
 int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bin_block_fwrite_fn wfwrite,
                                  uint64_t *bytes_written_out);
+
+/*
+ * Release the calling thread's flush-time sort scratch. Shared by every writer a
+ * thread flushes, so it outlives any single crawl_bin_block_writer_t; call it
+ * once as a writer thread winds down.
+ */
+void crawl_bin_block_writer_tls_release(void);
 
 /* ----------------------------------------------------------------------------
  * Reader side: iterate records across the row groups in a byte range.

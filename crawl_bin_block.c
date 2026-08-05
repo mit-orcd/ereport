@@ -160,6 +160,238 @@ int crawl_bin_block_writer_append_record(crawl_bin_block_writer_t *w, const bin_
     return 0;
 }
 
+/* ---- row-group ordering --------------------------------------------------
+ *
+ * Records reach the writer in crawl arrival order, which interleaves the
+ * directories several crawl threads happen to be reading, so parent_dir_id
+ * arrives as short broken runs and sibling names arrive scattered. Ordering a
+ * group by (parent_dir_id, name) just before it is encoded gives the column
+ * codecs one run per directory and puts a directory's names next to each other
+ * in the name blob.
+ *
+ * Ordering happens at flush, so it permutes rows *within* a group and never
+ * moves a record between groups: the flush threshold counts decoded bytes,
+ * which do not depend on order. Group membership, record counts, per-column
+ * min/max zone maps and type_mask are therefore all bit-identical to what an
+ * unsorted writer produces.
+ *
+ * Ties are broken by name_len then by arrival position, so two records that
+ * agree on parent and name still land in a defined order.
+ */
+
+/* Runs shorter than this sort faster by insertion than by merge. */
+#define SORT_RUN_INSERTION_MAX 32u
+
+/*
+ * Sort scratch is thread-local, not per-writer: a writer thread flushes one
+ * shard at a time, so this is 24 bytes per buffered record per *thread*
+ * instead of per live shard. Per shard it would add a quarter of a gigabyte at
+ * the default ECRAWL_UID_SHARDS of 1024, for buffers that are live for the
+ * microseconds a flush takes.
+ */
+static __thread uint32_t *tls_sort_idx;
+static __thread uint32_t *tls_sort_aux;
+static __thread uint64_t *tls_sort_noff;
+static __thread uint64_t *tls_sort_vals;
+static __thread size_t tls_sort_cap;
+static __thread unsigned char *tls_sort_names;
+static __thread size_t tls_sort_names_cap;
+
+void crawl_bin_block_writer_tls_release(void) {
+    free(tls_sort_idx);
+    free(tls_sort_aux);
+    free(tls_sort_noff);
+    free(tls_sort_vals);
+    free(tls_sort_names);
+    tls_sort_idx = NULL;
+    tls_sort_aux = NULL;
+    tls_sort_noff = NULL;
+    tls_sort_vals = NULL;
+    tls_sort_names = NULL;
+    tls_sort_cap = 0;
+    tls_sort_names_cap = 0;
+}
+
+static int sort_reserve(size_t n) {
+    uint32_t *i32;
+    uint64_t *u64;
+
+    if (tls_sort_cap >= n) return 0;
+    i32 = (uint32_t *)realloc(tls_sort_idx, n * sizeof(*i32));
+    if (!i32) return -1;
+    tls_sort_idx = i32;
+    i32 = (uint32_t *)realloc(tls_sort_aux, n * sizeof(*i32));
+    if (!i32) return -1;
+    tls_sort_aux = i32;
+    u64 = (uint64_t *)realloc(tls_sort_noff, (n + 1U) * sizeof(*u64));
+    if (!u64) return -1;
+    tls_sort_noff = u64;
+    u64 = (uint64_t *)realloc(tls_sort_vals, n * sizeof(*u64));
+    if (!u64) return -1;
+    tls_sort_vals = u64;
+    tls_sort_cap = n;
+    return 0;
+}
+
+/* Byte-wise name order, shorter name first on a shared prefix. */
+static int sort_name_cmp(const crawl_bin_block_writer_t *w, uint32_t a, uint32_t b) {
+    const uint64_t *len = w->col[CRAWL_COL_NAME_LEN];
+    size_t la = (size_t)len[a];
+    size_t lb = (size_t)len[b];
+    size_t m = la < lb ? la : lb;
+    int r = m ? memcmp(w->names + tls_sort_noff[a], w->names + tls_sort_noff[b], m) : 0;
+
+    if (r != 0) return r;
+    if (la != lb) return la < lb ? -1 : 1;
+    return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static void sort_run_insertion(const crawl_bin_block_writer_t *w, uint32_t *v, size_t n) {
+    size_t i, j;
+
+    for (i = 1; i < n; i++) {
+        uint32_t key = v[i];
+
+        for (j = i; j > 0 && sort_name_cmp(w, v[j - 1], key) > 0; j--) v[j] = v[j - 1];
+        v[j] = key;
+    }
+}
+
+/* Bottom-up merge, so a single directory holding a whole row group cannot hit a
+ * quadratic path on adversarial names. */
+static void sort_run_merge(const crawl_bin_block_writer_t *w, uint32_t *v, size_t n, uint32_t *tmp) {
+    uint32_t *src = v;
+    uint32_t *dst = tmp;
+    size_t width;
+
+    for (width = 1; width < n; width *= 2) {
+        size_t i;
+
+        for (i = 0; i < n; i += 2U * width) {
+            size_t l = i;
+            size_t lend = (i + width < n) ? i + width : n;
+            size_t r = lend;
+            size_t rend = (i + 2U * width < n) ? i + 2U * width : n;
+            size_t k = i;
+
+            while (l < lend && r < rend) dst[k++] = (sort_name_cmp(w, src[r], src[l]) < 0) ? src[r++] : src[l++];
+            while (l < lend) dst[k++] = src[l++];
+            while (r < rend) dst[k++] = src[r++];
+        }
+        {
+            uint32_t *t = src;
+
+            src = dst;
+            dst = t;
+        }
+    }
+    if (src != v) memcpy(v, src, n * sizeof(*v));
+}
+
+/*
+ * Stable LSD radix over the frame-of-reference parent_dir_id, one byte per pass
+ * and only as many passes as the group's own span needs -- a group covers a
+ * narrow slice of the shard's dir_ids, so this is usually two. Stability is what
+ * leaves equal-parent records in arrival order for the name pass to refine.
+ */
+static void sort_by_parent(const crawl_bin_block_writer_t *w, size_t n) {
+    const uint64_t *pid = w->col[CRAWL_COL_PARENT_DIR_ID];
+    uint32_t *src = tls_sort_idx;
+    uint32_t *dst = tls_sort_aux;
+    uint64_t mn = pid[0];
+    uint64_t mx = pid[0];
+    uint64_t span;
+    unsigned pass, passes;
+    size_t i;
+
+    for (i = 1; i < n; i++) {
+        if (pid[i] < mn) mn = pid[i];
+        if (pid[i] > mx) mx = pid[i];
+    }
+    span = mx - mn;
+    for (passes = 0; span != 0ULL; span >>= 8) passes++;
+
+    for (pass = 0; pass < passes; pass++) {
+        size_t cnt[256];
+        unsigned shift = pass * 8U;
+        size_t sum = 0;
+        size_t b;
+
+        memset(cnt, 0, sizeof(cnt));
+        for (i = 0; i < n; i++) cnt[((pid[src[i]] - mn) >> shift) & 0xFFU]++;
+        for (b = 0; b < 256; b++) {
+            size_t c = cnt[b];
+
+            cnt[b] = sum;
+            sum += c;
+        }
+        for (i = 0; i < n; i++) dst[cnt[((pid[src[i]] - mn) >> shift) & 0xFFU]++] = src[i];
+        {
+            uint32_t *t = src;
+
+            src = dst;
+            dst = t;
+        }
+    }
+    if (src != tls_sort_idx) memcpy(tls_sort_idx, src, n * sizeof(*src));
+}
+
+static int writer_apply_permutation(crawl_bin_block_writer_t *w) {
+    unsigned char *nb;
+    size_t i;
+    int c;
+
+    for (c = 0; c < CRAWL_COL__COUNT; c++) {
+        if (c == CRAWL_COL_NAME_BYTES || !w->col[c]) continue;
+        for (i = 0; i < w->count; i++) tls_sort_vals[i] = w->col[c][tls_sort_idx[i]];
+        memcpy(w->col[c], tls_sort_vals, w->count * sizeof(*tls_sort_vals));
+    }
+
+    if (w->names_len == 0) return 0;
+    if (block_grow(&tls_sort_names, &tls_sort_names_cap, w->names_len) != 0) return -1;
+    nb = tls_sort_names;
+    for (i = 0; i < w->count; i++) {
+        uint32_t s = tls_sort_idx[i];
+        size_t len = (size_t)(tls_sort_noff[s + 1U] - tls_sort_noff[s]);
+
+        if (len) memcpy(nb, w->names + tls_sort_noff[s], len);
+        nb += len;
+    }
+    memcpy(w->names, tls_sort_names, w->names_len);
+    return 0;
+}
+
+static int writer_sort_group(crawl_bin_block_writer_t *w) {
+    const uint64_t *pid;
+    uint64_t off = 0;
+    size_t i, run;
+
+    if (w->count < 2U) return 0;
+    if (sort_reserve(w->count) != 0) return -1;
+
+    for (i = 0; i < w->count; i++) {
+        tls_sort_idx[i] = (uint32_t)i;
+        tls_sort_noff[i] = off;
+        off += w->col[CRAWL_COL_NAME_LEN][i];
+    }
+    tls_sort_noff[w->count] = off;
+
+    sort_by_parent(w, w->count);
+
+    pid = w->col[CRAWL_COL_PARENT_DIR_ID];
+    for (i = 0; i < w->count; i = run) {
+        for (run = i + 1U; run < w->count && pid[tls_sort_idx[run]] == pid[tls_sort_idx[i]]; run++)
+            ;
+        if (run - i < 2U) continue;
+        if (run - i <= SORT_RUN_INSERTION_MAX)
+            sort_run_insertion(w, tls_sort_idx + i, run - i);
+        else
+            sort_run_merge(w, tls_sort_idx + i, run - i, tls_sort_aux);
+    }
+
+    return writer_apply_permutation(w);
+}
+
 /* Compress src into w->comp. Returns compressed length, or (size_t)-1. */
 static size_t writer_compress(crawl_bin_block_writer_t *w, const unsigned char *src, size_t len) {
     size_t bound;
@@ -192,6 +424,7 @@ int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bi
     if (!w || !fp || !wfwrite) return -1;
     if (w->count == 0) return 0;
     if (w->type_mask == 0U) return -1;
+    if (writer_sort_group(w) != 0) return -1;
 
     /* Each column is encoded and compressed independently, so all payloads must
      * be held until the directory that describes them can be written first. */

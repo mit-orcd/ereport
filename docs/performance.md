@@ -341,6 +341,111 @@ So the 8 MiB arm is not an 8 MiB arm: every full group closes at 65,536 records,
 
 Raw data: `~/orcd/scratch/ereport-automated-testing/results/rgtarget2-sweep-19671435` (per-arm `space-*.txt` column breakdowns, per-rep query output, parity files), `rgtarget2-rss-19671436` (peak-RSS sweep) and `rgtarget2-checks-19672395` (`make check` per target), with the job logs under `logs/`. An earlier pass over the same question — same trees, same eight query shapes, no A/A control and no harness gate — is alongside them as `ercbin09-rgsweep-19662025` and `ercbin09-rgrss-19662026`; it reached the same verdict on the same mechanism, measuring the 8 MiB size win at −6.5% on `dirheavy` against −6.5% here, and the partial-skip regression at +52% against +56% here.
 
+### Measured: sorting each row group by (parent_dir_id, name)
+
+The section above rejected the larger row group but measured the prize inside it. The whole 8 MiB size win was one column — `parent_dir_id` 3.94 → 2.37 MiB on `dirheavy` — and it came from longer runs, not from a longer compression window. Sorting a group by `parent_dir_id` before encoding it produces those runs directly, at 1 MiB, without the 10.7 GiB of writer RSS and the 56% partial-skip regression that made the 8 MiB arm unshippable. It is kept: **−17.1% on `mixed`, −0.83% on `dirheavy`, −9.5% on a long-name tree**, with query medians flat or faster on every shape, write throughput inside the A/A spread, and peak RSS flat at 1024 live shards. The win is a function of records per directory, and there is one narrow fan-out where it is a 1.42% loss; the curve is at the end of this section.
+
+**The audit came first, and the reason nothing depends on record order is structural.** Sorting happens at flush, so it permutes rows inside a buffer that is about to be encoded and never moves a record between groups: the flush threshold counts decoded bytes (112 + `name_len` per record), which do not depend on order. Group membership, `record_count`, `type_mask` and every per-column `min`/`max` are therefore identical to what an unsorted writer produces, and so is every group boundary and file offset. That disposes of the `.ckpt` sidecars, which record block-aligned *physical* offsets into the record region and are only used to split a shard into segments; of `rowgroups.idx` and `dirs.idx`, which are built at index time from what a group actually holds and from catalog paths respectively; and of the catalog's `dir_id` assignment, DFS numbering and subtree rollups, which are driven by directory arrival in a post-pass on final close and never read a row group. `ecrawl_mount` already sorts its directory listings by `(parent, name)` in memory, and `ecrawl_query --list` output was already compared sorted because crawl threads interleave, so record order was never deterministic to begin with. Mid-crawl resume is covered by the same argument rather than by a test — the harness exercises `.ckpt` loading and `ecrawl_repair` but has no restart case, so that leg is by construction, not by measurement.
+
+**The ordering is described, not promised.** [binary-format.md](binary-format.md) states the writer's order — `parent_dir_id`, then name bytes by `memcmp` over the common prefix with the shorter name first, then arrival position — and states equally plainly that a reader must not rely on it. Sorting is per group, so one directory's children can still straddle a boundary and arrive in either order, which makes any reader that assumed sibling adjacency wrong anyway; and a later writer that wanted a different order should not have to bump the format version to get it. The tie-break exists so the order is reproducible, not so it can be depended on.
+
+Setup: `node1610`, 32 CPUs requested, `--mem=96G`, `mit_normal`, fixture trees and `TMPDIR` on node-local `/scratch`, `ECRAWL_QUERY_THREADS=16`, medians of 9 reps with the three arms interleaved inside each rep, on the same `dirheavy` and `mixed` trees Phase 1 and 2 used. The third arm is **a second, independently built unsorted binary as an A/A control**. All three arms built with zero warnings, and all 48 sorted-output comparisons — 12 query shapes × 2 trees × 2 comparisons — matched byte for byte, including the 2,000,012-line and 4,800,012-line whole-tree `--list` shapes.
+
+Total capture size, on-disk `bin` + `ckpt`:
+
+| tree | records | unsorted | sorted | A/A |
+|---|---:|---:|---:|---:|
+| dirheavy | 4,000,006 | 31.65 MiB | **31.39 MiB (−0.83%)** | 31.66 MiB (+0.03%) |
+| mixed | 5,400,006 | 31.06 MiB | **25.74 MiB (−17.1%)** | 31.04 MiB (−0.07%) |
+
+The two trees disagree about *which* column pays, and the reason is a crossover the encoder is already choosing across correctly. `CRAWL_ENC_RLE` costs 16 bytes per run — a `(value, run_length)` pair of `uint64` — while `CRAWL_ENC_FOR_BITPACK` costs `bit_width` bits per record, about 2.4 bytes here. So RLE wins on `parent_dir_id` once the mean run exceeds ~6.5 records, which after sorting is just the mean number of records per directory. `mixed` has 9, `dirheavy` has 2:
+
+| tree | column | unsorted | sorted | encoding, unsorted → sorted |
+|---|---|---:|---:|---|
+| dirheavy | `inode` | 14.95 MiB | 14.95 MiB | `FOR_BITPACK` → `FOR_BITPACK` |
+| dirheavy | `name_bytes` | 4.55 MiB | **4.03 MiB (−11.4%)** | `BYTES` → `BYTES` |
+| dirheavy | `parent_dir_id` | 3.92 MiB | **4.15 MiB (+5.9%)** | `FOR_BITPACK` → `FOR_BITPACK` |
+| mixed | `inode` | 19.88 MiB | 19.86 MiB | `FOR_BITPACK` → `FOR_BITPACK` |
+| mixed | `parent_dir_id` | 7.87 MiB | **724.28 KiB (−91.0%)** | `FOR_BITPACK` → `RLE` (605 of 621 groups) |
+| mixed | `name_bytes` | 992.63 KiB | **2.91 MiB (+200%)** | `BYTES` → `BYTES` |
+
+`mixed`'s `parent_dir_id` is the Phase 2 prize collected in full and then some: 7.87 MiB to 724 KiB, where the 8 MiB row group only managed 40% on the other tree. `dirheavy` stays on `FOR_BITPACK` because two records per directory would cost 32 bytes per run against 2.4 — the encoder correctly declines — and then loses 5.9% at the zstd stage, because arrival order repeats each bucket's parent id many times over while the sorted stream is monotone and nearly distinct, so sorting removes literal matches zstd was living on without giving the run coder enough to replace them. A delta encoder would collect that back; `CRAWL_ENC_DELTA` is what the sorted stream is now shaped for and does not exist yet.
+
+**The cheap columns collapse, which is where the query win comes from.** On `dirheavy` six columns flip from `FOR_BITPACK` to `RLE` — `mode` raw 6.68 MiB → 14.72 KiB, `size` 2.41 MiB → 14.75 KiB, and the same for `atime`, `name_len`, `nlink`, `type` — dropping the record region's decoded size from 82.16 MiB to 67.16 MiB for only 0.26 MiB of compressed savings. Those columns were already near-free on disk (450x, 257x ratios) but were still being bit-unpacked four million values at a time on every scan. Sorted, they expand from a handful of runs.
+
+**Zone maps do not tighten, and the reason is the same structural argument as the audit.** The hypothesis going in was that sorted groups would cover narrow, near-disjoint `parent_dir_id` intervals and skip far more. They cannot, because intra-group sorting does not change *which* records are in a group and a zone map is a property of that set. Measured rather than assumed: on all twelve shapes, in both trees, `blocks_decompressed`, `blocks_skipped`, `records_scanned` and `directories_examined` are identical across all three arms — 469 groups on `dirheavy` and 621 on `mixed`, `records_scanned` 4,000,006 and 5,400,006, 468/469 and 620/621 skipped on the shapes that skip, 2,000,008 and 600,008 directories examined on the rollups. Only `parse_chunk_jobs` moves, 46 → 47 on `dirheavy`, because the sorted capture is smaller. Narrower intervals need records *assigned* to groups by key, not sorted inside them, and that means buffering across group boundaries — the memory cost the 8 MiB arm was rejected for.
+
+One thing the sweep set out to do and failed at: the `sel*` shapes put the size predicate at several points of the tree's own distribution trying to land a skip rate strictly between the 99.8% Phase 2 was stuck at and 0%, and none of them did. Every shape came out at 0%, 99.8% or 100%. The invariance above is the stronger statement — the counters are identical on every shape rather than close on one — but a genuinely intermediate skip rate remains unmeasured.
+
+Query medians, seconds, `ECRAWL_QUERY_THREADS=16`, `MID` = mean bytes per file:
+
+| tree | shape | skip | unsorted | sorted | A/A |
+|---|---|---:|---:|---:|---:|
+| dirheavy | `--subtree` rollup | — | 0.0717 | 0.0713 | 0.0714 |
+| dirheavy | `--top,dense,deep 64` | — | 0.2394 | **0.1857 (−22.4%)** | 0.2396 |
+| dirheavy | `--subtree --type f --size-gt 100 --list` | 99.8% | 0.0805 | 0.0805 | 0.0805 |
+| dirheavy | `--index-dir` subtree | — | 0.0042 | 0.0042 | 0.0043 |
+| dirheavy | `--size-gt 500M --type f --list` | 100% | 0.0059 | 0.0062 | 0.0060 |
+| dirheavy | `--size-gt MID --type f` | 99.8% | 0.0064 | 0.0064 | 0.0065 |
+| dirheavy | `--size-gt 0 --type f` | 0% | 0.0219 | **0.0178 (−18.7%)** | 0.0211 |
+| dirheavy | `--size-gt 4095` | 99.8% | 0.0066 | 0.0066 | 0.0065 |
+| dirheavy | narrow `--subtree --type f --list` | 0% | 0.0994 | 0.0961 | 0.0990 |
+| dirheavy | mid `--subtree --type f --list` | 0% | 0.1016 | 0.0977 | 0.1013 |
+| dirheavy | whole-tree `--subtree --type f --list` | 0% | 0.3033 | 0.3115 | 0.2949 |
+| dirheavy | `--size-gt MID`, `ECRAWL_QUERY_BLOCK_SKIP=0` | off | 0.0230 | **0.0197 (−14.3%)** | 0.0218 |
+| mixed | `--subtree` rollup | — | 0.0281 | 0.0279 | 0.0268 |
+| mixed | `--top,dense,deep 64` | — | 0.0860 | **0.0671 (−22.0%)** | 0.0865 |
+| mixed | `--subtree --type f --size-gt 100 --list` | 0% | 0.0506 | 0.0501 | 0.0509 |
+| mixed | `--index-dir` subtree | — | 0.0044 | 0.0043 | 0.0042 |
+| mixed | `--size-gt 500M --type f --list` | 100% | 0.0064 | 0.0062 | 0.0062 |
+| mixed | `--size-gt MID --type f` | 0% | 0.0220 | **0.0188 (−14.5%)** | 0.0229 |
+| mixed | `--size-gt 0 --type f` | 0% | 0.0262 | **0.0189 (−27.9%)** | 0.0245 |
+| mixed | `--size-gt 4095` | 99.8% | 0.0067 | 0.0066 | 0.0066 |
+| mixed | narrow `--subtree --type f --list` | 0% | 0.0507 | 0.0501 | 0.0514 |
+| mixed | mid `--subtree --type f --list` | 0% | 0.0510 | 0.0506 | 0.0509 |
+| mixed | whole-tree `--subtree --type f --list` | 0% | 0.5278 | 0.5382 | 0.5195 |
+| mixed | `--size-gt MID`, `ECRAWL_QUERY_BLOCK_SKIP=0` | off | 0.0231 | **0.0197 (−14.7%)** | 0.0249 |
+
+Two identical builds differ by up to 7.8% here — the sub-30 ms scans, where a tenth of a millisecond is already half a percent — so read anything under that as flat. The bolded rows are the decode-bound scans, and they move with the RLE collapse above rather than with anything about skipping: the shape that skips 99.8% of its groups is unchanged in every arm, while the shape that decodes all 621 is 28% faster. The rollup and the `--index-dir` subtree never touch the record region and correctly do not move. The whole-tree `--list` shapes are the one place sorted is nominally slowest (+2.7% and +2.0%), both inside an A/A spread of 2.8% and 1.6% on arms whose per-rep ranges overlap; they are also output-bound, printing two and 4.8 million lines. No shape regresses beyond the control.
+
+Write throughput is where the risk was, and it does not move. `dirheavy` crawl medians are 4.4471 s unsorted, 4.5085 s sorted, 4.4907 s control — sorted is 1.4% above unsorted and 0.4% above a control built from the same source. `mixed` is 2.2163 / 2.1297 / 2.1088, with sorted *faster* than unsorted. The nine reps of the unsorted `dirheavy` arm alone span 4.3113–5.9175 s (4.31–4.74 discarding one outlier), which covers every cell in the row. The sort is a two-pass LSD radix over the frame-of-reference `parent_dir_id` — usually two byte passes, since a group spans a narrow slice of the shard's dir ids — plus insertion or bottom-up merge on names within each equal-parent run, and at about 8,500 records per group it disappears into the zstd pass that follows it.
+
+Peak RSS is flat, which took one design decision. The sort needs 24 bytes of index per buffered record plus a gather copy of the group's name blob, and the obvious place to put that is the writer — but a writer is per shard, so at the default `ECRAWL_UID_SHARDS` of 1024 it would be a quarter of a gigabyte at the ~8,500 records a group holds on these trees and 1.6 GiB at the 65536-record cap, all of it live for the microseconds a flush takes. It is thread-local instead — a writer thread flushes one shard at a time — so the high-water mark is charged once per thread rather than once per shard. Peak RSS on the single-uid trees is 734.8 / 733.5 / 732.9 MiB on `dirheavy` and 360.6 / 359.0 / 358.6 MiB on `mixed`, and on the many-uid fixture the 8 MiB row group died on (the `LD_PRELOAD` `st_uid` shim, 1024 owner directories of 4096 files with 200-byte names, 4,195,329 entries):
+
+| live shards | unsorted | sorted | A/A |
+|---:|---:|---:|---:|
+| 2 | 106.8 MiB | 108.7 | 114.0 |
+| 9 | 271.6 | 275.2 | 272.1 |
+| 33 | 323.4 | 320.6 | 319.7 |
+| 129 | 522.5 | 508.3 | 515.3 |
+| 1024 | 2235.0 | 2229.4 | 2222.3 |
+
+At 1024 shards the sorted arm is 5.6 MiB below unsorted and 7.1 MiB above the control — inside the 12.7 MiB the two unsorted builds put between themselves.
+
+`make check` passes on both arms, 0 FAIL lines, with the dir-index fixture still landing in 4 row groups and pruning still keeping 1 of them, so the coverage Phase 2 found so easy to delete is intact. One unit test needed updating: `test_crawl_block_filter.c`'s round-trip asserted append order on records that all share `parent_dir_id`, which the sort legitimately invalidates, so its expectations were reordered to the byte-wise name order and a `check_group_order()` case was added with three distinct parents and shared-prefix names — `a`, `ab`, `b` under one, `a`, `aB`, `ab` under another — asserting the exact permutation, the multiset, and that the zone map still reports the true extremes. No harness script was touched.
+
+**`name_bytes` moves in both directions, which is the number that calibrates Phase 5.** Adjacency helps where names are long and share prefixes inside a directory and hurts where the arrival stream was already periodic. A third tree isolates the good case — 256 directories of 4096 files with 200-byte names, 1,048,833 records — and there sorted `name_bytes` is 2.01 MiB against 2.54 MiB unsorted and 2.96 MiB for the control, a −9.5% capture on the same comparison. Note what that control says: the *unsorted* arm's `name_bytes` varies by 16% between two identical builds, because crawl arrival order is nondeterministic and zstd's result depends on it, while the sorted arm's does not. Sorting buys reproducible capture size on top of smaller capture size. It also takes `name_bytes` on that tree to 99.35x, so zstd is already capturing nearly all the prefix redundancy that front-coding would target, and Phase 5's remaining headroom on this shape is small.
+
+**The `mixed` counter-case is a fan-out effect, and it crosses over at about 12 records per directory.** Holding the entry count near 1.2M and the `mixed` layout fixed — `bucket_NNNNN` directories of `w0000000`… files, the same eight-name alphabet in every directory — and sweeping only the fan-out:
+
+| files/dir | dirs | `name_bytes` unsorted → sorted | `parent_dir_id` unsorted → sorted | total |
+|---:|---:|---|---|---:|
+| 2 | 600,000 | 1.85 → 2.44 MiB (+32%) | 2.99 → 2.34 MiB | −0.19% |
+| 4 | 300,000 | 962 → 1516 KiB (+58%) | 2.43 → 2.03 MiB | **+1.42%** |
+| 8 | 150,000 | 520 → 1044 KiB (+100%) | 1.69 MiB → 239 KiB | −11.9% |
+| 16 | 75,000 | 295 → 203 KiB (−31%) | 468 → 86 KiB | −7.8% |
+| 32 | 37,500 | 168 → 110 KiB (−34%) | 57.1 → 47.8 KiB | −1.4% |
+
+The A/A control tracks the unsorted arm to within 0.5% at every point, so the reversal is real. It also confirms the 16-bytes-per-run arithmetic above from the other side: `parent_dir_id` stays on `FOR_BITPACK` at fan-out 4 and flips to `RLE` in 140 of 156 groups at fan-out 8, bracketing the predicted ~6.5. Reading the `name_bytes` reversal: the directory records' own names are the thing sorting concentrates. They share one parent, so they collect into a single run of distinct incrementing strings, where unsorted each one rode along inside a long repeating `bucket_NNNNN w0000000 w0000001` template that zstd matched almost entirely. Directory names are 45% of the name bytes at fan-out 2 and 4.6% at 32, which is the same order as where the curve turns. That is a reading of the curve, not a measurement of the two sub-streams separately.
+
+Two things follow. `mixed` at fan-out 8 sits exactly on the worst point for `name_bytes` and still wins 17.1% overall, because `parent_dir_id`'s RLE crossover lands at almost the same fan-out and is worth several times more. And there is one shape — fan-out 4, where `parent_dir_id` has not yet flipped to RLE but `name_bytes` has already lost 58% — **where sorting makes the capture 1.42% bigger**. It is a narrow window on a synthetic tree whose names repeat exactly across directories, and it costs nothing but size, but "smaller" is not universal and the curve above is where it is not.
+
+The peak win is at fan-out 8 (−11.9% here, −17.1% on `mixed` itself); by 32 it narrows to −1.4%, because `parent_dir_id` is already RLE without sorting by then and there is nothing left to collect.
+
+**Recommendation: keep the sort.** −17.1% on the tree shape where most captures live, −0.83% where it barely pays, +1.42% in one narrow synthetic window, and every gate holds — identical query answers on 48 comparisons, `make check` green with the dir-index fixture still spanning 4 groups and pruning still keeping 1, query medians flat or up to 22% faster, write throughput and peak RSS inside their own controls. Both per-column regressions are zstd losing literal matches to a more ordered stream, and both are what the later phases are for: `CRAWL_ENC_DELTA` for the now-monotone `parent_dir_id`, front-coding for `name_bytes`. Neither is worth pre-empting with a store-if-smaller guard at the group level, which would double the encode cost to protect columns worth 4 MiB and 2 MiB of a 26 MiB capture.
+
+Raw data: `~/orcd/scratch/ereport-automated-testing/results/recsort-sweep-19673578` (per-arm `space-*.txt`, per-rep query output with counters, parity files), `recsort-rss-19675022` (peak-RSS sweep under the uid shim), `recsort-check-19675077` (`make check` both arms), `recsort-names-19676435` (the long-name tree) and `recsort-fanout-19678085` (the fan-out crossover), with job logs under `logs/`.
+
 ## Synthetic adversarial trees
 
 `scripts/fixtures/generate-ecrawl-adversarial-tree.sh` builds stress layouts for `ecrawl` (flat megadir, optional depth chain, wide fan-out, optional `ecrawl_query` depth slices, optional ereport badge fixtures). Choose scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).
