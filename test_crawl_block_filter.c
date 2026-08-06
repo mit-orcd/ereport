@@ -481,6 +481,133 @@ out_unlink:
     return rc;
 }
 
+/*
+ * The residual encodings are chosen per chunk by compressing both candidates, so
+ * this builds a group shaped like the trees they were measured on -- inode a run
+ * of consecutive allocations broken by jumps, ctime equal to mtime, atime a few
+ * seconds off it -- and asserts that the writer really picked them, that the zone
+ * maps still report the absolute extremes a skipping reader tests, and that every
+ * value comes back.
+ *
+ * The projected scan at the end is the reason mtime is not optional: a consumer
+ * that asks for atime alone cannot get it without the column it was stored
+ * against, so the reader has to pull mtime in for it.
+ */
+static int check_residual_encodings(void) {
+    char path[] = "/tmp/test_crawl_residual.XXXXXX";
+    int fd = mkstemp(path);
+    crawl_bin_chunk_stdio_t io = {NULL, stdio_fread, NULL};
+    crawl_bin_block_writer_t w;
+    crawl_bin_block_reader_t r;
+    bin_rowgroup_hdr_t rg;
+    bin_colchunk_hdr_t col;
+    bin_file_header_t fh;
+    FILE *fp;
+    uint64_t off = sizeof(bin_file_header_t);
+    uint64_t inode_lo = ~0ULL, inode_hi = 0, atime_lo = ~0ULL, atime_hi = 0;
+    const int n = 4096;
+    int i, rc = -1;
+
+    if (fd < 0) return -1;
+    fp = fdopen(fd, "wb+");
+    if (!fp) {
+        close(fd);
+        unlink(path);
+        return -1;
+    }
+    memset(&fh, 0, sizeof(fh));
+    if (fwrite(&fh, sizeof(fh), 1, fp) != 1) goto out_unlink;
+    if (crawl_bin_block_writer_init(&w) != 0) goto out_unlink;
+
+    for (i = 0; i < n; i++) {
+        bin_record_hdr_t h;
+        char nm[32];
+
+        memset(&h, 0, sizeof(h));
+        h.parent_dir_id = 1;
+        snprintf(nm, sizeof(nm), "f%06d", i);
+        h.name_len = (uint16_t)strlen(nm);
+        h.type = 'f';
+        h.uid = 1000;
+        h.nlink = 1;
+        h.size = (uint64_t)(i % 97);
+        h.inode = 0x180000000ULL + (uint64_t)i;
+        if (i % 512 == 0) h.inode = 0x40000000ULL + (uint64_t)i * 7919ULL;
+        h.mtime = 1750000000ULL + (uint64_t)i * 1000ULL;
+        h.ctime = h.mtime;
+        h.atime = h.mtime + (uint64_t)(i % 5);
+        if (h.inode < inode_lo) inode_lo = h.inode;
+        if (h.inode > inode_hi) inode_hi = h.inode;
+        if (h.atime < atime_lo) atime_lo = h.atime;
+        if (h.atime > atime_hi) atime_hi = h.atime;
+        if (crawl_bin_block_writer_append_record(&w, &h, nm) != 0) {
+            crawl_bin_block_writer_free(&w);
+            goto out_unlink;
+        }
+    }
+    if (flush_group(&w, fp, &off) != 0) {
+        crawl_bin_block_writer_free(&w);
+        goto out_unlink;
+    }
+    crawl_bin_block_writer_free(&w);
+    if (fclose(fp) != 0) {
+        unlink(path);
+        return -1;
+    }
+
+    if (read_group(path, sizeof(bin_file_header_t), &rg, CRAWL_COL_INODE, &col) != 0) goto out_unlink;
+    if (col.encoding != CRAWL_ENC_DELTA || col.min_value != inode_lo || col.max_value != inode_hi)
+        goto out_unlink;
+    if (read_group(path, sizeof(bin_file_header_t), &rg, CRAWL_COL_CTIME, &col) != 0) goto out_unlink;
+    if (col.encoding != CRAWL_ENC_REF_MTIME) goto out_unlink;
+    if (read_group(path, sizeof(bin_file_header_t), &rg, CRAWL_COL_ATIME, &col) != 0) goto out_unlink;
+    if (col.encoding != CRAWL_ENC_REF_MTIME || col.min_value != atime_lo || col.max_value != atime_hi)
+        goto out_unlink;
+
+    fp = fopen(path, "rb");
+    if (!fp) goto out_unlink;
+    if (crawl_bin_block_reader_init(&r, &io, fp, sizeof(bin_file_header_t), off) != 0) goto out_close;
+    for (i = 0; i < n; i++) {
+        bin_record_hdr_t h;
+        const unsigned char *name = NULL;
+        uint64_t want_inode = (i % 512 == 0) ? 0x40000000ULL + (uint64_t)i * 7919ULL : 0x180000000ULL + (uint64_t)i;
+        uint64_t want_mtime = 1750000000ULL + (uint64_t)i * 1000ULL;
+
+        if (crawl_bin_block_reader_next(&r, &h, &name) != 1) goto out_close;
+        if (h.inode != want_inode || h.mtime != want_mtime || h.ctime != want_mtime ||
+            h.atime != want_mtime + (uint64_t)(i % 5))
+            goto out_close;
+    }
+    crawl_bin_block_reader_free(&r);
+    fclose(fp);
+
+    fp = fopen(path, "rb");
+    if (!fp) goto out_unlink;
+    if (crawl_bin_block_reader_init(&r, &io, fp, sizeof(bin_file_header_t), off) != 0) goto out_close;
+    if (crawl_bin_block_reader_set_projection(&r, CRAWL_COL_BIT(CRAWL_COL_ATIME)) != 0) goto out_close;
+    for (;;) {
+        uint32_t recs = 0;
+        const uint64_t *atime_col;
+        int grc = crawl_bin_block_reader_next_group(&r, &recs);
+
+        if (grc == 0) break;
+        if (grc < 0 || recs != (uint32_t)n) goto out_close;
+        atime_col = crawl_bin_block_reader_column(&r, CRAWL_COL_ATIME);
+        if (!atime_col) goto out_close;
+        for (i = 0; i < n; i++) {
+            if (atime_col[i] != 1750000000ULL + (uint64_t)i * 1000ULL + (uint64_t)(i % 5)) goto out_close;
+        }
+    }
+    rc = 0;
+
+out_close:
+    crawl_bin_block_reader_free(&r);
+    fclose(fp);
+out_unlink:
+    unlink(path);
+    return rc;
+}
+
 int main(void) {
     char path[] = "/tmp/test_crawl_block_filter.XXXXXX";
     int fd = mkstemp(path);
@@ -557,6 +684,7 @@ int main(void) {
     if (check_projection(path, off, full_bytes) != 0) return fail("column projection failed");
 
     if (check_hardlink_gating() != 0) return fail("hardlink-only column gating failed");
+    if (check_residual_encodings() != 0) return fail("residual column encodings failed");
 
     /* A predicate with no usable term must leave the reader unfiltered. */
     fp = fopen(path, "rb");

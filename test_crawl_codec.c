@@ -26,6 +26,8 @@ static const char *enc_name(uint8_t e) {
         case CRAWL_ENC_RLE: return "RLE";
         case CRAWL_ENC_CONST: return "CONST";
         case CRAWL_ENC_BYTES: return "BYTES";
+        case CRAWL_ENC_DELTA: return "DELTA";
+        case CRAWL_ENC_REF_MTIME: return "REF_MTIME";
         default: return "?";
     }
 }
@@ -107,6 +109,70 @@ static void roundtrip(const char *label, const uint64_t *vals, size_t n, int wan
     free(back);
 }
 
+/*
+ * Round-trip a residual candidate. ref == NULL asks for CRAWL_ENC_DELTA, a
+ * non-NULL ref for CRAWL_ENC_REF_MTIME. want_bytes >= 0 asserts the payload
+ * size, which is how "a constant stride costs 24 bytes" gets checked rather than
+ * assumed. The DELTA decode is deliberately handed min_value 0: the frame base
+ * lives in the payload, because the header's is the absolute zone map.
+ */
+static void roundtrip_residual(const char *label, const uint64_t *vals, const uint64_t *ref, size_t n,
+                               int want_staged, long want_bytes) {
+    unsigned char *buf = NULL;
+    size_t cap = 0, len = 0;
+    uint8_t bw = 0;
+    uint8_t enc = ref ? (uint8_t)CRAWL_ENC_REF_MTIME : (uint8_t)CRAWL_ENC_DELTA;
+    uint64_t *back = NULL;
+    size_t i;
+    int staged;
+
+    g_checks++;
+    staged = ref ? crawl_bin_codec_encode_ref_u64(vals, ref, n, &buf, &cap, &len, &bw)
+                 : crawl_bin_codec_encode_delta_u64(vals, n, &buf, &cap, &len, &bw);
+    if (staged != want_staged) {
+        printf("FAIL %s: staged %d, expected %d\n", label, staged, want_staged);
+        g_fail++;
+        goto out;
+    }
+    if (staged != 1) {
+        printf("ok   %-42s n=%-6zu no candidate\n", label, n);
+        goto out;
+    }
+    if (want_bytes >= 0 && len != (size_t)want_bytes) {
+        printf("FAIL %s: %zu payload bytes, expected %ld\n", label, len, want_bytes);
+        g_fail++;
+        goto out;
+    }
+
+    back = (uint64_t *)malloc((n ? n : 1) * sizeof(uint64_t));
+    if (!back) {
+        printf("FAIL %s: oom\n", label);
+        g_fail++;
+        goto out;
+    }
+    memset(back, 0xAA, (n ? n : 1) * sizeof(uint64_t));
+
+    if (ref ? crawl_bin_codec_decode_ref_u64(buf, len, n, enc, bw, ref, back) != 0
+            : crawl_bin_codec_decode_u64(buf, len, n, enc, bw, 0, back) != 0) {
+        printf("FAIL %s: decode failed (enc=%s len=%zu bw=%u)\n", label, enc_name(enc), len, (unsigned)bw);
+        g_fail++;
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        if (back[i] != vals[i]) {
+            printf("FAIL %s: value %zu: got %llu want %llu (enc=%s bw=%u)\n", label, i,
+                   (unsigned long long)back[i], (unsigned long long)vals[i], enc_name(enc), (unsigned)bw);
+            g_fail++;
+            goto out;
+        }
+    }
+    printf("ok   %-42s n=%-6zu enc=%-11s bw=%-2u bytes=%zu\n", label, n, enc_name(enc), (unsigned)bw, len);
+
+out:
+    free(buf);
+    free(back);
+}
+
 int main(void) {
     uint64_t *v;
     size_t i;
@@ -178,6 +244,86 @@ int main(void) {
     roundtrip("two values", v, 2, -1);
     roundtrip("empty column", v, 0, CRAWL_ENC_CONST);
 
+    /* ---- residual encodings ------------------------------------------------
+     * These are chosen by the writer on post-zstd bytes, so the codec is only
+     * asked whether the candidate round-trips; the sizes below are the ones the
+     * chooser is comparing against, not a promise about the winner. */
+
+    /* An allocator run: one stride, so the whole chunk is the 24-byte prefix. */
+    for (i = 0; i < n; i++) v[i] = 0x7000000000ULL + (uint64_t)i;
+    roundtrip_residual("delta: constant stride (inode run)", v, NULL, n, 1, 24);
+
+    /* All values equal: the deltas are a constant zero, same 24 bytes. A column
+     * like this never reaches the trial in practice -- CONST already won. */
+    for (i = 0; i < n; i++) v[i] = 1234567ULL;
+    roundtrip_residual("delta: all values equal", v, NULL, n, 1, 24);
+
+    /* What sorting by (parent_dir_id, name) actually hands the inode column:
+     * runs of +1 broken by jumps to another allocation group, both directions. */
+    for (i = 0; i < n; i++) v[i] = 0x180000000ULL + (uint64_t)i;
+    for (i = 0; i < n; i += 37) v[i] = 0x40000000ULL + (uint64_t)(i * 7919);
+    roundtrip_residual("delta: +1 runs with allocator jumps", v, NULL, n, 1, -1);
+
+    /* Strictly decreasing, so every residual is negative. */
+    for (i = 0; i < n; i++) v[i] = UINT64_MAX - (uint64_t)(i * 3);
+    roundtrip_residual("delta: strictly decreasing from UINT64_MAX", v, NULL, n, 1, -1);
+
+    /* Maximum-magnitude residuals in both directions, and values at both ends of
+     * the range: the zigzag must wrap exactly, not saturate. */
+    v[0] = 0;
+    v[1] = UINT64_MAX;
+    v[2] = 0;
+    v[3] = UINT64_MAX;
+    roundtrip_residual("delta: alternating 0 and UINT64_MAX", v, NULL, 4, 1, -1);
+    v[0] = 0;
+    v[1] = 1ULL << 63;
+    v[2] = 0;
+    roundtrip_residual("delta: 2^63 residual (int64 min)", v, NULL, 3, 1, -1);
+    v[0] = UINT64_MAX;
+    v[1] = 1;
+    roundtrip_residual("delta: two values, wrapping", v, NULL, 2, 1, -1);
+
+    /* Below two values there is no difference to take. */
+    v[0] = 42;
+    roundtrip_residual("delta: single value has no candidate", v, NULL, 1, 0, -1);
+    roundtrip_residual("delta: empty column has no candidate", v, NULL, 0, 0, -1);
+
+    /* High-entropy values, where the candidate is expected to lose on size but
+     * must still be exact -- the writer will compress both and drop this one. */
+    for (i = 0; i < n; i++) v[i] = ((uint64_t)i * 0x9E3779B97F4A7C15ULL) ^ ((uint64_t)i << 29);
+    roundtrip_residual("delta: high-entropy values", v, NULL, n, 1, -1);
+
+    /* Timestamps against mtime. ctime == mtime is the common case on a tree
+     * nobody has chmod'd, and collapses to the prefix alone. */
+    {
+        uint64_t *base = (uint64_t *)malloc(n * sizeof(uint64_t));
+
+        if (!base) return 1;
+        for (i = 0; i < n; i++) base[i] = 1750000000ULL + (uint64_t)(i % 977);
+
+        for (i = 0; i < n; i++) v[i] = base[i];
+        roundtrip_residual("ref: ctime equal to mtime", v, base, n, 1, 24);
+
+        for (i = 0; i < n; i++) v[i] = base[i] + (uint64_t)(i % 7);
+        roundtrip_residual("ref: atime a few seconds after mtime", v, base, n, 1, -1);
+
+        /* atime before mtime, which is what a restored-from-backup tree looks
+         * like: the residual is negative for every record. */
+        for (i = 0; i < n; i++) v[i] = base[i] - 86400ULL * (uint64_t)(1 + i % 31);
+        roundtrip_residual("ref: atime before mtime", v, base, n, 1, -1);
+
+        /* Uncorrelated: the residual is as wide as the values. Still exact. */
+        for (i = 0; i < n; i++) v[i] = ((uint64_t)i * 2654435761ULL) & 0xFFFFFFFFULL;
+        roundtrip_residual("ref: atime unrelated to mtime", v, base, n, 1, -1);
+
+        for (i = 0; i < n; i++) v[i] = UINT64_MAX;
+        roundtrip_residual("ref: UINT64_MAX against a real mtime", v, base, n, 1, -1);
+
+        v[0] = base[0] + 5ULL;
+        roundtrip_residual("ref: single record", v, base, 1, 1, 24);
+        free(base);
+    }
+
     /* A truncated or inconsistent payload must be refused, not half-decoded:
      * these headers are attacker-adjacent in the sense that a damaged shard
      * should error rather than yield silently wrong query results. */
@@ -222,6 +368,88 @@ int main(void) {
                 g_fail++;
             } else {
                 printf("ok   %-42s\n", "short RLE run table rejected");
+            }
+        }
+        free(buf);
+    }
+
+    /* Residual payloads carry a nested sub-encoding byte, which is the one place
+     * a damaged shard could ask the decoder to recurse or to reconstruct a column
+     * without the reference it needs. */
+    {
+        unsigned char *buf = NULL;
+        size_t cap = 0, len = 0;
+        uint8_t bw = 0;
+        uint64_t back[8];
+        uint64_t ref[8];
+
+        for (i = 0; i < 8; i++) {
+            v[i] = 5000000ULL + i * 3ULL;
+            ref[i] = 5000000ULL;
+        }
+        if (crawl_bin_codec_encode_delta_u64(v, 8, &buf, &cap, &len, &bw) != 1) {
+            printf("FAIL residual rejection setup\n");
+            g_fail++;
+        } else {
+            g_checks++;
+            if (crawl_bin_codec_decode_u64(buf, len - 1, 8, CRAWL_ENC_DELTA, bw, 0, back) == 0) {
+                printf("FAIL truncated DELTA payload was accepted\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "truncated DELTA payload rejected");
+            }
+
+            g_checks++;
+            if (crawl_bin_codec_decode_u64(buf, 16, 8, CRAWL_ENC_DELTA, bw, 0, back) == 0) {
+                printf("FAIL DELTA payload shorter than its prefix was accepted\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "DELTA payload without a prefix rejected");
+            }
+
+            g_checks++;
+            buf[0] = (unsigned char)CRAWL_ENC_DELTA;
+            if (crawl_bin_codec_decode_u64(buf, len, 8, CRAWL_ENC_DELTA, bw, 0, back) == 0) {
+                printf("FAIL nested DELTA sub-encoding was accepted\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "nested residual sub-encoding rejected");
+            }
+
+            g_checks++;
+            buf[0] = (unsigned char)CRAWL_ENC_BYTES;
+            if (crawl_bin_codec_decode_u64(buf, len, 8, CRAWL_ENC_DELTA, bw, 0, back) == 0) {
+                printf("FAIL byte-blob DELTA sub-encoding was accepted\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "byte-blob residual sub-encoding rejected");
+            }
+        }
+        free(buf);
+
+        /* REF_MTIME cannot be decoded without its reference column, and the
+         * reference decoder must not be handed some other encoding. */
+        buf = NULL;
+        cap = 0;
+        len = 0;
+        if (crawl_bin_codec_encode_ref_u64(v, ref, 8, &buf, &cap, &len, &bw) != 1) {
+            printf("FAIL ref rejection setup\n");
+            g_fail++;
+        } else {
+            g_checks++;
+            if (crawl_bin_codec_decode_u64(buf, len, 8, CRAWL_ENC_REF_MTIME, bw, 0, back) == 0) {
+                printf("FAIL REF_MTIME decoded without its reference column\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "REF_MTIME rejected by the plain decoder");
+            }
+
+            g_checks++;
+            if (crawl_bin_codec_decode_ref_u64(buf, len, 8, CRAWL_ENC_DELTA, bw, ref, back) == 0) {
+                printf("FAIL reference decoder accepted a DELTA chunk\n");
+                g_fail++;
+            } else {
+                printf("ok   %-42s\n", "reference decoder rejects other encodings");
             }
         }
         free(buf);
