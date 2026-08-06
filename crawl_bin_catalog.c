@@ -128,6 +128,14 @@ typedef struct {
     size_t scratch_cap;
     unsigned char *comp;
     size_t comp_cap;
+    /* The second candidate a large column is trial-compressed as, encoded and
+     * compressed, so both survive until the smaller is known. A catalog writer
+     * is transient -- one per shard finalization, not one per live shard -- so
+     * unlike the row-group writer it can hold these itself. */
+    unsigned char *trial;
+    size_t trial_cap;
+    unsigned char *trial_comp;
+    size_t trial_comp_cap;
     /* One chunk's payloads, back to back in directory order: the directory has
      * to be written before them, so they are held until it is. */
     unsigned char *pay;
@@ -142,23 +150,26 @@ static void cat_writer_free(cat_writer_t *w) {
     free(w->names);
     free(w->scratch);
     free(w->comp);
+    free(w->trial);
+    free(w->trial_comp);
     free(w->pay);
     if (w->cctx) ZSTD_freeCCtx(w->cctx);
     memset(w, 0, sizeof(*w));
 }
 
-/* Compress src into w->comp. Returns compressed length, or (size_t)-1. */
-static size_t cat_compress(cat_writer_t *w, const unsigned char *src, size_t len) {
+/* Compress src into *dst (grown as needed). Returns compressed length, or (size_t)-1. */
+static size_t cat_compress(cat_writer_t *w, unsigned char **dst, size_t *dst_cap, const unsigned char *src,
+                           size_t len) {
     size_t bound, cs;
 
     if (len == 0) return 0;
     bound = ZSTD_compressBound(len);
-    if (cat_grow(&w->comp, &w->comp_cap, bound) != 0) return (size_t)-1;
+    if (cat_grow(dst, dst_cap, bound) != 0) return (size_t)-1;
     if (!w->cctx) {
         w->cctx = ZSTD_createCCtx();
         if (!w->cctx) return (size_t)-1;
     }
-    cs = ZSTD_compressCCtx(w->cctx, w->comp, w->comp_cap, src, len, w->level);
+    cs = ZSTD_compressCCtx(w->cctx, *dst, *dst_cap, src, len, w->level);
     if (ZSTD_isError(cs)) return (size_t)-1;
     return cs;
 }
@@ -248,9 +259,32 @@ static int cat_write_chunk(cat_writer_t *w, const crawl_bin_catalog_src_t *s, ui
         if (enc == (uint8_t)CRAWL_ENC_BYTES_STORED) {
             cs = enc_len;
         } else {
-            cs = cat_compress(w, src, enc_len);
+            cs = cat_compress(w, &w->comp, &w->comp_cap, src, enc_len);
             if (cs == (size_t)-1) return -1;
             src = w->comp;
+        }
+        /* Same store-if-smaller as the record region, and for the same column
+         * shape: dfs_index is a permutation, so it is incompressible as values
+         * and nearly free as first differences. */
+        if (col != CRAWL_CATCOL_NAME_BYTES && enc_len >= CRAWL_BIN_ENC_TRIAL_MIN_BYTES) {
+            size_t trial_len = 0;
+            uint8_t trial_bw = 0;
+            int staged = crawl_bin_codec_encode_delta_u64(w->vals, n, &w->trial, &w->trial_cap, &trial_len,
+                                                          &trial_bw);
+
+            if (staged < 0) return -1;
+            if (staged == 1) {
+                size_t trial_cs = cat_compress(w, &w->trial_comp, &w->trial_comp_cap, w->trial, trial_len);
+
+                if (trial_cs == (size_t)-1) return -1;
+                if (trial_cs < cs) {
+                    cs = trial_cs;
+                    src = w->trial_comp;
+                    enc = (uint8_t)CRAWL_ENC_DELTA;
+                    bw = trial_bw;
+                    enc_len = trial_len;
+                }
+            }
         }
         if (cs > 0xFFFFFFFFULL) return -1;
         if (cs > 0) {

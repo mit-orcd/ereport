@@ -115,8 +115,51 @@ enum {
     /* Byte blob stored verbatim, with no zstd frame around it, so a reader that
      * has the bytes mapped can point straight at them. Only the catalog name
      * column uses it; see CRAWL_BIN_CATALOG_COMPRESS_NAMES. */
-    CRAWL_ENC_BYTES_STORED = 5
+    CRAWL_ENC_BYTES_STORED = 5,
+    /*
+     * Residual encodings. Both store a zigzagged signed residual per value and
+     * then re-encode that stream with one of RAW/FOR_BITPACK/RLE/CONST, so a
+     * column whose values are unrelated but whose *steps* repeat costs a few
+     * bits per record instead of a full frame-of-reference width. inode is the
+     * case they exist for: allocator runs make consecutive differences tiny and
+     * highly repetitive while the values themselves are near-random.
+     *
+     * The residual frame base cannot live in min_value, which has to stay the
+     * column's absolute extremes or the zone map stops working, so it sits in
+     * the payload:
+     *
+     *     uint8_t  sub_encoding    one of RAW/FOR_BITPACK/RLE/CONST
+     *     uint8_t  reserved[7]
+     *     uint64_t seed            first value (DELTA); unused (REF_MTIME)
+     *     uint64_t sub_min_value   frame base of the residual stream
+     *     <sub payload>            bit_width in the chunk header is its width
+     *
+     * DELTA differences against the previous value in the chunk and therefore
+     * carries count-1 residuals. REF_MTIME differences against the same
+     * record's mtime and carries count, which is why the writer emits the mtime
+     * column before atime and ctime and a reader must decode it first.
+     */
+    CRAWL_ENC_DELTA = 6,
+    CRAWL_ENC_REF_MTIME = 7
 };
+
+/* Bytes of payload prefix ahead of a residual encoding's sub payload. */
+#define CRAWL_ENC_RESIDUAL_PREFIX_BYTES 24u
+
+/*
+ * Encoded bytes a column chunk must reach before the writer serializes it a
+ * second way and compresses both.
+ *
+ * The residual encodings win on redundancy, not on width, so their payload is
+ * routinely *larger* pre-zstd and much smaller after it -- inode's first
+ * differences need one more bit than its values do, and compress 8x better.
+ * Picking on encoded bytes therefore cannot see them at all, and the only honest
+ * test is to zstd both candidates and keep the smaller. A chunk that has already
+ * collapsed to a handful of run pairs cannot save more than its whole payload,
+ * so below this size the second compression pass is not worth its CPU. See
+ * docs/performance.md#measured-delta-encoding-and-a-post-zstd-store-if-smaller-guard.
+ */
+#define CRAWL_BIN_ENC_TRIAL_MIN_BYTES 4096u
 
 typedef struct __attribute__((packed)) {
     uint8_t column_id;

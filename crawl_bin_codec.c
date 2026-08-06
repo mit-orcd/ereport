@@ -125,6 +125,41 @@ static size_t count_runs(const uint64_t *values, size_t count, size_t cap) {
     return runs;
 }
 
+static uint64_t zigzag_encode(uint64_t residual) {
+    int64_t s = (int64_t)residual;
+
+    return ((uint64_t)s << 1) ^ (s < 0 ? ~0ULL : 0ULL);
+}
+
+static uint64_t zigzag_decode(uint64_t z) { return (z >> 1) ^ ((z & 1ULL) ? ~0ULL : 0ULL); }
+
+/*
+ * Residual staging, thread-local rather than per-writer: a writer thread encodes
+ * one column at a time, so this is one buffer per thread instead of one per live
+ * shard, which at the default ECRAWL_UID_SHARDS of 1024 is the difference
+ * between half a megabyte and half a gigabyte of buffers that are live for the
+ * microseconds an encode takes.
+ */
+static __thread uint64_t *tls_residual;
+static __thread size_t tls_residual_cap;
+
+void crawl_bin_codec_tls_release(void) {
+    free(tls_residual);
+    tls_residual = NULL;
+    tls_residual_cap = 0;
+}
+
+static int residual_reserve(size_t n) {
+    uint64_t *p;
+
+    if (tls_residual_cap >= n) return 0;
+    p = (uint64_t *)realloc(tls_residual, n * sizeof(*p));
+    if (!p) return -1;
+    tls_residual = p;
+    tls_residual_cap = n;
+    return 0;
+}
+
 int crawl_bin_codec_encode_u64(const uint64_t *values, size_t count, unsigned char **out, size_t *out_cap,
                                size_t *len_out, uint8_t *enc_out, uint8_t *bit_width_out, uint64_t *min_out,
                                uint64_t *max_out) {
@@ -210,6 +245,77 @@ int crawl_bin_codec_encode_u64(const uint64_t *values, size_t count, unsigned ch
     return 0;
 }
 
+/*
+ * Serialize a residual stream: the chooser above picks how to store it, then the
+ * payload prefix is inserted in front of what it wrote. crawl_bin_codec_encode_u64
+ * never returns a residual encoding, so the nesting is one level deep by
+ * construction rather than by a depth check.
+ */
+static int encode_residual(const uint64_t *residual, size_t n, uint64_t seed, unsigned char **out, size_t *out_cap,
+                           size_t *len_out, uint8_t *bit_width_out) {
+    size_t sub_len = 0;
+    uint8_t sub_enc = 0, sub_bw = 0;
+    uint64_t sub_mn = 0, sub_mx = 0;
+
+    if (crawl_bin_codec_encode_u64(residual, n, out, out_cap, &sub_len, &sub_enc, &sub_bw, &sub_mn, &sub_mx) != 0)
+        return -1;
+    if (codec_grow(out, out_cap, CRAWL_ENC_RESIDUAL_PREFIX_BYTES + sub_len) != 0) return -1;
+    memmove(*out + CRAWL_ENC_RESIDUAL_PREFIX_BYTES, *out, sub_len);
+    memset(*out, 0, CRAWL_ENC_RESIDUAL_PREFIX_BYTES);
+    (*out)[0] = sub_enc;
+    put_u64le(*out + 8, seed);
+    put_u64le(*out + 16, sub_mn);
+    *len_out = CRAWL_ENC_RESIDUAL_PREFIX_BYTES + sub_len;
+    *bit_width_out = sub_bw;
+    return 1;
+}
+
+int crawl_bin_codec_encode_delta_u64(const uint64_t *values, size_t count, unsigned char **out, size_t *out_cap,
+                                     size_t *len_out, uint8_t *bit_width_out) {
+    size_t i;
+
+    if (!values || !out || !out_cap || !len_out || !bit_width_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count < 2) return 0;
+    if (residual_reserve(count - 1) != 0) return -1;
+    for (i = 1; i < count; i++) tls_residual[i - 1] = zigzag_encode(values[i] - values[i - 1]);
+    return encode_residual(tls_residual, count - 1, values[0], out, out_cap, len_out, bit_width_out);
+}
+
+int crawl_bin_codec_encode_ref_u64(const uint64_t *values, const uint64_t *ref, size_t count, unsigned char **out,
+                                   size_t *out_cap, size_t *len_out, uint8_t *bit_width_out) {
+    size_t i;
+
+    if (!values || !ref || !out || !out_cap || !len_out || !bit_width_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count == 0) return 0;
+    if (residual_reserve(count) != 0) return -1;
+    for (i = 0; i < count; i++) tls_residual[i] = zigzag_encode(values[i] - ref[i]);
+    return encode_residual(tls_residual, count, 0, out, out_cap, len_out, bit_width_out);
+}
+
+/* Split a residual payload into its prefix fields and its sub payload. */
+static int residual_split(const unsigned char *src, size_t src_len, uint8_t *sub_enc_out, uint64_t *seed_out,
+                          uint64_t *sub_min_out, const unsigned char **sub_out, size_t *sub_len_out) {
+    if (src_len < CRAWL_ENC_RESIDUAL_PREFIX_BYTES) return -1;
+    *sub_enc_out = src[0];
+    /* Only the four numeric encodings may nest, which is what bounds the decode
+     * recursion at one level; anything else is a damaged or hostile payload. */
+    if (*sub_enc_out > (uint8_t)CRAWL_ENC_CONST) {
+        errno = EINVAL;
+        return -1;
+    }
+    *seed_out = get_u64le(src + 8);
+    *sub_min_out = get_u64le(src + 16);
+    *sub_out = src + CRAWL_ENC_RESIDUAL_PREFIX_BYTES;
+    *sub_len_out = src_len - CRAWL_ENC_RESIDUAL_PREFIX_BYTES;
+    return 0;
+}
+
 int crawl_bin_codec_decode_u64(const unsigned char *src, size_t src_len, size_t count, uint8_t enc,
                                uint8_t bit_width, uint64_t min_value, uint64_t *dst) {
     size_t i;
@@ -257,8 +363,41 @@ int crawl_bin_codec_decode_u64(const unsigned char *src, size_t src_len, size_t 
             return written == count ? 0 : -1;
         }
 
+        case CRAWL_ENC_DELTA: {
+            uint8_t sub_enc;
+            uint64_t seed, sub_min;
+            const unsigned char *sub;
+            size_t sub_len;
+
+            if (residual_split(src, src_len, &sub_enc, &seed, &sub_min, &sub, &sub_len) != 0) return -1;
+            dst[0] = seed;
+            if (count == 1) return sub_len == 0 ? 0 : -1;
+            if (crawl_bin_codec_decode_u64(sub, sub_len, count - 1, sub_enc, bit_width, sub_min, dst + 1) != 0)
+                return -1;
+            for (i = 1; i < count; i++) dst[i] = dst[i - 1] + zigzag_decode(dst[i]);
+            return 0;
+        }
+
         default:
             errno = EINVAL;
             return -1;
     }
+}
+
+int crawl_bin_codec_decode_ref_u64(const unsigned char *src, size_t src_len, size_t count, uint8_t enc,
+                                   uint8_t bit_width, const uint64_t *ref, uint64_t *dst) {
+    uint8_t sub_enc;
+    uint64_t seed, sub_min;
+    const unsigned char *sub;
+    size_t sub_len, i;
+
+    if (!dst || !ref || (src_len > 0 && !src) || enc != (uint8_t)CRAWL_ENC_REF_MTIME) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (count == 0) return src_len == 0 ? 0 : -1;
+    if (residual_split(src, src_len, &sub_enc, &seed, &sub_min, &sub, &sub_len) != 0) return -1;
+    if (crawl_bin_codec_decode_u64(sub, sub_len, count, sub_enc, bit_width, sub_min, dst) != 0) return -1;
+    for (i = 0; i < count; i++) dst[i] = ref[i] + zigzag_decode(dst[i]);
+    return 0;
 }

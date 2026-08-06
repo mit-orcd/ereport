@@ -14,12 +14,14 @@
 #include "crawl_bin_codec.h"
 
 /* Columns written for every record, in the order they appear in a row group.
- * NAME_LEN precedes NAME_BYTES so a reader can build offsets while streaming. */
+ * NAME_LEN precedes NAME_BYTES so a reader can build offsets while streaming,
+ * and MTIME precedes ATIME and CTIME because those two may be stored as
+ * CRAWL_ENC_REF_MTIME residuals against it. */
 static const uint8_t k_write_columns[] = {
     CRAWL_COL_PARENT_DIR_ID, CRAWL_COL_NAME_LEN, CRAWL_COL_TYPE,      CRAWL_COL_UID,
     CRAWL_COL_GID,           CRAWL_COL_MODE,     CRAWL_COL_SIZE,      CRAWL_COL_INODE,
-    CRAWL_COL_DEV_MAJOR,     CRAWL_COL_DEV_MINOR, CRAWL_COL_NLINK,    CRAWL_COL_ATIME,
-    CRAWL_COL_MTIME,         CRAWL_COL_CTIME,    CRAWL_COL_NAME_BYTES};
+    CRAWL_COL_DEV_MAJOR,     CRAWL_COL_DEV_MINOR, CRAWL_COL_NLINK,    CRAWL_COL_MTIME,
+    CRAWL_COL_ATIME,         CRAWL_COL_CTIME,    CRAWL_COL_NAME_BYTES};
 
 #define WRITE_COLUMN_COUNT ((uint32_t)(sizeof(k_write_columns) / sizeof(k_write_columns[0])))
 
@@ -197,19 +199,34 @@ static __thread size_t tls_sort_cap;
 static __thread unsigned char *tls_sort_names;
 static __thread size_t tls_sort_names_cap;
 
+/* Staging for the residual candidate a large column chunk is trial-compressed
+ * as. Thread-local for the same reason the sort scratch is: a writer thread
+ * encodes one column of one shard at a time. */
+static __thread unsigned char *tls_trial_enc;
+static __thread size_t tls_trial_enc_cap;
+static __thread unsigned char *tls_trial_comp;
+static __thread size_t tls_trial_comp_cap;
+
 void crawl_bin_block_writer_tls_release(void) {
     free(tls_sort_idx);
     free(tls_sort_aux);
     free(tls_sort_noff);
     free(tls_sort_vals);
     free(tls_sort_names);
+    free(tls_trial_enc);
+    free(tls_trial_comp);
     tls_sort_idx = NULL;
     tls_sort_aux = NULL;
     tls_sort_noff = NULL;
     tls_sort_vals = NULL;
     tls_sort_names = NULL;
+    tls_trial_enc = NULL;
+    tls_trial_comp = NULL;
     tls_sort_cap = 0;
     tls_sort_names_cap = 0;
+    tls_trial_enc_cap = 0;
+    tls_trial_comp_cap = 0;
+    crawl_bin_codec_tls_release();
 }
 
 static int sort_reserve(size_t n) {
@@ -392,21 +409,44 @@ static int writer_sort_group(crawl_bin_block_writer_t *w) {
     return writer_apply_permutation(w);
 }
 
-/* Compress src into w->comp. Returns compressed length, or (size_t)-1. */
-static size_t writer_compress(crawl_bin_block_writer_t *w, const unsigned char *src, size_t len) {
+/* Compress src into *dst (grown as needed). Returns compressed length, or
+ * (size_t)-1. Two candidates for the same column are compressed into separate
+ * buffers so both survive until the smaller is known. */
+static size_t writer_compress(crawl_bin_block_writer_t *w, unsigned char **dst, size_t *dst_cap,
+                              const unsigned char *src, size_t len) {
     size_t bound;
     size_t cs;
 
     if (len == 0) return 0;
     bound = ZSTD_compressBound(len);
-    if (block_grow(&w->comp, &w->comp_cap, bound) != 0) return (size_t)-1;
+    if (block_grow(dst, dst_cap, bound) != 0) return (size_t)-1;
     if (!w->cctx) {
         w->cctx = ZSTD_createCCtx();
         if (!w->cctx) return (size_t)-1;
     }
-    cs = ZSTD_compressCCtx((ZSTD_CCtx *)w->cctx, w->comp, w->comp_cap, src, len, w->level);
+    cs = ZSTD_compressCCtx((ZSTD_CCtx *)w->cctx, *dst, *dst_cap, src, len, w->level);
     if (ZSTD_isError(cs)) return (size_t)-1;
     return cs;
+}
+
+/*
+ * Stage the residual candidate for one column in tls_trial_enc: differences
+ * against mtime for atime and ctime, which on a real tree are frequently equal
+ * to it, and against the previous value for everything else. Timestamps are only
+ * offered the mtime form -- measured, their first differences never beat their
+ * plain encoding, so trying both would buy a second compression pass nothing.
+ * Returns 1 when a candidate was staged, 0 when there is none, -1 on error.
+ */
+static int writer_residual_candidate(const crawl_bin_block_writer_t *w, uint8_t col, size_t *len_out,
+                                     uint8_t *enc_out, uint8_t *bw_out) {
+    if (col == (uint8_t)CRAWL_COL_ATIME || col == (uint8_t)CRAWL_COL_CTIME) {
+        *enc_out = (uint8_t)CRAWL_ENC_REF_MTIME;
+        return crawl_bin_codec_encode_ref_u64(w->col[col], w->col[CRAWL_COL_MTIME], w->count, &tls_trial_enc,
+                                              &tls_trial_enc_cap, len_out, bw_out);
+    }
+    *enc_out = (uint8_t)CRAWL_ENC_DELTA;
+    return crawl_bin_codec_encode_delta_u64(w->col[col], w->count, &tls_trial_enc, &tls_trial_enc_cap, len_out,
+                                            bw_out);
 }
 
 int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bin_block_fwrite_fn wfwrite,
@@ -441,6 +481,7 @@ int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bi
         size_t enc_len = 0;
         size_t cs;
         const unsigned char *src;
+        const unsigned char *comp;
         uint64_t raw_len;
 
         if (col == CRAWL_COL_NAME_BYTES) {
@@ -458,14 +499,38 @@ int crawl_bin_block_writer_flush(crawl_bin_block_writer_t *w, FILE *fp, crawl_bi
             raw_len = (uint64_t)enc_len;
         }
 
-        cs = writer_compress(w, src, enc_len);
+        cs = writer_compress(w, &w->comp, &w->comp_cap, src, enc_len);
         if (cs == (size_t)-1) goto done;
+        comp = w->comp;
+
+        /* Store-if-smaller, measured after zstd rather than before it: a residual
+         * candidate is often the larger payload and the smaller frame. */
+        if (col != CRAWL_COL_NAME_BYTES && enc_len >= CRAWL_BIN_ENC_TRIAL_MIN_BYTES) {
+            size_t trial_len = 0;
+            uint8_t trial_enc = 0, trial_bw = 0;
+            int staged = writer_residual_candidate(w, col, &trial_len, &trial_enc, &trial_bw);
+
+            if (staged < 0) goto done;
+            if (staged == 1) {
+                size_t trial_cs =
+                    writer_compress(w, &tls_trial_comp, &tls_trial_comp_cap, tls_trial_enc, trial_len);
+
+                if (trial_cs == (size_t)-1) goto done;
+                if (trial_cs < cs) {
+                    cs = trial_cs;
+                    comp = tls_trial_comp;
+                    enc = trial_enc;
+                    bw = trial_bw;
+                    raw_len = (uint64_t)trial_len;
+                }
+            }
+        }
         if (cs > 0xFFFFFFFFULL) goto done;
 
         if (cs > 0) {
             payload[ci] = (unsigned char *)malloc(cs);
             if (!payload[ci]) goto done;
-            memcpy(payload[ci], w->comp, cs);
+            memcpy(payload[ci], comp, cs);
         }
         payload_len[ci] = cs;
 
@@ -551,6 +616,11 @@ int crawl_bin_block_reader_set_projection(crawl_bin_block_reader_t *r, uint32_t 
     /* Name bytes are a flat blob; without the lengths there is no way to tell
      * where one record's name ends and the next begins. */
     if (projection & CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)) projection |= CRAWL_COL_BIT(CRAWL_COL_NAME_LEN);
+    /* atime and ctime may be stored as residuals against mtime, and which chunks
+     * are is not known until their headers are read, so mtime is pulled in
+     * whenever either is wanted. */
+    if (projection & (CRAWL_COL_BIT(CRAWL_COL_ATIME) | CRAWL_COL_BIT(CRAWL_COL_CTIME)))
+        projection |= CRAWL_COL_BIT(CRAWL_COL_MTIME);
     r->projection = projection;
     r->hardlink_only &= projection;
     /* Until a group is loaded, everything projected is nominally available. */
@@ -560,9 +630,11 @@ int crawl_bin_block_reader_set_projection(crawl_bin_block_reader_t *r, uint32_t 
 
 int crawl_bin_block_reader_set_hardlink_columns(crawl_bin_block_reader_t *r, uint32_t mask) {
     if (!r) return -1;
-    /* NLINK is the evidence the pruning rests on, and the name columns are unrelated to hardlinks. */
+    /* NLINK is the evidence the pruning rests on, and the name columns are unrelated to hardlinks.
+     * MTIME can be what atime and ctime are stored against, so dropping it per group would leave
+     * them undecodable. */
     mask &= ~(CRAWL_COL_BIT(CRAWL_COL_NLINK) | CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) |
-              CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
+              CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES) | CRAWL_COL_BIT(CRAWL_COL_MTIME));
     r->hardlink_only = mask & r->projection;
     return 0;
 }
@@ -643,6 +715,7 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
     uint32_t want;         /* columns to decode for this group; see hardlink_only */
     int rc = -1;
     int have_name_len = 0;
+    int have_mtime = 0;
 
     if (r->pos >= r->end) return 0;
     if (r->end - r->pos < sizeof(bin_rowgroup_hdr_t)) return -1;
@@ -731,10 +804,20 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
         }
 
         if (u64_grow(&r->col[col], &r->col_cap[col], rg.record_count ? rg.record_count : 1U) != 0) goto done;
-        if (crawl_bin_codec_decode_u64(r->raw, raw_len, rg.record_count, ch->encoding, ch->bit_width,
-                                       ch->min_value, r->col[col]) != 0)
+        if (ch->encoding == (uint8_t)CRAWL_ENC_REF_MTIME) {
+            /* The writer emits mtime ahead of atime and ctime, so a well-formed
+             * group has it decoded by now; a group that does not is one whose
+             * residual column cannot be reconstructed at all. */
+            if (!have_mtime) goto done;
+            if (crawl_bin_codec_decode_ref_u64(r->raw, raw_len, rg.record_count, ch->encoding, ch->bit_width,
+                                               r->col[CRAWL_COL_MTIME], r->col[col]) != 0)
+                goto done;
+        } else if (crawl_bin_codec_decode_u64(r->raw, raw_len, rg.record_count, ch->encoding, ch->bit_width,
+                                              ch->min_value, r->col[col]) != 0) {
             goto done;
+        }
         if (col == CRAWL_COL_NAME_LEN) have_name_len = 1;
+        if (col == CRAWL_COL_MTIME) have_mtime = 1;
     }
     if (skip_run && fseeko(r->fp, (off_t)skip_run, SEEK_CUR) != 0) goto done;
 
