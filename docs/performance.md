@@ -24,7 +24,7 @@ See [tools.md#edelete](tools.md#edelete) for the unlink-contention tuning note (
 ### `ecrawl`: crawling and capture
 
 - Parallel crawl threads feed a task queue; multiple threads traverse the tree concurrently while respecting directory boundaries.
-- Parallel stat pool (when `ECRAWL_STAT_THREADS` > 0, default 8) — Each crawl worker does one `readdir` per open directory; trusted non-directory names are batched to stat workers (see [tools.md#directory-scanning-and-stat-workers](tools.md#directory-scanning-and-stat-workers)). Set `ECRAWL_STAT_THREADS=0` for legacy inline-only `fstatat` (often faster on very low-latency metadata).
+- Parallel stat pool (when `ECRAWL_STAT_THREADS` > 0, default 8) — Each crawl worker does one `readdir` per open directory; trusted non-directory names are batched to stat workers (see [tools.md#directory-scanning-and-stat-workers](tools.md#directory-scanning-and-stat-workers)). Set `ECRAWL_STAT_THREADS=0` for inline-only `fstatat` on the crawl threads. That can be **faster on cold-cache crawls** of directory-heavy trees — see [cold crawls and the stat pool](#cold-crawls-and-the-stat-pool).
 - Stat workers can also take crawl tasks when their own queue is empty (`ECRAWL_STAT_HELPS_CRAWL`, default 0), lifting the fixed split between the two pools. Off because it measured no faster — see [letting stat workers also crawl](#rejected-letting-stat-workers-also-crawl), which is also where the stat pool's zero-batch case on small-directory trees is documented.
 - Uid-sharded output — Records hash to many `uid_shard_*.bin` files so writes spread across descriptors and writer threads; you avoid one giant append-only file and reduce lock contention on a single sink.
 - Separate writer threads — Crawl threads batch work to bounded writer queues; dedicated writers flush shards with large buffered I/O instead of every thread hitting the filesystem independently for every record. `ECRAWL_WRITER_QUEUE_BATCHES` caps pending record batches per writer (default 64, range 4…4096).
@@ -112,13 +112,38 @@ It never happens. Sweeping the stat pool from 1 to 16 threads over `mega_dir1` �
 | 8 | 5.88 | 48 | 0 |
 | 16 | 5.04 | 48 | 0 |
 
-The reason is `STAT_PENDING_DRAIN_EVERY_READDIRS`: every 65536 dirents, a crawl thread waits for all of its outstanding batches. At the default batch size of 1024 names that is 64 batches — exactly `ECRAWL_STAT_QUEUE_BATCHES`. The reader is stopped by its own drain before the queue it feeds can fill, so the blocking enqueue is structurally unreachable rather than merely rare, and a change that avoids blocking there has nothing to avoid. Across eight fixtures the inline path fired 11 times in total.
+The reason (at the time of that sweep) was `STAT_PENDING_DRAIN_EVERY_READDIRS`: every 65536 dirents, a crawl thread waited for **all** of its outstanding batches. At the default batch size of 1024 names that is 64 batches — exactly `ECRAWL_STAT_QUEUE_BATCHES`. The reader was stopped by its own drain before the queue it feeds could fill, so the blocking enqueue was structurally unreachable rather than merely rare, and a change that avoids blocking there had nothing to avoid. Across eight fixtures the inline path fired 11 times in total.
 
 The code is kept behind `ECRAWL_STAT_FULL_INLINE`, **default 0**, for cold or remote metadata, where a stat costs far more than a dirent read and the queue plausibly does fill. Turn it on only with `wait_stat_enqueue > 0` as evidence.
 
-The sweep does expose a real bottleneck, just not that one: the drain is a *barrier* rather than backpressure, because the reader waits for all 64 batches to finish instead of enough of them to make room, then refills from empty. Hence the plateau above — one reader on one directory sees no benefit past 4 stat threads, and 16 threads is no better than 2. Compare `single_huge_dir`, the same 12M entries spread over 2,931 directories so several crawl threads read at once, which goes from 10.81s to 1.13s across the same sweep. Draining only as far as the next free slot is the more promising thing to attack next.
+That sweep exposed a real bottleneck that has since been fixed in the mid-readdir path: the drain was a *barrier* rather than backpressure. The reader waited for all 64 batches to finish instead of enough of them to make room, then refilled from empty — hence the plateau above (one reader on one directory saw no benefit past 4 stat threads). Compare `single_huge_dir`, the same 12M entries spread over 2,931 directories so several crawl threads read at once, which went from 10.81s to 1.13s across the same sweep.
+
+Mid-readdir now calls `stat_pending_drain_until_unfinished_below` (with `keep_max = ECRAWL_STAT_QUEUE_BATCHES`): it reaps finished batches without waiting, then waits only until unfinished pending drops below the queue cap. End-of-directory and flush-failure paths still use a full `stat_pending_drain_all`. Re-run the `mega_dir1` stat-thread sweep to see whether a single megadir now scales past 4 threads; the numbers in the table above are the pre-fix baseline.
 
 Caveat on all of the above: these runs are warm-cache on node-local RAID, because `drop_caches` needs root. Warm cache is the regime where coordination overhead is visible and storage latency is not, which is what makes it the right place to measure a *scheduling* change — and the wrong place to conclude anything about cold, high-latency metadata.
+
+### Cold crawls and the stat pool
+
+On a cold metadata cache (`sync; echo 3 > /proc/sys/vm/drop_caches` as root), disabling the pool can beat the default. Measured on local XFS with `--no-write` over the adversarial synth tree under `/data1/erbmi1/ecrawl-synth` (~16.7M entries; its `single_huge_dir` is the **default-sharded** form, ~2.9k leaf dirs of ~4k files, not one megadir):
+
+| config | elapsed | note |
+|---|---:|---|
+| `ECRAWL_STAT_THREADS=0` | **12.1 s** | every `fstatat` on the crawl thread |
+| default (`STAT_THREADS=8`, `MIN_OFFLOAD=32`) | 21.0 s | `stat_enqueue_block_ns` ≈ 9.9 s |
+
+Many crawl threads stating inline keep the machine busy; with the pool on, producers outrun eight consumers and crawl threads stall on a full queue. Read `stat_enqueue_block_ns` / `wait_stat_enqueue` in the summary: when those dominate wall time, try `ECRAWL_STAT_THREADS=0`.
+
+Caveats that keep this from being a new default:
+
+- On the same host, a **hot** cache of a ~4.3M-entry directory-heavy tree had the default pool slightly ahead of `STAT_THREADS=0` (~1.25 s vs ~1.41 s median). Cold and hot disagree.
+- Setting `ECRAWL_STAT_BATCH_MIN_OFFLOAD=0` with the pool still on (force every tiny batch onto the queue) was slower cold *and* hot on that tree — do not confuse “disable the pool” with “zero the offload threshold.”
+- A true single-directory megadir (`SYNTH_FLAT_SHARD_CAP=0` / `mega_dir1`) is the pool’s intended case; cold high-latency stores (HDD, ZFS, NFS) may still prefer a non-zero pool. Remeasure there before changing defaults.
+
+```bash
+# cold crawl, directory-heavy tree: try inline stats
+sync; echo 3 > /proc/sys/vm/drop_caches   # needs root
+ECRAWL_STAT_THREADS=0 ./ecrawl --no-write /path/to/tree
+```
 
 ### Rejected: widening the stat pool with core count
 

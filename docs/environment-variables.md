@@ -33,7 +33,7 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_WRITER_QUEUE_BATCHES` | `ecrawl` | Pending record batches per writer queue when writing shards (default 64, range 4…4096). |
 | `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 1024). |
 | `ECRAWL_MAX_OPEN_SHARDS` | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 1024). |
-| `ECRAWL_STAT_THREADS` | `ecrawl` | Stat worker threads for batched `fstatat` (default 8; `0` disables). |
+| `ECRAWL_STAT_THREADS` | `ecrawl` | Stat worker threads for batched `fstatat` (default 8; `0` disables — try on cold-cache directory-heavy crawls; see [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool)). |
 | `ECRAWL_STAT_BATCH_ENTRIES` | `ecrawl` | Names per stat batch (default 1024, range 64…65536). |
 | `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS` | `ecrawl` | Trusted non-dir `d_type` entries per directory handled inline before batching (default `0` = always batch; `N` > 0 = inline prefix of `N`). |
 | `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | `ecrawl` | Min names in an end-of-directory stat batch before offloading to stat workers (default 32; `0` = always enqueue). |

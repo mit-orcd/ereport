@@ -36,7 +36,7 @@ Positional arguments are only `start-path` (required) and optionally `output-dir
 
 ### Directory scanning and stat workers
 
-Applies when `ECRAWL_STAT_THREADS` > 0 (the default). `ECRAWL_STAT_THREADS=0` skips this pool: every child name is `fstatat`’d on the crawl thread that read the directory (same semantics, no cross-thread batch queue).
+Applies when `ECRAWL_STAT_THREADS` > 0 (the default). `ECRAWL_STAT_THREADS=0` skips this pool: every child name is `fstatat`’d on the crawl thread that read the directory (same semantics, no cross-thread batch queue). On **cold-cache** crawls of directory-heavy trees that can be faster than the default pool — crawl threads no longer stall on a full stat queue (`stat_enqueue_block_ns` in the summary). See [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool).
 
 | Step | What happens |
 |------|----------------|
@@ -57,7 +57,7 @@ Optional environment variables (no CLI flags for these; see also [environment-va
 | `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
 | `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 1024). |
 | `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 128 = every shard a writer owns at the default 1024 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
-| `ECRAWL_STAT_THREADS` | Stat worker threads for batched `fstatat` (default 8; `0` disables the pool). |
+| `ECRAWL_STAT_THREADS` | Stat worker threads for batched `fstatat` (default 8; `0` disables the pool — every `fstatat` runs on the crawl thread). Try `0` on cold-cache, directory-heavy crawls when `stat_enqueue_block_ns` is large; see [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool). |
 | `ECRAWL_STAT_BATCH_ENTRIES` | Directory names per stat batch (default 1024, range 64…65536). |
 | `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS` | Per directory, trusted non-dir `d_type` entries handled inline before stat batching (default `0` = batch from the first entry; set `N` > 0 for an inline prefix of `N` names). Max 2097152. |
 | `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | End-of-directory stat batches with fewer than this many names run inline on the crawl thread (default 32; `0` = always enqueue tail batches to the stat pool). Mid-directory flushes at `ECRAWL_STAT_BATCH_ENTRIES` always offload when the stat pool is enabled. |
@@ -87,7 +87,7 @@ ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
-ECRAWL_STAT_THREADS=0 ./ecrawl /path/to/filesystem-tree
+ECRAWL_STAT_THREADS=0 ./ecrawl --no-write /path/to/filesystem-tree   # inline stats; often faster cold
 ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS=0 ./ecrawl /path/to/filesystem-tree
 ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
 ```

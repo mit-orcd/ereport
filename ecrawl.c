@@ -140,8 +140,9 @@
 #define RECORD_BATCH_BYTES (1U << 20)
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
-/* During one directory's readdir, periodically drain pending stat batches so megadirs do not hold an
- * unbounded number of completed batches until EOF (see stat_pending_drain_all). */
+/* During one directory's readdir, periodically apply pending-batch backpressure so megadirs do not
+ * hold an unbounded number of completed batches until EOF (see
+ * stat_pending_drain_until_unfinished_below). End-of-directory still uses a full drain. */
 #define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
 
 /* Per-crawl-thread buffer (bytes) for raw getdents64 directory reads. A larger buffer returns more
@@ -4494,6 +4495,15 @@ static void stat_batch_wait_done(stat_batch_t *b) {
     pthread_mutex_unlock(&b->done_mutex);
 }
 
+static int stat_batch_is_finished(stat_batch_t *b) {
+    int finished;
+
+    pthread_mutex_lock(&b->done_mutex);
+    finished = b->finished;
+    pthread_mutex_unlock(&b->done_mutex);
+    return finished;
+}
+
 static void merge_discovered_from_batch(stat_batch_t *batch, dir_stack_t *stack, task_queue_t *queue,
                                         worker_aux_stats_t *aux, shared_state_t *shared) {
     (void)batch;
@@ -4538,6 +4548,66 @@ static void print_stat_batch_unexpected_dir_warnings(FILE *fp) {
     }
     g_stat_batch_unexpected_dir_sample_n = 0;
     pthread_mutex_unlock(&g_stat_batch_unexpected_dir_mu);
+}
+
+/* Destroy already-finished pending batches without waiting. Compacts unfinished entries to the front.
+ * Mid-readdir backpressure uses this so completed batches do not pin names_blob memory until EOF. */
+static void stat_pending_reap_finished(stat_pending_vec_t *v, dir_stack_t *stack, task_queue_t *queue,
+                                       worker_aux_stats_t *aux, shared_state_t *shared) {
+    size_t i;
+    size_t keep = 0;
+
+    if (!v || v->count == 0) return;
+    for (i = 0; i < v->count; i++) {
+        stat_batch_t *b = v->items[i];
+
+        if (!stat_batch_is_finished(b)) {
+            v->items[keep++] = b;
+            continue;
+        }
+        merge_discovered_from_batch(b, stack, queue, aux, shared);
+        stat_batch_destroy(b);
+    }
+    v->count = keep;
+}
+
+/* Mid-readdir backpressure: reap finished batches, then wait only until unfinished pending drops
+ * below keep_max (typically ECRAWL_STAT_QUEUE_BATCHES). Unlike a full barrier, the reader can keep
+ * feeding the pool once there is room instead of waiting for every outstanding batch. */
+static void stat_pending_drain_until_unfinished_below(stat_pending_vec_t *v, size_t keep_max,
+                                                     dir_stack_t *stack, task_queue_t *queue,
+                                                     worker_aux_stats_t *aux, shared_state_t *shared) {
+    if (!v) return;
+    if (keep_max == 0) {
+        /* Same as a full drain when the caller asks for an empty unfinished set. */
+        size_t i;
+
+        for (i = 0; i < v->count; i++) {
+            stat_batch_t *b = v->items[i];
+
+            stat_batch_wait_done(b);
+            merge_discovered_from_batch(b, stack, queue, aux, shared);
+            stat_batch_destroy(b);
+        }
+        v->count = 0;
+        return;
+    }
+
+    for (;;) {
+        size_t i;
+
+        stat_pending_reap_finished(v, stack, queue, aux, shared);
+        if (v->count < keep_max) return;
+
+        /* Oldest unfinished first: after reap_finished every remaining item is unfinished. */
+        for (i = 0; i < v->count; i++) {
+            if (!stat_batch_is_finished(v->items[i])) {
+                stat_batch_wait_done(v->items[i]);
+                break;
+            }
+        }
+        if (i >= v->count) return;
+    }
 }
 
 /* Wait for each enqueue'd batch from this crawl thread, run post-batch donation, destroy batch structs.
@@ -4938,6 +5008,10 @@ static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *
     nb->cap = 0;
     stat_names_builder_clear(nb);
 
+    /* Reclaim already-finished batches before growing pend further (self-processed
+     * and completed worker batches between periodic backpressure checks). */
+    if (pend->count > 0) stat_pending_reap_finished(pend, stack, queue, aux, shared);
+
     if (stat_pending_push(pend, b) != 0) {
         fprintf(stderr, "ERROR stat pending OOM\n");
         stats_add_error(shared);
@@ -5252,9 +5326,10 @@ static int process_directory_iterative(dir_stack_t *stack,
                 memset(&nb, 0, sizeof(nb));
                 memset(&pend, 0, sizeof(pend));
 
-                /* Pending stat batches are drained at end of directory, on stat-flush errors, and every
-                 * STAT_PENDING_DRAIN_EVERY_READDIRS dirents during readdir so backlog stays bounded on
-                 * megadirs. We do not drain before each DT_DIR/UNKNOWN (no correctness barrier there). */
+                /* Pending stat batches are fully drained at end of directory and on flush errors.
+                 * Mid-readdir, every STAT_PENDING_DRAIN_EVERY_READDIRS dirents, apply backpressure:
+                 * reap finished batches and wait only until unfinished pending drops below the
+                 * global queue cap (not a full barrier). No drain before each DT_DIR/UNKNOWN. */
 
                 {
                     size_t reliable_nondir_seen_in_dir = 0;
@@ -5266,7 +5341,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                     readdir_drain_counter++;
                     if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
                         readdir_drain_counter = 0;
-                        if (pend.count > 0) stat_pending_drain_all(&pend, stack, queue, aux, shared);
+                        if (pend.count > 0)
+                            stat_pending_drain_until_unfinished_below(&pend, g_stat_queue_max_batches_cfg,
+                                                                      stack, queue, aux, shared);
                     }
 
                     size_t child_name_len;
