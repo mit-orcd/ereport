@@ -145,17 +145,25 @@
 #   AGES="fresh"               tree ages to build and measure, as separate rows:
 #                              fresh, renameshuf, churn, linkshuf (see above).
 #                              Default `fresh` keeps the shipped behaviour.
-#   CELLS="dfs-hash dfs-hash-B dfs-ino bfs-hash bfs-ino bfs-spread"
-#                              also available, not default: dfs-hash-full,
-#                              dfs-ino-full, bfs-hash-full, bfs-ino-full, which
-#                              pass --sort-window all (one window per directory
-#                              instead of 1024 names). Those exist so a null at
-#                              a megadirectory is attributable: per-batch
-#                              sorting can only reach chunk locality while a
-#                              directory holds at most ~1024x64 entries, so
-#                              without a whole-directory cell `one_dir` cannot
-#                              tell "inode order does not help" from "the batch
-#                              is 15x too small to express inode order".
+#   CELLS="dfs-hash dfs-hash-B dfs-ino bfs-hash bfs-ino bfs-spread
+#           dfs-hash.statx dfs-hash.statx-min dfs-hash.statx-nosync"
+#                              Strategy cells stay on --stat-call fstatat (the
+#                              default, what every earlier result here used).
+#                              The three dfs-hash.statx* cells re-run the
+#                              baseline with ewalkbench's --stat-call modes so
+#                              the syscall dimension is measured next to the
+#                              strategy matrix without multiplying every cell
+#                              by four. Also available, not default:
+#                              dfs-hash-full, dfs-ino-full, bfs-hash-full,
+#                              bfs-ino-full, which pass --sort-window all (one
+#                              window per directory instead of 1024 names).
+#                              Those exist so a null at a megadirectory is
+#                              attributable: per-batch sorting can only reach
+#                              chunk locality while a directory holds at most
+#                              ~1024x64 entries, so without a whole-directory
+#                              cell `one_dir` cannot tell "inode order does not
+#                              help" from "the batch is 15x too small to express
+#                              inode order".
 #   SORT_WINDOW=<unset>        pass --sort-window to every cell that does not
 #                              already name one. Unset means the flag is never
 #                              passed and ewalkbench's 1024-name default (what
@@ -285,7 +293,7 @@ SHAPES=${SHAPES:-"many_dirs few_dirs one_dir"}
 # Default `fresh` on purpose: aged trees are opt-in, so an existing invocation
 # builds and measures exactly the trees it did before.
 AGES=${AGES:-"fresh"}
-CELLS=${CELLS:-"dfs-hash dfs-hash-B dfs-ino bfs-hash bfs-ino bfs-spread"}
+CELLS=${CELLS:-"dfs-hash dfs-hash-B dfs-ino bfs-hash bfs-ino bfs-spread dfs-hash.statx dfs-hash.statx-min dfs-hash.statx-nosync"}
 SORT_WINDOW=${SORT_WINDOW:-}
 ROTATE_CELLS=${ROTATE_CELLS:-1}
 BASELINE_CELL=${BASELINE_CELL:-dfs-hash}
@@ -396,6 +404,15 @@ cell_args() {
     bfs-hash)              args="--order bfs --stat hash" ;;
     bfs-ino)               args="--order bfs --stat ino" ;;
     bfs-spread)            args="--order bfs --stat spread" ;;
+    # Baseline × --stat-call. Same walk/stat order as dfs-hash; only the
+    # syscall that reads the inode changes. Named as suffixes on dfs-hash so
+    # vs_base in SUMMARY_TABLE.txt compares them to the fstatat baseline, and
+    # so a reader of cells.tsv does not have to open the run file to see which
+    # call was used. fstatat itself is not a named cell: it is the default of
+    # every strategy cell, including dfs-hash.
+    dfs-hash.statx)        args="--order dfs --stat hash --stat-call statx" ;;
+    dfs-hash.statx-min)    args="--order dfs --stat hash --stat-call statx-min" ;;
+    dfs-hash.statx-nosync) args="--order dfs --stat hash --stat-call statx-nosync" ;;
     dfs-hash-full)         args="--order dfs --stat hash --sort-window all" ;;
     dfs-ino-full)          args="--order dfs --stat ino --sort-window all" ;;
     bfs-hash-full)         args="--order bfs --stat hash --sort-window all" ;;
@@ -1074,7 +1091,7 @@ run_one() { # group cell rep
 
   drop_caches_before_rep || { status="DROP_CACHES_FAILED"; cold_this=0; }
 
-  printf '    rep%-2s %-12s %-10s %-13s ' "$rep" "$shape" "$age" "$cell"
+  printf '    rep%-2s %-12s %-10s %-22s ' "$rep" "$shape" "$age" "$cell"
   if [[ -n "$TIMEOUT_BIN" && "$RUN_TIMEOUT_SEC" -gt 0 ]]; then
     "$TIMEOUT_BIN" "$RUN_TIMEOUT_SEC" "$BIN" "${args[@]}" --threads "$THREADS" "$root" \
       >"$out" 2>"$out.stderr"
@@ -1300,12 +1317,12 @@ summarize() {
           echo "  state any real system reaches. churn is the honest aged-filesystem model."
         fi
       fi
-      printf '  %-14s %5s %10s %12s %9s %13s %14s %10s %11s %8s\n' \
+      printf '  %-22s %5s %10s %12s %9s %13s %14s %10s %11s %8s\n' \
         cell reps median_s entries_per_s vs_base chunk_reuse median_ino_delta ino_buckets readdir_asc window
       for cell in "${CELL_LIST[@]}"; do
         n=$(nok "$shape" "$age" "$cell")
         if [[ "$n" -eq 0 ]]; then
-          printf '  %-14s %5s %10s %12s %9s %13s %14s %10s %11s %8s   NO VALID REPS\n' \
+          printf '  %-22s %5s %10s %12s %9s %13s %14s %10s %11s %8s   NO VALID REPS\n' \
             "$cell" 0 - - - - - - - -
           checks_failed=1
           continue
@@ -1316,7 +1333,7 @@ summarize() {
           -v bk="$(med "$shape" "$age" "$cell" 15)" -v sw="$(med "$shape" "$age" "$cell" 16)" \
           -v ra="$(med "$shape" "$age" "$cell" 17)" 'BEGIN{
             gap = (b+0 > 0 && m+0 > 0) ? sprintf("%+.1f%%", 100*(b-m)/b) : "-"
-            printf "  %-14s %5s %10s %12s %9s %13s %14s %10s %11s %8s\n", cell, n, m, e, gap, cr, d, bk, ra, sw
+            printf "  %-22s %5s %10s %12s %9s %13s %14s %10s %11s %8s\n", cell, n, m, e, gap, cr, d, bk, ra, sw
           }'
       done
       if [[ -n "$base" && -n "$ctrl" ]]; then
@@ -1326,9 +1343,14 @@ summarize() {
         echo "  noise floor: UNAVAILABLE (no valid $CONTROL_CELL reps) — no gap can be called real"
         checks_failed=1
       fi
+      case " ${CELL_LIST[*]} " in
+        *" dfs-hash.statx "*|*" dfs-hash.statx-min "*|*" dfs-hash.statx-nosync "*)
+          echo "  dfs-hash.statx* cells differ from $BASELINE_CELL only in --stat-call; read their vs_base as the syscall effect, not a strategy effect."
+          ;;
+      esac
       echo "  sorted elapsed_sec per cell (compare distributions, not just medians):"
       for cell in "${CELL_LIST[@]}"; do
-        printf '    %-14s %s\n' "$cell" "$(reps_sorted "$shape" "$age" "$cell")"
+        printf '    %-22s %s\n' "$cell" "$(reps_sorted "$shape" "$age" "$cell")"
       done
       echo
     done
@@ -1543,7 +1565,7 @@ perf_stat_one() { # group cell rep
 
   drop_caches_before_rep || { status="DROP_CACHES_FAILED"; cold_this=0; }
 
-  printf '    perf stat %-12s %-11s %-14s ' "$shape" "$age" "$cell"
+  printf '    perf stat %-12s %-11s %-22s ' "$shape" "$age" "$cell"
   perf stat -x, -e "$PERF_EVENTS" -o "$base.csv" -- \
     "$BIN" "${args[@]}" --threads "$THREADS" "$root" \
     >"$base.summary.txt" 2>"$base.stderr.txt"
@@ -1877,6 +1899,7 @@ write_env_snapshot() {
     echo "sort_window=${SORT_WINDOW:-<tool default: 1024 names, as ECRAWL_STAT_INODE_ORDER>}"
     echo "stat_threads=$(observed_key stat_threads) (observed; the tool's own summary, not a flag this script passes)"
     echo "stat_min_offload=<tool default: 32 names, as ECRAWL_STAT_BATCH_MIN_OFFLOAD>"
+    echo "stat_call: strategy cells use ewalkbench's default fstatat (observed baseline=$(observed_key stat_call)); dfs-hash.statx / .statx-min / .statx-nosync pass --stat-call explicitly so the syscall dimension is measured without multiplying every strategy cell by four"
     echo "dir_enqueue_batch=$(observed_key dir_enqueue_batch) (observed; discovered directories published per acquisition of the global queue lock, as ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH. 1 is the one-lock-per-directory form: on a 200,000-directory shape that is bimodal at 0.395 s or 1.100 s, so a 1 here means the timing rows are two populations and their median is an artefact of the split. queue_push_ops in each row is what the batch actually achieved.)"
     echo "locality_counters=$(observed_key locality_counters) (observed; 1 = chunk_reuse_rate, median_ino_delta and distinct_ino_buckets were counted)"
     echo "stat_pool: stat_threads=0 is the inline path logs/ewalk-strategy-manual-567654 was measured with; a nonzero value measures a different walker, so the two sets of rows are not comparable"

@@ -54,6 +54,18 @@
  * ordering does not help here" apart from "the batch is too small to express
  * inode ordering in this directory". See the comment above walk_dir_batched.
  *
+ * --stat-call changes the syscall rather than the order. fstatat is what
+ * ecrawl issues and the default; statx is what dut issues, and on this system
+ * the two are genuinely different syscalls, since glibc 2.28 routes fstatat to
+ * newfstatat. The hypothesis it exists to falsify is that STATX_BASIC_STATS
+ * buys nothing over newfstatat, because it names the same fields and both end
+ * in vfs_getattr, and that a win needs a narrowed mask on a filesystem that
+ * acts on one — for NFS, a mask the client can answer out of its attribute
+ * cache without a GETATTR round trip, which is what statx-min asks for. Worth
+ * saying where the flag lives rather than discovering it later: ecrawl reports
+ * bytes, so the production crawl cannot drop STATX_SIZE and cannot collect
+ * that win however large it measures here.
+ *
  * Alongside the timing it reports inode-locality counters, so a run can show
  * that the requested strategy actually changed inode access rather than being
  * assumed to have done so. They are on by default and --no-locality turns
@@ -109,13 +121,25 @@
  * are ecrawl's defaults (DEFAULT_STAT_QUEUE_BATCHES, DEFAULT_STAT_BATCH_MIN_OFFLOAD),
  * so a cell with the pool on differs from ecrawl in strategy and not in how
  * work is split. Queue-full means stat inline, which is also what ecrawl's
- * ECRAWL_STAT_FULL_INLINE fallback does. */
+ * ECRAWL_STAT_FULL_INLINE fallback does.
+ *
+ * The offload threshold was laddered on XFS (job 19684544 cold / 19678135 warm)
+ * against a 200,000×5 many_dirs tree, a 200×5000 few_dirs tree and a 1M-file
+ * one_dir tree. At 32, many_dirs offloads 0 of 200,000 batches — every directory
+ * is smaller than the gate, so the pool never runs. At 0 the pool engages
+ * (~87k–200k offloaded) but many_dirs regresses ~40–50% (warm median 0.308 s →
+ * 0.471 s at 8 stat threads), because the queue handoff costs more than an
+ * inline fstatat on a five-name batch. So 32 stays: it matches ecrawl, and
+ * zeroing it to "engage the pool" is a measured loss, not a free fix. */
 #define STAT_QUEUE_BATCHES       64
 #define DEFAULT_STAT_MIN_OFFLOAD 32
 /* ecrawl's ECRAWL_STAT_THREADS default, and therefore this one: a benchmark
  * that stands in for ecrawl has to have ecrawl's stat concurrency, or its wall
- * time describes a walker nobody runs. --stat-threads 0 selects the older
- * fully-inline path. */
+ * time describes a walker nobody runs. The same ladder found no default that
+ * beats 8 on both one_dir and many_dirs: cold one_dir stays ~5 s from 8 to 128
+ * (the single getdents64 reader is the bottleneck, not the pool depth), and
+ * many_dirs under the 32-name gate never reaches the pool at all. --stat-threads
+ * 0 selects the older fully-inline path. */
 #define DEFAULT_STAT_THREADS 8
 
 /* A DFS worker hands the shallow half of its local stack to the global queue
@@ -151,6 +175,22 @@
 
 enum walk_order { ORDER_DFS = 0, ORDER_BFS = 1 };
 enum stat_order { STAT_HASH = 0, STAT_INO = 1, STAT_SPREAD = 2 };
+
+/* --stat-call: which syscall reads the inode. fstatat is what ecrawl does and
+ * what every result before this dimension existed was measured with; statx is
+ * byte-for-byte what dut does. They are genuinely different syscalls here —
+ * glibc 2.28 routes fstatat to newfstatat — so the two are comparable rather
+ * than two spellings of one thing. */
+enum stat_call { CALL_FSTATAT = 0, CALL_STATX = 1, CALL_STATX_MIN = 2, CALL_STATX_NOSYNC = 3 };
+
+#ifdef STATX_BASIC_STATS
+#define HAVE_STATX 1
+/* Everything ecrawl reads from an inode except size, blocks and the
+ * timestamps. Those are precisely the fields an NFS client cannot produce
+ * without a GETATTR round trip, so this mask is the only one of the three that
+ * a filesystem can act on; the others name what newfstatat already returns. */
+#define STATX_MIN_MASK (STATX_TYPE | STATX_MODE | STATX_INO | STATX_NLINK | STATX_UID | STATX_GID)
+#endif
 
 struct linux_dirent64 {
     uint64_t       d_ino;
@@ -776,6 +816,12 @@ typedef struct {
     int       no_dtype; /* ignore d_type; every entry is classified by its inode */
     int       locality; /* keep the inode-locality counters (default) */
 
+    /* --stat-call. The mask and flags are resolved once in main rather than
+     * switched on per entry, so the hot path carries the call it was given. */
+    int          stat_call;
+    unsigned int statx_mask;
+    int          statx_flags;
+
     taskdeq_t local;   /* DFS local stack (front = top) */
 
     /* Discovered directories bound for the global queue, held back until
@@ -794,6 +840,7 @@ typedef struct {
     uint64_t  queue_push_ops;  /* acquisitions of wq->mu to publish directories */
     uint64_t  max_dir_names;
     uint64_t  unknown_stats;   /* entries classified by inode rather than by d_type */
+    uint64_t  statx_short;     /* statx replies missing a field the walk needs */
 
     /* readdir_asc_frac: consecutive stat-eligible entries within one directory,
      * in getdents64 order, whose inode number went up. A property of the tree
@@ -1126,8 +1173,53 @@ static void dstream_fill_batch(worker_t *w, dstream_t *s, nbatch_t *b) {
     }
 }
 
+static const char *stat_call_name(int call) {
+    switch (call) {
+    case CALL_STATX:        return "statx";
+    case CALL_STATX_MIN:    return "statx-min";
+    case CALL_STATX_NOSYNC: return "statx-nosync";
+    default:                return "fstatat";
+    }
+}
+
 /*
- * fstatat one name relative to the parent dirfd, exactly as ecrawl does.
+ * Read the inode with whichever call --stat-call named, and hand back the only
+ * two fields the walk consumes.
+ *
+ * statx is allowed to fill less than it was asked for, and stx_mask is what it
+ * actually filled. A reply without the type or the inode falls back to fstatat
+ * for that entry rather than being used: a mode that misclassified a directory
+ * or fed a zero inode to the locality counters would stop being comparable
+ * with the others, and the comparison is the whole reason the dimension
+ * exists. The shortfalls are counted, so "statx answered in full" is something
+ * the summary can support rather than assume.
+ */
+static int stat_fields(worker_t *w, int dirfd, const char *name, uint64_t *ino, mode_t *mode) {
+    struct stat st;
+
+#ifdef HAVE_STATX
+    if (w->stat_call != CALL_FSTATAT) {
+        struct statx stx;
+
+        if (statx(dirfd, name, w->statx_flags, w->statx_mask, &stx) != 0)
+            return -1;
+        if ((stx.stx_mask & (STATX_TYPE | STATX_INO)) == (STATX_TYPE | STATX_INO)) {
+            *ino = (uint64_t)stx.stx_ino;
+            *mode = (mode_t)stx.stx_mode;
+            return 0;
+        }
+        w->statx_short++;
+    }
+#endif
+    if (fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return -1;
+    *ino = (uint64_t)st.st_ino;
+    *mode = st.st_mode;
+    return 0;
+}
+
+/*
+ * Stat one name relative to the parent dirfd, exactly as ecrawl does.
  * DT_UNKNOWN entries (filesystems without dirent ftype) are classified here,
  * so entry and directory totals stay identical whatever the strategy is.
  *
@@ -1141,22 +1233,24 @@ static void dstream_fill_batch(worker_t *w, dstream_t *s, nbatch_t *b) {
  */
 static void stat_one(worker_t *w, dirref_t *dir, nbatch_t *b, const nent_t *e) {
     const char *name = b->arena + e->off;
-    struct stat st;
+    uint64_t ino = 0;
+    mode_t mode = 0;
 
     w->fstatat_calls++;
     if (e->unknown)
         w->unknown_stats++;
-    if (fstatat(dir->fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-        fprintf(stderr, "ewalkbench: fstatat %s/%s: %s\n", dir->path, name, strerror(errno));
+    if (stat_fields(w, dir->fd, name, &ino, &mode) != 0) {
+        fprintf(stderr, "ewalkbench: %s %s/%s: %s\n",
+                stat_call_name(w->stat_call), dir->path, name, strerror(errno));
         w->errors++;
         if (e->unknown)
             w->files++;
         return;
     }
-    worker_note_stat(w, (uint64_t)st.st_ino);
+    worker_note_stat(w, ino);
     if (!e->unknown)
         return;
-    if (S_ISDIR(st.st_mode)) {
+    if (S_ISDIR(mode)) {
         size_t child_len;
         char *child = join_path(dir->path, dir->path_len, name, e->len, &child_len);
 
@@ -1201,6 +1295,15 @@ static void stat_one(worker_t *w, dirref_t *dir, nbatch_t *b, const nent_t *e) {
  * min_offload names, so full mid-directory flushes always offload and only a
  * short tail is stat'd inline, and a full queue also falls back to inline
  * rather than stalling the read.
+ *
+ * That "short tail" framing only holds when directories are larger than the
+ * threshold. On a tree of 200,000 five-file directories every batch is a "tail",
+ * so the gate at the default of 32 offloads nothing (stat_batches_offloaded=0,
+ * stat_batches_inlined=200000). Setting the threshold to 0 engages the pool,
+ * but the same tree then gets ~40–50% slower: the handoff costs more than
+ * stating five names inline. The counter is printed as stat_min_offload next to
+ * the two batch counters so a run that hits this can be recognised rather than
+ * read as a pool that was never asked for.
  *
  * At --stat-threads 0 the batch is instead stat'd here, on the thread that
  * read it, which makes one directory the unit of parallelism however many
@@ -1453,6 +1556,7 @@ static void usage(FILE *fp) {
         "usage: ewalkbench [--order dfs|bfs] [--stat hash|ino|spread] [--threads N]\n"
         "                  [--sort-window N|all] [--stat-threads N]\n"
         "                  [--stat-min-offload N] [--dir-enqueue-batch N]\n"
+        "                  [--stat-call fstatat|statx|statx-min|statx-nosync]\n"
         "                  [--no-stat] [--no-dtype] [--no-locality] <root>\n"
         "\n"
         "  --order dfs      depth-first: LIFO local stack per thread plus a global queue (default)\n"
@@ -1479,7 +1583,10 @@ static void usage(FILE *fp) {
         "  --stat-min-offload N  batches of fewer than N names are stat'd inline\n"
         "                   rather than queued, 0..%u (default %d, which is what\n"
         "                   ecrawl's ECRAWL_STAT_BATCH_MIN_OFFLOAD does; 0 queues\n"
-        "                   every batch). Only meaningful with --stat-threads.\n"
+        "                   every batch). On a tree of five-file directories the\n"
+        "                   default offloads nothing, and 0 engages the pool but\n"
+        "                   is the slower of the two — measured, not assumed.\n"
+        "                   Only meaningful with --stat-threads.\n"
         "  --dir-enqueue-batch N  discovered directories published per acquisition\n"
         "                   of the global queue lock, 1..%u (default %d, which is\n"
         "                   ecrawl's ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH). 1 is one\n"
@@ -1487,6 +1594,18 @@ static void usage(FILE *fp) {
         "                   this file had before the batch existed; on a\n"
         "                   200,000-directory tree that is bimodal, 0.395 s or\n"
         "                   1.100 s per run. Reported as queue_push_ops.\n"
+        "  --stat-call C    which syscall reads the inode (default fstatat, what\n"
+        "                   ecrawl does and what every earlier result here was\n"
+        "                   measured with). statx is AT_SYMLINK_NOFOLLOW |\n"
+        "                   AT_NO_AUTOMOUNT with STATX_BASIC_STATS, byte-for-byte\n"
+        "                   what dut does; statx-min narrows the mask to type, mode,\n"
+        "                   ino, nlink, uid and gid, dropping the size, blocks and\n"
+        "                   timestamps that force an NFS GETATTR round trip;\n"
+        "                   statx-nosync adds AT_STATX_DONT_SYNC to the full mask.\n"
+        "                   The walk reads only the type and the inode whichever is\n"
+        "                   chosen, and a statx reply missing either falls back to\n"
+        "                   fstatat for that entry and is counted as\n"
+        "                   statx_mask_short, so the modes stay comparable.\n"
         "  --no-stat        walk names only and read no inode, as ecrawl --no-stat\n"
         "                   does: d_type classifies each entry and only DT_UNKNOWN\n"
         "                   still costs an fstatat (reported as dtype_unknown_stats).\n"
@@ -1586,6 +1705,9 @@ int main(int argc, char **argv) {
     const char *root = NULL;
     int order = ORDER_DFS;
     int stat_mode = STAT_HASH;
+    int stat_call = CALL_FSTATAT;
+    unsigned int statx_mask = 0;
+    int statx_flags = 0;
     int nthreads = 8;
     size_t sort_window = STAT_BATCH_NAMES;
     int stat_threads = DEFAULT_STAT_THREADS;
@@ -1611,6 +1733,7 @@ int main(int argc, char **argv) {
     uint64_t batches_offloaded = 0, batches_inlined = 0, max_dir_names = 0;
     uint64_t queue_push_ops = 0;
     uint64_t unknown_stats = 0;
+    uint64_t statx_short = 0;
     uint64_t *deltas = NULL;
     size_t ndeltas = 0, deltas_cap = 0;
     uint64_t median_delta = 0;
@@ -1649,6 +1772,29 @@ int main(int argc, char **argv) {
             else if (strcmp(v, "spread") == 0) stat_mode = STAT_SPREAD;
             else { fprintf(stderr, "ewalkbench: invalid --stat %s\n", v); return 2; }
             stat_name = (stat_mode == STAT_HASH) ? "hash" : (stat_mode == STAT_INO ? "ino" : "spread");
+            continue;
+        }
+        if (strncmp(a, "--stat-call", 11) == 0 && (a[11] == '\0' || a[11] == '=')) {
+            const char *v = (a[11] == '=') ? a + 12 : (++i < argc ? argv[i] : NULL);
+
+            if (!v) { usage(stderr); return 2; }
+            if (strcmp(v, "fstatat") == 0) stat_call = CALL_FSTATAT;
+#ifdef HAVE_STATX
+            else if (strcmp(v, "statx") == 0) stat_call = CALL_STATX;
+            else if (strcmp(v, "statx-min") == 0) stat_call = CALL_STATX_MIN;
+            else if (strcmp(v, "statx-nosync") == 0) stat_call = CALL_STATX_NOSYNC;
+#else
+            /* Refused rather than quietly served by fstatat: a run that asked
+             * for statx and got the baseline would report a difference of
+             * zero as a measurement. */
+            else if (strcmp(v, "statx") == 0 || strcmp(v, "statx-min") == 0 ||
+                     strcmp(v, "statx-nosync") == 0) {
+                fprintf(stderr, "ewalkbench: --stat-call %s needs STATX_BASIC_STATS, "
+                                "which this build's <sys/stat.h> does not define\n", v);
+                return 2;
+            }
+#endif
+            else { fprintf(stderr, "ewalkbench: invalid --stat-call %s\n", v); return 2; }
             continue;
         }
         if (strncmp(a, "--sort-window", 13) == 0 && (a[13] == '\0' || a[13] == '=')) {
@@ -1751,6 +1897,15 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef HAVE_STATX
+    if (stat_call != CALL_FSTATAT) {
+        statx_flags = AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+        statx_mask = (stat_call == CALL_STATX_MIN) ? STATX_MIN_MASK : STATX_BASIC_STATS;
+        if (stat_call == CALL_STATX_NOSYNC)
+            statx_flags |= AT_STATX_DONT_SYNC;
+    }
+#endif
+
     if (stat_threads > 0 && stat_mode == STAT_SPREAD)
         stat_threads = 0; /* the mode stats one entry at a time by design */
     /* Nothing to offload when only DT_UNKNOWN entries are stat'd, and ecrawl
@@ -1812,6 +1967,9 @@ int main(int argc, char **argv) {
         workers[i].no_stat = no_stat;
         workers[i].no_dtype = no_dtype;
         workers[i].locality = locality;
+        workers[i].stat_call = stat_call;
+        workers[i].statx_mask = statx_mask;
+        workers[i].statx_flags = statx_flags;
         workers[i].rng = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)i + 1);
     }
     for (i = 0; i < stat_threads; i++) {
@@ -1826,6 +1984,9 @@ int main(int argc, char **argv) {
         stat_workers[i].no_stat = no_stat;
         stat_workers[i].no_dtype = no_dtype;
         stat_workers[i].locality = locality;
+        stat_workers[i].stat_call = stat_call;
+        stat_workers[i].statx_mask = statx_mask;
+        stat_workers[i].statx_flags = statx_flags;
         stat_workers[i].rng = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)(nthreads + i) + 1);
     }
 
@@ -1899,6 +2060,7 @@ int main(int argc, char **argv) {
         batches_inlined += w->batches_inlined;
         queue_push_ops += w->queue_push_ops;
         unknown_stats += w->unknown_stats;
+        statx_short += w->statx_short;
         if (w->max_dir_names > max_dir_names)
             max_dir_names = w->max_dir_names;
         if (w->fatal) fatal = 1;
@@ -1969,6 +2131,19 @@ int main(int argc, char **argv) {
     printf("stat_sort_window=%zu\n", (stat_mode == STAT_SPREAD) ? (size_t)STAT_BATCH_NAMES : sort_window);
     printf("stat_threads=%d\n", stat_threads);
     printf("stat_threads_requested=%d\n", stat_threads_req);
+    printf("stat_call=%s\n", stat_call_name(stat_call));
+    /* The mask is echoed rather than left to be derived from the mode name,
+     * since the mode name is a label and the mask is the thing the kernel was
+     * asked for. Under fstatat there is no mask and no statx to come up short,
+     * so both are named as unavailable rather than printed as zeros a reader
+     * could take for measurements. */
+    if (stat_call == CALL_FSTATAT) {
+        printf("statx_mask_requested=(unavailable: --stat-call fstatat)\n");
+        printf("statx_mask_short=(unavailable: --stat-call fstatat)\n");
+    } else {
+        printf("statx_mask_requested=0x%08x\n", statx_mask);
+        printf("statx_mask_short=%" PRIu64 "\n", statx_short);
+    }
     printf("no_stat=%d\n", no_stat);
     printf("no_dtype=%d\n", no_dtype);
     printf("locality_counters=%d\n", locality);
@@ -2002,6 +2177,15 @@ int main(int argc, char **argv) {
      * from here is not counted: these are the workers' own acquisitions. */
     printf("dir_enqueue_batch=%d\n", enqueue_batch);
     printf("queue_push_ops=%" PRIu64 "\n", queue_push_ops);
+    /* The threshold decides the two counters under it, so it is echoed with
+     * them rather than left to be inferred from the flags: a run whose
+     * directories are all smaller than it offloads nothing, and without this
+     * key that reads as a pool that was never asked for. Named as unavailable
+     * when no pool started, since the gate is then inert rather than zero. */
+    if (stat_started > 0)
+        printf("stat_min_offload=%d\n", min_offload);
+    else
+        printf("stat_min_offload=(unavailable: no stat pool)\n");
     printf("stat_batches_offloaded=%" PRIu64 "\n", batches_offloaded);
     printf("stat_batches_inlined=%" PRIu64 "\n", batches_inlined);
     printf("stat_pool_max_inflight=%" PRIu64 "\n", wq.max_inflight);
