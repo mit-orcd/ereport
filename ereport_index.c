@@ -43,10 +43,12 @@
 #endif
 
 /*
+ * 3: trigrams are taken from each path's basename only (segment-once). path_isdir.bin
+ *    records which path_ids are directories so --search can expand a directory hit to its
+ *    descendants. Readers reject older versions — rebuild with `--make`.
  * 2: durable paths.bin and tri_postings.bin are zstd-compressed (EPATH002 / chunked postings).
- * Readers reject anything else — a v1 index has to be rebuilt with `--make`.
  */
-#define INDEX_VERSION 2
+#define INDEX_VERSION 3
 /*
  * Top bits of the 24-bit trigram used to partition records into tmp_trigrams_<bucket>_w<shard>.bin
  * during the index phase, and into one merge segment per bucket during the merge phase.
@@ -288,6 +290,7 @@ typedef struct {
     char *path;
     uint32_t *codes;
     size_t code_count;
+    uint8_t is_dir; /* 1 if crawl record type is 'd' */
 } parsed_path_t;
 
 typedef struct write_batch {
@@ -436,12 +439,15 @@ typedef struct {
     char index_dir[PATH_MAX];
     FILE *paths_fp;
     FILE *path_offsets_fp;
+    FILE *path_isdir_fp; /* bit-packed: bit i set iff path_id i is a directory */
     /* paths.bin write position and the staged path_offsets.bin entries. Both belong to the single paths
      * writer thread, which is the pipeline's only serial stage: asking stdio for the position (ftello) cost
      * it an lseek per path, and the offsets went out one 8-byte fwrite at a time. */
     uint64_t paths_pos;
     uint64_t *path_offsets_buf;
     size_t path_offsets_n;
+    uint8_t isdir_pending_byte;
+    unsigned isdir_pending_bits;
     /* EPATH002 writer state, also owned exclusively by the paths writer thread. */
     uint64_t paths_file_pos;
     unsigned char *paths_chunk;
@@ -1473,7 +1479,7 @@ static write_batch_t *write_batch_create(void) {
 
 /* Copies path and codes into the batch arena; the caller keeps its own buffers. */
 static int write_batch_append(write_batch_t *batch, const char *path, size_t path_len, const uint32_t *codes,
-                              size_t code_count) {
+                              size_t code_count, int is_dir) {
     parsed_path_t *tmp;
     char *path_copy;
     uint32_t *codes_copy = NULL;
@@ -1500,6 +1506,7 @@ static int write_batch_append(write_batch_t *batch, const char *path, size_t pat
     batch->items[batch->count].path = path_copy;
     batch->items[batch->count].codes = codes_copy;
     batch->items[batch->count].code_count = code_count;
+    batch->items[batch->count].is_dir = is_dir ? 1U : 0U;
     batch->approx_body_bytes += sizeof(parsed_path_t) + path_len + 1U + code_count * sizeof(uint32_t);
     batch->count++;
     return 0;
@@ -3090,8 +3097,8 @@ static char *ascii_lower_dup(const char *s) {
 }
 
 /* After trigram intersection, require the full query substring to appear contiguously in the path.
- * (Trigrams are extracted per path segment during --make, but the query term is contiguous; otherwise
- * unrelated paths can match every trigram in different segments — e.g. …/micro/…/iche/…/hel… without "michel".) */
+ * Trigrams are basename-only at index time; directory hits expand to descendants at search time.
+ * Verify still rejects scattered false positives (e.g. …/micro/…/iche/…/hel… without "michel"). */
 static int path_matches_term(const char *path, const char *lower_term) {
     char *lower;
     int matched;
@@ -3218,33 +3225,46 @@ static int append_unique_trigram(uint32_t **codes, size_t *count, size_t *cap, u
 }
 
 /* Count sliding 3-byte windows (one trigram each) across path segments (length >= 3). */
-static size_t count_path_trigram_windows(const char *path) {
-    const char *seg = path;
-    size_t total = 0;
+/* Final path component only — parents are indexed when those entries appear as their own basenames. */
+static const char *path_basename_seg(const char *path, size_t *len_out) {
+    const char *slash;
+    const char *base;
 
-    while (*seg != '\0') {
-        const char *next = strchr(seg, '/');
-        size_t seg_len = next ? (size_t)(next - seg) : strlen(seg);
-
-        if (seg_len >= 3) total += seg_len - 2;
-        if (!next) break;
-        seg = next + 1;
+    if (!path) {
+        *len_out = 0;
+        return "";
     }
-    return total;
+    slash = strrchr(path, '/');
+    base = slash ? slash + 1 : path;
+    *len_out = strlen(base);
+    return base;
+}
+
+static size_t count_basename_trigram_windows(const char *path) {
+    size_t seg_len = 0;
+
+    (void)path_basename_seg(path, &seg_len);
+    return seg_len >= 3 ? seg_len - 2 : 0;
 }
 
 /*
- * On success *out_codes points at the caller's scratch buffer (or heap memory the
- * caller owns when scratch is NULL); it is valid until the next call for that
- * scratch and must not be freed.
+ * Emit trigrams for the basename only (segment-once). On success *out_codes points at the
+ * caller's scratch buffer (or heap memory the caller owns when scratch is NULL); it is valid
+ * until the next call for that scratch and must not be freed.
  */
 static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t *out_count, worker_arg_t *scratch) {
-    const char *seg = path;
-    size_t nraw = count_path_trigram_windows(path);
+    const char *base;
+    size_t seg_len = 0;
+    size_t nraw;
     uint32_t *codes;
     size_t pos = 0;
+    size_t i;
+    char *lower_seg;
     int codes_owned = 0;
+    int lower_owned = 0;
 
+    base = path_basename_seg(path, &seg_len);
+    nraw = count_basename_trigram_windows(path);
     if (nraw == 0) {
         *out_codes = NULL;
         *out_count = 0;
@@ -3254,53 +3274,33 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
     if (scratch) {
         if (ensure_worker_buf(&scratch->codes_buf, &scratch->codes_cap, nraw * sizeof(uint32_t)) != 0) return -1;
         codes = (uint32_t *)scratch->codes_buf;
+        if (ensure_worker_buf(&scratch->lower_seg_buf, &scratch->lower_seg_cap, seg_len + 1U) != 0) return -1;
+        lower_seg = scratch->lower_seg_buf;
     } else {
         codes = (uint32_t *)malloc(nraw * sizeof(uint32_t));
         if (!codes) return -1;
         codes_owned = 1;
-    }
-
-    seg = path;
-    while (*seg != '\0') {
-        const char *next = strchr(seg, '/');
-        size_t seg_len = next ? (size_t)(next - seg) : strlen(seg);
-
-        if (seg_len >= 3) {
-            size_t i;
-            char *lower_seg;
-
-            if (scratch) {
-                if (ensure_worker_buf(&scratch->lower_seg_buf, &scratch->lower_seg_cap, seg_len + 1U) != 0) {
-                    if (codes_owned) free(codes);
-                    return -1;
-                }
-                lower_seg = scratch->lower_seg_buf;
-            } else {
-                lower_seg = (char *)malloc(seg_len + 1);
-                if (!lower_seg) {
-                    if (codes_owned) free(codes);
-                    return -1;
-                }
-            }
-
-            for (i = 0; i < seg_len; i++) {
-                unsigned char b = (unsigned char)seg[i];
-                lower_seg[i] = (char)((b >= (unsigned char)'A' && b <= (unsigned char)'Z') ? (b + 32U) : b);
-            }
-            lower_seg[seg_len] = '\0';
-
-            for (i = 0; i + 3 <= seg_len; i++) {
-                uint32_t trigram = ((uint32_t)(unsigned char)lower_seg[i] << 16) |
-                                   ((uint32_t)(unsigned char)lower_seg[i + 1] << 8) |
-                                   (uint32_t)(unsigned char)lower_seg[i + 2];
-                codes[pos++] = trigram;
-            }
-            if (!scratch) free(lower_seg);
+        lower_seg = (char *)malloc(seg_len + 1);
+        if (!lower_seg) {
+            free(codes);
+            return -1;
         }
-
-        if (!next) break;
-        seg = next + 1;
+        lower_owned = 1;
     }
+
+    for (i = 0; i < seg_len; i++) {
+        unsigned char b = (unsigned char)base[i];
+        lower_seg[i] = (char)((b >= (unsigned char)'A' && b <= (unsigned char)'Z') ? (b + 32U) : b);
+    }
+    lower_seg[seg_len] = '\0';
+
+    for (i = 0; i + 3 <= seg_len; i++) {
+        uint32_t trigram = ((uint32_t)(unsigned char)lower_seg[i] << 16) |
+                           ((uint32_t)(unsigned char)lower_seg[i + 1] << 8) |
+                           (uint32_t)(unsigned char)lower_seg[i + 2];
+        codes[pos++] = trigram;
+    }
+    if (lower_owned) free(lower_seg);
 
     if (pos != nraw) {
         if (codes_owned) free(codes);
@@ -3657,6 +3657,33 @@ static int flush_path_offsets(build_ctx_t *ctx) {
     return 0;
 }
 
+static int append_isdir_bit(build_ctx_t *ctx, int is_dir) {
+    if (!ctx->path_isdir_fp) return -1;
+    if (is_dir) ctx->isdir_pending_byte = (uint8_t)(ctx->isdir_pending_byte | (uint8_t)(1U << ctx->isdir_pending_bits));
+    ctx->isdir_pending_bits++;
+    if (ctx->isdir_pending_bits == 8U) {
+        if (mk_fwrite(&ctx->isdir_pending_byte, 1, 1, ctx->path_isdir_fp) != 1) {
+            fprintf(stderr, "ereport_index: fwrite path_isdir.bin: %s\n", strerror(errno));
+            return -1;
+        }
+        ctx->isdir_pending_byte = 0;
+        ctx->isdir_pending_bits = 0;
+    }
+    return 0;
+}
+
+static int flush_isdir_tail(build_ctx_t *ctx) {
+    if (!ctx->path_isdir_fp) return -1;
+    if (ctx->isdir_pending_bits == 0U) return 0;
+    if (mk_fwrite(&ctx->isdir_pending_byte, 1, 1, ctx->path_isdir_fp) != 1) {
+        fprintf(stderr, "ereport_index: fwrite path_isdir.bin: %s\n", strerror(errno));
+        return -1;
+    }
+    ctx->isdir_pending_byte = 0;
+    ctx->isdir_pending_bits = 0;
+    return 0;
+}
+
 static int stage_path_offset(build_ctx_t *ctx, uint64_t offset) {
     if (!ctx->path_offsets_buf) /* allocation failed at startup: write straight through */
         return mk_fwrite(&offset, sizeof(offset), 1, ctx->path_offsets_fp) == 1 ? 0 : -1;
@@ -3830,7 +3857,8 @@ static void *paths_writer_main(void *arg_void) {
                 uint64_t path_id = base + (uint64_t)i;
                 trigram_job_t *job;
 
-                if (append_paths_only(pa->ctx, item->path) != 0) {
+                if (append_paths_only(pa->ctx, item->path) != 0 ||
+                    append_isdir_bit(pa->ctx, item->is_dir) != 0) {
                     pa->ctx->indexed_paths = base + (uint64_t)i;
                     atomic_fetch_add_explicit(&rs->indexed_paths, (unsigned long long)i, memory_order_relaxed);
                     atomic_store(&rs->writer_failed, 1);
@@ -4163,11 +4191,11 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             atomic_fetch_add(&rs->bad_input_files, 1U);
             goto out;
         }
-        /* A trigram index over paths needs the path and the owner, nothing else:
-         * eleven of fourteen columns are never read, so never decoded. */
+        /* Path, owner, and type (directory bit for search-time descendant expansion). */
         (void)crawl_bin_block_reader_set_projection(&br, CRAWL_COL_BIT(CRAWL_COL_PARENT_DIR_ID) |
                                                              CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES) |
-                                                             CRAWL_COL_BIT(CRAWL_COL_UID));
+                                                             CRAWL_COL_BIT(CRAWL_COL_UID) |
+                                                             CRAWL_COL_BIT(CRAWL_COL_TYPE));
     }
 
     for (;;) {
@@ -4257,7 +4285,8 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
                     break;
                 }
             }
-            if (write_batch_append(batch, pathbuf, strlen(pathbuf), codes, code_count) != 0) {
+            if (write_batch_append(batch, pathbuf, strlen(pathbuf), codes, code_count,
+                                   r.type == (uint8_t)'d') != 0) {
                 fprintf(stderr, "warn: failed to append write batch for %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
                 break;
@@ -4313,6 +4342,22 @@ static void *worker_main(void *arg_void) {
 
     mk_io_tls_flush();
     return NULL;
+}
+
+static void close_index_path_files(build_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->paths_fp) {
+        mk_fclose(ctx->paths_fp);
+        ctx->paths_fp = NULL;
+    }
+    if (ctx->path_offsets_fp) {
+        mk_fclose(ctx->path_offsets_fp);
+        ctx->path_offsets_fp = NULL;
+    }
+    if (ctx->path_isdir_fp) {
+        mk_fclose(ctx->path_isdir_fp);
+        ctx->path_isdir_fp = NULL;
+    }
 }
 
 /* path_offsets.bin carries one more entry than there are paths: the end of the last path. */
@@ -4861,6 +4906,7 @@ static int write_meta_file(const build_ctx_t *ctx) {
     paths_level = meta_read_paths_level(ctx->index_dir);
 
     fprintf(fp, "ereport_index_version=%d\n", INDEX_VERSION);
+    fprintf(fp, "trigrams=basename\n");
     fprintf(fp, "paths_comp=zstd_blocks\n");
     fprintf(fp, "postings_comp=zstd_framed\n");
     fprintf(fp, "zstd_level=%u\n", paths_level ? paths_level : (uint32_t)durable_zstd_level());
@@ -6630,33 +6676,42 @@ static int build_index_dir(const char *user_spec,
 
     (void)path_try_resolve_inplace(ctx.index_dir, sizeof(ctx.index_dir));
 
-    if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
-        build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0) {
-        if (stats_thread_started) {
-            index_stats_stop_request(&run_stats);
-            pthread_join(stats_thread, NULL);
-            clear_status_line();
-            stats_thread_started = 0;
-        }
-        for (i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
-        free(chunks);
-        index_free_file_states(file_states, path_count);
-        return 1;
-    }
+    {
+        char isdir_path[PATH_MAX];
 
-    ctx.paths_fp = mk_fopen(paths_path, "wb");
-    ctx.path_offsets_fp = mk_fopen(offsets_path, "wb");
+        if (build_path(paths_path, sizeof(paths_path), ctx.index_dir, "paths.bin") != 0 ||
+            build_path(offsets_path, sizeof(offsets_path), ctx.index_dir, "path_offsets.bin") != 0 ||
+            build_path(isdir_path, sizeof(isdir_path), ctx.index_dir, "path_isdir.bin") != 0) {
+            if (stats_thread_started) {
+                index_stats_stop_request(&run_stats);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+            }
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            index_free_file_states(file_states, path_count);
+            return 1;
+        }
+
+        ctx.paths_fp = mk_fopen(paths_path, "wb");
+        ctx.path_offsets_fp = mk_fopen(offsets_path, "wb");
+        ctx.path_isdir_fp = mk_fopen(isdir_path, "wb");
+        ctx.isdir_pending_byte = 0;
+        ctx.isdir_pending_bits = 0;
+    }
     if (ctx.paths_fp && setvbuf(ctx.paths_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
     if (ctx.path_offsets_fp && setvbuf(ctx.path_offsets_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
-    if (ctx.paths_fp && ctx.path_offsets_fp && paths_writer_open(&ctx) != 0) {
-        mk_fclose(ctx.paths_fp);
-        ctx.paths_fp = NULL;
+    if (ctx.path_isdir_fp && setvbuf(ctx.path_isdir_fp, NULL, _IOFBF, MERGE_IO_BUFSIZE) != 0) {
     }
-    if (!ctx.paths_fp || !ctx.path_offsets_fp) {
+    if (ctx.paths_fp && ctx.path_offsets_fp && ctx.path_isdir_fp && paths_writer_open(&ctx) != 0) {
+        close_index_path_files(&ctx);
+    }
+    if (!ctx.paths_fp || !ctx.path_offsets_fp || !ctx.path_isdir_fp) {
         fprintf(stderr, "failed to initialize index outputs in %s\n", ctx.index_dir);
         if (stats_thread_started) {
             index_stats_stop_request(&run_stats);
@@ -6664,8 +6719,7 @@ static int build_index_dir(const char *user_spec,
             clear_status_line();
             stats_thread_started = 0;
         }
-        if (ctx.paths_fp) mk_fclose(ctx.paths_fp);
-        if (ctx.path_offsets_fp) mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -6682,8 +6736,7 @@ static int build_index_dir(const char *user_spec,
             clear_status_line();
             stats_thread_started = 0;
         }
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
         for (i = 0; i < chunk_count; i++) free(chunks[i].path);
@@ -6739,8 +6792,7 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -6768,8 +6820,7 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -6799,8 +6850,7 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -6839,8 +6889,7 @@ static int build_index_dir(const char *user_spec,
                 stats_thread_started = 0;
             }
             parallel_bucket_io_shutdown(&ctx);
-            mk_fclose(ctx.paths_fp);
-            mk_fclose(ctx.path_offsets_fp);
+            close_index_path_files(&ctx);
             pthread_mutex_destroy(&queue.mutex);
             pthread_mutex_destroy(&write_queue.mutex);
             pthread_cond_destroy(&write_queue.has_batch);
@@ -6879,8 +6928,7 @@ static int build_index_dir(const char *user_spec,
             stats_thread_started = 0;
         }
         parallel_bucket_io_shutdown(&ctx);
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         pthread_mutex_destroy(&queue.mutex);
         pthread_mutex_destroy(&write_queue.mutex);
         pthread_cond_destroy(&write_queue.has_batch);
@@ -6976,13 +7024,12 @@ static int build_index_dir(const char *user_spec,
         free(chunks);
         index_free_file_states(file_states, path_count);
         parallel_bucket_io_shutdown(&ctx);
-        mk_fclose(ctx.paths_fp);
-        mk_fclose(ctx.path_offsets_fp);
+        close_index_path_files(&ctx);
         return 1;
     }
 
-    if (write_final_path_offset(&ctx) != 0 || paths_writer_close(&ctx) != 0 || mk_fclose(ctx.paths_fp) != 0 ||
-        mk_fclose(ctx.path_offsets_fp) != 0) {
+    if (write_final_path_offset(&ctx) != 0 || paths_writer_close(&ctx) != 0 || flush_isdir_tail(&ctx) != 0) {
+        close_index_path_files(&ctx);
         paths_writer_free(&ctx);
         fprintf(stderr, "failed to finalize paths in %s\n", ctx.index_dir);
         memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
@@ -7006,6 +7053,41 @@ static int build_index_dir(const char *user_spec,
         index_free_file_states(file_states, path_count);
         parallel_bucket_io_shutdown(&ctx);
         return 1;
+    }
+    {
+        int close_bad = 0;
+
+        if (mk_fclose(ctx.paths_fp) != 0) close_bad = 1;
+        ctx.paths_fp = NULL;
+        if (mk_fclose(ctx.path_offsets_fp) != 0) close_bad = 1;
+        ctx.path_offsets_fp = NULL;
+        if (mk_fclose(ctx.path_isdir_fp) != 0) close_bad = 1;
+        ctx.path_isdir_fp = NULL;
+        if (close_bad) {
+            paths_writer_free(&ctx);
+            fprintf(stderr, "failed to finalize paths in %s\n", ctx.index_dir);
+            memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+            free(tids);
+            free(args);
+            pthread_mutex_destroy(&queue.mutex);
+            pthread_mutex_destroy(&write_queue.mutex);
+            pthread_cond_destroy(&write_queue.has_batch);
+            pthread_cond_destroy(&write_queue.has_space);
+            pthread_mutex_destroy(&trigram_queue.mutex);
+            pthread_cond_destroy(&trigram_queue.has_job);
+            pthread_cond_destroy(&trigram_queue.has_space);
+            free(trigram_tids);
+            trigram_tids = NULL;
+            free(tw_worker_args);
+            tw_worker_args = NULL;
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            index_free_file_states(file_states, path_count);
+            parallel_bucket_io_shutdown(&ctx);
+            return 1;
+        }
     }
 
     paths_writer_free(&ctx);
@@ -7673,6 +7755,62 @@ enum {
     SEARCH_INTERSECT_STOP_RATIO = 64
 };
 
+static int path_is_under_any_dir(const char *path, char **dirs, size_t ndirs) {
+    size_t i;
+
+    for (i = 0; i < ndirs; i++) {
+        size_t n;
+
+        if (!dirs[i]) continue;
+        n = strlen(dirs[i]);
+        if (n == 0) continue;
+        if (strncmp(path, dirs[i], n) == 0 && path[n] == '/') return 1;
+    }
+    return 0;
+}
+
+static int load_path_isdir_bits(const char *index_dir, uint64_t npaths, uint8_t **out_bits, size_t *out_bytes) {
+    char path[PATH_MAX];
+    FILE *fp;
+    size_t need;
+    uint8_t *bits;
+    struct stat st;
+
+    *out_bits = NULL;
+    *out_bytes = 0;
+    if (npaths == 0) return 0;
+    if (build_path(path, sizeof(path), index_dir, "path_isdir.bin") != 0) return -1;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "missing path_isdir.bin in %s (rebuild with ereport_index --make)\n", index_dir);
+        return -1;
+    }
+    need = (size_t)((npaths + 7ULL) / 8ULL);
+    if ((uint64_t)st.st_size < (uint64_t)need) {
+        fprintf(stderr, "path_isdir.bin in %s is truncated\n", index_dir);
+        return -1;
+    }
+    bits = (uint8_t *)malloc(need);
+    if (!bits) return -1;
+    fp = fopen(path, "rb");
+    if (!fp) {
+        free(bits);
+        return -1;
+    }
+    if (fread(bits, 1, need, fp) != need) {
+        fclose(fp);
+        free(bits);
+        return -1;
+    }
+    fclose(fp);
+    *out_bits = bits;
+    *out_bytes = need;
+    return 0;
+}
+
+static int path_isdir_bit(const uint8_t *bits, uint64_t path_id) {
+    return (int)((bits[path_id >> 3] >> (path_id & 7ULL)) & 1U);
+}
+
 typedef struct {
     const char *paths_path;
     const char *offsets_path;
@@ -7860,6 +7998,20 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         size_t json_cap = 0;
         size_t ki;
         char **pref_paths = NULL;
+        uint64_t *hit_ids = NULL;
+        char **hit_paths = NULL;
+        size_t hit_n = 0;
+        size_t hit_cap = 0;
+        char **dir_prefs = NULL;
+        size_t dir_n = 0;
+        size_t dir_cap = 0;
+        uint8_t *isdir_bits = NULL;
+        size_t isdir_bytes = 0; /* set by load_path_isdir_bits; unused beyond load */
+        int need_expand = 0;
+        uint64_t *final_ids = NULL;
+        char **final_paths = NULL;
+        size_t final_n = 0;
+        size_t final_cap = 0;
 
         /* One shared header/chunk-table/dictionary load; the workers below only add a FILE* and a
          * decompression context each, so the table does not get duplicated per thread. */
@@ -7947,6 +8099,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
 
             if (pref_paths) {
                 path = pref_paths[i];
+                pref_paths[i] = NULL;
             } else {
                 path = read_path_by_id(&serial_pr, offsets_fp, current.ids[i]);
                 if (!path) continue;
@@ -7956,34 +8109,177 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                 }
             }
             if (!path) continue;
-            if (match_idx >= skip_req && page_emitted < max_emit) {
-                if (json_output) {
-                    if (page_emitted >= json_cap) {
-                        size_t nc = json_cap ? json_cap * 2 : 64;
-                        char **np = (char **)realloc(json_paths, nc * sizeof(char *));
-                        if (!np) {
-                            free(path);
-                            for (ki = 0; ki < page_emitted; ki++) free(json_paths[ki]);
-                            free(json_paths);
-                            free(current.ids);
-                            current.ids = NULL;
-                            goto out;
-                        }
-                        json_paths = np;
-                        json_cap = nc;
-                    }
-                    json_paths[page_emitted++] = path;
-                } else {
-                    printf("%s\n", path);
+            if (hit_n == hit_cap) {
+                size_t nc = hit_cap ? hit_cap * 2 : 64;
+                uint64_t *ni;
+                char **np;
+
+                ni = (uint64_t *)realloc(hit_ids, nc * sizeof(*ni));
+                if (!ni) {
                     free(path);
-                    page_emitted++;
+                    for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                    free(hit_ids);
+                    free(hit_paths);
+                    free(pref_paths);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
                 }
-            } else {
-                free(path);
+                hit_ids = ni;
+                np = (char **)realloc(hit_paths, nc * sizeof(*np));
+                if (!np) {
+                    free(path);
+                    for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                    free(hit_ids);
+                    free(hit_paths);
+                    free(pref_paths);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
+                }
+                hit_paths = np;
+                hit_cap = nc;
             }
-            match_idx++;
+            hit_ids[hit_n] = current.ids[i];
+            hit_paths[hit_n] = path;
+            hit_n++;
+        }
+        free(pref_paths);
+        pref_paths = NULL;
+
+        if (hit_n > 0 && indexed_paths_corpus > 0 &&
+            load_path_isdir_bits(index_dir, indexed_paths_corpus, &isdir_bits, &isdir_bytes) != 0) {
+            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+            free(hit_ids);
+            free(hit_paths);
+            free(current.ids);
+            current.ids = NULL;
+            goto out;
+        }
+        (void)isdir_bytes;
+        for (ki = 0; ki < hit_n; ki++) {
+            if (!isdir_bits || !path_isdir_bit(isdir_bits, hit_ids[ki])) continue;
+            if (dir_n == dir_cap) {
+                size_t nc = dir_cap ? dir_cap * 2 : 16;
+                char **np = (char **)realloc(dir_prefs, nc * sizeof(*np));
+
+                if (!np) {
+                    for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
+                    free(hit_ids);
+                    free(hit_paths);
+                    free(dir_prefs);
+                    free(isdir_bits);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
+                }
+                dir_prefs = np;
+                dir_cap = nc;
+            }
+            dir_prefs[dir_n++] = hit_paths[ki];
+            need_expand = 1;
         }
 
+        if (need_expand) {
+            size_t hi = 0;
+            uint64_t pid;
+
+            paths_reader_free(&serial_pr);
+            if (paths_fp) {
+                fclose(paths_fp);
+                paths_fp = NULL;
+            }
+            if (offsets_fp) {
+                fclose(offsets_fp);
+                offsets_fp = NULL;
+            }
+            paths_fp = fopen(paths_path, "rb");
+            offsets_fp = fopen(offsets_path, "rb");
+            if (!paths_fp || !offsets_fp || paths_reader_init(&serial_pr, paths_fp, &paths_index) != 0) {
+                fprintf(stderr, "cannot open paths.bin under %s\n", index_dir);
+                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                free(hit_ids);
+                free(hit_paths);
+                free(dir_prefs);
+                free(isdir_bits);
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
+            }
+
+            for (pid = 0; pid < indexed_paths_corpus; pid++) {
+                int at_hit = (hi < hit_n && hit_ids[hi] == pid);
+                char *path;
+
+                if (final_n == final_cap) {
+                    size_t nc = final_cap ? final_cap * 2 : (hit_n ? hit_n * 2 : 64);
+                    uint64_t *ni;
+                    char **np;
+
+                    ni = (uint64_t *)realloc(final_ids, nc * sizeof(*ni));
+                    if (!ni) {
+                        for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                        for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
+                        free(hit_ids);
+                        free(hit_paths);
+                        free(final_ids);
+                        free(final_paths);
+                        free(dir_prefs);
+                        free(isdir_bits);
+                        free(current.ids);
+                        current.ids = NULL;
+                        goto out;
+                    }
+                    final_ids = ni;
+                    np = (char **)realloc(final_paths, nc * sizeof(*np));
+                    if (!np) {
+                        for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                        for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
+                        free(hit_ids);
+                        free(hit_paths);
+                        free(final_ids);
+                        free(final_paths);
+                        free(dir_prefs);
+                        free(isdir_bits);
+                        free(current.ids);
+                        current.ids = NULL;
+                        goto out;
+                    }
+                    final_paths = np;
+                    final_cap = nc;
+                }
+
+                if (at_hit) {
+                    final_ids[final_n] = pid;
+                    final_paths[final_n] = hit_paths[hi];
+                    hit_paths[hi] = NULL;
+                    final_n++;
+                    hi++;
+                    continue;
+                }
+
+                path = read_path_by_id(&serial_pr, offsets_fp, pid);
+                if (!path) continue;
+                if (!path_is_under_any_dir(path, dir_prefs, dir_n)) {
+                    free(path);
+                    continue;
+                }
+                final_ids[final_n] = pid;
+                final_paths[final_n] = path;
+                final_n++;
+            }
+            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+            free(hit_ids);
+            free(hit_paths);
+            hit_ids = final_ids;
+            hit_paths = final_paths;
+            hit_n = final_n;
+            final_ids = NULL;
+            final_paths = NULL;
+        }
+
+        free(dir_prefs);
+        free(isdir_bits);
         paths_reader_free(&serial_pr);
         if (paths_fp) {
             fclose(paths_fp);
@@ -7993,7 +8289,46 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
             fclose(offsets_fp);
             offsets_fp = NULL;
         }
-        if (pref_paths) free(pref_paths);
+
+        for (ki = 0; ki < hit_n; ki++) {
+            char *path = hit_paths[ki];
+
+            if (!path) continue;
+            if (match_idx >= skip_req && page_emitted < max_emit) {
+                if (json_output) {
+                    if (page_emitted >= json_cap) {
+                        size_t nc = json_cap ? json_cap * 2 : 64;
+                        char **np = (char **)realloc(json_paths, nc * sizeof(char *));
+                        if (!np) {
+                            free(path);
+                            for (size_t j = ki + 1; j < hit_n; j++) free(hit_paths[j]);
+                            for (size_t j = 0; j < page_emitted; j++) free(json_paths[j]);
+                            free(json_paths);
+                            free(hit_ids);
+                            free(hit_paths);
+                            free(current.ids);
+                            current.ids = NULL;
+                            goto out;
+                        }
+                        json_paths = np;
+                        json_cap = nc;
+                    }
+                    json_paths[page_emitted++] = path;
+                    hit_paths[ki] = NULL;
+                } else {
+                    printf("%s\n", path);
+                    free(path);
+                    hit_paths[ki] = NULL;
+                    page_emitted++;
+                }
+            } else {
+                free(path);
+                hit_paths[ki] = NULL;
+            }
+            match_idx++;
+        }
+        free(hit_ids);
+        free(hit_paths);
 
         if (json_output) {
             uint64_t search_ms_done = monotonic_ms_elapsed(&t_search_start);

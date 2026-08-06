@@ -467,6 +467,8 @@ The images below are illustrative mockups of the layout (fonts and spacing may d
 
 `ereport_index` builds and searches an on-disk trigram index over crawl path strings—either for one resolved Unix user or for every UID when no user is selected (see `--make` disambiguation below; same idea as `ereport` all-users mode: all uid-shard files, no UID filter on records).
 
+Indexing is **segment-once**: trigrams are taken only from each path's basename (the final component). Parent directory names are not re-trigrammed onto every child. Directory records still contribute their own basename trigrams, and `--search` expands a matching directory to its descendants so middle-segment hits remain complete.
+
 The search is a case-insensitive substring match on individual path segments (slashes separate segments; matches do not span `/`). For example:
 
 ```text
@@ -476,8 +478,9 @@ doc
 matches paths such as:
 
 ```text
-/path/foo/alice/...
+/path/foo/acme-docs
 /path/foo/acme-docs/...
+/path/foo/doc
 /path/foo/doc/...
 ```
 
@@ -610,9 +613,10 @@ Current index format:
 
 Current files under `<username>/index/`:
 
-- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields)
+- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields; `trigrams=basename` on version 3+)
 - `path_offsets.bin`
 - `paths.bin`
+- `path_isdir.bin` — bit-packed directory flags (one bit per `path_id`) for search-time descendant expansion
 - `tri_keys.bin`
 - `tri_postings.bin`
 - `dirs.idx`, `rowgroups.idx` — the directory-index sidecars, unless `--no-dir-index` was passed
@@ -627,7 +631,13 @@ Cost, measured on a 1.13M-record capture of 21726 directories: `dirs.idx` 509 Ki
 
 `--make` reports `dir_index=1`, `dir_index_dirs`, `dir_index_bytes`, `rowgroup_index_groups`, `rowgroup_index_bytes` and `dir_index_sec` on stdout, and `meta.txt` records `dir_index`, `dir_index_dirs`, `rowgroup_index` and `rowgroup_index_groups`. Those are advisory: a reader validates the sidecars against the shards themselves, not against `meta.txt`.
 
-#### Compression (index version 2)
+#### Index version 3 (basename trigrams)
+
+Version 3 keeps the version-2 compression layout and changes what is inverted: each path contributes trigrams from its basename only. `path_isdir.bin` is written beside `path_offsets.bin`. `--search` intersects basename postings, verifies candidates, then if any hit is a directory walks the corpus for paths under those directory prefixes so segment-anywhere semantics stay intact without re-emitting parent trigrams during `--make`.
+
+There is no dual-read path for older indexes: `--search` and `--resume-merge` require `ereport_index_version=3` in `meta.txt`.
+
+#### Compression (index version 2+)
 
 The two files that dominate index size are zstd-compressed; the two that are random-accessed by fixed-size record are not.
 
@@ -640,7 +650,7 @@ The two files that dominate index size are zstd-compressed; the two that are ran
 
 A trained zstd dictionary for `paths.bin` was measured and rejected. A 256 KiB chunk already holds roughly 1400 neighbouring paths, so its window captures nearly all of the shared-prefix redundancy: on a 199k-path `/usr` corpus a 64 KiB dictionary shrank the compressed frames by 1.7%, but storing the dictionary made the file 3% larger overall, and training it cost 0.34 s on the paths writer — the only serial stage of the `--make` pipeline.
 
-There is no dual-read path for older indexes: `--search` and `--resume-merge` check `ereport_index_version=2` in `meta.txt` and the `EPATH002` magic in `paths.bin`, and tell you to rebuild if either is missing.
+`--search` and `--resume-merge` also check the `EPATH002` magic in `paths.bin`, and tell you to rebuild if it is missing.
 
 During merge, transient `tmp_trigrams_*.bin` files are removed as buckets are processed. Parallel merge may create short-lived `merge_seg_k_*` / `merge_seg_p_*` segment files under the same directory; successful runs delete them after the stitch step. `--resume-merge` also drops orphan half-segment files if a crash left only one of the pair.
 

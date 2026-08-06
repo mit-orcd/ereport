@@ -1962,14 +1962,16 @@ run_integration() {
         tail -n 80 "${td}/ei.stderr" >&2 || true
         die "ereport_index --make failed"
     }
-    [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" ]] ||
-        die "ereport_index did not write tri_keys.bin / paths.bin under ${idx_make}"
-    summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin written"
+    [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" && -f "${idx_make}/path_isdir.bin" ]] ||
+        die "ereport_index did not write tri_keys.bin / paths.bin / path_isdir.bin under ${idx_make}"
+    summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin+path_isdir.bin written"
 
     expect_eq "ereport_index: paths.bin magic" "EPATH002" "$(head -c 8 "${idx_make}/paths.bin")" \
         "paths.bin uses the compressed EPATH002 layout"
-    expect_eq "ereport_index: meta version" "2" "$(kv_last ereport_index_version "${idx_make}/meta.txt")" \
-        "meta.txt records the compressed index version"
+    expect_eq "ereport_index: meta version" "3" "$(kv_last ereport_index_version "${idx_make}/meta.txt")" \
+        "meta.txt records the basename-trigram index version"
+    expect_eq "ereport_index: trigrams scope" "basename" "$(kv_last trigrams "${idx_make}/meta.txt")" \
+        "meta.txt records basename-only trigrams"
 
     # Round trip through both compressed files: postings decode, then a path comes back out of paths.bin.
     log "ereport_index --search (compressed index round trip)"
@@ -1987,21 +1989,44 @@ run_integration() {
     [[ "$ei_hits" -ge 1 ]] || die "ereport_index --search found no path containing 'sub'"
     summary_add PASS "ereport_index --search" "${ei_hits} path(s) decoded from the compressed index"
 
+    # Basename-only trigrams still find descendants under a matching directory segment.
+    log "ereport_index segment-once (directory hit expands to descendant file)"
+    local seg_root="${td}/segonce_tree" seg_crawl="${td}/segonce_crawl" seg_idx="${td}/segonce_idx"
+    mkdir -p "${seg_root}/unique_dir_xyz/nested"
+    printf 'x\n' >"${seg_root}/unique_dir_xyz/nested/leaf_only.dat"
+    "$ECRAWL" "$seg_root" "$seg_crawl" >/dev/null 2>"${td}/segonce_crawl.err" || {
+        tail -n 40 "${td}/segonce_crawl.err" >&2 || true
+        die "ecrawl failed for segment-once fixture"
+    }
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --index-dir "$seg_idx" --no-dir-index "$(id -un)" "$seg_crawl" \
+        >"${td}/segonce_make.out" 2>"${td}/segonce_make.err" || {
+        tail -n 40 "${td}/segonce_make.err" >&2 || true
+        die "ereport_index --make failed on segment-once fixture"
+    }
+    "$EREPORT_INDEX" --search --index-dir "$seg_idx" unique_dir_xyz >"${td}/segonce_search.out" 2>"${td}/segonce_search.err" || {
+        tail -n 40 "${td}/segonce_search.err" >&2 || true
+        die "ereport_index --search failed on segment-once fixture"
+    }
+    grep -q 'leaf_only\.dat$' "${td}/segonce_search.out" ||
+        die "ereport_index --search unique_dir_xyz did not expand to nested/leaf_only.dat"
+    summary_add PASS "ereport_index segment-once expand" "directory hit returns descendant file"
+
     "$EREPORT_INDEX" --search --index-dir "$idx_make" zzqqxxnotpresent >"${td}/ei_search_none.out" 2>/dev/null || true
     [[ ! -s "${td}/ei_search_none.out" ]] ||
         die "ereport_index --search returned matches for a term that is not in the tree"
     summary_add PASS "ereport_index --search (no match)" "absent term returns nothing"
 
-    # An index from before the compression change must be rejected rather than misread.
+    # An older index version must be rejected rather than misread.
     local idx_stale="${td}/index_stale"
     cp -r "$idx_make" "$idx_stale"
-    sed -i 's/^ereport_index_version=2$/ereport_index_version=1/' "${idx_stale}/meta.txt"
+    sed -i 's/^ereport_index_version=3$/ereport_index_version=2/' "${idx_stale}/meta.txt"
     if "$EREPORT_INDEX" --search --index-dir "$idx_stale" sub >/dev/null 2>"${td}/ei_stale.err"; then
-        die "ereport_index --search accepted an index whose meta.txt claims version 1"
+        die "ereport_index --search accepted an index whose meta.txt claims version 2"
     fi
     grep -q "rebuild" "${td}/ei_stale.err" ||
         die "ereport_index --search rejected the stale index without telling the user to rebuild"
-    summary_add PASS "ereport_index version gate" "a v1 index is refused with a rebuild hint"
+    summary_add PASS "ereport_index version gate" "a v2 index is refused with a rebuild hint"
 
     run_ecrawl_mount_tests "$td" "$root_abs" "$crawl_out" "$ce"
 
