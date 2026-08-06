@@ -28,7 +28,6 @@ uname -a | tee "$RESULTS/env_host.txt"
 df -T /path/to/tree | tee -a "$RESULTS/env_host.txt"
 # If ZFS:
 #   cat /proc/spl/kstat/zfs/arcstats | tee "$RESULTS/arcstats_before.txt"
-# Optional: scripts/tools/ecrawl-mem-arc-snapshot.sh during the crawl
 ```
 
 Set `THREADS` once and leave it alone: it is the total worker budget handed to every tool that accepts one (ecrawl's three pools, `ereport_index`'s two, GUFI `-n`, XDU `-j`, `fd`, `dua`, `dut` `-t`, and Robinhood's scan and pipeline threads via its config). Setting a specific `ECRAWL_*` or `EREPORT_INDEX_*` variable overrides its share, which the summary then reports as resolved. Robinhood's share is written by `mariadb.sh setup`, so change `THREADS` before that step, not after.
