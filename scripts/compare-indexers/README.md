@@ -443,11 +443,11 @@ but the slowest tool and flattens everything else into a sliver at the origin.
 On a log axis a phase split cannot be read additively, so the phases move from
 the bar into its label.
 
-**Figures 1 and 2** are the traversal figures, and their five rows are the one
-group that compares with no asterisk at all: `find`, `fd`, `du`, `dua` and
-`ecrawl --no-write` each walk the whole tree and keep nothing. `find` and `fd`
-only read directories; `du`, `dua` and `ecrawl` also `stat` every entry, which
-is most of the spread between them. `ecrawl --no-write` is what earns `ecrawl` a
+**Figures 1 and 2** are the traversal figures, and their six rows are the one
+group that compares with no asterisk at all: `find`, `fd`, `du`, `dua`, `dut`
+and `ecrawl --no-write` each walk the whole tree and keep nothing. `find` and
+`fd` only read directories; `du`, `dua`, `dut` and `ecrawl` also `stat` every
+entry, which is most of the spread between them. `ecrawl --no-write` is what earns `ecrawl` a
 place here at all — its full capture against `find` is not a like-for-like race,
 but its walk without the capture is. The capture's own cost stays readable in
 `SUMMARY_TABLE.txt` as `ecrawl/write` minus `ecrawl/nowrite`; it is not a bar,
@@ -561,14 +561,14 @@ python3 scripts/compare-indexers/plot_results.py \
 
 ## Paper queries
 
-| ID | Meaning | find | fd | du | dua | suite | GUFI | XDU |
-|----|---------|------|----|----|-----|-------|------|-----|
-| Q1 | unique name | `-name` | `-g` glob | – | – | `ereport_index --search` \| `grep` | `gufi_find -name` | `xdu-find -p` |
-| Q2 | `slurm-*.out` | `-name` glob | `-g` glob | – | – | `ereport_index --search slurm-` \| `grep` | `gufi_find` | regex |
-| Q3 | size > 500MB | `-size` | `--size` | – | – | `ecrawl_query --size-gt --type f --list` | `-size` | `--min-size` |
-| Q4 | subtree bytes, apparent | – | – | `du -sb` | `dua aggregate -A` | `ecrawl_query --subtree` → `bytes=` | `gufi_du -s` (rollup only) | sum sizes |
-| Q5 | subtree file count | `-type f` | `-t f` | – | – | `ecrawl_query --subtree --type f --list` | `gufi_find` | `--count` |
-| Q6 | `*token*.dat` **[extra]** | `-name` glob | `-g` glob | – | – | `ereport_index --search token` \| `grep` | `gufi_find` | regex |
+| ID | Meaning | find | fd | du | dua | dut | suite | GUFI | XDU |
+|----|---------|------|----|----|-----|-----|-------|------|-----|
+| Q1 | unique name | `-name` | `-g` glob | – | – | – | `ereport_index --search` \| `grep` | `gufi_find -name` | `xdu-find -p` |
+| Q2 | `slurm-*.out` | `-name` glob | `-g` glob | – | – | – | `ereport_index --search slurm-` \| `grep` | `gufi_find` | regex |
+| Q3 | size > 500MB | `-size` | `--size` | – | – | – | `ecrawl_query --size-gt --type f --list` | `-size` | `--min-size` |
+| Q4 | subtree bytes, apparent | – | – | `du -sb` | `dua aggregate -A` | `dut -b -s` | `ecrawl_query --subtree` → `bytes=` | `gufi_du -s` (rollup only) | sum sizes |
+| Q5 | subtree file count | `-type f` | `-t f` | – | – | – | `ecrawl_query --subtree --type f --list` | `gufi_find` | `--count` |
+| Q6 | `*token*.dat` **[extra]** | `-name` glob | `-g` glob | – | – | – | `ereport_index --search token` \| `grep` | `gufi_find` | regex |
 
 ### Q6 is extra
 
@@ -672,9 +672,9 @@ puts it on the bar next to the two numbers.
 
 ### Traditional baselines
 
-Four traditional tools run as separate rows, in two matched pairs — serial and
-parallel — so a slow `find` or `du` is not mistaken for the best the traditional
-approach can do:
+Five traditional tools run as separate rows, one serial search and one serial
+aggregate against their parallel counterparts, so a slow `find` or `du` is not
+mistaken for the best the traditional approach can do:
 
 | Tool | Pair | Answers |
 |------|------|---------|
@@ -682,12 +682,13 @@ approach can do:
 | `fd` | parallel search | Q1–Q3, Q5, Q6 |
 | `du` | serial aggregate | Q4 |
 | `dua` ([dua-cli](https://github.com/Byron/dua-cli)) | parallel aggregate | Q4 |
+| `dut` ([dut](https://codeberg.org/201984/dut)) | parallel aggregate | Q4 |
 
 A dash above means the tool has no primitive for that query, not that it lost:
-`find`/`fd` cannot total a subtree, and `du`/`dua` have no name, type or size
-predicates. Q4 therefore moved off the `find` rows onto `du`, which measures the
-identical `du -sb` call. `find` is also the reference every other tool's count is
-checked against, Q6 included — an unanchored glob costs it exactly what an
+`find`/`fd` cannot total a subtree, and `du`/`dua`/`dut` have no name, type or
+size predicates. Q4 therefore moved off the `find` rows onto `du`, which measures
+the identical `du -sb` call. `find` is also the reference every other tool's count
+is checked against, Q6 included — an unanchored glob costs it exactly what an
 anchored one does, since it was reading every name either way.
 
 `fd` follows the [test.sh](../test/test.sh) convention (`--hidden --no-ignore`,
@@ -700,9 +701,26 @@ With the sentinel its total matches `du -sb` exactly. `DUA_BIN` is probed by
 running it, since a `dua` built against a newer glibc resolves on `PATH` but
 dies at startup.
 
-Both parallel walkers are pinned to `THREADS`, the same budget ecrawl, GUFI, XDU
-and Robinhood get; `find` and `du` are single-threaded by design, which is the
-point of reporting all four.
+`dut` is the other parallel `du`, and runs as `-c -b -s -d 0 -n 1`, plus `-x` on
+the walk row only. `-s -b` is what makes its total apparent bytes rather than
+size on disk, and it deduplicates hard links the way `du` does, so it needs no
+annotation: on the seeded fixture it returns `du -sb`'s number to the byte. The
+rest are not cosmetic — `dut` sizes its output from the terminal height and,
+with stdout on a pipe and no `-n`, prints *every entry in the tree*, which on a
+production tree would make the row a measurement of printing rather than of
+walking, and `-c` drops the colour escapes so the total parses. The `-x` split
+is deliberate: on the walk row `dut` is the counterpart of `find -xdev` and is
+bounded like every other walk baseline, while Q4 is compared against `du -sb`,
+which crosses mount points, so a `dut` held to one filesystem would answer a
+smaller number on any tree with a mount inside it and be marked DISAGREES for a
+difference this harness introduced. `env.txt` records both vectors. It answers
+Q4 only: `-f` counts files and directories together with no type predicate, so
+Q5 is skipped rather than answered with a number that means something else.
+
+All three parallel walkers are pinned to `THREADS`, the same budget ecrawl,
+GUFI, XDU and Robinhood get — `dut` defaults to 4 threads or one per logical
+processor, whichever is larger; `find` and `du` are single-threaded by design,
+which is the point of reporting all five.
 
 ### Thread budget
 
@@ -716,7 +734,7 @@ split the budget:
 |------|------------------------|
 | ecrawl | crawl + stat + writer, keeping its stock 2:1:1 shape (16 → 8+4+4) |
 | `ereport_index --make` | parse workers + trigram writers, halved |
-| ereport, GUFI `-n`, XDU `-j`, `fd`, `dua` | one pool, the whole budget |
+| ereport, GUFI `-n`, XDU `-j`, `fd`, `dua`, `dut` `-t` | one pool, the whole budget |
 | Robinhood | `nb_threads_scan` + `EntryProcessor`, halved, written into its config |
 | `find`, `du` | single-threaded, nothing to set |
 
@@ -769,7 +787,7 @@ older result sets and the paper's own tables remain comparable.
    tables, which is not a database anyone queries; `indexes` times the three
    `CREATE INDEX` statements that make them queryable. Both are what Robinhood
    costs, and the charts and the summary add them.
-7. `find` / `fd` / `du` / `dua` `walk` — live walks with `index_bytes=0`
+7. `find` / `fd` / `du` / `dua` / `dut` `walk` — live walks with `index_bytes=0`
 
 The walk rows time the same metadata sweep the indexers perform, only discarded
 instead of stored. They are reference points rather than indexers, so they stay
@@ -792,7 +810,7 @@ versions. [`init.sh`](init.sh) clones and builds the pinned tags into a private
 prefix:
 
 ```bash
-# Installs GUFI, XDU, Robinhood and dua into the default PREFIX
+# Installs GUFI, XDU, Robinhood, dua and dut into the default PREFIX
 # (~/.local/indexer-compare, or the ORCD scratch prefix when that dir exists).
 # Lists the dnf/apt build dependencies and asks before installing them.
 scripts/compare-indexers/init.sh
@@ -838,6 +856,7 @@ helper refuses to drop a database unless its private provision marker matches.
 - **XDU v0.4.1:** <https://github.com/glentner/xdu> — `xdu`, `xdu-find`
 - **Robinhood 3.2.0:** <https://github.com/cea-hpc/robinhood> — POSIX build; optional `SETUP_MARIADB=1` provisions a disposable local database and config
 - **dua-cli 2.39.1:** <https://github.com/Byron/dua-cli> — `dua`; taken from the distribution package when present, otherwise `cargo install`
+- **dut:** <https://codeberg.org/201984/dut> — `dut`; built from a local checkout (`DUT_SRC`, default `~/git/dut`) rather than a pinned tag, because upstream's only tag predates both the flag that counts files and a fix for losing entries when the getdents buffer fills. The sources are copied into `SRC_ROOT` and built there, so the checkout stays clean, and the stamp is `git describe --tags --always --dirty` on it — edit that tree and the next `init.sh` rebuilds
 
 Overrides: see `lib.sh` (`GUFI_DIR2INDEX`, `XDU_BIN`, `ECRAWL_BIN`, …).
 
@@ -948,7 +967,7 @@ control.
 ## Fairness checklist
 
 - Same tree, host, and thread budget
-- `THREADS` is the total per tool and covers ecrawl, `ereport_index`, ereport, GUFI, XDU, `fd`, `dua` and Robinhood; `env.txt` records the resolved split plus `fd_args` / `dua_args`
+- `THREADS` is the total per tool and covers ecrawl, `ereport_index`, ereport, GUFI, XDU, `fd`, `dua`, `dut` and Robinhood; `env.txt` records the resolved split plus `fd_args` / `dua_args` / `dut_walk_args` / `dut_query_args`
 - `RLIMIT_NOFILE` raised to 128k, so no tool is throttled by a limit another one escaped
 - Every index and every query measured cold **and** hot, recorded per row in the `cache` column and never averaged together
 - Hot queries rotate through three argument sets, so no hot number is a re-answer of the question the pass before it asked

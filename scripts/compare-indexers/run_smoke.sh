@@ -15,7 +15,7 @@
 #                        without waiting for a real tree
 #   SKIP_PREPARE=0|1     reuse existing synth-root
 #   SKIP_CORRECTNESS=0|1
-#   TOOLS_INDEX=...      default: ecrawl find du (+ fd/dua/gufi/xdu if installed)
+#   TOOLS_INDEX=...      default: ecrawl find du (+ fd/dua/dut/gufi/xdu if installed)
 #   TOOLS_QUERY=...      explicit query tool list (disables auto-detection)
 #   REPS=1               keep smoke fast (queries use same REPS)
 #   CACHE_MODES="cold hot"  passes per repetition; one name for a single pass
@@ -89,6 +89,7 @@ if [[ -z "$TOOLS_INDEX" ]]; then
   baseline_candidate fd && TOOLS_INDEX+=" fd"
   tool_available du && TOOLS_INDEX+=" du"
   baseline_candidate dua && TOOLS_INDEX+=" dua"
+  baseline_candidate dut && TOOLS_INDEX+=" dut"
   tool_available gufi && TOOLS_INDEX+=" gufi"
   tool_available xdu && TOOLS_INDEX+=" xdu"
   # Installed but unprovisioned Robinhood would contribute a scan that cannot
@@ -126,6 +127,7 @@ else
   baseline_candidate fd && TOOLS_Q+=" fd"
   tool_available du && TOOLS_Q+=" du"
   baseline_candidate dua && TOOLS_Q+=" dua"
+  baseline_candidate dut && TOOLS_Q+=" dut"
   tool_available gufi && [[ -n "${GUFI_INDEX_DIR:-}" ]] && TOOLS_Q+=" gufi"
   tool_available xdu && [[ -n "${XDU_INDEX_DIR:-}" ]] && TOOLS_Q+=" xdu"
   tool_available robinhood && rbh_db_ready && TOOLS_Q+=" robinhood"

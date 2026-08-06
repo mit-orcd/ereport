@@ -109,7 +109,7 @@
 # REPS defaults to 3 here (run_smoke.sh alone defaults to 1) because the charts
 # need repetitions to show error bars. DROP_CACHES defaults to 1 when running as
 # root and 0 otherwise. DO_NOWRITE defaults to 1 here so ecrawl's walk-only row
-# is measured alongside find/fd/du/dua, which also store nothing; set
+# is measured alongside find/fd/du/dua/dut, which also store nothing; set
 # DO_NOWRITE=0 to skip that extra traversal. On dnf hosts PKG_ARGS defaults to
 # --disableplugin=etckeeper so a site hook cannot stall the install on a
 # password prompt; set PKG_ARGS to override.
@@ -150,7 +150,7 @@ FROM_ENV_CACHE_MODES=${CACHE_MODES+1}
 FROM_ENV_INSTALL=${INSTALL_PACKAGES+1}
 # An explicit empty TOOLS means "install nothing external", so honour it rather
 # than falling back to the default set.
-TOOLS=${TOOLS-"gufi xdu robinhood dua"}
+TOOLS=${TOOLS-"gufi xdu robinhood dua dut"}
 REPS=${REPS:-3}
 # Cold and hot both get measured; the correctness modes below drop back to one
 # pass. Defaulted here as well as in lib.sh so this script can report it.
@@ -218,7 +218,7 @@ usage() {
 # script deliberately does not source lib.sh, and a typo has to be caught here:
 # rejected at the command line it costs a retype, accepted it costs a whole run
 # at a repetition count nobody chose.
-REPS_TOOL_NAMES="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua"
+REPS_TOOL_NAMES="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
 
 reps_valid() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1)); }
 
@@ -724,7 +724,7 @@ do_run() {
   printf 'results=%s\n' "$results" >>"$tree/$STATE_NAME.tmp"
   mv "$tree/$STATE_NAME.tmp" "$tree/$STATE_NAME"
 
-  # find, fd, du and dua all walk without storing anything, so ecrawl's
+  # find, fd, du, dua and dut all walk without storing anything, so ecrawl's
   # walk-only mode is the only like-for-like row against them. It costs one
   # extra traversal per rep, which is the cheapest walk in the table.
   local nowrite=${DO_NOWRITE:-1}

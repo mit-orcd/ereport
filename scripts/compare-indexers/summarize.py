@@ -34,21 +34,6 @@ def fmt(x, nd=3):
     return ("{0:." + str(nd) + "f}").format(x)
 
 
-# ecrawl_query answered Q3/Q4/Q5 as ecrawl_analyze until the rename. Rows
-# recorded under the old name are folded onto the current one, so a results
-# directory from before it reads as one tool rather than two; the output captured
-# beside those rows still carries the old filenames, which is what
-# tool_spellings is for.
-LEGACY_TOOL_NAMES = {"ecrawl_analyze": "ecrawl_query"}
-LEGACY_TOOL_FILES = {new: old for old, new in LEGACY_TOOL_NAMES.items()}
-
-
-def tool_spellings(tool):
-    """The names a tool's captured output can be filed under, current first."""
-    legacy = LEGACY_TOOL_FILES.get(tool)
-    return (tool, legacy) if legacy else (tool,)
-
-
 def load_csv(path):
     """Rows, each tagged with the directory it came from so that stderr lookups
     stay inside the phase that produced the row."""
@@ -56,8 +41,6 @@ def load_csv(path):
         rows = list(csv.DictReader(f))
     for row in rows:
         row["__dir"] = str(path.parent)
-        if row.get("tool") in LEGACY_TOOL_NAMES:
-            row["tool"] = LEGACY_TOOL_NAMES[row["tool"]]
     return rows
 
 
@@ -379,6 +362,7 @@ def summarize_env(env, arg_sets=1):
         ("fd", "version_fd"),
         ("du", "version_du"),
         ("dua", "version_dua"),
+        ("dut", "version_dut"),
     ]
     shown = [(label, env[key]) for label, key in versions if env.get(key)]
     if shown:
@@ -572,8 +556,8 @@ def summarize_index(rows):
         lines.append("")
         lines.append("walk-only rows (store nothing, so index_MiB is 0): " + ", ".join(walkers))
         lines.append("  These measure traversal alone. ecrawl/nowrite is the like-for-like")
-        lines.append("  comparison against find, fd, du and dua; ecrawl/write is that same walk")
-        lines.append("  plus writing the capture, so the difference is the cost of storing it.")
+        lines.append("  comparison against find, fd, du, dua and dut; ecrawl/write is that same")
+        lines.append("  walk plus writing the capture, so the difference is the cost of storing it.")
     return lines
 
 
@@ -806,20 +790,19 @@ def find_stderr(row_dir, tool, label, rep):
     base = Path(row_dir)
     if not base.is_dir():
         return None
-    for spelling in tool_spellings(tool):
-        candidates = [
-            "{0}_{1}_r{2}.stderr.txt".format(spelling, label, rep),
-            "{0}_{1}_r{2}.err.txt".format(spelling, label, rep),
-            "{0}_r{1}.stderr.txt".format(spelling, rep),
-            "{0}_r{1}.err.txt".format(spelling, rep),
-        ]
-        for name in candidates:
-            p = base / name
-            if p.is_file() and p.stat().st_size > 0:
-                return p
-        for p in sorted(base.glob("{0}*{1}*_r{2}*err*.txt".format(spelling, label, rep))):
-            if p.is_file() and p.stat().st_size > 0:
-                return p
+    candidates = [
+        "{0}_{1}_r{2}.stderr.txt".format(tool, label, rep),
+        "{0}_{1}_r{2}.err.txt".format(tool, label, rep),
+        "{0}_r{1}.stderr.txt".format(tool, rep),
+        "{0}_r{1}.err.txt".format(tool, rep),
+    ]
+    for name in candidates:
+        p = base / name
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    for p in sorted(base.glob("{0}*{1}*_r{2}*err*.txt".format(tool, label, rep))):
+        if p.is_file() and p.stat().st_size > 0:
+            return p
     return None
 
 
@@ -899,6 +882,10 @@ CANNOT_MARKERS = (
     # dua answer. Unmatched, this landed in UNRECOGNIZED SKIP REASON, which reads
     # as something to fix rather than as the capability gap it is.
     "reports_sizes_not_file_counts",
+    # dut's -f counts files and directories together and takes no type
+    # predicate, so it cannot be asked Q5's question either. Its other four
+    # skips already read as "totals_bytes_only".
+    "no_type_filter",
     "_lacks_",
     "no_such_predicate",
     # The plain GUFI index cannot answer Q4: gufi_du reads treesummary rows, and
@@ -1007,19 +994,18 @@ def find_stdout(row_dir, tool, query, rep):
     base = Path(row_dir)
     if not base.is_dir():
         return None
-    for spelling in tool_spellings(tool):
-        for name in (
-            "{0}_{1}_r{2}.out.txt".format(spelling, query, rep),
-            "{0}_{1}_r{2}.stdout.txt".format(spelling, query, rep),
-        ):
-            p = base / name
-            if p.is_file():
-                return p
-        # Later passes carry the pass in the filename (_hot_a2), so the exact
-        # names above only find the first one.
-        for p in sorted(base.glob("{0}_{1}_r{2}_*.out.txt".format(spelling, query, rep))):
-            if p.is_file():
-                return p
+    for name in (
+        "{0}_{1}_r{2}.out.txt".format(tool, query, rep),
+        "{0}_{1}_r{2}.stdout.txt".format(tool, query, rep),
+    ):
+        p = base / name
+        if p.is_file():
+            return p
+    # Later passes carry the pass in the filename (_hot_a2), so the exact
+    # names above only find the first one.
+    for p in sorted(base.glob("{0}_{1}_r{2}_*.out.txt".format(tool, query, rep))):
+        if p.is_file():
+            return p
     return None
 
 

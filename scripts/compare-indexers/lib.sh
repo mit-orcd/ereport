@@ -325,6 +325,7 @@ _unexecutable_why() {
 # warning benchmark.sh prints before the run give the same instruction.
 FD_FIX_HINT="install the fd-find package"
 DUA_FIX_HINT="rebuild it with 'TOOLS=dua FORCE_REINSTALL=1 scripts/compare-indexers/init.sh'"
+DUT_FIX_HINT="rebuild it with 'TOOLS=dut FORCE_REINSTALL=1 scripts/compare-indexers/init.sh'"
 
 # Prefer a pinned path only while it still exists and is executable; otherwise
 # rediscover on PATH. ${VAR:-default} keeps a stale env.sh pin forever even when
@@ -500,6 +501,76 @@ dua_skip_reason() {
   fi
 }
 
+# dut is the other parallel du: one C file, a thread per core, and hard links
+# deduplicated the way du does it. -s -b makes its total apparent bytes, which
+# is du -sb exactly, so it belongs beside dua rather than as a unit of its own.
+DUT_BIN=$(_resolve_or_find "${DUT_BIN:-}" dut || true)
+# -d 0 -n 1 are not cosmetic. dut sizes its output from the terminal height, and
+# with stdout on a pipe it falls back to printing every entry in the tree: on a
+# production tree that is millions of lines, and the row would be timing the
+# printing rather than the walk. -c drops the colour escapes so the total parses.
+# This vector is what the Q4 rows run, and it deliberately has no -x: Q4 is
+# compared against `du -sb`, which crosses mount points, so bounding dut to one
+# filesystem would answer a smaller number on any tree with a mount inside it
+# and be marked DISAGREES for a difference the harness introduced.
+DUT_ARGS=(-c -b -s -d 0 -n 1)
+DUT_OK=0
+DUT_WHY=""
+if [[ -n "$DUT_BIN" ]]; then
+  # Probed by running it, like fd and dua: a binary that resolves but dies on a
+  # newer glibc must not look available.
+  _dut_err=$(mktemp 2>/dev/null || echo /tmp/ic-dut-probe.$$)
+  _dut_st=0
+  _dut_help=""
+  _dut_path=$(command -v dut 2>/dev/null || true)
+  _dut_candidates=("$DUT_BIN")
+  [[ -n "$_dut_path" && "$_dut_path" != "$DUT_BIN" ]] && _dut_candidates+=("$_dut_path")
+  for _dut_cand in "${_dut_candidates[@]}"; do
+    [[ -x "$_dut_cand" ]] || continue
+    _dut_help=$("$_dut_cand" -h 2>"$_dut_err") || _dut_st=$?
+    if [[ -n "$_dut_help" ]]; then
+      DUT_BIN=$_dut_cand
+      DUT_OK=1
+      break
+    fi
+  done
+  if [[ "$DUT_OK" == "1" ]]; then
+    case "$_dut_help" in
+      # Otherwise it runs at 4 threads or one per logical processor, whichever
+      # is larger, while every other tool is held to THREADS.
+      *"-t "*) DUT_ARGS+=(-t "$THREADS") ;;
+    esac
+  else
+    if [[ -x "$DUT_BIN" ]]; then
+      DUT_WHY=$(grep -m1 '.' "$_dut_err" 2>/dev/null | tr -d '\r' | cut -c1-200 || true)
+      if [[ -z "$DUT_WHY" ]]; then
+        DUT_WHY=$(_probe_loader_hint "$DUT_BIN" "$_dut_err")
+      fi
+      [[ -n "$DUT_WHY" ]] || DUT_WHY="-h exited ${_dut_st} with empty stdout/stderr"
+    else
+      DUT_WHY=$(_unexecutable_why "$DUT_BIN" "$DUT_FIX_HINT")
+    fi
+  fi
+  rm -f "$_dut_err"
+  unset _dut_err _dut_help _dut_st _dut_path _dut_candidates _dut_cand
+fi
+
+# The walk row is the one place -x belongs: there dut is the counterpart of
+# `find -xdev`, and every walk baseline the figures put beside it is bounded to
+# the tree's own filesystem. It is derived after the probe so the thread budget
+# lands in both vectors.
+DUT_WALK_ARGS=("${DUT_ARGS[@]}" -x)
+
+dut_skip_reason() {
+  if [[ -z "${DUT_BIN:-}" ]]; then
+    printf 'dut_not_found_run_init.sh_with_dut_in_TOOLS'
+  elif [[ -n "$DUT_WHY" ]]; then
+    printf 'dut_not_runnable: %s' "$DUT_WHY"
+  else
+    printf 'dut_not_runnable'
+  fi
+}
+
 # True when the harness has a path for a baseline tool, whether or not the
 # probe succeeded. run_smoke uses this so a present-but-broken dua/fd still
 # lands in TOOLS and emits skipped CSV rows instead of vanishing.
@@ -507,6 +578,7 @@ baseline_candidate() {
   case "$1" in
     fd) [[ -n "${FD_BIN:-}" ]] ;;
     dua) [[ -n "${DUA_BIN:-}" ]] ;;
+    dut) [[ -n "${DUT_BIN:-}" ]] ;;
     *) tool_available "$1" ;;
   esac
 }
@@ -520,10 +592,11 @@ baseline_candidate() {
 # that is what actually decides FD_BIN and DUA_BIN for the run.
 baseline_health_report() {
   local tool bin fix why probe
-  for tool in fd dua; do
+  for tool in fd dua dut; do
     case "$tool" in
       fd) bin=${FD_BIN:-} fix=$FD_FIX_HINT probe=(--help) ;;
       dua) bin=${DUA_BIN:-} fix=$DUA_FIX_HINT probe=(aggregate --help) ;;
+      dut) bin=${DUT_BIN:-} fix=$DUT_FIX_HINT probe=(-h) ;;
     esac
     # No path at all is a different story, and the skipped rows already tell it.
     [[ -n "$bin" ]] || continue
@@ -918,7 +991,7 @@ select_arg_set() {
 # is rejected rather than silently ignored, which is the whole failure mode a
 # per-tool knob invites. Deliberately not spelled REPS_*, or the check below
 # would read this list as a tool of its own.
-KNOWN_REPS_TOOLS="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua"
+KNOWN_REPS_TOOLS="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
 
 # ereport_index used to be pinned to rep 1 by a condition in run_index.sh. That
 # default is worth keeping -- it builds from ecrawl's capture, so repeating it
@@ -1023,6 +1096,7 @@ tool_available() {
     fd) [[ "$FD_OK" == "1" ]] ;;
     du) command -v du >/dev/null 2>&1 ;;
     dua) [[ "$DUA_OK" == "1" ]] ;;
+    dut) [[ "$DUT_OK" == "1" ]] ;;
     *) return 1 ;;
   esac
 }
@@ -1376,6 +1450,14 @@ write_env_snapshot() {
     else
       echo "version_dua=$(tool_version "${DUA_BIN:-}" "${INDEXER_COMPARE_DUA_VERSION:-}")"
     fi
+    # dut takes -v rather than --version, so tool_version cannot read its
+    # banner; the checkout init.sh built it from is the version here.
+    if [[ -n "${DUT_BIN:-}" && "$DUT_OK" != "1" ]]; then
+      echo "version_dut=present but not runnable: $DUT_BIN"
+      echo "dut_unusable=${DUT_WHY:-no error text}"
+    else
+      echo "version_dut=$(tool_version "${DUT_BIN:-}" "${INDEXER_COMPARE_DUT_VERSION:-}")"
+    fi
     echo "version_find=$(tool_version find)"
     echo "version_du=$(tool_version du)"
     echo "version_python3=$(tool_version python3)"
@@ -1450,6 +1532,11 @@ write_env_snapshot() {
     echo "fd_args=${FD_COMMON_ARGS[*]}"
     echo "dua_bin=${DUA_BIN:-}"
     echo "dua_args=${DUA_AGG_ARGS[*]}"
+    echo "dut_bin=${DUT_BIN:-}"
+    # Two lines because the two phases run two vectors: -x on the walk, which is
+    # find -xdev, and none on Q4, which is graded against du -sb.
+    echo "dut_walk_args=${DUT_WALK_ARGS[*]}"
+    echo "dut_query_args=${DUT_ARGS[*]}"
     echo "ECRAWL_CRAWL_THREADS=${ECRAWL_CRAWL_THREADS:-}"
     echo "ECRAWL_STAT_THREADS=${ECRAWL_STAT_THREADS:-}"
     echo "ECRAWL_WRITER_THREADS=${ECRAWL_WRITER_THREADS:-}"

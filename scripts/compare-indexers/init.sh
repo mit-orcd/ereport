@@ -2,7 +2,7 @@
 #
 # Build/install the three open-source indexers used by the PEARC '26 paper:
 #   Robinhood 3.2.0, GUFI 0.6.10, XDU 0.4.1
-# plus dua-cli, the parallel du used as a traditional-tool baseline.
+# plus dua-cli and dut, the parallel dus used as traditional-tool baselines.
 #
 # This installs into a private prefix. SETUP_MARIADB=1 additionally installs
 # and starts MariaDB and creates a disposable Robinhood benchmark database.
@@ -20,7 +20,7 @@
 #                          $HOME/.local/indexer-compare
 #   SRC_ROOT=              default: matching .../src beside the scratch PREFIX
 #                          when used, else $HOME/.cache/indexer-compare-src
-#   TOOLS="gufi xdu robinhood dua"
+#   TOOLS="gufi xdu robinhood dua dut"
 #   JOBS=$(nproc)          build parallelism for every tool; lower it to share
 #                          a busy host
 #   FORCE_REINSTALL=0      1: rebuild every tool even when the pinned version is
@@ -56,6 +56,11 @@
 #   XDU_VERSION=v0.4.1
 #   ROBINHOOD_VERSION=3.2.0
 #   DUA_VERSION=2.39.1
+#   DUT_SRC=$HOME/git/dut  checkout dut is built from. It is not installed from
+#                          a pinned tag like the others: upstream's only tag
+#                          predates both the -f flag and a getdents fix, so the
+#                          local checkout is the version, and whatever it
+#                          describes as is what gets stamped and rebuilt on.
 #
 set -euo pipefail
 
@@ -81,7 +86,7 @@ if [[ -z "${SRC_ROOT:-}" ]]; then
   fi
 fi
 unset _ic_scratch_prefix _ic_scratch_src
-TOOLS=${TOOLS-"gufi xdu robinhood dua"}
+TOOLS=${TOOLS-"gufi xdu robinhood dua dut"}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 INSTALL_PACKAGES=${INSTALL_PACKAGES:-ask}
 # etckeeper's dnf plugin commits /etc after every transaction, and where a site
@@ -109,6 +114,13 @@ GUFI_VERSION=${GUFI_VERSION:-0.6.10}
 XDU_VERSION=${XDU_VERSION:-v0.4.1}
 ROBINHOOD_VERSION=${ROBINHOOD_VERSION:-3.2.0}
 DUA_VERSION=${DUA_VERSION:-2.39.1}
+
+# dut is the one tool built from a working checkout instead of a pinned tag, so
+# its version is whatever that checkout is: --dirty included, because a stamp
+# naming a commit the sources no longer match would skip the rebuild that
+# editing them was meant to cause, and would name the wrong source in env.txt.
+DUT_SRC=${DUT_SRC:-$HOME/git/dut}
+DUT_VERSION=${DUT_VERSION:-$(git -C "$DUT_SRC" describe --tags --always --dirty 2>/dev/null || echo unknown)}
 
 GUFI_REPO=${GUFI_REPO:-https://github.com/mar-file-system/GUFI.git}
 XDU_REPO=${XDU_REPO:-https://github.com/glentner/xdu.git}
@@ -581,6 +593,46 @@ install_dua() {
   mark_installed dua "$DUA_VERSION"
 }
 
+# dut: the other parallel du, a single C file with no dependency beyond
+# libatomic. There is no tag to pin -- upstream's only one predates both the
+# flag that counts files and a fix for losing entries when the getdents buffer
+# fills -- so this builds the checkout in $DUT_SRC and stamps what it describes
+# as. The sources are copied out first: `make` writes the binary beside them,
+# and $DUT_SRC is somebody's own checkout, not a tree this script owns.
+install_dut() {
+  if [[ ! -d "$DUT_SRC" ]]; then
+    # Not fatal here: the rest of TOOLS is still worth installing, and verify()
+    # ends the run over the missing binary once it has been.
+    log "WARN: no dut checkout at $DUT_SRC"
+    log "      clone it (git clone https://codeberg.org/201984/dut.git $DUT_SRC) or set DUT_SRC=<checkout>"
+    return 0
+  fi
+  tool_installed dut "$DUT_VERSION" "$PREFIX/bin/dut" && return 0
+  require_cmd make
+
+  # The Makefile leaves CC at make's default of `cc`, which a toolchain module
+  # that installs gcc and no cc does not provide.
+  local cc=${CC:-}
+  [[ -n "$cc" ]] || cc=$(command -v cc 2>/dev/null || command -v gcc 2>/dev/null || true)
+  [[ -n "$cc" ]] ||
+    die "no C compiler for dut (rerun and accept the dependency install, or set CC=)"
+
+  local src="$SRC_ROOT/dut"
+  mkdir -p "$src"
+  log "building/installing dut $DUT_VERSION from $DUT_SRC"
+  local f
+  for f in main.c Makefile dut.1; do
+    [[ -f "$DUT_SRC/$f" ]] || die "$DUT_SRC is not a dut checkout: no $f in it"
+    cp -f "$DUT_SRC/$f" "$src/$f"
+  done
+  (
+    cd "$src"
+    make -j"$JOBS" CC="$cc"
+    make install PREFIX="$PREFIX"
+  )
+  mark_installed dut "$DUT_VERSION"
+}
+
 install_robinhood() {
   tool_installed robinhood "$ROBINHOOD_VERSION" \
     "$PREFIX/sbin/robinhood" "$PREFIX/bin/rbh-find" && return 0
@@ -729,6 +781,8 @@ export INDEXER_COMPARE_GUFI_VERSION="$GUFI_VERSION"
 export INDEXER_COMPARE_XDU_VERSION="$XDU_VERSION"
 export INDEXER_COMPARE_ROBINHOOD_VERSION="$ROBINHOOD_VERSION"
 export INDEXER_COMPARE_DUA_VERSION="$DUA_VERSION"
+# Not a pinned tag but the checkout it was built from, since dut has none.
+export INDEXER_COMPARE_DUT_VERSION="$DUT_VERSION"
 EOF
   # Pin DUA_BIN when this prefix holds a dua. Otherwise unset any stale pin from
   # an older env.sh (sourcing a file that omits the variable does not clear it)
@@ -740,6 +794,16 @@ EOF
     printf 'unset DUA_BIN\n' >>"$env_file"
     if command -v dua >/dev/null 2>&1; then
       printf 'export DUA_BIN="%s"\n' "$(command -v dua)" >>"$env_file"
+    fi
+  fi
+  # Same present-or-PATH rule as dua above, for the same reason: a pin left in
+  # an older env.sh outlives the prefix it named.
+  if [[ -x "$PREFIX/bin/dut" ]]; then
+    printf 'export DUT_BIN="%s"\n' "$PREFIX/bin/dut" >>"$env_file"
+  else
+    printf 'unset DUT_BIN\n' >>"$env_file"
+    if command -v dut >/dev/null 2>&1; then
+      printf 'export DUT_BIN="%s"\n' "$(command -v dut)" >>"$env_file"
     fi
   fi
   if [[ -x "$CHART_VENV/bin/python" ]]; then
@@ -771,7 +835,8 @@ verify() {
     "$PREFIX/bin/xdu-find" \
     "$PREFIX/sbin/robinhood" \
     "$PREFIX/bin/rbh-find" \
-    "$PREFIX/bin/rbh-du"; do
+    "$PREFIX/bin/rbh-du" \
+    "$PREFIX/bin/dut"; do
     if [[ -x "$path" ]]; then
       printf '  OK      %s\n' "$path"
     else
@@ -780,6 +845,7 @@ verify() {
         *gufi*) want_tool gufi && failed=1 ;;
         *xdu*) want_tool xdu && failed=1 ;;
         *robinhood*|*rbh-find*) want_tool robinhood && failed=1 ;;
+        */dut) want_tool dut && failed=1 ;;
       esac
     fi
   done
@@ -807,6 +873,7 @@ main() {
   want_tool xdu && install_xdu
   want_tool robinhood && install_robinhood
   want_tool dua && install_dua
+  want_tool dut && install_dut
 
   write_env_file
   log "installation summary"

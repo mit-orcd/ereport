@@ -36,7 +36,7 @@ OUT=$(cd "$OUT" && pwd)
 CHECK_TOOLS=${CHECK_TOOLS:-}
 if [[ -z "$CHECK_TOOLS" ]]; then
   CHECK_TOOLS="find ecrawl ecrawl_query"
-  for _t in gufi xdu dua; do
+  for _t in gufi xdu dua dut; do
     tool_available "$_t" && CHECK_TOOLS+=" $_t"
   done
   unset _t
@@ -317,6 +317,29 @@ check_dua() {
   fi
 }
 
+# Same reference as dua, and for the same reason: -s -b totals file lengths and
+# counts a multiply-linked inode once, which is what du -sb reports. The Q4
+# vector, not the walk one, since this is the answer being checked against du.
+check_dut() {
+  if ! tool_available dut; then
+    echo "dut: skipped ($(dut_skip_reason))" | tee -a "$SUMMARY"
+    return 0
+  fi
+  local bytes
+  if ! "$DUT_BIN" "${DUT_ARGS[@]}" "$TREE" \
+    >"$OUT/dut.out.txt" 2>"$OUT/dut.err.txt"; then
+    echo "dut: FAIL (nonzero exit)" | tee -a "$SUMMARY"
+    FAIL=1
+    return 0
+  fi
+  bytes=$(awk 'END { print $1 }' "$OUT/dut.out.txt")
+  if cmp_num dut "bytes" "$bytes" "$REF_DU_BYTES"; then
+    echo "dut: OK bytes=$bytes (= du -sb)" | tee -a "$SUMMARY"
+  else
+    FAIL=1
+  fi
+}
+
 for t in $CHECK_TOOLS; do
   case "$t" in
     find) echo "find: baseline written" | tee -a "$SUMMARY" ;;
@@ -325,6 +348,7 @@ for t in $CHECK_TOOLS; do
     gufi) check_gufi ;;
     xdu) check_xdu ;;
     dua) check_dua ;;
+    dut) check_dut ;;
     robinhood) note_external "$t" ;;
     # A name this fixture has no checker for is a gap in the fixture, not a
     # wrong answer from a tool, so it must not fail the run.

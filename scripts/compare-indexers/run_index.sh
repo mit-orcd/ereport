@@ -7,8 +7,8 @@
 #   scripts/compare-indexers/run_index.sh <tree-root> [results-dir]
 #
 # Env:
-#   TOOLS="ecrawl gufi xdu robinhood find fd du dua"
-#                                   (find/fd/du/dua = live walk baselines only)
+#   TOOLS="ecrawl gufi xdu robinhood find fd du dua dut"
+#                               (find/fd/du/dua/dut = live walk baselines only)
 #   REPS=3 DROP_CACHES=0|1 THREADS=16
 #   CACHE_MODES="cold hot"    which passes each repetition makes. Every tool
 #                     builds its whole pipeline cold, then again hot, so a hot
@@ -43,7 +43,7 @@ mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 WORK_ROOT=${WORK_ROOT:-"$OUT/indexes"}
 mkdir -p "$WORK_ROOT"
-TOOLS=${TOOLS:-"ecrawl gufi xdu robinhood find fd du dua"}
+TOOLS=${TOOLS:-"ecrawl gufi xdu robinhood find fd du dua dut"}
 INCLUDE_EREPORT_INDEX=${INCLUDE_EREPORT_INDEX:-1}
 
 echo "==> threads: $(thread_plan)"
@@ -572,8 +572,8 @@ run_fd_baseline() {
   fi
 }
 
-# du and dua walk the tree to total it, which is the same metadata sweep the
-# indexers do — just discarded instead of stored.
+# du, dua and dut walk the tree to total it, which is the same metadata sweep
+# the indexers do — just discarded instead of stored.
 run_du_baseline() {
   local rep=$1
   local stem="du_walk_r${rep}${RUN_TAG}"
@@ -617,6 +617,30 @@ run_dua_baseline() {
     append_row dua walk "$rep" ok "${el:-}" 0 "live_walk_baseline_dua_parallel"
   else
     append_row dua walk "$rep" fail "${el:-}" 0 "exit=$st"
+  fi
+}
+
+run_dut_baseline() {
+  local rep=$1
+  if ! tool_available dut; then
+    append_row dut walk "$rep" skipped "" 0 "$(dut_skip_reason)"
+    return 0
+  fi
+  local stem="dut_walk_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
+  set +e
+  # One line of output, and bounded to this filesystem like find -xdev: see
+  # DUT_WALK_ARGS in lib.sh, which is the Q4 vector plus that -x.
+  time_cmd "$tfile" "$DUT_BIN" "${DUT_WALK_ARGS[@]}" "$TREE" \
+    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+  local st=$?
+  set -e
+  local el
+  el=$(elapsed_from_time_v "$tfile" || echo "")
+  if [[ $st -eq 0 ]]; then
+    append_row dut walk "$rep" ok "${el:-}" 0 "live_walk_baseline_dut_parallel_apparent"
+  else
+    append_row dut walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi
 }
 
@@ -664,6 +688,7 @@ run_tool_pipeline() {
     fd) run_fd_baseline "$rep" ;;
     du) run_du_baseline "$rep" ;;
     dua) run_dua_baseline "$rep" ;;
+    dut) run_dut_baseline "$rep" ;;
     *) echo "WARN: unknown tool $t" >&2 ;;
   esac
 }

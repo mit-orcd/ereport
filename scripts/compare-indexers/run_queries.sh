@@ -23,7 +23,7 @@
 #   GUFI_ROLLUP_INDEX_DIR=...   the same index after gufi_rollup
 #   XDU_INDEX_DIR=...
 #
-# Env: TOOLS="find fd du dua ecrawl_suite gufi xdu robinhood" REPS=3
+# Env: TOOLS="find fd du dua dut ecrawl_suite gufi xdu robinhood" REPS=3
 #      REPS_<TOOL>=n overrides REPS for one tool, e.g. REPS_ROBINHOOD=1
 #      CACHE_MODES="cold hot"  which passes each repetition makes. The cold pass
 #                     uses argument set 1; the hot pass repeats set 1, so the
@@ -46,7 +46,7 @@ TS=$(date +%Y%m%d-%H%M%S)
 OUT=${2:-"$COMPARE_DIR/results/queries-$TS"}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
-TOOLS=${TOOLS:-"find fd du dua ecrawl_suite gufi xdu robinhood"}
+TOOLS=${TOOLS:-"find fd du dua dut ecrawl_suite gufi xdu robinhood"}
 
 echo "==> threads: $(thread_plan)"
 raise_nofile
@@ -275,7 +275,7 @@ q_find() {
   fi
 }
 
-# du/dua answer Q4 only: they total bytes and have no name, type or size
+# du/dua/dut answer Q4 only: they total bytes and have no name, type or size
 # predicates, so the remaining queries are genuinely out of scope for them.
 q_du() {
   local rep=$1
@@ -334,6 +334,39 @@ q_dua() {
   # --stats reports entries traversed (files plus directories), which is not the
   # regular-file count Q5 asks for.
   append_q dua Q5 "$rep" skipped "" 0 "dua_reports_sizes_not_file_counts"
+}
+
+q_dut() {
+  local rep=$1
+  if ! tool_available dut; then
+    append_q dut Q4 "$rep" skipped "" 0 "$(dut_skip_reason)"
+    return 0
+  fi
+  local stem="dut_Q4_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
+  set +e
+  time_cmd "$tfile" "$DUT_BIN" "${DUT_ARGS[@]}" "$Q4_SUBTREE" \
+    >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
+  local st=$?
+  set -e
+  local el bytes
+  el=$(elapsed_from_time_v "$tfile" || echo "")
+  # `<total> <shared> <path>`, one line: the first field is the total, and with
+  # -s -b and no -x it is du -sb's number, over du -sb's tree, hard links
+  # deduplicated the same way.
+  bytes=$(awk 'END { print $1 }' "$OUT/${stem}.out.txt")
+  if [[ $st -eq 0 ]]; then
+    append_q dut Q4 "$rep" ok "${el:-}" "${bytes:-0}" "dut_apparent_bytes"
+  else
+    append_q dut Q4 "$rep" fail "${el:-}" 0 "exit=$st"
+  fi
+  local q
+  for q in Q1 Q2 Q3 Q6; do
+    append_q dut "$q" "$rep" skipped "" 0 "dut_totals_bytes_only_no_search_predicates"
+  done
+  # -f does count entries, but it counts directories along with files and takes
+  # no type predicate, so it does not answer the regular-file count Q5 asks for.
+  append_q dut Q5 "$rep" skipped "" 0 "dut_counts_dirs_too_no_type_filter"
 }
 
 # The index-then-filter pipeline for Q1/Q2, with the values already substituted
@@ -913,6 +946,7 @@ run_one_tool() {
     fd) q_fd "$rep" ;;
     du) q_du "$rep" ;;
     dua) q_dua "$rep" ;;
+    dut) q_dut "$rep" ;;
     ecrawl_suite|suite) q_suite "$rep" ;;
     gufi) q_gufi "$rep" ;;
     xdu) q_xdu "$rep" ;;

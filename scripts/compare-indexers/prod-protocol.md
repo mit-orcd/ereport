@@ -31,7 +31,7 @@ df -T /path/to/tree | tee -a "$RESULTS/env_host.txt"
 # Optional: scripts/tools/ecrawl-mem-arc-snapshot.sh during the crawl
 ```
 
-Set `THREADS` once and leave it alone: it is the total worker budget handed to every tool that accepts one (ecrawl's three pools, `ereport_index`'s two, GUFI `-n`, XDU `-j`, `fd`, `dua`, and Robinhood's scan and pipeline threads via its config). Setting a specific `ECRAWL_*` or `EREPORT_INDEX_*` variable overrides its share, which the summary then reports as resolved. Robinhood's share is written by `mariadb.sh setup`, so change `THREADS` before that step, not after.
+Set `THREADS` once and leave it alone: it is the total worker budget handed to every tool that accepts one (ecrawl's three pools, `ereport_index`'s two, GUFI `-n`, XDU `-j`, `fd`, `dua`, `dut` `-t`, and Robinhood's scan and pipeline threads via its config). Setting a specific `ECRAWL_*` or `EREPORT_INDEX_*` variable overrides its share, which the summary then reports as resolved. Robinhood's share is written by `mariadb.sh setup`, so change `THREADS` before that step, not after.
 
 Open-file limits matter at this scale; `benchmark.sh` raises `RLIMIT_NOFILE` to 128k, and a non-root run is capped by the hard limit.
 
@@ -56,7 +56,7 @@ export DROP_CACHES=0   # or 1
 export REPS=1          # production index once; queries use REPS=3
                        # or keep REPS=3 and spare only the slow rows:
                        #   export REPS=3 REPS_GUFI=1 REPS_ROBINHOOD=1
-export TOOLS="ecrawl gufi xdu find fd du dua"   # add robinhood when RBH_SCAN_ARGS is set
+export TOOLS="ecrawl gufi xdu find fd du dua dut"   # add robinhood when RBH_SCAN_ARGS is set
 export INCLUDE_EREPORT_INDEX=1   # Q1/Q2/Q6 need it, and so do Q4/Q5
 export DO_NOWRITE=0    # optional: also set DO_NOWRITE=1 for walk-only upper bound
 
@@ -95,7 +95,7 @@ export GUFI_ROLLUP_INDEX_DIR=$(cat "$RESULTS/index/gufi_rollup_index_dir.txt" 2>
 export XDU_INDEX_DIR=$(cat "$RESULTS/index/xdu_index_dir.txt" 2>/dev/null || true)
 export INDEX_RESULTS_DIR=$RESULTS/index
 export REPS=3
-export TOOLS="find fd du dua ecrawl_suite gufi xdu"
+export TOOLS="find fd du dua dut ecrawl_suite gufi xdu"
 
 scripts/compare-indexers/run_queries.sh "$TREE" "$RESULTS/queries"
 ```
@@ -162,7 +162,7 @@ Expect strict equality only if the subtree is quiescent.
 | FS type / vendor | ZFS, GPFS, VAST, XFS, … |
 | Cold and hot | both, per phase, never averaged together |
 | Thread / job counts | per tool |
-| Index rows | `ecrawl` write + `ereport_index` make (report the total and the split); GUFI plain; GUFI `rollup_index` + `rollup_step` (likewise); XDU; Robinhood `scan` + `indexes` (likewise, and say where its datadir was); `find`/`fd`/`du`/`dua` walk references |
+| Index rows | `ecrawl` write + `ereport_index` make (report the total and the split); GUFI plain; GUFI `rollup_index` + `rollup_step` (likewise); XDU; Robinhood `scan` + `indexes` (likewise, and say where its datadir was); `find`/`fd`/`du`/`dua`/`dut` walk references |
 | Query rows | Q1–Q6 mean ± stddev per cache state, with Q6 marked extra; skip notes for unsupported predicates. GUFI appears twice, plain and rolled-up, and its Q4 only under the latter. The suite's rows are named for the binary that ran: `ereport_index` for Q1/Q2/Q6 (index search piped through an exact filter, both stages timed), `ecrawl_query` for Q3/Q4/Q5 (a pass over the capture, which for Q4 and Q5 the dir-index sidecars from the `ereport_index` make row cut down or replace) |
 | Parity gaps | Patterns whose longest literal run is under three characters, or that use character classes, have no index path and are skipped; Q3 has no subtree to resolve and still costs a full capture scan, and so do Q4 and Q5 when the sidecars are absent or bound to another capture; byte definition |
 | Units | Every size is apparent bytes: `gufi_du --apparent-size --block-size 1`, `xdu` indexed with `--apparent-size` (Q3 and Q4 are skipped when the build has no such flag, since the index then holds `st_blocks`), `rbh-du`'s unit form probed from `--help` and recorded per row. Thresholds are passed as bare byte counts, never `K`/`M`/`G` |
