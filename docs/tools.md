@@ -29,7 +29,7 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--no-stat [--contains <text>] [--print0]] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
 ```
 
 Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
@@ -94,9 +94,10 @@ ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/files
 
 Notes:
 
-- `--no-write` crawls and reports metrics without writing shard files.
+- `--no-write` crawls and reports metrics without writing shard files. It also skips the hardlink inode registry (`hardlink_dedup=off`): entry/file counts stay exact, but `total_bytes` can overcount multiply-linked files.
 - `--verbose` enables the full end-of-run diagnostics.
-- `--no-stat` walks names only and never reads an inode, streaming each path to stdout instead of writing a capture. It implies `--no-write` and rejects an `output-dir`, because a record needs the uid, size, inode and mtime that only `stat` provides. Recursion is driven entirely by the `d_type` that `getdents64` already returns; on a filesystem that reports `DT_UNKNOWN` the walk falls back to one `fstatat` for those entries alone and counts them in `dtype_unknown_fallbacks`. Because stdout is the path stream, the run summary goes to stderr, so `./ecrawl --no-stat /tree | sort` is a clean path list.
+- `--no-stat` walks names only and never reads an inode, streaming each path to stdout instead of writing a capture. It implies `--no-write` and rejects an `output-dir`, because a record needs the uid, size, inode and mtime that only `stat` provides. Recursion is driven entirely by the `d_type` that `getdents64` already returns; on a filesystem that reports `DT_UNKNOWN` the walk falls back to one `fstatat` for those entries alone and counts them in `dtype_unknown_fallbacks`. Because stdout is the path stream, the run summary goes to stderr, so `./ecrawl --no-stat /tree | sort` is a clean path list. Counts are limited to what `d_type` can prove (files, dirs, symlinks, other) — no byte totals.
+- `--count` (requires `--no-stat`) only tallies those d_type counts and does not print paths. Use it for a names-only file/folder census: `./ecrawl --no-stat --count /tree`. The summary stays on stdout.
 - `--contains <text>` (requires `--no-stat`) keeps only paths whose **full path** contains `text`, case-insensitively — the same rule as `ereport_index --search`, and equivalent to `find /tree | grep -iF text`. It is not a glob: `*` and `?` match themselves. Matching is cheap because a directory whose own path already matches short-circuits its whole subtree, and non-matching directories compare each child name against a small window instead of rebuilding the full path.
 - `--print0` (requires `--no-stat`) NUL-separates the stream, for paths containing newlines.
 - `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--verbose` end-of-run metrics and the built-in contention counters instead.

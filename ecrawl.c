@@ -852,6 +852,8 @@ static int g_stat_inode_order = 0;
 /* --no-stat: walk names only, never read an inode. Recursion needs just d_type, so records
  * (uid/size/inode/nlink/times all come from stat) cannot be written and paths stream instead. */
 static int g_no_stat = 0;
+/* --count (requires --no-stat): tally d_type counts only; do not stream paths to stdout. */
+static int g_nostat_count = 0;
 static int g_print0 = 0;
 /* --contains: lowercased needle for the full-path substring filter; NULL when unset. */
 static char *g_contains_lower = NULL;
@@ -1062,9 +1064,13 @@ static int nostat_ctx_init(nostat_ctx_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
     if (!g_no_stat) return 0;
 
-    ctx->buf = (char *)malloc(PATHOUT_BUF_BYTES);
-    if (!ctx->buf) return -1;
-    ctx->cap = PATHOUT_BUF_BYTES;
+    /* --count never prints paths, so skip the pathout buffer unless --contains still needs
+     * the windowed matcher (count matching names without streaming them). */
+    if (!g_nostat_count) {
+        ctx->buf = (char *)malloc(PATHOUT_BUF_BYTES);
+        if (!ctx->buf) return -1;
+        ctx->cap = PATHOUT_BUF_BYTES;
+    }
 
     if (g_contains_len > 0) {
         /* Worst case: the whole parent tail (needle_len-1), a separator, and a NAME_MAX name. */
@@ -1119,6 +1125,7 @@ static int pathout_emit(nostat_ctx_t *ctx, const char *path, size_t path_len) {
     size_t need = path_len + 1u;
     char sep = g_print0 ? '\0' : '\n';
 
+    if (g_nostat_count) return 0;
     if (!ctx->buf) return -1;
     if (need > ctx->cap) {
         /* Longer than one whole buffer: flush what we have and write it straight through. */
@@ -2092,7 +2099,10 @@ static void regular_file_accounting(shared_state_t *shared, crawl_stats_t *stats
     blocks = st->st_blocks;
     from_blocks = (blocks > 0) ? (uint64_t)blocks * (uint64_t)ST_BLOCKS_BYTES_UNIT : 0ULL;
 
-    if (st->st_nlink <= 1) {
+    if (st->st_nlink <= 1 || g_no_write) {
+        /* --no-write skips the hardlink inode registry: every visit credits st_size.
+         * Byte totals can overcount multiply-linked files; entry/file counts stay exact. */
+        if (st->st_nlink > 1) stats->total_hardlink_files++;
         out->byte_credit = apparent;
         out->allocated_bytes = from_blocks;
         if (apparent > 0ULL && from_blocks < apparent) out->sparse_heuristic_inc = 1ULL;
@@ -2268,16 +2278,18 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--no-stat [--contains <text>] [--print0]] [--verbose] "
+            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--verbose] "
             "[--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
     fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
+    fprintf(stderr, "Count: %s --no-stat --count /data1\n", prog);
     fprintf(stderr, "Search: %s --no-stat --contains slurm- /data1\n", prog);
     fprintf(stderr,
             "--no-stat: walk names only (no inode reads) and stream paths to stdout; no capture is written.\n"
+            "--count: with --no-stat, only count files/dirs/etc from d_type; do not print paths.\n"
             "--contains: keep paths whose full path contains <text>, case-insensitive "
             "(same rule as ereport_index --search). Requires --no-stat.\n"
             "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n");
@@ -5177,7 +5189,7 @@ static int process_directory_iterative(dir_stack_t *stack,
             dir_path_len = work.path_len;
             account_entry_dtype(stats, perf, DT_DIR);
             dirmatch_begin(&wa->nostat, dir_path, dir_path_len, work.ancestor_matched, &dm);
-            if (dm.all_match && pathout_emit(&wa->nostat, dir_path, dir_path_len) != 0) {
+            if (!g_nostat_count && dm.all_match && pathout_emit(&wa->nostat, dir_path, dir_path_len) != 0) {
                 stats_add_error(shared);
                 free(dir_path);
                 continue;
@@ -5302,7 +5314,8 @@ static int process_directory_iterative(dir_stack_t *stack,
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
                         account_entry_dtype(stats, perf, child_d_type);
-                        if (dirmatch_hit(&wa->nostat, &dm, ent_name, child_name_len)) {
+                        /* --count tallies only; skip path assembly and the stdout stream. */
+                        if (!g_nostat_count && dirmatch_hit(&wa->nostat, &dm, ent_name, child_name_len)) {
                             char child[PATH_MAX];
                             size_t child_path_len = dir_path_len + child_name_len +
                                                     ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
@@ -6497,9 +6510,11 @@ static void print_no_stat_stats(FILE *fp) {
     fprintf(fp, "byte_accounting=(unavailable: --no-stat reads no inodes)\n");
     fprintf(fp, "hardlink_files=(unavailable: --no-stat reads no inodes)\n");
     fprintf(fp, "total_bytes=(unavailable: --no-stat reads no inodes)\n");
+    fprintf(fp, "nostat_count=%d\n", g_nostat_count);
     if (g_contains_lower)
         fprintf(fp, "contains=%s\n", g_contains_lower);
-    fprintf(fp, "paths_printed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_nostat_printed));
+    if (!g_nostat_count)
+        fprintf(fp, "paths_printed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_nostat_printed));
     /* Nonzero only on filesystems that do not report d_type, where recursion still needs a stat. */
     fprintf(fp, "dtype_unknown_fallbacks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_nostat_dtype_unknown_fallbacks));
 }
@@ -6525,6 +6540,8 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "no_write=%d\n", g_no_write);
     fprintf(fp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
     fprintf(fp, "output_layout=%s\n", g_no_write ? "none" : "uid_shards");
+    /* Unique-byte hardlink dedup needs the inode registry; --no-write skips it. */
+    fprintf(fp, "hardlink_dedup=%s\n", g_no_write ? "off" : "on");
     fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
     fprintf(fp, "seed_mode=%s\n", "root_only");
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
@@ -6702,6 +6719,10 @@ int main(int argc, char **argv) {
             g_no_write = 1;
             continue;
         }
+        if (strcmp(argv[i], "--count") == 0) {
+            g_nostat_count = 1;
+            continue;
+        }
         if (strcmp(argv[i], "--print0") == 0) {
             g_print0 = 1;
             continue;
@@ -6806,12 +6827,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--no-stat streams paths and cannot write a capture; drop the output-dir argument\n");
         return 2;
     }
+    if (g_nostat_count && !g_no_stat) {
+        fprintf(stderr, "--count tallies a names-only walk and requires --no-stat\n");
+        return 2;
+    }
     if (g_contains_lower && !g_no_stat) {
         fprintf(stderr, "--contains filters the streamed path list and requires --no-stat\n");
         return 2;
     }
     if (g_print0 && !g_no_stat) {
         fprintf(stderr, "--print0 applies to the --no-stat path stream\n");
+        return 2;
+    }
+    if (g_print0 && g_nostat_count) {
+        fprintf(stderr, "--print0 applies to the path stream; drop it when using --count\n");
         return 2;
     }
 
@@ -6909,14 +6938,17 @@ int main(int argc, char **argv) {
 
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.stats_mutex, NULL);
-    if (inode_registry_init(&g_hardlink_registry) != 0) {
-        fprintf(stderr, "ERROR failed to initialize hardlink registry\n");
-        pthread_mutex_destroy(&shared.stats_mutex);
-        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
-        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
-        return 1;
+    /* --no-write / --no-stat never consult the hardlink registry (see regular_file_accounting). */
+    if (!g_no_write) {
+        if (inode_registry_init(&g_hardlink_registry) != 0) {
+            fprintf(stderr, "ERROR failed to initialize hardlink registry\n");
+            pthread_mutex_destroy(&shared.stats_mutex);
+            if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+            if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+            return 1;
+        }
+        hardlink_registry_ready = 1;
     }
-    hardlink_registry_ready = 1;
     queue_init(&queue);
 
     if (!g_no_write) {
@@ -7304,14 +7336,16 @@ int main(int argc, char **argv) {
         human_decimal(min_ops, min_ops_buf, sizeof(min_ops_buf));
 
         /* --no-stat owns stdout for the path stream, so the summary goes to stderr and
-         * `ecrawl --no-stat ... | sort` stays a clean path list. */
-        FILE *sumfp = g_no_stat ? stderr : stdout;
+         * `ecrawl --no-stat ... | sort` stays a clean path list. --count does not stream,
+         * so the summary stays on stdout. */
+        FILE *sumfp = (g_no_stat && !g_nostat_count) ? stderr : stdout;
 
         if (!g_verbose) {
             fprintf(sumfp, "start_path=%s\n", start_path);
             if (g_record_root) fprintf(sumfp, "record_root=%s\n", g_record_root);
             fprintf(sumfp, "no_write=%d\n", g_no_write);
             fprintf(sumfp, "no_stat=%d\n", g_no_stat);
+            if (g_no_write) fprintf(sumfp, "hardlink_dedup=off\n");
             fprintf(sumfp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
             fprintf(sumfp, "crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
             fprintf(sumfp, "writer_threads=%d\n", writer_threads_used);
@@ -7325,7 +7359,9 @@ int main(int argc, char **argv) {
             if (g_no_stat) {
                 print_no_stat_stats(sumfp);
             } else {
-                fprintf(sumfp, "byte_accounting=%s\n", "unique_regular_files");
+                fprintf(sumfp, "byte_accounting=%s\n",
+                        g_no_write ? "st_size_per_visit (--no-write; hardlinks may overcount)"
+                                  : "unique_regular_files");
                 fprintf(sumfp, "hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
                 fprintf(sumfp, "total_bytes=%" PRIu64 "\n", shared.total_bytes);
                 fprintf(sumfp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
@@ -7367,6 +7403,6 @@ int main(int argc, char **argv) {
     /* Everything after t1 is invisible to elapsed_sec, which is exactly how a serial uid/gid resolve
      * once hid 8.4s of a 9.3s run. Report the gap so the next such regression shows up in the
      * summary instead of only in wall-clock time. */
-    if (g_verbose) fprintf(g_no_stat ? stderr : stdout, "teardown_sec=%.3f\n", now_sec() - t1);
+    if (g_verbose) fprintf((g_no_stat && !g_nostat_count) ? stderr : stdout, "teardown_sec=%.3f\n", now_sec() - t1);
     return atomic_load(&g_writer_failed) ? 1 : 0;
 }
