@@ -6379,6 +6379,72 @@ static void bucket_page_slices_free(bucket_page_slice_t slices[AGE_BUCKETS][SIZE
     }
 }
 
+static const char BUCKET_DETAIL_PAGE_HEAD[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>Bucket Details</title>\n"
+    "<style>\n"
+    "html{box-sizing:border-box}\n"
+    "body{font-family:\"DejaVu Sans Mono\",\"Consolas\",monospace;margin:0;padding:10px clamp(10px,2.2vw,28px) 28px;width:100%;max-width:none;box-sizing:border-box;color:#1f2328;background:#fcfcf8}\n"
+    ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;max-width:none;margin-bottom:22px}\n"
+    "h1,h2{margin:0 0 12px 0;font-weight:600}\n"
+    "h3{margin:18px 0 10px;font-weight:600;font-size:14px;color:#3d362c}\n"
+    ".shape-drill-h2{margin-top:22px}\n"
+    ".shape-drill-details{margin-top:12px}\n"
+    ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:13px}\n"
+    ".meta-sub{font-weight:400;color:#666}\n"
+    ".note{font-size:12px;color:#666;margin-bottom:14px;max-width:none;width:100%}\n"
+    ".table-trunc-note{font-size:12px;color:#555;margin:0 0 12px;max-width:none;width:100%;line-height:1.45}\n"
+    ".bucket-help{margin:0 0 18px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:none;width:100%;font-size:13px;line-height:1.55;color:#555}\n"
+    ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n"
+    ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n"
+    ".bucket-help .bucket-help-body{padding:0 12px 12px}\n"
+    ".bucket-help .bucket-help-body p{margin:0 0 10px}\n"
+    ".bucket-help .bucket-help-body p:last-child{margin-bottom:0}\n"
+    "table{border-collapse:collapse;font-size:13px;table-layout:auto;width:max-content;max-width:none}\n"
+    "th,td{border:1px solid #d5d0c5;padding:5px 12px;vertical-align:top}\n"
+    "thead th{background:#ece6da;position:sticky;top:0;z-index:3}\n"
+    "thead th:first-child,tbody td:first-child{position:sticky;left:0;z-index:4}\n"
+    "thead th:first-child{background:#ece6da;z-index:5}\n"
+    "tbody td:first-child{background:#f8f5ee;z-index:1}\n"
+    "td.r,th.r{text-align:right}\n"
+    ".bucket-table-wrap td.num{white-space:nowrap;box-sizing:border-box}\n"
+    ".bucket-table-wrap th.num{white-space:normal;box-sizing:border-box}\n"
+    ".bucket-table-wrap th.num .th-text{overflow-wrap:break-word;word-break:normal}\n"
+    ".bucket-table-wrap th.sort-h{cursor:pointer;user-select:none}\n"
+    ".bucket-table-wrap th.sort-h:hover{background:#ddd4c4}\n"
+    ".bucket-table-wrap th.sort-asc .th-text::after{content:\" \\25b2\";font-size:0.72em;opacity:0.85}\n"
+    ".bucket-table-wrap th.sort-desc .th-text::after{content:\" \\25bc\";font-size:0.72em;opacity:0.85}\n"
+    "th:first-child{min-width:max(260px,min(28vw,560px));max-width:none;box-sizing:border-box}\n"
+    ".path-cell{min-width:max(260px,min(28vw,560px));max-width:none;overflow-x:hidden;overflow-y:visible;box-sizing:border-box}\n"
+    ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;min-width:0}\n"
+    ".path-toggle{min-width:0;max-width:100%;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n"
+    ".path-prefix{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;font-size:11px;line-height:1.15;margin-bottom:1px}\n"
+    ".path-tail{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;color:#1f2328;line-height:1.2}\n"
+    ".copy-path{opacity:0;pointer-events:none;align-self:start;flex-shrink:0;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n"
+    ".path-cell:hover .copy-path,.path-cell:focus-within .copy-path,.path-cell.expanded .copy-path{opacity:1;pointer-events:auto}\n"
+    ".copy-path:hover{background:#eadfc9}\n"
+    ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n"
+    ".path-full{margin-top:6px;padding:6px 8px;max-width:100%;box-sizing:border-box;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;overflow-wrap:anywhere;font-size:10px;line-height:1.35;color:#4e4538;user-select:all;overflow-x:auto}\n"
+    ".path-cell.expanded .path-prefix{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}\n"
+    ".heat-map-margins{font-size:12px;color:#555;margin:0 0 16px;line-height:1.5;max-width:none;width:100%}\n"
+    ".heat-map-margins p{margin:6px 0 0}\n"
+    "a{color:#6b4c16;text-decoration:none}\n"
+    ".path-ctime-led-badge{font-size:9px;font-weight:700;line-height:1;padding:2px 6px;border-radius:999px;background:rgba(109,40,217,0.92);color:#faf5ff;border:1px solid rgba(76,29,149,0.85);margin-right:6px;vertical-align:middle;white-space:nowrap;display:inline-block}\n"
+    ".path-ctime-led-pct{font-variant-numeric:tabular-nums}\n"
+    ".bucket-heat-shape{font-size:12px;color:#444;margin:0 0 14px;line-height:1.5;display:flex;flex-wrap:wrap;align-items:center;gap:6px;max-width:none;width:100%}\n"
+    ".bucket-heat-shape-label{font-weight:600;color:#555;margin-right:2px}\n"
+    ".bucket-heat-shape .heat-map-badges{position:static;display:flex;flex-direction:row;flex-wrap:wrap;align-items:center;gap:4px;pointer-events:auto}\n"
+    ".bucket-heat-shape .heat-ctime-led-badge,.bucket-heat-shape .heat-shape-badge{font-size:8px;pointer-events:auto;cursor:help}\n"
+    ".bucket-heat-shape .heat-ctime-led-badge{font-size:8px;font-weight:700;line-height:1;padding:2px 5px;border-radius:4px;background:rgba(109,40,217,0.94);color:#faf5ff;border:1px solid rgba(76,29,149,0.88);letter-spacing:0.02em;white-space:nowrap;margin-right:0}\n"
+    ".heat-shape-badge{font-size:8px;font-weight:700;line-height:1;padding:2px 5px;border-radius:4px;letter-spacing:0.02em;white-space:nowrap;border:1px solid rgba(0,0,0,0.14)}\n"
+    ".heat-shape-deep{background:rgba(14,116,144,0.92);color:#ecfeff}\n"
+    ".heat-shape-dense{background:rgba(180,83,9,0.92);color:#fffbeb}\n"
+    ".heat-shape-skew{background:rgba(127,29,29,0.92);color:#fef2f2}\n";
+
 static int emit_bucket_detail_page(const char *filename,
                                    const char *username,
                                    int all_users,
@@ -6413,6 +6479,7 @@ static int emit_bucket_detail_page(const char *filename,
     int init_fail_at = -1;
 
     if (!out) return -1;
+    (void)setvbuf(out, NULL, _IOFBF, 1 << 20);
 
     if (detail_levels < 1 || detail_levels > BUCKET_DETAIL_LEVELS_MAX || !scratch) {
         counted_fclose(out);
@@ -6433,95 +6500,13 @@ static int emit_bucket_detail_page(const char *filename,
         return -1;
     }
 
-    fprintf(out, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
-    fprintf(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    fprintf(out, "<title>Bucket Details</title>\n<style>\n");
-    fprintf(out, "html{box-sizing:border-box}\n");
-    fprintf(out,
-            "body{font-family:\"DejaVu Sans Mono\",\"Consolas\",monospace;margin:0;padding:"
-            "10px clamp(10px,2.2vw,28px) 28px;width:100%%;max-width:none;box-sizing:border-box;color:#1f2328;"
-            "background:#fcfcf8}\n");
-    fprintf(out,
-            ".bucket-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%%;max-width:none;"
-            "margin-bottom:22px}\n");
-    fprintf(out, "h1,h2{margin:0 0 12px 0;font-weight:600}\n");
-    fprintf(out, "h3{margin:18px 0 10px;font-weight:600;font-size:14px;color:#3d362c}\n");
-    fprintf(out, ".shape-drill-h2{margin-top:22px}\n");
-    fprintf(out, ".shape-drill-details{margin-top:12px}\n");
-    fprintf(out, ".meta{margin:0 0 14px 0;color:#555;line-height:1.5;font-size:13px}\n");
-    fprintf(out, ".meta-sub{font-weight:400;color:#666}\n");
-    fprintf(out, ".note{font-size:12px;color:#666;margin-bottom:14px;max-width:none;width:100%%}\n");
-    fprintf(out,
-            ".table-trunc-note{font-size:12px;color:#555;margin:0 0 12px;max-width:none;width:100%%;line-height:1.45}\n");
-    fprintf(out,
-            ".bucket-help{margin:0 0 18px;border:1px solid #ddd2c8;border-radius:8px;background:#faf8f4;max-width:none;"
-            "width:100%%;font-size:13px;line-height:1.55;color:#555}\n");
-    fprintf(out, ".bucket-help summary{cursor:pointer;padding:10px 12px;font-weight:600;color:#4a4034;list-style-position:outside}\n");
-    fprintf(out, ".bucket-help summary::-webkit-details-marker{color:#8b7355}\n");
-    fprintf(out, ".bucket-help .bucket-help-body{padding:0 12px 12px}\n");
-    fprintf(out, ".bucket-help .bucket-help-body p{margin:0 0 10px}\n");
-    fprintf(out, ".bucket-help .bucket-help-body p:last-child{margin-bottom:0}\n");
-    fprintf(out,
-            "table{border-collapse:collapse;font-size:13px;table-layout:auto;width:max-content;max-width:none}\n");
-    fprintf(out, "th,td{border:1px solid #d5d0c5;padding:5px 12px;vertical-align:top}\n");
-    fprintf(out, "thead th{background:#ece6da;position:sticky;top:0;z-index:3}\n");
-    fprintf(out, "thead th:first-child,tbody td:first-child{position:sticky;left:0;z-index:4}\n");
-    fprintf(out, "thead th:first-child{background:#ece6da;z-index:5}\n");
-    fprintf(out, "tbody td:first-child{background:#f8f5ee;z-index:1}\n");
-    fprintf(out, "td.r,th.r{text-align:right}\n");
-    fprintf(out,
-            ".bucket-table-wrap td.num{white-space:nowrap;box-sizing:border-box}\n"
-            ".bucket-table-wrap th.num{white-space:normal;box-sizing:border-box}\n"
-            ".bucket-table-wrap th.num .th-text{overflow-wrap:break-word;word-break:normal}\n");
-    fprintf(out,
-            ".bucket-table-wrap th.sort-h{cursor:pointer;user-select:none}\n"
-            ".bucket-table-wrap th.sort-h:hover{background:#ddd4c4}\n"
-            ".bucket-table-wrap th.sort-asc .th-text::after{content:\" \\25b2\";font-size:0.72em;opacity:0.85}\n"
-            ".bucket-table-wrap th.sort-desc .th-text::after{content:\" \\25bc\";font-size:0.72em;opacity:0.85}\n");
-    fprintf(out,
-            "th:first-child{min-width:max(260px,min(28vw,560px));max-width:none;box-sizing:border-box}\n");
-    fprintf(out,
-            ".path-cell{min-width:max(260px,min(28vw,560px));max-width:none;overflow-x:hidden;overflow-y:visible;"
-            "box-sizing:border-box}\n");
-    fprintf(out, ".path-line{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px;min-width:0}\n");
-    fprintf(out, ".path-toggle{min-width:0;max-width:100%%;display:block;border:0;background:none;padding:0;margin:0;color:inherit;font:inherit;text-align:left;cursor:pointer}\n");
-    fprintf(out,
-            ".path-prefix{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#8b8172;"
-            "font-size:11px;line-height:1.15;margin-bottom:1px}\n");
-    fprintf(out,
-            ".path-tail{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;"
-            "color:#1f2328;line-height:1.2}\n");
-    fprintf(out, ".copy-path{opacity:0;pointer-events:none;align-self:start;flex-shrink:0;border:1px solid #d8ccb8;background:#f4ede0;color:#6b4c16;border-radius:999px;padding:1px 5px;font:inherit;font-size:9px;line-height:1.2;cursor:pointer;transition:opacity 0.15s ease,background-color 0.15s ease}\n");
-    fprintf(out, ".path-cell:hover .copy-path,.path-cell:focus-within .copy-path,.path-cell.expanded .copy-path{opacity:1;pointer-events:auto}\n");
-    fprintf(out, ".copy-path:hover{background:#eadfc9}\n");
-    fprintf(out, ".path-toggle:hover .path-tail,.path-toggle:focus .path-tail{text-decoration:underline}\n");
-    fprintf(out, ".path-full{margin-top:6px;padding:6px 8px;max-width:100%%;box-sizing:border-box;background:#f4efe4;border:1px solid #ddd2bf;border-radius:4px;white-space:normal;word-break:break-all;overflow-wrap:anywhere;font-size:10px;line-height:1.35;color:#4e4538;user-select:all;overflow-x:auto}\n");
-    fprintf(out, ".path-cell.expanded .path-prefix{white-space:normal;overflow:hidden;text-overflow:clip;word-break:break-all;overflow-wrap:anywhere}\n");
-    fprintf(out,
-            ".heat-map-margins{font-size:12px;color:#555;margin:0 0 16px;line-height:1.5;max-width:none;width:100%%}\n");
-    fprintf(out, ".heat-map-margins p{margin:6px 0 0}\n");
-    fprintf(out, "a{color:#6b4c16;text-decoration:none}\n");
-    fprintf(out,
-            ".path-ctime-led-badge{font-size:9px;font-weight:700;line-height:1;padding:2px 6px;border-radius:999px;"
-            "background:rgba(109,40,217,0.92);color:#faf5ff;border:1px solid rgba(76,29,149,0.85);margin-right:6px;"
-            "vertical-align:middle;white-space:nowrap;display:inline-block}\n");
-    fprintf(out, ".path-ctime-led-pct{font-variant-numeric:tabular-nums}\n");
-    fprintf(out,
-            ".bucket-heat-shape{font-size:12px;color:#444;margin:0 0 14px;line-height:1.5;display:flex;flex-wrap:wrap;"
-            "align-items:center;gap:6px;max-width:none;width:100%%}\n"
-            ".bucket-heat-shape-label{font-weight:600;color:#555;margin-right:2px}\n"
-            ".bucket-heat-shape .heat-map-badges{position:static;display:flex;flex-direction:row;flex-wrap:wrap;"
-            "align-items:center;gap:4px;pointer-events:auto}\n"
-            ".bucket-heat-shape .heat-ctime-led-badge,.bucket-heat-shape .heat-shape-badge{font-size:8px;"
-            "pointer-events:auto;cursor:help}\n"
-            ".bucket-heat-shape .heat-ctime-led-badge{font-size:8px;font-weight:700;line-height:1;padding:2px 5px;"
-            "border-radius:4px;background:rgba(109,40,217,0.94);color:#faf5ff;border:1px solid rgba(76,29,149,0.88);"
-            "letter-spacing:0.02em;white-space:nowrap;margin-right:0}\n"
-            ".heat-shape-badge{font-size:8px;font-weight:700;line-height:1;padding:2px 5px;border-radius:4px;"
-            "letter-spacing:0.02em;white-space:nowrap;border:1px solid rgba(0,0,0,0.14)}\n"
-            ".heat-shape-deep{background:rgba(14,116,144,0.92);color:#ecfeff}\n"
-            ".heat-shape-dense{background:rgba(180,83,9,0.92);color:#fffbeb}\n"
-            ".heat-shape-skew{background:rgba(127,29,29,0.92);color:#fef2f2}\n");
+    /* One fwrite of the shared head+CSS; rewriting it with dozens of fprintfs
+     * per age×size page was a measurable slice of bucket_html_cells wall. */
+    if (fwrite(BUCKET_DETAIL_PAGE_HEAD, 1, sizeof(BUCKET_DETAIL_PAGE_HEAD) - 1, out) !=
+        sizeof(BUCKET_DETAIL_PAGE_HEAD) - 1) {
+        counted_fclose(out);
+        return -1;
+    }
     emit_heat_badge_tip_shell_css(out);
     fprintf(out, "</style>\n</head>\n<body>\n");
 

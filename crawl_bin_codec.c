@@ -83,8 +83,53 @@ static void bitpack(const uint64_t *values, size_t count, uint64_t base, unsigne
     }
 }
 
+/* Hot path for CRAWL_ENC_FOR_BITPACK: width-specialized loops beat the generic
+ * bit walker when a whole column uses a common width (uid/gid/mode/timestamps). */
 static void bitunpack(const unsigned char *src, size_t count, uint64_t base, unsigned w, uint64_t *dst) {
     size_t i;
+
+    if (w == 8U) {
+        for (i = 0; i < count; i++) dst[i] = base + (uint64_t)src[i];
+        return;
+    }
+    if (w == 16U) {
+        for (i = 0; i < count; i++) {
+            size_t o = i * 2U;
+            dst[i] = base + ((uint64_t)src[o] | ((uint64_t)src[o + 1U] << 8));
+        }
+        return;
+    }
+    if (w == 32U) {
+        for (i = 0; i < count; i++) {
+            size_t o = i * 4U;
+            dst[i] = base + ((uint64_t)src[o] | ((uint64_t)src[o + 1U] << 8) | ((uint64_t)src[o + 2U] << 16) |
+                             ((uint64_t)src[o + 3U] << 24));
+        }
+        return;
+    }
+    if (w == 64U) {
+        for (i = 0; i < count; i++) dst[i] = base + get_u64le(src + i * 8U);
+        return;
+    }
+    if (w == 1U) {
+        for (i = 0; i < count; i++) {
+            unsigned char byte = src[i >> 3];
+            dst[i] = base + (uint64_t)((byte >> (i & 7U)) & 1U);
+        }
+        return;
+    }
+    if (w > 0U && w < 8U && (8U % w) == 0U) {
+        /* Pack several values into each source byte (2, 4). */
+        unsigned per_byte = 8U / w;
+        unsigned mask = (1U << w) - 1U;
+
+        for (i = 0; i < count; i++) {
+            unsigned char byte = src[i / per_byte];
+            unsigned slot = (unsigned)(i % per_byte);
+            dst[i] = base + (uint64_t)((byte >> (slot * w)) & mask);
+        }
+        return;
+    }
 
     for (i = 0; i < count; i++) {
         size_t bit = i * (size_t)w;
@@ -329,12 +374,25 @@ int crawl_bin_codec_decode_u64(const unsigned char *src, size_t src_len, size_t 
     switch (enc) {
         case CRAWL_ENC_CONST:
             if (src_len != 0) return -1;
-            for (i = 0; i < count; i++) dst[i] = min_value;
+            if (min_value == 0ULL) {
+                memset(dst, 0, count * sizeof(*dst));
+            } else {
+                /* Tight fill; compilers vectorize this more readily than a
+                 * growing RLE-style store of the same constant. */
+                uint64_t *p = dst;
+                uint64_t *end = dst + count;
+                while (p < end) *p++ = min_value;
+            }
             return 0;
 
         case CRAWL_ENC_RAW:
             if (src_len != count * sizeof(uint64_t)) return -1;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            /* On-disk layout is little-endian; host LE can memcpy the column. */
+            memcpy(dst, src, count * sizeof(uint64_t));
+#else
             for (i = 0; i < count; i++) dst[i] = get_u64le(src + i * 8U);
+#endif
             return 0;
 
         case CRAWL_ENC_FOR_BITPACK:

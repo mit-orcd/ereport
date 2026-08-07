@@ -817,7 +817,7 @@ static void ereport_index_install_verbose_io(void) {
  * tmp_trigrams_*.bin: 8-byte magic, then [u32 n_recs][u32 payload_bytes][payload]* frames.
  *
  * The payload is a delta-varint stream, not a zstd frame. Records reach a frame as runs of one path_id
- * with strictly ascending trigrams that all share the file's bucket (see append_trigram_records_batch_parallel),
+ * with strictly ascending trigrams that all share the file's bucket (see append_trigram_codes_batch_parallel),
  * so a varint pass gets them to 2-3 bytes per record for a fraction of zstd's cost. These files are written
  * and read back inside one --make and never outlive it, so there is no on-disk format to stay compatible with.
  *
@@ -3294,11 +3294,16 @@ static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t 
     }
     lower_seg[seg_len] = '\0';
 
-    for (i = 0; i + 3 <= seg_len; i++) {
-        uint32_t trigram = ((uint32_t)(unsigned char)lower_seg[i] << 16) |
-                           ((uint32_t)(unsigned char)lower_seg[i + 1] << 8) |
-                           (uint32_t)(unsigned char)lower_seg[i + 2];
-        codes[pos++] = trigram;
+    /* Rolling 24-bit window: one byte in, one code out after the first triplet. */
+    {
+        uint32_t tri = ((uint32_t)(unsigned char)lower_seg[0] << 16) |
+                       ((uint32_t)(unsigned char)lower_seg[1] << 8) |
+                       (uint32_t)(unsigned char)lower_seg[2];
+        codes[pos++] = tri;
+        for (i = 3; i < seg_len; i++) {
+            tri = ((tri << 8) | (uint32_t)(unsigned char)lower_seg[i]) & 0x00FFFFFFU;
+            codes[pos++] = tri;
+        }
     }
     if (lower_owned) free(lower_seg);
 
@@ -3436,21 +3441,6 @@ static int parallel_bucket_io_init(build_ctx_t *ctx, uint32_t shard_count) {
     return 0;
 }
 
-/* Per trigram worker: sort buffer for batching writes to tmp_trigrams (avoid malloc per path). */
-static __thread trigram_record_t *tw_sort_buf;
-static __thread size_t tw_sort_cap;
-
-static trigram_record_t *tw_ensure_sort_buf(size_t n) {
-    if (n <= tw_sort_cap) return tw_sort_buf;
-    {
-        void *p = realloc(tw_sort_buf, n * sizeof(trigram_record_t));
-        if (!p) return NULL;
-        tw_sort_buf = (trigram_record_t *)p;
-        tw_sort_cap = n;
-    }
-    return tw_sort_buf;
-}
-
 /* Encode + write the records pending in tw_worker_buf[ix] as one frame; reset the buffer. */
 static int tw_worker_flush_locked(build_ctx_t *ctx, size_t ix) {
     FILE *fp;
@@ -3537,11 +3527,14 @@ static void parallel_bucket_io_shutdown(build_ctx_t *ctx) {
 }
 
 /*
- * Write n trigram records for one bucket on one trigram worker's shard file (caller groups by bucket).
- * Each worker_id maps to tmp_trigrams_%04u_w%04u.bin — no mutex (exclusive FILE* per worker × bucket).
+ * Write n trigram codes for one bucket on one trigram worker's shard file (caller
+ * groups by bucket). One path_id is stamped onto every record — the job already
+ * shares a single path — so the worker never expands codes[] into a separate
+ * trigram_record_t[] scratch first. Each worker_id maps to
+ * tmp_trigrams_%04u_w%04u.bin — no mutex (exclusive FILE* per worker × bucket).
  */
-static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t worker_id, uint32_t bucket,
-                                                 const trigram_record_t *recs, size_t n) {
+static int append_trigram_codes_batch_parallel(build_ctx_t *ctx, uint32_t worker_id, uint32_t bucket,
+                                               const uint32_t *codes, size_t n, uint64_t path_id) {
     FILE *fp;
     char path[PATH_MAX];
     size_t ix;
@@ -3606,14 +3599,19 @@ static int append_trigram_records_batch_parallel(build_ctx_t *ctx, uint32_t work
 
     ctx->tw_worker_lru_age[ix] = ++ctx->tw_worker_lru_next_tick[worker_id];
 
-    /* Accumulate records into the per-shard buffer; flush one frame each time it fills. */
+    /* Stamp path_id once per record into the per-shard frame buffer; flush when full. */
     while (n > 0) {
         size_t space = (size_t)ctx->tw_frame_records - ctx->tw_worker_buf_n[ix];
         size_t take = n < space ? n : space;
+        trigram_record_t *dst = ctx->tw_worker_buf[ix] + ctx->tw_worker_buf_n[ix];
+        size_t k;
 
-        memcpy(ctx->tw_worker_buf[ix] + ctx->tw_worker_buf_n[ix], recs, take * sizeof(*recs));
+        for (k = 0; k < take; k++) {
+            dst[k].trigram = codes[k];
+            dst[k].path_id = path_id;
+        }
         ctx->tw_worker_buf_n[ix] += (uint32_t)take;
-        recs += take;
+        codes += take;
         n -= take;
         if (ctx->tw_worker_buf_n[ix] == ctx->tw_frame_records) {
             if (tw_worker_flush_locked(ctx, ix) != 0) {
@@ -3923,11 +3921,12 @@ static void *paths_writer_main(void *arg_void) {
  *
  * The job's trigram codes arrive pre-sorted and de-duplicated (from
  * sort_codes_unique), and bucket = trigram >> (24 - TRIGRAM_BUCKET_BITS) is
- * monotonic in the trigram, so the records are *already* grouped by bucket in
- * ascending order. We split them straight into contiguous per-bucket runs and
- * append each run with one write — no sort. Profiling showed the previous
- * sort here (whether per-job qsort or a per-batch re-sort) was pure redundant
- * work that cost ~24% of index-phase CPU on mega_dir1 for zero benefit.
+ * monotonic in the trigram, so the codes are *already* grouped by bucket in
+ * ascending order. Split them into contiguous per-bucket runs on codes[] and
+ * stamp path_id while filling the shard frame buffer — no intermediate
+ * trigram_record_t[] expansion. Profiling showed the previous per-job re-sort
+ * was ~24% of index-phase CPU; the expand-then-memcpy pass was the next cost
+ * inside trigram_worker_main on single_huge_dir.
  *
  * Note: correctness does not depend on the input being sorted — each emitted
  * run is a maximal same-bucket span, so every record lands in its own bucket
@@ -3941,31 +3940,17 @@ static int trigram_worker_process_job(trigram_worker_arg_t *tw, index_run_stats_
     }
 
     if (job->code_count > 0) {
-        trigram_record_t *buf = tw_ensure_sort_buf(job->code_count);
-        size_t i;
-        size_t run_i;
+        size_t run_i = 0;
 
-        if (!buf) {
-            fprintf(stderr, "ereport_index: realloc trigram batch buf (%zu): %s\n", job->code_count, strerror(errno));
-            atomic_store(&rs->writer_failed, 1);
-            wb_arena_release(job->arena);
-            return -1;
-        }
-        for (i = 0; i < job->code_count; i++) {
-            buf[i].trigram = job->codes[i];
-            buf[i].path_id = job->path_id;
-        }
-
-        run_i = 0;
         while (run_i < job->code_count) {
-            uint32_t b = buf[run_i].trigram >> (24 - TRIGRAM_BUCKET_BITS);
+            uint32_t b = job->codes[run_i] >> (24 - TRIGRAM_BUCKET_BITS);
             size_t run_j = run_i + 1;
-            while (run_j < job->code_count) {
-                uint32_t bj = buf[run_j].trigram >> (24 - TRIGRAM_BUCKET_BITS);
-                if (bj != b) break;
+
+            while (run_j < job->code_count &&
+                   (job->codes[run_j] >> (24 - TRIGRAM_BUCKET_BITS)) == b)
                 run_j++;
-            }
-            if (append_trigram_records_batch_parallel(tw->ctx, tw->worker_index, b, buf + run_i, run_j - run_i) != 0) {
+            if (append_trigram_codes_batch_parallel(tw->ctx, tw->worker_index, b, job->codes + run_i,
+                                                     run_j - run_i, job->path_id) != 0) {
                 atomic_store(&rs->writer_failed, 1);
                 wb_arena_release(job->arena);
                 return -1;
