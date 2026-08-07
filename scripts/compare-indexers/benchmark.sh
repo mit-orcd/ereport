@@ -108,11 +108,11 @@
 #
 # REPS defaults to 3 here (run_smoke.sh alone defaults to 1) because the charts
 # need repetitions to show error bars. DROP_CACHES defaults to 1 when running as
-# root and 0 otherwise. DO_NOWRITE defaults to 1 here so ecrawl's walk-only row
-# is measured alongside find/fd/du/dua/dut, which also store nothing; set
-# DO_NOWRITE=0 to skip that extra traversal. On dnf hosts PKG_ARGS defaults to
-# --disableplugin=etckeeper so a site hook cannot stall the install on a
-# password prompt; set PKG_ARGS to override.
+# root and 0 otherwise. DO_NOWRITE defaults to 1 so ecrawl's stat-walk row sits
+# beside du/dua/dut; DO_NOSTAT defaults to 1 so the names-only row sits beside
+# find/fd. Each adds one extra traversal per rep; set either to 0 to skip.
+# On dnf hosts PKG_ARGS defaults to --disableplugin=etckeeper so a site hook
+# cannot stall the install on a password prompt; set PKG_ARGS to override.
 #
 set -euo pipefail
 
@@ -724,17 +724,19 @@ do_run() {
   printf 'results=%s\n' "$results" >>"$tree/$STATE_NAME.tmp"
   mv "$tree/$STATE_NAME.tmp" "$tree/$STATE_NAME"
 
-  # find, fd, du, dua and dut all walk without storing anything, so ecrawl's
-  # walk-only mode is the only like-for-like row against them. It costs one
-  # extra traversal per rep, which is the cheapest walk in the table.
+  # Walk peers come in two classes: find/fd (names-only) and du/dua/dut (stat +
+  # size). ecrawl needs a row in each — --no-stat and --no-write — each one extra
+  # traversal per rep.
   local nowrite=${DO_NOWRITE:-1}
+  local nostat=${DO_NOSTAT:-1}
 
-  log "4/5 benchmarking (reps=$(reps_summary) cache=$CACHE_MODES DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite)"
+  log "4/5 benchmarking (reps=$(reps_summary) cache=$CACHE_MODES DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite DO_NOSTAT=$nostat)"
   info "results: $results"
   info "each timed binary prints one line: <seconds>  <label>"
   SKIP_PREPARE=1 REPS="$REPS" DROP_CACHES="$DROP_CACHES" DROP_DB_CACHE="$DROP_DB_CACHE" \
     CACHE_MODES="$CACHE_MODES" \
-    DO_NOWRITE="$nowrite" WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
+    DO_NOWRITE="$nowrite" DO_NOSTAT="$nostat" \
+    WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
     WITH_EXTERNALS="${WITH_EXTERNALS:-0}" \
     "$SCRIPT_DIR/run_smoke.sh" "$tree" "$results"
 

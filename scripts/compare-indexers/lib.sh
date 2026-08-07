@@ -1275,6 +1275,28 @@ except Exception:
 PY
 }
 
+# Last non-empty key=value from a tool summary (stdout or stderr).
+kv_from_file() {
+  local key=$1 file=$2
+  [[ -f "$file" ]] || return 0
+  grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+# First whitespace-separated field of the first non-empty line (du -sb, wc -l).
+first_field_from_file() {
+  local file=$1
+  [[ -f "$file" ]] || {
+    echo ""
+    return 0
+  }
+  awk 'NF { print $1; exit }' "$file" 2>/dev/null || true
+}
+
+# dut -s -b prints "<bytes>\t<path>" (or spaces); take the leading integer.
+dut_bytes_from_stdout() {
+  first_field_from_file "$1"
+}
+
 dir_bytes() {
   local d=$1
   if [[ ! -d "$d" ]]; then

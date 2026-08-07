@@ -403,8 +403,8 @@ Each smoke run writes six figures, each as both PNG and PDF:
 
 | File | Title | Question it answers |
 |---|---|---|
-| `charts/figure1_walk_time` | walking, elapsed time | How long does it take to *see* every file? |
-| `charts/figure2_walk_rate` | walking, throughput | How many files per second is that? |
+| `charts/figure1_walk_time` | walking, elapsed time | Names-only vs metadata+size: how long does each peer walk take? |
+| `charts/figure2_walk_rate` | walking, throughput | The same split, in files per second |
 | `charts/figure3_build_time` | building, elapsed time | How long does it take to get from a cold tree to a queryable index? |
 | `charts/figure4_build_rate` | building, throughput | How many files per second is *that*? |
 | `charts/figure5_index_size` | index storage | What does the index cost to keep? |
@@ -443,15 +443,20 @@ but the slowest tool and flattens everything else into a sliver at the origin.
 On a log axis a phase split cannot be read additively, so the phases move from
 the bar into its label.
 
-**Figures 1 and 2** are the traversal figures, and their six rows are the one
-group that compares with no asterisk at all: `find`, `fd`, `du`, `dua`, `dut`
-and `ecrawl --no-write` each walk the whole tree and keep nothing. `find` and
-`fd` only read directories; `du`, `dua`, `dut` and `ecrawl` also `stat` every
-entry, which is most of the spread between them. `ecrawl --no-write` is what earns `ecrawl` a
-place here at all — its full capture against `find` is not a like-for-like race,
-but its walk without the capture is. The capture's own cost stays readable in
-`SUMMARY_TABLE.txt` as `ecrawl/write` minus `ecrawl/nowrite`; it is not a bar,
-because a run that also writes an index does not belong beside four that do not.
+**Figures 1 and 2** are the traversal figures, each drawn as two side-by-side
+panels so peers stay with peers. Every bar’s timed command also returns an
+answer (recorded in the CSV `notes` and the summary footnote):
+
+- **Left — regular-file count:** `find -type f | wc -l`, `fd -t f | wc -l`, and
+  `ecrawl --no-stat --count` (`files=`). Dirents only; no inode reads.
+- **Right — apparent size:** `du -sb`, `dua`, `dut`, and `ecrawl --no-write`
+  (`total_bytes=`). Hard links may disagree: `du`/`dua`/`dut` typically credit
+  a file once; `ecrawl --no-write` has `hardlink_dedup=off` and can overcount.
+
+`ecrawl`'s full capture is not on these figures; its cost stays readable in
+`SUMMARY_TABLE.txt` as `ecrawl/write` minus `ecrawl/nowrite`. `benchmark.sh`
+defaults `DO_NOSTAT=1` and `DO_NOWRITE=1` so both walk panels get an ecrawl row;
+set either to `0` to skip that extra traversal.
 
 **Figures 3 and 4** are the build figures: everything it takes to go from an
 unindexed tree to something queryable, as run, measured end to end for every
@@ -769,32 +774,32 @@ older result sets and the paper's own tables remain comparable.
    `ecrawl`'s last repetition, because that is the capture the query phase reads
    and the sidecars only work with the capture they were made from; the `input=`
    note names it.
-3. `ecrawl` / `nowrite` — walk only, storing nothing. This is the like-for-like
-   row against `find`, `fd`, `du` and `dua`, and the gap to `ecrawl`/`write` is
-   the cost of writing the capture. Not comparable to the full indexers, so it
-   is what appears on the walk figures; `ecrawl`/`write` appears on the build
-   figures instead, and the gap between the two rows stays readable in
-   `SUMMARY_TABLE.txt`. Default on under `benchmark.sh --do`, otherwise
-   `DO_NOWRITE=1`.
-4. GUFI `plain` and `rollup_index` — the same `gufi_dir2index` command into two
+3. `ecrawl` / `nowrite` — stat walk, storing nothing. Like-for-like against
+   `du` / `dua` / `dut` on the walk figures' right panel. The gap to
+   `ecrawl`/`write` is the cost of writing the capture (`SUMMARY_TABLE.txt`).
+   Default on under `benchmark.sh --do` (`DO_NOWRITE=1`).
+4. `ecrawl` / `nostat` — `--no-stat --count`; answers regular-file count
+   (`answer_files=`). Like-for-like against `find` / `fd` on the walk figures'
+   left panel. Default on under `benchmark.sh --do` (`DO_NOSTAT=1`).
+5. GUFI `plain` and `rollup_index` — the same `gufi_dir2index` command into two
    directories, so the rollup has its own copy to work on; the charts pool them
    into one measurement. `rollup_step` is the separate `gufi_rollup` pass, and
    its `index_bytes` is what the rollup adds on top of the replica, so the two
    rows sum to what is on disk.
-5. XDU parquet
-6. Robinhood `scan` and `indexes` — two stages, not alternatives. The scan
+6. XDU parquet
+7. Robinhood `scan` and `indexes` — two stages, not alternatives. The scan
    (site-configured via `RBH_SCAN` + `RBH_SCAN_ARGS`) crawls into index-free
    tables, which is not a database anyone queries; `indexes` times the three
    `CREATE INDEX` statements that make them queryable. Both are what Robinhood
    costs, and the charts and the summary add them.
-7. `find` / `fd` / `du` / `dua` / `dut` `walk` — live walks with `index_bytes=0`
+8. `find` / `fd` / `du` / `dua` / `dut` `walk` — live walks with `index_bytes=0`
+   that return `answer_files=` (find/fd) or `answer_bytes=` (du/dua/dut)
 
-The walk rows time the same metadata sweep the indexers perform, only discarded
-instead of stored. They are reference points rather than indexers, so they stay
-out of the build and storage charts and appear only on Figures 1 and 2.
-`find` and `fd` write their listings to `/dev/null`: only the timing is
-used, and keeping a path list would cost tens of GiB per rep on a production
-tree while charging them for writes `du`/`dua` never make.
+The walk rows are reference points rather than indexers: they stay out of the
+build and storage charts and appear only on Figures 1 and 2, split into
+file-count peers (`find`/`fd`/`ecrawl`/`nostat`) and apparent-size peers
+(`du`/`dua`/`dut`/`ecrawl`/`nowrite`). Answers live in CSV `notes` and the
+summary footnote; charts still plot elapsed time and files/s.
 
 Also reuse the heavier fixture profiler when needed:
 

@@ -23,8 +23,10 @@
 #   DROP_CACHES_SCOPE=all        all | first-rep
 #   DROP_DB_CACHE=0      1: also restart MariaDB when dropping caches
 #   KEEP_ALL_INDEXES=0   1: keep every rep's index instead of the last one
-#   DO_NOWRITE=0         1: also time ecrawl walking without storing anything,
-#                        the like-for-like row against find/fd/du/dua
+#   DO_NOWRITE=0         1: also time ecrawl --no-write (apparent-size peer of
+#                        du/dua/dut; answer_bytes= in notes)
+#   DO_NOSTAT=0          1: also time ecrawl --no-stat --count (file-count peer
+#                        of find/fd; answer_files= in notes)
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -105,6 +107,9 @@ fi
 export TOOLS="$TOOLS_INDEX"
 export INCLUDE_EREPORT_INDEX=1
 export DO_NOWRITE=${DO_NOWRITE:-0}
+export DO_NOSTAT=${DO_NOSTAT:-0}
+
+echo "==> index tools: $TOOLS  DO_NOWRITE=$DO_NOWRITE DO_NOSTAT=$DO_NOSTAT"
 
 "$COMPARE_DIR/run_index.sh" "$SYNTH_ROOT" "$RESULTS_ROOT/index"
 

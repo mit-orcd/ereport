@@ -86,12 +86,13 @@ INDEX_ORDER = [
     "XDU",
 ]
 
-# Walk-only rows: every one of these traverses the tree and stores nothing, so
-# they are the rows that can sit beside each other with no asterisk.
-# ecrawl --no-write is the suite's entry, and the reason it exists is that
-# comparing ecrawl's full capture against find is not a like-for-like race.
-WALK_VARIANTS = ("walk", "nowrite")
+# Walk-only rows store nothing. They are not one peer group: find/fd (and
+# ecrawl --no-stat --count) return a regular-file count with no inode reads,
+# while du/dua/dut (and ecrawl --no-write) return apparent size. Figures 1–2
+# draw those as two panels.
+WALK_VARIANTS = ("walk", "nowrite", "nostat")
 WALK_LABELS = {
+    ("ecrawl", "nostat"): "ecrawl --no-stat --count",
     ("ecrawl", "nowrite"): "ecrawl --no-write",
     ("find", "walk"): "find",
     ("fd", "walk"): "fd",
@@ -99,8 +100,12 @@ WALK_LABELS = {
     ("dua", "walk"): "dua",
     ("dut", "walk"): "dut",
 }
-
-WALK_CHART_ORDER = ["ecrawl --no-write", "fd", "find", "du", "dua", "dut"]
+# Names-only peers: timed job returns a regular-file count (answer_files=).
+WALK_NAMES_ORDER = ["ecrawl --no-stat --count", "fd", "find"]
+# Metadata + size peers: timed job returns apparent bytes (answer_bytes=).
+WALK_META_ORDER = ["ecrawl --no-write", "dut", "dua", "du"]
+WALK_NAMES_LABELS = frozenset(WALK_NAMES_ORDER)
+WALK_META_LABELS = frozenset(WALK_META_ORDER)
 QUERY_ORDER = [
     "ecrawl_query",
     "ereport",
@@ -134,7 +139,8 @@ QUERY_TITLES = {
 COLORS = {
     "ecrawl + ereport_index": "#0072B2",
     "ecrawl": "#0072B2",
-    "ecrawl --no-write": "#0072B2",
+    "ecrawl --no-stat --count": "#0072B2",
+    "ecrawl --no-write": "#56B4E9",
     "ereport": "#0072B2",
     "ecrawl_query": "#0072B2",
     "ereport_index": "#56B4E9",
@@ -497,25 +503,24 @@ def index_metrics(rows):
 
 
 def walk_floor(rows):
-    """Fastest tool that only traversed, as the reference for what a walk costs."""
+    """Fastest names-only walk: the floor no indexer can go below to see every name."""
     grouped = group_index(rows)
     best = None
     for (tool, variant), selected in grouped.items():
-        if variant not in WALK_VARIANTS:
+        label = WALK_LABELS.get((tool, variant))
+        if label not in WALK_NAMES_LABELS:
             continue
         times = floats(selected, "elapsed_sec")
         if not times:
             continue
         mean = statistics.mean(times)
-        name = WALK_LABELS.get((tool, variant)) or "{} {}".format(tool, variant)
         if best is None or mean < best[1]:
-            best = (name, mean)
+            best = (label, mean)
     return best
 
 
 def walk_metrics(rows):
-    """Traversal rows: every tool here walks the whole tree and stores nothing,
-    which makes them the one group that compares with no asterisk at all."""
+    """Traversal rows that store nothing, keyed by chart label for both walk panels."""
     grouped = group_index(rows)
     count = row_file_count(rows)
     result = {}
@@ -1080,7 +1085,7 @@ def index_figure(datasets, out_dir, spec):
         # Above the first bar rather than beside it: the fastest indexer sits at
         # the bottom, which is exactly where this line is closest to a bar.
         axis.annotate(
-            "walk only, stores nothing ({}, {})".format(name, fmt_seconds(value)),
+            "fastest names-only walk ({}, {})".format(name, fmt_seconds(value)),
             xy=(value, -0.82),
             xytext=(4, 0),
             textcoords="offset points",
@@ -1190,9 +1195,14 @@ def index_figure(datasets, out_dir, spec):
 # Captions carry only what the picture cannot: a bar that names its own phases,
 # a legend that names its own series and a title that says what is plotted do
 # not get a sentence repeating them.
-WALK_CAPTION = (
-    "Every row walks the whole tree and keeps nothing. find and fd read "
-    "directories only; du, dua, dut and ecrawl stat every file."
+WALK_NAMES_CAPTION = (
+    "Left: names-only peers. Each bar returns a regular-file count "
+    "(find/fd via wc -l; ecrawl --no-stat --count via files=); no inode reads."
+)
+WALK_META_CAPTION = (
+    "Right: apparent-size peers (du -sb semantics). Hard links may disagree: "
+    "du/dua/dut typically credit a file once; ecrawl --no-write has "
+    "hardlink_dedup=off and can overcount."
 )
 BUILD_CAPTION = "Unindexed tree to queryable index, end to end."
 # Added only when the figure actually draws those bars: a caption explaining a
@@ -1210,31 +1220,40 @@ SIZE_TOOL_NOTES = [
     (("Robinhood (scan only)",), "Robinhood is its database before any index."),
 ]
 
+WALK_PANELS = [
+    {
+        "panel_title": "Regular-file count (names-only)",
+        "order": WALK_NAMES_ORDER,
+        "caption": WALK_NAMES_CAPTION,
+    },
+    {
+        "panel_title": "Apparent size (metadata + bytes)",
+        "order": WALK_META_ORDER,
+        "caption": WALK_META_CAPTION,
+    },
+]
+
 INDEX_FIGURES = [
     {
         "name": "figure1_walk_time",
         "number": 1,
         "heading": "walking, elapsed time",
-        "panel_title": "How long a full walk of the tree takes",
         "key": "walk",
-        "order": WALK_CHART_ORDER,
+        "panels": WALK_PANELS,
         "metric": "time",
         "formatter": fmt_seconds,
         "xlabel": "Elapsed seconds",
-        "caption": WALK_CAPTION,
     },
     {
         "name": "figure2_walk_rate",
         "number": 2,
         "heading": "walking, throughput",
-        "panel_title": "Files per second, walking",
         "key": "walk",
-        "order": WALK_CHART_ORDER,
+        "panels": WALK_PANELS,
         "metric": "rate",
         "better": "higher",
         "formatter": fmt_rate,
         "xlabel": "Files per second",
-        "caption": WALK_CAPTION,
     },
     {
         "name": "figure3_build_time",
@@ -1292,11 +1311,243 @@ INDEX_FIGURES = [
 ]
 
 
+def _walk_panel_tools(datasets, key, order, metric):
+    """Tools from this peer group's `order` only (do not pull in the other panel)."""
+    present = set()
+    for dataset in datasets:
+        present.update(dataset.get(key, {}).keys())
+    return [
+        tool
+        for tool in order
+        if tool in present
+        and any(
+            dataset[key].get(tool, {}).get(metric, (None, None))[0] is not None
+            for dataset in datasets
+        )
+    ]
+
+
+def _sort_walk_tools(tools, datasets, key, metric, higher_better):
+    def sort_key(tool):
+        means = [
+            dataset[key].get(tool, {}).get(metric, (None, None))[0]
+            for dataset in datasets
+        ]
+        means = [m for m in means if m is not None]
+        if not means:
+            return 0.0
+        return min(means) if higher_better else -max(means)
+
+    return sorted(tools, key=sort_key)
+
+
+def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_better,
+                     shades, xlabel, panel_title):
+    """One peer-group ranking; independent x-scale from the sibling panel."""
+    multi = len(datasets) > 1
+    bar_h = 0.72 / len(datasets)
+    positions = list(range(len(tools)))
+    values = [
+        dataset[key].get(tool, {}).get(metric, (None, None))[0]
+        for dataset in datasets
+        for tool in tools
+    ]
+    positive = [v for v in values if v and v > 0]
+    log = bool(positive) and max(positive) / min(positive) >= LOG_RANGE
+    pending = []
+    for dataset_index, dataset in enumerate(datasets):
+        offset = (dataset_index - (len(datasets) - 1) / 2.0) * bar_h
+        for row, tool in enumerate(tools):
+            mean, std = dataset[key].get(tool, {}).get(metric, (None, None))
+            y = positions[row] + offset
+            if mean is None:
+                continue
+            base = shade(COLORS.get(tool, "#4C72B0"), shades[dataset_index])
+            axis.barh(
+                y,
+                mean,
+                height=bar_h * 0.86,
+                color=base,
+                edgecolor="white",
+                linewidth=0.6,
+                zorder=3,
+            )
+            if std:
+                axis.errorbar(
+                    mean, y, xerr=std, fmt="none", ecolor="#333333",
+                    elinewidth=1.0, capsize=2.5, zorder=4,
+                )
+            pending.append((y, dataset_index, mean, std, formatter(mean) if mean else "0"))
+
+    axis.set_yticks(positions)
+    axis.set_yticklabels(tools, fontsize=9)
+    axis.set_ylim(-0.7, len(tools) - 0.3)
+    axis.invert_yaxis()
+    axis.set_title(panel_title, fontsize=10, fontweight="bold", loc="left", pad=4)
+    axis_xlabel = xlabel
+    if log:
+        axis.set_xscale("log")
+        axis.xaxis.set_major_locator(LogLocator(base=10.0))
+        axis.xaxis.set_major_formatter(
+            FuncFormatter(lambda v, _: "{:,.0f}".format(v) if v >= 1 else "{:g}".format(v))
+        )
+        axis_xlabel += " (log scale)"
+    style_axis(axis, axis_xlabel, log)
+    low, high = axis.get_xlim()
+    if log and positive:
+        low = min(positive) / 4.0
+        axis.set_xlim(low, high * 2.6)
+    else:
+        axis.set_xlim(low, high * 1.22)
+    for y, dataset_index, mean, std, text in pending:
+        end = mean + (std or 0)
+        v_shift = 0
+        if multi and len(datasets) > 1:
+            v_shift = (0.5 - dataset_index) * 10
+        bar_label(axis, y, end, text, log, v_shift=v_shift)
+
+
+def walk_figure(datasets, out_dir, spec):
+    """Figures 1–2: two side-by-side peer groups (names-only vs metadata+size)."""
+    key = spec["key"]
+    metric = spec.get("metric", "time")
+    formatter = spec.get("formatter", fmt_seconds)
+    higher_better = spec.get("better") == "higher"
+    panels = spec["panels"]
+    panel_tools = []
+    for panel in panels:
+        tools = _walk_panel_tools(datasets, key, panel["order"], metric)
+        tools = _sort_walk_tools(tools, datasets, key, metric, higher_better)
+        panel_tools.append(tools)
+    if not any(panel_tools):
+        return [], None
+
+    multi = len(datasets) > 1
+    shades = [0.0, 0.45, 0.68, 0.8][: len(datasets)]
+    while len(shades) < len(datasets):
+        shades.append(0.8)
+
+    page = LETTER_LANDSCAPE
+    printable = page[1] - 2 * LETTER_MARGIN
+    header_in = 1.20 if any(d.get("conditions") for d in datasets) else 0.85
+    if datasets[0].get("caveat"):
+        header_in += 0.18
+    xlabel_band_in = 0.55
+    caption_guess_in = 0.70 if multi else 0.55
+    band_pad_in = 0.08
+    max_rows = max((len(t) for t in panel_tools if t), default=1)
+    min_axes_in = INDEX_ROW_IN * max_rows + 0.20
+    fixed_in = header_in + xlabel_band_in + caption_guess_in
+    axes_in = max(min_axes_in,
+                  INDEX_PAGE_FILL * printable - fixed_in - band_pad_in)
+    content_in = fixed_in + axes_in + band_pad_in
+    y_bottom, y_top, height = _page_band(page, content_in)
+    fig = plt.figure(figsize=page)
+
+    left_margin = 0.10
+    mid_gap = 0.04
+    right_margin = 0.04
+    panel_width = (1.0 - left_margin - right_margin - mid_gap) / 2.0
+    axes_bottom = y_bottom + (caption_guess_in + xlabel_band_in) / height
+    axes_height = axes_in / height
+    axes = []
+    for i, tools in enumerate(panel_tools):
+        if not tools:
+            axes.append(None)
+            continue
+        x0 = left_margin + i * (panel_width + mid_gap)
+        axis = fig.add_axes([x0, axes_bottom, panel_width, axes_height])
+        _draw_walk_panel(
+            axis, datasets, tools, key, metric, formatter, higher_better,
+            shades, spec["xlabel"], panels[i]["panel_title"],
+        )
+        axes.append(axis)
+
+    subtitle = subtitle_for(datasets)
+    conditions = datasets[0].get("conditions", "")
+    caption = "Means over repetitions; whiskers \u00b11 s.d. {} is better.".format(
+        "Higher" if higher_better else "Lower"
+    )
+    for panel, tools in zip(panels, panel_tools):
+        if tools and panel.get("caption"):
+            caption += " " + panel["caption"]
+    if multi and metric != "rate" and multiple_trees(datasets):
+        caption += " Across trees compare the rate figure, not seconds."
+    caption = wrap_caption(caption, page[0] - 2 * LETTER_MARGIN)
+    caveat = datasets[0].get("caveat", "")
+    legend_in = 0.55 if multi else 0.0
+    caption_lines = caption.count("\n") + 1
+    caption_text_in = 0.16 * caption_lines + 0.10
+    caption_in = caption_text_in + legend_in
+    fixed_in = header_in + xlabel_band_in + caption_in
+    axes_budget = printable - fixed_in - band_pad_in
+    axes_in = max(min_axes_in, min(INDEX_PAGE_FILL * printable - fixed_in - band_pad_in,
+                                   axes_budget))
+    content_in = fixed_in + axes_in + band_pad_in
+    y_bottom, y_top, height = _page_band(page, content_in)
+    axes_bottom = y_bottom + (caption_in + xlabel_band_in) / height
+    axes_height = axes_in / height
+    for i, axis in enumerate(axes):
+        if axis is None:
+            continue
+        x0 = left_margin + i * (panel_width + mid_gap)
+        axis.set_position([x0, axes_bottom, panel_width, axes_height])
+
+    fig.text(0.05, y_top,
+             "Figure {}: {}".format(spec["number"], spec["heading"]),
+             fontsize=12, fontweight="bold", va="top")
+    fig.text(
+        0.05,
+        y_top - 0.28 / height,
+        subtitle + ("\n" + conditions if conditions else ""),
+        fontsize=8,
+        color="#555555",
+        va="top",
+    )
+    if caveat:
+        fig.text(
+            0.05,
+            y_top - (0.28 + (0.28 if conditions else 0.14)) / height,
+            caveat,
+            fontsize=8,
+            color="#b2182b",
+            fontweight="bold",
+            va="top",
+        )
+    fig.text(0.05, y_bottom + legend_in / height, caption,
+             fontsize=7.5, color="#555555", va="bottom")
+
+    if multi:
+        proxies = [
+            Patch(facecolor=shade("#555555", shades[i]), edgecolor="white",
+                  label=series_label(dataset, datasets))
+            for i, dataset in enumerate(datasets)
+        ]
+        fig.legend(
+            handles=proxies,
+            title=series_title(datasets),
+            frameon=False,
+            fontsize=8,
+            loc="lower left",
+            bbox_to_anchor=(0.05, y_bottom),
+            ncol=len(proxies),
+        )
+    outputs = []
+    for suffix in ("png", "pdf"):
+        path = out_dir / ("{}.{}".format(spec["name"], suffix))
+        fig.savefig(str(path), dpi=200 if suffix == "png" else None)
+        outputs.append(path)
+    return outputs, fig
+
+
 def plot_index(datasets, out_dir):
     outputs = []
     figures = []
     for spec in INDEX_FIGURES:
-        paths, fig = index_figure(datasets, out_dir, spec)
+        if spec.get("panels"):
+            paths, fig = walk_figure(datasets, out_dir, spec)
+        else:
+            paths, fig = index_figure(datasets, out_dir, spec)
         if not paths or fig is None:
             continue
         outputs.extend(paths)

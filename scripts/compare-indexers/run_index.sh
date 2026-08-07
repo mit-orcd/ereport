@@ -23,8 +23,10 @@
 #                     whose capture survives the run and gets queried.
 #   WORK_ROOT=<dir>   where tool indexes are written (default: <results-dir>/indexes)
 #   INCLUDE_EREPORT_INDEX=1   also time ereport_index --make after ecrawl (separate row)
-#   DO_NOWRITE=1      extra ecrawl row: full stat walk, no capture written
-#   DO_NOSTAT=1       extra ecrawl row: names-only walk (no inode reads), the fd-walk peer
+#   DO_NOWRITE=1      extra ecrawl row: stat walk, no capture; answers apparent bytes
+#                     (du/dua/dut peer; hardlink_dedup=off may overcount)
+#   DO_NOSTAT=1       extra ecrawl row: --no-stat --count; answers regular-file count
+#                     (find/fd peer)
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -139,12 +141,11 @@ run_ecrawl() {
   # crawl root fall out of the capture pass, with no query afterwards. It writes
   # only at exit, so it does not affect the timing.
   if [[ "$variant" == "nostat" ]]; then
-    # Names-only walk: stdout is the path stream and the metrics go to stderr, so
-    # discard stdout exactly as the fd row does and keep the two walks comparable.
+    # Names-only census: d_type file count, no path stream (find/fd peer).
     (
       export ECRAWL_CRAWL_THREADS="$ECRAWL_NOSTAT_CRAWL_THREADS" ECRAWL_STAT_THREADS=0
-      time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-stat "$TREE" \
-        >/dev/null 2>"$OUT/${stem}.stderr.txt"
+      time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-stat --count "$TREE" \
+        >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
     )
     st=$?
   elif [[ "$variant" == "nowrite" ]]; then
@@ -155,7 +156,7 @@ run_ecrawl() {
     st=$?
   fi
   set -e
-  local el bytes notes
+  local el bytes notes answer
   el=$(elapsed_from_time_v "$tfile" || echo "")
   if [[ "$variant" == "write" ]]; then
     bytes=$(ecrawl_index_bytes "$dest")
@@ -164,12 +165,12 @@ run_ecrawl() {
     echo "$dest" >"$OUT/ecrawl_bin_dir.txt"
   elif [[ "$variant" == "nostat" ]]; then
     bytes=0
-    # No inode reads, so this row carries no size or ownership data at all: it is a
-    # like-for-like peer of the fd walk, not of any row that builds an index.
-    notes="names_only_no_inode_reads_compare_to_fd_walk"
+    answer=$(kv_from_file files "$OUT/${stem}.stdout.txt")
+    notes="answer_files=${answer:-};names_only_regular_file_count"
   else
     bytes=0
-    notes="walk_only_not_comparable_to_full_index"
+    answer=$(kv_from_file total_bytes "$OUT/${stem}.stdout.txt")
+    notes="answer_bytes=${answer:-};apparent_size_hardlink_dedup=off"
   fi
   if [[ $st -ne 0 ]]; then
     append_row ecrawl "$variant" "$rep" fail "${el:-}" "$bytes" "exit=$st"
@@ -528,20 +529,24 @@ run_find_baseline() {
   local rep=$1
   local stem="find_walk_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
+  local out="$OUT/${stem}.stdout.txt"
   set +e
-  # Only the timing is used. Keeping the listing would cost ~50GB per rep on a
-  # production tree and would charge find for writes du/dua never make.
-  time_cmd "$tfile" find "$TREE" -xdev -printf '%p\n' >/dev/null 2>"$OUT/${stem}.stderr.txt"
+  # Regular-file census (names-only peer). Pipe to wc so the answer is one integer
+  # rather than a multi-GB path listing.
+  time_cmd "$tfile" bash -c 'find "$1" -xdev -type f | wc -l' bash "$TREE" \
+    >"$out" 2>"$OUT/${stem}.stderr.txt"
   local st=$?
   set -e
-  local el
+  local el answer notes
   el=$(elapsed_from_time_v "$tfile" || echo "")
+  answer=$(first_field_from_file "$out")
+  notes="answer_files=${answer:-};names_only_regular_file_count"
   if [[ $st -eq 0 ]]; then
-    append_row find walk "$rep" ok "${el:-}" 0 "live_walk_baseline"
+    append_row find walk "$rep" ok "${el:-}" 0 "$notes"
   elif [[ $st -eq 1 ]]; then
     # find exits 1 when it cannot descend somewhere or an entry vanishes; the
     # walk still ran, so keep the baseline rather than losing the comparison.
-    append_row find walk "$rep" ok "${el:-}" 0 "live_walk_baseline partial_exit=1"
+    append_row find walk "$rep" ok "${el:-}" 0 "${notes};partial_exit=1"
   else
     append_row find walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi
@@ -555,40 +560,48 @@ run_fd_baseline() {
   fi
   local stem="fd_walk_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
+  local out="$OUT/${stem}.stdout.txt"
   set +e
-  # No --type filter, so this walks every entry like the find baseline does.
-  time_cmd "$tfile" "$FD_BIN" "${FD_COMMON_ARGS[@]}" . "$TREE" \
-    >/dev/null 2>"$OUT/${stem}.stderr.txt"
+  # Regular-file census with the same FD_COMMON_ARGS pin as the query rows.
+  time_cmd "$tfile" bash -c '
+    fd_bin=$1; tree=$2; shift 2
+    "$fd_bin" "$@" -t f . "$tree" | wc -l
+  ' bash "$FD_BIN" "$TREE" "${FD_COMMON_ARGS[@]}" \
+    >"$out" 2>"$OUT/${stem}.stderr.txt"
   local st=$?
   set -e
-  local el
+  local el answer notes
   el=$(elapsed_from_time_v "$tfile" || echo "")
+  answer=$(first_field_from_file "$out")
+  notes="answer_files=${answer:-};names_only_regular_file_count"
   if [[ $st -eq 0 ]]; then
-    append_row fd walk "$rep" ok "${el:-}" 0 "live_walk_baseline_parallel"
+    append_row fd walk "$rep" ok "${el:-}" 0 "$notes"
   elif [[ $st -eq 1 ]]; then
-    append_row fd walk "$rep" ok "${el:-}" 0 "live_walk_baseline_parallel partial_exit=1"
+    append_row fd walk "$rep" ok "${el:-}" 0 "${notes};partial_exit=1"
   else
     append_row fd walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi
 }
 
-# du, dua and dut walk the tree to total it, which is the same metadata sweep
-# the indexers do — just discarded instead of stored.
+# du, dua and dut walk the tree for apparent size (metadata + size peer group).
 run_du_baseline() {
   local rep=$1
   local stem="du_walk_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
+  local out="$OUT/${stem}.stdout.txt"
   set +e
   time_cmd "$tfile" du -sb "$TREE" \
-    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+    >"$out" 2>"$OUT/${stem}.stderr.txt"
   local st=$?
   set -e
-  local el
+  local el answer notes
   el=$(elapsed_from_time_v "$tfile" || echo "")
+  answer=$(first_field_from_file "$out")
+  notes="answer_bytes=${answer:-};apparent_size_hardlinks_may_differ"
   if [[ $st -eq 0 ]]; then
-    append_row du walk "$rep" ok "${el:-}" 0 "live_walk_baseline_du_apparent"
+    append_row du walk "$rep" ok "${el:-}" 0 "$notes"
   elif [[ $st -eq 1 ]]; then
-    append_row du walk "$rep" ok "${el:-}" 0 "live_walk_baseline_du_apparent partial_exit=1"
+    append_row du walk "$rep" ok "${el:-}" 0 "${notes};partial_exit=1"
   else
     append_row du walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi
@@ -604,17 +617,20 @@ run_dua_baseline() {
   sentinel=$(dua_sentinel "$OUT")
   local stem="dua_walk_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
+  local out="$OUT/${stem}.stdout.txt"
   set +e
   time_cmd "$tfile" "$DUA_BIN" "${DUA_AGG_ARGS[@]}" "$TREE" "$sentinel" \
-    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+    >"$out" 2>"$OUT/${stem}.stderr.txt"
   local st=$?
   set -e
-  local el
+  local el answer notes
   el=$(elapsed_from_time_v "$tfile" || echo "")
+  answer=$(dua_bytes_for_path "$out" "$TREE")
+  notes="answer_bytes=${answer:-};apparent_size_hardlinks_may_differ"
   if [[ $st -eq 0 ]]; then
     # dua reports unreadable paths on stderr and still exits 0, so a partial
     # walk here is only visible in dua_walk_r*.stderr.txt.
-    append_row dua walk "$rep" ok "${el:-}" 0 "live_walk_baseline_dua_parallel"
+    append_row dua walk "$rep" ok "${el:-}" 0 "$notes"
   else
     append_row dua walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi
@@ -628,17 +644,20 @@ run_dut_baseline() {
   fi
   local stem="dut_walk_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
+  local out="$OUT/${stem}.stdout.txt"
   set +e
   # One line of output, and bounded to this filesystem like find -xdev: see
   # DUT_WALK_ARGS in lib.sh, which is the Q4 vector plus that -x.
   time_cmd "$tfile" "$DUT_BIN" "${DUT_WALK_ARGS[@]}" "$TREE" \
-    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+    >"$out" 2>"$OUT/${stem}.stderr.txt"
   local st=$?
   set -e
-  local el
+  local el answer notes
   el=$(elapsed_from_time_v "$tfile" || echo "")
+  answer=$(dut_bytes_from_stdout "$out")
+  notes="answer_bytes=${answer:-};apparent_size_hardlinks_may_differ"
   if [[ $st -eq 0 ]]; then
-    append_row dut walk "$rep" ok "${el:-}" 0 "live_walk_baseline_dut_parallel_apparent"
+    append_row dut walk "$rep" ok "${el:-}" 0 "$notes"
   else
     append_row dut walk "$rep" fail "${el:-}" 0 "exit=$st"
   fi

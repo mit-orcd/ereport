@@ -549,15 +549,40 @@ def summarize_index(rows):
         {
             "{0}/{1}".format(tool, variant)
             for (tool, variant, _cache) in groups
-            if variant in ("walk", "nowrite")
+            if variant in ("walk", "nowrite", "nostat")
         }
     )
     if walkers:
         lines.append("")
         lines.append("walk-only rows (store nothing, so index_MiB is 0): " + ", ".join(walkers))
-        lines.append("  These measure traversal alone. ecrawl/nowrite is the like-for-like")
-        lines.append("  comparison against find, fd, du, dua and dut; ecrawl/write is that same")
-        lines.append("  walk plus writing the capture, so the difference is the cost of storing it.")
+        lines.append("  Two peer groups with returned answers:")
+        lines.append("  names-only file count (find/fd/ecrawl/nostat) vs apparent size")
+        lines.append("  (du/dua/dut/ecrawl/nowrite). ecrawl/write is the nowrite walk plus")
+        lines.append("  writing the capture, so write − nowrite is the cost of storing it.")
+        lines.append(
+            "  Apparent bytes: du/dua/dut usually credit hard links once; "
+            "ecrawl/nowrite has hardlink_dedup=off and may overcount."
+        )
+        for (tool, variant, cache), rs in sorted(
+            groups.items(), key=lambda x: (x[0][0], x[0][1], cache_key(x[0][2]))
+        ):
+            if variant not in ("walk", "nowrite", "nostat"):
+                continue
+            ok = [r for r in rs if r.get("status") == "ok"]
+            if not ok:
+                continue
+            note = ok[-1].get("notes") or ""
+            answer = ""
+            for part in note.split(";"):
+                if part.startswith("answer_files=") or part.startswith("answer_bytes="):
+                    answer = part
+                    break
+            if not answer:
+                continue
+            label = cache or "-"
+            lines.append(
+                "  {0}/{1} ({2}): {3}".format(tool, variant, label, answer)
+            )
     return lines
 
 
