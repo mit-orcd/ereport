@@ -29,22 +29,20 @@
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
- *   - Global progress counters (TTY tot/obj/s) are folded from thread-local perf every
- *     GLOBAL_PERF_FLUSH_EVERY entries and whenever the rolling window rolls, in both write and
- *     --no-write mode: one atomic RMW per counter per entry costs more than the accounting itself
- *     once a dozen threads share those cache lines.
+ *   - Live progress is opt-in (--progress). Workers publish TLS file/entry/byte totals on the
+ *     donate-entry check cadence (every DEFAULT_DONATE_ENTRY_CHECK_EVERY dirents); a coalesced
+ *     stderr line is printed on that same path. Without --progress there is no stats thread and
+ *     no GLOBAL_PERF_FLUSH_EVERY atomic multipack.
  *   - Each run clears prior crawl outputs in the chosen output-dir: uid_shard_*.bin, matching *.bin.ckpt,
  *     and crawl_manifest.txt (uid.txt/gid.txt are reopened truncated). An interrupted crawl has nothing to
  *     resume across runs; only in-process shard reopen (LRU) reloads checkpoints for shards written this run.
- *   - Rolling 10-second stats are printed once per second on a TTY only; omitted when stdout
- *     is redirected so logs are not filled with carriage-return lines.
- *   - Live stats always show q, t, p, and wq even when zero (q = global crawl task-queue length).
  *
  * Build:
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ *   ./ecrawl [--no-write] [--progress] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ *   --progress: cheap live files=/entries= on stderr (donate-entry cadence).
  *   --verbose: full metrics to stdout at exit.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
@@ -859,7 +857,21 @@ static int g_print0 = 0;
 static char *g_contains_lower = NULL;
 static size_t g_contains_len = 0;
 static int g_verbose = 0;
+/* --progress: publish TLS totals on donate-entry checks and print a coalesced stderr line. */
+static int g_progress = 0;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
+
+/* Per-worker published totals for --progress (plain stores; owning thread only). */
+typedef struct {
+    uint64_t entries;
+    uint64_t files;
+    uint64_t bytes;
+} progress_slot_t;
+
+static progress_slot_t *g_progress_slots = NULL;
+static size_t g_progress_nslots = 0;
+static atomic_ullong g_progress_last_print_ns = 0;
+#define PROGRESS_PRINT_MIN_NS 500000000ULL /* coalesce: at most ~2 lines/s */
 static int g_stat_threads_configured = 0;
 static size_t g_getdents_buf_bytes = DEFAULT_GETDENTS_BUF;
 static size_t g_stat_batch_entries_cfg = DEFAULT_STAT_BATCH_ENTRIES;
@@ -1232,13 +1244,6 @@ static void account_entry_dtype(crawl_stats_t *stats, perf_local_t *perf, unsign
         break;
     }
 
-    {
-        int idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
-
-        if (perf->entries == 1) perf->bucket_idx = idx;
-        if (perf->entries >= (uint64_t)GLOBAL_PERF_FLUSH_EVERY || idx != perf->bucket_idx)
-            perf_flush_local(perf);
-    }
 }
 
 static void ecrawl_hook_task_popped_verbose(void) { ATOMIC_ADD_RELAXED(&g_tasks_popped, 1); }
@@ -1709,9 +1714,73 @@ static void format_duration(double sec, char *out, size_t out_sz) {
 }
 
 static void clear_status_line(void) {
-    if (!isatty(STDOUT_FILENO)) return;
-    printf("\r\033[2K\r");
-    fflush(stdout);
+    if (isatty(STDOUT_FILENO)) {
+        printf("\r\033[2K\r");
+        fflush(stdout);
+    }
+    if (g_progress && isatty(STDERR_FILENO)) {
+        fprintf(stderr, "\r\033[2K\r");
+        fflush(stderr);
+    }
+}
+
+/* Publish this worker's crawl_stats_t into its progress slot (owning thread / under emit_stats_lock). */
+static void progress_publish(worker_arg_t *wa) {
+    size_t idx;
+
+    if (!g_progress || !wa || !g_progress_slots) return;
+    if (wa->worker_index == 0) return;
+    idx = (size_t)wa->worker_index - 1U;
+    if (idx >= g_progress_nslots) return;
+
+    pthread_mutex_lock(&wa->emit_stats_lock);
+    g_progress_slots[idx].entries = wa->stats.total_entries;
+    g_progress_slots[idx].files = wa->stats.total_files;
+    g_progress_slots[idx].bytes = wa->stats.total_bytes;
+    pthread_mutex_unlock(&wa->emit_stats_lock);
+}
+
+/* Coalesced stderr progress line; only one thread wins the last-print CAS per interval. */
+static void progress_maybe_print(void) {
+    struct timespec ts;
+    unsigned long long now_ns;
+    unsigned long long prev;
+    uint64_t entries = 0;
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+    size_t i;
+    double elapsed_sec;
+    char fe[32], ff[32], fb[32], el[32];
+    int tty;
+
+    if (!g_progress || !g_progress_slots) return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    now_ns = (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+    prev = atomic_load(&g_progress_last_print_ns);
+    if (prev != 0ULL && (now_ns - prev) < PROGRESS_PRINT_MIN_NS) return;
+    if (!atomic_compare_exchange_strong(&g_progress_last_print_ns, &prev, now_ns)) return;
+
+    for (i = 0; i < g_progress_nslots; i++) {
+        entries += g_progress_slots[i].entries;
+        files += g_progress_slots[i].files;
+        bytes += g_progress_slots[i].bytes;
+    }
+
+    elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
+    human_decimal((double)files, ff, sizeof(ff));
+    human_decimal((double)entries, fe, sizeof(fe));
+    human_decimal((double)bytes, fb, sizeof(fb));
+    format_duration(elapsed_sec, el, sizeof(el));
+    tty = isatty(STDERR_FILENO);
+    if (bytes > 0ULL) {
+        fprintf(stderr, "%sfiles=%s entries=%s bytes=%s el=%s%s", tty ? "\r" : "", ff, fe, fb, el,
+                tty ? "            " : "\n");
+    } else {
+        fprintf(stderr, "%sfiles=%s entries=%s el=%s%s", tty ? "\r" : "", ff, fe, el,
+                tty ? "            " : "\n");
+    }
+    fflush(stderr);
 }
 
 static inline size_t id_registry_hash(uint32_t id) {
@@ -2099,10 +2168,7 @@ static void regular_file_accounting(shared_state_t *shared, crawl_stats_t *stats
     blocks = st->st_blocks;
     from_blocks = (blocks > 0) ? (uint64_t)blocks * (uint64_t)ST_BLOCKS_BYTES_UNIT : 0ULL;
 
-    if (st->st_nlink <= 1 || g_no_write) {
-        /* --no-write skips the hardlink inode registry: every visit credits st_size.
-         * Byte totals can overcount multiply-linked files; entry/file counts stay exact. */
-        if (st->st_nlink > 1) stats->total_hardlink_files++;
+    if (st->st_nlink <= 1) {
         out->byte_credit = apparent;
         out->allocated_bytes = from_blocks;
         if (apparent > 0ULL && from_blocks < apparent) out->sparse_heuristic_inc = 1ULL;
@@ -2179,18 +2245,6 @@ static uint64_t account_entry_local(shared_state_t *shared, crawl_stats_t *stats
         contrib = apparent_size;
     }
 
-    /* Fold into the process-wide progress counters in batches, never per entry: with 16 crawl plus 8 stat
-     * threads these six counters live on a handful of cache lines, and one atomic RMW per entry per counter
-     * costs more than the accounting itself. Flush on entry count, and whenever the rolling window rolls so
-     * a bucket only ever receives counts from its own second. */
-    {
-        int idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
-
-        if (perf->entries == 1) perf->bucket_idx = idx;
-        if (perf->entries >= (uint64_t)GLOBAL_PERF_FLUSH_EVERY || idx != perf->bucket_idx)
-            perf_flush_local(perf);
-    }
-
     return contrib;
 }
 
@@ -2237,34 +2291,8 @@ static void stats_add_donation_attempt_local(worker_aux_stats_t *s, uint64_t cou
 }
 
 static void perf_flush_local(perf_local_t *perf) {
-    int idx;
-
-    if (!perf || perf->entries == 0) return;
-
-    /* The bucket the counts were accumulated in, which may no longer be the current one. It is still inside
-     * the live window: the stats thread only ever clears the bucket it is about to make current. */
-    idx = perf->bucket_idx;
-    if (idx < 0 || idx >= WINDOW_SECONDS) idx = (int)ATOMIC_LOAD_RELAXED(&g_bucket_index);
-
-    ATOMIC_ADD_RELAXED(&g_total_entries, perf->entries);
-    ATOMIC_ADD_RELAXED(&g_window_entries, perf->entries);
-    ATOMIC_ADD_RELAXED(&g_bucket_entries[idx], perf->entries);
-
-    if (perf->dirs > 0) {
-        ATOMIC_ADD_RELAXED(&g_total_dirs, perf->dirs);
-        ATOMIC_ADD_RELAXED(&g_window_dirs, perf->dirs);
-        ATOMIC_ADD_RELAXED(&g_bucket_dirs[idx], perf->dirs);
-    }
-    if (perf->files > 0) {
-        ATOMIC_ADD_RELAXED(&g_total_files, perf->files);
-        ATOMIC_ADD_RELAXED(&g_window_files, perf->files);
-        ATOMIC_ADD_RELAXED(&g_bucket_files[idx], perf->files);
-        ATOMIC_ADD_RELAXED(&g_total_bytes, perf->bytes);
-        ATOMIC_ADD_RELAXED(&g_total_allocated_bytes, perf->allocated_bytes);
-        ATOMIC_ADD_RELAXED(&g_files_sparse_heuristic, perf->files_sparse_heuristic);
-    }
-
-    memset(perf, 0, sizeof(*perf));
+    /* Rolling-window globals / 1 Hz stats thread removed; crawl_stats_t is authoritative. */
+    (void)perf;
 }
 
 static int write_bin_header(FILE *fp) {
@@ -2278,8 +2306,8 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--verbose] "
-            "[--record-root <abs-path>] <start-path> [output-dir]\n",
+            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] "
+            "[--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
@@ -2292,7 +2320,8 @@ static void print_usage(const char *prog) {
             "--count: with --no-stat, only count files/dirs/etc from d_type; do not print paths.\n"
             "--contains: keep paths whose full path contains <text>, case-insensitive "
             "(same rule as ereport_index --search). Requires --no-stat.\n"
-            "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n");
+            "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n"
+            "--progress: cheap live files=/entries= on stderr (donate-entry cadence); not implied by --verbose.\n");
     fprintf(stderr,
             "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
@@ -4170,11 +4199,15 @@ static int should_donate_to_idle(const shared_state_t *shared, const dir_stack_t
 }
 
 static void donate_spill_on_entries(shared_state_t *shared, dir_stack_t *stack, task_queue_t *queue,
-                                    worker_aux_stats_t *aux, size_t *entries_since_check) {
+                                    worker_aux_stats_t *aux, size_t *entries_since_check, worker_arg_t *wa) {
     size_t want;
 
     if (*entries_since_check < g_donate_entry_check_every_cfg) return;
     *entries_since_check = 0;
+    if (g_progress && wa) {
+        progress_publish(wa);
+        progress_maybe_print();
+    }
     if (!should_donate_to_idle(shared, stack)) return;
 
     /* One per idle peer, capped by what is on the stack: enough to wake them, not so much that a
@@ -4704,6 +4737,8 @@ static void process_stat_batch_worker(stat_batch_t *batch) {
         close(batch->dirfd_dup);
         batch->dirfd_dup = -1;
     }
+
+    if (g_progress && wa) progress_publish(wa);
 
     atomic_fetch_add_explicit(&g_stat_batches_completed, 1ULL, memory_order_relaxed);
 
@@ -5267,7 +5302,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
                     entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
                     child_name_len = strlen(ent_name);
 
                     /* Filesystems without d_type support report DT_UNKNOWN, and we cannot recurse
@@ -5365,7 +5400,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
                     entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
 
                     child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
@@ -5491,7 +5526,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
                     entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
 
                     child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
@@ -6540,8 +6575,8 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "no_write=%d\n", g_no_write);
     fprintf(fp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
     fprintf(fp, "output_layout=%s\n", g_no_write ? "none" : "uid_shards");
-    /* Unique-byte hardlink dedup needs the inode registry; --no-write skips it. */
-    fprintf(fp, "hardlink_dedup=%s\n", g_no_write ? "off" : "on");
+    /* Unique-byte hardlink dedup uses the inode registry whenever inodes are read. */
+    fprintf(fp, "hardlink_dedup=%s\n", g_no_stat ? "off" : "on");
     fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
     fprintf(fp, "seed_mode=%s\n", "root_only");
     fprintf(fp, "uid_shards=%u\n", g_uid_shards);
@@ -6751,6 +6786,10 @@ int main(int argc, char **argv) {
             g_verbose = 1;
             continue;
         }
+        if (strcmp(argv[i], "--progress") == 0) {
+            g_progress = 1;
+            continue;
+        }
         if (strcmp(argv[i], "--record-root") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--record-root requires a path\n");
@@ -6938,8 +6977,9 @@ int main(int argc, char **argv) {
 
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.stats_mutex, NULL);
-    /* --no-write / --no-stat never consult the hardlink registry (see regular_file_accounting). */
-    if (!g_no_write) {
+    /* Hardlink unique-byte credit needs the inode registry whenever we stat (write or --no-write).
+     * --no-stat never reads inodes, so it cannot dedupe. */
+    if (!g_no_stat) {
         if (inode_registry_init(&g_hardlink_registry) != 0) {
             fprintf(stderr, "ERROR failed to initialize hardlink registry\n");
             pthread_mutex_destroy(&shared.stats_mutex);
@@ -7114,30 +7154,10 @@ int main(int argc, char **argv) {
         disk_monitor_started = 1;
     }
 
-    if (pthread_create(&stats_thread, NULL, stats_thread_main, NULL) != 0) {
-        fprintf(stderr, "ERROR failed to create stats thread\n");
-        if (!g_no_write) {
-            atomic_store(&g_disk_wait_disabled, 1);
-            disk_monitor_stop_request();
-            if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
-            disk_monitor_started = 0;
-            for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
-            for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
-        }
-        if (!g_no_write) {
-            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
-            free(writer_queues);
-            free(writer_threads);
-            free(writer_args);
-        }
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
-        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
-        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
-        return 1;
-    }
-    stats_thread_started = 1;
+    /* No 1 Hz stats thread: default is silent; --progress prints on donate-entry cadence. */
+    stats_thread_started = 0;
+    (void)stats_thread;
+    (void)sizeof(&stats_thread_main);
 
     /* Crawl workers first, then one per stat thread when the stat pool may also crawl. Keeping them in
      * one array means the stats merge and the lock teardown below cover both pools unchanged. */
@@ -7150,9 +7170,6 @@ int main(int argc, char **argv) {
         free(workers);
         free(worker_args);
         fprintf(stderr, "ERROR allocation failed for crawl thread table (%d threads)\n", g_crawl_threads);
-        stats_stop_request();
-        pthread_join(stats_thread, NULL);
-        clear_status_line();
         if (!g_no_write) {
             atomic_store(&g_disk_wait_disabled, 1);
             disk_monitor_stop_request();
@@ -7175,15 +7192,45 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (g_progress) {
+        g_progress_nslots = (size_t)worker_arg_count;
+        g_progress_slots = (progress_slot_t *)calloc(g_progress_nslots, sizeof(*g_progress_slots));
+        if (!g_progress_slots) {
+            free(workers);
+            free(worker_args);
+            fprintf(stderr, "ERROR allocation failed for progress slots\n");
+            if (!g_no_write) {
+                atomic_store(&g_disk_wait_disabled, 1);
+                disk_monitor_stop_request();
+                if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
+                disk_monitor_started = 0;
+                for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
+                for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
+            }
+            if (!g_no_write) {
+                for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
+                free(writer_queues);
+                free(writer_threads);
+                free(writer_args);
+            }
+            queue_destroy(&queue);
+            pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+            if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+            if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+            return 1;
+        }
+        atomic_store(&g_progress_last_print_ns, 0);
+    }
+
     for (i = 0; i < worker_arg_count; i++) {
         if (pthread_mutex_init(&worker_args[i].emit_stats_lock, NULL) != 0) {
             fprintf(stderr, "ERROR crawl worker mutex init failed\n");
             while (i > 0) pthread_mutex_destroy(&worker_args[--i].emit_stats_lock);
+            free(g_progress_slots);
+            g_progress_slots = NULL;
             free(workers);
             free(worker_args);
-            stats_stop_request();
-            pthread_join(stats_thread, NULL);
-            clear_status_line();
             if (!g_no_write) {
                 atomic_store(&g_disk_wait_disabled, 1);
                 disk_monitor_stop_request();
@@ -7222,11 +7269,14 @@ int main(int argc, char **argv) {
     if (stat_pool_start(stat_helper_args > 0 ? &worker_args[g_crawl_threads] : NULL) != 0) {
         fprintf(stderr, "ERROR failed to start stat worker pool\n");
         for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
+        free(g_progress_slots);
+        g_progress_slots = NULL;
         free(workers);
         free(worker_args);
-        stats_stop_request();
-        pthread_join(stats_thread, NULL);
-        clear_status_line();
+        if (stats_thread_started) {
+            stats_stop_request();
+            pthread_join(stats_thread, NULL);
+        }
         if (!g_no_write) {
             atomic_store(&g_disk_wait_disabled, 1);
             disk_monitor_stop_request();
@@ -7297,8 +7347,8 @@ int main(int argc, char **argv) {
     if (stats_thread_started) {
         stats_stop_request();
         pthread_join(stats_thread, NULL);
-        clear_status_line();
     }
+    clear_status_line();
 
     /* Resolve uid/gid names here rather than leaving it to id_registry_destroy at the end of main.
      * It is real work whose cost scales with distinct owners, so it belongs inside t0..t1 where
@@ -7345,7 +7395,7 @@ int main(int argc, char **argv) {
             if (g_record_root) fprintf(sumfp, "record_root=%s\n", g_record_root);
             fprintf(sumfp, "no_write=%d\n", g_no_write);
             fprintf(sumfp, "no_stat=%d\n", g_no_stat);
-            if (g_no_write) fprintf(sumfp, "hardlink_dedup=off\n");
+            fprintf(sumfp, "hardlink_dedup=%s\n", g_no_stat ? "off" : "on");
             fprintf(sumfp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
             fprintf(sumfp, "crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);
             fprintf(sumfp, "writer_threads=%d\n", writer_threads_used);
@@ -7359,9 +7409,7 @@ int main(int argc, char **argv) {
             if (g_no_stat) {
                 print_no_stat_stats(sumfp);
             } else {
-                fprintf(sumfp, "byte_accounting=%s\n",
-                        g_no_write ? "st_size_per_visit (--no-write; hardlinks may overcount)"
-                                  : "unique_regular_files");
+                fprintf(sumfp, "byte_accounting=%s\n", "unique_regular_files");
                 fprintf(sumfp, "hardlink_files=%" PRIu64 "\n", shared.total_hardlink_files);
                 fprintf(sumfp, "total_bytes=%" PRIu64 "\n", shared.total_bytes);
                 fprintf(sumfp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
@@ -7385,6 +7433,9 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
 
+    free(g_progress_slots);
+    g_progress_slots = NULL;
+    g_progress_nslots = 0;
     free(workers);
     free(worker_args);
 

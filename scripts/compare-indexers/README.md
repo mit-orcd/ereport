@@ -450,8 +450,8 @@ answer (recorded in the CSV `notes` and the summary footnote):
 - **Left — regular-file count:** `find -type f | wc -l`, `fd -t f | wc -l`, and
   `ecrawl --no-stat --count` (`files=`). Dirents only; no inode reads.
 - **Right — apparent size:** `du -sb`, `dua`, `dut`, and `ecrawl --no-write`
-  (`total_bytes=`). Hard links may disagree: `du`/`dua`/`dut` typically credit
-  a file once; `ecrawl --no-write` has `hardlink_dedup=off` and can overcount.
+  (`total_bytes=`). All credit each hard-linked inode once (`ecrawl` reports
+  `hardlink_dedup=on`).
 
 `ecrawl`'s full capture is not on these figures; its cost stays readable in
 `SUMMARY_TABLE.txt` as `ecrawl/write` minus `ecrawl/nowrite`. `benchmark.sh`

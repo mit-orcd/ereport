@@ -1200,9 +1200,8 @@ WALK_NAMES_CAPTION = (
     "(find/fd via wc -l; ecrawl --no-stat --count via files=); no inode reads."
 )
 WALK_META_CAPTION = (
-    "Right: apparent-size peers (du -sb semantics). Hard links may disagree: "
-    "du/dua/dut typically credit a file once; ecrawl --no-write has "
-    "hardlink_dedup=off and can overcount."
+    "Right: apparent-size peers (du -sb semantics). Hard-linked inodes are "
+    "credited once (du/dua/dut and ecrawl --no-write with hardlink_dedup=on)."
 )
 BUILD_CAPTION = "Unindexed tree to queryable index, end to end."
 # Added only when the figure actually draws those bars: a caption explaining a

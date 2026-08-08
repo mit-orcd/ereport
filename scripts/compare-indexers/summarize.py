@@ -560,8 +560,8 @@ def summarize_index(rows):
         lines.append("  (du/dua/dut/ecrawl/nowrite). ecrawl/write is the nowrite walk plus")
         lines.append("  writing the capture, so write − nowrite is the cost of storing it.")
         lines.append(
-            "  Apparent bytes: du/dua/dut usually credit hard links once; "
-            "ecrawl/nowrite has hardlink_dedup=off and may overcount."
+            "  Apparent bytes: du/dua/dut and ecrawl/nowrite credit hard links once "
+            "(hardlink_dedup=on)."
         )
         for (tool, variant, cache), rs in sorted(
             groups.items(), key=lambda x: (x[0][0], x[0][1], cache_key(x[0][2]))

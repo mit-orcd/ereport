@@ -29,7 +29,7 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
 ```
 
 Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
@@ -71,13 +71,14 @@ Optional environment variables (no CLI flags for these; see also [environment-va
 | `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | When every crawl thread already holds a popped task, still allow proactive donation if the local stack is at least this deep and the global queue is below `started × ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` (default 64 dirs; range `donate_floor`…65536). |
 | `ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` | Caps global task-queue depth for that “all busy” donation path (default 4; range 1…256). |
 | `ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH` | Coalesce `fstatat`-discovered subdir enqueues into fewer global queue pushes (default 48 paths per flush; range 1…4096). |
-| `ECRAWL_STALL_HINT_SECONDS` | After the rolling window is warm (~10 seconds), emit one stderr line if `window_entries` stays 0 for this many consecutive seconds (default `5`; `0` disables). Another hint is allowed only after `window_entries` goes non-zero again. |
+| `ECRAWL_STALL_HINT_SECONDS` | Retained for compatibility; the 1 Hz rolling-window stats thread was removed, so stall hints are not emitted. |
 
 Examples:
 
 ```bash
 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --no-write /path/to/filesystem-tree
+./ecrawl --no-write --progress /path/to/filesystem-tree
 ./ecrawl --no-write --verbose /path/to/filesystem-tree
 ./ecrawl --no-stat /path/to/filesystem-tree                      # names only, no inode reads
 ./ecrawl --no-stat --contains slurm- /path/to/filesystem-tree    # case-insensitive path search
@@ -94,13 +95,14 @@ ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/files
 
 Notes:
 
-- `--no-write` crawls and reports metrics without writing shard files. It also skips the hardlink inode registry (`hardlink_dedup=off`): entry/file counts stay exact, but `total_bytes` can overcount multiply-linked files.
-- `--verbose` enables the full end-of-run diagnostics.
+- `--no-write` crawls and reports metrics without writing shard files. Hardlink dedup stays on (`hardlink_dedup=on`): each regular-file inode credits `st_size` once, matching write-mode `total_bytes` and `du`/`dut` semantics.
+- `--verbose` enables the full end-of-run diagnostics only; it does not imply mid-run progress.
+- `--progress` prints a cheap live `files=` / `entries=` (and `bytes=` when accounted) line on stderr, driven by the donate-entry check cadence (every `ECRAWL_DONATE_ENTRY_CHECK_EVERY` dirents, default 4096), coalesced to about two updates per second. There is no dedicated progress thread. Omit it for dut-quiet timed walks.
 - `--no-stat` walks names only and never reads an inode, streaming each path to stdout instead of writing a capture. It implies `--no-write` and rejects an `output-dir`, because a record needs the uid, size, inode and mtime that only `stat` provides. Recursion is driven entirely by the `d_type` that `getdents64` already returns; on a filesystem that reports `DT_UNKNOWN` the walk falls back to one `fstatat` for those entries alone and counts them in `dtype_unknown_fallbacks`. Because stdout is the path stream, the run summary goes to stderr, so `./ecrawl --no-stat /tree | sort` is a clean path list. Counts are limited to what `d_type` can prove (files, dirs, symlinks, other) — no byte totals.
 - `--count` (requires `--no-stat`) only tallies those d_type counts and does not print paths. Use it for a names-only file/folder census: `./ecrawl --no-stat --count /tree`. The summary stays on stdout.
 - `--contains <text>` (requires `--no-stat`) keeps only paths whose **full path** contains `text`, case-insensitively — the same rule as `ereport_index --search`, and equivalent to `find /tree | grep -iF text`. It is not a glob: `*` and `?` match themselves. Matching is cheap because a directory whose own path already matches short-circuits its whole subtree, and non-matching directories compare each child name against a small window instead of rebuilding the full path.
 - `--print0` (requires `--no-stat`) NUL-separates the stream, for paths containing newlines.
-- `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--verbose` end-of-run metrics and the built-in contention counters instead.
+- `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--progress` for live counts and `--verbose` for end-of-run metrics.
 - `--record-root <path>` rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks `start-path` on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with `realpath(3)`.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):

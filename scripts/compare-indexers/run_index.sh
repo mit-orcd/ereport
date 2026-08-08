@@ -24,7 +24,7 @@
 #   WORK_ROOT=<dir>   where tool indexes are written (default: <results-dir>/indexes)
 #   INCLUDE_EREPORT_INDEX=1   also time ereport_index --make after ecrawl (separate row)
 #   DO_NOWRITE=1      extra ecrawl row: stat walk, no capture; answers apparent bytes
-#                     (du/dua/dut peer; hardlink_dedup=off may overcount)
+#                     (du/dua/dut peer; hardlink_dedup=on)
 #   DO_NOSTAT=1       extra ecrawl row: --no-stat --count; answers regular-file count
 #                     (find/fd peer)
 #
@@ -170,7 +170,7 @@ run_ecrawl() {
   else
     bytes=0
     answer=$(kv_from_file total_bytes "$OUT/${stem}.stdout.txt")
-    notes="answer_bytes=${answer:-};apparent_size_hardlink_dedup=off"
+    notes="answer_bytes=${answer:-};apparent_size_hardlink_dedup=on"
   fi
   if [[ $st -ne 0 ]]; then
     append_row ecrawl "$variant" "$rep" fail "${el:-}" "$bytes" "exit=$st"
