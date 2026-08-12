@@ -16,13 +16,14 @@
  * directory the unit of parallelism, so one large directory is walked by one
  * thread whatever --threads says — measured as cpu_util 0.70 against 16
  * threads on a 1M-file directory, a queue depth of about 1 that describes the
- * bench rather than the strategy under test. ecrawl does not work that way: it
- * hands every mid-directory batch to a stat pool (ECRAWL_STAT_THREADS,
- * default 8) and stats only end-of-directory tails inline. So --stat-threads
- * defaults to 8 here as well. --stat-threads 0 selects the old fully-inline
- * path and is how the 18-row dataset in logs/ewalk-strategy-manual-567654/
- * was produced, so those results stay reproducible rather than merely
- * remembered.
+ * bench rather than the strategy under test. ecrawl did not work that way: it
+ * handed every mid-directory batch to a stat pool (8 threads by default) and
+ * stat'd only end-of-directory tails inline, until measurement showed the
+ * pool rarely won and it was removed. --stat-threads still defaults to 8 here
+ * so that walker remains reproducible. --stat-threads 0 selects the old
+ * fully-inline path and is how the 18-row dataset in
+ * logs/ewalk-strategy-manual-567654/ was produced, so those results stay
+ * reproducible rather than merely remembered.
  *
  * Discovered directories reach the global queue in batches of
  * --dir-enqueue-batch (ecrawl's ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH default of
@@ -49,8 +50,8 @@
  * rather than from the read loop.
  *
  * --sort-window widens that 1024-name batch, up to the whole directory. It is
- * opt-in and defaults to 1024 precisely because 1024 is what ecrawl's
- * ECRAWL_STAT_INODE_ORDER does; the wider window exists to tell "inode
+ * opt-in and defaults to 1024 precisely because 1024 is the window ecrawl's
+ * removed stat pool used; the wider window exists to tell "inode
  * ordering does not help here" apart from "the batch is too small to express
  * inode ordering in this directory". See the comment above walk_dir_batched.
  *
@@ -118,10 +119,9 @@
 
 /* --stat-threads: depth of the batch queue between readers and stat threads,
  * and the tail-batch size below which a batch is stat'd inline instead. Both
- * are ecrawl's defaults (DEFAULT_STAT_QUEUE_BATCHES, DEFAULT_STAT_BATCH_MIN_OFFLOAD),
- * so a cell with the pool on differs from ecrawl in strategy and not in how
- * work is split. Queue-full means stat inline, which is also what ecrawl's
- * ECRAWL_STAT_FULL_INLINE fallback does.
+ * were ecrawl's defaults before its stat pool was removed, so a cell with the
+ * pool on differed from ecrawl in strategy and not in how work is split.
+ * Queue-full means stat inline, which is also what ecrawl's fallback did.
  *
  * The offload threshold was laddered on XFS (job 19684544 cold / 19678135 warm)
  * against a 200,000×5 many_dirs tree, a 200×5000 few_dirs tree and a 1M-file
@@ -129,12 +129,13 @@
  * is smaller than the gate, so the pool never runs. At 0 the pool engages
  * (~87k–200k offloaded) but many_dirs regresses ~40–50% (warm median 0.308 s →
  * 0.471 s at 8 stat threads), because the queue handoff costs more than an
- * inline fstatat on a five-name batch. So 32 stays: it matches ecrawl, and
- * zeroing it to "engage the pool" is a measured loss, not a free fix. */
-#define STAT_QUEUE_BATCHES       64
+ * inline fstatat on a five-name batch. So 32 stays: it matches what ecrawl's
+ * pool did, and zeroing it to "engage the pool" is a measured loss, not a
+ * free fix. */
+#define STAT_QUEUE_BATCHES       256
 #define DEFAULT_STAT_MIN_OFFLOAD 32
-/* ecrawl's ECRAWL_STAT_THREADS default, and therefore this one: a benchmark
- * that stands in for ecrawl has to have ecrawl's stat concurrency, or its wall
+/* ecrawl's removed stat-pool default, and therefore this one: a benchmark
+ * that stands in for that walker has to have its stat concurrency, or its wall
  * time describes a walker nobody runs. The same ladder found no default that
  * beats 8 on both one_dir and many_dirs: cold one_dir stays ~5 s from 8 to 128
  * (the single getdents64 reader is the bottleneck, not the pool depth), and
@@ -1271,7 +1272,7 @@ static void stat_one(worker_t *w, dirref_t *dir, nbatch_t *b, const nent_t *e) {
  * w->fill_names (1024 by default). hash leaves the batch in getdents64 order;
  * ino sorts the batch by d_ino, so consecutive lookups walk inode chunks in
  * order. The default window is 1024 rather than the directory because that is
- * what ecrawl's ECRAWL_STAT_INODE_ORDER does.
+ * the window ecrawl's removed stat pool used.
  *
  * How far apart those two orders actually are is a property of the
  * filesystem, not an assumption to make: measured on ORCD /scratch (XFS),
@@ -1566,23 +1567,23 @@ static void usage(FILE *fp) {
         "  --stat spread    keep %d directories open and rotate one stat across them\n"
         "  --threads N      worker threads, 1..1024 (default 8)\n"
         "  --sort-window N  names accumulated before a batch is statted, 1..%u\n"
-        "                   (default %d, which is what ecrawl's ECRAWL_STAT_INODE_ORDER\n"
-        "                   uses; --stat ino sorts this window, and --stat hash reads it\n"
+        "                   (default %d, the window ecrawl's removed stat pool\n"
+        "                   used; --stat ino sorts this window, and --stat hash reads it\n"
         "                   the same way so the two differ only by the sort)\n"
         "  --sort-window all  one window per directory, capped at %u names (~24 bytes\n"
         "                   per name plus the name bytes, per worker). Ignored by\n"
         "                   --stat spread, whose slots always refill %d names.\n"
         "  --stat-threads N stat batches on a pool of N threads instead of on the\n"
-        "                   thread that read the directory, 0..1024 (default %d, which\n"
-        "                   is ecrawl's ECRAWL_STAT_THREADS). 0 stats every batch on\n"
+        "                   thread that read the directory, 0..1024 (default %d,\n"
+        "                   ecrawl's removed stat-pool default). 0 stats every batch on\n"
         "                   the thread that read it, which makes one directory the\n"
         "                   unit of parallelism; it is the pre-pool behaviour and what\n"
         "                   logs/ewalk-strategy-manual-567654/ was measured with.\n"
         "                   Ignored by --stat spread, whose whole point is the\n"
         "                   interleaving of consecutive lookups on one thread.\n"
         "  --stat-min-offload N  batches of fewer than N names are stat'd inline\n"
-        "                   rather than queued, 0..%u (default %d, which is what\n"
-        "                   ecrawl's ECRAWL_STAT_BATCH_MIN_OFFLOAD does; 0 queues\n"
+        "                   rather than queued, 0..%u (default %d, what ecrawl's\n"
+        "                   removed stat pool used; 0 queues\n"
         "                   every batch). On a tree of five-file directories the\n"
         "                   default offloads nothing, and 0 engages the pool but\n"
         "                   is the slower of the two — measured, not assumed.\n"

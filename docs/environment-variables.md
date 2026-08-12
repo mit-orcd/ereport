@@ -10,8 +10,7 @@ The Min logical CPUs and Min RAM columns below are practical floors for running 
 
 | Program | Parallelism role | Override (env) | Built-in default | Min logical CPUs | Min RAM |
 |---------|------------------|----------------|------------------|------------------|---------|
-| `ecrawl` | Walk / queue directory work | `ECRAWL_CRAWL_THREADS` | 16 crawl threads (minimum 1; no fixed maximum) | 4 | 4 GiB |
-| `ecrawl` | Parallel `fstatat` on batched non-directory names (per-directory `readdir` stays on crawl workers) | `ECRAWL_STAT_THREADS` | 8 stat threads (`0` disables pool; legacy inline stat) | 4 | 4 GiB |
+| `ecrawl` | Walk / queue directory work, inline `fstatat` | `ECRAWL_CRAWL_THREADS` | 16 crawl threads (minimum 1; no fixed maximum) | 4 | 4 GiB |
 | `ecrawl` | Flush uid-sharded `.bin` output | `ECRAWL_WRITER_THREADS` | 8 writer threads | 4 | 4 GiB |
 | `ecrawl_repair` | Parallel rescans; optional `truncate` on incomplete tail; checkpoint rebuild / verify | `ECRAWL_REPAIR_THREADS` | 16 | 4 | 4 GiB |
 | `ecrawl_query` | Parallel shard scan for stats only (no writes) | `ECRAWL_QUERY_THREADS` | 16 (maximum 4096) | 4 | 4 GiB |
@@ -33,13 +32,6 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_WRITER_QUEUE_BATCHES` | `ecrawl` | Pending record batches per writer queue when writing shards (default 64, range 4…4096). |
 | `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 1024). |
 | `ECRAWL_MAX_OPEN_SHARDS` | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 1024). |
-| `ECRAWL_STAT_THREADS` | `ecrawl` | Stat worker threads for batched `fstatat` (default 8; `0` disables — try on cold-cache directory-heavy crawls; see [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool)). |
-| `ECRAWL_STAT_BATCH_ENTRIES` | `ecrawl` | Names per stat batch (default 1024, range 64…65536). |
-| `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS` | `ecrawl` | Trusted non-dir `d_type` entries per directory handled inline before batching (default `0` = always batch; `N` > 0 = inline prefix of `N`). |
-| `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | `ecrawl` | Min names in an end-of-directory stat batch before offloading to stat workers (default 32; `0` = always enqueue). |
-| `ECRAWL_STAT_QUEUE_BATCHES` | `ecrawl` | Max pending stat batches (default 64, range 4…4096). |
-| `ECRAWL_STAT_RANDOM_QUEUE` | `ecrawl` | `0` = FIFO stat-batch dequeue; non-zero (default `1`) = pseudo-random. |
-| `ECRAWL_STAT_INODE_ORDER` | `ecrawl` | `1` = sort each stat batch by inode before statting (default `0`). |
 | `ECRAWL_DONATE_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in `DT_DIR` pushes (default 64). |
 | `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in dirents, so a deep chain that pushes one subdirectory per directory still sheds work to idle peers (default 4096; `0` disables). |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | `ecrawl` | Max dirs donated per queue push on force spill (default 2048). |

@@ -34,19 +34,17 @@ Basic usage:
 
 Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
 
-### Directory scanning and stat workers
+### Directory scanning
 
-Applies when `ECRAWL_STAT_THREADS` > 0 (the default). `ECRAWL_STAT_THREADS=0` skips this pool: every child name is `fstatat`’d on the crawl thread that read the directory (same semantics, no cross-thread batch queue). On **cold-cache** crawls of directory-heavy trees that can be faster than the default pool — crawl threads no longer stall on a full stat queue (`stat_enqueue_block_ns` in the summary). See [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool).
+`ecrawl` uses a flat worker pool: every non-directory name is `fstatat`’d inline on the crawl thread that read the directory. There is no cross-thread stat batching.
 
 | Step | What happens |
 |------|----------------|
 | 1. `readdir` | One crawl worker reads each directory stream sequentially; skips `.` and `..`. |
-| 2. Obvious subdirectories | If `d_type` is `DT_DIR`, the child path is pushed onto that worker’s directory stack (and may be donated to other crawl threads). No stat worker involved. |
-| 3. Trusted non-directory types | If `d_type` is one of `DT_REG`, `DT_LNK`, `DT_FIFO`, `DT_SOCK`, `DT_CHR`, `DT_BLK`, `DT_WHT`, the name is either `fstatat`’d inline on the crawl thread or queued for stat workers, depending on how many such entries were already seen in this directory (see `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS`, default `0`). `0` means always send these names to stat workers (no inline prefix). A positive value `N` handles the first `N` trusted non-dirs inline per directory, then batches the rest. |
-| 4. Everything else (`DT_UNKNOWN`, etc.) | `fstatat` on the crawl thread; if it is a directory, behave like step 2; otherwise emit like a file. These names are never placed in stat-worker batches (the batch path assumes the dentry already looked like a non-directory). |
-| 5. Workers + flush points | Stat threads `fstatat` batched names against a `dup`'d directory fd. Pending batches are capped globally (`ECRAWL_STAT_QUEUE_BATCHES`). When `readdir` finishes that directory, the crawl thread waits for its pending batches for that folder, then continues. |
+| 2. Obvious subdirectories | If `d_type` is `DT_DIR`, the child path is pushed onto that worker’s directory stack (and may be donated to other crawl threads). |
+| 3. Everything else | `fstatat` on the crawl thread; if it is a directory, behave like step 2; otherwise emit like a file. |
 
-Unexpected directory inside a batch: If `fstatat` still reports a directory for a batched name (rare: wrong `d_type` or rename race), `ecrawl` counts `stat_batch_unexpected_dir_total`, prints a `WARN` block on stderr after the run (up to 100 example paths; message notes truncation), and does not descend into those paths—so totals may be incomplete if that warning appears.
+Unexpected directory: If `fstatat` reports a directory where `d_type` said otherwise (rare: wrong `d_type` or rename race), `ecrawl` counts `stat_batch_unexpected_dir_total`, prints a `WARN` block on stderr after the run (up to 100 example paths; message notes truncation), and does not descend into those paths—so totals may be incomplete if that warning appears.
 
 Optional environment variables (no CLI flags for these; see also [environment-variables.md](environment-variables.md)):
 
@@ -57,13 +55,6 @@ Optional environment variables (no CLI flags for these; see also [environment-va
 | `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
 | `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 1024). |
 | `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 128 = every shard a writer owns at the default 1024 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
-| `ECRAWL_STAT_THREADS` | Stat worker threads for batched `fstatat` (default 8; `0` disables the pool — every `fstatat` runs on the crawl thread). Try `0` on cold-cache, directory-heavy crawls when `stat_enqueue_block_ns` is large; see [performance.md#cold-crawls-and-the-stat-pool](performance.md#cold-crawls-and-the-stat-pool). |
-| `ECRAWL_STAT_BATCH_ENTRIES` | Directory names per stat batch (default 1024, range 64…65536). |
-| `ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS` | Per directory, trusted non-dir `d_type` entries handled inline before stat batching (default `0` = batch from the first entry; set `N` > 0 for an inline prefix of `N` names). Max 2097152. |
-| `ECRAWL_STAT_BATCH_MIN_OFFLOAD` | End-of-directory stat batches with fewer than this many names run inline on the crawl thread (default 32; `0` = always enqueue tail batches to the stat pool). Mid-directory flushes at `ECRAWL_STAT_BATCH_ENTRIES` always offload when the stat pool is enabled. |
-| `ECRAWL_STAT_QUEUE_BATCHES` | Max pending stat batches globally (default 64, range 4…4096); bounds `dup(dirfd)` backlog and crawl-thread blocking when the pool is full. |
-| `ECRAWL_STAT_RANDOM_QUEUE` | `0` = FIFO stat-batch dequeue; non-zero (default `1`) = pseudo-random dequeue among pending batches. |
-| `ECRAWL_STAT_INODE_ORDER` | `1` = sort each stat batch by the `d_ino` `getdents64` returned before statting it (default `0` = readdir order). XFS hands back dirents in name-hash order while the inodes sit in allocation order, so statting as read walks inode clusters at random; whether reordering pays depends on the filesystem and only shows with cold caches. |
 | `ECRAWL_DONATE_CHECK_EVERY` | During `readdir`, check whether to donate local directory-stack work every `N` `DT_DIR` pushes (default 64; `1` = check after every directory child). |
 | `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | During `readdir`, also check every `N` dirents (default 4096; `0` disables). The check above is driven by subdirectories found, so a deep narrow chain — one subdirectory per directory, however many files — never reaches the donation floor and walks single-threaded. This one fires on entries read instead, and when peers are idle it hands over the directories the worker is holding; the worker is mid-`readdir`, so it keeps working either way. |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | When the local stack exceeds `ECRAWL_FORCE_DONATE_AT`, donate up to this many directories per queue push (default 2048). |
@@ -88,9 +79,7 @@ ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
-ECRAWL_STAT_THREADS=0 ./ecrawl --no-write /path/to/filesystem-tree   # inline stats; often faster cold
-ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS=0 ./ecrawl /path/to/filesystem-tree
-ECRAWL_STAT_RANDOM_QUEUE=0 ECRAWL_STAT_QUEUE_BATCHES=128 ./ecrawl /path/to/filesystem-tree /tmp/crawl-out
+ECRAWL_CRAWL_THREADS=24 ./ecrawl --no-write /path/to/filesystem-tree
 ```
 
 Notes:
@@ -118,7 +107,7 @@ After every run (including non-verbose), stdout includes lightweight queue conte
 - `wait_writer_push`: crawl-thread wakeups waiting on a full uid-shard writer queue (writers falling behind).
 - `wait_writer_pop`: writer wakeups waiting on an empty queue (crawl threads not feeding writers fast enough).
 
-With `--verbose`, full metrics also include `wait_stat_pop` / `wait_stat_enqueue` (same idea for the stat batch pool), `stat_queue_depth_max`, `stat_batches_*`, `stat_batch_unexpected_dir_total`, `donate_all_busy_*`, `discovered_dir_enqueue_batch`, and crawl `manifest=` path plus `st_blocks_bytes_unit`, `total_allocated_bytes`, `files_sparse_heuristic` (same keys as `crawl_manifest.txt`).
+With `--verbose`, full metrics also include `stat_batch_unexpected_dir_total`, `donate_all_busy_*`, `discovered_dir_enqueue_batch`, and crawl `manifest=` path plus `st_blocks_bytes_unit`, `total_allocated_bytes`, `files_sparse_heuristic` (same keys as `crawl_manifest.txt`).
 
 Interpret these as counts of blocking episodes, not wall-clock time. Summary `WARN` lines for unexpected batched directories always go to stderr, even when stdout is concise.
 

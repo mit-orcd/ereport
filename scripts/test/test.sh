@@ -1454,7 +1454,7 @@ run_dir_index_tests() {
     target="${tree_abs}/target"
 
     log "ecrawl (dir-index fixture: ${bulk_dirs}x${bulk_files} bulk files + target subtree)"
-    ECRAWL_CRAWL_THREADS=1 ECRAWL_STAT_THREADS=1 ECRAWL_WRITER_THREADS=1 \
+    ECRAWL_CRAWL_THREADS=1 ECRAWL_WRITER_THREADS=1 \
         "$ECRAWL" "$tree_abs" "$out" >"${td}/dirx.crawl.log" 2>&1 || {
         tail -n 20 "${td}/dirx.crawl.log" >&2 || true
         die "ecrawl failed on the dir-index fixture"

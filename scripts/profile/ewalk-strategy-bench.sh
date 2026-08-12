@@ -166,8 +166,8 @@
 #                              inode order".
 #   SORT_WINDOW=<unset>        pass --sort-window to every cell that does not
 #                              already name one. Unset means the flag is never
-#                              passed and ewalkbench's 1024-name default (what
-#                              ecrawl's ECRAWL_STAT_INODE_ORDER does) applies.
+#                              passed and ewalkbench's 1024-name default (the
+#                              window ecrawl's removed stat pool used) applies.
 #   ROTATE_CELLS=1             rotate cell order by rep index.
 #   BASELINE_CELL=dfs-hash     the cell others are compared against.
 #   CONTROL_CELL=dfs-hash-B    the A/A cell that sets the noise floor.
@@ -1896,9 +1896,9 @@ write_env_snapshot() {
     echo "cells=$CELLS"
     echo "shapes=$SHAPES"
     echo "ages=$AGES"
-    echo "sort_window=${SORT_WINDOW:-<tool default: 1024 names, as ECRAWL_STAT_INODE_ORDER>}"
+    echo "sort_window=${SORT_WINDOW:-<tool default: 1024 names>}"
     echo "stat_threads=$(observed_key stat_threads) (observed; the tool's own summary, not a flag this script passes)"
-    echo "stat_min_offload=<tool default: 32 names, as ECRAWL_STAT_BATCH_MIN_OFFLOAD>"
+    echo "stat_min_offload=<tool default: 32 names>"
     echo "stat_call: strategy cells use ewalkbench's default fstatat (observed baseline=$(observed_key stat_call)); dfs-hash.statx / .statx-min / .statx-nosync pass --stat-call explicitly so the syscall dimension is measured without multiplying every strategy cell by four"
     echo "dir_enqueue_batch=$(observed_key dir_enqueue_batch) (observed; discovered directories published per acquisition of the global queue lock, as ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH. 1 is the one-lock-per-directory form: on a 200,000-directory shape that is bimodal at 0.395 s or 1.100 s, so a 1 here means the timing rows are two populations and their median is an artefact of the split. queue_push_ops in each row is what the batch actually achieved.)"
     echo "locality_counters=$(observed_key locality_counters) (observed; 1 = chunk_reuse_rate, median_ino_delta and distinct_ino_buckets were counted)"

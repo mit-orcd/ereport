@@ -90,25 +90,22 @@ THREADS=${THREADS:-${ECRAWL_CRAWL_THREADS:-16}}
 
 # One thread budget for every tool that can be told what to use. Comparing
 # tools at their default fan-out compares packaging decisions, not indexers:
-# ecrawl ships 16 crawl + 8 stat + 8 writer threads, fd and dua default to
+# ecrawl ships 16 crawl + 8 writer threads, fd and dua default to
 # every logical processor (448 on this class of node), and Robinhood defaults
 # to 2 scan threads. THREADS is the *total* per tool, so a tool that runs
 # several pools at once splits it. An explicitly set per-tool variable wins,
 # and is reported as-is.
 #
-# ecrawl's three pools run concurrently, so keep its stock 2:1:1 shape
-# (crawl:writer:stat) and scale that into the budget.
-_t_crawl=$((THREADS / 2))
+# ecrawl's two pools run concurrently, so keep its stock 2:1 shape
+# (crawl:writer) and scale that into the budget.
+_t_crawl=$(( (2 * THREADS) / 3 ))
 ((_t_crawl >= 1)) || _t_crawl=1
-_t_writer=$((THREADS / 4))
+_t_writer=$((THREADS - _t_crawl))
 ((_t_writer >= 1)) || _t_writer=1
-_t_stat=$((THREADS - _t_crawl - _t_writer))
-((_t_stat >= 0)) || _t_stat=0
 export ECRAWL_CRAWL_THREADS=${ECRAWL_CRAWL_THREADS:-$_t_crawl}
-export ECRAWL_STAT_THREADS=${ECRAWL_STAT_THREADS:-$_t_stat}
 export ECRAWL_WRITER_THREADS=${ECRAWL_WRITER_THREADS:-$_t_writer}
-# --no-stat runs neither the stat pool nor the writer pool, so the whole budget goes to
-# crawl threads. Leaving it on the 2:1:1 split would hand that row half the parallelism of
+# --no-stat runs no writer pool and stats nothing, so the whole budget goes to
+# crawl threads. Leaving it on the 2:1 split would hand that row part of the parallelism of
 # the fd walk it is meant to be compared against, measuring the split rather than the walk.
 export ECRAWL_NOSTAT_CRAWL_THREADS=${ECRAWL_NOSTAT_CRAWL_THREADS:-$THREADS}
 
@@ -123,7 +120,7 @@ export EREPORT_INDEX_TRIGRAM_THREADS=${EREPORT_INDEX_TRIGRAM_THREADS:-$_t_trigra
 # ereport and ecrawl_query queries each run one pool.
 export EREPORT_THREADS=${EREPORT_THREADS:-$THREADS}
 export ECRAWL_QUERY_THREADS=${ECRAWL_QUERY_THREADS:-$THREADS}
-unset _t_crawl _t_writer _t_stat _t_half _t_trigram
+unset _t_crawl _t_writer _t_half _t_trigram
 
 # gufi_dir2index and gufi_rollup take a thread count on the command line, but
 # the spelling has moved between releases, so probe --help rather than assume.
@@ -208,8 +205,8 @@ gufi_rel_path() {
 # Reported in the summary so an unpinnable tool is visible rather than a silent
 # asymmetry in the numbers.
 thread_plan() {
-  printf 'budget=%s ecrawl=%s+%s+%s(crawl+stat+writer) ecrawl_nostat=%s(crawl) ereport_index=%s+%s(parse+trigram) ereport=%s ecrawl_query=%s' \
-    "$THREADS" "$ECRAWL_CRAWL_THREADS" "$ECRAWL_STAT_THREADS" "$ECRAWL_WRITER_THREADS" \
+  printf 'budget=%s ecrawl=%s+%s(crawl+writer) ecrawl_nostat=%s(crawl) ereport_index=%s+%s(parse+trigram) ereport=%s ecrawl_query=%s' \
+    "$THREADS" "$ECRAWL_CRAWL_THREADS" "$ECRAWL_WRITER_THREADS" \
     "$ECRAWL_NOSTAT_CRAWL_THREADS" \
     "$EREPORT_INDEX_THREADS" "$EREPORT_INDEX_TRIGRAM_THREADS" "$EREPORT_THREADS" "$ECRAWL_QUERY_THREADS"
 }
@@ -1560,7 +1557,6 @@ write_env_snapshot() {
     echo "dut_walk_args=${DUT_WALK_ARGS[*]}"
     echo "dut_query_args=${DUT_ARGS[*]}"
     echo "ECRAWL_CRAWL_THREADS=${ECRAWL_CRAWL_THREADS:-}"
-    echo "ECRAWL_STAT_THREADS=${ECRAWL_STAT_THREADS:-}"
     echo "ECRAWL_WRITER_THREADS=${ECRAWL_WRITER_THREADS:-}"
     echo "work_root=${WORK_ROOT:-}"
     echo "tmpdir=${TMPDIR:-/tmp}"

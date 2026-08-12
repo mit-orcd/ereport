@@ -11,20 +11,11 @@
  *   - Worker threads consume queued batches of directory work.
  *   - Workers traverse directories iteratively with a local stack.
  *   - Workers may donate batches of accumulated subdirectories back to the global queue.
- *   - Parallel stat pool (ECRAWL_STAT_THREADS, default 8; set 0 to disable): one readdir hop per directory while
- *     crawl workers batch only direntries whose d_type is a trusted non-directory (DT_REG/LNK/FIFO/SOCK/CHR/BLK)
- *     and stat threads run fstatat concurrently (bounded queue + chunk size). Per directory, the first N such
- *     entries are handled inline on the crawl thread (ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS, default 0, i.e.
- *     batch from the first entry). Trusted DT_DIR children are fstatat'd once under the parent dirfd (st cached on
- *     the work item so pop skips lstat), pushed on the crawl thread's local stack, and spilled to the global
- *     queue when the stack grows large or idle workers need work.
- *     DT_DIR and DT_UNKNOWN are never handed to the parallel stat batch pool;
- *     if fstatat still finds a directory inside a batch (rare race / wrong d_type), ecrawl warns and does not crawl it.
- *     Default ECRAWL_STAT_RANDOM_QUEUE=1 dequeues pending batches in pseudo-random order (set 0 for FIFO).
- *   - Optionally the two pools are not a fixed partition: a stat worker with an empty queue can take
- *     crawl tasks (ECRAWL_STAT_HELPS_CRAWL, default 0 -- measured as no faster; see docs/performance.md).
- *     A helper stats inline while crawling, so it never waits on the pool it came from -- which is what
- *     keeps mutual helping from deadlocking. See tls_stat_inline_only.
+ *   - No cross-thread stat pool: every non-directory name is fstatat'd on the crawl thread that read it
+ *     (inline). Trusted DT_DIR children are fstatat'd once under the parent dirfd (st cached on the work
+ *     item so pop skips lstat), pushed on the crawl thread's local stack, and spilled to the global queue
+ *     when the stack grows large or idle workers need work. If fstatat finds a directory where d_type
+ *     said otherwise, ecrawl warns and does not crawl it.
  *   - Dedicated writer threads consume buffered batches and write uid-sharded output; each batch is sorted by
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
@@ -138,11 +129,6 @@
 #define RECORD_BATCH_BYTES (1U << 20)
 #define WRITE_BUFFER_SIZE (1U << 20)
 #define WINDOW_SECONDS 10
-/* During one directory's readdir, periodically apply pending-batch backpressure so megadirs do not
- * hold an unbounded number of completed batches until EOF (see
- * stat_pending_drain_until_unfinished_below). End-of-directory still uses a full drain. */
-#define STAT_PENDING_DRAIN_EVERY_READDIRS 65536U
-
 /* Per-crawl-thread buffer (bytes) for raw getdents64 directory reads. A larger buffer returns more
  * dirents per getdents64 syscall, cutting syscall count (and its mitigation/seccomp/trace overhead)
  * on large directories. 0 = fall back to libc opendir/readdir. Env: ECRAWL_GETDENTS_BUF. */
@@ -154,39 +140,9 @@
  * stay live without an atomic RMW per entry. A batch is also flushed when the rolling window rolls, so the
  * displayed numbers are never more than one stats tick behind whatever N is. */
 #define GLOBAL_PERF_FLUSH_EVERY 8192U
-#define DEFAULT_STAT_THREADS 8
 /* Workers resolving distinct uids/gids to names at finalize. The work is one blocking NSS call per
  * distinct id, so the useful width is set by round-trip latency, not by core count. */
 #define DEFAULT_ID_RESOLVE_THREADS 16
-#define DEFAULT_STAT_RANDOM_QUEUE 1
-#define DEFAULT_STAT_BATCH_ENTRIES 1024U
-#define DEFAULT_STAT_QUEUE_BATCHES 64U
-#define DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS 0U
-/* End-of-directory stat batches with fewer names than this run on the crawl thread (avoids per-dir
- * sync to stat workers for sparse trees). Mid-directory flushes at stat_batch_entries always offload.
- * 0 = always enqueue tail batches to the stat pool. Env: ECRAWL_STAT_BATCH_MIN_OFFLOAD. */
-#define DEFAULT_STAT_BATCH_MIN_OFFLOAD 32U
-/* When the stat queue is full, stat the batch on the crawl thread instead of waiting for a free slot.
- * Off by default because measurement could not find a case where the queue fills: on warm local disk it
- * peaked at 50 of 64 batches even with a single stat thread on a 12M-entry directory, because reading
- * dirents costs about as much as statting them, so producer and consumer rates track each other.
- * It is kept for cold or remote storage, where a stat costs far more than a dirent read and the queue
- * plausibly does fill -- turn it on only with wait_stat_enqueue > 0 as evidence.
- * Env: ECRAWL_STAT_FULL_INLINE. */
-#define DEFAULT_STAT_FULL_INLINE 0
-/* Let stat workers take crawl tasks when their own queue is empty. On trees of small directories the
- * stat pool really does receive zero batches (crawl threads stat those inline), so this looked like eight
- * wasted threads -- but off by default, because it buys nothing measurable: with spare cores, a thread
- * parked in pthread_cond_wait costs nothing, and adding crawlers does not move a run that is bound by
- * I/O and by the pending-batch drain. Interleaved A/B on six fixtures put every difference inside the
- * A/A control gap. Kept for the case the measurements cannot cover -- crawl threads configured at or
- * below the core count while the stat pool sits idle. See docs/performance.md.
- * Env: ECRAWL_STAT_HELPS_CRAWL. */
-#define DEFAULT_STAT_HELPS_CRAWL 0
-/* How long a stat worker that could also crawl sleeps on an empty stat queue before looking at the
- * crawl queue again. Nothing wakes it when a crawl task is pushed, so this bounds that blind spot;
- * short enough not to matter, long enough not to spin. */
-#define STAT_HELPER_POLL_NS 1000000L
 #define DISK_SPACE_CHECK_INTERVAL_SEC 30
 #define DISK_MIN_FREE_BYTES ((uint64_t)(10ULL * 1024 * 1024 * 1024))
 
@@ -211,7 +167,6 @@
 #define DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH 48U
 #define TASK_NODE_FREE_MAX 65536U
 #define HARDLINK_REGISTRY_SHARDS 256U
-#define STAT_BATCH_UNEXPECTED_DIR_SAMPLES 100
 
 /*
  * POSIX and Linux document st_blocks in 512-byte units (not necessarily the volume's
@@ -397,10 +352,9 @@ typedef struct {
     size_t cap;
 } pending_batch_t;
 
-/* One context per crawl thread, shared with the stat workers that process that thread's batches.
- * pending_locks[i] guards pending[i] only, so concurrent emitters that hash to different writers
- * never wait on each other, and the queue push happens after the lock is dropped.
- * stats_lock guards the owner's crawl_stats_t / perf_local_t. */
+/* One context per crawl thread. pending_locks[i] guards pending[i] only, so concurrent emitters
+ * that hash to different writers never wait on each other, and the queue push happens after the
+ * lock is dropped. stats_lock guards the owner's crawl_stats_t / perf_local_t (progress publish). */
 typedef struct {
     writer_queue_t *writer_queues;
     int writer_threads;
@@ -430,35 +384,6 @@ typedef struct {
     shared_state_t *shared;
     dir_stack_t pending;
 } discovered_dir_batch_t;
-
-typedef struct stat_batch stat_batch_t;
-
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_nonempty;
-    pthread_cond_t cond_nonfull;
-    stat_batch_t **slots;
-    size_t q_count;
-    size_t q_max;
-    int stop;
-    int nthreads;
-    pthread_t *threads;
-} stat_pool_t;
-
-struct stat_batch {
-    struct stat_batch *queue_next; /* unused; kept for stable struct layout */
-    int dirfd_dup;
-    const char *parent_path;
-    size_t parent_len;
-    unsigned char *names_blob;
-    size_t names_blob_len;
-    size_t name_count;
-    worker_arg_t *owner;
-    emit_context_t *emit_ctx;
-    pthread_mutex_t done_mutex;
-    pthread_cond_t done_cond;
-    int finished;
-};
 
 struct task_node {
     dir_work_t *items;
@@ -618,24 +543,8 @@ static atomic_ullong g_tasks_popped        = 0;
 static atomic_ullong g_writer_queue_depth  = 0;
 static atomic_ullong g_batches_enqueued    = 0;
 static atomic_ullong g_batches_dequeued    = 0;
-static atomic_ullong g_stat_batches_enqueued   = 0;
-static atomic_ullong g_stat_batches_completed  = 0;
-static atomic_ullong g_stat_batches_dup_fallback = 0;
-static atomic_ullong g_stat_batches_tail_inlined = 0;
-static atomic_ullong g_stat_batches_self_processed = 0;
-static atomic_ullong g_stat_batches_helper_inlined = 0;
-static atomic_ullong g_stat_crawl_tasks_helped = 0;
-static atomic_ullong g_wait_stat_pop      = 0;
-static atomic_ullong g_wait_stat_enqueue  = 0;
-static atomic_ullong g_stat_queue_depth_max = 0;
-static atomic_ullong g_stat_batch_unexpected_dir_total = 0;
-static pthread_mutex_t g_stat_batch_unexpected_dir_mu = PTHREAD_MUTEX_INITIALIZER;
-static size_t g_stat_batch_unexpected_dir_sample_n;
-static char *g_stat_batch_unexpected_dir_samples[STAT_BATCH_UNEXPECTED_DIR_SAMPLES];
 
-/* pthread_cond_wait wakeups (cheap relaxed atomics); high counts suggest queue starvation.
- * Stat pool: wait_stat_pop = workers blocked on empty queue; wait_stat_enqueue = crawl blocked on full queue;
- * stat_queue_depth_max = peak pending batches (cap = stat_queue_max_batches). */
+/* pthread_cond_wait wakeups (cheap relaxed atomics); high counts suggest queue starvation. */
 static atomic_ullong g_wait_crawl_tasks = 0;
 static atomic_ullong g_wait_writer_push = 0;
 static atomic_ullong g_wait_writer_pop  = 0;
@@ -647,13 +556,8 @@ static atomic_ullong g_writer_queue_wait_ns = 0;
 /* Wall time slept, not wakeup counts: the counters above cannot distinguish a thread that woke a million
  * times from one that lost half the run to a single wait. Summed across a pool's threads, so the ceiling
  * is nthreads * elapsed and the ratio is that pool's idle fraction (see print_verbose_full_stats).
- *   crawl_idle_ns       - crawl workers with no task to pop (pool wider than the tree can feed)
- *   stat_idle_ns        - stat workers with no batch to take (crawl threads are stat'ing inline instead)
- *   stat_enqueue_block_ns - crawl workers stalled on a full stat queue (the stat pool is the bottleneck)
- * The last two moving in opposite directions is the whole reason the split cannot be picked up front. */
+ *   crawl_idle_ns       - crawl workers with no task to pop (pool wider than the tree can feed) */
 static atomic_ullong g_crawl_idle_ns          = 0;
-static atomic_ullong g_stat_idle_ns           = 0;
-static atomic_ullong g_stat_enqueue_block_ns  = 0;
 
 static atomic_ullong g_io_lstat_calls      = 0;
 static atomic_ullong g_io_stat_calls       = 0;
@@ -685,18 +589,9 @@ static atomic_ullong g_shard_ckpt_writes   = 0; /* .ckpt sidecar writes (one ope
 static _Thread_local uint32_t tls_wait_crawl_pending;
 static _Thread_local uint32_t tls_wait_writer_push_pending;
 static _Thread_local uint32_t tls_wait_writer_pop_pending;
-static _Thread_local uint32_t tls_wait_stat_pop_pending;
-static _Thread_local uint32_t tls_wait_stat_enqueue_pending;
 static _Thread_local uint32_t tls_donate_calls_pending;
 static _Thread_local uint64_t tls_writer_queue_wait_ns_pending;
-/* Set while a stat worker is running a crawl task. Such a thread must stat everything itself rather
- * than queue batches: if every stat worker were crawling and waiting on the pool to drain its own
- * batches, the batches would have nobody left to run them. Statting inline keeps a helper's progress
- * independent of the pool it came from, which is what makes the helping deadlock-free. */
-static _Thread_local int tls_stat_inline_only;
 static _Thread_local uint64_t tls_crawl_idle_ns_pending;
-static _Thread_local uint64_t tls_stat_idle_ns_pending;
-static _Thread_local uint64_t tls_stat_enqueue_block_ns_pending;
 
 static uint64_t monotonic_ns(void) {
     struct timespec ts;
@@ -731,14 +626,6 @@ static void tls_crawl_idle_add_ns(uint64_t ns) {
     tls_wait_ns_add(&tls_crawl_idle_ns_pending, &g_crawl_idle_ns, ns);
 }
 
-static void tls_stat_idle_add_ns(uint64_t ns) {
-    tls_wait_ns_add(&tls_stat_idle_ns_pending, &g_stat_idle_ns, ns);
-}
-
-static void tls_stat_enqueue_block_add_ns(uint64_t ns) {
-    tls_wait_ns_add(&tls_stat_enqueue_block_ns_pending, &g_stat_enqueue_block_ns, ns);
-}
-
 static void tls_wait_crawl_inc(void) {
     tls_wait_crawl_pending++;
     if (tls_wait_crawl_pending >= TLS_WAIT_COUNTER_BATCH) {
@@ -768,24 +655,6 @@ static void tls_wait_writer_pop_inc(void) {
     }
 }
 
-static void tls_wait_stat_pop_inc(void) {
-    tls_wait_stat_pop_pending++;
-    if (tls_wait_stat_pop_pending >= TLS_WAIT_COUNTER_BATCH) {
-        atomic_fetch_add_explicit(&g_wait_stat_pop, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
-                                  memory_order_relaxed);
-        tls_wait_stat_pop_pending -= TLS_WAIT_COUNTER_BATCH;
-    }
-}
-
-static void tls_wait_stat_enqueue_inc(void) {
-    tls_wait_stat_enqueue_pending++;
-    if (tls_wait_stat_enqueue_pending >= TLS_WAIT_COUNTER_BATCH) {
-        atomic_fetch_add_explicit(&g_wait_stat_enqueue, (unsigned long long)TLS_WAIT_COUNTER_BATCH,
-                                  memory_order_relaxed);
-        tls_wait_stat_enqueue_pending -= TLS_WAIT_COUNTER_BATCH;
-    }
-}
-
 static void tls_flush_thread_batch_counters(void) {
     if (tls_wait_crawl_pending) {
         atomic_fetch_add_explicit(&g_wait_crawl_tasks, (unsigned long long)tls_wait_crawl_pending,
@@ -804,16 +673,6 @@ static void tls_flush_thread_batch_counters(void) {
                                   memory_order_relaxed);
         tls_wait_writer_pop_pending = 0;
     }
-    if (tls_wait_stat_pop_pending) {
-        atomic_fetch_add_explicit(&g_wait_stat_pop, (unsigned long long)tls_wait_stat_pop_pending,
-                                  memory_order_relaxed);
-        tls_wait_stat_pop_pending = 0;
-    }
-    if (tls_wait_stat_enqueue_pending) {
-        atomic_fetch_add_explicit(&g_wait_stat_enqueue, (unsigned long long)tls_wait_stat_enqueue_pending,
-                                  memory_order_relaxed);
-        tls_wait_stat_enqueue_pending = 0;
-    }
     if (tls_donate_calls_pending) {
         atomic_fetch_add_explicit(&g_donate_calls, (unsigned long long)tls_donate_calls_pending, memory_order_relaxed);
         tls_donate_calls_pending = 0;
@@ -826,14 +685,6 @@ static void tls_flush_thread_batch_counters(void) {
         atomic_fetch_add_explicit(&g_crawl_idle_ns, tls_crawl_idle_ns_pending, memory_order_relaxed);
         tls_crawl_idle_ns_pending = 0;
     }
-    if (tls_stat_idle_ns_pending) {
-        atomic_fetch_add_explicit(&g_stat_idle_ns, tls_stat_idle_ns_pending, memory_order_relaxed);
-        tls_stat_idle_ns_pending = 0;
-    }
-    if (tls_stat_enqueue_block_ns_pending) {
-        atomic_fetch_add_explicit(&g_stat_enqueue_block_ns, tls_stat_enqueue_block_ns_pending, memory_order_relaxed);
-        tls_stat_enqueue_block_ns_pending = 0;
-    }
 }
 
 static int g_split_depth = 2;
@@ -845,8 +696,6 @@ static int g_max_open_shards_explicit = 0; /* set when ECRAWL_MAX_OPEN_SHARDS as
 static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
-/* ECRAWL_STAT_INODE_ORDER=1: sort each stat batch by inode before statting (see stat_names_builder_seal). */
-static int g_stat_inode_order = 0;
 /* --no-stat: walk names only, never read an inode. Recursion needs just d_type, so records
  * (uid/size/inode/nlink/times all come from stat) cannot be written and paths stream instead. */
 static int g_no_stat = 0;
@@ -872,12 +721,7 @@ static progress_slot_t *g_progress_slots = NULL;
 static size_t g_progress_nslots = 0;
 static atomic_ullong g_progress_last_print_ns = 0;
 #define PROGRESS_PRINT_MIN_NS 500000000ULL /* coalesce: at most ~2 lines/s */
-static int g_stat_threads_configured = 0;
 static size_t g_getdents_buf_bytes = DEFAULT_GETDENTS_BUF;
-static size_t g_stat_batch_entries_cfg = DEFAULT_STAT_BATCH_ENTRIES;
-static size_t g_stat_batch_after_reliable_nondirs_cfg = DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS;
-static size_t g_stat_batch_min_offload_cfg          = DEFAULT_STAT_BATCH_MIN_OFFLOAD;
-static size_t g_stat_queue_max_batches_cfg = DEFAULT_STAT_QUEUE_BATCHES;
 static size_t g_donate_check_every_cfg     = DEFAULT_DONATE_CHECK_EVERY;
 static size_t g_donate_entry_check_every_cfg = DEFAULT_DONATE_ENTRY_CHECK_EVERY;
 static size_t g_donate_chunk_force_max_cfg = DONATE_CHUNK_FORCE_MAX;
@@ -885,13 +729,6 @@ static size_t g_force_donate_count_cfg     = LOCAL_STACK_FORCE_DONATE_COUNT;
 static size_t g_donate_all_busy_min_stack_cfg              = DEFAULT_DONATE_ALL_BUSY_MIN_STACK;
 static unsigned g_donate_all_busy_max_qdepth_mult_cfg = DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT;
 static size_t g_discovered_dir_enqueue_batch_cfg = DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH;
-static int g_stat_random_queue_dequeue = 0;
-static int g_stat_full_inline = DEFAULT_STAT_FULL_INLINE;
-static int g_stat_helps_crawl = DEFAULT_STAT_HELPS_CRAWL;
-/* Stat threads that may also take crawl tasks; 0 when helping is off. Set before any thread starts. */
-static int g_crawl_helper_threads = 0;
-static stat_pool_t g_stat_pool;
-static int g_stat_pool_ready = 0;
 static atomic_uint g_fd_pressure = 0;
 static atomic_uint g_writer_failed = 0;
 static atomic_uint g_disk_low = 0;
@@ -1315,19 +1152,6 @@ static int parse_ecrawl_crawl_threads(void) {
     return (int)t;
 }
 
-/* Parallel stat workers for megadir non-directory dirents. Env: ECRAWL_STAT_THREADS (default DEFAULT_STAT_THREADS; 0 = off). */
-static int parse_ecrawl_stat_threads(void) {
-    const char *e = getenv("ECRAWL_STAT_THREADS");
-    long t;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_THREADS;
-    errno = 0;
-    t = strtol(e, &end, 10);
-    if (errno || end == e || *end || t < 0 || t > (long)INT_MAX) return DEFAULT_STAT_THREADS;
-    return (int)t;
-}
-
 /* Workers used to resolve uid/gid names at finalize. Env: ECRAWL_ID_RESOLVE_THREADS (1 = serial). */
 static int parse_ecrawl_id_resolve_threads(void) {
     const char *e = getenv("ECRAWL_ID_RESOLVE_THREADS");
@@ -1355,59 +1179,6 @@ static size_t parse_ecrawl_getdents_buf(void) {
     if (v == 0ULL) return 0;
     if (v < MIN_GETDENTS_BUF) return MIN_GETDENTS_BUF;
     if (v > MAX_GETDENTS_BUF) return MAX_GETDENTS_BUF;
-    return (size_t)v;
-}
-
-static size_t parse_ecrawl_stat_batch_entries(void) {
-    const char *e = getenv("ECRAWL_STAT_BATCH_ENTRIES");
-    unsigned long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_BATCH_ENTRIES;
-    errno = 0;
-    v = strtoul(e, &end, 10);
-    if (errno || end == e || *end || v < 64UL || v > 65536UL) return DEFAULT_STAT_BATCH_ENTRIES;
-    return (size_t)v;
-}
-
-static size_t parse_ecrawl_stat_queue_batches(void) {
-    const char *e = getenv("ECRAWL_STAT_QUEUE_BATCHES");
-    unsigned long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_QUEUE_BATCHES;
-    errno = 0;
-    v = strtoul(e, &end, 10);
-    if (errno || end == e || *end || v < 4UL || v > 4096UL) return DEFAULT_STAT_QUEUE_BATCHES;
-    return (size_t)v;
-}
-
-/* Per directory: trusted non-dir d_types handled inline until this many seen; then batch to stat pool.
- * Default 0 batches every trusted non-dir (and unknown d_type) so sparse trees still use stat threads.
- * Raise (e.g. 512) to inline the first N trusted non-dirs per directory on the crawl thread.
- * Env: ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS. */
-static size_t parse_ecrawl_stat_batch_after_reliable_nondirs(void) {
-    const char *e = getenv("ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS");
-    unsigned long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS;
-    errno = 0;
-    v = strtoul(e, &end, 10);
-    if (errno || end == e || *end || v > 2097152UL) return DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS;
-    return (size_t)v;
-}
-
-/* Tail batches smaller than this (names) run on the crawl thread; 0 = always use stat pool. */
-static size_t parse_ecrawl_stat_batch_min_offload(void) {
-    const char *e = getenv("ECRAWL_STAT_BATCH_MIN_OFFLOAD");
-    unsigned long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_BATCH_MIN_OFFLOAD;
-    errno = 0;
-    v = strtoul(e, &end, 10);
-    if (errno || end == e || *end || v > 65536UL) return DEFAULT_STAT_BATCH_MIN_OFFLOAD;
     return (size_t)v;
 }
 
@@ -1504,60 +1275,6 @@ static size_t parse_ecrawl_discovered_dir_enqueue_batch(void) {
     return (size_t)v;
 }
 
-/* Stat batch dequeue order: non-zero = pseudo-random (default); 0 = FIFO. Env: ECRAWL_STAT_RANDOM_QUEUE. */
-static int parse_ecrawl_stat_random_queue(void) {
-    const char *e = getenv("ECRAWL_STAT_RANDOM_QUEUE");
-    long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_RANDOM_QUEUE;
-    errno = 0;
-    v = strtol(e, &end, 10);
-    if (errno || end == e || *end) return DEFAULT_STAT_RANDOM_QUEUE;
-    return v != 0 ? 1 : 0;
-}
-
-/* Stat a batch on the crawl thread when the pool queue is full instead of waiting for a slot:
- * non-zero = on (default); 0 = block as before. Env: ECRAWL_STAT_FULL_INLINE. */
-static int parse_ecrawl_stat_full_inline(void) {
-    const char *e = getenv("ECRAWL_STAT_FULL_INLINE");
-    long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_FULL_INLINE;
-    errno = 0;
-    v = strtol(e, &end, 10);
-    if (errno || end == e || *end) return DEFAULT_STAT_FULL_INLINE;
-    return v != 0 ? 1 : 0;
-}
-
-/* Let stat workers run crawl tasks when their queue is empty: non-zero = on (default); 0 = off.
- * Env: ECRAWL_STAT_HELPS_CRAWL. */
-static int parse_ecrawl_stat_helps_crawl(void) {
-    const char *e = getenv("ECRAWL_STAT_HELPS_CRAWL");
-    long v;
-    char *end;
-
-    if (!e || !*e) return DEFAULT_STAT_HELPS_CRAWL;
-    errno = 0;
-    v = strtol(e, &end, 10);
-    if (errno || end == e || *end) return DEFAULT_STAT_HELPS_CRAWL;
-    return v != 0 ? 1 : 0;
-}
-
-/* Sort each stat batch by inode before statting: 1 = on, 0 = off (default). Env: ECRAWL_STAT_INODE_ORDER. */
-static int parse_ecrawl_stat_inode_order(void) {
-    const char *e = getenv("ECRAWL_STAT_INODE_ORDER");
-    long v;
-    char *end;
-
-    if (!e || !*e) return 0;
-    errno = 0;
-    v = strtol(e, &end, 10);
-    if (errno || end == e || *end) return 0;
-    return v != 0 ? 1 : 0;
-}
-
 /* Writer thread count for uid-sharded output. Default: DEFAULT_WRITER_THREADS. */
 static int parse_ecrawl_writer_threads_env(void) {
     const char *e = getenv("ECRAWL_WRITER_THREADS");
@@ -1613,7 +1330,7 @@ static void configure_max_open_shards(void) {
 
     soft = lim.rlim_cur;
     reserve = FD_RESERVE_BASE +
-              (rlim_t)(g_crawl_threads + g_crawl_helper_threads) * FD_RESERVE_PER_CRAWL_THREAD +
+              (rlim_t)g_crawl_threads * FD_RESERVE_PER_CRAWL_THREAD +
               (rlim_t)g_writer_threads * FD_RESERVE_PER_WRITER;
     if (soft <= reserve + (rlim_t)g_writer_threads) {
         g_max_open_shards = 1U;
@@ -1901,7 +1618,7 @@ static void *id_resolve_worker_main(void *arg) {
 /* Resolve and write every id the crawl collected. Doing this once at finalize instead of on first
  * sight of each id keeps NSS off the crawl's hot path: getpwuid_r/getgrgid_r can mean a socket
  * round-trip to nss-systemd or sssd, and on a tree with thousands of distinct owners those lookups
- * showed up as ~10% of the write-mode profile, plus they hold up the stat worker that drew the
+ * showed up as ~10% of the write-mode profile, plus they hold up the crawl thread that drew the
  * unlucky entry.
  *
  * The lookups are latency-bound rather than CPU-bound, so they run across a small pool: a serial
@@ -2327,22 +2044,9 @@ static void print_usage(const char *prog) {
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
             "ECRAWL_UID_SHARDS (power of 2, default %u), "
             "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE), "
-            "ECRAWL_STAT_THREADS (parallel stat workers, default %d; 0=off), "
             "ECRAWL_ID_RESOLVE_THREADS (uid/gid name lookups at finalize, default %d; 1=serial), "
             "ECRAWL_GETDENTS_BUF (raw getdents64 read-buffer bytes per crawl thread, default %u, "
-            "range %u..%u; 0=use libc opendir/readdir), "
-            "ECRAWL_STAT_BATCH_ENTRIES (default %u, range 64..65536), "
-            "ECRAWL_STAT_BATCH_AFTER_RELIABLE_NONDIRS (inline trusted non-dirs per dir before batching, default %u; 0=always append), "
-            "ECRAWL_STAT_BATCH_MIN_OFFLOAD (tail batches smaller than this many names use crawl-thread fstatat; "
-            "default %u; 0=always offload tails to stat pool), "
-            "ECRAWL_STAT_QUEUE_BATCHES (pending stat batches cap, default %u), "
-            "ECRAWL_STAT_FULL_INLINE (default 0; 1=a full stat queue makes the crawl thread stat the batch "
-            "itself instead of waiting for a slot, for cold/remote storage where the queue can fill), "
-            "ECRAWL_STAT_HELPS_CRAWL (default 0; 1=stat workers take crawl tasks when their queue is empty, "
-            "which measured no faster but helps if crawl threads are configured below the core count), "
-            "ECRAWL_STAT_RANDOM_QUEUE (default 1: random stat-batch dequeue; 0=FIFO), "
-            "ECRAWL_STAT_INODE_ORDER (default 0; 1=sort each stat batch by inode before statting, which can help "
-            "on a cold XFS where dirents come back in name-hash order).\n"
+            "range %u..%u; 0=use libc opendir/readdir).\n"
             "Donation (reduce task-queue mutex traffic): ECRAWL_DONATE_CHECK_EVERY (default %u: donate check every N "
             "DT_DIR pushes during readdir), ECRAWL_DONATE_ENTRY_CHECK_EVERY (default %u: also check every N dirents, "
             "which is what lets a deep narrow chain shed work; 0 disables), "
@@ -2358,15 +2062,10 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_WRITER_QUEUE_BATCHES,
             (unsigned)DEFAULT_UID_SHARDS,
             DEFAULT_MAX_OPEN_SHARDS,
-            DEFAULT_STAT_THREADS,
             DEFAULT_ID_RESOLVE_THREADS,
             (unsigned)DEFAULT_GETDENTS_BUF,
             (unsigned)MIN_GETDENTS_BUF,
             (unsigned)MAX_GETDENTS_BUF,
-            (unsigned)DEFAULT_STAT_BATCH_ENTRIES,
-            (unsigned)DEFAULT_STAT_BATCH_AFTER_RELIABLE_NONDIRS,
-            (unsigned)DEFAULT_STAT_BATCH_MIN_OFFLOAD,
-            (unsigned)DEFAULT_STAT_QUEUE_BATCHES,
             (unsigned)DEFAULT_DONATE_CHECK_EVERY,
             (unsigned)DEFAULT_DONATE_ENTRY_CHECK_EVERY,
             (unsigned)DONATE_CHUNK_FORCE_MAX,
@@ -3556,20 +3255,6 @@ static int queue_pop_wait(task_queue_t *q, dir_stack_t *task) {
     return 0;
 }
 
-/* Take a task only if one is already queued. Deliberately does not decide the crawl is over the way
- * queue_pop_wait does: this is for a thread whose real job is elsewhere, so an empty queue means
- * "nothing to help with right now", never "everyone can go home". */
-static int queue_try_pop(task_queue_t *q, dir_stack_t *task) {
-    pthread_mutex_lock(&q->mutex);
-    if (!q->head || q->closed) {
-        pthread_mutex_unlock(&q->mutex);
-        return -1;
-    }
-    queue_take_head_and_unlock(q, task);
-    return 0;
-}
-
-
 static int writer_queue_init(writer_queue_t *q, size_t max_batches) {
     memset(q, 0, sizeof(*q));
     q->max_batches = max_batches;
@@ -3744,8 +3429,7 @@ static int submit_detached_batch(emit_context_t *ctx, int writer_index, unsigned
     }
 
     /* Folding the owner's pending perf on every MiB batch keeps the TTY totals moving on captures whose
-     * directories are too small to reach GLOBAL_PERF_FLUSH_EVERY. The owner is shared with its stat
-     * workers, so the fold needs its lock. */
+     * directories are too small to reach GLOBAL_PERF_FLUSH_EVERY. The fold needs the owner's lock. */
     if (ctx->perf) {
         if (ctx->stats_lock) pthread_mutex_lock(ctx->stats_lock);
         perf_flush_local(ctx->perf);
@@ -3924,8 +3608,8 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     return 0;
 }
 
-/* The owner's counters are shared with its stat workers, so keep the critical section to the
- * accounting itself: the stat call, the path join and emit_record all stay outside it. */
+/* Keep the critical section to the accounting itself: the stat call, the path join and
+ * emit_record all stay outside it. */
 static uint64_t account_entry_shared(emit_context_t *ctx, shared_state_t *shared, crawl_stats_t *stats,
                                      perf_local_t *perf, const struct stat *st) {
     uint64_t contrib;
@@ -3950,8 +3634,7 @@ static int emit_context_flush_all(emit_context_t *ctx) {
 /* ----- crawl identity -----------------------------------------------------------------------------
  * The per-thread state process_directory_iterative needs: writer-batch buffers, the --no-stat path
  * buffer, and one getdents64 buffer (a thread reads one directory at a time, so one buffer suffices;
- * NULL/0 falls back to libc readdir). Only crawl workers used to need this, but a stat worker that can
- * take a crawl task needs exactly the same thing, so it lives here rather than inside either loop. */
+ * NULL/0 falls back to libc readdir). */
 typedef struct {
     emit_context_t emit;
     char *dirbuf;
@@ -3986,8 +3669,7 @@ static int process_directory_iterative(dir_stack_t *stack, worker_arg_t *wa, emi
 
 /* Run one task popped from the global queue, then account for no longer holding it. The pop already
  * counted this thread into g_active_workers, and quiescence is "seeding done, queue empty, nobody
- * active", so the thread that drops the last active count has to wake the sleepers that can now exit.
- * Shared because a stat worker taking a crawl task has to follow the same discipline exactly. */
+ * active", so the thread that drops the last active count has to wake the sleepers that can now exit. */
 static void crawl_run_task(dir_stack_t *task, worker_arg_t *arg, crawl_identity_t *ci) {
     process_directory_iterative(task, arg, &ci->emit, arg->queue, ci->dirbuf, ci->dirbuf_cap);
     atomic_fetch_sub(&g_active_workers, 1);
@@ -4002,8 +3684,7 @@ static void crawl_run_task(dir_stack_t *task, worker_arg_t *arg, crawl_identity_
 }
 
 static void crawl_identity_destroy(crawl_identity_t *ci, worker_arg_t *arg) {
-    /* Last fold for this owner: its stat workers are done with these counters by now, but they share the
-     * lock with it, so keep the fold inside it like every other one. */
+    /* Last fold for this owner, under its lock like every other fold. */
     pthread_mutex_lock(&arg->emit_stats_lock);
     perf_flush_local(&arg->perf);
     pthread_mutex_unlock(&arg->emit_stats_lock);
@@ -4067,11 +3748,7 @@ static int dir_stack_pop(dir_stack_t *s, dir_work_t *work) {
 static int should_donate_work(const shared_state_t *shared, const dir_stack_t *local_stack) {
     uint64_t qdepth = ATOMIC_LOAD_RELAXED(&g_queue_depth);
     int active = atomic_load(&g_active_workers);
-    /* Stat helpers take crawl tasks too, so they count in g_active_workers and have to count here as
-     * well; leaving them out drives idle negative and permanently selects the all-busy branch below.
-     * A helper busy statting is still counted as a possible taker, which errs toward donating -- the
-     * cheaper mistake, since the cost is queue mutex traffic rather than an idle thread. */
-    int started = (int)shared->crawl_threads_started + g_crawl_helper_threads;
+    int started = (int)shared->crawl_threads_started;
     int idle = started - active;
     uint64_t max_q_idle;
     uint64_t max_q_all_busy;
@@ -4278,812 +3955,6 @@ static void crawl_handle_dirent_dt_dir(int dir_fd, const char *dir_path, size_t 
     }
 }
 
-/* One name in the builder's blob, kept beside it so a batch can be reordered without re-parsing. */
-typedef struct {
-    uint64_t ino;
-    uint32_t off;
-    uint32_t len;
-} stat_name_ent_t;
-
-typedef struct {
-    unsigned char *buf;
-    size_t len;
-    size_t cap;
-    size_t count;
-    stat_name_ent_t *ents; /* [count], parallel to the blob; only read when inode ordering is on */
-    size_t ents_cap;
-    unsigned char *sortbuf; /* scratch the reordered blob is built into, then swapped with buf */
-    size_t sortcap;
-    unsigned char sealed; /* 1 once this batch has been ordered; flush paths can be reached twice */
-} stat_names_builder_t;
-
-typedef struct {
-    stat_batch_t **items;
-    size_t count;
-    size_t cap;
-} stat_pending_vec_t;
-
-static void stat_names_builder_clear(stat_names_builder_t *nb) {
-    if (!nb) return;
-    nb->len = 0;
-    nb->count = 0;
-    nb->sealed = 0;
-}
-
-static void stat_names_builder_free(stat_names_builder_t *nb) {
-    if (!nb) return;
-    free(nb->buf);
-    nb->buf = NULL;
-    free(nb->ents);
-    nb->ents = NULL;
-    free(nb->sortbuf);
-    nb->sortbuf = NULL;
-    nb->len = nb->cap = nb->count = nb->ents_cap = nb->sortcap = 0;
-    nb->sealed = 0;
-}
-
-static int stat_names_builder_append(stat_names_builder_t *nb, const char *name, size_t name_len, uint64_t ino) {
-    size_t need;
-
-    if (!nb || !name) return -1;
-    if (name_len > UINT32_MAX || nb->len > UINT32_MAX) return -1;
-    need = name_len + 1;
-    if (nb->len + need > nb->cap) {
-        size_t nc = nb->cap ? nb->cap * 2 : 4096;
-        while (nb->len + need > nc) {
-            if (nc >= (((size_t)1) << (sizeof(size_t) * 8 - 2))) return -1;
-            nc *= 2;
-        }
-        {
-            unsigned char *p = (unsigned char *)realloc(nb->buf, nc);
-            if (!p) return -1;
-            nb->buf = p;
-            nb->cap = nc;
-        }
-    }
-    if (nb->count + 1 > nb->ents_cap) {
-        size_t ne = nb->ents_cap ? nb->ents_cap * 2 : 256;
-        stat_name_ent_t *e = (stat_name_ent_t *)realloc(nb->ents, ne * sizeof(*e));
-
-        if (!e) return -1;
-        nb->ents = e;
-        nb->ents_cap = ne;
-    }
-    nb->ents[nb->count].ino = ino;
-    nb->ents[nb->count].off = (uint32_t)nb->len;
-    nb->ents[nb->count].len = (uint32_t)name_len;
-    memcpy(nb->buf + nb->len, name, name_len);
-    nb->buf[nb->len + name_len] = '\0';
-    nb->len += need;
-    nb->count++;
-    return 0;
-}
-
-static int cmp_stat_name_ent_ino(const void *a, const void *b) {
-    uint64_t x = ((const stat_name_ent_t *)a)->ino;
-    uint64_t y = ((const stat_name_ent_t *)b)->ino;
-
-    return (x > y) - (x < y);
-}
-
-/*
- * Order a batch's names by inode before anything stats them. XFS returns dirents in name-hash order
- * while the inodes sit in allocation order, so a batch statted as read walks inode clusters at random;
- * `fstatat` and the `xfs_iget` under it are most of a cold crawl. Off by default: the win depends on
- * the filesystem and only shows with cold caches, so ECRAWL_STAT_INODE_ORDER=1 asks for it.
- */
-static void stat_names_builder_seal(stat_names_builder_t *nb) {
-    unsigned char *out;
-    size_t pos = 0;
-    size_t i;
-
-    if (!nb || nb->sealed) return;
-    nb->sealed = 1;
-    if (!g_stat_inode_order || nb->count < 2 || !nb->ents) return;
-
-    if (nb->sortcap < nb->len) {
-        unsigned char *p = (unsigned char *)realloc(nb->sortbuf, nb->cap);
-
-        if (!p) return; /* fall back to readdir order */
-        nb->sortbuf = p;
-        nb->sortcap = nb->cap;
-    }
-    qsort(nb->ents, nb->count, sizeof(nb->ents[0]), cmp_stat_name_ent_ino);
-    out = nb->sortbuf;
-    for (i = 0; i < nb->count; i++) {
-        size_t nl = nb->ents[i].len;
-
-        memcpy(out + pos, nb->buf + nb->ents[i].off, nl);
-        out[pos + nl] = '\0';
-        nb->ents[i].off = (uint32_t)pos;
-        pos += nl + 1;
-    }
-    /* The blob is handed to the batch, so keep the one it replaced as next time's scratch. */
-    {
-        unsigned char *old_buf = nb->buf;
-        size_t old_cap = nb->cap;
-
-        nb->buf = nb->sortbuf;
-        nb->cap = nb->sortcap;
-        nb->sortbuf = old_buf;
-        nb->sortcap = old_cap;
-    }
-}
-
-static void stat_batch_record_unexpected_dir(const char *parent_path, size_t parent_len, const char *name,
-                                             size_t name_len);
-
-/* Run fstatat+account+emit (crawl thread) for all names in nb, then clear nb. Same work as stat pool
- * workers for a batch; used for dup(dirfd) failure and small tail batches to avoid per-directory sync. */
-static int stat_nb_process_inline_crawl(int dir_fd, const char *parent_path, size_t parent_len,
-                                        stat_names_builder_t *nb, worker_arg_t *wa, emit_context_t *emit,
-                                        dir_stack_t *stack, task_queue_t *queue, worker_aux_stats_t *aux) {
-    unsigned char *p;
-    unsigned char *end;
-    shared_state_t *shared = wa->shared;
-
-    (void)stack;
-    (void)aux;
-    if (!nb || nb->count == 0) return 0;
-    stat_names_builder_seal(nb);
-    {
-        discovered_dir_batch_t db;
-
-        discovered_dir_batch_init(&db, queue, shared);
-        p = nb->buf;
-        end = nb->buf + nb->len;
-        while (p < end) {
-        const char *name = (const char *)p;
-        size_t nl = strlen(name);
-        struct stat child_st;
-
-        if (nl == 0) break;
-        p += nl + 1;
-
-        if (ecrawl_io_fstatat_nf(dir_fd, name, &child_st) != 0) {
-            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", parent_path, name, strerror(errno));
-            stats_add_error(shared);
-            continue;
-        }
-        if (S_ISDIR(child_st.st_mode)) {
-            char *child_path_owned;
-            size_t child_path_len;
-
-            if (path_join_alloc(parent_path, parent_len, name, nl, &child_path_owned, &child_path_len) != 0) {
-                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", parent_path, name, strerror(errno));
-                stats_add_error(shared);
-                continue;
-            }
-            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0, 0) != 0)
-                continue;
-            stat_batch_record_unexpected_dir(parent_path, parent_len, name, nl);
-        } else {
-            uint64_t contrib;
-
-            record_ids_from_stat(&child_st);
-            contrib = account_entry_shared(emit, shared, &wa->stats, &wa->perf, &child_st);
-            if (!g_no_write) {
-                char child[PATH_MAX];
-                size_t child_path_len =
-                    parent_len + nl + ((parent_len == 1 && parent_path[0] == '/') ? 0U : 1U);
-
-                if (path_join_fast(parent_path, parent_len, name, nl, child, sizeof(child)) != 0) {
-                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", parent_path, name);
-                    stats_add_error(shared);
-                    continue;
-                }
-                if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
-                    fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
-                    stats_add_error(shared);
-                }
-            }
-        }
-        }
-        discovered_dir_batch_fini(&db);
-    }
-    stat_names_builder_clear(nb);
-    return 0;
-}
-
-static void stat_pending_vec_free(stat_pending_vec_t *v) {
-    if (!v) return;
-    free(v->items);
-    v->items = NULL;
-    v->count = v->cap = 0;
-}
-
-static int stat_pending_push(stat_pending_vec_t *v, stat_batch_t *b) {
-    if (!v || !b) return -1;
-    if (v->count >= v->cap) {
-        size_t nc = v->cap ? v->cap * 2 : 8;
-        stat_batch_t **ni = (stat_batch_t **)realloc(v->items, nc * sizeof(*ni));
-        if (!ni) return -1;
-        v->items = ni;
-        v->cap = nc;
-    }
-    v->items[v->count++] = b;
-    return 0;
-}
-
-static stat_batch_t *stat_batch_create(void) {
-    stat_batch_t *b = (stat_batch_t *)calloc(1, sizeof(*b));
-
-    if (!b) return NULL;
-    b->dirfd_dup = -1;
-    if (pthread_mutex_init(&b->done_mutex, NULL) != 0) {
-        free(b);
-        return NULL;
-    }
-    if (pthread_cond_init(&b->done_cond, NULL) != 0) {
-        pthread_mutex_destroy(&b->done_mutex);
-        free(b);
-        return NULL;
-    }
-    return b;
-}
-
-static void stat_batch_destroy(stat_batch_t *b) {
-    if (!b) return;
-    if (b->dirfd_dup >= 0) {
-        close(b->dirfd_dup);
-        b->dirfd_dup = -1;
-    }
-    free(b->names_blob);
-    pthread_mutex_destroy(&b->done_mutex);
-    pthread_cond_destroy(&b->done_cond);
-    free(b);
-}
-
-static void stat_batch_wait_done(stat_batch_t *b) {
-    pthread_mutex_lock(&b->done_mutex);
-    while (!b->finished) pthread_cond_wait(&b->done_cond, &b->done_mutex);
-    pthread_mutex_unlock(&b->done_mutex);
-}
-
-static int stat_batch_is_finished(stat_batch_t *b) {
-    int finished;
-
-    pthread_mutex_lock(&b->done_mutex);
-    finished = b->finished;
-    pthread_mutex_unlock(&b->done_mutex);
-    return finished;
-}
-
-static void merge_discovered_from_batch(stat_batch_t *batch, dir_stack_t *stack, task_queue_t *queue,
-                                        worker_aux_stats_t *aux, shared_state_t *shared) {
-    (void)batch;
-
-    donate_spill_if_needed(shared, stack, queue, aux);
-}
-
-static void stat_batch_record_unexpected_dir(const char *parent_path, size_t parent_len, const char *name,
-                                             size_t name_len) {
-    char *full = NULL;
-    size_t full_len = 0;
-
-    if (path_join_alloc(parent_path, parent_len, name, name_len, &full, &full_len) != 0) return;
-    atomic_fetch_add_explicit(&g_stat_batch_unexpected_dir_total, 1ULL, memory_order_relaxed);
-    pthread_mutex_lock(&g_stat_batch_unexpected_dir_mu);
-    if (g_stat_batch_unexpected_dir_sample_n < STAT_BATCH_UNEXPECTED_DIR_SAMPLES) {
-        g_stat_batch_unexpected_dir_samples[g_stat_batch_unexpected_dir_sample_n++] = full;
-        full = NULL;
-    }
-    pthread_mutex_unlock(&g_stat_batch_unexpected_dir_mu);
-    free(full);
-}
-
-static void print_stat_batch_unexpected_dir_warnings(FILE *fp) {
-    uint64_t total = (uint64_t)atomic_load(&g_stat_batch_unexpected_dir_total);
-    size_t i;
-
-    if (total == 0ULL) return;
-    fprintf(fp,
-            "WARN stat_batch_unexpected_dir_total=%" PRIu64
-            " (batched name fstatat reported a directory; enqueued for crawl; "
-            "counter includes dtype lies and unknown d_type batches)\n",
-            total);
-    pthread_mutex_lock(&g_stat_batch_unexpected_dir_mu);
-    for (i = 0; i < g_stat_batch_unexpected_dir_sample_n; i++)
-        fprintf(fp, "  example: %s\n", g_stat_batch_unexpected_dir_samples[i]);
-    if (total > (uint64_t)g_stat_batch_unexpected_dir_sample_n)
-        fprintf(fp, "  (%zu example paths shown; output truncated)\n", g_stat_batch_unexpected_dir_sample_n);
-    for (i = 0; i < g_stat_batch_unexpected_dir_sample_n; i++) {
-        free(g_stat_batch_unexpected_dir_samples[i]);
-        g_stat_batch_unexpected_dir_samples[i] = NULL;
-    }
-    g_stat_batch_unexpected_dir_sample_n = 0;
-    pthread_mutex_unlock(&g_stat_batch_unexpected_dir_mu);
-}
-
-/* Destroy already-finished pending batches without waiting. Compacts unfinished entries to the front.
- * Mid-readdir backpressure uses this so completed batches do not pin names_blob memory until EOF. */
-static void stat_pending_reap_finished(stat_pending_vec_t *v, dir_stack_t *stack, task_queue_t *queue,
-                                       worker_aux_stats_t *aux, shared_state_t *shared) {
-    size_t i;
-    size_t keep = 0;
-
-    if (!v || v->count == 0) return;
-    for (i = 0; i < v->count; i++) {
-        stat_batch_t *b = v->items[i];
-
-        if (!stat_batch_is_finished(b)) {
-            v->items[keep++] = b;
-            continue;
-        }
-        merge_discovered_from_batch(b, stack, queue, aux, shared);
-        stat_batch_destroy(b);
-    }
-    v->count = keep;
-}
-
-/* Mid-readdir backpressure: reap finished batches, then wait only until unfinished pending drops
- * below keep_max (typically ECRAWL_STAT_QUEUE_BATCHES). Unlike a full barrier, the reader can keep
- * feeding the pool once there is room instead of waiting for every outstanding batch. */
-static void stat_pending_drain_until_unfinished_below(stat_pending_vec_t *v, size_t keep_max,
-                                                     dir_stack_t *stack, task_queue_t *queue,
-                                                     worker_aux_stats_t *aux, shared_state_t *shared) {
-    if (!v) return;
-    if (keep_max == 0) {
-        /* Same as a full drain when the caller asks for an empty unfinished set. */
-        size_t i;
-
-        for (i = 0; i < v->count; i++) {
-            stat_batch_t *b = v->items[i];
-
-            stat_batch_wait_done(b);
-            merge_discovered_from_batch(b, stack, queue, aux, shared);
-            stat_batch_destroy(b);
-        }
-        v->count = 0;
-        return;
-    }
-
-    for (;;) {
-        size_t i;
-
-        stat_pending_reap_finished(v, stack, queue, aux, shared);
-        if (v->count < keep_max) return;
-
-        /* Oldest unfinished first: after reap_finished every remaining item is unfinished. */
-        for (i = 0; i < v->count; i++) {
-            if (!stat_batch_is_finished(v->items[i])) {
-                stat_batch_wait_done(v->items[i]);
-                break;
-            }
-        }
-        if (i >= v->count) return;
-    }
-}
-
-/* Wait for each enqueue'd batch from this crawl thread, run post-batch donation, destroy batch structs.
- * Called when finishing a directory read (and on flush failure cleanup); not on every DT_DIR/UNKNOWN. */
-static void stat_pending_drain_all(stat_pending_vec_t *v, dir_stack_t *stack, task_queue_t *queue,
-                                   worker_aux_stats_t *aux, shared_state_t *shared) {
-    size_t i;
-
-    for (i = 0; i < v->count; i++) {
-        stat_batch_t *b = v->items[i];
-
-        stat_batch_wait_done(b);
-        merge_discovered_from_batch(b, stack, queue, aux, shared);
-        stat_batch_destroy(b);
-    }
-    v->count = 0;
-}
-
-static void process_stat_batch_worker(stat_batch_t *batch) {
-    unsigned char *p = batch->names_blob;
-    unsigned char *end = batch->names_blob + batch->names_blob_len;
-    worker_arg_t *wa = batch->owner;
-    emit_context_t *emit = batch->emit_ctx;
-    discovered_dir_batch_t db;
-
-    discovered_dir_batch_init(&db, wa->queue, wa->shared);
-
-    while (p < end) {
-        const char *name = (const char *)p;
-        size_t nl = strlen(name);
-        struct stat child_st;
-
-        if (nl == 0) break;
-        p += nl + 1;
-
-        if (ecrawl_io_fstatat_nf(batch->dirfd_dup, name, &child_st) != 0) {
-            fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", batch->parent_path, name, strerror(errno));
-            stats_add_error(wa->shared);
-            continue;
-        }
-        if (S_ISDIR(child_st.st_mode)) {
-            char *child_path_owned;
-            size_t child_path_len;
-
-            if (path_join_alloc(batch->parent_path, batch->parent_len, name, nl, &child_path_owned, &child_path_len) !=
-                0) {
-                fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", batch->parent_path, name, strerror(errno));
-                stats_add_error(wa->shared);
-                continue;
-            }
-            if (discovered_dir_batch_push(&db, child_path_owned, child_path_len, &child_st, 0, 0) != 0)
-                continue;
-            stat_batch_record_unexpected_dir(batch->parent_path, batch->parent_len, name, nl);
-        } else {
-            uint64_t contrib;
-
-            /* The id registries and emit_record synchronize themselves; only the owner's
-             * counters need its lock, so several workers on one owner still run in parallel. */
-            record_ids_from_stat(&child_st);
-            contrib = account_entry_shared(emit, wa->shared, &wa->stats, &wa->perf, &child_st);
-            if (!g_no_write) {
-                char child[PATH_MAX];
-                size_t child_path_len =
-                    batch->parent_len + nl + ((batch->parent_len == 1 && batch->parent_path[0] == '/') ? 0U : 1U);
-
-                if (path_join_fast(batch->parent_path, batch->parent_len, name, nl, child, sizeof(child)) != 0) {
-                    fprintf(stderr, "ERROR worker path too long: %s/%s\n", batch->parent_path, name);
-                    stats_add_error(wa->shared);
-                    continue;
-                }
-                if (emit_record(emit, child, child_path_len, &child_st, contrib) != 0) {
-                    fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
-                    stats_add_error(wa->shared);
-                }
-            }
-        }
-    }
-
-    discovered_dir_batch_fini(&db);
-
-    if (batch->dirfd_dup >= 0) {
-        close(batch->dirfd_dup);
-        batch->dirfd_dup = -1;
-    }
-
-    if (g_progress && wa) progress_publish(wa);
-
-    atomic_fetch_add_explicit(&g_stat_batches_completed, 1ULL, memory_order_relaxed);
-
-    pthread_mutex_lock(&batch->done_mutex);
-    batch->finished = 1;
-    pthread_cond_broadcast(&batch->done_cond);
-    pthread_mutex_unlock(&batch->done_mutex);
-}
-
-static __thread unsigned int g_stat_dequeue_rng;
-
-static size_t stat_queue_pick_dequeue_idx(size_t n) {
-    if (n <= 1) return 0;
-    if (!g_stat_random_queue_dequeue) return 0;
-    if (g_stat_dequeue_rng == 0)
-        g_stat_dequeue_rng = (unsigned int)((uintptr_t)pthread_self() ^ (uintptr_t)clock());
-    return (size_t)((unsigned long long)rand_r(&g_stat_dequeue_rng) * (unsigned long long)n /
-                    ((unsigned long long)RAND_MAX + 1ULL));
-}
-
-/* Take the next batch, waiting according to wait_ns: negative waits until one arrives, 0 does not wait
- * at all, positive waits at most that many nanoseconds. Sets *stopping when the pool is shutting down.
- * The check and the wait share one lock acquisition so a batch enqueued in between cannot be missed. */
-static stat_batch_t *stat_batch_take(long wait_ns, int *stopping) {
-    stat_batch_t *batch = NULL;
-
-    *stopping = 0;
-    pthread_mutex_lock(&g_stat_pool.mutex);
-    for (;;) {
-        if (g_stat_pool.q_count > 0) {
-            size_t n = g_stat_pool.q_count;
-            size_t idx = stat_queue_pick_dequeue_idx(n);
-
-            batch = g_stat_pool.slots[idx];
-            if (g_stat_random_queue_dequeue && n > 1) {
-                g_stat_pool.slots[idx] = g_stat_pool.slots[n - 1];
-            } else if (n > 1) {
-                memmove(g_stat_pool.slots, g_stat_pool.slots + 1, (n - 1) * sizeof(stat_batch_t *));
-            }
-            g_stat_pool.q_count--;
-            pthread_cond_signal(&g_stat_pool.cond_nonfull);
-            break;
-        }
-        if (g_stat_pool.stop) {
-            *stopping = 1;
-            break;
-        }
-        if (wait_ns == 0) break;
-
-        tls_wait_stat_pop_inc();
-        {
-            uint64_t t0 = monotonic_ns();
-
-            if (wait_ns > 0) {
-                struct timespec ts;
-
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += wait_ns;
-                while (ts.tv_nsec >= 1000000000L) {
-                    ts.tv_nsec -= 1000000000L;
-                    ts.tv_sec++;
-                }
-                pthread_cond_timedwait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex, &ts);
-                if (t0) tls_stat_idle_add_ns(monotonic_ns() - t0);
-                /* Whether or not a batch landed, go back to the caller: a crawl-queue push does not
-                 * signal this condvar, so returning is the only way that queue gets looked at again. */
-                if (g_stat_pool.q_count == 0) {
-                    if (g_stat_pool.stop) *stopping = 1;
-                    break;
-                }
-                continue;
-            }
-            pthread_cond_wait(&g_stat_pool.cond_nonempty, &g_stat_pool.mutex);
-            if (t0) tls_stat_idle_add_ns(monotonic_ns() - t0);
-        }
-    }
-    pthread_mutex_unlock(&g_stat_pool.mutex);
-    return batch;
-}
-
-static void *stat_worker_main(void *arg) {
-    /* Non-NULL only when this pool may also take crawl tasks, in which case it is this thread's own
-     * crawl identity -- never a crawl worker's, whose stats and buffers belong to that worker. */
-    worker_arg_t *wa = (worker_arg_t *)arg;
-    crawl_identity_t ci;
-    int can_crawl = 0;
-    long wait_ns;
-
-    if (wa && crawl_identity_init(&ci, wa) == 0) can_crawl = 1;
-    wait_ns = can_crawl ? 0 : -1;
-
-    for (;;) {
-        int stopping = 0;
-        stat_batch_t *batch = stat_batch_take(wait_ns, &stopping);
-        dir_stack_t task;
-
-        /* Batches come first: each one holds a dup'd fd and a crawl thread parked in the drain that
-         * ends its directory, so it is the more urgent of the two queues. */
-        if (batch) {
-            process_stat_batch_worker(batch);
-            wait_ns = can_crawl ? 0 : -1;
-            continue;
-        }
-        if (stopping) break;
-        if (!can_crawl) continue;
-
-        if (queue_try_pop(wa->queue, &task) == 0) {
-            atomic_fetch_add_explicit(&g_stat_crawl_tasks_helped, 1ULL, memory_order_relaxed);
-            tls_stat_inline_only = 1;
-            crawl_run_task(&task, wa, &ci);
-            tls_stat_inline_only = 0;
-            wait_ns = 0;
-            continue;
-        }
-        /* Both queues empty, so sleeping is finally worth it -- but only briefly, since nothing wakes
-         * this thread when a crawl task appears. */
-        wait_ns = STAT_HELPER_POLL_NS;
-    }
-
-    if (can_crawl) crawl_identity_destroy(&ci, wa);
-    tls_flush_thread_batch_counters();
-    return NULL;
-}
-
-static void stat_queue_track_depth_max_locked(size_t depth) {
-    unsigned long long cur;
-    unsigned long long d = (unsigned long long)depth;
-
-    do {
-        cur = atomic_load_explicit(&g_stat_queue_depth_max, memory_order_relaxed);
-        if (d <= cur) break;
-    } while (!atomic_compare_exchange_weak_explicit(&g_stat_queue_depth_max, &cur, d, memory_order_relaxed,
-                                                     memory_order_relaxed));
-}
-
-/* 0 = queued, 1 = queue full (only returned when may_block is 0), -1 = pool stopped.
- * A crawl thread that cannot queue has a better option than sleeping until a slot frees: the batch is
- * self-contained, so it can stat it itself (see stat_flush_builder). may_block preserves the old
- * behaviour for ECRAWL_STAT_FULL_INLINE=0. */
-static int stat_batch_enqueue(stat_batch_t *batch, int may_block) {
-    pthread_mutex_lock(&g_stat_pool.mutex);
-    while (may_block && g_stat_pool.q_count >= g_stat_pool.q_max && !g_stat_pool.stop) {
-        uint64_t t0 = monotonic_ns();
-
-        tls_wait_stat_enqueue_inc();
-        pthread_cond_wait(&g_stat_pool.cond_nonfull, &g_stat_pool.mutex);
-        if (t0) tls_stat_enqueue_block_add_ns(monotonic_ns() - t0);
-    }
-    if (g_stat_pool.stop) {
-        pthread_mutex_unlock(&g_stat_pool.mutex);
-        return -1;
-    }
-    if (g_stat_pool.q_count >= g_stat_pool.q_max) {
-        pthread_mutex_unlock(&g_stat_pool.mutex);
-        return 1;
-    }
-    batch->queue_next = NULL;
-    g_stat_pool.slots[g_stat_pool.q_count++] = batch;
-    stat_queue_track_depth_max_locked(g_stat_pool.q_count);
-    pthread_cond_signal(&g_stat_pool.cond_nonempty);
-    pthread_mutex_unlock(&g_stat_pool.mutex);
-    return 0;
-}
-
-/* helper_args is one worker_arg_t per stat thread when they may also crawl, else NULL. They are owned
- * by main alongside the crawl workers' so that stats merging and lock teardown stay in one place. */
-static int stat_pool_start(worker_arg_t *helper_args) {
-    size_t i;
-
-    if (g_stat_threads_configured <= 0) return 0;
-    memset(&g_stat_pool, 0, sizeof(g_stat_pool));
-    g_stat_pool.q_max = g_stat_queue_max_batches_cfg;
-    if (pthread_mutex_init(&g_stat_pool.mutex, NULL) != 0) return -1;
-    if (pthread_cond_init(&g_stat_pool.cond_nonempty, NULL) != 0) {
-        pthread_mutex_destroy(&g_stat_pool.mutex);
-        return -1;
-    }
-    if (pthread_cond_init(&g_stat_pool.cond_nonfull, NULL) != 0) {
-        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
-        pthread_mutex_destroy(&g_stat_pool.mutex);
-        return -1;
-    }
-    g_stat_pool.slots = (stat_batch_t **)calloc(g_stat_pool.q_max, sizeof(stat_batch_t *));
-    if (!g_stat_pool.slots) {
-        pthread_cond_destroy(&g_stat_pool.cond_nonfull);
-        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
-        pthread_mutex_destroy(&g_stat_pool.mutex);
-        memset(&g_stat_pool, 0, sizeof(g_stat_pool));
-        return -1;
-    }
-    g_stat_pool.threads =
-        (pthread_t *)calloc((size_t)g_stat_threads_configured, sizeof(*g_stat_pool.threads));
-    if (!g_stat_pool.threads) {
-        free(g_stat_pool.slots);
-        pthread_cond_destroy(&g_stat_pool.cond_nonfull);
-        pthread_cond_destroy(&g_stat_pool.cond_nonempty);
-        pthread_mutex_destroy(&g_stat_pool.mutex);
-        memset(&g_stat_pool, 0, sizeof(g_stat_pool));
-        return -1;
-    }
-    for (i = 0; i < (size_t)g_stat_threads_configured; i++) {
-        if (pthread_create(&g_stat_pool.threads[i], NULL, stat_worker_main,
-                           helper_args ? &helper_args[i] : NULL) != 0) {
-            pthread_mutex_lock(&g_stat_pool.mutex);
-            g_stat_pool.stop = 1;
-            pthread_cond_broadcast(&g_stat_pool.cond_nonempty);
-            pthread_cond_broadcast(&g_stat_pool.cond_nonfull);
-            pthread_mutex_unlock(&g_stat_pool.mutex);
-            while (i > 0) pthread_join(g_stat_pool.threads[--i], NULL);
-            free(g_stat_pool.threads);
-            free(g_stat_pool.slots);
-            pthread_cond_destroy(&g_stat_pool.cond_nonfull);
-            pthread_cond_destroy(&g_stat_pool.cond_nonempty);
-            pthread_mutex_destroy(&g_stat_pool.mutex);
-            memset(&g_stat_pool, 0, sizeof(g_stat_pool));
-            return -1;
-        }
-        g_stat_pool.nthreads++;
-    }
-    g_stat_pool_ready = 1;
-    return 0;
-}
-
-static void stat_pool_stop(void) {
-    size_t i;
-
-    if (!g_stat_pool_ready) return;
-    pthread_mutex_lock(&g_stat_pool.mutex);
-    g_stat_pool.stop = 1;
-    pthread_cond_broadcast(&g_stat_pool.cond_nonempty);
-    pthread_cond_broadcast(&g_stat_pool.cond_nonfull);
-    pthread_mutex_unlock(&g_stat_pool.mutex);
-    for (i = 0; i < (size_t)g_stat_pool.nthreads; i++) pthread_join(g_stat_pool.threads[i], NULL);
-    free(g_stat_pool.threads);
-    g_stat_pool.threads = NULL;
-    g_stat_pool.nthreads = 0;
-    free(g_stat_pool.slots);
-    g_stat_pool.slots = NULL;
-    pthread_mutex_destroy(&g_stat_pool.mutex);
-    pthread_cond_destroy(&g_stat_pool.cond_nonempty);
-    pthread_cond_destroy(&g_stat_pool.cond_nonfull);
-    memset(&g_stat_pool, 0, sizeof(g_stat_pool));
-    g_stat_pool_ready = 0;
-}
-
-static int d_type_reliable_nondir_for_stat_batch(unsigned char t) {
-#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_DIR) && defined(DT_UNKNOWN)
-    switch (t) {
-    case DT_REG:
-    case DT_LNK:
-    case DT_FIFO:
-    case DT_SOCK:
-    case DT_CHR:
-    case DT_BLK:
-    case DT_WHT:
-        return 1;
-    default:
-        return 0;
-    }
-#else
-    (void)t;
-    return 0;
-#endif
-}
-
-static int stat_flush_builder(stat_names_builder_t *nb, int dir_fd, const char *parent_path, size_t parent_len,
-                              worker_arg_t *wa, emit_context_t *emit, dir_stack_t *stack, task_queue_t *queue,
-                              worker_aux_stats_t *aux, stat_pending_vec_t *pend) {
-    stat_batch_t *b;
-    int dfd;
-    int rc;
-    shared_state_t *shared = wa->shared;
-
-    if (!nb || nb->count == 0) return 0;
-
-    if (tls_stat_inline_only) {
-        /* A stat worker on loan to the crawl side: it must not queue work to the pool it belongs to. */
-        if (stat_nb_process_inline_crawl(dir_fd, parent_path, parent_len, nb, wa, emit, stack, queue, aux) != 0) {
-            stats_add_error(shared);
-            return -1;
-        }
-        atomic_fetch_add_explicit(&g_stat_batches_helper_inlined, 1ULL, memory_order_relaxed);
-        return 0;
-    }
-    stat_names_builder_seal(nb);
-
-    dfd = dup(dir_fd);
-    if (dfd < 0) {
-        if (stat_nb_process_inline_crawl(dir_fd, parent_path, parent_len, nb, wa, emit, stack, queue, aux) != 0) {
-            stats_add_error(shared);
-            return -1;
-        }
-        atomic_fetch_add_explicit(&g_stat_batches_dup_fallback, 1ULL, memory_order_relaxed);
-        return 0;
-    }
-
-    b = stat_batch_create();
-    if (!b) {
-        fprintf(stderr, "ERROR stat batch OOM\n");
-        stats_add_error(shared);
-        close(dfd);
-        return -1;
-    }
-    b->dirfd_dup = dfd;
-    b->parent_path = parent_path;
-    b->parent_len = parent_len;
-    b->names_blob = nb->buf;
-    b->names_blob_len = nb->len;
-    b->name_count = nb->count;
-    b->owner = wa;
-    b->emit_ctx = emit;
-
-    nb->buf = NULL;
-    nb->cap = 0;
-    stat_names_builder_clear(nb);
-
-    /* Reclaim already-finished batches before growing pend further (self-processed
-     * and completed worker batches between periodic backpressure checks). */
-    if (pend->count > 0) stat_pending_reap_finished(pend, stack, queue, aux, shared);
-
-    if (stat_pending_push(pend, b) != 0) {
-        fprintf(stderr, "ERROR stat pending OOM\n");
-        stats_add_error(shared);
-        stat_batch_destroy(b);
-        return -1;
-    }
-    rc = stat_batch_enqueue(b, !g_stat_full_inline);
-    if (rc < 0) {
-        fprintf(stderr, "ERROR stat enqueue (pool stopped)\n");
-        stats_add_error(shared);
-        pend->count--;
-        stat_batch_destroy(b);
-        return -1;
-    }
-    if (rc > 0) {
-        /* Queue full. Every stat worker is busy, so waiting for a slot would idle the one thread still
-         * free to stat: do the batch here instead. It stays in pend, so the drain that ends this
-         * directory finds it already finished and releases the dup'd fd and blob on the same schedule. */
-        atomic_fetch_add_explicit(&g_stat_batches_self_processed, 1ULL, memory_order_relaxed);
-        process_stat_batch_worker(b);
-        return 0;
-    }
-    atomic_fetch_add_explicit(&g_stat_batches_enqueued, 1ULL, memory_order_relaxed);
-    return 0;
-}
 
 /* ----- raw getdents64 directory reader (with libc readdir fallback) ------------------------------
  * When g_getdents_buf_bytes > 0 a directory is read with raw getdents64(2) into a per-crawl-thread
@@ -5367,154 +4238,6 @@ static int process_directory_iterative(dir_stack_t *stack,
                     }
                 }
                 donate_spill_if_needed(shared, stack, queue, aux);
-            } else if (g_stat_threads_configured > 0) {
-                stat_names_builder_t nb;
-                stat_pending_vec_t pend;
-
-                memset(&nb, 0, sizeof(nb));
-                memset(&pend, 0, sizeof(pend));
-
-                /* Pending stat batches are fully drained at end of directory and on flush errors.
-                 * Mid-readdir, every STAT_PENDING_DRAIN_EVERY_READDIRS dirents, apply backpressure:
-                 * reap finished batches and wait only until unfinished pending drops below the
-                 * global queue cap (not a full barrier). No drain before each DT_DIR/UNKNOWN. */
-
-                {
-                    size_t reliable_nondir_seen_in_dir = 0;
-                    size_t readdir_drain_counter       = 0;
-                    size_t dirs_since_donate_check     = 0;
-                    size_t entries_since_donate_check  = 0;
-
-                while (ecrawl_dir_reader_next(&rd, &ent_name, &ent_dtype, &ent_ino) == 1) {
-                    readdir_drain_counter++;
-                    if (readdir_drain_counter >= STAT_PENDING_DRAIN_EVERY_READDIRS) {
-                        readdir_drain_counter = 0;
-                        if (pend.count > 0)
-                            stat_pending_drain_until_unfinished_below(&pend, g_stat_queue_max_batches_cfg,
-                                                                      stack, queue, aux, shared);
-                    }
-
-                    size_t child_name_len;
-                    struct stat child_st;
-                    unsigned char child_d_type = ent_dtype;
-
-                    if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
-                    entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
-
-                    child_name_len = strlen(ent_name);
-                    if (child_d_type == DT_DIR) {
-                        crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent_name, child_name_len,
-                                                   shared, stats, perf, emit, stack, queue, aux, &disc_b);
-                        dirs_since_donate_check++;
-                        donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
-                    } else {
-                        const int use_reliable_nondir_inline =
-                            d_type_reliable_nondir_for_stat_batch(child_d_type) &&
-                            g_stat_batch_after_reliable_nondirs_cfg > 0U &&
-                            reliable_nondir_seen_in_dir < g_stat_batch_after_reliable_nondirs_cfg;
-
-                        if (use_reliable_nondir_inline) {
-                            if (ecrawl_io_fstatat_nf(dir_fd, ent_name, &child_st) != 0) {
-                                fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent_name,
-                                        strerror(errno));
-                                stats_add_error(shared);
-                                continue;
-                            }
-                            if (S_ISDIR(child_st.st_mode)) {
-                                char *child_path_owned;
-                                size_t child_path_len;
-
-                                if (path_join_alloc(dir_path, dir_path_len, ent_name, child_name_len,
-                                                    &child_path_owned, &child_path_len) != 0) {
-                                    fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, ent_name,
-                                            strerror(errno));
-                                    stats_add_error(shared);
-                                    continue;
-                                }
-                                if (discovered_dir_batch_push(&disc_b, child_path_owned, child_path_len, &child_st,
-                                                              0, 0) != 0)
-                                    continue;
-                                stat_batch_record_unexpected_dir(dir_path, dir_path_len, ent_name, child_name_len);
-                                dirs_since_donate_check++;
-                                donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
-                            } else {
-                                uint64_t contrib;
-
-                                record_ids_from_stat(&child_st);
-                                contrib = account_entry_shared(emit, shared, stats, perf, &child_st);
-                                if (!g_no_write) {
-                                    char child[PATH_MAX];
-                                    size_t child_path_emitted_len = dir_path_len + child_name_len +
-                                                                   ((dir_path_len == 1 && dir_path[0] == '/') ? 0U
-                                                                                                             : 1U);
-
-                                    if (path_join_fast(dir_path, dir_path_len, ent_name, child_name_len, child,
-                                                       sizeof(child)) != 0) {
-                                        fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, ent_name);
-                                        stats_add_error(shared);
-                                        continue;
-                                    }
-                                    if (emit_record(emit, child, child_path_emitted_len, &child_st, contrib) != 0) {
-                                        fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
-                                        stats_add_error(shared);
-                                    }
-                                }
-                            }
-                            reliable_nondir_seen_in_dir++;
-                        } else {
-                            /* Batched fstatat: trusted non-dirs past inline cap, DT_UNKNOWN, etc. Stat workers
-                             * enqueue discovered directories (same as crawl-thread inline path). */
-                            if (stat_names_builder_append(&nb, ent_name, child_name_len, ent_ino) != 0) {
-                                fprintf(stderr, "ERROR worker stat batch append %s/%s: %s\n", dir_path, ent_name,
-                                        strerror(errno));
-                                stats_add_error(shared);
-                                continue;
-                            }
-                            if (nb.count >= g_stat_batch_entries_cfg) {
-                                if (stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
-                                                       &pend) != 0) {
-                                    (void)discovered_dir_batch_flush(&disc_b);
-                                    stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                                    ecrawl_dir_reader_close(&rd);
-                                    stat_names_builder_free(&nb);
-                                    stat_pending_vec_free(&pend);
-                                    free(dir_path);
-                                    goto outer_continue;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                donate_spill_if_needed(shared, stack, queue, aux);
-                stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                if (nb.count > 0) {
-                    int tail_rc;
-
-                    if (g_stat_batch_min_offload_cfg == 0U || nb.count >= g_stat_batch_min_offload_cfg)
-                        tail_rc = stat_flush_builder(&nb, dir_fd, dir_path, dir_path_len, wa, emit, stack, queue, aux,
-                                                     &pend);
-                    else {
-                        tail_rc = stat_nb_process_inline_crawl(dir_fd, dir_path, dir_path_len, &nb, wa, emit, stack,
-                                                               queue, aux);
-                        if (tail_rc == 0)
-                            atomic_fetch_add_explicit(&g_stat_batches_tail_inlined, 1ULL, memory_order_relaxed);
-                    }
-                    if (tail_rc != 0) {
-                        (void)discovered_dir_batch_flush(&disc_b);
-                        stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                        ecrawl_dir_reader_close(&rd);
-                        stat_names_builder_free(&nb);
-                        stat_pending_vec_free(&pend);
-                        free(dir_path);
-                        goto outer_continue;
-                    }
-                }
-                stat_pending_drain_all(&pend, stack, queue, aux, shared);
-                stat_names_builder_free(&nb);
-                stat_pending_vec_free(&pend);
-                }
             } else {
                 size_t dirs_since_donate_check = 0;
                 size_t entries_since_donate_check = 0;
@@ -5587,7 +4310,6 @@ static int process_directory_iterative(dir_stack_t *stack,
         (void)discovered_dir_batch_flush(&disc_b);
         ecrawl_dir_reader_close(&rd);
         free(dir_path);
-    outer_continue:;
     }
 
     discovered_dir_batch_fini(&disc_b);
@@ -5726,16 +4448,14 @@ static void *stats_thread_main(void *arg) {
                     unsigned long long wcrawl = atomic_load(&g_wait_crawl_tasks);
                     unsigned long long wwp = atomic_load(&g_wait_writer_push);
                     unsigned long long wwc = atomic_load(&g_wait_writer_pop);
-                    unsigned long long wsp = atomic_load(&g_wait_stat_pop);
-                    unsigned long long wse = atomic_load(&g_wait_stat_enqueue);
 
                     fprintf(stderr,
                             "ecrawl: stall hint: rolling-window entries stayed at 0 for %d s "
                             "(elapsed %.1f s; total_entries=%llu; q=%llu wq=%llu active=%d; "
                             "last_sec delta: entries=%llu readdir=%llu stat_meta=%llu; "
-                            "wait: crawl_q=%llu wr_push=%llu wr_pop=%llu st_pop=%llu st_enq=%llu)\n",
+                            "wait: crawl_q=%llu wr_push=%llu wr_pop=%llu)\n",
                             stall_zero_secs, elapsed_sec, (unsigned long long)total_entries, qdepth, wqdepth, active,
-                            d_tot, d_rd, d_ls + (io_st - g_progress_prev_stat), wcrawl, wwp, wwc, wsp, wse);
+                            d_tot, d_rd, d_ls + (io_st - g_progress_prev_stat), wcrawl, wwp, wwc);
                     fflush(stderr);
                     stall_announced = 1;
                 }
@@ -6531,11 +5251,7 @@ static void print_queue_wait_metrics_to(FILE *fp) {
     fprintf(fp, "wait_crawl_tasks=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_crawl_tasks));
     fprintf(fp, "wait_writer_push=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_push));
     fprintf(fp, "wait_writer_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_writer_pop));
-    fprintf(fp, "wait_stat_pop=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_pop));
-    fprintf(fp, "wait_stat_enqueue=%" PRIu64 "\n", (uint64_t)atomic_load(&g_wait_stat_enqueue));
     fprintf(fp, "crawl_idle_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_crawl_idle_ns));
-    fprintf(fp, "stat_idle_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_idle_ns));
-    fprintf(fp, "stat_enqueue_block_ns=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_enqueue_block_ns));
 }
 
 /* What a names-only walk can and cannot report. Byte totals, hardlink dedup and the uid/gid
@@ -6583,45 +5299,14 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "uid_shard_digits=%d\n", g_shard_digits);
     fprintf(fp, "writer_threads=%d\n", writer_threads_used);
     fprintf(fp, "crawl_threads=%d\n", g_crawl_threads);
-    fprintf(fp, "stat_threads=%d\n", g_stat_threads_configured);
-    fprintf(fp, "stat_batch_entries=%zu\n", g_stat_batch_entries_cfg);
-    fprintf(fp, "stat_batch_after_reliable_nondirs=%zu\n", g_stat_batch_after_reliable_nondirs_cfg);
-    fprintf(fp, "stat_batch_min_offload=%zu\n", g_stat_batch_min_offload_cfg);
-    fprintf(fp, "stat_queue_max_batches=%zu\n", g_stat_queue_max_batches_cfg);
-    fprintf(fp, "stat_random_queue_dequeue=%d\n", g_stat_random_queue_dequeue);
-    fprintf(fp, "stat_batches_enqueued=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_enqueued));
-    fprintf(fp, "stat_batches_completed=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_completed));
-    fprintf(fp, "stat_batches_dup_fallback=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_dup_fallback));
-    fprintf(fp, "stat_batches_tail_inlined=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_batches_tail_inlined));
-    fprintf(fp, "stat_full_inline=%d\n", g_stat_full_inline);
-    fprintf(fp, "stat_batches_self_processed=%" PRIu64 "\n",
-            (uint64_t)atomic_load(&g_stat_batches_self_processed));
-    fprintf(fp, "stat_helps_crawl=%d\n", g_stat_helps_crawl);
-    fprintf(fp, "stat_crawl_tasks_helped=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_crawl_tasks_helped));
-    fprintf(fp, "stat_batches_helper_inlined=%" PRIu64 "\n",
-            (uint64_t)atomic_load(&g_stat_batches_helper_inlined));
-    fprintf(fp, "stat_batch_unexpected_dir_total=%" PRIu64 "\n",
-            (uint64_t)atomic_load(&g_stat_batch_unexpected_dir_total));
-    fprintf(fp, "stat_queue_depth_max=%" PRIu64 "\n", (uint64_t)atomic_load(&g_stat_queue_depth_max));
-    /* Idle time as a fraction of each pool's thread-seconds, which is what decides whether the fixed
-     * crawl/stat split fits this tree. crawl_idle high means the crawl pool is wider than the tree can
-     * feed; stat_enqueue_block high means the reverse, crawl threads paying for a saturated stat pool.
-     * Both are charged against the crawl pool's threads because both are crawl threads sitting still. */
+    /* Idle time as a fraction of the crawl pool's thread-seconds: crawl_idle high means the pool is
+     * wider than the tree can feed. */
     {
         double crawl_thread_sec = (double)shared->crawl_threads_started * elapsed_sec;
-        double stat_thread_sec = (double)g_stat_threads_configured * elapsed_sec;
         double crawl_idle_sec = (double)atomic_load(&g_crawl_idle_ns) / 1e9;
-        double stat_idle_sec = (double)atomic_load(&g_stat_idle_ns) / 1e9;
-        double enq_block_sec = (double)atomic_load(&g_stat_enqueue_block_ns) / 1e9;
 
         fprintf(fp, "crawl_idle_sec=%.3f\n", crawl_idle_sec);
-        fprintf(fp, "stat_idle_sec=%.3f\n", stat_idle_sec);
-        fprintf(fp, "stat_enqueue_block_sec=%.3f\n", enq_block_sec);
-        if (crawl_thread_sec > 0.0) {
-            fprintf(fp, "crawl_idle_pct=%.1f\n", 100.0 * crawl_idle_sec / crawl_thread_sec);
-            fprintf(fp, "stat_enqueue_block_pct=%.1f\n", 100.0 * enq_block_sec / crawl_thread_sec);
-        }
-        if (stat_thread_sec > 0.0) fprintf(fp, "stat_idle_pct=%.1f\n", 100.0 * stat_idle_sec / stat_thread_sec);
+        if (crawl_thread_sec > 0.0) fprintf(fp, "crawl_idle_pct=%.1f\n", 100.0 * crawl_idle_sec / crawl_thread_sec);
     }
     fprintf(fp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
     fprintf(fp, "writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
@@ -6722,8 +5407,6 @@ int main(int argc, char **argv) {
     writer_queue_t *writer_queues = NULL;
     pthread_t *workers = NULL;
     worker_arg_t *worker_args = NULL;
-    int stat_helper_args = 0;
-    int worker_arg_count = 0;
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
     pthread_t stats_thread;
@@ -6902,21 +5585,7 @@ int main(int argc, char **argv) {
 
     g_crawl_threads = parse_ecrawl_crawl_threads();
     g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
-    g_stat_threads_configured = parse_ecrawl_stat_threads();
-    /* Nothing to offload when no entry is stat'd; leaving the pool up would just park threads. */
-    if (g_no_stat) g_stat_threads_configured = 0;
     g_getdents_buf_bytes = parse_ecrawl_getdents_buf();
-    g_stat_batch_entries_cfg = parse_ecrawl_stat_batch_entries();
-    g_stat_batch_after_reliable_nondirs_cfg = parse_ecrawl_stat_batch_after_reliable_nondirs();
-    g_stat_batch_min_offload_cfg          = parse_ecrawl_stat_batch_min_offload();
-    g_stat_queue_max_batches_cfg = parse_ecrawl_stat_queue_batches();
-    g_stat_random_queue_dequeue = parse_ecrawl_stat_random_queue();
-    g_stat_full_inline = parse_ecrawl_stat_full_inline();
-    g_stat_helps_crawl = parse_ecrawl_stat_helps_crawl();
-    /* Set here rather than at thread start so configure_max_open_shards below reserves descriptors for
-     * the helpers as well: while crawling, each holds a dirfd exactly like a crawl worker. */
-    g_crawl_helper_threads = (g_stat_helps_crawl && g_stat_threads_configured > 0) ? g_stat_threads_configured : 0;
-    g_stat_inode_order = parse_ecrawl_stat_inode_order();
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_entry_check_every_cfg = parse_ecrawl_donate_entry_check_every();
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
@@ -7070,16 +5739,6 @@ int main(int argc, char **argv) {
     atomic_store(&g_writer_queue_depth, 0);
     atomic_store(&g_batches_enqueued, 0);
     atomic_store(&g_batches_dequeued, 0);
-    atomic_store(&g_stat_batches_enqueued, 0);
-    atomic_store(&g_stat_batches_completed, 0);
-    atomic_store(&g_stat_batches_dup_fallback, 0);
-    atomic_store(&g_stat_batches_tail_inlined, 0);
-    atomic_store(&g_stat_batches_self_processed, 0);
-    atomic_store(&g_stat_batches_helper_inlined, 0);
-    atomic_store(&g_stat_crawl_tasks_helped, 0);
-    atomic_store(&g_wait_stat_pop, 0);
-    atomic_store(&g_wait_stat_enqueue, 0);
-    atomic_store(&g_stat_queue_depth_max, 0);
     atomic_store(&g_wait_crawl_tasks, 0);
     atomic_store(&g_wait_writer_push, 0);
     atomic_store(&g_wait_writer_pop, 0);
@@ -7088,8 +5747,6 @@ int main(int argc, char **argv) {
     atomic_store(&g_donate_calls, 0);
     atomic_store(&g_writer_queue_wait_ns, 0);
     atomic_store(&g_crawl_idle_ns, 0);
-    atomic_store(&g_stat_idle_ns, 0);
-    atomic_store(&g_stat_enqueue_block_ns, 0);
     atomic_store(&g_io_lstat_calls, 0);
     atomic_store(&g_io_stat_calls, 0);
     atomic_store(&g_io_mkdir_calls, 0);
@@ -7159,13 +5816,8 @@ int main(int argc, char **argv) {
     (void)stats_thread;
     (void)sizeof(&stats_thread_main);
 
-    /* Crawl workers first, then one per stat thread when the stat pool may also crawl. Keeping them in
-     * one array means the stats merge and the lock teardown below cover both pools unchanged. */
-    stat_helper_args = g_crawl_helper_threads;
-    worker_arg_count = g_crawl_threads + stat_helper_args;
-
     workers = (pthread_t *)calloc((size_t)g_crawl_threads, sizeof(*workers));
-    worker_args = (worker_arg_t *)calloc((size_t)worker_arg_count, sizeof(*worker_args));
+    worker_args = (worker_arg_t *)calloc((size_t)g_crawl_threads, sizeof(*worker_args));
     if (!workers || !worker_args) {
         free(workers);
         free(worker_args);
@@ -7193,7 +5845,7 @@ int main(int argc, char **argv) {
     }
 
     if (g_progress) {
-        g_progress_nslots = (size_t)worker_arg_count;
+        g_progress_nslots = (size_t)g_crawl_threads;
         g_progress_slots = (progress_slot_t *)calloc(g_progress_nslots, sizeof(*g_progress_slots));
         if (!g_progress_slots) {
             free(workers);
@@ -7223,7 +5875,7 @@ int main(int argc, char **argv) {
         atomic_store(&g_progress_last_print_ns, 0);
     }
 
-    for (i = 0; i < worker_arg_count; i++) {
+    for (i = 0; i < g_crawl_threads; i++) {
         if (pthread_mutex_init(&worker_args[i].emit_stats_lock, NULL) != 0) {
             fprintf(stderr, "ERROR crawl worker mutex init failed\n");
             while (i > 0) pthread_mutex_destroy(&worker_args[--i].emit_stats_lock);
@@ -7254,8 +5906,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Before stat_pool_start, not after: a helper thread reads these the moment it runs. */
-    for (i = 0; i < worker_arg_count; i++) {
+    for (i = 0; i < g_crawl_threads; i++) {
         worker_args[i].shared = &shared;
         worker_args[i].queue = &queue;
         worker_args[i].writer_queues = writer_queues;
@@ -7264,39 +5915,6 @@ int main(int argc, char **argv) {
         memset(&worker_args[i].stats, 0, sizeof(worker_args[i].stats));
         memset(&worker_args[i].perf, 0, sizeof(worker_args[i].perf));
         memset(&worker_args[i].aux, 0, sizeof(worker_args[i].aux));
-    }
-
-    if (stat_pool_start(stat_helper_args > 0 ? &worker_args[g_crawl_threads] : NULL) != 0) {
-        fprintf(stderr, "ERROR failed to start stat worker pool\n");
-        for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
-        free(g_progress_slots);
-        g_progress_slots = NULL;
-        free(workers);
-        free(worker_args);
-        if (stats_thread_started) {
-            stats_stop_request();
-            pthread_join(stats_thread, NULL);
-        }
-        if (!g_no_write) {
-            atomic_store(&g_disk_wait_disabled, 1);
-            disk_monitor_stop_request();
-            if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
-            disk_monitor_started = 0;
-            for (i = 0; i < writer_threads_used; i++) writer_queue_close(&writer_queues[i]);
-            for (i = 0; i < writer_threads_used; i++) pthread_join(writer_threads[i], NULL);
-        }
-        if (!g_no_write) {
-            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
-            free(writer_queues);
-            free(writer_threads);
-            free(writer_args);
-        }
-        queue_destroy(&queue);
-        pthread_mutex_destroy(&shared.stats_mutex);
-        if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
-        if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
-        if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
-        return 1;
     }
 
     for (i = 0; i < g_crawl_threads; i++) {
@@ -7318,8 +5936,6 @@ int main(int argc, char **argv) {
 
     for (i = 0; i < worker_count_started; i++) pthread_join(workers[i], NULL);
 
-    stat_pool_stop();
-
     pthread_mutex_lock(&queue.mutex);
     queue.closed = 1;
     pthread_cond_broadcast(&queue.cond);
@@ -7328,12 +5944,6 @@ int main(int argc, char **argv) {
     for (i = 0; i < worker_count_started; i++) {
         stats_merge(&shared, &worker_args[i].stats);
         stats_merge_aux(&shared, &worker_args[i].aux);
-    }
-    /* Stat helpers accumulate into their own slots when they crawl, and stat_pool_stop above has already
-     * joined them, so their counts are final and would otherwise be dropped. */
-    for (i = 0; i < stat_helper_args; i++) {
-        stats_merge(&shared, &worker_args[g_crawl_threads + i].stats);
-        stats_merge_aux(&shared, &worker_args[g_crawl_threads + i].aux);
     }
 
     if (!g_no_write) {
@@ -7428,10 +6038,9 @@ int main(int argc, char **argv) {
         } else {
             print_verbose_full_stats(sumfp, &shared, elapsed, writer_threads_used, start_path);
         }
-        print_stat_batch_unexpected_dir_warnings(stderr);
     }
 
-    for (i = 0; i < worker_arg_count; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
+    for (i = 0; i < g_crawl_threads; i++) pthread_mutex_destroy(&worker_args[i].emit_stats_lock);
 
     free(g_progress_slots);
     g_progress_slots = NULL;

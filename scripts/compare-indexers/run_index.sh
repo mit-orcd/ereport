@@ -143,7 +143,7 @@ run_ecrawl() {
   if [[ "$variant" == "nostat" ]]; then
     # Names-only census: d_type file count, no path stream (find/fd peer).
     (
-      export ECRAWL_CRAWL_THREADS="$ECRAWL_NOSTAT_CRAWL_THREADS" ECRAWL_STAT_THREADS=0
+      export ECRAWL_CRAWL_THREADS="$ECRAWL_NOSTAT_CRAWL_THREADS"
       time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-stat --count "$TREE" \
         >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
     )
