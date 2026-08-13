@@ -9,6 +9,16 @@
 #   DATA_DIR             synthetic tree root   (/data1/erbmi1/ecrawl-synth)
 #   REPORT_DIR           output/fixture root   (/data1/erbmi1/ereport)
 #
+# Options:
+#   TRIJOURNAL=0         set 1 to exercise crawl-time trigram journals: step1
+#                        crawls with --trigram-journal $REPORT_DIR/journals and
+#                        builds the index with --journal-dir (a successful --make
+#                        deletes the journals it consumed); step2 enables the
+#                        per-fixture journals (kept at <bin-root>/<fixture>/journals)
+#                        via DO_TRIJOURNAL / EREPORT_INDEX_JOURNALS.
+#   step2's fixture scripts take their own env knobs (DO_QUERY, MANYSHARD_COPIES,
+#   REPS, ...); anything exported here is inherited by them.
+#
 # Deploying this to a server means copying scripts/ recursively: the default
 # sibling lookup expects fixtures/ and profile/ to sit beside each other.
 set -u
@@ -21,6 +31,12 @@ data_dir=${DATA_DIR:-/data1/erbmi1/ecrawl-synth}
 report_dir=${REPORT_DIR:-/data1/erbmi1/ereport}
 bin_dir="$report_dir/bin"
 idx_dir="$report_dir/index"
+trijournal=${TRIJOURNAL:-0}
+
+# step2's fixture scripts each have their own knob; drive both from TRIJOURNAL.
+if [[ "$trijournal" == "1" ]]; then
+  export DO_TRIJOURNAL=1 EREPORT_INDEX_JOURNALS=1
+fi
 
 # The profilers only auto-detect ./<tool>, /tmp/<tool> and $PATH — none of which
 # match a $bin_root deploy — so name the binaries for them explicitly.
@@ -46,11 +62,18 @@ function step1() {
   DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) DEPTH_SLICE_ENABLE=1 SYNTH_PROFILE=extreme "$scripts_root/fixtures/generate-ecrawl-adversarial-tree.sh" "$data_dir"
   # Crawled twice on purpose: --verbose turns on the per-call I/O counter atomics,
   # so the quiet run is the one whose capture and timing the later steps use.
-  ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "$data_dir" "$bin_dir"
-  ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "$data_dir" "$bin_dir"
+  local jdir="$report_dir/journals"
+  local crawl_args=() make_args=()
+  if [[ "$trijournal" == "1" ]]; then
+    mkdir -p "$jdir"
+    crawl_args=(--trigram-journal "$jdir")
+    make_args=(--journal-dir "$jdir")
+  fi
+  ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "${crawl_args[@]}" "$data_dir" "$bin_dir"
+  ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "${crawl_args[@]}" "$data_dir" "$bin_dir"
   ECRAWL_QUERY_THREADS=64 "$bin_root/ecrawl_query" --top 10 "$bin_dir"
   EREPORT_THREADS=64 "$bin_root/ereport" --bucket-details 4 --report-dir "$report_dir" mtime "$bin_dir"
-  EREPORT_INDEX_THREADS=64 "$bin_root/ereport_index" --make --index-dir "$idx_dir" "$bin_dir"
+  EREPORT_INDEX_THREADS=64 "$bin_root/ereport_index" --make --index-dir "$idx_dir" "${make_args[@]}" "$bin_dir"
 }
 
 function step2() {

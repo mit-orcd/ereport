@@ -2069,6 +2069,7 @@ static void die_usage(const char *argv0) {
             "    Optional --journal-dir <path>: replay crawl-time trigram journals (ecrawl --trigram-journal DIR)\n"
             "    instead of parsing captures for shards whose journal matches the live .bin (basename, size, mtime,\n"
             "    catalog offset/entries). Missing or stale journals fall back to the capture parse per shard.\n"
+            "    Journals that were replayed are deleted once the index build succeeds.\n"
             "    Also writes the directory-index sidecars dirs.idx and rowgroups.idx (~24 bytes per directory)\n"
             "    that `ecrawl_query --index-dir` uses to answer a subtree rollup without reading every catalog\n"
             "    row, and to scan only the row groups that can hold the subtree. --no-dir-index skips that phase;\n"
@@ -6256,6 +6257,7 @@ static int build_index_dir(const char *user_spec,
     double t0 = now_sec();
     double t1;
     double chunk_prep_sec = 0.0;
+    uint64_t journal_shards_deleted = 0;
     int stats_thread_started = 0;
     int threads = parse_index_thread_count();
     int trigram_threads = parse_trigram_thread_count(threads);
@@ -7097,6 +7099,28 @@ static int build_index_dir(const char *user_spec,
         }
     }
 
+    /* The index is complete; journals that were validated and replayed are dead weight
+     * (a cache bound to a capture that is now indexed), so remove them. Stale or
+     * missing journals were never consumed and stay untouched. Deletion failure is
+     * advisory only. */
+    if (g_journal_dir) {
+        for (i = 0; i < path_count; i++) {
+            char jpath[PATH_MAX];
+            const char *base;
+
+            if (!file_states[i].use_journal) continue;
+            base = strrchr(paths[i], '/');
+            base = base ? base + 1 : paths[i];
+            if (trij_journal_path(jpath, sizeof(jpath), g_journal_dir, base, 0) != 0) continue;
+            if (unlink(jpath) != 0 && errno != ENOENT) {
+                fprintf(stderr, "ereport_index: warn: cannot delete consumed journal %s: %s\n", jpath,
+                        strerror(errno));
+                continue;
+            }
+            journal_shards_deleted++;
+        }
+    }
+
     t1 = now_sec();
     clear_status_line();
     printf("mode=make\n");
@@ -7112,6 +7136,7 @@ static int build_index_dir(const char *user_spec,
         for (i = 0; i < path_count; i++)
             if (file_states[i].use_journal) jn++;
         printf("journal_shards=%" PRIu64 "\n", jn);
+        printf("journal_shards_deleted=%" PRIu64 "\n", journal_shards_deleted);
     }
     printf("scanned_records=%" PRIu64 "\n", ctx.scanned_records);
     printf("index_dir=%s\n", ctx.index_dir);

@@ -1723,14 +1723,25 @@ run_trijournal_tests() {
         "$(kv_last unique_trigrams "${idx_plain}/meta.txt")" \
         "$(kv_last unique_trigrams "${idx_jrnl}/meta.txt")" || true
 
+    # A successful journal build consumes its journals: replayed shards' .tij
+    # files are deleted; anything it did not validate stays behind.
+    expect_eq_continue "successful --make deletes consumed journals" "$njournals" \
+        "$(kv_last journal_shards_deleted "${td}/trij.make.jrnl.out")" || true
+    expect_eq_continue "journal dir empty after successful --make" "0" \
+        "$(find "$jdir" -maxdepth 1 -name '*.tij' | wc -l | tr -d ' ')" || true
+
     # reference answer set for the fallback cases below (the term loop's last
     #   iteration leaves a different query in trij.s.plain)
     "$EREPORT_INDEX" --search --index-dir "$idx_plain" report_file_0001 2>/dev/null | sort >"${td}/trij.s.ref"
 
     # 2. Staleness: a shard whose size/mtime moved must fall back, with the
-    #    answers still exactly right.
+    #    answers still exactly right -- and the stale journal is NOT deleted,
+    #    since it was never consumed.
+    rm -rf "$out" "$jdir"; mkdir -p "$out" "$jdir"
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+        "$ECRAWL" --trigram-journal "$jdir" "$tree_abs" "$out" >"${td}/trij.crawl.log" 2>&1 ||
+        die "ecrawl --trigram-journal recrawl failed"
     shard=$(find "$out" -maxdepth 1 -name 'uid_shard_*.bin' | LC_ALL=C sort | head -n1)
-    cp -p "$shard" "${td}/trij.shard.bak"
     printf 'x' >>"$shard"
     EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
         "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "${td}/trij_idx_stale" "$out" \
@@ -1739,10 +1750,17 @@ run_trijournal_tests() {
     "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_stale" report_file_0001 2>/dev/null | sort >"${td}/trij.s.stale"
     expect_eq_continue "stale shard: falls back, answers still match" \
         "$(cksum <"${td}/trij.s.ref")" "$(cksum <"${td}/trij.s.stale")" || true
-    cp -p "${td}/trij.shard.bak" "$shard"
+    expect_eq_continue "stale shard: journal not consumed, not deleted" "0" \
+        "$(kv_last journal_shards_deleted "${td}/trij.make.stale.out")" || true
+    expect_eq_continue "stale shard: stale journal left in place" "1" \
+        "$(find "$jdir" -maxdepth 1 -name '*.tij' | wc -l | tr -d ' ')" || true
 
-    # 3. Mixed coverage: merge this journaled crawl with a second crawl that has
+    # 3. Mixed coverage: merge a journaled crawl with a second crawl that has
     #    no journals; the merged index must still match a fully plain build.
+    rm -rf "$out" "$jdir"; mkdir -p "$out" "$jdir"
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+        "$ECRAWL" --trigram-journal "$jdir" "$tree_abs" "$out" >"${td}/trij.crawl.log" 2>&1 ||
+        die "ecrawl --trigram-journal recrawl failed"
     local tree2="${td}/trij_tree2" out2="${td}/trij_crawl2" idx_mix="${td}/trij_idx_mix"
     mkdir -p "$tree2/omega"
     (cd "$tree2/omega" && seq -f 'omega_file_%03g.log' 1 300 | xargs -r touch)
@@ -1766,7 +1784,12 @@ run_trijournal_tests() {
     expect_eq_continue "mixed coverage: journaled shard answers match" \
         "$(cksum <"${td}/trij.s.mixplain2")" "$(cksum <"${td}/trij.s.mix2")" || true
 
-    # 4. Crash leftover: a .tij.tmp without a finalized .tij is ignored.
+    # 4. Crash leftover: a .tij.tmp without a finalized .tij is ignored (and
+    #    nothing is deleted, since nothing was consumed).
+    rm -rf "$out" "$jdir"; mkdir -p "$out" "$jdir"
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+        "$ECRAWL" --trigram-journal "$jdir" "$tree_abs" "$out" >"${td}/trij.crawl.log" 2>&1 ||
+        die "ecrawl --trigram-journal recrawl failed"
     local jf
     jf=$(find "$jdir" -maxdepth 1 -name 'uid_shard_*.bin.tij' | LC_ALL=C sort | head -n1)
     cp "$jf" "${jf}.tmp"
@@ -1778,7 +1801,8 @@ run_trijournal_tests() {
     "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_crash" report_file_0001 2>/dev/null | sort >"${td}/trij.s.crash"
     expect_eq_continue "crash leftover .tij.tmp ignored: answers match" \
         "$(cksum <"${td}/trij.s.ref")" "$(cksum <"${td}/trij.s.crash")" || true
-    mv "${jf}.tmp" "$jf"
+    expect_eq_continue "crash leftover .tij.tmp left in place" "1" \
+        "$(find "$jdir" -maxdepth 1 -name '*.tij.tmp' | wc -l | tr -d ' ')" || true
 
     # 5. Overflow: a one-batch queue on a larger tree must void the journal run
     #    without blocking or corrupting the crawl, and publish nothing.

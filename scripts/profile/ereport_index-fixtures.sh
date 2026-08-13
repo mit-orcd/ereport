@@ -63,6 +63,16 @@
 #   PERF_CALLGRAPH=dwarf       perf call-graph mode (dwarf|fp).
 #   REPS=1                     repetitions of the clean index pass per fixture.
 #   EREPORT_INDEX_VERBOSE_ARGS=...  extra args appended to ereport_index.
+#   EREPORT_INDEX_JOURNALS=0   set 1 to build with --journal-dir
+#                              <bin-root>/<fixture>/journals (produced by
+#                              ecrawl-fixtures.sh DO_TRIJOURNAL=1). A successful
+#                              --make DELETES the journals it consumed, so the
+#                              script hardlink-snapshots the journal dir once per
+#                              fixture and restores it before every pass (clean
+#                              reps, strace, perf, sched) and again at the end;
+#                              without the restore, rep 2+ would silently measure
+#                              the plain-parse fallback. A fixture without
+#                              journals warns and builds plain.
 #
 # Data layout (under <bin-root>, persistent):
 #   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
@@ -125,6 +135,13 @@ INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 KEEP_INDEX=${KEEP_INDEX:-1}
 RAISE_ULIMIT=${RAISE_ULIMIT:-1}
 EREPORT_INDEX_VERBOSE_ARGS=${EREPORT_INDEX_VERBOSE_ARGS:-}
+EREPORT_INDEX_JOURNALS=${EREPORT_INDEX_JOURNALS:-0}
+
+# Per-fixture journal state (set by profile_one): a successful --make deletes
+# consumed journals, so every pass restores them from a hardlink snapshot.
+FX_JDIR=""
+FX_JDIR_GOLDEN=""
+FX_USE_JOURNALS=0
 
 # Index builds open many trigram-bucket files and write large paths.bin; raise
 # soft limits best-effort (never above the hard limit, never fatal).
@@ -180,9 +197,18 @@ fi
 build_argv() {
   local bindir=$1 indexdir=$2
   RUN_ARGV=("$EREPORT_INDEX_BIN" --make --index-dir "$indexdir" --verbose)
+  [[ "$FX_USE_JOURNALS" == "1" ]] && RUN_ARGV+=(--journal-dir "$FX_JDIR")
   # shellcheck disable=SC2206
   [[ -n "$EREPORT_INDEX_VERBOSE_ARGS" ]] && RUN_ARGV+=($EREPORT_INDEX_VERBOSE_ARGS)
   RUN_ARGV+=("$bindir")
+}
+
+# cp -al: the snapshot and the live dir share extents, so a restore is instant
+# and the --make's unlinks only drop the live dir's links.
+restore_journals() {
+  [[ "$FX_USE_JOURNALS" == "1" ]] || return 0
+  rm -rf "$FX_JDIR"
+  cp -al "$FX_JDIR_GOLDEN" "$FX_JDIR" 2>/dev/null || cp -a "$FX_JDIR_GOLDEN" "$FX_JDIR"
 }
 
 run_clean() {
@@ -191,6 +217,7 @@ run_clean() {
   # Rebuild into a clean index dir so timings are not skewed by stale files;
   # the final clean pass is the canonical, kept output.
   rm -rf "$indexdir"; mkdir -p "$indexdir"
+  restore_journals
   build_argv "$bindir" "$indexdir"
   echo "    index clean${sfx}: ${RUN_ARGV[*]}"
   # Own monotonic wall timer in addition to ereport_index's elapsed_sec stat.
@@ -213,6 +240,8 @@ run_clean() {
     for f in tri_keys.bin tri_postings.bin paths.bin path_offsets.bin meta.txt; do
       [[ -e "$indexdir/$f" ]] && echo "size_$f=$(stat -c %s "$indexdir/$f" 2>/dev/null)"
     done
+    # Journal engagement proof: how many shards were replayed (and deleted).
+    grep -E '^journal_shards' "$dest/clean.stats${sfx}.txt" 2>/dev/null
   } >"$dest/index_size${sfx}.txt"
   [[ "$KEEP_INDEX" == "1" ]] || rm -rf "$indexdir"
 }
@@ -222,6 +251,7 @@ run_strace() {
   [[ "$DO_STRACE" == "1" ]] || return 0
   local indexdir="$INSTR_BASE/strace"
   rm -rf "$indexdir"; mkdir -p "$indexdir"
+  restore_journals
   build_argv "$bindir" "$indexdir"
   echo "    index strace: strace -f -c (timing not representative)"
   strace -f -c -o "$dest/strace.txt" \
@@ -234,6 +264,7 @@ run_perf() {
   [[ "$DO_PERF" == "1" ]] || return 0
   local indexdir="$INSTR_BASE/perf"
   rm -rf "$indexdir"; mkdir -p "$indexdir"
+  restore_journals
   build_argv "$bindir" "$indexdir"
   echo "    index perf: perf record --call-graph $PERF_CALLGRAPH -F $PERF_FREQ"
   local data="$dest/perf.data"
@@ -267,6 +298,7 @@ run_sched() {
   command -v perf >/dev/null 2>&1 || return 0
   local indexdir="$INSTR_BASE/sched"
   rm -rf "$indexdir"; mkdir -p "$indexdir"
+  restore_journals
   build_argv "$bindir" "$indexdir"
   echo "    index sched: perf sched record (per-thread concurrency; data not kept)"
   local data="$dest/perf.sched.data"
@@ -302,6 +334,21 @@ profile_one() {
   fi
   mkdir -p "$dest" "$idest"
   echo "uid_shard_files=$nsh" >"$dest/bins.txt"
+
+  FX_USE_JOURNALS=0
+  FX_JDIR="$fxout/journals"
+  FX_JDIR_GOLDEN="$fxout/journals.golden"
+  if [[ "$EREPORT_INDEX_JOURNALS" == "1" ]]; then
+    if compgen -G "$FX_JDIR/*.tij" >/dev/null; then
+      rm -rf "$FX_JDIR_GOLDEN"
+      cp -al "$FX_JDIR" "$FX_JDIR_GOLDEN" 2>/dev/null || cp -a "$FX_JDIR" "$FX_JDIR_GOLDEN"
+      FX_USE_JOURNALS=1
+    else
+      echo "WARNING: EREPORT_INDEX_JOURNALS=1 but no *.tij under $FX_JDIR; building plain" >&2
+      echo "         (produce them with ecrawl-fixtures.sh DO_TRIJOURNAL=1)" >&2
+    fi
+  fi
+
   local r
   for ((r = 1; r <= REPS; r++)); do
     run_clean "$idest" "$bindir" "$indexdir" "$r"
@@ -309,6 +356,13 @@ profile_one() {
   run_strace "$idest" "$bindir"
   run_perf   "$idest" "$bindir"
   run_sched  "$idest" "$bindir" "$fixture"
+
+  # Leave the journal dir whole for the next consumer; drop the snapshot.
+  if [[ "$FX_USE_JOURNALS" == "1" ]]; then
+    restore_journals
+    rm -rf "$FX_JDIR_GOLDEN"
+    FX_USE_JOURNALS=0
+  fi
 }
 
 # ---- env snapshot ----------------------------------------------------------
@@ -320,7 +374,7 @@ profile_one() {
   echo "results_dir=$RESULTS_DIR"
   echo "ereport_index_bin=$EREPORT_INDEX_BIN"
   echo "config: index_threads=$EREPORT_INDEX_THREADS trigram_threads=${EREPORT_INDEX_TRIGRAM_THREADS:-default}"
-  echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_index=$KEEP_INDEX"
+  echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS keep_index=$KEEP_INDEX journals=$EREPORT_INDEX_JOURNALS"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -513,9 +567,9 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "index(s)", "idx_size", "paths",
+cols = ["fixture", "shards", "jrn", "index(s)", "idx_size", "paths",
         "trigrams", "chunkprep", "indexph", "mergeph"]
-w = [22, 7, 9, 9, 12, 11, 10, 9, 9]
+w = [22, 7, 5, 9, 9, 12, 11, 10, 9, 9]
 
 
 def row(vals):
@@ -536,6 +590,7 @@ for fx in fixtures:
     lines.append(row([
         fx,
         kv(root / fx / "bins.txt").get("uid_shard_files", "-"),
+        fmt(num(iv.get("journal_shards"))),
         fmt(el_avg, "f2") if el_avg is not None else "-",
         isz or "-",
         fmt(num(iv.get("indexed_paths"))),

@@ -2928,7 +2928,8 @@ static void query_report_rollup(const query_rollup_t *r, const char *source, dou
     fflush(stdout);
 }
 
-static void query_report(query_result_t *res, unsigned n, uint64_t records_scanned, double elapsed) {
+static void query_report(query_result_t *res, unsigned n, uint64_t records_scanned, double elapsed,
+                         double chunk_prep_sec) {
     FILE *out = g_query.list_paths ? stderr : stdout;
     query_result_t sum;
     uint64_t dupes = 0;
@@ -2980,6 +2981,7 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
     fprintf(out, "blocks_skipped=%" PRIu64 "\n", sum.blocks_skipped);
     fprintf(out, "records_skipped_by_block_filter=%" PRIu64 "\n", sum.records_skipped);
     fprintf(out, "parse_chunk_jobs=%zu\n", g_parse_chunk_jobs);
+    fprintf(out, "chunk_prep_sec=%.6f\n", chunk_prep_sec);
     if (g_rgix_stats.used) {
         /* kept is the intersection the scan actually used; the two single-sketch
          * counts are what the interval or the bitmap would have kept on its own,
@@ -3241,7 +3243,7 @@ static void analyze_rollup_node(parent_node_t *n, void *ctx) {
 }
 
 static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth, size_t shard_files,
-                                 size_t parse_chunk_jobs) {
+                                 size_t parse_chunk_jobs, double chunk_prep_sec) {
     analyze_rollup_t roll;
     unsigned di;
     uint64_t depth_records = 0;
@@ -3275,6 +3277,7 @@ static void print_analyze_report(parent_map_t *map, const uint64_t *merged_depth
     printf("ecrawl_query\n");
     printf("uid_shard_bin_files=%zu\n", shard_files);
     printf("parse_chunk_jobs=%zu\n", parse_chunk_jobs);
+    printf("chunk_prep_sec=%.6f\n", chunk_prep_sec);
     printf("records_total=%" PRIu64 "\n", roll.total_records);
     printf("distinct_parent_directories=%" PRIu64 "\n", roll.distinct_parents);
     printf("parents_with_at_least_one_regular_file=%" PRIu64 "\n", roll.parents_with_files);
@@ -3433,7 +3436,9 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         }
     }
 
+    double chunk_prep_sec = 0.0;
     {
+        double t_prep0 = analyze_now_sec();
         uint64_t split_target = parse_split_target_bytes(dir_path, names, name_count, nthreads);
         int built = -1;
 
@@ -3451,6 +3456,9 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             fprintf(stderr, "ecrawl_query: failed to build chunk job list\n");
             return 1;
         }
+        /* The chunk-list build is a serial per-shard prologue; at high shard counts it
+         * is the one phase no worker helps with, so report it separately. */
+        chunk_prep_sec = analyze_now_sec() - t_prep0;
     }
     crawl_sidecar_close(&sidecar);
     g_parse_chunk_jobs = chunk_count;
@@ -3623,7 +3631,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
 
     if (g_query.active) {
         query_report(pool.qres, nthreads, atomic_load_explicit(&pool.analyze_records_done, memory_order_relaxed),
-                     analyze_now_sec() - sctx.t0);
+                     analyze_now_sec() - sctx.t0, chunk_prep_sec);
         query_results_free(pool.qres, nthreads);
         pool.qres = NULL;
         analyze_free_shard_catalogs(&pool, name_count);
@@ -3698,7 +3706,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     }
 
     if (merged) {
-        print_analyze_report(merged, merged_depth, name_count, chunk_count);
+        print_analyze_report(merged, merged_depth, name_count, chunk_count, chunk_prep_sec);
         parent_map_free(merged);
     }
 

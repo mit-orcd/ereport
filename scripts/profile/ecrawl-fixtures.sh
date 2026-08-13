@@ -74,6 +74,14 @@
 #                              and proceeds warm.
 #   REPS=1                     repetitions of the clean pass per fixture/mode.
 #   ECRAWL_VERBOSE_ARGS=...    extra args appended to ecrawl (e.g. extra flags).
+#   DO_TRIJOURNAL=0            write-mode crawls also run --trigram-journal into a
+#                              per-fixture journal dir: the kept rep-1 crawl uses
+#                              <bin-root>/<fixture>/journals (consumed by
+#                              ereport_index-fixtures.sh with EREPORT_INDEX_JOURNALS=1),
+#                              throwaway passes use <outdir>.journals next to their
+#                              shards and delete both. Per-fixture dirs because shard
+#                              basenames collide across fixtures. Never nowrite mode:
+#                              --no-write + --trigram-journal is an error.
 #   Any ECRAWL_* env (ECRAWL_MAX_OPEN_SHARDS, ECRAWL_CRAWL_THREADS, ...) is
 #   inherited by every ecrawl run and recorded in env.txt.
 #
@@ -135,6 +143,7 @@ DROP_CACHES=${DROP_CACHES:-1}
 REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 ECRAWL_VERBOSE_ARGS=${ECRAWL_VERBOSE_ARGS:-}
+DO_TRIJOURNAL=${DO_TRIJOURNAL:-0}
 
 if [[ -n "${FIXTURES:-}" ]]; then
   read -ra FIXLIST <<<"$FIXTURES"
@@ -194,11 +203,15 @@ maybe_drop_caches() {
 }
 
 # Build the ecrawl argv for a given start path / mode into global RUN_ARGV.
+# jdir (optional) is the trigram journal dir; honored in write mode only.
 build_argv() {
-  local mode=$1 start=$2 outdir=$3
+  local mode=$1 start=$2 outdir=$3 jdir=${4:-}
   RUN_ARGV=("$ECRAWL_BIN" --verbose)
   if [[ "$mode" == "nowrite" ]]; then
     RUN_ARGV=("$ECRAWL_BIN" --no-write --verbose)
+  elif [[ "$DO_TRIJOURNAL" == "1" && -n "$jdir" ]]; then
+    mkdir -p "$jdir"
+    RUN_ARGV+=(--trigram-journal "$jdir")
   fi
   # shellcheck disable=SC2206
   [[ -n "$ECRAWL_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_VERBOSE_ARGS)
@@ -214,10 +227,17 @@ run_clean() {
   local sfx=""
   [[ "$REPS" -gt 1 ]] && sfx=".rep${rep}"
 
+  # Kept crawls journal into <bin-root>/<fixture>/journals so the index profiler
+  # can consume them; throwaway crawls journal next to their throwaway shards.
+  local jdir=""
+  if [[ "$mode" == "write" && "$DO_TRIJOURNAL" == "1" ]]; then
+    if [[ "$keep" == "1" ]]; then jdir="$BIN_ROOT/$fixture/journals"; else jdir="$outdir.journals"; fi
+    rm -rf "$jdir"
+  fi
   if [[ "$mode" == "write" ]]; then
     rm -rf "$outdir"; mkdir -p "$outdir"
   fi
-  build_argv "$mode" "$start" "$outdir"
+  build_argv "$mode" "$start" "$outdir" "$jdir"
   maybe_drop_caches
 
   echo "    clean/$mode${sfx}: ${RUN_ARGV[*]}"
@@ -243,12 +263,18 @@ run_clean() {
       echo "uid_shard_files_created=$nsh"
       echo "output_dir_size=$(du -sh "$outdir" 2>/dev/null | cut -f1)"
       [[ "$keep" == "1" ]] && echo "kept_bin_dir=$outdir"
+      if [[ -n "$jdir" ]]; then
+        echo "journal_files=$(find "$jdir" -maxdepth 1 -name '*.tij' 2>/dev/null | wc -l)"
+        echo "journal_bytes=$(du -sb "$jdir" 2>/dev/null | cut -f1)"
+        [[ "$keep" == "1" ]] && echo "kept_journal_dir=$jdir"
+      fi
     } >"$dest/shards${sfx}.txt"
     if [[ "$keep" == "1" ]]; then
       echo "    kept bins: $nsh shard(s) -> $outdir"
+      [[ -n "$jdir" ]] && echo "    kept journals: -> $jdir"
     else
       # Reclaim space immediately; throwaway shards can be large for mega dirs.
-      rm -rf "$outdir"
+      rm -rf "$outdir" ${jdir:+"$jdir"}
     fi
   fi
 }
@@ -257,21 +283,25 @@ run_clean() {
 run_strace() {
   local mode=$1 start=$2 dest=$3 outdir=$4
   [[ "$DO_STRACE" == "1" ]] || return 0
-  if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
-  build_argv "$mode" "$start" "$outdir"
+  local jdir=""
+  [[ "$mode" == "write" && "$DO_TRIJOURNAL" == "1" ]] && jdir="$outdir.journals"
+  if [[ "$mode" == "write" ]]; then rm -rf "$outdir" ${jdir:+"$jdir"}; mkdir -p "$outdir"; fi
+  build_argv "$mode" "$start" "$outdir" "$jdir"
   maybe_drop_caches
   echo "    strace/$mode: strace -f -c (timing not representative)"
   strace -f -c -o "$dest/strace.${mode}.txt" \
     "${RUN_ARGV[@]}" >/dev/null 2>"$dest/strace.${mode}.ecrawl-stderr.txt"
-  [[ "$mode" == "write" ]] && rm -rf "$outdir"
+  [[ "$mode" == "write" ]] && rm -rf "$outdir" ${jdir:+"$jdir"}
 }
 
 # perf pass: CPU profile.
 run_perf() {
   local mode=$1 start=$2 dest=$3 outdir=$4
   [[ "$DO_PERF" == "1" ]] || return 0
-  if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
-  build_argv "$mode" "$start" "$outdir"
+  local jdir=""
+  [[ "$mode" == "write" && "$DO_TRIJOURNAL" == "1" ]] && jdir="$outdir.journals"
+  if [[ "$mode" == "write" ]]; then rm -rf "$outdir" ${jdir:+"$jdir"}; mkdir -p "$outdir"; fi
+  build_argv "$mode" "$start" "$outdir" "$jdir"
   # DWARF call graphs so stacks resolve even when ecrawl is built -O2 without frame pointers.
   # Set PERF_CALLGRAPH=fp if the binary is built with -fno-omit-frame-pointer (cheaper, smaller).
   local cg=${PERF_CALLGRAPH:-dwarf}
@@ -296,7 +326,7 @@ run_perf() {
       >"$dest/perf.${mode}.report.txt"
   fi
   rm -f "$data"
-  [[ "$mode" == "write" ]] && rm -rf "$outdir"
+  [[ "$mode" == "write" ]] && rm -rf "$outdir" ${jdir:+"$jdir"}
 }
 
 # Per-thread scheduling view (runtime / switches / delay) for big fixtures only.
@@ -307,8 +337,10 @@ run_sched() {
   [[ "$DO_SCHED" == "1" ]] || return 0
   case " $SCHED_FIXTURES " in *" $fixture "*) ;; *) return 0 ;; esac
   command -v perf >/dev/null 2>&1 || return 0
-  if [[ "$mode" == "write" ]]; then rm -rf "$outdir"; mkdir -p "$outdir"; fi
-  build_argv "$mode" "$start" "$outdir"
+  local jdir=""
+  [[ "$mode" == "write" && "$DO_TRIJOURNAL" == "1" ]] && jdir="$outdir.journals"
+  if [[ "$mode" == "write" ]]; then rm -rf "$outdir" ${jdir:+"$jdir"}; mkdir -p "$outdir"; fi
+  build_argv "$mode" "$start" "$outdir" "$jdir"
   maybe_drop_caches
   echo "    sched/$mode: perf sched record (per-thread concurrency; data not kept)"
   local data="$dest/perf.${mode}.sched.data"
@@ -324,7 +356,7 @@ run_sched() {
       >"$dest/perf.${mode}.sched.latency.txt"
   fi
   rm -f "$data"
-  [[ "$mode" == "write" ]] && rm -rf "$outdir"
+  [[ "$mode" == "write" ]] && rm -rf "$outdir" ${jdir:+"$jdir"}
 }
 
 profile_one() {
@@ -371,7 +403,7 @@ profile_one() {
   echo "output_base=$OUTPUT_BASE"
   echo "output_base_fstype=$(fs_type "$(dirname "$OUTPUT_BASE")")"
   echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED  reps=$REPS drop_caches=$DROP_CACHES"
+  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED  reps=$REPS drop_caches=$DROP_CACHES trijournal=$DO_TRIJOURNAL"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -781,6 +813,9 @@ if tar -czf "$TARBALL" -C "$(dirname "$RESULTS_DIR")" "$(basename "$RESULTS_DIR"
   echo "  Combined report: $COMBINED"
   if [[ "$DO_WRITE" == "1" ]]; then
     echo "  Reusable bins:   $BIN_ROOT/<fixture>/bin/  (feed this <bin-root> to the follow-up profilers)"
+    if [[ "$DO_TRIJOURNAL" == "1" ]]; then
+      echo "  Reusable journals: $BIN_ROOT/<fixture>/journals/  (EREPORT_INDEX_JOURNALS=1 in the index profiler)"
+    fi
   else
     echo "  Reusable bins:   (none; DO_WRITE=0 so no shards were kept)"
   fi

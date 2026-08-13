@@ -79,6 +79,16 @@
 #                              below for the shape and what each default isolates).
 #                              Narrow it to shorten a run:
 #                                QUERY_VARIANTS=$'subtree-rollup|| --subtree @ROOT@\nsubtree-exact|| --subtree @ROOT@ --exact'
+#   MANYSHARD_COPIES=0         if >=2, synthesize a _MANYSHARDS_ fixture: N
+#                              hardlinked (reflink fallback) copies of a source
+#                              fixture's shards under <bin-root>/_MANYSHARDS_/bin.
+#                              Real fixture crawls are single-UID and produce one
+#                              shard, so the serial per-shard chunk-build prologue
+#                              (chunk_prep_sec) and the catalog dedup never see
+#                              scale without this. Answers are duplicated by
+#                              construction: a stress fixture, not a correctness
+#                              one.
+#   MANYSHARD_SOURCE=<name>    source fixture (default: first in the list).
 #
 # Data layout (under <bin-root>, persistent):
 #   <fixture>/bin/             ecrawl uid_shard_*.bin (produced by the ecrawl profiler)
@@ -153,6 +163,8 @@ QUERY_SIZE_GT=${QUERY_SIZE_GT:-524288000}
 QUERY_TYPE=${QUERY_TYPE:-f}
 QUERY_OUTPUT_SINK=${QUERY_OUTPUT_SINK:-/dev/null}
 QUERY_GID=${QUERY_GID:-$(id -g)}
+MANYSHARD_COPIES=${MANYSHARD_COPIES:-0}
+MANYSHARD_SOURCE=${MANYSHARD_SOURCE:-}
 
 # Query variants, one instrumented pass each: "name|env|args".
 #
@@ -216,6 +228,47 @@ fi
 if [[ ${#FIXLIST[@]} -eq 0 ]]; then
   echo "ERROR: no fixtures with bins found under '$BIN_ROOT' (run profile/ecrawl-fixtures.sh first)" >&2
   exit 1
+fi
+
+# ---- synthetic many-shard fixture -------------------------------------------
+# ecrawl shards by uid, so a single-user fixture crawl yields one shard and the
+# O(shard-count) prologue stays trivial. Copy one fixture's shards N times under
+# fresh uid_shard_<i>.bin names: the prologue reads headers per FILE, so content
+# duplication still exercises it (and the LOADING/READY catalog dedup) at scale.
+MANYSHARD_NAME="_MANYSHARDS_"
+if [[ "$MANYSHARD_COPIES" =~ ^[0-9]+$ ]] && (( MANYSHARD_COPIES >= 2 )); then
+  src_fx=${MANYSHARD_SOURCE:-${FIXLIST[0]}}
+  src_bin="$BIN_ROOT/$src_fx/bin"
+  ms_root="$BIN_ROOT/$MANYSHARD_NAME"
+  ms_bin="$ms_root/bin"
+  if [[ ! -d "$src_bin" ]]; then
+    echo "WARNING: MANYSHARD_COPIES=$MANYSHARD_COPIES but source fixture '$src_fx' has no bin dir; skipping" >&2
+  else
+    # Shard slots are uid & (uid_shards-1), NOT 0..n-1 — cycle the real filenames.
+    mapfile -t srcs < <(find "$src_bin" -maxdepth 1 -name 'uid_shard_*.bin' | LC_ALL=C sort)
+    nsrc=${#srcs[@]}
+    base=$(basename "${srcs[0]}"); digits=${base#uid_shard_}; digits=${digits%.bin}; width=${#digits}
+    echo "synthesizing $MANYSHARD_NAME: $MANYSHARD_COPIES shard file(s) from $src_fx ($nsrc source shard(s))"
+    rm -rf "$ms_root"
+    mkdir -p "$ms_bin"
+    ok=1
+    for ((i = 0; i < MANYSHARD_COPIES; i++)); do
+      dst=$(printf '%s/uid_shard_%0*d.bin' "$ms_bin" "$width" "$i")
+      if ! ln "${srcs[$((i % nsrc))]}" "$dst" 2>/dev/null; then
+        if ! cp --reflink=auto -a "${srcs[$((i % nsrc))]}" "$dst" 2>/dev/null; then
+          echo "WARNING: can neither hardlink nor reflink shard copies; $MANYSHARD_NAME skipped" >&2
+          ok=0
+          break
+        fi
+      fi
+    done
+    if (( ok )); then
+      [[ -f "$src_bin/crawl_manifest.txt" ]] && cp -a "$src_bin/crawl_manifest.txt" "$ms_bin/"
+      FIXLIST+=("$MANYSHARD_NAME")
+    else
+      rm -rf "$ms_root"
+    fi
+  fi
 fi
 
 # ---- tool availability -----------------------------------------------------
@@ -479,6 +532,7 @@ profile_one() {
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
   echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE gid=$QUERY_GID sink=$QUERY_OUTPUT_SINK"
   echo "query_variants: $(printf '%s ' "${QVARIANTS[@]%%|*}")"
+  echo "manyshard: copies=$MANYSHARD_COPIES source=${MANYSHARD_SOURCE:-first-fixture}"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -720,9 +774,9 @@ for key in ("config:", "modes:"):
 lines.append("")
 
 # --- main timing table ----------------------------------------------------
-cols = ["fixture", "shards", "analyze(s)", "records",
+cols = ["fixture", "shards", "analyze(s)", "prep(s)", "records",
         "parents", "maxNfile", "chunks"]
-w = [22, 8, 11, 14, 14, 12, 11]
+w = [22, 8, 11, 8, 14, 14, 12, 11]
 
 
 def row(vals):
@@ -742,6 +796,7 @@ for fx in fixtures:
         fx,
         kv(root / fx / "bins.txt").get("uid_shard_files", "-"),
         fmt(el_avg, "f2") if el_avg is not None else "-",
+        fmt(num(av.get("chunk_prep_sec")), "f2"),
         fmt(num(av.get("records_total"))),
         fmt(num(av.get("distinct_parent_directories"))),
         fmt(num(av.get("max_regular_files_under_single_parent"))),
@@ -754,9 +809,9 @@ lines.append("")
 # is one whose column zone maps proved no record inside could match, so it was
 # seeked past instead of decompressed. skip% is the share of groups avoided.
 # answered says whether the catalog rollups or a record scan produced the answer.
-qcols = ["fixture", "variant", "query(s)", "entries", "scanned",
+qcols = ["fixture", "variant", "query(s)", "prep(s)", "entries", "scanned",
          "blks_dec", "blks_skip", "skip%", "answered"]
-qw = [20, 22, 10, 12, 14, 10, 10, 7, 16]
+qw = [20, 22, 10, 8, 12, 14, 10, 10, 7, 16]
 
 
 def qrow(vals):
@@ -788,6 +843,7 @@ for fx in fixtures:
             fx,
             vname,
             fmt(el_avg, "f2") if el_avg is not None else "-",
+            fmt(num(qv.get("chunk_prep_sec")), "f2"),
             fmt(num(qv.get("entries"))),
             fmt(num(qv.get("records_scanned"))),
             fmt(dec),
