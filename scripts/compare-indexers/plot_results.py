@@ -1443,7 +1443,13 @@ def walk_figure(datasets, out_dir, spec):
     y_bottom, y_top, height = _page_band(page, content_in)
     fig = plt.figure(figsize=page)
 
-    left_margin = 0.10
+    # Size the left gutter to the longest y-tick label actually drawn, so a
+    # long name ("ecrawl --no-stat --count") is not clipped by a margin that
+    # was tuned for "du". Measure in points, convert to figure fraction.
+    longest = max((len(t) for tools in panel_tools for t in tools), default=0)
+    tick_pt = 9.0
+    label_in = longest * tick_pt * 0.62 / 72.0
+    left_margin = min(0.22, max(0.10, (label_in + 0.15) / page[0]))
     mid_gap = 0.04
     right_margin = 0.04
     panel_width = (1.0 - left_margin - right_margin - mid_gap) / 2.0
