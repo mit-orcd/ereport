@@ -16,6 +16,7 @@ __pycache__/
 /test_crawl_block_filter
 /test_crawl_catalog
 /test_crawl_codec
+/test_crawl_trijournal
 /edelete
 /ecrawl_mount
 /enfsprobe

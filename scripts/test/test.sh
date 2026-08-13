@@ -1659,6 +1659,165 @@ run_dir_index_tests() {
     dirx_stored_path_tests "$td"
 }
 
+# --- crawl-time trigram journals: ecrawl --trigram-journal + ereport_index --journal-dir ----
+#
+# The journals are a cache: index answers built through them must be identical
+# to answers built by parsing the captures, and any staleness, gap in coverage,
+# overflow void, or crash leftover must fall back to the capture parse rather
+# than answer from wrong data.
+run_trijournal_tests() {
+    local td=$1
+    local tree="${td}/trij_tree" out="${td}/trij_crawl" jdir="${td}/trij_journals"
+    local idx_plain="${td}/trij_idx_plain" idx_jrnl="${td}/trij_idx_jrnl"
+    local tree_abs d i shard nshards njournals
+
+    section_int "[integration] crawl-time trigram journals (--trigram-journal / --journal-dir)"
+
+    for d in alpha beta gamma delta/eps delta/zeta; do
+        mkdir -p "$tree/$d"
+        (cd "$tree/$d" && seq -f 'report_file_%04g.txt' 1 400 | xargs -r touch)
+    done
+    tree_abs=$(cd "$tree" && pwd -P)
+
+    log "ecrawl --trigram-journal (trijournal fixture)"
+    ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+        "$ECRAWL" --trigram-journal "$jdir" "$tree_abs" "$out" >"${td}/trij.crawl.log" 2>&1 || {
+        tail -n 20 "${td}/trij.crawl.log" >&2 || true
+        die "ecrawl --trigram-journal failed on the trijournal fixture"
+    }
+
+    nshards=$(find "$out" -maxdepth 1 -name 'uid_shard_*.bin' | wc -l)
+    njournals=$(find "$jdir" -maxdepth 1 -name 'uid_shard_*.bin.tij' | wc -l)
+    [[ "$nshards" -gt 0 ]] || die "trijournal fixture wrote no uid shards"
+    expect_eq_continue "one published journal per shard" "$nshards" "$njournals" \
+        "$(kv_last trigram_journal_published "${td}/trij.crawl.log") published per crawl log" || true
+    expect_eq_continue "crawl log: journal not voided" "0" \
+        "$(kv_last trigram_journal_voided "${td}/trij.crawl.log")" || true
+    expect_eq_continue "crawl log: no leftover .tij.tmp" "0" \
+        "$(find "$jdir" -maxdepth 1 -name '*.tij.tmp' | wc -l | tr -d ' ')" || true
+    summary_metric "trijournal: shards / journal bytes" \
+        "${njournals} / $(kv_last trigram_journal_bytes "${td}/trij.crawl.log")"
+
+    # 1. Equality: --make with and without the journals must answer identically.
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --index-dir "$idx_plain" "$out" \
+        >"${td}/trij.make.plain.out" 2>"${td}/trij.make.plain.err" ||
+        die "ereport_index --make (plain) failed on the trijournal fixture"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "$idx_jrnl" "$out" \
+        >"${td}/trij.make.jrnl.out" 2>"${td}/trij.make.jrnl.err" ||
+        die "ereport_index --make --journal-dir failed on the trijournal fixture"
+
+    local term
+    for term in report_file_0001 eps report; do
+        "$EREPORT_INDEX" --search --index-dir "$idx_plain" "$term" 2>/dev/null | sort >"${td}/trij.s.plain"
+        "$EREPORT_INDEX" --search --index-dir "$idx_jrnl" "$term" 2>/dev/null | sort >"${td}/trij.s.jrnl"
+        expect_eq_continue "search '$term': journal index answers match" \
+            "$(cksum <"${td}/trij.s.plain")" "$(cksum <"${td}/trij.s.jrnl")" \
+            "$(wc -l <"${td}/trij.s.plain" | tr -d ' ') paths" || true
+    done
+    expect_eq_continue "meta: indexed_paths match" \
+        "$(kv_last indexed_paths "${idx_plain}/meta.txt")" \
+        "$(kv_last indexed_paths "${idx_jrnl}/meta.txt")" || true
+    expect_eq_continue "meta: unique_trigrams match" \
+        "$(kv_last unique_trigrams "${idx_plain}/meta.txt")" \
+        "$(kv_last unique_trigrams "${idx_jrnl}/meta.txt")" || true
+
+    # reference answer set for the fallback cases below (the term loop's last
+    #   iteration leaves a different query in trij.s.plain)
+    "$EREPORT_INDEX" --search --index-dir "$idx_plain" report_file_0001 2>/dev/null | sort >"${td}/trij.s.ref"
+
+    # 2. Staleness: a shard whose size/mtime moved must fall back, with the
+    #    answers still exactly right.
+    shard=$(find "$out" -maxdepth 1 -name 'uid_shard_*.bin' | LC_ALL=C sort | head -n1)
+    cp -p "$shard" "${td}/trij.shard.bak"
+    printf 'x' >>"$shard"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "${td}/trij_idx_stale" "$out" \
+        >"${td}/trij.make.stale.out" 2>"${td}/trij.make.stale.err" ||
+        die "ereport_index --make --journal-dir (stale shard) failed"
+    "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_stale" report_file_0001 2>/dev/null | sort >"${td}/trij.s.stale"
+    expect_eq_continue "stale shard: falls back, answers still match" \
+        "$(cksum <"${td}/trij.s.ref")" "$(cksum <"${td}/trij.s.stale")" || true
+    cp -p "${td}/trij.shard.bak" "$shard"
+
+    # 3. Mixed coverage: merge this journaled crawl with a second crawl that has
+    #    no journals; the merged index must still match a fully plain build.
+    local tree2="${td}/trij_tree2" out2="${td}/trij_crawl2" idx_mix="${td}/trij_idx_mix"
+    mkdir -p "$tree2/omega"
+    (cd "$tree2/omega" && seq -f 'omega_file_%03g.log' 1 300 | xargs -r touch)
+    "$ECRAWL" "$(cd "$tree2" && pwd -P)" "$out2" >"${td}/trij.crawl2.log" 2>&1 ||
+        die "ecrawl failed on the second trijournal fixture"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "$idx_mix" "$out" "$out2" \
+        >"${td}/trij.make.mix.out" 2>"${td}/trij.make.mix.err" ||
+        die "ereport_index --make --journal-dir (mixed coverage) failed"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --index-dir "${td}/trij_idx_mixplain" "$out" "$out2" \
+        >"${td}/trij.make.mixplain.out" 2>"${td}/trij.make.mixplain.err" ||
+        die "ereport_index --make (mixed plain) failed"
+    "$EREPORT_INDEX" --search --index-dir "$idx_mix" omega_file_001 2>/dev/null | sort >"${td}/trij.s.mix"
+    "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_mixplain" omega_file_001 2>/dev/null | sort >"${td}/trij.s.mixplain"
+    expect_eq_continue "mixed coverage: unjournaled shard still indexed, answers match" \
+        "$(cksum <"${td}/trij.s.mixplain")" "$(cksum <"${td}/trij.s.mix")" \
+        "$(wc -l <"${td}/trij.s.mix" | tr -d ' ') paths" || true
+    "$EREPORT_INDEX" --search --index-dir "$idx_mix" report_file_0002 2>/dev/null | sort >"${td}/trij.s.mix2"
+    "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_mixplain" report_file_0002 2>/dev/null | sort >"${td}/trij.s.mixplain2"
+    expect_eq_continue "mixed coverage: journaled shard answers match" \
+        "$(cksum <"${td}/trij.s.mixplain2")" "$(cksum <"${td}/trij.s.mix2")" || true
+
+    # 4. Crash leftover: a .tij.tmp without a finalized .tij is ignored.
+    local jf
+    jf=$(find "$jdir" -maxdepth 1 -name 'uid_shard_*.bin.tij' | LC_ALL=C sort | head -n1)
+    cp "$jf" "${jf}.tmp"
+    rm "$jf"
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "${td}/trij_idx_crash" "$out" \
+        >"${td}/trij.make.crash.out" 2>"${td}/trij.make.crash.err" ||
+        die "ereport_index --make --journal-dir (crash leftover) failed"
+    "$EREPORT_INDEX" --search --index-dir "${td}/trij_idx_crash" report_file_0001 2>/dev/null | sort >"${td}/trij.s.crash"
+    expect_eq_continue "crash leftover .tij.tmp ignored: answers match" \
+        "$(cksum <"${td}/trij.s.ref")" "$(cksum <"${td}/trij.s.crash")" || true
+    mv "${jf}.tmp" "$jf"
+
+    # 5. Overflow: a one-batch queue on a larger tree must void the journal run
+    #    without blocking or corrupting the crawl, and publish nothing.
+    local otree="${td}/trij_otree" oout="${td}/trij_ocrawl" ojdir="${td}/trij_ojournals"
+    mkdir -p "$otree/bulk"
+    for ((i = 0; i < 60; i++)); do
+        d=$(printf '%s/bulk/d%02d' "$otree" "$i")
+        mkdir -p "$d"
+        (cd "$d" && seq -f 'overflow_probe_file_%04g.dat' 1 2000 | xargs -r touch)
+    done
+    ECRAWL_CRAWL_THREADS=8 ECRAWL_TRIGRAM_JOURNAL_THREADS=1 ECRAWL_TRIGRAM_JOURNAL_QUEUE_BATCHES=1 \
+        "$ECRAWL" --trigram-journal "$ojdir" "$(cd "$otree" && pwd -P)" "$oout" \
+        >"${td}/trij.ocrawl.log" 2>&1 ||
+        die "ecrawl --trigram-journal (overflow probe) failed"
+    local ovoid
+    ovoid=$(kv_last trigram_journal_voided "${td}/trij.ocrawl.log")
+    if [[ "$ovoid" == "1" ]]; then
+        expect_eq_continue "overflow: no journals published" "0" \
+            "$(find "$ojdir" -maxdepth 1 -name '*.tij' | wc -l | tr -d ' ')" || true
+        expect_eq_continue "overflow: no leftover .tij.tmp" "0" \
+            "$(find "$ojdir" -maxdepth 1 -name '*.tij.tmp' | wc -l | tr -d ' ')" || true
+    else
+        summary_add PASS "overflow probe" "queue never filled on this host; void path not exercised"
+    fi
+    EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
+        "$EREPORT_INDEX" --make --journal-dir "$ojdir" --index-dir "${td}/trij_idx_ov" "$oout" \
+        >"${td}/trij.make.ov.out" 2>"${td}/trij.make.ov.err" ||
+        die "ereport_index --make --journal-dir (post-overflow) failed"
+    local oentries
+    oentries=$(kv_last entries "${td}/trij.ocrawl.log")
+    expect_eq_continue "overflow: index still covers every crawled record" "$oentries" \
+        "$(kv_last indexed_paths "${td}/trij_idx_ov/meta.txt")" || true
+
+    # 6. --no-write has no writer stream to tee, so the flag is an error there.
+    local nw_rc=0
+    "$ECRAWL" --no-write --trigram-journal "${td}/trij_nw" "$tree_abs" >/dev/null 2>&1 || nw_rc=$?
+    expect_eq "--no-write + --trigram-journal exits 2" "2" "$nw_rc"
+}
+
 run_ecrawl_mount_tests() {
     local td=$1 root_abs=$2 crawl_out=$3 want_entries=$4
     local dr="${td}/emount.dryrun" drerr="${td}/emount.dryrun.err"
@@ -1950,6 +2109,8 @@ run_integration() {
     run_v8_rollup_tests "$td"
 
     run_dir_index_tests "$td"
+
+    run_trijournal_tests "$td"
 
     run_ecrawl_no_stat_tests "$td"
 

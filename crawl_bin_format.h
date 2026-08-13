@@ -486,6 +486,11 @@ static inline int crawl_bin_record_ctime_led(const bin_record_hdr_t *r) {
 #define CRAWL_SIDECAR_MAGIC_LEN 8
 #define CRAWL_SIDECAR_VERSION 1u
 
+/* Crawl-time trigram journal (crawl_trijournal.c): one <shard>.tij per shard. */
+#define CRAWL_TRIJ_MAGIC "ETIJ001"
+#define CRAWL_TRIJ_MAGIC_LEN 8
+#define TRIJOURNAL_VERSION 1u
+
 typedef struct __attribute__((packed)) {
     char magic[8];
     uint32_t version;

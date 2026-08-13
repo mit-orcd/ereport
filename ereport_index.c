@@ -37,6 +37,8 @@
 #include "crawl_ckpt.h"
 #include "crawl_fpcache.h"
 #include "path_canon.h"
+#include "trigram_extract.h"
+#include "crawl_trijournal.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -94,6 +96,11 @@ static int g_durable_zstd_level = -1; /* -1 = parse EREPORT_INDEX_ZSTD_LEVEL on 
  * directory are indexed (full absolute paths kept), so the index mirrors an ereport --subtree report. */
 static char g_subtree_buf[PATH_MAX];
 static const char *g_subtree_prefix = NULL;
+
+/* --journal-dir <path>: crawl-time trigram journals (ecrawl --trigram-journal). A shard whose
+ * journal passes the five-fact live check is replayed straight into the write-batch pipeline,
+ * skipping capture parse, catalog load, path reconstruction, and extraction for that shard. */
+static const char *g_journal_dir = NULL;
 
 /* Directory-boundary prefix test: matches `prefix` itself and `prefix/...` but not `prefixfoo`.
  * (Mirrors ereport.c's starts_with_dir_prefix.) */
@@ -385,6 +392,7 @@ typedef struct {
 typedef struct {
     atomic_uint remaining_chunks;
     crawl_bin_catalog_t *catalog;
+    int use_journal; /* --journal-dir validation passed: replay the shard's .tij, skip the capture */
 } file_state_t;
 
 /*
@@ -527,14 +535,11 @@ typedef struct {
     file_state_t *file_states;
     build_ctx_t *ctx;
     size_t write_batch_flush_at;
-    char *lower_seg_buf;
-    size_t lower_seg_cap;
     /* Reused per record: the reconstructed path and its trigram codes are copied
      * into the batch arena, so neither needs a malloc per path. */
     char *path_buf;
     size_t path_cap;
-    char *codes_buf;
-    size_t codes_cap;
+    trigram_scratch_t tri;
 } worker_arg_t;
 
 typedef struct {
@@ -2042,7 +2047,7 @@ static int argv_skip_verbose_prefix(int argc, char **argv) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [--no-dir-index] [username|uid] [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [--no-dir-index] [--journal-dir <path>] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
             "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
             "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
@@ -2061,6 +2066,9 @@ static void die_usage(const char *argv0) {
             "    that directory (full absolute paths kept), mirroring `ereport --subtree` so search covers just that subtree.\n"
             "    Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW while indexing\n"
             "    (bins unchanged), e.g. /data1/group=/orcd/data; applied before --subtree.\n"
+            "    Optional --journal-dir <path>: replay crawl-time trigram journals (ecrawl --trigram-journal DIR)\n"
+            "    instead of parsing captures for shards whose journal matches the live .bin (basename, size, mtime,\n"
+            "    catalog offset/entries). Missing or stale journals fall back to the capture parse per shard.\n"
             "    Also writes the directory-index sidecars dirs.idx and rowgroups.idx (~24 bytes per directory)\n"
             "    that `ecrawl_query --index-dir` uses to answer a subtree rollup without reading every catalog\n"
             "    row, and to scan only the row groups that can hold the subtree. --no-dir-index skips that phase;\n"
@@ -2486,6 +2494,7 @@ typedef struct {
     int *prep_rc;
     file_chunk_t **prep_chunks;
     size_t *prep_chunk_counts;
+    file_state_t *file_states;
     atomic_size_t next_path_index;
     index_run_stats_t *run_stats;
 } chunk_prep_pool_t;
@@ -2502,8 +2511,28 @@ static void *chunk_prep_worker_main(void *arg) {
 
         if (i >= pool->path_count) break;
 
-        r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i, pool->chunk_targets[i],
-                                            parse_index_thread_count(), &local_chunks, &local_count, &fc);
+        /* A valid crawl-time trigram journal replaces the capture parse for this shard with a
+         * single whole-shard replay work item. Missing/stale journals fall back to today's path. */
+        if (g_journal_dir) {
+            trij_reader_t jr;
+
+            if (trij_reader_open_validate(&jr, g_journal_dir, pool->paths[i], NULL) == 1) {
+                size_t cap = 0;
+
+                trij_reader_close(&jr);
+                r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap, pool->paths[i], 0,
+                                           UINT64_MAX, i);
+                if (r == 0) pool->file_states[i].use_journal = 1;
+            } else {
+                r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
+                                                    pool->chunk_targets[i], parse_index_thread_count(),
+                                                    &local_chunks, &local_count, &fc);
+            }
+        } else {
+            r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
+                                                pool->chunk_targets[i], parse_index_thread_count(),
+                                                &local_chunks, &local_count, &fc);
+        }
         pool->prep_rc[(int)i] = r;
         pool->prep_chunks[(int)i] = local_chunks;
         pool->prep_chunk_counts[(int)i] = local_count;
@@ -2525,12 +2554,6 @@ static int u64_vec_push(u64_vec_t *v, uint64_t id) {
     }
     v->ids[v->count++] = id;
     return 0;
-}
-
-static int cmp_u32(const void *a, const void *b) {
-    uint32_t aa = *(const uint32_t *)a;
-    uint32_t bb = *(const uint32_t *)b;
-    return (aa > bb) - (aa < bb);
 }
 
 /* LSD radix byte: little-endian, path_id bytes first (least significant key), then trigram bytes — so the
@@ -3111,107 +3134,6 @@ static int path_matches_term(const char *path, const char *lower_term) {
     return matched;
 }
 
-static int ensure_worker_buf(char **buf, size_t *cap, size_t need) {
-    char *p;
-    size_t nc;
-
-    if (*cap >= need) return 0;
-    nc = *cap ? *cap : 4096U;
-    while (nc < need) nc <<= 1;
-    p = (char *)realloc(*buf, nc);
-    if (!p) return -1;
-    *buf = p;
-    *cap = nc;
-    return 0;
-}
-
-static void insertion_sort_u32(uint32_t *a, size_t n) {
-    size_t i;
-    for (i = 1; i < n; i++) {
-        uint32_t key = a[i];
-        size_t j = i;
-        while (j > 0 && a[j - 1] > key) {
-            a[j] = a[j - 1];
-            j--;
-        }
-        a[j] = key;
-    }
-}
-
-/*
- * Longest input this can take on the stack. A path yields fewer trigram codes than it has bytes,
- * so PATH_MAX rounded up covers every real input; anything larger falls back to qsort.
- */
-#define RADIX_U32_MAX_N 4096
-
-/*
- * LSD radix over the code bytes. glibc's qsort costs an indirect call per comparison plus a temp
- * allocation, and this runs once per path — 8.3% of the badge run sat in msort_with_tmp. All four
- * digit histograms come from a single counting pass, and a digit whose byte is the same in every
- * key is skipped, so 24-bit trigram codes cost three scatter passes rather than four.
- */
-static void radix_sort_u32(uint32_t *a, size_t n) {
-    uint32_t scratch[RADIX_U32_MAX_N];
-    size_t count[4][256];
-    uint32_t *src = a;
-    uint32_t *dst = scratch;
-    size_t i;
-    int pass;
-
-    memset(count, 0, sizeof(count));
-    for (i = 0; i < n; i++) {
-        uint32_t v = a[i];
-
-        count[0][v & 0xFFU]++;
-        count[1][(v >> 8) & 0xFFU]++;
-        count[2][(v >> 16) & 0xFFU]++;
-        count[3][(v >> 24) & 0xFFU]++;
-    }
-
-    for (pass = 0; pass < 4; pass++) {
-        unsigned shift = (unsigned)pass * 8U;
-        size_t off[256];
-        size_t acc = 0;
-        int d;
-
-        /* A permutation does not change the multiset, so the counts stay valid across passes. */
-        if (count[pass][(a[0] >> shift) & 0xFFU] == n) continue;
-
-        for (d = 0; d < 256; d++) {
-            off[d] = acc;
-            acc += count[pass][d];
-        }
-        for (i = 0; i < n; i++) dst[off[(src[i] >> shift) & 0xFFU]++] = src[i];
-        {
-            uint32_t *sw = src;
-
-            src = dst;
-            dst = sw;
-        }
-    }
-    if (src != a) memcpy(a, src, n * sizeof(*a));
-}
-
-static void sort_codes_unique(uint32_t *codes, size_t *count) {
-    size_t n = *count;
-    size_t w;
-    size_t i;
-
-    if (n <= 1) return;
-    if (n <= 64U)
-        insertion_sort_u32(codes, n);
-    else if (n <= (size_t)RADIX_U32_MAX_N)
-        radix_sort_u32(codes, n);
-    else
-        qsort(codes, n, sizeof(*codes), cmp_u32);
-
-    w = 1;
-    for (i = 1; i < n; i++) {
-        if (codes[i] != codes[w - 1]) codes[w++] = codes[i];
-    }
-    *count = w;
-}
-
 static int append_unique_trigram(uint32_t **codes, size_t *count, size_t *cap, uint32_t trigram) {
     if (*count == *cap) {
         size_t new_cap = *cap ? (*cap * 2) : 32;
@@ -3221,100 +3143,6 @@ static int append_unique_trigram(uint32_t **codes, size_t *count, size_t *cap, u
         *cap = new_cap;
     }
     (*codes)[(*count)++] = trigram;
-    return 0;
-}
-
-/* Count sliding 3-byte windows (one trigram each) across path segments (length >= 3). */
-/* Final path component only — parents are indexed when those entries appear as their own basenames. */
-static const char *path_basename_seg(const char *path, size_t *len_out) {
-    const char *slash;
-    const char *base;
-
-    if (!path) {
-        *len_out = 0;
-        return "";
-    }
-    slash = strrchr(path, '/');
-    base = slash ? slash + 1 : path;
-    *len_out = strlen(base);
-    return base;
-}
-
-static size_t count_basename_trigram_windows(const char *path) {
-    size_t seg_len = 0;
-
-    (void)path_basename_seg(path, &seg_len);
-    return seg_len >= 3 ? seg_len - 2 : 0;
-}
-
-/*
- * Emit trigrams for the basename only (segment-once). On success *out_codes points at the
- * caller's scratch buffer (or heap memory the caller owns when scratch is NULL); it is valid
- * until the next call for that scratch and must not be freed.
- */
-static int extract_path_trigrams(const char *path, uint32_t **out_codes, size_t *out_count, worker_arg_t *scratch) {
-    const char *base;
-    size_t seg_len = 0;
-    size_t nraw;
-    uint32_t *codes;
-    size_t pos = 0;
-    size_t i;
-    char *lower_seg;
-    int codes_owned = 0;
-    int lower_owned = 0;
-
-    base = path_basename_seg(path, &seg_len);
-    nraw = count_basename_trigram_windows(path);
-    if (nraw == 0) {
-        *out_codes = NULL;
-        *out_count = 0;
-        return 0;
-    }
-
-    if (scratch) {
-        if (ensure_worker_buf(&scratch->codes_buf, &scratch->codes_cap, nraw * sizeof(uint32_t)) != 0) return -1;
-        codes = (uint32_t *)scratch->codes_buf;
-        if (ensure_worker_buf(&scratch->lower_seg_buf, &scratch->lower_seg_cap, seg_len + 1U) != 0) return -1;
-        lower_seg = scratch->lower_seg_buf;
-    } else {
-        codes = (uint32_t *)malloc(nraw * sizeof(uint32_t));
-        if (!codes) return -1;
-        codes_owned = 1;
-        lower_seg = (char *)malloc(seg_len + 1);
-        if (!lower_seg) {
-            free(codes);
-            return -1;
-        }
-        lower_owned = 1;
-    }
-
-    for (i = 0; i < seg_len; i++) {
-        unsigned char b = (unsigned char)base[i];
-        lower_seg[i] = (char)((b >= (unsigned char)'A' && b <= (unsigned char)'Z') ? (b + 32U) : b);
-    }
-    lower_seg[seg_len] = '\0';
-
-    /* Rolling 24-bit window: one byte in, one code out after the first triplet. */
-    {
-        uint32_t tri = ((uint32_t)(unsigned char)lower_seg[0] << 16) |
-                       ((uint32_t)(unsigned char)lower_seg[1] << 8) |
-                       (uint32_t)(unsigned char)lower_seg[2];
-        codes[pos++] = tri;
-        for (i = 3; i < seg_len; i++) {
-            tri = ((tri << 8) | (uint32_t)(unsigned char)lower_seg[i]) & 0x00FFFFFFU;
-            codes[pos++] = tri;
-        }
-    }
-    if (lower_owned) free(lower_seg);
-
-    if (pos != nraw) {
-        if (codes_owned) free(codes);
-        return -1;
-    }
-
-    sort_codes_unique(codes, &nraw);
-    *out_codes = codes;
-    *out_count = nraw;
     return 0;
 }
 
@@ -4142,6 +3970,118 @@ static int mk_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_
     return 0;
 }
 
+/* Replay one shard's crawl-time trigram journal: entries already carry the full path, uid, type,
+ * and sorted-unique basename codes, so there is no catalog, no block reader, and no extraction.
+ * Filters re-apply in the capture path's order: uid, --path-rewrite, --subtree. */
+static int process_chunk_make_journal(worker_arg_t *worker, const file_chunk_t *chunk) {
+    build_ctx_t *ctx = worker->ctx;
+    index_run_stats_t *rs = ctx->run_stats;
+    write_queue_t *write_queue = worker->write_queue;
+    write_batch_t *batch = NULL;
+    uint64_t scanned_local = 0;
+    uint64_t scanned_published = 0;
+    trij_reader_t jr;
+    int rc = -1;
+
+    memset(&jr, 0, sizeof(jr));
+    jr.fd = -1;
+    if (trij_reader_open_validate(&jr, g_journal_dir, chunk->path, NULL) != 1) {
+        /* Validated during chunk prep; turning stale mid-run means the shard is being rewritten
+         * under us — count it bad rather than silently indexing nothing. */
+        fprintf(stderr, "warn: journal for %s turned stale mid-run\n", chunk->path);
+        atomic_fetch_add(&rs->bad_input_files, 1U);
+        return -1;
+    }
+
+    for (;;) {
+        const char *path;
+        size_t path_len;
+        uint64_t uid;
+        uint8_t type;
+        const uint32_t *codes;
+        size_t code_count;
+        int got = trij_reader_next(&jr, &path, &path_len, &uid, &type, &codes, &code_count);
+
+        if (got == 0) {
+            rc = 0;
+            break;
+        }
+        if (got < 0) {
+            fprintf(stderr, "warn: corrupt journal for %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            break;
+        }
+
+        scanned_local++;
+        if (g_verbose && scanned_local - scanned_published >= (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) {
+            uint64_t delta =
+                ((scanned_local - scanned_published) / (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) *
+                (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE;
+            atomic_fetch_add_explicit(&rs->scanned_records, delta, memory_order_relaxed);
+            scanned_published += delta;
+        }
+
+        if (!ctx->aggregate_all_users && (uid_t)uid != ctx->target_uid) continue;
+
+        if (path_len == 0 || path_len >= PATH_MAX) {
+            fprintf(stderr, "warn: journal path out of range in %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            break;
+        }
+        /* Rewrite/subtree need a NUL-terminated path; write_batch_append copies what survives. */
+        if (trigram_ensure_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
+            fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            break;
+        }
+        memcpy(worker->path_buf, path, path_len);
+        worker->path_buf[path_len] = '\0';
+
+        if (g_rewrite_from) {
+            (void)rewrite_path_prefix(worker->path_buf, PATH_MAX);
+        }
+        if (g_subtree_prefix && !subtree_path_under_prefix(worker->path_buf)) continue;
+
+        if (!batch) {
+            batch = write_batch_create();
+            if (!batch) {
+                fprintf(stderr, "warn: failed to allocate write batch for %s\n", chunk->path);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
+                break;
+            }
+        }
+        if (write_batch_append(batch, worker->path_buf, strlen(worker->path_buf), codes, code_count,
+                               type == (uint8_t)'d') != 0) {
+            fprintf(stderr, "warn: failed to append write batch for %s\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            break;
+        }
+
+        if (batch->count >= worker->write_batch_flush_at) {
+            if (write_queue_push(write_queue, batch) != 0) {
+                fprintf(stderr, "warn: failed to queue write batch for %s\n", chunk->path);
+                atomic_fetch_add(&rs->bad_input_files, 1U);
+                write_batch_destroy(batch);
+                batch = NULL;
+                break;
+            }
+            batch = NULL;
+        }
+    }
+
+    trij_reader_close(&jr);
+    if (scanned_local > scanned_published)
+        atomic_fetch_add_explicit(&rs->scanned_records, scanned_local - scanned_published, memory_order_relaxed);
+    if (batch) {
+        if (write_queue_push(write_queue, batch) != 0) {
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            write_batch_destroy(batch);
+        }
+    }
+    finalize_chunk_file_progress(rs, worker->file_states, chunk->file_index);
+    return rc;
+}
+
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     build_ctx_t *ctx = worker->ctx;
     index_run_stats_t *rs = ctx->run_stats;
@@ -4157,6 +4097,9 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     memset(&br, 0, sizeof(br));
     dir_cache.id = 0;
     dir_cache.len = 0;
+
+    if (file_states[chunk->file_index].use_journal)
+        return process_chunk_make_journal(worker, chunk);
 
     fp = ei_shard_fopen(chunk->path, "rb");
     if (!fp) {
@@ -4227,7 +4170,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
 
         /* Reconstruct into the worker's own buffer; write_batch_append copies the
          * bytes that survive the filters into the batch arena. */
-        if (ensure_worker_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
+        if (trigram_ensure_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
             fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
             atomic_fetch_add(&rs->bad_input_files, 1U);
             break;
@@ -4256,7 +4199,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
         {
             uint32_t *codes = NULL;
             size_t code_count = 0;
-            if (extract_path_trigrams(pathbuf, &codes, &code_count, worker) != 0) {
+            if (trigram_extract_path(pathbuf, &codes, &code_count, &worker->tri) != 0) {
                 fprintf(stderr, "warn: failed to extract trigrams from %s\n", chunk->path);
                 atomic_fetch_add(&rs->bad_input_files, 1U);
                 break;
@@ -4315,15 +4258,15 @@ static void *worker_main(void *arg_void) {
         process_chunk_make(arg, chunk);
     }
 
-    free(arg->lower_seg_buf);
-    arg->lower_seg_buf = NULL;
-    arg->lower_seg_cap = 0;
+    free(arg->tri.lower_seg_buf);
+    arg->tri.lower_seg_buf = NULL;
+    arg->tri.lower_seg_cap = 0;
     free(arg->path_buf);
     arg->path_buf = NULL;
     arg->path_cap = 0;
-    free(arg->codes_buf);
-    arg->codes_buf = NULL;
-    arg->codes_cap = 0;
+    free(arg->tri.codes_buf);
+    arg->tri.codes_buf = NULL;
+    arg->tri.codes_cap = 0;
 
     mk_io_tls_flush();
     return NULL;
@@ -5705,7 +5648,7 @@ static size_t merge_resume_list_tmp_buckets(build_ctx_t *ctx, uint32_t *out, siz
         if (sz == 0) continue;
         if (n < out_cap) out[n++] = b;
     }
-    if (n > 1) qsort(out, n, sizeof(uint32_t), cmp_u32);
+    if (n > 1) qsort(out, n, sizeof(uint32_t), trigram_cmp_u32);
     return n;
 }
 
@@ -5740,7 +5683,7 @@ static int merge_list_segment_bucket_ids(const build_ctx_t *ctx, uint32_t *out, 
         if (n >= out_cap) return -1;
         out[n++] = b;
     }
-    if (n > 1) qsort(out, n, sizeof(uint32_t), cmp_u32);
+    if (n > 1) qsort(out, n, sizeof(uint32_t), trigram_cmp_u32);
     *out_n = n;
     return 0;
 }
@@ -6474,6 +6417,7 @@ static int build_index_dir(const char *user_spec,
         pool.prep_rc = prep_rc;
         pool.prep_chunks = prep_chunks;
         pool.prep_chunk_counts = prep_chunk_counts;
+        pool.file_states = file_states;
         pool.run_stats = &run_stats;
         atomic_store(&pool.next_path_index, 0);
 
@@ -6611,6 +6555,7 @@ static int build_index_dir(const char *user_spec,
 
     for (i = 0; i < path_count; i++) {
         if (atomic_load(&file_states[i].remaining_chunks) == 0U) continue;
+        if (file_states[i].use_journal) continue; /* journal replay needs no directory catalog */
         if (index_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
             fprintf(stderr, "ereport_index: cannot load directory catalog from %s\n", paths[i]);
             if (stats_thread_started) {
@@ -7162,6 +7107,12 @@ static int build_index_dir(const char *user_spec,
     printf("input_layout=%s\n", g_input_layout);
     if (g_input_uid_shards) printf("input_uid_shards=%u\n", g_input_uid_shards);
     printf("input_files=%" PRIu64 "\n", ctx.input_files);
+    if (g_journal_dir) {
+        uint64_t jn = 0;
+        for (i = 0; i < path_count; i++)
+            if (file_states[i].use_journal) jn++;
+        printf("journal_shards=%" PRIu64 "\n", jn);
+    }
     printf("scanned_records=%" PRIu64 "\n", ctx.scanned_records);
     printf("index_dir=%s\n", ctx.index_dir);
     printf("indexed_paths=%" PRIu64 "\n", ctx.indexed_paths);
@@ -7594,7 +7545,7 @@ static int collect_query_trigrams(const char *term, uint32_t **out_codes, size_t
     }
     free(lower);
 
-    qsort(codes, count, sizeof(*codes), cmp_u32);
+    qsort(codes, count, sizeof(*codes), trigram_cmp_u32);
     if (count > 1) {
         size_t out_i = 1;
         for (i = 1; i < count; i++) {
@@ -8492,6 +8443,15 @@ int main(int argc, char **argv) {
             if (strcmp(argv[ai], "--no-dir-index") == 0) {
                 g_dir_index = 0;
                 ai++;
+                continue;
+            }
+            if (strcmp(argv[ai], "--journal-dir") == 0) {
+                if (ai + 2 > argc || argv[ai + 1][0] == '\0') {
+                    fprintf(stderr, "ereport_index: --journal-dir requires a path\n");
+                    return 2;
+                }
+                g_journal_dir = argv[ai + 1];
+                ai += 2;
                 continue;
             }
             break;

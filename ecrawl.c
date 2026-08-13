@@ -74,6 +74,9 @@
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_ckpt.h"
+#include "crawl_trijournal.h"
+#include "ecrawl_trijournal.h"
+#include "ecrawl_wire.h"
 #include "path_canon.h"
 #include "path_utils.h"
 
@@ -121,6 +124,11 @@
  * Always auto-capped against RLIMIT_NOFILE and the actual per-writer shard count in configure_max_open_shards(). */
 #define DEFAULT_MAX_OPEN_SHARDS 128U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
+/* Crawl-time trigram journal pool (--trigram-journal): extraction threads and the bounded
+ * handoff queue depth in record batches. Env: ECRAWL_TRIGRAM_JOURNAL_THREADS /
+ * ECRAWL_TRIGRAM_JOURNAL_QUEUE_BATCHES. */
+#define DEFAULT_TRIJOURNAL_THREADS 4
+#define DEFAULT_TRIJOURNAL_QUEUE_BATCHES 64U
 #define FD_RESERVE_BASE 128U
 #define FD_RESERVE_PER_CRAWL_THREAD 4U
 #define FD_RESERVE_PER_WRITER 4U
@@ -264,14 +272,8 @@ typedef struct {
     uint64_t donation_successes;
 } shared_state_t;
 
-typedef struct __attribute__((packed)) {
-    uint32_t shard;
-    uint32_t data_len;
-    /* Per-record byte contribution (account_entry_local result). Wire-only —
-     * carried so the writer can roll it into per-dir catalog aggregates without
-     * re-running hardlink dedup. Not written to disk. */
-    uint64_t byte_credit;
-} batch_frame_hdr_t;
+/* batch_frame_hdr_t and record_batch_t live in ecrawl_wire.h, shared with the
+ * trigram journal pool (ecrawl_trijournal.c). */
 
 typedef struct {
     char *path;
@@ -328,12 +330,6 @@ typedef struct {
 typedef struct {
     inode_registry_shard_t shards[HARDLINK_REGISTRY_SHARDS];
 } inode_registry_t;
-
-typedef struct record_batch {
-    unsigned char *data;
-    size_t len;
-    struct record_batch *next;
-} record_batch_t;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -696,6 +692,18 @@ static int g_max_open_shards_explicit = 0; /* set when ECRAWL_MAX_OPEN_SHARDS as
 static unsigned g_writer_queue_batches = DEFAULT_WRITER_QUEUE_BATCHES;
 static int g_shard_digits = 4;
 static int g_no_write = 0;
+/* --trigram-journal DIR: tee writer-bound record batches to a pool writing per-shard .tij
+ * journals for `ereport_index --make --journal-dir`. Off by default; needs the writer stream. */
+static char g_trijournal_dir[PATH_MAX];
+static int g_trijournal_enabled = 0;
+static int g_trijournal_threads = DEFAULT_TRIJOURNAL_THREADS;
+static unsigned g_trijournal_queue_batches = DEFAULT_TRIJOURNAL_QUEUE_BATCHES;
+static trijournal_pool_t *g_trijournal_pool = NULL;
+/* Final pool tallies, captured at finish for the run summary. */
+static uint64_t g_trijournal_final_bytes = 0;
+static uint64_t g_trijournal_final_entries = 0;
+static uint64_t g_trijournal_final_published = 0;
+static int g_trijournal_final_voided = 0;
 /* --no-stat: walk names only, never read an inode. Recursion needs just d_type, so records
  * (uid/size/inode/nlink/times all come from stat) cannot be written and paths stream instead. */
 static int g_no_stat = 0;
@@ -1298,6 +1306,32 @@ static unsigned parse_ecrawl_writer_queue_batches_env(void) {
     errno = 0;
     v = strtoul(e, &end, 10);
     if (errno || end == e || *end || v < 4UL || v > 4096UL) return DEFAULT_WRITER_QUEUE_BATCHES;
+    return (unsigned)v;
+}
+
+/* Trigram journal pool thread count (--trigram-journal). Default: DEFAULT_TRIJOURNAL_THREADS. */
+static int parse_ecrawl_trijournal_threads_env(void) {
+    const char *e = getenv("ECRAWL_TRIGRAM_JOURNAL_THREADS");
+    long t;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_TRIJOURNAL_THREADS;
+    errno = 0;
+    t = strtol(e, &end, 10);
+    if (errno || end == e || *end || t < 1 || t > 256) return DEFAULT_TRIJOURNAL_THREADS;
+    return (int)t;
+}
+
+/* Bounded journal handoff queue depth in record batches. Env: ECRAWL_TRIGRAM_JOURNAL_QUEUE_BATCHES. */
+static unsigned parse_ecrawl_trijournal_queue_batches_env(void) {
+    const char *e = getenv("ECRAWL_TRIGRAM_JOURNAL_QUEUE_BATCHES");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return DEFAULT_TRIJOURNAL_QUEUE_BATCHES;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end || v < 1UL || v > 4096UL) return DEFAULT_TRIJOURNAL_QUEUE_BATCHES;
     return (unsigned)v;
 }
 
@@ -2074,10 +2108,16 @@ static void print_usage(const char *prog) {
             (unsigned)DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT,
             (unsigned)DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH);
     fprintf(stderr,
+            "Trigram journal (--trigram-journal): ECRAWL_TRIGRAM_JOURNAL_THREADS (default %d), "
+            "ECRAWL_TRIGRAM_JOURNAL_QUEUE_BATCHES (default %u).\n",
+            DEFAULT_TRIJOURNAL_THREADS, (unsigned)DEFAULT_TRIJOURNAL_QUEUE_BATCHES);
+    fprintf(stderr,
             "Diagnostics (with --verbose): ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive "
             "seconds with zero rolling-window entries once the window is warm (default 5; 0=off).\n");
     fprintf(stderr,
-            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
+            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n"
+            "--trigram-journal DIR: while crawling, also write per-shard trigram journals to DIR for\n"
+            "    ereport_index --make --journal-dir (default off; incompatible with --no-write/--no-stat).\n");
     fprintf(stderr,
             "Default output is a concise summary. --verbose prints full metrics to stdout at exit.\n");
 }
@@ -2143,6 +2183,47 @@ static int crawl_output_dir_scrub_prior_artifacts(void) {
     return 0;
 }
 
+static int trijournal_artifact_should_delete(const char *name) {
+    size_t len = strlen(name);
+
+    if (len >= 8 && strcmp(name + len - 8, ".tij.tmp") == 0) return 1;
+    return len >= 4 && strcmp(name + len - 4, ".tij") == 0;
+}
+
+/* Journals bind to one run's shards; a new run voids every leftover, published or not. */
+static int trijournal_dir_scrub_prior_artifacts(void) {
+    DIR *dir;
+    struct dirent *de;
+    char path[PATH_MAX];
+    int n;
+
+    dir = ecrawl_io_opendir(g_trijournal_dir);
+    if (!dir) {
+        fprintf(stderr, "ERROR cannot open --trigram-journal directory %s: %s\n", g_trijournal_dir,
+                strerror(errno));
+        return -1;
+    }
+    while ((de = ecrawl_io_readdir(dir)) != NULL) {
+        const char *name = de->d_name;
+        if (name[0] == '.') continue;
+        if (!trijournal_artifact_should_delete(name)) continue;
+        n = snprintf(path, sizeof(path), "%s/%s", g_trijournal_dir, name);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            fprintf(stderr, "ERROR trigram journal scrub path too long under %s\n", g_trijournal_dir);
+            ecrawl_io_closedir(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (unlink(path) != 0 && errno != ENOENT) {
+            fprintf(stderr, "ERROR unlink %s: %s\n", path, strerror(errno));
+            ecrawl_io_closedir(dir);
+            return -1;
+        }
+    }
+    ecrawl_io_closedir(dir);
+    return 0;
+}
+
 static int build_default_output_dir(char *out, size_t out_sz) {
     static const char *months[] = {
         "jan", "feb", "mar", "apr", "may", "jun",
@@ -2189,6 +2270,12 @@ static int build_default_output_dir(char *out, size_t out_sz) {
 
 static int build_shard_path(uint32_t shard, char *out, size_t out_sz) {
     int n = snprintf(out, out_sz, "%s/uid_shard_%0*u.bin", g_output_dir, g_shard_digits, shard);
+    return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
+}
+
+/* Basename only; the trigram journal pool names <journal_dir>/<basename>.tij after the shard. */
+static int ecrawl_shard_basename(uint32_t shard, char *out, size_t out_sz) {
+    int n = snprintf(out, out_sz, "uid_shard_%0*u.bin", g_shard_digits, shard);
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
 }
 
@@ -3286,8 +3373,7 @@ static void writer_queue_destroy(writer_queue_t *q) {
     cur = q->head;
     while (cur) {
         next = cur->next;
-        free(cur->data);
-        free(cur);
+        record_batch_release(cur);
         cur = next;
     }
     pthread_mutex_unlock(&q->mutex);
@@ -3421,10 +3507,10 @@ static int submit_detached_batch(emit_context_t *ctx, int writer_index, unsigned
     batch->data = data;
     batch->len = len;
     batch->next = NULL;
+    atomic_init(&batch->refs, 1u);
 
     if (writer_queue_push(&ctx->writer_queues[writer_index], batch) != 0) {
-        free(batch->data);
-        free(batch);
+        record_batch_release(batch);
         return -1;
     }
 
@@ -5022,11 +5108,16 @@ static int writer_process_batch(uint32_t writer_index,
                                 shard_file_state_t *shards,
                                 unsigned *open_count,
                                 uint64_t *tick,
-                                record_batch_t *batch) {
+                                      record_batch_t *batch) {
     size_t scan;
     size_t nframes;
     size_t i;
     writer_batch_frame_t *order = NULL;
+
+    /* Trigram journal tee: one atomic incref + bounded try-push per pool lane; on overflow the
+     * pool voids the run's journals and the crawl continues unaffected. The batch buffer is
+     * read-only for both consumers (the per-batch qsort below orders an offset index). */
+    if (g_trijournal_pool) trijournal_pool_offer(g_trijournal_pool, batch);
 
     writer_wait_disk_ok();
 
@@ -5100,15 +5191,63 @@ static int writer_process_batch(uint32_t writer_index,
     return 0;
 }
 
+/* Binding facts for the trigram journal finalize: re-stat the shard and re-read its header,
+ * the same five facts the journal reader will re-check (sidecar five-fact contract). */
+static void trijournal_collect_shard_facts(const char *bin_path, uint32_t shard, uint32_t *shards_out,
+                                           trij_binding_t *facts_out, size_t *n) {
+    int fd;
+    struct stat st;
+    bin_file_header_t fh;
+    uint64_t n_entries = 0;
+    trij_binding_t *b;
+
+    fd = open(bin_path, O_RDONLY);
+    if (fd < 0) return;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) goto out;
+    if (pread(fd, &fh, sizeof(fh), 0) != (ssize_t)sizeof(fh)) goto out;
+    if (!crawl_bin_hdr_magic_ok(fh.magic, fh.version, FORMAT_VERSION)) goto out;
+    if (fh.catalog_offset < sizeof(fh) || fh.catalog_offset >= (uint64_t)st.st_size) goto out;
+    if ((uint64_t)st.st_size - fh.catalog_offset < sizeof(uint64_t)) goto out;
+    if (pread(fd, &n_entries, sizeof(n_entries), (off_t)fh.catalog_offset) != (ssize_t)sizeof(n_entries))
+        goto out;
+
+    b = &facts_out[*n];
+    b->shard_size = (uint64_t)st.st_size;
+    b->shard_mtime_sec = (uint64_t)st.st_mtim.tv_sec;
+    b->shard_mtime_nsec = (uint64_t)st.st_mtim.tv_nsec;
+    b->catalog_offset = fh.catalog_offset;
+    b->catalog_entries = n_entries;
+    b->max_dir_id = n_entries; /* v9 dir_ids are dense 1..N within the shard */
+    shards_out[*n] = shard;
+    (*n)++;
+out:
+    (void)close(fd);
+}
+
 static void *writer_thread_main(void *arg_void) {
     writer_arg_t *arg = (writer_arg_t *)arg_void;
     shard_file_state_t *shards = (shard_file_state_t *)calloc(g_uid_shards, sizeof(*shards));
     unsigned open_count = 0;
     uint64_t tick = 0;
+    uint32_t *trij_fact_shards = NULL;
+    trij_binding_t *trij_facts = NULL;
+    size_t trij_facts_n = 0;
 
     if (!shards) {
         fprintf(stderr, "ERROR writer %u failed to allocate shard state\n", arg->writer_index);
         return NULL;
+    }
+    if (g_trijournal_pool) {
+        trij_fact_shards = (uint32_t *)malloc(g_uid_shards * sizeof(*trij_fact_shards));
+        trij_facts = (trij_binding_t *)malloc(g_uid_shards * sizeof(*trij_facts));
+        if (!trij_fact_shards || !trij_facts) {
+            fprintf(stderr, "warn: writer %u could not allocate trigram journal finalize state\n",
+                    arg->writer_index);
+            free(trij_fact_shards);
+            free(trij_facts);
+            trij_fact_shards = NULL;
+            trij_facts = NULL;
+        }
     }
 
     for (;;) {
@@ -5118,8 +5257,7 @@ static void *writer_thread_main(void *arg_void) {
             fprintf(stderr, "ERROR writer %u failed processing batch: %s\n", arg->writer_index, strerror(errno));
             atomic_store(&g_writer_failed, 1U);
         }
-        free(batch->data);
-        free(batch);
+        record_batch_release(batch);
     }
 
     {
@@ -5141,14 +5279,20 @@ static void *writer_thread_main(void *arg_void) {
             }
             if (shards[i].fp) {
                 char path[PATH_MAX];
-                if (build_shard_path(i, path, sizeof(path)) == 0 &&
-                    shard_flush_ckpt_before_close(&shards[i], path, 1) != 0) {
-                    fprintf(stderr, "ERROR writer %u failed finalizing shard %u: %s\n", arg->writer_index, i,
-                            strerror(errno));
-                    atomic_store(&g_writer_failed, 1U);
+                int flush_ok = 0;
+                if (build_shard_path(i, path, sizeof(path)) == 0) {
+                    if (shard_flush_ckpt_before_close(&shards[i], path, 1) != 0) {
+                        fprintf(stderr, "ERROR writer %u failed finalizing shard %u: %s\n", arg->writer_index, i,
+                                strerror(errno));
+                        atomic_store(&g_writer_failed, 1U);
+                    } else {
+                        flush_ok = 1;
+                    }
                 }
                 ecrawl_io_fclose(shards[i].fp);
                 shards[i].fp = NULL;
+                if (flush_ok && trij_facts)
+                    trijournal_collect_shard_facts(path, i, trij_fact_shards, trij_facts, &trij_facts_n);
             }
             /* Free in-memory catalog/ckpt retained across eviction (now persisted on disk). */
             if (shards[i].cat_live) shard_state_release(&shards[i]);
@@ -5157,6 +5301,15 @@ static void *writer_thread_main(void *arg_void) {
                 shards[i].blk_inited = 0;
             }
         }
+    }
+    /* All of this writer's batches were teed before processing, so the journal queues hold
+     * every shard frame ahead of this finalize (FIFO). */
+    if (trij_facts) {
+        if (trijournal_pool_finalize_shards(g_trijournal_pool, trij_fact_shards, trij_facts,
+                                            trij_facts_n) != 0)
+            fprintf(stderr, "warn: writer %u could not post trigram journal finalize\n", arg->writer_index);
+        free(trij_fact_shards);
+        free(trij_facts);
     }
     free(shards);
     crawl_bin_block_writer_tls_release();
@@ -5310,6 +5463,15 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     }
     fprintf(fp, "max_open_shards=%u\n", g_no_write ? 0U : g_max_open_shards);
     fprintf(fp, "writer_queue_batches=%u\n", g_no_write ? 0U : g_writer_queue_batches);
+    fprintf(fp, "trigram_journal=%s\n", g_trijournal_enabled ? g_trijournal_dir : "off");
+    if (g_trijournal_enabled) {
+        fprintf(fp, "trigram_journal_threads=%d\n", g_trijournal_threads);
+        fprintf(fp, "trigram_journal_queue_batches=%u\n", g_trijournal_queue_batches);
+        fprintf(fp, "trigram_journal_published=%" PRIu64 "\n", g_trijournal_final_published);
+        fprintf(fp, "trigram_journal_entries=%" PRIu64 "\n", g_trijournal_final_entries);
+        fprintf(fp, "trigram_journal_bytes=%" PRIu64 "\n", g_trijournal_final_bytes);
+        fprintf(fp, "trigram_journal_voided=%d\n", g_trijournal_final_voided);
+    }
     fprintf(fp, "record_batch_bytes=%u\n", (unsigned)RECORD_BATCH_BYTES);
     fprintf(fp, "write_buffer_size=%u\n", g_no_write ? 0U : (unsigned)WRITE_BUFFER_SIZE);
     fprintf(fp, "byte_accounting=%s\n", "unique_regular_files");
@@ -5522,6 +5684,30 @@ int main(int argc, char **argv) {
             g_record_root = g_record_root_buf;
             continue;
         }
+        if (strcmp(argv[i], "--trigram-journal") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--trigram-journal requires a directory\n");
+                print_usage(argv[0]);
+                return 2;
+            }
+            i++;
+            if (argv[i][0] == '\0') {
+                fprintf(stderr, "--trigram-journal directory must not be empty\n");
+                return 2;
+            }
+            if (snprintf(g_trijournal_dir, sizeof(g_trijournal_dir), "%s", argv[i]) >=
+                (int)sizeof(g_trijournal_dir)) {
+                fprintf(stderr, "--trigram-journal path too long\n");
+                return 2;
+            }
+            path_rstrip_slashes(g_trijournal_dir);
+            if (g_trijournal_dir[0] == '\0') {
+                fprintf(stderr, "--trigram-journal directory invalid\n");
+                return 2;
+            }
+            g_trijournal_enabled = 1;
+            continue;
+        }
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -5540,6 +5726,12 @@ int main(int argc, char **argv) {
 
     if (positional_count < 1) {
         print_usage(argv[0]);
+        return 2;
+    }
+
+    /* The journal tees the writer-bound record stream; --no-write/--no-stat have no writer stream. */
+    if (g_trijournal_enabled && g_no_write) {
+        fprintf(stderr, "--trigram-journal cannot be combined with --no-write/--no-stat\n");
         return 2;
     }
 
@@ -5596,6 +5788,8 @@ int main(int argc, char **argv) {
     g_uid_shards = parse_ecrawl_uid_shards_env();
     g_writer_threads = parse_ecrawl_writer_threads_env();
     g_writer_queue_batches = parse_ecrawl_writer_queue_batches_env();
+    g_trijournal_threads = parse_ecrawl_trijournal_threads_env();
+    g_trijournal_queue_batches = parse_ecrawl_trijournal_queue_batches_env();
     if ((uint32_t)g_writer_threads > g_uid_shards) g_writer_threads = (int)g_uid_shards;
     g_requested_max_open_shards = parse_ecrawl_max_open_shards_env();
     configure_max_open_shards();
@@ -5618,6 +5812,15 @@ int main(int argc, char **argv) {
         if (path_resolve_inplace(g_output_dir, sizeof(g_output_dir), "ecrawl: output-dir ") != 0) return 1;
 
         if (crawl_output_dir_scrub_prior_artifacts() != 0) return 1;
+
+        if (g_trijournal_enabled) {
+            if (ensure_output_dir_exists(g_trijournal_dir) != 0) {
+                fprintf(stderr, "ERROR invalid --trigram-journal directory %s: %s\n", g_trijournal_dir,
+                        strerror(errno));
+                return 1;
+            }
+            if (trijournal_dir_scrub_prior_artifacts() != 0) return 1;
+        }
 
         {
             char uid_path[PATH_MAX];
@@ -5768,6 +5971,21 @@ int main(int argc, char **argv) {
     g_crawl_wall_clock_start = time(NULL);
 
     if (!g_no_write) {
+        if (g_trijournal_enabled &&
+            trijournal_pool_start(&g_trijournal_pool, g_trijournal_dir, g_uid_shards, g_trijournal_threads,
+                                  g_trijournal_queue_batches, ecrawl_shard_basename) != 0) {
+            fprintf(stderr, "ERROR failed to start trigram journal pool in %s\n", g_trijournal_dir);
+            for (i = 0; i < writer_slots; i++) writer_queue_destroy(&writer_queues[i]);
+            free(writer_queues);
+            free(writer_threads);
+            free(writer_args);
+            queue_destroy(&queue);
+            pthread_mutex_destroy(&shared.stats_mutex);
+            if (hardlink_registry_ready) inode_registry_destroy(&g_hardlink_registry);
+            if (uid_registry_ready) id_registry_destroy(&g_uid_registry);
+            if (gid_registry_ready) id_registry_destroy(&g_gid_registry);
+            return 1;
+        }
         writer_threads_used = 0;
         for (i = 0; i < writer_slots; i++) {
             writer_args[i].queue = &writer_queues[i];
@@ -5954,6 +6172,21 @@ int main(int argc, char **argv) {
         if (disk_monitor_started) pthread_join(disk_monitor_thread, NULL);
     }
 
+    if (g_trijournal_pool) {
+        double jt0 = now_sec();
+        int jrc = trijournal_pool_finish(g_trijournal_pool);
+        if (g_verbose) fprintf(stderr, "trijournal_pool_finish_sec=%.3f\n", now_sec() - jt0);
+        g_trijournal_final_bytes = trijournal_pool_bytes(g_trijournal_pool);
+        g_trijournal_final_entries = trijournal_pool_entries(g_trijournal_pool);
+        g_trijournal_final_published = trijournal_pool_published(g_trijournal_pool);
+        g_trijournal_final_voided = trijournal_pool_voided(g_trijournal_pool);
+        trijournal_pool_free(g_trijournal_pool);
+        g_trijournal_pool = NULL;
+        if (jrc != 0)
+            fprintf(stderr,
+                    "warn: trigram journal voided/incomplete; ereport_index falls back to capture parse\n");
+    }
+
     if (stats_thread_started) {
         stats_stop_request();
         pthread_join(stats_thread, NULL);
@@ -6029,6 +6262,13 @@ int main(int argc, char **argv) {
                 fprintf(sumfp, "symlink_apparent_bytes=%" PRIu64 "\n", shared.symlink_apparent_bytes);
                 fprintf(sumfp, "other_apparent_bytes=%" PRIu64 "\n", shared.other_apparent_bytes);
                 fprintf(sumfp, "apparent_bytes_total=%" PRIu64 "\n", apparent_bytes_total);
+            }
+            if (g_trijournal_enabled) {
+                fprintf(sumfp, "trigram_journal=%s\n", g_trijournal_dir);
+                fprintf(sumfp, "trigram_journal_published=%" PRIu64 "\n", g_trijournal_final_published);
+                fprintf(sumfp, "trigram_journal_entries=%" PRIu64 "\n", g_trijournal_final_entries);
+                fprintf(sumfp, "trigram_journal_bytes=%" PRIu64 "\n", g_trijournal_final_bytes);
+                fprintf(sumfp, "trigram_journal_voided=%d\n", g_trijournal_final_voided);
             }
             fprintf(sumfp, "avg_ops_per_sec=%s\n", avg_ops_buf);
             fprintf(sumfp, "elapsed_sec=%.3f\n", elapsed);
