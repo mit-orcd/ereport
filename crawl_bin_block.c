@@ -187,9 +187,9 @@ int crawl_bin_block_writer_append_record(crawl_bin_block_writer_t *w, const bin_
 /*
  * Sort scratch is thread-local, not per-writer: a writer thread flushes one
  * shard at a time, so this is 24 bytes per buffered record per *thread*
- * instead of per live shard. Per shard it would add a quarter of a gigabyte at
- * the default ECRAWL_UID_SHARDS of 1024, for buffers that are live for the
- * microseconds a flush takes.
+ * instead of per live shard. Per shard it would add well over a hundred
+ * megabytes at the default ECRAWL_UID_SHARDS of 512, for buffers that are
+ * live for the microseconds a flush takes.
  */
 static __thread uint32_t *tls_sort_idx;
 static __thread uint32_t *tls_sort_aux;

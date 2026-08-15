@@ -53,8 +53,8 @@ Optional environment variables (no CLI flags for these; see also [environment-va
 | `ECRAWL_CRAWL_THREADS` | Crawl threads (minimum 1, default 16; no fixed maximum—practical limits are RAM and OS thread capacity). |
 | `ECRAWL_WRITER_THREADS` | Writer threads for uid-sharded `.bin` output (default 8). |
 | `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
-| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 1024). |
-| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 128 = every shard a writer owns at the default 1024 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
+| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 512). |
+| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 64 = every shard a writer owns at the default 512 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
 | `ECRAWL_DONATE_CHECK_EVERY` | During `readdir`, check whether to donate local directory-stack work every `N` `DT_DIR` pushes (default 64; `1` = check after every directory child). |
 | `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | During `readdir`, also check every `N` dirents (default 4096; `0` disables). The check above is driven by subdirectories found, so a deep narrow chain — one subdirectory per directory, however many files — never reaches the donation floor and walks single-threaded. This one fires on entries read instead, and when peers are idle it hands over the directories the worker is holding; the worker is mid-`readdir`, so it keeps working either way. |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | When the local stack exceeds `ECRAWL_FORCE_DONATE_AT`, donate up to this many directories per queue push (default 2048). |

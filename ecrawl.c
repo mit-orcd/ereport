@@ -139,11 +139,12 @@
 
 #define DEFAULT_CRAWL_THREADS 16
 #define DEFAULT_WRITER_THREADS 8
-#define DEFAULT_UID_SHARDS 1024U
-/* Per-writer open-shard LRU target. 128 = ceil(DEFAULT_UID_SHARDS / DEFAULT_WRITER_THREADS), i.e. a writer can
+#define DEFAULT_UID_SHARDS 512U
+/* Per-writer open-shard LRU target. 64 = ceil(DEFAULT_UID_SHARDS / DEFAULT_WRITER_THREADS), i.e. a writer can
  * hold every shard it owns open at once, eliminating LRU thrash (fopen/fclose churn) on many-UID workloads.
- * Always auto-capped against RLIMIT_NOFILE and the actual per-writer shard count in configure_max_open_shards(). */
-#define DEFAULT_MAX_OPEN_SHARDS 128U
+ * Always auto-capped against RLIMIT_NOFILE and the actual per-writer shard count in configure_max_open_shards().
+ * 512 shards fit a 1024-fd ulimit with the default 16 crawl / 8 writer threads (64 open per writer). */
+#define DEFAULT_MAX_OPEN_SHARDS 64U
 #define DEFAULT_WRITER_QUEUE_BATCHES 64U
 /* Crawl-time trigram journal pool (--trigram-journal): extraction threads and the bounded
  * handoff queue depth in record batches. Env: ECRAWL_TRIGRAM_JOURNAL_THREADS /
@@ -1689,7 +1690,7 @@ static void configure_max_open_shards(void) {
 
     /*
      * The default is only right for the default writer count: with fewer writers each owns more than
-     * 128 shards, and holding just 128 of them open puts the rest on an LRU that evicts and reopens a
+     * 64 shards, and holding just 64 of them open puts the rest on an LRU that evicts and reopens a
      * shard for every burst of records belonging to it — each round trip costing an fopen, a catalog
      * reload and a rewritten .ckpt sidecar. Raise the default to cover the whole ownership set when
      * the fd budget allows; total buffer memory is bounded by uid_shards * WRITE_BUFFER_SIZE either

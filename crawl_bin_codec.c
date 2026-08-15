@@ -181,9 +181,9 @@ static uint64_t zigzag_decode(uint64_t z) { return (z >> 1) ^ ((z & 1ULL) ? ~0UL
 /*
  * Residual staging, thread-local rather than per-writer: a writer thread encodes
  * one column at a time, so this is one buffer per thread instead of one per live
- * shard, which at the default ECRAWL_UID_SHARDS of 1024 is the difference
- * between half a megabyte and half a gigabyte of buffers that are live for the
- * microseconds an encode takes.
+ * shard, which at the default ECRAWL_UID_SHARDS of 512 is the difference
+ * between a small per-thread buffer and hundreds of megabytes live only for
+ * the microseconds an encode takes.
  */
 static __thread uint64_t *tls_residual;
 static __thread size_t tls_residual_cap;

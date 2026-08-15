@@ -30,8 +30,8 @@ Defaults below are the built-in values when the variable is unset—each tool us
 | `ECRAWL_CRAWL_THREADS` | `ecrawl` | Crawl threads (minimum 1, default 16; no fixed maximum). |
 | `ECRAWL_WRITER_THREADS` | `ecrawl` | Uid-shard writer threads (default 8). |
 | `ECRAWL_WRITER_QUEUE_BATCHES` | `ecrawl` | Pending record batches per writer queue when writing shards (default 64, range 4…4096). |
-| `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 1024). |
-| `ECRAWL_MAX_OPEN_SHARDS` | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 1024). |
+| `ECRAWL_UID_SHARDS` | `ecrawl` | Uid shard count, power of two (default 512). |
+| `ECRAWL_MAX_OPEN_SHARDS` | `ecrawl` | Per-writer shard file cache target, auto-capped by `RLIMIT_NOFILE` (default 64). |
 | `ECRAWL_DONATE_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in `DT_DIR` pushes (default 64). |
 | `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | `ecrawl` | Donate-check period during `readdir` in dirents, so a deep chain that pushes one subdirectory per directory still sheds work to idle peers (default 4096; `0` disables). |
 | `ECRAWL_DONATE_CHUNK_FORCE_MAX` | `ecrawl` | Max dirs donated per queue push on force spill (default 2048). |
