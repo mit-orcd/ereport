@@ -853,6 +853,145 @@ run_ecrawl_no_stat_tests() {
     pass "ecrawl --no-stat + --contains"
 }
 
+# --statx / --iouring swap the inode-read path (and batch it); the walk's answers and the
+# capture's content must be identical to the fstatat baseline. Shard bytes are order-independent
+# (record sizes do not depend on emit order), so they are compared exactly; crawl_manifest.txt is
+# excluded (it embeds the wall clock).
+run_ecrawl_statx_tests() {
+    local td=$1
+    local st="${td}/statx_walk" err="${td}/statx.err"
+    local modes="base statx iouring" m keys k v_base v_new mismatch shard_base shard_new
+
+    section_int "[integration] ecrawl --statx / --iouring (inode-read variants)"
+
+    mkdir -p "${st}/a/b" "${st}/c"
+    echo one >"${st}/a/one.txt"
+    echo twenty-two-characters >"${st}/a/b/two.txt"
+    : >"${st}/c/empty"
+    ln "${st}/a/one.txt" "${st}/c/one-hardlink"
+    ln -s ../a "${st}/c/link_a"
+    st=$(cd "$st" && pwd -P)
+
+    # If this build has no io_uring support the flag must refuse cleanly; skip those legs.
+    if ! "$ECRAWL" --no-write --iouring "$st" >/dev/null 2>"$err"; then
+        if grep -q "no io_uring support" "$err"; then
+            modes="base statx"
+            summary_add SKIP "ecrawl --iouring" "built without io_uring support"
+            log "note: ecrawl built without io_uring; --iouring legs skipped"
+        else
+            die "ecrawl --no-write --iouring failed: $(tail -n1 "$err")"
+        fi
+    fi
+
+    local -A nw_sum=()
+    for m in $modes; do
+        local flags=() tag=""
+        case "$m" in
+            statx) flags=(--statx); tag="--statx" ;;
+            iouring) flags=(--iouring); tag="--iouring" ;;
+        esac
+        ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+            "$ECRAWL" --no-write --verbose "${flags[@]}" "$st" >"${td}/statx_nw_${m}.out" 2>"$err" ||
+            die "ecrawl --no-write $tag failed"
+        nw_sum[$m]=$(grep -E '^(entries|dirs|files|symlinks|other|total_bytes|total_allocated_bytes|hardlink_files)=' \
+            "${td}/statx_nw_${m}.out" | LC_ALL=C sort)
+        if [[ "$m" == "iouring" ]]; then
+            log "note: --iouring io_uring_batches=$(kv_last io_uring_batches "${td}/statx_nw_${m}.out")" \
+                "sync_redos=$(kv_last io_uring_sync_redos "${td}/statx_nw_${m}.out")"
+        fi
+    done
+    for m in $modes; do
+        [[ "$m" == "base" ]] && continue
+        expect_eq_continue "ecrawl --no-write ($m): walk answers match fstatat baseline" \
+            "${nw_sum[base]}" "${nw_sum[$m]}" "entries/files/bytes/hardlinks"
+    done
+
+    # Force the inline path: MIN_BATCH above any directory's child count, so every
+    # collected batch skips the ring. Answers must still match the fstatat baseline.
+    # On a kernel without a working ring, --iouring never enters crawl_dir_entries_iouring
+    # (fd < 0); skip the counter checks there.
+    if [[ "$modes" == *iouring* ]]; then
+        local ring_live=0 batches0 inline0
+        batches0=$(kv_last io_uring_batches "${td}/statx_nw_iouring.out")
+        inline0=$(kv_last io_uring_inline_stats "${td}/statx_nw_iouring.out")
+        if [[ "${batches0:-0}" -gt 0 || "${inline0:-0}" -gt 0 ]]; then
+            ring_live=1
+        fi
+        ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" ECRAWL_IOURING_MIN_BATCH=65536 \
+            "$ECRAWL" --no-write --verbose --iouring "$st" >"${td}/statx_nw_inline.out" 2>"$err" ||
+            die "ecrawl --no-write --iouring (MIN_BATCH=65536) failed"
+        expect_eq_continue "ecrawl --iouring MIN_BATCH=65536: walk answers match baseline" \
+            "${nw_sum[base]}" \
+            "$(grep -E '^(entries|dirs|files|symlinks|other|total_bytes|total_allocated_bytes|hardlink_files)=' \
+                "${td}/statx_nw_inline.out" | LC_ALL=C sort)" \
+            "inline path"
+        if [[ "$ring_live" == "1" ]]; then
+            expect_eq_continue "ecrawl --iouring MIN_BATCH=65536: no ring submits" \
+                "0" "$(kv_last io_uring_batches "${td}/statx_nw_inline.out")"
+            expect_eq_continue "ecrawl --iouring MIN_BATCH=65536: names took inline path" \
+                "1" "$(( $(kv_last io_uring_inline_stats "${td}/statx_nw_inline.out") > 0 ))" \
+                "io_uring_inline_stats=$(kv_last io_uring_inline_stats "${td}/statx_nw_inline.out")"
+        else
+            summary_add SKIP "ecrawl --iouring MIN_BATCH=65536: ring counters" \
+                "io_uring unavailable at runtime; walk used statx fallback"
+        fi
+    fi
+
+    # Write mode: counters plus total shard bytes must match the baseline capture.
+    for m in $modes; do
+        local flags=() tag=""
+        case "$m" in
+            statx) flags=(--statx); tag="--statx" ;;
+            iouring) flags=(--iouring); tag="--iouring" ;;
+        esac
+        ECRAWL_CRAWL_THREADS="${ECRAWL_CRAWL_THREADS:-4}" \
+            "$ECRAWL" --verbose "${flags[@]}" "$st" "${td}/statx_cap_${m}" >"${td}/statx_cap_${m}.out" 2>"$err" ||
+            die "ecrawl $tag capture failed"
+        nw_sum[$m]=$(grep -E '^(entries|dirs|files|symlinks|other|total_bytes|total_allocated_bytes|hardlink_files)=' \
+            "${td}/statx_cap_${m}.out" | LC_ALL=C sort)
+        shard_base=$(find "${td}/statx_cap_${m}" -name 'uid_shard_*.bin' -exec stat -c %s {} + |
+            awk '{s+=$1} END {print s+0}')
+        nw_sum[$m]="${nw_sum[$m]}"$'\n'"shard_bytes=${shard_base}"
+        expect_eq_continue "ecrawl capture ($m): stat_impl recorded" \
+            "$m" "$(kv_last stat_impl "${td}/statx_cap_${m}.out" | sed 's/fstatat/base/')"
+    done
+    for m in $modes; do
+        [[ "$m" == "base" ]] && continue
+        expect_eq_continue "ecrawl capture ($m): counters + shard bytes match baseline" \
+            "${nw_sum[base]}" "${nw_sum[$m]}" "incl. uid_shard_*.bin total bytes"
+    done
+
+    # --no-stat + --statx: the only inode reads left (crawl root, d_type-less probes) go through
+    # statx with a STATX_TYPE-only mask; the path list must still equal find.
+    find "$st" | LC_ALL=C sort >"${td}/statx_nostat.ref"
+    "$ECRAWL" --no-stat --statx "$st" 2>"$err" | LC_ALL=C sort >"${td}/statx_nostat.out" ||
+        die "ecrawl --no-stat --statx failed"
+    expect_eq_continue "ecrawl --no-stat --statx: path set equals find" \
+        "$(cksum <"${td}/statx_nostat.ref" | cut -d' ' -f1)" \
+        "$(cksum <"${td}/statx_nostat.out" | cut -d' ' -f1)" "STATX_TYPE mask path"
+    "$ECRAWL" --no-stat --statx --verbose "$st" >/dev/null 2>"$err" ||
+        die "ecrawl --no-stat --statx --verbose failed"
+    expect_le_continue "ecrawl --no-stat --statx: inode reads" 1 \
+        "$(kv_last io_lstat_calls "$err")" "root only"
+
+    # --statx + --trigram-journal: journals are produced, replayed and deleted with the statx
+    # read path feeding the writer stream.
+    local jdir="${td}/statx_journals" jcap="${td}/statx_jcap" jidx="${td}/statx_jidx" nj
+    "$ECRAWL" --verbose --statx --trigram-journal "$jdir" "$st" "$jcap" >"${td}/statx_jcap.out" 2>"$err" ||
+        die "ecrawl --statx --trigram-journal failed"
+    nj=$(find "$jdir" -name '*.tij' | wc -l | tr -d ' ')
+    expect_eq_continue "ecrawl --statx --trigram-journal: journals written" "1" "$((nj > 0))" "$nj .tij files"
+    EREPORT_INDEX_THREADS=2 "$EREPORT_INDEX" --make --journal-dir "$jdir" --index-dir "$jidx" "$jcap" \
+        >/dev/null 2>"$err" || die "ereport_index --make --journal-dir (statx capture) failed"
+    nj=$(find "$jdir" -name '*.tij' 2>/dev/null | wc -l | tr -d ' ')
+    expect_eq_continue "ereport_index (statx capture): journals deleted on success" "0" "$nj" ""
+
+    rm -rf "$st" "$err" "${td}"/statx_nw_* "${td}"/statx_cap_* "${td}"/statx_nw_inline.out \
+        "${td}"/statx_nostat.* \
+        "${td}"/statx_journals "${td}"/statx_jcap* "${td}"/statx_jidx
+    pass "ecrawl --statx / --iouring"
+}
+
 # ERCBIN09: the catalog rollup fast path must agree with the record scan wherever
 # it claims to apply, must decline where it cannot be exact, and the gid/mode
 # columns the columnar format brought back must filter correctly.
@@ -2137,6 +2276,8 @@ run_integration() {
     run_trijournal_tests "$td"
 
     run_ecrawl_no_stat_tests "$td"
+
+    run_ecrawl_statx_tests "$td"
 
     run_edelete_tests "$td" "$root_abs"
 

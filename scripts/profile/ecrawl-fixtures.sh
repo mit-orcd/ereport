@@ -82,6 +82,16 @@
 #                              shards and delete both. Per-fixture dirs because shard
 #                              basenames collide across fixtures. Never nowrite mode:
 #                              --no-write + --trigram-journal is an error.
+#   ECRAWL_STAT_IMPL=fstatat   inode-read syscall for every pass: fstatat (default) |
+#                              statx (--statx, minimal attribute mask) | iouring
+#                              (--iouring, per-worker batched inode reads via
+#                              IORING_OP_STATX; falls back to statx when the kernel
+#                              lacks the opcode — check io_uring_batches in
+#                              clean.summary.txt). Batches smaller than
+#                              ECRAWL_IOURING_MIN_BATCH (default 8) are statx'd
+#                              inline (io_uring_inline_stats) so tiny-dir trees
+#                              do not pay one io_uring_enter per directory.
+#                              One impl per run; the strace table shows the syscall swap.
 #   Any ECRAWL_* env (ECRAWL_MAX_OPEN_SHARDS, ECRAWL_CRAWL_THREADS, ...) is
 #   inherited by every ecrawl run and recorded in env.txt.
 #
@@ -144,6 +154,12 @@ REPS=${REPS:-1}
 INCLUDE_ROOT=${INCLUDE_ROOT:-0}
 ECRAWL_VERBOSE_ARGS=${ECRAWL_VERBOSE_ARGS:-}
 DO_TRIJOURNAL=${DO_TRIJOURNAL:-0}
+# Inode-read syscall for every pass (clean/strace/perf/sched): fstatat | statx | iouring.
+ECRAWL_STAT_IMPL=${ECRAWL_STAT_IMPL:-fstatat}
+case "$ECRAWL_STAT_IMPL" in
+  fstatat|statx|iouring) ;;
+  *) echo "ERROR: ECRAWL_STAT_IMPL must be fstatat|statx|iouring (got '$ECRAWL_STAT_IMPL')" >&2; exit 2 ;;
+esac
 
 if [[ -n "${FIXTURES:-}" ]]; then
   read -ra FIXLIST <<<"$FIXTURES"
@@ -213,6 +229,10 @@ build_argv() {
     mkdir -p "$jdir"
     RUN_ARGV+=(--trigram-journal "$jdir")
   fi
+  case "$ECRAWL_STAT_IMPL" in
+    statx) RUN_ARGV+=(--statx) ;;
+    iouring) RUN_ARGV+=(--iouring) ;;
+  esac
   # shellcheck disable=SC2206
   [[ -n "$ECRAWL_VERBOSE_ARGS" ]] && RUN_ARGV+=($ECRAWL_VERBOSE_ARGS)
   RUN_ARGV+=("$start")
@@ -403,7 +423,7 @@ profile_one() {
   echo "output_base=$OUTPUT_BASE"
   echo "output_base_fstype=$(fs_type "$(dirname "$OUTPUT_BASE")")"
   echo "ecrawl_bin=$ECRAWL_BIN"
-  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED  reps=$REPS drop_caches=$DROP_CACHES trijournal=$DO_TRIJOURNAL"
+  echo "modes: nowrite=$DO_NOWRITE write=$DO_WRITE  strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED  reps=$REPS drop_caches=$DROP_CACHES trijournal=$DO_TRIJOURNAL stat_impl=$ECRAWL_STAT_IMPL"
   echo "sched_fixtures: $SCHED_FIXTURES"
   echo "fixtures: ${FIXLIST[*]}"
   echo
@@ -593,7 +613,7 @@ def strace_counts(fx, mode):
     if not p.exists():
         return out
     txt = p.read_text(errors="replace")
-    for name in ("getdents64", "newfstatat", "openat", "close", "futex"):
+    for name in ("getdents64", "newfstatat", "statx", "io_uring_enter", "openat", "close", "futex"):
         m = re.search(
             r"^\s*([\d.]+)\s+[\d.]+\s+\d+\s+(\d+)\s+(?:\d+\s+)?" + name + r"\b",
             txt, re.M)
@@ -738,8 +758,10 @@ for fx in fixtures:
 lines.append("")
 
 # --- strace histogram highlights ------------------------------------------
-cols3 = ["fixture", "mode", "getdents64", "newfstatat", "openat", "close", "futex%"]
-w3 = [22, 8, 12, 12, 11, 11, 8]
+# statx / io_uring_enter sit beside newfstatat so a --statx / --iouring run
+# shows the syscall swap directly (newfstatat ~0, its replacement carrying the count).
+cols3 = ["fixture", "mode", "getdents64", "newfstatat", "statx", "io_uring_ent", "openat", "close", "futex%"]
+w3 = [22, 8, 12, 12, 12, 13, 11, 11, 8]
 
 
 def row3(vals):
@@ -756,6 +778,8 @@ for fx in fixtures:
             fx, mode,
             fmt(sc.get("getdents64")),
             fmt(sc.get("newfstatat")),
+            fmt(sc.get("statx")),
+            fmt(sc.get("io_uring_enter")),
             fmt(sc.get("openat")),
             fmt(sc.get("close")),
             fmt(sc.get("futex_pct"), "f1") if "futex_pct" in sc else "-",

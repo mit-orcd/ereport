@@ -54,6 +54,18 @@ PIPELINES = [
         "ecrawl",  # label when only the first phase ran
     ),
     (
+        # Same build with crawl-time journals: the crawl row carries the extra
+        # journal bytes, the index row is the parallel replay of those journals.
+        # Two lines: as one it is the widest y-tick label and outgrows the
+        # fixed left margin of the single-panel build figures.
+        "ecrawl + ereport_index\n(journal)",
+        [
+            ((("ecrawl_trij", "write"),), "crawl"),
+            ((("ereport_index_trij", "make"),), "trigram index"),
+        ],
+        "ecrawl (journal)",
+    ),
+    (
         # Two stages, not two alternatives: the scan crawls into index-free
         # tables, which is not a database anyone queries, and the three CREATE
         # INDEX statements are what make them queryable. Charting the scan alone
@@ -64,6 +76,20 @@ PIPELINES = [
             ((("robinhood", "indexes"),), "indexes"),
         ],
         "Robinhood (scan only)",
+    ),
+    (
+        # statx variants: the same capture as ecrawl, only the inode-read
+        # syscall differs. Crawl-only pipelines: the ereport_index half is
+        # byte-identical to the baseline's, so re-running it would measure
+        # nothing new.
+        "ecrawl --statx",
+        [((("ecrawl", "write_statx"),), "crawl")],
+        "ecrawl --statx",
+    ),
+    (
+        "ecrawl --io_uring",
+        [((("ecrawl", "write_iouring"),), "crawl")],
+        "ecrawl --io_uring",
     ),
     ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "dir2index")], None),
     (
@@ -78,7 +104,11 @@ PIPELINES = [
 ]
 INDEX_ORDER = [
     "ecrawl + ereport_index",
+    "ecrawl + ereport_index\n(journal)",
     "ecrawl",
+    "ecrawl (journal)",
+    "ecrawl --statx",
+    "ecrawl --io_uring",
     "Robinhood",
     "Robinhood (scan only)",
     "GUFI (dir2index)",
@@ -90,10 +120,12 @@ INDEX_ORDER = [
 # ecrawl --no-stat --count) return a regular-file count with no inode reads,
 # while du/dua/dut (and ecrawl --no-write) return apparent size. Figures 1–2
 # draw those as two panels.
-WALK_VARIANTS = ("walk", "nowrite", "nostat")
+WALK_VARIANTS = ("walk", "nowrite", "nostat", "nowrite_statx", "nowrite_iouring")
 WALK_LABELS = {
     ("ecrawl", "nostat"): "ecrawl --no-stat --count",
     ("ecrawl", "nowrite"): "ecrawl --no-write",
+    ("ecrawl", "nowrite_statx"): "ecrawl --no-write --statx",
+    ("ecrawl", "nowrite_iouring"): "ecrawl --no-write --io_uring",
     ("find", "walk"): "find",
     ("fd", "walk"): "fd",
     ("du", "walk"): "du",
@@ -103,7 +135,14 @@ WALK_LABELS = {
 # Names-only peers: timed job returns a regular-file count (answer_files=).
 WALK_NAMES_ORDER = ["ecrawl --no-stat --count", "fd", "find"]
 # Metadata + size peers: timed job returns apparent bytes (answer_bytes=).
-WALK_META_ORDER = ["ecrawl --no-write", "dut", "dua", "du"]
+WALK_META_ORDER = [
+    "ecrawl --no-write",
+    "ecrawl --no-write --statx",
+    "ecrawl --no-write --io_uring",
+    "dut",
+    "dua",
+    "du",
+]
 WALK_NAMES_LABELS = frozenset(WALK_NAMES_ORDER)
 WALK_META_LABELS = frozenset(WALK_META_ORDER)
 QUERY_ORDER = [
@@ -138,9 +177,16 @@ QUERY_TITLES = {
 # the common colour vision deficiencies and in greyscale print.
 COLORS = {
     "ecrawl + ereport_index": "#0072B2",
+    "ecrawl + ereport_index\n(journal)": "#E69F00",
     "ecrawl": "#0072B2",
+    "ecrawl (journal)": "#E69F00",
     "ecrawl --no-stat --count": "#0072B2",
     "ecrawl --no-write": "#56B4E9",
+    # Same hue, lighter tints: same tool, different inode-read syscall.
+    "ecrawl --statx": "#56B4E9",
+    "ecrawl --io_uring": "#A6CEE3",
+    "ecrawl --no-write --statx": "#8FCDE9",
+    "ecrawl --no-write --io_uring": "#C4E3F2",
     "ereport": "#0072B2",
     "ecrawl_query": "#0072B2",
     "ereport_index": "#56B4E9",

@@ -395,6 +395,17 @@ PIPELINE_PHASES = [
         "ecrawl + ereport_index",
         [("crawl", [("ecrawl", "write")]), ("trigram index", [("ereport_index", "make")])],
     ),
+    (
+        "ecrawl + ereport_index (journal)",
+        [
+            ("crawl", [("ecrawl_trij", "write")]),
+            ("trigram index", [("ereport_index_trij", "make")]),
+        ],
+    ),
+    # Crawl-only statx variants: the capture is identical to ecrawl/write, so
+    # there is no index half to re-measure.
+    ("ecrawl --statx", [("crawl", [("ecrawl", "write_statx")])]),
+    ("ecrawl --io_uring", [("crawl", [("ecrawl", "write_iouring")])]),
     ("GUFI (dir2index)", [("dir2index", GUFI_DIR2INDEX)]),
     (
         "GUFI + rollup",
@@ -549,7 +560,7 @@ def summarize_index(rows):
         {
             "{0}/{1}".format(tool, variant)
             for (tool, variant, _cache) in groups
-            if variant in ("walk", "nowrite", "nostat")
+            if variant in ("walk", "nowrite", "nostat", "nowrite_statx", "nowrite_iouring")
         }
     )
     if walkers:
@@ -566,7 +577,7 @@ def summarize_index(rows):
         for (tool, variant, cache), rs in sorted(
             groups.items(), key=lambda x: (x[0][0], x[0][1], cache_key(x[0][2]))
         ):
-            if variant not in ("walk", "nowrite", "nostat"):
+            if variant not in ("walk", "nowrite", "nostat", "nowrite_statx", "nowrite_iouring"):
                 continue
             ok = [r for r in rs if r.get("status") == "ok"]
             if not ok:

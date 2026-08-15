@@ -43,6 +43,7 @@
  * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
  */
 
+#define _GNU_SOURCE /* statx() declaration in <sys/stat.h> (glibc >= 2.28) */
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
 
@@ -114,6 +115,26 @@
 #endif
 #ifndef DT_WHT
 #define DT_WHT 14
+#endif
+
+/* --iouring batches per-entry inode reads through a per-worker io_uring. Raw syscalls, no liburing
+ * dependency; compiled out when the header or the arch's syscall numbers are missing. */
+#if defined(__has_include)
+#  if __has_include(<linux/io_uring.h>)
+#    include <linux/io_uring.h>
+#    define ECRAWL_HAVE_IOURING 1
+#  endif
+#endif
+#if defined(ECRAWL_HAVE_IOURING) && !defined(__NR_io_uring_setup)
+#  if defined(__x86_64__)
+#    define __NR_io_uring_setup 425
+#    define __NR_io_uring_enter 426
+#  elif defined(__aarch64__)
+#    define __NR_io_uring_setup 277
+#    define __NR_io_uring_enter 278
+#  else
+#    undef ECRAWL_HAVE_IOURING
+#  endif
 #endif
 
 #define DEFAULT_CRAWL_THREADS 16
@@ -826,6 +847,259 @@ static int ecrawl_plstat(const char *path, struct stat *st) {
     return lstat(path, st);
 }
 
+/* ----- --statx / --iouring: statx(2) with a mode-minimal attribute mask -----------------------------
+ * fstatat(2) always collects STATX_BASIC_STATS; ecrawl never reads all of it. --no-write needs no
+ * ownership or timestamps, --no-stat's d_type probe needs only the type bits, and even the capture
+ * path reads exactly BASIC_STATS. Asking for less lets network/cluster filesystems skip attribute
+ * work (the local-filesystem win is small). A filesystem that declines part of the mask (stx_mask
+ * short of what was requested) is answered with a plain fstatat for that one entry, so consumers
+ * never see zeroed fields. */
+static int g_statx_mode = 0;    /* --statx */
+static int g_iouring_statx = 0; /* --iouring (IORING_OP_STATX; same mask as --statx) */
+static unsigned g_statx_mask = STATX_BASIC_STATS;
+
+static void ecrawl_statx_select_mask(void) {
+    if (g_no_stat)
+        g_statx_mask = STATX_TYPE; /* d_type probe only */
+    else if (g_no_write)
+        g_statx_mask = STATX_TYPE | STATX_SIZE | STATX_BLOCKS | STATX_NLINK | STATX_INO;
+    else
+        g_statx_mask = STATX_BASIC_STATS;
+}
+
+static void ecrawl_statx_to_stat(const struct statx *sx, struct stat *st) {
+    memset(st, 0, sizeof(*st));
+    st->st_mode = sx->stx_mode;
+    st->st_uid = sx->stx_uid;
+    st->st_gid = sx->stx_gid;
+    st->st_size = (off_t)sx->stx_size;
+    st->st_blocks = (blkcnt_t)sx->stx_blocks;
+    st->st_nlink = (nlink_t)sx->stx_nlink;
+    st->st_ino = (ino_t)sx->stx_ino;
+    st->st_dev = makedev(sx->stx_dev_major, sx->stx_dev_minor);
+    st->st_rdev = makedev(sx->stx_rdev_major, sx->stx_rdev_minor);
+    st->st_blksize = (blksize_t)sx->stx_blksize;
+    st->st_atim.tv_sec = sx->stx_atime.tv_sec;
+    st->st_atim.tv_nsec = sx->stx_atime.tv_nsec;
+    st->st_mtim.tv_sec = sx->stx_mtime.tv_sec;
+    st->st_mtim.tv_nsec = sx->stx_mtime.tv_nsec;
+    st->st_ctim.tv_sec = sx->stx_ctime.tv_sec;
+    st->st_ctim.tv_nsec = sx->stx_ctime.tv_nsec;
+}
+
+static int ecrawl_statx_fstatat_nf(int dirfd_value, const char *name, struct stat *st) {
+    struct statx sx;
+
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
+    if (statx(dirfd_value, name, AT_SYMLINK_NOFOLLOW, g_statx_mask, &sx) != 0) return -1;
+    if ((sx.stx_mask & g_statx_mask) != g_statx_mask)
+        return fstatat(dirfd_value, name, st, AT_SYMLINK_NOFOLLOW);
+    ecrawl_statx_to_stat(&sx, st);
+    return 0;
+}
+
+static int ecrawl_statx_lstat(const char *path, struct stat *st) {
+    struct statx sx;
+
+    ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
+    if (statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, g_statx_mask, &sx) != 0) return -1;
+    if ((sx.stx_mask & g_statx_mask) != g_statx_mask) return lstat(path, st);
+    ecrawl_statx_to_stat(&sx, st);
+    return 0;
+}
+
+/* Called after ecrawl_install_verbose_profile: the statx wrappers replace whichever stat pointers
+ * are current, and they count g_io_lstat_calls themselves so --verbose accounting is unchanged. */
+static void ecrawl_install_statx_profile(void) {
+    if (!g_statx_mode && !g_iouring_statx) return;
+    ecrawl_statx_select_mask();
+    ecrawl_io_lstat = ecrawl_statx_lstat;
+    ecrawl_io_fstatat_nf = ecrawl_statx_fstatat_nf;
+}
+
+/* ----- per-worker io_uring for batched statx -------------------------------------------------------
+ * The walk loop is otherwise one synchronous fstatat per entry; with --iouring each worker
+ * owns a small ring, queues up to ECRAWL_IOURING_DEPTH statx SQEs per directory batch, and reaps
+ * them in readdir order. One io_uring_enter per batch amortizes the syscall boundary and lets the
+ * kernel run the lookups concurrently. */
+static unsigned g_iouring_depth = 256; /* ECRAWL_IOURING_DEPTH */
+static unsigned g_iouring_min_batch = 8; /* ECRAWL_IOURING_MIN_BATCH: below this, stat inline */
+static atomic_ullong g_io_uring_batches = 0;    /* batches submitted to a ring */
+static atomic_ullong g_io_uring_sync_redos = 0; /* entries re-stat'd synchronously (short mask or dead ring) */
+static atomic_ullong g_io_uring_inline_stats = 0; /* names that skipped the ring (batch < min) */
+static atomic_int g_io_uring_warned = 0;        /* one fallback warning per run, not one per worker */
+
+#ifdef ECRAWL_HAVE_IOURING
+typedef struct {
+    char name[256];      /* owned copy of the dirent name; the SQE points here */
+    uint16_t name_len;
+    unsigned char dtype; /* getdents d_type, kept for dispatch parity with the inline loop */
+    struct statx stx;    /* SQE result buffer */
+} uring_slot_t;
+
+typedef struct {
+    int fd;   /* -1: ring not usable */
+    int dead; /* hard ring error mid-run: finish batches with synchronous statx */
+    unsigned depth;
+    unsigned sq_next; /* SQ is fully drained each batch, so this tracks *sq_tail */
+    unsigned *sq_tail;
+    unsigned *sq_ring_mask;
+    unsigned *sq_array;
+    struct io_uring_sqe *sqes;
+    unsigned *cq_head;
+    unsigned *cq_tail;
+    unsigned *cq_ring_mask;
+    struct io_uring_cqe *cqes;
+    void *sq_map;
+    size_t sq_map_len;
+    void *cq_map;
+    size_t cq_map_len;
+    void *sqes_map;
+    size_t sqes_map_len;
+    uring_slot_t *slots;
+    long *res; /* per-slot completion results, indexed by slot */
+    unsigned batch;
+} uring_stat_ctx_t;
+
+static void uring_stat_destroy(uring_stat_ctx_t *u) {
+    if (u->sq_map && u->sq_map != MAP_FAILED) munmap(u->sq_map, u->sq_map_len);
+    if (u->cq_map && u->cq_map != MAP_FAILED && u->cq_map != u->sq_map) munmap(u->cq_map, u->cq_map_len);
+    if (u->sqes_map && u->sqes_map != MAP_FAILED) munmap(u->sqes_map, u->sqes_map_len);
+    free(u->slots);
+    free(u->res);
+    if (u->fd >= 0) close(u->fd);
+    memset(u, 0, sizeof(*u));
+    u->fd = -1;
+}
+
+static int uring_stat_init(uring_stat_ctx_t *u, unsigned depth) {
+    struct io_uring_params p;
+    size_t sq_ring, cq_ring;
+
+    memset(u, 0, sizeof(*u));
+    u->fd = -1;
+    memset(&p, 0, sizeof(p));
+    u->fd = (int)syscall(__NR_io_uring_setup, depth, &p);
+    if (u->fd < 0) return -1;
+
+    sq_ring = p.sq_off.array + (size_t)p.sq_entries * sizeof(unsigned);
+    cq_ring = p.cq_off.cqes + (size_t)p.cq_entries * sizeof(struct io_uring_cqe);
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        if (cq_ring > sq_ring) sq_ring = cq_ring;
+        cq_ring = sq_ring;
+    }
+    u->sq_map_len = sq_ring;
+    u->cq_map_len = cq_ring;
+    u->sq_map = mmap(NULL, sq_ring, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, u->fd, IORING_OFF_SQ_RING);
+    if (u->sq_map == MAP_FAILED) goto fail;
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        u->cq_map = u->sq_map;
+    } else {
+        u->cq_map = mmap(NULL, cq_ring, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, u->fd, IORING_OFF_CQ_RING);
+        if (u->cq_map == MAP_FAILED) goto fail;
+    }
+    u->sqes_map_len = (size_t)p.sq_entries * sizeof(struct io_uring_sqe);
+    u->sqes_map = mmap(NULL, u->sqes_map_len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, u->fd, IORING_OFF_SQES);
+    if (u->sqes_map == MAP_FAILED) goto fail;
+
+    u->sq_tail = (unsigned *)((char *)u->sq_map + p.sq_off.tail);
+    u->sq_ring_mask = (unsigned *)((char *)u->sq_map + p.sq_off.ring_mask);
+    u->sq_array = (unsigned *)((char *)u->sq_map + p.sq_off.array);
+    u->cq_head = (unsigned *)((char *)u->cq_map + p.cq_off.head);
+    u->cq_tail = (unsigned *)((char *)u->cq_map + p.cq_off.tail);
+    u->cq_ring_mask = (unsigned *)((char *)u->cq_map + p.cq_off.ring_mask);
+    u->cqes = (struct io_uring_cqe *)((char *)u->cq_map + p.cq_off.cqes);
+    u->sqes = (struct io_uring_sqe *)u->sqes_map;
+
+    u->slots = calloc(depth, sizeof(uring_slot_t));
+    u->res = calloc(depth, sizeof(long));
+    if (!u->slots || !u->res) goto fail;
+    u->depth = depth;
+    return 0;
+fail:
+    {
+        int saved_errno = errno;
+        uring_stat_destroy(u);
+        errno = saved_errno; /* caller reports why setup failed, not how cleanup went */
+    }
+    return -1;
+}
+
+/* Queue a statx SQE for slot i of the current batch. */
+static void uring_prep_slot(uring_stat_ctx_t *u, unsigned i, int dirfd, uring_slot_t *slot) {
+    unsigned idx = (u->sq_next + i) & *u->sq_ring_mask;
+    struct io_uring_sqe *sqe = &u->sqes[idx];
+
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_STATX;
+    sqe->fd = dirfd;
+    sqe->addr = (uint64_t)(uintptr_t)slot->name;
+    sqe->len = g_statx_mask;
+    sqe->off = (uint64_t)(uintptr_t)&slot->stx; /* statx has no file offset: off carries the out buffer */
+    sqe->statx_flags = AT_SYMLINK_NOFOLLOW;
+    sqe->user_data = i;
+    u->sq_array[idx] = idx;
+}
+
+/* Submit the n prepped SQEs and wait for every completion; results land in u->res[slot].
+ * Returns -1 on a hard ring error (caller degrades the batch to synchronous statx). */
+static int uring_submit_wait_all(uring_stat_ctx_t *u, unsigned n) {
+    unsigned done = 0;
+    int ret;
+
+    atomic_store_explicit((_Atomic unsigned *)u->sq_tail, u->sq_next + n, memory_order_release);
+    while (done < n) {
+        unsigned head, tail;
+
+        ret = (int)syscall(__NR_io_uring_enter, u->fd, done == 0 ? n : 0, n - done, IORING_ENTER_GETEVENTS, NULL, 0);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        head = atomic_load_explicit((_Atomic unsigned *)u->cq_head, memory_order_acquire);
+        tail = atomic_load_explicit((_Atomic unsigned *)u->cq_tail, memory_order_acquire);
+        while (head != tail) {
+            struct io_uring_cqe *cqe = &u->cqes[head & *u->cq_ring_mask];
+            u->res[cqe->user_data] = cqe->res;
+            done++;
+            head++;
+        }
+        atomic_store_explicit((_Atomic unsigned *)u->cq_head, head, memory_order_release);
+    }
+    u->sq_next += n;
+    ATOMIC_ADD_RELAXED(&g_io_uring_batches, 1);
+    return 0;
+}
+
+/* One-shot probe: some kernels/filesystems reject IORING_OP_STATX even when io_uring works. */
+static int uring_stat_probe(uring_stat_ctx_t *u) {
+    uring_slot_t *slot = &u->slots[0];
+
+    memcpy(slot->name, ".", 2);
+    slot->name_len = 1;
+    uring_prep_slot(u, 0, AT_FDCWD, slot);
+    if (uring_submit_wait_all(u, 1) != 0) return -1;
+    if (u->res[0] == -EINVAL || u->res[0] == -EOPNOTSUPP || u->res[0] == -ENOSYS) return -1;
+    return 0;
+}
+#else
+typedef struct {
+    int fd;
+    int dead;
+} uring_stat_ctx_t;
+
+static int uring_stat_init(uring_stat_ctx_t *u, unsigned depth) {
+    (void)depth;
+    u->fd = -1;
+    return -1;
+}
+static void uring_stat_destroy(uring_stat_ctx_t *u) { (void)u; }
+static int uring_stat_probe(uring_stat_ctx_t *u) {
+    (void)u;
+    return -1;
+}
+#endif
+
 static int ecrawl_pfstatat_nf_verbose(int dirfd_value, const char *name, struct stat *st) {
     return ecrawl_pfstatat_nf(dirfd_value, name, st);
 }
@@ -1188,6 +1462,41 @@ static size_t parse_ecrawl_getdents_buf(void) {
     if (v < MIN_GETDENTS_BUF) return MIN_GETDENTS_BUF;
     if (v > MAX_GETDENTS_BUF) return MAX_GETDENTS_BUF;
     return (size_t)v;
+}
+
+/* io_uring batch depth for --iouring (SQEs per directory batch). Env: ECRAWL_IOURING_DEPTH.
+ * Clamped to [16, 4096]; the kernel may round the actual ring size up to a power of two. */
+static unsigned parse_ecrawl_iouring_depth(void) {
+    const char *e = getenv("ECRAWL_IOURING_DEPTH");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) return 256;
+    errno = 0;
+    v = strtoul(e, &end, 10);
+    if (errno || end == e || *end) return 256;
+    if (v < 16UL) return 16;
+    if (v > 4096UL) return 4096;
+    return (unsigned)v;
+}
+
+/* Minimum names in a collected directory batch before --iouring submits the ring.
+ * Below this, those names are statx'd synchronously (tiny dirs: one enter is a tax).
+ * Env: ECRAWL_IOURING_MIN_BATCH. Clamped to [1, depth]; 1 = always use the ring. */
+static unsigned parse_ecrawl_iouring_min_batch(unsigned depth) {
+    const char *e = getenv("ECRAWL_IOURING_MIN_BATCH");
+    unsigned long v;
+    char *end;
+
+    if (!e || !*e) v = 8;
+    else {
+        errno = 0;
+        v = strtoul(e, &end, 10);
+        if (errno || end == e || *end) v = 8;
+    }
+    if (v < 1UL) v = 1;
+    if (v > (unsigned long)depth) v = depth;
+    return (unsigned)v;
 }
 
 static size_t parse_ecrawl_donate_check_every(void) {
@@ -2057,7 +2366,8 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] "
+            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] "
+            "[--statx] [--iouring] [--progress] "
             "[--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
@@ -2072,7 +2382,13 @@ static void print_usage(const char *prog) {
             "--contains: keep paths whose full path contains <text>, case-insensitive "
             "(same rule as ereport_index --search). Requires --no-stat.\n"
             "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n"
-            "--progress: cheap live files=/entries= on stderr (donate-entry cadence); not implied by --verbose.\n");
+            "--progress: cheap live files=/entries= on stderr (donate-entry cadence); not implied by --verbose.\n"
+            "--statx: read inodes with statx(2) asking only for the fields this mode consumes "
+            "(--no-write: type/size/blocks/nlink/ino; capture: BASIC_STATS).\n"
+            "--iouring: batch each directory's inode reads through a per-worker io_uring "
+            "(ECRAWL_IOURING_DEPTH, default 256, range 16..4096; ECRAWL_IOURING_MIN_BATCH, "
+            "default 8: smaller collected batches are statx'd inline). The kernel opcode is "
+            "STATX; the mask is the same as --statx.\n");
     fprintf(stderr,
             "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
             "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
@@ -3725,6 +4041,8 @@ typedef struct {
     emit_context_t emit;
     char *dirbuf;
     size_t dirbuf_cap;
+    /* --iouring: per-worker ring (fd < 0 when unavailable or disabled). */
+    uring_stat_ctx_t uring;
 } crawl_identity_t;
 
 static int crawl_identity_init(crawl_identity_t *ci, worker_arg_t *arg) {
@@ -3747,17 +4065,34 @@ static int crawl_identity_init(crawl_identity_t *ci, worker_arg_t *arg) {
         ci->dirbuf = malloc(ci->dirbuf_cap);
         if (!ci->dirbuf) ci->dirbuf_cap = 0; /* fall back to libc readdir on OOM */
     }
+    ci->uring.fd = -1;
+    ci->uring.dead = 0;
+    if (g_iouring_statx) {
+        const char *why = NULL;
+
+        if (uring_stat_init(&ci->uring, g_iouring_depth) != 0)
+            why = strerror(errno);
+        else if (uring_stat_probe(&ci->uring) != 0)
+            why = "kernel rejects IORING_OP_STATX";
+        if (why) {
+            if (atomic_exchange(&g_io_uring_warned, 1) == 0)
+                fprintf(stderr, "WARN: io_uring unavailable (%s); --iouring falls back to statx\n", why);
+            uring_stat_destroy(&ci->uring);
+        }
+    }
     return 0;
 }
 
 static int process_directory_iterative(dir_stack_t *stack, worker_arg_t *wa, emit_context_t *emit,
-                                       task_queue_t *queue, char *dirbuf, size_t dirbuf_cap);
+                                       task_queue_t *queue, char *dirbuf, size_t dirbuf_cap,
+                                       uring_stat_ctx_t *uring);
 
 /* Run one task popped from the global queue, then account for no longer holding it. The pop already
  * counted this thread into g_active_workers, and quiescence is "seeding done, queue empty, nobody
  * active", so the thread that drops the last active count has to wake the sleepers that can now exit. */
 static void crawl_run_task(dir_stack_t *task, worker_arg_t *arg, crawl_identity_t *ci) {
-    process_directory_iterative(task, arg, &ci->emit, arg->queue, ci->dirbuf, ci->dirbuf_cap);
+    process_directory_iterative(task, arg, &ci->emit, arg->queue, ci->dirbuf, ci->dirbuf_cap,
+                                g_iouring_statx ? &ci->uring : NULL);
     atomic_fetch_sub(&g_active_workers, 1);
 
     if (atomic_load(&g_main_done) && atomic_load(&g_active_workers) == 0) {
@@ -3781,6 +4116,7 @@ static void crawl_identity_destroy(crawl_identity_t *ci, worker_arg_t *arg) {
     free(ci->dirbuf);
     ci->dirbuf = NULL;
     ci->dirbuf_cap = 0;
+    uring_stat_destroy(&ci->uring);
 }
 
 static int dir_stack_init(dir_stack_t *s) {
@@ -4144,12 +4480,210 @@ static void ecrawl_dir_reader_close(ecrawl_dir_reader_t *r) {
     }
 }
 
+/* ----- --iouring: batched per-entry inode reads (IORING_OP_STATX) ----------------------------------
+ * Same per-entry semantics as the inline loop in process_directory_iterative, but the per-entry
+ * statx calls of one directory are queued as a batch on this worker's ring and reaped in readdir
+ * order. A ring that dies mid-run degrades to synchronous statx per slot, so no entry is lost. */
+#ifdef ECRAWL_HAVE_IOURING
+
+/* Leaf accounting shared by the dispatch branches (mirrors the inline loop's leaf body). */
+static void crawl_iouring_leaf(const char *dir_path, size_t dir_path_len, const char *name, size_t name_len,
+                               const struct stat *st, shared_state_t *shared, crawl_stats_t *stats,
+                               perf_local_t *perf, emit_context_t *emit) {
+    uint64_t contrib;
+
+    record_ids_from_stat(st);
+    contrib = account_entry_shared(emit, shared, stats, perf, st);
+    if (!g_no_write) {
+        char child[PATH_MAX];
+        size_t child_len = dir_path_len + name_len + ((dir_path_len == 1 && dir_path[0] == '/') ? 0U : 1U);
+
+        if (path_join_fast(dir_path, dir_path_len, name, name_len, child, sizeof(child)) != 0) {
+            fprintf(stderr, "ERROR worker path too long: %s/%s\n", dir_path, name);
+            stats_add_error(shared);
+            return;
+        }
+        if (emit_record(emit, child, child_len, st, contrib) != 0) {
+            fprintf(stderr, "ERROR worker emit_record %s: %s\n", child, strerror(errno));
+            stats_add_error(shared);
+        }
+    }
+}
+
+/* Dispatch one stat'd entry exactly like the inline loop: a trusted DT_DIR goes to the local stack,
+ * a d_type-surprise directory goes to the discovered batch, anything else is a leaf. */
+static void crawl_iouring_dispatch(const char *dir_path, size_t dir_path_len, const char *name, size_t name_len,
+                                   unsigned char dtype, const struct stat *st, shared_state_t *shared,
+                                   crawl_stats_t *stats, perf_local_t *perf, emit_context_t *emit,
+                                   dir_stack_t *stack, task_queue_t *queue, worker_aux_stats_t *aux,
+                                   discovered_dir_batch_t *disc_batch, size_t *dirs_since_donate_check) {
+    char *owned;
+    size_t owned_len;
+
+    if (dtype == DT_DIR && S_ISDIR(st->st_mode)) {
+        if (path_join_alloc(dir_path, dir_path_len, name, name_len, &owned, &owned_len) != 0) {
+            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, name, strerror(errno));
+            stats_add_error(shared);
+            return;
+        }
+        if (dir_stack_push_take(stack, owned, owned_len, st, 0, 0) != 0) {
+            fprintf(stderr, "ERROR worker stack push %s: %s\n", owned, strerror(errno));
+            stats_add_error(shared);
+            if (disc_batch) {
+                (void)discovered_dir_batch_push(disc_batch, owned, owned_len, st, 0, 0);
+            } else if (enqueue_discovered_dir_task(queue, owned, owned_len, st, shared, 0, 0) != 0) {
+                fprintf(stderr, "ERROR worker failed to enqueue subdirectory task: %s\n", strerror(errno));
+                free(owned);
+            }
+            return;
+        }
+        (*dirs_since_donate_check)++;
+        donate_spill_periodic(shared, stack, queue, aux, dirs_since_donate_check);
+        return;
+    }
+    if (dtype != DT_DIR && S_ISDIR(st->st_mode)) {
+        if (path_join_alloc(dir_path, dir_path_len, name, name_len, &owned, &owned_len) != 0) {
+            fprintf(stderr, "ERROR worker path alloc %s/%s: %s\n", dir_path, name, strerror(errno));
+            stats_add_error(shared);
+            return;
+        }
+        if (discovered_dir_batch_push(disc_batch, owned, owned_len, st, 0, 0) != 0) return;
+        (*dirs_since_donate_check)++;
+        donate_spill_periodic(shared, stack, queue, aux, dirs_since_donate_check);
+        return;
+    }
+    crawl_iouring_leaf(dir_path, dir_path_len, name, name_len, st, shared, stats, perf, emit);
+}
+
+static void crawl_dir_entries_iouring(ecrawl_dir_reader_t *rd, int dir_fd, const char *dir_path,
+                                      size_t dir_path_len, shared_state_t *shared, crawl_stats_t *stats,
+                                      perf_local_t *perf, emit_context_t *emit, dir_stack_t *stack,
+                                      task_queue_t *queue, worker_aux_stats_t *aux,
+                                      discovered_dir_batch_t *disc_batch, worker_arg_t *wa,
+                                      uring_stat_ctx_t *u) {
+    const char *ent_name;
+    unsigned char ent_dtype;
+    uint64_t ent_ino = 0;
+    size_t dirs_since_donate_check = 0;
+    size_t entries_since_donate_check = 0;
+    int eof = 0;
+
+    while (!eof) {
+        unsigned i, n;
+        int use_ring;
+
+        /* Phase 1: collect names only. Prep/submit waits until we know n vs min_batch. */
+        u->batch = 0;
+        while (u->batch < u->depth) {
+            uring_slot_t *slot;
+            size_t name_len;
+            int rr = ecrawl_dir_reader_next(rd, &ent_name, &ent_dtype, &ent_ino);
+
+            if (rr != 1) {
+                eof = 1;
+                break;
+            }
+            if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
+            entries_since_donate_check++;
+            donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
+            name_len = strlen(ent_name);
+            slot = &u->slots[u->batch];
+            if (name_len >= sizeof(slot->name)) {
+                /* Beyond NAME_MAX: stat inline, keep the batch for the rest. */
+                struct stat st;
+
+                if (ecrawl_io_fstatat_nf(dir_fd, ent_name, &st) != 0) {
+                    fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, ent_name, strerror(errno));
+                    stats_add_error(shared);
+                    continue;
+                }
+                crawl_iouring_dispatch(dir_path, dir_path_len, ent_name, name_len, ent_dtype, &st, shared,
+                                       stats, perf, emit, stack, queue, aux, disc_batch,
+                                       &dirs_since_donate_check);
+                continue;
+            }
+            memcpy(slot->name, ent_name, name_len + 1);
+            slot->name_len = (uint16_t)name_len;
+            slot->dtype = ent_dtype;
+            u->batch++;
+        }
+        n = u->batch;
+        if (n == 0) break;
+
+        /* Tiny directories: one io_uring_enter for 1–2 names is a tax (neutral_flat). */
+        use_ring = !u->dead && n >= g_iouring_min_batch;
+        if (use_ring) {
+            for (i = 0; i < n; i++) uring_prep_slot(u, i, dir_fd, &u->slots[i]);
+            if (uring_submit_wait_all(u, n) != 0) {
+                u->dead = 1;
+                use_ring = 0;
+                fprintf(stderr, "WARN worker io_uring failed mid-run; continuing with statx\n");
+            }
+        }
+
+        for (i = 0; i < n; i++) {
+            uring_slot_t *slot = &u->slots[i];
+            struct stat st;
+
+            if (!use_ring) {
+                if (u->dead)
+                    ATOMIC_ADD_RELAXED(&g_io_uring_sync_redos, 1);
+                else
+                    ATOMIC_ADD_RELAXED(&g_io_uring_inline_stats, 1);
+                if (ecrawl_statx_fstatat_nf(dir_fd, slot->name, &st) != 0) {
+                    fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, slot->name, strerror(errno));
+                    stats_add_error(shared);
+                    continue;
+                }
+            } else {
+                long res = u->res[i];
+
+                ATOMIC_ADD_RELAXED(&g_io_lstat_calls, 1);
+                if (res != 0) {
+                    fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, slot->name,
+                            strerror((int)-res));
+                    stats_add_error(shared);
+                    continue;
+                }
+                if ((slot->stx.stx_mask & g_statx_mask) != g_statx_mask) {
+                    ATOMIC_ADD_RELAXED(&g_io_uring_sync_redos, 1);
+                    if (fstatat(dir_fd, slot->name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                        fprintf(stderr, "ERROR worker fstatat %s/%s: %s\n", dir_path, slot->name,
+                                strerror(errno));
+                        stats_add_error(shared);
+                        continue;
+                    }
+                } else {
+                    ecrawl_statx_to_stat(&slot->stx, &st);
+                }
+            }
+            crawl_iouring_dispatch(dir_path, dir_path_len, slot->name, slot->name_len, slot->dtype, &st,
+                                   shared, stats, perf, emit, stack, queue, aux, disc_batch,
+                                   &dirs_since_donate_check);
+        }
+    }
+    donate_spill_if_needed(shared, stack, queue, aux);
+}
+#else
+/* Never called: the stub ring's fd is always -1, so the caller takes the inline loop. */
+static void crawl_dir_entries_iouring(ecrawl_dir_reader_t *rd, int dir_fd, const char *dir_path,
+                                      size_t dir_path_len, shared_state_t *shared, crawl_stats_t *stats,
+                                      perf_local_t *perf, emit_context_t *emit, dir_stack_t *stack,
+                                      task_queue_t *queue, worker_aux_stats_t *aux,
+                                      discovered_dir_batch_t *disc_batch, worker_arg_t *wa,
+                                      uring_stat_ctx_t *u) {
+    (void)rd; (void)dir_fd; (void)dir_path; (void)dir_path_len; (void)shared; (void)stats;
+    (void)perf; (void)emit; (void)stack; (void)queue; (void)aux; (void)disc_batch; (void)wa; (void)u;
+}
+#endif
+
 static int process_directory_iterative(dir_stack_t *stack,
                                        worker_arg_t *wa,
                                        emit_context_t *emit,
                                        task_queue_t *queue,
                                        char *dirbuf,
-                                       size_t dirbuf_cap) {
+                                       size_t dirbuf_cap,
+                                       uring_stat_ctx_t *uring) {
     shared_state_t *shared = wa->shared;
     crawl_stats_t *stats = &wa->stats;
     perf_local_t *perf = &wa->perf;
@@ -4324,6 +4858,9 @@ static int process_directory_iterative(dir_stack_t *stack,
                     }
                 }
                 donate_spill_if_needed(shared, stack, queue, aux);
+            } else if (uring && uring->fd >= 0) {
+                crawl_dir_entries_iouring(&rd, dir_fd, dir_path, dir_path_len, shared, stats, perf, emit,
+                                          stack, queue, aux, &disc_b, wa, uring);
             } else {
                 size_t dirs_since_donate_check = 0;
                 size_t entries_since_donate_check = 0;
@@ -5442,6 +5979,10 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "start_path=%s\n", start_path);
     if (g_record_root) fprintf(fp, "record_root=%s\n", g_record_root);
     fprintf(fp, "no_write=%d\n", g_no_write);
+    fprintf(fp, "stat_impl=%s\n", g_iouring_statx ? "iouring" : (g_statx_mode ? "statx" : "fstatat"));
+    fprintf(fp, "statx_mask=0x%x\n", (g_statx_mode || g_iouring_statx) ? g_statx_mask : 0u);
+    fprintf(fp, "iouring_depth=%u\n", g_iouring_statx ? g_iouring_depth : 0u);
+    fprintf(fp, "iouring_min_batch=%u\n", g_iouring_statx ? g_iouring_min_batch : 0u);
     fprintf(fp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
     fprintf(fp, "output_layout=%s\n", g_no_write ? "none" : "uid_shards");
     /* Unique-byte hardlink dedup uses the inode registry whenever inodes are read. */
@@ -5510,6 +6051,9 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     fprintf(fp, "errors=%" PRIu64 "\n", shared->total_errors);
     fprintf(fp, "writer_failed=%u\n", atomic_load(&g_writer_failed));
     fprintf(fp, "io_lstat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_lstat_calls));
+    fprintf(fp, "io_uring_batches=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_uring_batches));
+    fprintf(fp, "io_uring_sync_redos=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_uring_sync_redos));
+    fprintf(fp, "io_uring_inline_stats=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_uring_inline_stats));
     fprintf(fp, "io_stat_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_stat_calls));
     fprintf(fp, "io_mkdir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_mkdir_calls));
     fprintf(fp, "io_opendir_calls=%" PRIu64 "\n", (uint64_t)atomic_load(&g_io_opendir_calls));
@@ -5597,6 +6141,15 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--no-stat") == 0) {
             g_no_stat = 1;
             g_no_write = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--statx") == 0) {
+            g_statx_mode = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--iouring") == 0) {
+            g_iouring_statx = 1;
+            g_statx_mode = 1; /* IORING_OP_STATX is the only inode-read opcode */
             continue;
         }
         if (strcmp(argv[i], "--count") == 0) {
@@ -5757,8 +6310,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "--print0 applies to the path stream; drop it when using --count\n");
         return 2;
     }
+#ifndef ECRAWL_HAVE_IOURING
+    if (g_iouring_statx) {
+        fprintf(stderr, "--iouring: this build has no io_uring support (missing <linux/io_uring.h> or arch syscall numbers)\n");
+        return 2;
+    }
+#endif
 
     ecrawl_install_verbose_profile();
+    ecrawl_install_statx_profile();
 
     if (path_resolve_existing(positionals[0], g_start_path_canon, "ecrawl: start-path ") != 0) return 2;
     start_path = g_start_path_canon;
@@ -5778,6 +6338,8 @@ int main(int argc, char **argv) {
     g_crawl_threads = parse_ecrawl_crawl_threads();
     g_stall_hint_seconds_cfg = parse_ecrawl_stall_hint_seconds();
     g_getdents_buf_bytes = parse_ecrawl_getdents_buf();
+    g_iouring_depth = parse_ecrawl_iouring_depth();
+    g_iouring_min_batch = parse_ecrawl_iouring_min_batch(g_iouring_depth);
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_entry_check_every_cfg = parse_ecrawl_donate_entry_check_every();
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
@@ -6238,6 +6800,8 @@ int main(int argc, char **argv) {
             if (g_record_root) fprintf(sumfp, "record_root=%s\n", g_record_root);
             fprintf(sumfp, "no_write=%d\n", g_no_write);
             fprintf(sumfp, "no_stat=%d\n", g_no_stat);
+            fprintf(sumfp, "stat_impl=%s\n",
+                    g_iouring_statx ? "iouring" : (g_statx_mode ? "statx" : "fstatat"));
             fprintf(sumfp, "hardlink_dedup=%s\n", g_no_stat ? "off" : "on");
             fprintf(sumfp, "output_dir=%s\n", g_no_write ? "(disabled)" : g_output_dir);
             fprintf(sumfp, "crawl_threads_started=%" PRIu64 "\n", shared.crawl_threads_started);

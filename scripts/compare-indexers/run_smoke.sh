@@ -27,6 +27,8 @@
 #                        du/dua/dut; answer_bytes= in notes)
 #   DO_NOSTAT=0          1: also time ecrawl --no-stat --count (file-count peer
 #                        of find/fd; answer_files= in notes)
+#   DO_STATX=0           1: also time ecrawl write+--no-write with --statx
+#   DO_IOURING=0         1: also time ecrawl write+--no-write with --iouring
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -108,8 +110,10 @@ export TOOLS="$TOOLS_INDEX"
 export INCLUDE_EREPORT_INDEX=1
 export DO_NOWRITE=${DO_NOWRITE:-0}
 export DO_NOSTAT=${DO_NOSTAT:-0}
+export DO_STATX=${DO_STATX:-0}
+export DO_IOURING=${DO_IOURING:-0}
 
-echo "==> index tools: $TOOLS  DO_NOWRITE=$DO_NOWRITE DO_NOSTAT=$DO_NOSTAT"
+echo "==> index tools: $TOOLS  DO_NOWRITE=$DO_NOWRITE DO_NOSTAT=$DO_NOSTAT DO_STATX=$DO_STATX DO_IOURING=$DO_IOURING"
 
 "$COMPARE_DIR/run_index.sh" "$SYNTH_ROOT" "$RESULTS_ROOT/index"
 

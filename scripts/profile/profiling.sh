@@ -6,7 +6,7 @@
 # Overridable paths (defaults in parentheses):
 #   EREPORT_BIN_DIR      built binaries        (/tmp/ereport)
 #   EREPORT_SCRIPTS_DIR  scripts/ root         (the parent of this script's dir)
-#   DATA_DIR             synthetic tree root   (/data1/erbmi1/ecrawl-synth)
+#   DATA_DIR             synthetic tree root   (/data1/erbmi1/ecrawl-synt)
 #   REPORT_DIR           output/fixture root   (/data1/erbmi1/ereport)
 #
 # Options:
@@ -16,6 +16,13 @@
 #                        deletes the journals it consumed); step2 enables the
 #                        per-fixture journals (kept at <bin-root>/<fixture>/journals)
 #                        via DO_TRIJOURNAL / EREPORT_INDEX_JOURNALS.
+#   STAT_IMPL=fstatat    inode-read syscall for every ecrawl pass in step1/step2:
+#                        fstatat (default) | statx (--statx) | iouring
+#                        (--iouring). One impl per run; compare across runs.
+#                        iouring falls back to statx when the kernel lacks
+#                        IORING_OP_STATX (watch io_uring_batches in summaries).
+#                        ECRAWL_IOURING_MIN_BATCH (default 8) stats tiny
+#                        directory batches inline.
 #   step2's fixture scripts take their own env knobs (DO_QUERY, MANYSHARD_COPIES,
 #   REPS, ...); anything exported here is inherited by them.
 #
@@ -27,16 +34,21 @@ ulimit -n 100000
 self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bin_root=${EREPORT_BIN_DIR:-/tmp/ereport}
 scripts_root=${EREPORT_SCRIPTS_DIR:-$(cd "$self_dir/.." && pwd)}
-data_dir=${DATA_DIR:-/data1/erbmi1/ecrawl-synth}
+data_dir=${DATA_DIR:-/data1/erbmi1/ecrawl-synt}
 report_dir=${REPORT_DIR:-/data1/erbmi1/ereport}
 bin_dir="$report_dir/bin"
 idx_dir="$report_dir/index"
 trijournal=${TRIJOURNAL:-0}
+stat_impl=${STAT_IMPL:-fstatat}
 
 # step2's fixture scripts each have their own knob; drive both from TRIJOURNAL.
 if [[ "$trijournal" == "1" ]]; then
   export DO_TRIJOURNAL=1 EREPORT_INDEX_JOURNALS=1
 fi
+case "$stat_impl" in
+  fstatat|statx|iouring) export ECRAWL_STAT_IMPL="$stat_impl" ;;
+  *) echo "ERROR: STAT_IMPL must be fstatat|statx|iouring (got '$stat_impl')" >&2; exit 2 ;;
+esac
 
 # The profilers only auto-detect ./<tool>, /tmp/<tool> and $PATH — none of which
 # match a $bin_root deploy — so name the binaries for them explicitly.
@@ -69,6 +81,10 @@ function step1() {
     crawl_args=(--trigram-journal "$jdir")
     make_args=(--journal-dir "$jdir")
   fi
+  case "$stat_impl" in
+    statx) crawl_args+=(--statx) ;;
+    iouring) crawl_args+=(--iouring) ;;
+  esac
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" --verbose "${crawl_args[@]}" "$data_dir" "$bin_dir"
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "${crawl_args[@]}" "$data_dir" "$bin_dir"
   ECRAWL_QUERY_THREADS=64 "$bin_root/ecrawl_query" --top 10 "$bin_dir"

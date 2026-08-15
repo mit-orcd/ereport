@@ -8,7 +8,10 @@
 #
 # Env:
 #   TOOLS="ecrawl gufi xdu robinhood find fd du dua dut"
-#                               (find/fd/du/dua/dut = live walk baselines only)
+#                               (find/fd/du/dua/dut = live walk baselines only;
+#                                add ecrawl_trij for the --trigram-journal variant:
+#                                crawl writes per-shard journals, ereport_index
+#                                --journal-dir replays them; separate CSV rows)
 #   REPS=3 DROP_CACHES=0|1 THREADS=16
 #   CACHE_MODES="cold hot"    which passes each repetition makes. Every tool
 #                     builds its whole pipeline cold, then again hot, so a hot
@@ -27,6 +30,8 @@
 #                     (du/dua/dut peer; hardlink_dedup=on)
 #   DO_NOSTAT=1       extra ecrawl row: --no-stat --count; answers regular-file count
 #                     (find/fd peer)
+#   DO_STATX=1        extra ecrawl rows: write+nowrite with --statx (statx(2), minimal mask)
+#   DO_IOURING=1      extra ecrawl rows: write+nowrite with --iouring (batched inode reads)
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -126,7 +131,7 @@ PY
 }
 
 run_ecrawl() {
-  local variant=$1 # write | nowrite | nostat
+  local variant=$1 # write | nowrite | nostat | write_statx | write_iouring | nowrite_statx | nowrite_iouring
   local rep=$2
   local dest="$WORK_ROOT/ecrawl_${variant}_r${rep}"
   prune_prev_index "ecrawl_${variant}" "$rep"
@@ -135,6 +140,12 @@ run_ecrawl() {
   local stem="ecrawl_${variant}_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
   local st=0
+  # statx variants: same work as their base variant, different inode-read syscall.
+  local stat_flags=()
+  case "$variant" in
+    *_statx) stat_flags=(--statx) ;;
+    *_iouring) stat_flags=(--iouring) ;;
+  esac
   set +e
   # --verbose prints the run's full key=value metrics to stdout at exit, which is
   # where the tree-wide file count and byte totals come from: Q4 and Q5 for the
@@ -148,21 +159,27 @@ run_ecrawl() {
         >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
     )
     st=$?
-  elif [[ "$variant" == "nowrite" ]]; then
-    time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-write "$TREE" >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+  elif [[ "$variant" == nowrite* ]]; then
+    time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-write "${stat_flags[@]}" "$TREE" \
+      >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
     st=$?
   else
-    time_cmd "$tfile" "$ECRAWL_BIN" --verbose "$TREE" "$dest" >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+    time_cmd "$tfile" "$ECRAWL_BIN" --verbose "${stat_flags[@]}" "$TREE" "$dest" \
+      >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
     st=$?
   fi
   set -e
   local el bytes notes answer
   el=$(elapsed_from_time_v "$tfile" || echo "")
-  if [[ "$variant" == "write" ]]; then
+  if [[ "$variant" == write* ]]; then
     bytes=$(ecrawl_index_bytes "$dest")
     notes="ERCBIN08_shards"
-    # Keep last write dest for ereport_index
-    echo "$dest" >"$OUT/ecrawl_bin_dir.txt"
+    if [[ "$variant" == "write_statx" ]]; then notes="$notes;statx"; fi
+    if [[ "$variant" == "write_iouring" ]]; then notes="$notes;iouring"; fi
+    # Keep last plain-write dest for ereport_index
+    if [[ "$variant" == "write" ]]; then
+      echo "$dest" >"$OUT/ecrawl_bin_dir.txt"
+    fi
   elif [[ "$variant" == "nostat" ]]; then
     bytes=0
     answer=$(kv_from_file files "$OUT/${stem}.stdout.txt")
@@ -171,11 +188,54 @@ run_ecrawl() {
     bytes=0
     answer=$(kv_from_file total_bytes "$OUT/${stem}.stdout.txt")
     notes="answer_bytes=${answer:-};apparent_size_hardlink_dedup=on"
+    if [[ "$variant" == "nowrite_statx" ]]; then notes="$notes;statx"; fi
+    if [[ "$variant" == "nowrite_iouring" ]]; then notes="$notes;iouring"; fi
   fi
   if [[ $st -ne 0 ]]; then
     append_row ecrawl "$variant" "$rep" fail "${el:-}" "$bytes" "exit=$st"
+  elif [[ "$variant" == *_iouring ]]; then
+    # A kernel without IORING_OP_STATX makes ecrawl fall back to plain statx;
+    # the row would measure the wrong mode under the wrong label. Skip it.
+    local batches
+    batches=$(kv_from_file io_uring_batches "$OUT/${stem}.stdout.txt")
+    if [[ "${batches:-0}" == "0" ]]; then
+      append_row ecrawl "$variant" "$rep" skipped "${el:-}" "$bytes" "iouring_unavailable;fell_back_to_statx"
+    else
+      append_row ecrawl "$variant" "$rep" ok "${el:-}" "$bytes" "$notes"
+    fi
   else
     append_row ecrawl "$variant" "$rep" ok "${el:-}" "$bytes" "$notes"
+  fi
+}
+
+# Journal variant of the write crawl: same capture, plus per-shard trigram
+# journals in a sibling dir for ereport_index --journal-dir. The journals are
+# crawl output, so their bytes are billed to the crawl row.
+run_ecrawl_trij() {
+  local rep=$1
+  local dest="$WORK_ROOT/ecrawl_trij_r${rep}"
+  local jdir="$WORK_ROOT/ecrawl_trij_journals_r${rep}"
+  prune_prev_index ecrawl_trij "$rep"
+  prune_prev_index ecrawl_trij_journals "$rep"
+  rm -rf "$dest" "$jdir"
+  mkdir -p "$dest" "$jdir"
+  local stem="ecrawl_trij_write_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
+  local st=0
+  set +e
+  time_cmd "$tfile" "$ECRAWL_BIN" --verbose --trigram-journal "$jdir" "$TREE" "$dest" \
+    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+  st=$?
+  set -e
+  local el bytes
+  el=$(elapsed_from_time_v "$tfile" || echo "")
+  bytes=$(( $(ecrawl_index_bytes "$dest") + $(dir_bytes "$jdir") ))
+  if [[ $st -ne 0 ]]; then
+    append_row ecrawl_trij write "$rep" fail "${el:-}" "$bytes" "exit=$st"
+  else
+    append_row ecrawl_trij write "$rep" ok "${el:-}" "$bytes" "ERCBIN08_shards+crawl_trijournals"
+    echo "$dest" >"$OUT/ecrawl_trij_bin_dir.txt"
+    echo "$jdir" >"$OUT/ecrawl_trij_journal_dir.txt"
   fi
 }
 
@@ -188,12 +248,13 @@ run_ecrawl() {
 # deleted, and the shard-bound dir-index sidecars correctly reject it, so the
 # queries fell back to the slow path and the run showed no improvement.
 ereport_index_rep() {
-  local rep=$1 ecrawl_reps index_reps
-  ecrawl_reps=$(tool_reps ecrawl)
+  local rep=$1 crawl_tool=${2:-ecrawl}
+  local crawl_reps index_reps
+  crawl_reps=$(tool_reps "$crawl_tool")
   index_reps=$(tool_reps ereport_index)
-  # There are only as many captures to index as ecrawl makes.
-  ((index_reps <= ecrawl_reps)) || index_reps=$ecrawl_reps
-  ((rep > ecrawl_reps - index_reps))
+  # There are only as many captures to index as the crawl tool makes.
+  ((index_reps <= crawl_reps)) || index_reps=$crawl_reps
+  ((rep > crawl_reps - index_reps))
 }
 
 run_ereport_index() {
@@ -230,6 +291,45 @@ run_ereport_index() {
     append_row ereport_index make "$rep" ok "${el:-}" "$bytes" \
       "trigram_on_top_of_crawl; input=${bin_dir##*/}"
     echo "$idx" >"$OUT/ereport_index_dir.txt"
+  fi
+}
+
+# Journal-consuming twin of run_ereport_index: indexes the capture from
+# run_ecrawl_trij, replaying its per-shard journals. A successful build deletes
+# the replayed journals; every pass crawls first, so the next pass starts from
+# a full set again and no snapshot/restore is needed between passes.
+run_ereport_index_trij() {
+  local rep=$1
+  local bin_dir jdir
+  bin_dir=$(cat "$OUT/ecrawl_trij_bin_dir.txt" 2>/dev/null || true)
+  jdir=$(cat "$OUT/ecrawl_trij_journal_dir.txt" 2>/dev/null || true)
+  if [[ -z "$bin_dir" || ! -d "$bin_dir" || -z "$jdir" || ! -d "$jdir" ]]; then
+    append_row ereport_index_trij make "$rep" skipped "" 0 "no_ecrawl_trij_bins"
+    return 0
+  fi
+  if ! tool_available ereport_index; then
+    append_row ereport_index_trij make "$rep" skipped "" 0 "missing_binary"
+    return 0
+  fi
+  local idx="$WORK_ROOT/ereport_index_trij_r${rep}"
+  rm -rf "$idx"
+  mkdir -p "$idx"
+  local stem="ereport_index_trij_r${rep}${RUN_TAG}"
+  local tfile="$OUT/${stem}.time.txt"
+  set +e
+  time_cmd "$tfile" "$EREPORT_INDEX_BIN" --make --journal-dir "$jdir" --index-dir "$idx" "$bin_dir" \
+    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
+  local st=$?
+  set -e
+  local el bytes
+  el=$(elapsed_from_time_v "$tfile" || echo "")
+  bytes=$(dir_bytes "$idx")
+  if [[ $st -ne 0 ]]; then
+    append_row ereport_index_trij make "$rep" fail "${el:-}" "$bytes" "exit=$st"
+  else
+    append_row ereport_index_trij make "$rep" ok "${el:-}" "$bytes" \
+      "trigram_on_top_of_crawl; journal_replay; input=${bin_dir##*/}"
+    echo "$idx" >"$OUT/ereport_index_trij_dir.txt"
   fi
 }
 
@@ -677,6 +777,14 @@ run_tool_pipeline() {
       if [[ "${DO_NOWRITE:-0}" == "1" ]]; then
         run_ecrawl nowrite "$rep"
       fi
+      if [[ "${DO_STATX:-0}" == "1" ]]; then
+        run_ecrawl write_statx "$rep"
+        run_ecrawl nowrite_statx "$rep"
+      fi
+      if [[ "${DO_IOURING:-0}" == "1" ]]; then
+        run_ecrawl write_iouring "$rep"
+        run_ecrawl nowrite_iouring "$rep"
+      fi
       if [[ "${DO_NOSTAT:-0}" == "1" ]]; then
         run_ecrawl nostat "$rep"
       fi
@@ -687,6 +795,14 @@ run_tool_pipeline() {
       # query phase reads are the pair that were made from each other.
       if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep"; then
         run_ereport_index "$rep"
+      fi
+      ;;
+    ecrawl_trij)
+      run_ecrawl_trij "$rep"
+      # Same gating as the plain pair: the journal replay is timed on
+      # ecrawl_trij's last reps and REPS_EREPORT_INDEX caps both pipelines.
+      if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep" ecrawl_trij; then
+        run_ereport_index_trij "$rep"
       fi
       ;;
     gufi)
