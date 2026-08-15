@@ -990,10 +990,9 @@ select_arg_set() {
 # would read this list as a tool of its own.
 KNOWN_REPS_TOOLS="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
 
-# ereport_index used to be pinned to rep 1 by a condition in run_index.sh. That
-# default is worth keeping -- it builds from ecrawl's capture, so repeating it
-# measures the same input twice -- but it is a default now, not a rule.
-REPS_EREPORT_INDEX=${REPS_EREPORT_INDEX:-1}
+# Crawl and index are one pipeline, so the index follows the crawl's count
+# unless the caller pins it lower (last N write reps of each cache series).
+REPS_EREPORT_INDEX=${REPS_EREPORT_INDEX:-$REPS}
 
 reps_var_name() {
   printf 'REPS_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
@@ -1118,7 +1117,25 @@ harness_warn() {
 # asking and the affected rows can say so.
 DB_DOWN=0
 
+# One drop (or one deliberate non-drop) starts a tool-rep. Later timed commands
+# in the same unit — crawl then index, or Q1 then Q6 — must not drop again, or
+# the "last cold run warms the hot series" contract is only true of the last
+# command, not of the pipeline.
+UNIT_CACHE_READY=0
+UNIT_CACHE_DROPPED=0
+
+begin_timed_unit() {
+  UNIT_CACHE_READY=0
+  maybe_drop_caches
+  UNIT_CACHE_DROPPED=$CACHE_DROPPED
+  UNIT_CACHE_READY=1
+}
+
 maybe_drop_caches() {
+  if [[ "${UNIT_CACHE_READY:-0}" == "1" ]]; then
+    CACHE_DROPPED=${UNIT_CACHE_DROPPED:-0}
+    return 0
+  fi
   CACHE_DROPPED=0
   # The hot pass is defined by not dropping anything, including MariaDB's buffer
   # pool: it is measuring what the work costs when the metadata is already in

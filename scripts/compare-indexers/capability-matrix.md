@@ -54,7 +54,7 @@ Three more fairness decisions shape every number here. Each phase is measured **
 | Q6 substring `*token*.dat` **[extra]** | find predicates, but no index can serve it | find-like | regex | `ereport_index --search token` \| `grep -E '/[^/]*token[^/]*\.dat$'` |
 | User-scoped search | DB filters | designed for unprivileged users | partition (`-u`) | per-uid crawl/report or all-users |
 
-Each query has **three argument sets**. A repetition asks set 1 cold, set 1 hot — so the cache delta is measured on identical work — then sets 2 and 3 hot, so no hot number is a second answer to a question just asked. Correctness is checked per (query, argument set), each against its own reference.
+Each query has **three argument sets**. The measured series is set 1: all cold reps, then all hot reps, so the cache delta is identical work. Sets 2 and 3 run once hot afterwards, so those bars are different questions. Correctness is checked per (query, argument set), each against its own reference.
 
 ## Ops / architecture
 
@@ -158,10 +158,10 @@ Each query has **three argument sets**. A repetition asks set 1 cold, set 1 hot 
     shape with one anchor's difference, so the pair is the measurement, not either row alone. The seeds
     plant a directory carrying the token and a file with the wrong extension, so a tool that indexes
     directories or matches the whole path over-reports and the correctness check catches it.
-14. **Cold and hot are separate measurements, not a range.** Every repetition of every phase runs cold
-    (caches dropped, MariaDB restarted for the rows that read it) and then hot, and the `cache` column
-    keeps them apart in the CSVs, the tables and the figures. A cold pass on a host where the harness
-    could not drop anything records itself as `warm`, because a claim the run cannot support should not
-    be in the data. In the index phase it is the whole pipeline that repeats, so a hot `ereport_index`
-    reads the shards a hot `ecrawl` just wrote.
+14. **Cold and hot are separate measurements, not a range.** Each tool finishes all of its cold reps
+    (one drop, then the whole pipeline) before any hot rep, so the last cold run is what warms the
+    hot series. The `cache` column keeps them apart in the CSVs, the tables and the figures. A cold
+    pass on a host where the harness could not drop anything records itself as `warm`, because a claim
+    the run cannot support should not be in the data. Crawl and index are one unit, so a hot
+    `ereport_index` reads the shards the hot `ecrawl` in that same unit just wrote.
 15. **Open files:** every tool here wants far more than the stock 1024 — `ereport_index` keeps trigram writers × LRU shards open, GUFI opens a database per directory. `benchmark.sh` raises `RLIMIT_NOFILE` to 128k (`NOFILE_TARGET`) for the whole run, and the step-by-step scripts do the same for themselves. Non-root runs are capped by the hard limit, which the summary records.

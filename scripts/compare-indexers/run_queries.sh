@@ -25,10 +25,9 @@
 #
 # Env: TOOLS="find fd du dua dut ecrawl_suite gufi xdu robinhood" REPS=3
 #      REPS_<TOOL>=n overrides REPS for one tool, e.g. REPS_ROBINHOOD=1
-#      CACHE_MODES="cold hot"  which passes each repetition makes. The cold pass
-#                     uses argument set 1; the hot pass repeats set 1, so the
-#                     cache delta is measured on identical work, and then runs
-#                     the remaining sets so no bar is a re-answer.
+#      CACHE_MODES="cold hot"  per tool: all cold reps (drop, then Q1–Q6 on
+#                     set 1), then all hot reps (same work, warmed by the last
+#                     cold suite). Remaining argument sets run once hot after.
 #      ARG_SETS=3     ceiling on how many argument sets the hot pass uses
 #
 set -euo pipefail
@@ -129,23 +128,11 @@ if [[ -f "$SEEDS" ]]; then
   set +a
 fi
 
-# How many argument sets the manifest planted, and the passes each repetition
-# makes over them: cold on set 1, then hot on set 1 (so the cache delta is
-# measured on identical work) and on every remaining set (so no later bar is a
-# re-answer of a question just answered).
+# How many argument sets the manifest planted. The measured series is set 1
+# only: all cold reps, then all hot reps, so the last cold suite warms the hot
+# series. Sets 2..N run once afterwards, still hot, so those bars are not a
+# re-answer of set 1.
 ARG_SETS_AVAILABLE=$(arg_sets_available)
-QUERY_PASSES=()
-for _mode in $CACHE_MODES; do
-  if [[ "$_mode" == "cold" ]]; then
-    QUERY_PASSES+=("cold:1")
-  else
-    for ((_s = 1; _s <= ARG_SETS_AVAILABLE; _s++)); do
-      QUERY_PASSES+=("$_mode:$_s")
-    done
-  fi
-done
-unset _mode _s
-((${#QUERY_PASSES[@]} > 0)) || QUERY_PASSES=("cold:1")
 
 select_arg_set 1
 if [[ -z "$Q1_NAME" ]]; then
@@ -935,12 +922,14 @@ blocked() {
   return 0
 }
 
-REPS_MAX=$(max_tool_reps $TOOLS)
 echo "==> repetitions: $(reps_plan $TOOLS)"
-printf '==> passes per rep: %s\n' "${QUERY_PASSES[*]}"
+echo "==> cache series per tool: $CACHE_MODES (all cold reps, then all hot reps, set 1)"
 
 run_one_tool() {
   local t=$1 rep=$2
+  USES_DB=0
+  [[ "$t" == "robinhood" ]] && USES_DB=1
+  begin_timed_unit
   case "$t" in
     find) q_find "$rep" ;;
     fd) q_fd "$rep" ;;
@@ -955,28 +944,35 @@ run_one_tool() {
   esac
 }
 
-for ((rep = 1; rep <= REPS_MAX; rep++)); do
-  export CURRENT_REP=$rep
-  for pass in "${QUERY_PASSES[@]}"; do
-    CACHE_STATE=${pass%%:*}
-    select_arg_set "${pass#*:}"
-    # One filename set per pass. The cold pass keeps the untagged names, which
-    # is what summarize.py reaches for first when it quotes a command's output.
-    if [[ "$pass" == "${QUERY_PASSES[0]}" ]]; then
+for t in $TOOLS; do
+  t_reps=$(tool_reps "$t")
+  pass=0
+  for mode in $CACHE_MODES; do
+    pass=$((pass + 1))
+    export CACHE_STATE=$mode
+    select_arg_set 1
+    for ((rep = 1; rep <= t_reps; rep++)); do
+      export CURRENT_REP=$rep
       RUN_TAG=""
-    else
-      RUN_TAG="_${CACHE_STATE}_a${ARG_SET}"
-    fi
-    for t in $TOOLS; do
-      t_reps=$(tool_reps "$t")
-      # A tool that has had its repetitions still leaves the others running, so
-      # the query series each one sees is unchanged.
-      ((rep <= t_reps)) || continue
-      printf '==> rep %d/%d %s set %d: %s Q1-Q6 (%s)\n' \
-        "$rep" "$t_reps" "$CACHE_STATE" "$ARG_SET" "$t" "$(date +%H:%M:%S)"
+      ((pass == 1)) || RUN_TAG="_${mode}"
+      printf '==> %s rep %d/%d %s set %d Q1-Q6 (%s)\n' \
+        "$t" "$rep" "$t_reps" "$mode" "$ARG_SET" "$(date +%H:%M:%S)"
       run_one_tool "$t" "$rep"
     done
   done
+  # Extra argument sets stay hot-only and run once, after this tool's measured
+  # series, so they are not a second answer to set 1 and do not drop the cache
+  # that the last hot suite left.
+  if [[ "$ARG_SETS_AVAILABLE" -gt 1 ]] && [[ " $CACHE_MODES " == *" hot "* ]]; then
+    export CACHE_STATE=hot
+    export CURRENT_REP=1
+    for ((_s = 2; _s <= ARG_SETS_AVAILABLE; _s++)); do
+      select_arg_set "$_s"
+      RUN_TAG="_hot_a${ARG_SET}"
+      printf '==> %s extra set %d (hot) Q1-Q6 (%s)\n' "$t" "$ARG_SET" "$(date +%H:%M:%S)"
+      run_one_tool "$t" 1
+    done
+  fi
 done
 
 # Robinhood's indexes are part of what a run costs, so they do not survive it:

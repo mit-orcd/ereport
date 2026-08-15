@@ -36,10 +36,11 @@ Open-file limits matter at this scale; `benchmark.sh` raises `RLIMIT_NOFILE` to 
 
 ### 2. Cold and hot
 
-Both are measured, in that order, for every repetition of every phase:
-`CACHE_MODES="cold hot"` is the default. Each `ecrawl` variant is its own
-cold/hot pair (drop, then the same command again) so the hot number is not
-whatever the previous variant left in cache. Run as root with `DROP_CACHES=1` and
+Both are measured, in that order, as a per-tool series:
+`CACHE_MODES="cold hot"` is the default. Each tool (and each `ecrawl` variant)
+does all of its cold reps — drop, then crawl and index together, or Q1–Q6 —
+and only then its hot reps, so the last cold run is what warms the hot series.
+Run as root with `DROP_CACHES=1` and
 `DROP_DB_CACHE=1` so the cold pass is genuinely cold (`sync; echo 3 >
 /proc/sys/vm/drop_caches`, plus a MariaDB restart for the rows that read it);
 without the privileges to drop anything the cold pass records itself as `warm`

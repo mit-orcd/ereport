@@ -41,10 +41,9 @@ SEED_ROOT="$SYNTH_ROOT/$SEED_QUERY_DIR"
 rm -rf "$SEED_ROOT"
 mkdir -p "$SEED_ROOT/large_subdir" "$SEED_ROOT/named" "$SEED_ROOT/infix"
 
-# Three arguments per query, not one. The benchmark asks each question four
-# times per repetition -- once cold and three times hot -- and a hot run that
-# repeats the cold argument twice more would be timing the answer it already
-# has in memory rather than the index.
+# Three arguments per query, not one. The measured series is set 1 (all cold
+# reps, then all hot reps); sets 2 and 3 run once hot afterwards so those bars
+# are different questions, not a re-answer of set 1.
 STAMP="$(date +%s)_$$"
 
 # Q1: three unique basenames.

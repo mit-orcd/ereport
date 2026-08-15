@@ -87,8 +87,8 @@
 #   TOOLS_INDEX, TOOLS_QUERY, RBH_DB_DATADIR, EDELETE_BIN, EDELETE_THREADS
 #
 # REPS_<TOOL> is the env spelling of --reps: REPS_GUFI=1 and --reps gufi=1 do
-# the same thing. REPS_EREPORT_INDEX defaults to 1 because it indexes ecrawl's
-# capture, so repeating it re-measures identical input; REPS_ECRAWL is its cap.
+# the same thing. REPS_EREPORT_INDEX follows REPS so crawl and index stay a
+# pair; REPS_ECRAWL is still its cap.
 #
 # Add ecrawl_trij to TOOLS_INDEX to also measure the crawl-time trigram journal
 # pipeline: ecrawl --trigram-journal + ereport_index --journal-dir, charted as
@@ -102,10 +102,10 @@
 # SYNTH_PROFILE, REPS, TOOLS, DROP_CACHES, CACHE_MODES and INSTALL_PACKAGES are
 # only defaulted when they are unset.
 #
-# CACHE_MODES is "cold hot" for a measured run: every repetition of every phase
-# is timed once against dropped caches and once warm, since the two answer
-# different questions. --small, --smoke and --quick cut back to one pass, because
-# they check answers rather than measure them.
+# CACHE_MODES is "cold hot" for a measured run: each tool finishes all its cold
+# reps (drop, then the whole pipeline) before any hot rep, so the last cold run
+# is what warms the hot series. --small, --smoke and --quick cut back to one
+# pass, because they check answers rather than measure them.
 #
 # RBH_DB_DATADIR puts MariaDB's tables on the storage under test, defaulting to
 # <work>/mariadb, so Robinhood's index is not the only one on the OS disk.

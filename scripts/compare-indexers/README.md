@@ -235,14 +235,12 @@ space separated and may be repeated; the env spelling is `REPS_GUFI=1`. Tool
 names are checked against the list the harness actually runs, because a typo
 that was accepted would cost a whole run at a count nobody chose.
 
-Tools are still visited repetition-major, so each one meets the same cache state
-it would have met at a flat `REPS`; a tool that has had its repetitions simply
-drops out of the later passes. `REPS_EREPORT_INDEX` defaults to 1 — it indexes
-the capture `ecrawl` just wrote, so a second pass re-measures identical input —
-and is capped by `REPS_ECRAWL`. Its repetitions are `ecrawl`'s *last* ones, not
-its first: each `ecrawl` repetition overwrites the capture pointer and prunes the
-one before it, so only the final capture is still there to be queried, and an
-index built from any earlier one is paired with a crawl that no longer exists.
+Each tool (and each `ecrawl` variant) finishes all of its cold reps before any
+hot rep, so a tool with fewer repetitions simply ends its series earlier and
+does not sit in the middle of another tool's cache. `REPS_EREPORT_INDEX` follows
+`REPS` — crawl and index are one pipeline — and is capped by `REPS_ECRAWL`. Pin
+it lower to index only the last N write reps of each cache series. The capture
+that survives is still the last write, which is the one `run_queries.sh` reads.
 
 When any tool differs, `env.txt` records `reps_per_tool=`, and both
 `SUMMARY_TABLE.txt` and the chart captions name the exceptions rather than
@@ -917,22 +915,22 @@ See [prod-protocol.md](prod-protocol.md).
 
 | Setting | Effect |
 |---------|--------|
-| `CACHE_MODES="cold hot"` | which passes each repetition makes; `CACHE_MODES=cold` restores the old single-pass behaviour |
-| `DROP_CACHES=1` | `sync` + `drop_caches` before each timed command on a cold pass (needs root) |
-| `DROP_CACHES_SCOPE=first-rep` | only rep 1 is cold, so later reps show warm latency as in the paper |
+| `CACHE_MODES="cold hot"` | per tool: all cold reps, then all hot reps; `CACHE_MODES=cold` is a single series |
+| `DROP_CACHES=1` | `sync` + `drop_caches` once at the start of each cold tool-rep (needs root) |
+| `DROP_CACHES_SCOPE=first-rep` | only cold rep 1 drops, so later cold reps show warm latency as in the paper |
 | `DROP_DB_CACHE=1` | also restart MariaDB, since `drop_caches` leaves InnoDB's buffer pool warm |
-| `ARG_SETS=3` | ceiling on how many query argument sets the hot passes rotate through |
+| `ARG_SETS=3` | ceiling on extra hot-only argument sets after the measured set-1 series |
 
 ### Cold and hot are both measured
 
 Cold and hot answer different questions, and a run that reports only one of them
-is answering the other by accident. So every repetition runs twice:
+is answering the other by accident. Each tool (and each `ecrawl` variant) runs
+as a series:
 
-- **cold** — caches dropped before each timed command (and MariaDB restarted for
-  the rows that read it), which is what the work costs against storage nobody
-  has touched.
-- **hot** — nothing dropped, which is what it costs when the metadata is already
-  in memory: the state a second query on a live system meets.
+- **cold** — `REPS` times: drop caches (and restart MariaDB for the rows that
+  read it), then the whole pipeline (crawl and index together, or Q1–Q6).
+- **hot** — `REPS` times: the same pipeline, nothing dropped. The last cold run
+  is what warms the first hot; later hots stay warm.
 
 The `cache` column of both CSVs says which pass a row belongs to, and it is
 `warm` rather than `cold` when the run wanted a cold pass but had no privileges
@@ -940,12 +938,9 @@ to drop anything — a claim the run cannot make should not be in the data. The
 summary table and the charts key on that column, so cold and hot appear as two
 series rather than being averaged into a number neither of them measured.
 
-In the index phase, `ecrawl` and `ecrawl_trij` pair each variant cold-then-hot
-(drop, timed, timed) so a hot write is the same command again, not the first
-command after six other walks and an index build. `ereport_index` is its own
-pair after the write pair. Other tools still run their whole pipeline cold and
-then hot, so a hot `gufi_rollup` reads the tree its own `dir2index` just wrote.
-The last write of a pair rebuilds into the same directory, so the disk
+A drop starts the unit, not every timed command inside it: index is not re-dropped
+after the crawl that just wrote its shards, and Q2 is not re-dropped after Q1.
+The last write of a series rebuilds into the same directory, so the disk
 footprint is unchanged.
 
 ### Query argument sets
@@ -953,13 +948,9 @@ footprint is unchanged.
 A hot query that asks exactly what the cold one just asked is measuring the
 answer it already has. `prepare-synth.sh` therefore plants **three argument sets**
 per query — three unique basenames, three glob families with their own literals,
-three size thresholds, three subtrees, three infix tokens — and each repetition
-asks:
-
-1. cold, set 1
-2. hot, set 1 — the same work, so the cold/hot delta is a clean comparison
-3. hot, set 2 and hot, set 3 — different questions, so no later bar is a
-   re-answer
+three size thresholds, three subtrees, three infix tokens. The measured series
+is set 1 only (all cold reps, then all hot reps). Sets 2 and 3 run once hot
+after that tool's series, so those bars are different questions, not a re-answer.
 
 Set 1 is what the manifest's unindexed keys name, so a seed file written by hand,
 or by a `prepare-synth.sh` from before the sets existed, still resolves as set 1.
