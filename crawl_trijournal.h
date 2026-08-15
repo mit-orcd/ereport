@@ -7,11 +7,12 @@
  * `ereport_index --make --journal-dir DIR` to skip capture parsing for that
  * shard.
  *
- * File layout (<journal_dir>/<shard basename>.tij):
+ * File layout (<journal_dir>/<shard basename>.tij), version 2:
  *
  *     trij_hdr_t                       (rewritten at finalize)
  *     shard basename                   (hdr.name_len bytes)
  *     trij_block_hdr_t + zstd frame    (repeated: one per block of entries)
+ *     trij_block_ent_t[block_count]    (at hdr.block_table_off, written at finalize)
  *
  * Each decompressed block is a sequence of entries:
  *
@@ -19,7 +20,11 @@
  *     varint code_count, varint first_code, varint (gap-1) x (code_count-1)
  *
  * Codes are the sorted-unique 24-bit basename trigrams from trigram_extract.c,
- * so gaps are >= 1 and (gap-1) stays unsigned. Reads are strictly sequential.
+ * so gaps are >= 1 and (gap-1) stays unsigned. Blocks are self-contained zstd
+ * frames, and the v2 block table records each block's file offset, so a reader
+ * can seek to any block and replay a bounded range — ereport_index uses that to
+ * split one shard's journal into parallel work units like capture chunks.
+ * Sequential front-to-back replay remains the default when no range is set.
  *
  * Publication contract: ecrawl writes <name>.tij.tmp with flags=0 and only
  * renames to <name>.tij after rewriting the header with TRIJ_FLAG_COMPLETE
@@ -55,6 +60,8 @@ typedef struct __attribute__((packed)) {
     uint64_t catalog_offset;
     uint64_t catalog_entries; /* the uint64 that opens the catalog blob */
     uint64_t max_dir_id;
+    uint64_t block_table_off; /* v2: file offset of the trij_block_ent_t array; 0 when count is 0 */
+    uint64_t block_count; /* v2: number of flushed blocks (and table entries) */
     uint32_t name_len; /* shard basename bytes follow the header */
     uint32_t reserved32;
 } trij_hdr_t;
@@ -65,6 +72,14 @@ typedef struct __attribute__((packed)) {
     uint32_t uncomp_len;
     uint32_t reserved;
 } trij_block_hdr_t;
+
+/* v2 block table entry: seek target for ranged replay. file_off names the
+ * block's trij_block_hdr_t; comp_len is the zstd frame size after it. */
+typedef struct __attribute__((packed)) {
+    uint64_t file_off;
+    uint32_t comp_len;
+    uint32_t n_entries;
+} trij_block_ent_t;
 
 /* The facts finalize records and validation re-checks against the live shard. */
 typedef struct {
@@ -93,6 +108,9 @@ typedef struct {
     size_t block_len;
     uint32_t block_entries;
     uint64_t record_count;
+    trij_block_ent_t *blocks; /* one entry per flushed block, written as the v2 table at finalize */
+    size_t blocks_count;
+    size_t blocks_cap;
     int failed; /* sticky: any I/O or alloc error voids this shard's journal */
 } trij_writer_t;
 
@@ -138,6 +156,9 @@ typedef struct {
     uint64_t entries_read;
     uint32_t *codes; /* decode buffer, valid until the next trij_reader_next */
     size_t codes_cap;
+    trij_block_ent_t *blocks; /* v2 table after trij_reader_load_block_table */
+    uint64_t block_count;
+    uint64_t blocks_left; /* replay bound: hdr.block_count at validate, or the set_block_range count */
     int eof;
 } trij_reader_t;
 
@@ -153,10 +174,26 @@ int trij_reader_open_validate(trij_reader_t *r, const char *journal_dir, const c
 
 /*
  * Next entry: 1 = the out-params are filled (pointers into reader storage,
- * valid until the next call), 0 = clean EOF, -1 = corrupt journal.
+ * valid until the next call), 0 = clean EOF (or the end of a range set with
+ * trij_reader_set_block_range), -1 = corrupt journal.
  */
 int trij_reader_next(trij_reader_t *r, const char **path, size_t *path_len, uint64_t *uid,
                      uint8_t *type, const uint32_t **codes, size_t *code_count);
+
+/*
+ * Load the v2 block table into the reader (idempotent). Uses pread, so the
+ * fd's sequential replay position is undisturbed. 0 on success, -1 on error
+ * (truncated/bogus table). The table is at r->blocks / r->block_count.
+ */
+int trij_reader_load_block_table(trij_reader_t *r);
+
+/*
+ * Position the reader at block `first` and bound replay to `nblocks` blocks;
+ * trij_reader_next then yields exactly the entries of blocks
+ * [first, first+nblocks) and returns 0. Requires the table to be loaded.
+ * 0 on success, -1 on a range past the table or a seek error.
+ */
+int trij_reader_set_block_range(trij_reader_t *r, uint64_t first, uint64_t nblocks);
 
 void trij_reader_close(trij_reader_t *r);
 

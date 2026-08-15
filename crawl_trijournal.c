@@ -211,6 +211,19 @@ static int trij_writer_flush_block(trij_writer_t *w) {
     bh.comp_len = (uint32_t)clen;
     bh.uncomp_len = (uint32_t)w->block_len;
     if (trij_writer_reopen(w) != 0) goto out;
+    /* Record the block's seek target before advancing file_off: the v2 block
+     * table written at finalize is what ranged (parallel) replay seeks by. */
+    if (w->blocks_count == w->blocks_cap) {
+        size_t ncap = w->blocks_cap ? w->blocks_cap * 2 : 64;
+        trij_block_ent_t *nb = (trij_block_ent_t *)realloc(w->blocks, ncap * sizeof(*nb));
+        if (!nb) goto out;
+        w->blocks = nb;
+        w->blocks_cap = ncap;
+    }
+    w->blocks[w->blocks_count].file_off = w->file_off;
+    w->blocks[w->blocks_count].comp_len = (uint32_t)clen;
+    w->blocks[w->blocks_count].n_entries = w->block_entries;
+    w->blocks_count++;
     if (trij_pwrite_all(w->fd, &bh, sizeof(bh), (off_t)w->file_off) != 0) goto out;
     if (trij_pwrite_all(w->fd, comp, clen, (off_t)(w->file_off + sizeof(bh))) != 0) goto out;
     w->file_off += (uint64_t)sizeof(bh) + (uint64_t)clen;
@@ -277,6 +290,18 @@ int trij_writer_finalize(trij_writer_t *w, const trij_binding_t *binding) {
         return -1;
     }
 
+    /* The block table goes after the last block, before the header rewrite:
+     * a crash anywhere in here leaves flags=0 in the on-disk header and the
+     * .tmp is never renamed, so readers never see a partial table. */
+    if (w->blocks_count > 0) {
+        size_t table_len = w->blocks_count * sizeof(*w->blocks);
+        if (trij_pwrite_all(w->fd, w->blocks, table_len, (off_t)w->file_off) != 0) {
+            w->failed = 1;
+            return -1;
+        }
+        w->bytes_written += (uint64_t)table_len;
+    }
+
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, CRAWL_TRIJ_MAGIC, CRAWL_TRIJ_MAGIC_LEN);
     hdr.version = TRIJOURNAL_VERSION;
@@ -288,6 +313,8 @@ int trij_writer_finalize(trij_writer_t *w, const trij_binding_t *binding) {
     hdr.catalog_offset = binding->catalog_offset;
     hdr.catalog_entries = binding->catalog_entries;
     hdr.max_dir_id = binding->max_dir_id;
+    hdr.block_table_off = w->blocks_count ? w->file_off : 0;
+    hdr.block_count = (uint64_t)w->blocks_count;
     /* The basename was written at create; only the fixed header is rewritten. */
     hdr.name_len = w->name_len;
     if (trij_pwrite_all(w->fd, &hdr, sizeof(hdr), 0) != 0) {
@@ -328,6 +355,10 @@ void trij_writer_abort(trij_writer_t *w) {
     w->block_cap = 0;
     w->block_len = 0;
     w->block_entries = 0;
+    free(w->blocks);
+    w->blocks = NULL;
+    w->blocks_count = 0;
+    w->blocks_cap = 0;
 }
 
 /* ----------------------------------------------------------------- reader */
@@ -386,6 +417,10 @@ int trij_reader_open_validate(trij_reader_t *r, const char *journal_dir, const c
         if (n_entries != r->hdr.catalog_entries) goto out;
     }
 
+    /* Bound sequential replay to the published blocks: the v2 block table sits
+     * after the last block, so "read until physical EOF" would parse table bytes
+     * as a block header. A set_block_range call overrides this bound. */
+    r->blocks_left = r->hdr.block_count;
     valid = 1;
 out:
     if (sfd >= 0) (void)close(sfd);
@@ -411,8 +446,13 @@ int trij_reader_next(trij_reader_t *r, const char **path, size_t *path_len, uint
 
     if (r->block_entries_left == 0) {
         trij_block_hdr_t bh;
-        int rr = trij_read_all(r->fd, &bh, sizeof(bh));
+        int rr;
 
+        if (r->blocks_left == 0) {
+            r->eof = 1;
+            return 0;
+        }
+        rr = trij_read_all(r->fd, &bh, sizeof(bh));
         if (rr > 0) {
             r->eof = 1;
             return 0;
@@ -431,6 +471,7 @@ int trij_reader_next(trij_reader_t *r, const char **path, size_t *path_len, uint
         r->ubuf_len = bh.uncomp_len;
         r->ubuf_pos = 0;
         r->block_entries_left = bh.n_entries;
+        r->blocks_left--;
     }
 
     p = r->ubuf + r->ubuf_pos;
@@ -481,6 +522,75 @@ int trij_reader_next(trij_reader_t *r, const char **path, size_t *path_len, uint
     return 1;
 }
 
+int trij_reader_load_block_table(trij_reader_t *r) {
+    uint64_t i;
+    size_t len;
+
+    if (r->blocks) return 0; /* idempotent */
+    if (r->fd < 0) return -1;
+    if (r->hdr.block_count == 0) return 0; /* empty journal: no blocks to seek to */
+    if (r->hdr.block_count > (UINT64_MAX / sizeof(trij_block_ent_t))) return -1;
+    if (r->hdr.block_table_off < sizeof(trij_hdr_t)) return -1;
+    len = (size_t)r->hdr.block_count * sizeof(trij_block_ent_t);
+    r->blocks = (trij_block_ent_t *)malloc(len);
+    if (!r->blocks) return -1;
+    {
+        const unsigned char *p = (const unsigned char *)r->blocks;
+        size_t left = len;
+        off_t off = (off_t)r->hdr.block_table_off;
+
+        while (left > 0) {
+            ssize_t n = pread(r->fd, (void *)p, left, off);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                goto bad;
+            }
+            if (n == 0) goto bad; /* table truncated */
+            p += (size_t)n;
+            off += n;
+            left -= (size_t)n;
+        }
+    }
+    r->block_count = r->hdr.block_count;
+    /* Table sanity: ascending in-file offsets, each block header inside the file
+     * region before the table itself, entry counts summing to record_count. */
+    {
+        uint64_t entries = 0;
+        for (i = 0; i < r->block_count; i++) {
+            uint64_t boff = r->blocks[i].file_off;
+            if (boff < sizeof(trij_hdr_t) || boff + sizeof(trij_block_hdr_t) > r->hdr.block_table_off)
+                goto bad;
+            if (i > 0 && boff <= r->blocks[i - 1].file_off) goto bad;
+            if ((uint64_t)r->blocks[i].comp_len > r->hdr.block_table_off - boff) goto bad;
+            entries += r->blocks[i].n_entries;
+        }
+        if (entries != r->hdr.record_count) goto bad;
+    }
+    return 0;
+bad:
+    free(r->blocks);
+    r->blocks = NULL;
+    r->block_count = 0;
+    return -1;
+}
+
+int trij_reader_set_block_range(trij_reader_t *r, uint64_t first, uint64_t nblocks) {
+    if (!r->blocks || first > r->block_count || nblocks > r->block_count - first) return -1;
+    if (nblocks == 0) {
+        r->blocks_left = 0;
+        r->block_entries_left = 0;
+        r->eof = 0; /* a later non-empty range on this reader must still read */
+        return 0;
+    }
+    if (lseek(r->fd, (off_t)r->blocks[first].file_off, SEEK_SET) < 0) return -1;
+    r->blocks_left = nblocks;
+    r->block_entries_left = 0;
+    r->ubuf_pos = 0;
+    r->ubuf_len = 0;
+    r->eof = 0;
+    return 0;
+}
+
 void trij_reader_close(trij_reader_t *r) {
     if (r->fd >= 0) {
         (void)close(r->fd);
@@ -495,4 +605,7 @@ void trij_reader_close(trij_reader_t *r) {
     free(r->codes);
     r->codes = NULL;
     r->codes_cap = 0;
+    free(r->blocks);
+    r->blocks = NULL;
+    r->block_count = 0;
 }

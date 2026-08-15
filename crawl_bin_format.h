@@ -489,7 +489,9 @@ static inline int crawl_bin_record_ctime_led(const bin_record_hdr_t *r) {
 /* Crawl-time trigram journal (crawl_trijournal.c): one <shard>.tij per shard. */
 #define CRAWL_TRIJ_MAGIC "ETIJ001"
 #define CRAWL_TRIJ_MAGIC_LEN 8
-#define TRIJOURNAL_VERSION 1u
+/* v2 adds the block-offset table for ranged (parallel) replay; v1 journals fail
+ * the version check and the indexer falls back to parsing the capture. */
+#define TRIJOURNAL_VERSION 2u
 
 typedef struct __attribute__((packed)) {
     char magic[8];

@@ -124,7 +124,8 @@ static size_t entry_make(unsigned int i, char *path, size_t path_cap, uint64_t *
     return code_count;
 }
 
-#define ROUND_ENTRIES 5000u /* ~300 KB uncompressed: crosses the 256 KB block target */
+#define ROUND_ENTRIES 5000u /* ~200 KB uncompressed at ~40 B/entry: fits one block */
+#define RANGE_ENTRIES 24000u /* ~1 MB: comfortably crosses several 256 KB blocks */
 
 static void test_round_trip(const char *jdir, const char *shard_path) {
     trij_writer_t w;
@@ -296,6 +297,7 @@ static void test_incomplete(const char *jdir, const char *shard_path) {
     free(w.path_tmp);
     free(w.path_final);
     free(w.block);
+    free(w.blocks);
 
     memset(&r, 0, sizeof(r));
     rc = trij_reader_open_validate(&r, jdir, shard_path, NULL);
@@ -426,6 +428,205 @@ static void test_path_overflow(const char *jdir) {
               -1);
 }
 
+/* Replay the reader's current range, checking every entry against the
+ * deterministic pattern at (*next)+n; advances *next. 0 ok, -1 problem. */
+static int replay_check(trij_reader_t *r, uint64_t *next, uint64_t *count_out) {
+    uint64_t n = 0;
+
+    for (;;) {
+        const char *gpath;
+        size_t gpath_len;
+        uint64_t guid;
+        uint8_t gtype;
+        const uint32_t *gcodes;
+        size_t gcc;
+        char epath[4096];
+        uint64_t euid;
+        uint8_t etype;
+        uint32_t ecodes[8];
+        size_t ecc;
+        int got = trij_reader_next(r, &gpath, &gpath_len, &guid, &gtype, &gcodes, &gcc);
+
+        if (got < 0) return -1;
+        if (got == 0) break;
+        ecc = entry_make((unsigned int)(*next + n), epath, sizeof(epath), &euid, &etype, ecodes, 8);
+        if (gpath_len != strlen(epath) || memcmp(gpath, epath, gpath_len) != 0 || guid != euid ||
+            gtype != etype || gcc != ecc || (gcc && memcmp(gcodes, ecodes, gcc * sizeof(uint32_t)) != 0))
+            return -1;
+        n++;
+    }
+    *next += n;
+    *count_out = n;
+    return 0;
+}
+
+static void test_block_table_and_ranges(const char *jdir, const char *shard_path) {
+    trij_writer_t w;
+    trij_reader_t r;
+    trij_binding_t binding;
+    char path[4096];
+    uint64_t uid;
+    uint8_t type;
+    uint32_t codes[8];
+    unsigned int i;
+    uint64_t sum_entries;
+    uint64_t b;
+    int rc;
+
+    binding_from_stat(shard_path, &binding);
+    memset(&w, 0, sizeof(w));
+    if (trij_writer_create(&w, jdir, "uid_shard_0007.bin") != 0) {
+        fail("ranges create", "trij_writer_create failed");
+        return;
+    }
+    for (i = 0; i < RANGE_ENTRIES; i++) {
+        size_t cc = entry_make(i, path, sizeof(path), &uid, &type, codes, 8);
+        if (trij_writer_append(&w, path, strlen(path), uid, type, codes, cc) != 0) {
+            fail("ranges append", "trij_writer_append failed");
+            trij_writer_abort(&w);
+            return;
+        }
+    }
+    rc = trij_writer_finalize(&w, &binding);
+    check_int("ranges finalize", rc, 0);
+    if (rc != 0) return;
+
+    memset(&r, 0, sizeof(r));
+    rc = trij_reader_open_validate(&r, jdir, shard_path, NULL);
+    check_int("ranges open_validate", rc, 1);
+    if (rc != 1) return;
+
+    rc = trij_reader_load_block_table(&r);
+    check_int("block table loads", rc, 0);
+    if (rc != 0) {
+        trij_reader_close(&r);
+        return;
+    }
+    check_int("table idempotent", trij_reader_load_block_table(&r), 0);
+    check_int("multiple blocks", r.block_count >= 2, 1);
+    check_u64("first block after name", r.block_count ? r.blocks[0].file_off : 0,
+              (uint64_t)sizeof(trij_hdr_t) + (uint64_t)strlen("uid_shard_0007.bin"));
+    sum_entries = 0;
+    for (b = 0; b < r.block_count; b++) {
+        if (b > 0 && r.blocks[b].file_off <= r.blocks[b - 1].file_off) {
+            fail("block offsets ascending", "disorder in table");
+            break;
+        }
+        sum_entries += r.blocks[b].n_entries;
+    }
+    check_u64("table entries sum to record_count", sum_entries, RANGE_ENTRIES);
+
+    /* Two ranges concatenated must reproduce the exact full sequence, for a
+     * few split points: ranges partition the journal with no boundary loss. */
+    {
+        uint64_t splits[3];
+        unsigned int s;
+
+        splits[0] = 1;
+        splits[1] = r.block_count / 2;
+        splits[2] = r.block_count - 1;
+        for (s = 0; s < 3; s++) {
+            uint64_t k = splits[s];
+            uint64_t next = 0;
+            uint64_t n = 0;
+            char what[96];
+
+            snprintf(what, sizeof(what), "ranges partition at block %llu", (unsigned long long)k);
+            rc = trij_reader_set_block_range(&r, 0, k);
+            rc |= replay_check(&r, &next, &n);
+            rc |= trij_reader_set_block_range(&r, k, r.block_count - k);
+            rc |= replay_check(&r, &next, &n);
+            if (rc == 0 && next == RANGE_ENTRIES)
+                ok(what);
+            else
+                fail(what, "range concatenation lost or shifted entries");
+        }
+    }
+
+    /* A single middle block replays exactly its own entries. */
+    {
+        uint64_t first_entry = r.blocks[0].n_entries;
+        uint64_t next = first_entry;
+        uint64_t n = 0;
+
+        rc = trij_reader_set_block_range(&r, 1, 1);
+        rc |= replay_check(&r, &next, &n);
+        check_int("single middle block replays", rc, 0);
+        check_u64("single middle block entry count", n, r.blocks[1].n_entries);
+    }
+
+    /* Empty range: immediate clean EOF, and the reader recovers afterwards. */
+    check_int("empty range accepted", trij_reader_set_block_range(&r, 1, 0), 0);
+    {
+        uint64_t next = 0;
+        uint64_t n = 42;
+
+        check_int("empty range yields nothing", replay_check(&r, &next, &n), 0);
+        check_u64("empty range count", n, 0);
+        check_int("range after empty", trij_reader_set_block_range(&r, 0, 1), 0);
+        check_int("replay after empty range", replay_check(&r, &next, &n), 0);
+        check_u64("replay after empty: block 0 entries", n, r.blocks[0].n_entries);
+    }
+
+    /* Ranges past the table are rejected. */
+    check_int("range past end rejected", trij_reader_set_block_range(&r, r.block_count, 1), -1);
+    check_int("range overflow rejected", trij_reader_set_block_range(&r, r.block_count - 1, 2), -1);
+
+    trij_reader_close(&r);
+}
+
+static void test_v1_rejected(const char *jdir, const char *shard_path) {
+    trij_writer_t w;
+    trij_reader_t r;
+    trij_binding_t binding;
+    char jpath[4096];
+    char path[64];
+    uint64_t uid;
+    uint8_t type;
+    uint32_t codes[8];
+    int fd;
+    int rc;
+
+    binding_from_stat(shard_path, &binding);
+    memset(&w, 0, sizeof(w));
+    if (trij_writer_create(&w, jdir, "uid_shard_0007.bin") != 0) {
+        fail("v1 create", "create failed");
+        return;
+    }
+    entry_make(5, path, sizeof(path), &uid, &type, codes, 8);
+    (void)trij_writer_append(&w, path, strlen(path), uid, type, codes, 1);
+    if (trij_writer_finalize(&w, &binding) != 0) {
+        fail("v1 finalize", "finalize failed");
+        return;
+    }
+
+    /* Downgrade the on-disk version field (right after the 8-byte magic) to 1:
+     * a pre-table journal must fail validation so the caller parses the capture. */
+    if (trij_journal_path(jpath, sizeof(jpath), jdir, "uid_shard_0007.bin", 0) != 0) {
+        fail("v1 setup", "path build failed");
+        return;
+    }
+    fd = open(jpath, O_RDWR);
+    if (fd < 0) {
+        fail("v1 setup", "open failed");
+        return;
+    }
+    {
+        uint32_t v1 = 1;
+        if (pwrite(fd, &v1, sizeof(v1), 8) != (ssize_t)sizeof(v1)) {
+            fail("v1 setup", "version rewrite failed");
+            (void)close(fd);
+            return;
+        }
+    }
+    (void)close(fd);
+
+    memset(&r, 0, sizeof(r));
+    rc = trij_reader_open_validate(&r, jdir, shard_path, NULL);
+    check_int("v1 journal rejected (capture fallback)", rc, 0);
+    if (rc == 1) trij_reader_close(&r);
+}
+
 int main(void) {
     char tmpl[] = "/tmp/test_trij_XXXXXX";
     char *dir;
@@ -449,6 +650,8 @@ int main(void) {
     }
 
     test_round_trip(jdir, shard);
+    test_block_table_and_ranges(jdir, shard);
+    test_v1_rejected(jdir, shard);
     test_empty_journal(jdir, shard);
     test_incomplete(jdir, shard);
     expect_reject("reject size mismatch", jdir, shard, mutate_size);

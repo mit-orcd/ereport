@@ -2512,17 +2512,43 @@ static void *chunk_prep_worker_main(void *arg) {
 
         if (i >= pool->path_count) break;
 
-        /* A valid crawl-time trigram journal replaces the capture parse for this shard with a
-         * single whole-shard replay work item. Missing/stale journals fall back to today's path. */
+        /* A valid crawl-time trigram journal replaces the capture parse for this shard with
+         * replay work items. The v2 block table lets one shard's journal split into parallel
+         * block-range chunks (start_offset/end_offset carry block indices then); a table-less
+         * or single-block journal stays one whole-shard [0, UINT64_MAX) replay chunk.
+         * Missing/stale journals fall back to today's path. */
         if (g_journal_dir) {
             trij_reader_t jr;
 
             if (trij_reader_open_validate(&jr, g_journal_dir, pool->paths[i], NULL) == 1) {
                 size_t cap = 0;
+                int split = trij_reader_load_block_table(&jr) == 0 && jr.block_count > 1 &&
+                            jr.hdr.record_count > 0;
 
+                r = 0;
+                if (split) {
+                    /* ~4 work units per parse worker, whole blocks, balanced by entries. */
+                    uint64_t want = (uint64_t)parse_index_thread_count() * 4ULL;
+                    uint64_t per = (jr.hdr.record_count + want - 1ULL) / want;
+                    uint64_t b = 0;
+
+                    while (b < jr.block_count && r == 0) {
+                        uint64_t e = b;
+                        uint64_t acc = 0;
+
+                        do {
+                            acc += jr.blocks[e].n_entries;
+                            e++;
+                        } while (e < jr.block_count && acc < per);
+                        r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap,
+                                                   pool->paths[i], b, e, i);
+                        b = e;
+                    }
+                } else {
+                    r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap, pool->paths[i], 0,
+                                               UINT64_MAX, i);
+                }
                 trij_reader_close(&jr);
-                r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap, pool->paths[i], 0,
-                                           UINT64_MAX, i);
                 if (r == 0) pool->file_states[i].use_journal = 1;
             } else {
                 r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
@@ -3992,6 +4018,19 @@ static int process_chunk_make_journal(worker_arg_t *worker, const file_chunk_t *
         fprintf(stderr, "warn: journal for %s turned stale mid-run\n", chunk->path);
         atomic_fetch_add(&rs->bad_input_files, 1U);
         return -1;
+    }
+
+    /* Chunk prep stashed a block range in the chunk offsets for journaled shards;
+     * [0, UINT64_MAX) means the whole journal (no table or a single block). */
+    if (chunk->start_offset != 0 || chunk->end_offset != UINT64_MAX) {
+        if (trij_reader_load_block_table(&jr) != 0 ||
+            trij_reader_set_block_range(&jr, chunk->start_offset,
+                                        chunk->end_offset - chunk->start_offset) != 0) {
+            fprintf(stderr, "warn: journal block table for %s unreadable mid-run\n", chunk->path);
+            atomic_fetch_add(&rs->bad_input_files, 1U);
+            trij_reader_close(&jr);
+            return -1;
+        }
     }
 
     for (;;) {
