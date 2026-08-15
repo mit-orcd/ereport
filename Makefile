@@ -179,23 +179,13 @@ ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bi
 ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-# Standalone walk benchmark for inode access strategy (scripts/profile/ewalk-strategy-bench.sh).
-# Deliberately not in TARGETS: it is a measurement instrument, not part of the
-# product, so `make` and scripts/test/test.sh stay unaffected. Build with `make ewalkbench`.
-# -g here and not in CFLAGS: the bench's perf pass defaults to PERF_CALLGRAPH=dwarf
-# and has no DWARF to unwind without it. It does not affect codegen, so timings stay
-# comparable to runs built without it. -fno-omit-frame-pointer is deliberately absent
-# for the opposite reason: it does change codegen, and the wall times are the result.
-ewalkbench: ewalkbench.c
-	$(CC) $(CFLAGS) -g $(JEMALLOC_CFLAGS) -o $@ ewalkbench.c $(JEMALLOC_LIBS)
-
 # Debug build
 debug: CFLAGS = -O0 -g -Wall -Wextra -pthread
 debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog test_crawl_trijournal *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
+	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog test_crawl_trijournal *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
 	rm -rf __pycache__
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
