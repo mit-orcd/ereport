@@ -90,10 +90,6 @@
 # the same thing. REPS_EREPORT_INDEX follows REPS so crawl and index stay a
 # pair; REPS_ECRAWL is still its cap.
 #
-# Add ecrawl_trij to TOOLS_INDEX to also measure the crawl-time trigram journal
-# pipeline: ecrawl --trigram-journal + ereport_index --journal-dir, charted as
-# "ecrawl + ereport_index (journal)" next to the plain pair.
-#
 # WORK_ROOT and RESULTS_ROOT are the env spellings of --work and --results;
 # WORK_ROOT names the index directory itself, --work names a parent that also
 # gets a tmp/ for TMPDIR.
@@ -115,9 +111,10 @@
 # root and 0 otherwise. DO_NOWRITE defaults to 1 so ecrawl's stat-walk row sits
 # beside du/dua/dut; DO_NOSTAT defaults to 1 so the names-only row sits beside
 # find/fd. Each adds one extra traversal per rep; set either to 0 to skip.
-# DO_STATX / DO_IOURING default to 0 and each adds two ecrawl traversals per rep
-# (write + --no-write) with --statx / --iouring, to measure the inode-read
-# syscall against the fstatat baseline.
+# Cold write / --no-write crawls pass --iouring (ECRAWL_COLD_IOURING=1); hot
+# stays on fstatat. That is the measured inode-read path, not an extra row.
+# DO_STATX / DO_IOURING stay 0: they add write+nowrite variants that measure
+# --statx / --iouring as their own CSV rows, which a default run does not need.
 # On dnf hosts PKG_ARGS defaults to --disableplugin=etckeeper so a site hook
 # cannot stall the install on a password prompt; set PKG_ARGS to override.
 #
@@ -225,7 +222,7 @@ usage() {
 # script deliberately does not source lib.sh, and a typo has to be caught here:
 # rejected at the command line it costs a retype, accepted it costs a whole run
 # at a repetition count nobody chose.
-REPS_TOOL_NAMES="ecrawl ecrawl_trij ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
+REPS_TOOL_NAMES="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
 
 reps_valid() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1)); }
 
@@ -738,14 +735,16 @@ do_run() {
   local nostat=${DO_NOSTAT:-1}
   local statx=${DO_STATX:-0}
   local iouring=${DO_IOURING:-0}
+  local cold_iouring=${ECRAWL_COLD_IOURING:-1}
 
-  log "4/5 benchmarking (reps=$(reps_summary) cache=$CACHE_MODES DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite DO_NOSTAT=$nostat DO_STATX=$statx DO_IOURING=$iouring)"
+  log "4/5 benchmarking (reps=$(reps_summary) cache=$CACHE_MODES DROP_CACHES=$DROP_CACHES DROP_DB_CACHE=$DROP_DB_CACHE DO_NOWRITE=$nowrite DO_NOSTAT=$nostat DO_STATX=$statx DO_IOURING=$iouring ECRAWL_COLD_IOURING=$cold_iouring)"
   info "results: $results"
   info "each timed binary prints one line: <seconds>  <label>"
   SKIP_PREPARE=1 REPS="$REPS" DROP_CACHES="$DROP_CACHES" DROP_DB_CACHE="$DROP_DB_CACHE" \
     CACHE_MODES="$CACHE_MODES" \
     DO_NOWRITE="$nowrite" DO_NOSTAT="$nostat" \
     DO_STATX="$statx" DO_IOURING="$iouring" \
+    ECRAWL_COLD_IOURING="$cold_iouring" \
     WORK_ROOT="$SCRATCH_INDEXES" TMPDIR="$SCRATCH_TMP" \
     WITH_EXTERNALS="${WITH_EXTERNALS:-0}" \
     "$SCRIPT_DIR/run_smoke.sh" "$tree" "$results"

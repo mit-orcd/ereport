@@ -8,10 +8,7 @@
 #
 # Env:
 #   TOOLS="ecrawl gufi xdu robinhood find fd du dua dut"
-#                               (find/fd/du/dua/dut = live walk baselines only;
-#                                add ecrawl_trij for the --trigram-journal variant:
-#                                crawl writes per-shard journals, ereport_index
-#                                --journal-dir replays them; separate CSV rows)
+#                               (find/fd/du/dua/dut = live walk baselines only)
 #   REPS=3 DROP_CACHES=0|1 THREADS=16
 #   CACHE_MODES="cold hot"    per tool (and per ecrawl variant): all cold reps
 #                     first, then all hot reps. Each cold rep drops, then runs
@@ -32,6 +29,8 @@
 #                     (find/fd peer)
 #   DO_STATX=1        extra ecrawl rows: write+nowrite with --statx (statx(2), minimal mask)
 #   DO_IOURING=1      extra ecrawl rows: write+nowrite with --iouring (batched inode reads)
+#   ECRAWL_COLD_IOURING=1  default write/nowrite pass --iouring on the cold
+#                     cache series (hot stays fstatat). Set 0 for fstatat on both.
 #
 set -euo pipefail
 # shellcheck source=lib.sh
@@ -140,11 +139,17 @@ run_ecrawl() {
   local stem="ecrawl_${variant}_r${rep}${RUN_TAG}"
   local tfile="$OUT/${stem}.time.txt"
   local st=0
-  # statx variants: same work as their base variant, different inode-read syscall.
+  # Inode-read syscall: named variants pin one; the default write/nowrite use
+  # --iouring on a cold pass (ECRAWL_COLD_IOURING=1) and fstatat when hot.
   local stat_flags=()
   case "$variant" in
     *_statx) stat_flags=(--statx) ;;
     *_iouring) stat_flags=(--iouring) ;;
+    write|nowrite)
+      if [[ "${ECRAWL_COLD_IOURING:-1}" == "1" && "$CACHE_STATE" == "cold" ]]; then
+        stat_flags=(--iouring)
+      fi
+      ;;
   esac
   set +e
   # --verbose prints the run's full key=value metrics to stdout at exit, which is
@@ -153,11 +158,12 @@ run_ecrawl() {
   # only at exit, so it does not affect the timing.
   if [[ "$variant" == "nostat" ]]; then
     # Names-only census: d_type file count, no path stream (find/fd peer).
-    (
-      export ECRAWL_CRAWL_THREADS="$ECRAWL_NOSTAT_CRAWL_THREADS"
+    # Env prefix, not a subshell: time_cmd records CACHE_DROPPED in this
+    # shell, and a subshell used to drop that flag so the row was written
+    # as warm after a real drop.
+    ECRAWL_CRAWL_THREADS="$ECRAWL_NOSTAT_CRAWL_THREADS" \
       time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-stat --count "$TREE" \
         >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
-    )
     st=$?
   elif [[ "$variant" == nowrite* ]]; then
     time_cmd "$tfile" "$ECRAWL_BIN" --verbose --no-write "${stat_flags[@]}" "$TREE" \
@@ -175,7 +181,9 @@ run_ecrawl() {
     bytes=$(ecrawl_index_bytes "$dest")
     notes="ERCBIN08_shards"
     if [[ "$variant" == "write_statx" ]]; then notes="$notes;statx"; fi
-    if [[ "$variant" == "write_iouring" ]]; then notes="$notes;iouring"; fi
+    if [[ "$variant" == "write_iouring" || ( "$variant" == "write" && "${stat_flags[*]}" == *--iouring* ) ]]; then
+      notes="$notes;iouring"
+    fi
     # Keep last plain-write dest for ereport_index
     if [[ "$variant" == "write" ]]; then
       echo "$dest" >"$OUT/ecrawl_bin_dir.txt"
@@ -189,53 +197,31 @@ run_ecrawl() {
     answer=$(kv_from_file total_bytes "$OUT/${stem}.stdout.txt")
     notes="answer_bytes=${answer:-};apparent_size_hardlink_dedup=on"
     if [[ "$variant" == "nowrite_statx" ]]; then notes="$notes;statx"; fi
-    if [[ "$variant" == "nowrite_iouring" ]]; then notes="$notes;iouring"; fi
+    if [[ "$variant" == "nowrite_iouring" || ( "$variant" == "nowrite" && "${stat_flags[*]}" == *--iouring* ) ]]; then
+      notes="$notes;iouring"
+    fi
   fi
   if [[ $st -ne 0 ]]; then
     append_row ecrawl "$variant" "$rep" fail "${el:-}" "$bytes" "exit=$st"
-  elif [[ "$variant" == *_iouring ]]; then
-    # A kernel without IORING_OP_STATX makes ecrawl fall back to plain statx;
-    # the row would measure the wrong mode under the wrong label. Skip it.
+  elif [[ "${stat_flags[*]}" == *--iouring* ]]; then
+    # A kernel without IORING_OP_STATX makes ecrawl fall back to plain statx.
+    # Extra *_iouring rows skip so they are not mislabelled; the default
+    # write/nowrite keep the capture (the index needs it) and note the fallback.
     local batches
     batches=$(kv_from_file io_uring_batches "$OUT/${stem}.stdout.txt")
     if [[ "${batches:-0}" == "0" ]]; then
-      append_row ecrawl "$variant" "$rep" skipped "${el:-}" "$bytes" "iouring_unavailable;fell_back_to_statx"
+      if [[ "$variant" == *_iouring ]]; then
+        append_row ecrawl "$variant" "$rep" skipped "${el:-}" "$bytes" "iouring_unavailable;fell_back_to_statx"
+      else
+        notes=${notes%;iouring}
+        append_row ecrawl "$variant" "$rep" ok "${el:-}" "$bytes" \
+          "${notes};iouring_unavailable;fell_back_to_statx"
+      fi
     else
       append_row ecrawl "$variant" "$rep" ok "${el:-}" "$bytes" "$notes"
     fi
   else
     append_row ecrawl "$variant" "$rep" ok "${el:-}" "$bytes" "$notes"
-  fi
-}
-
-# Journal variant of the write crawl: same capture, plus per-shard trigram
-# journals in a sibling dir for ereport_index --journal-dir. The journals are
-# crawl output, so their bytes are billed to the crawl row.
-run_ecrawl_trij() {
-  local rep=$1
-  local dest="$WORK_ROOT/ecrawl_trij_r${rep}"
-  local jdir="$WORK_ROOT/ecrawl_trij_journals_r${rep}"
-  prune_prev_index ecrawl_trij "$rep"
-  prune_prev_index ecrawl_trij_journals "$rep"
-  rm -rf "$dest" "$jdir"
-  mkdir -p "$dest" "$jdir"
-  local stem="ecrawl_trij_write_r${rep}${RUN_TAG}"
-  local tfile="$OUT/${stem}.time.txt"
-  local st=0
-  set +e
-  time_cmd "$tfile" "$ECRAWL_BIN" --verbose --trigram-journal "$jdir" "$TREE" "$dest" \
-    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
-  st=$?
-  set -e
-  local el bytes
-  el=$(elapsed_from_time_v "$tfile" || echo "")
-  bytes=$(( $(ecrawl_index_bytes "$dest") + $(dir_bytes "$jdir") ))
-  if [[ $st -ne 0 ]]; then
-    append_row ecrawl_trij write "$rep" fail "${el:-}" "$bytes" "exit=$st"
-  else
-    append_row ecrawl_trij write "$rep" ok "${el:-}" "$bytes" "ERCBIN08_shards+crawl_trijournals"
-    echo "$dest" >"$OUT/ecrawl_trij_bin_dir.txt"
-    echo "$jdir" >"$OUT/ecrawl_trij_journal_dir.txt"
   fi
 }
 
@@ -291,44 +277,6 @@ run_ereport_index() {
     append_row ereport_index make "$rep" ok "${el:-}" "$bytes" \
       "trigram_on_top_of_crawl; input=${bin_dir##*/}"
     echo "$idx" >"$OUT/ereport_index_dir.txt"
-  fi
-}
-
-# Journal-consuming twin of run_ereport_index: indexes the capture from
-# run_ecrawl_trij, replaying its per-shard journals. Crawl always runs in the
-# same unit, so the .tij files are fresh; --make deletes them after this pass.
-run_ereport_index_trij() {
-  local rep=$1
-  local bin_dir jdir
-  bin_dir=$(cat "$OUT/ecrawl_trij_bin_dir.txt" 2>/dev/null || true)
-  jdir=$(cat "$OUT/ecrawl_trij_journal_dir.txt" 2>/dev/null || true)
-  if [[ -z "$bin_dir" || ! -d "$bin_dir" || -z "$jdir" || ! -d "$jdir" ]]; then
-    append_row ereport_index_trij make "$rep" skipped "" 0 "no_ecrawl_trij_bins"
-    return 0
-  fi
-  if ! tool_available ereport_index; then
-    append_row ereport_index_trij make "$rep" skipped "" 0 "missing_binary"
-    return 0
-  fi
-  local idx="$WORK_ROOT/ereport_index_trij_r${rep}"
-  rm -rf "$idx"
-  mkdir -p "$idx"
-  local stem="ereport_index_trij_r${rep}${RUN_TAG}"
-  local tfile="$OUT/${stem}.time.txt"
-  set +e
-  time_cmd "$tfile" "$EREPORT_INDEX_BIN" --make --journal-dir "$jdir" --index-dir "$idx" "$bin_dir" \
-    >"$OUT/${stem}.stdout.txt" 2>"$OUT/${stem}.stderr.txt"
-  local st=$?
-  set -e
-  local el bytes
-  el=$(elapsed_from_time_v "$tfile" || echo "")
-  bytes=$(dir_bytes "$idx")
-  if [[ $st -ne 0 ]]; then
-    append_row ereport_index_trij make "$rep" fail "${el:-}" "$bytes" "exit=$st"
-  else
-    append_row ereport_index_trij make "$rep" ok "${el:-}" "$bytes" \
-      "trigram_on_top_of_crawl; journal_replay; input=${bin_dir##*/}"
-    echo "$idx" >"$OUT/ereport_index_trij_dir.txt"
   fi
 }
 
@@ -801,15 +749,6 @@ run_ecrawl_write_unit() {
   fi
 }
 
-run_ecrawl_trij_unit() {
-  local rep=$1
-  begin_timed_unit
-  run_ecrawl_trij "$rep"
-  if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep" ecrawl_trij; then
-    run_ereport_index_trij "$rep"
-  fi
-}
-
 run_ecrawl_series() {
   local variants=(write)
   [[ "${DO_NOWRITE:-0}" == "1" ]] && variants+=(nowrite)
@@ -861,10 +800,6 @@ for t in $TOOLS; do
   case "$t" in
     ecrawl)
       run_ecrawl_series
-      continue
-      ;;
-    ecrawl_trij)
-      run_cache_series "ecrawl_trij write+index" "$(tool_reps ecrawl_trij)" run_ecrawl_trij_unit
       continue
       ;;
   esac

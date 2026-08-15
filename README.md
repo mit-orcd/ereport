@@ -46,6 +46,8 @@ Walks a local filesystem tree and writes uid-sharded binary metadata records (lo
 ./ecrawl /path/to/tree [output-dir]      # add --no-write to benchmark without writing shards
 ```
 
+`--statx` and `--iouring` mostly do not help; leave them off. `--statx` is a wash, and `--iouring` is a cold-only win on some wide local dirs and a large NFS regression.
+
 Full flags, the stat-worker pipeline, and tuning knobs: [docs/tools.md#ecrawl](docs/tools.md#ecrawl).
 
 ### `edelete` — delete non-directory paths

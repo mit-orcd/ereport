@@ -2,8 +2,7 @@
 #define ECRAWL_WIRE_H
 
 /*
- * Wire types shared by ecrawl's emit/writer path and the crawl-time trigram
- * journal pool (ecrawl_trijournal.c). A record batch is a byte buffer of
+ * Wire types for ecrawl's emit/writer path. A record batch is a byte buffer of
  * frames, each [batch_frame_hdr_t][bin_record_hdr_t + name bytes]; while
  * parent_dir_id == 0 the name bytes carry the record's full stored path.
  */
@@ -26,8 +25,7 @@ typedef struct record_batch {
     unsigned char *data;
     size_t len;
     struct record_batch *next;
-    /* 1 for the owning writer queue; +1 per trigram-journal pool queue the
-     * batch was teed into. Freed when the last reference drops. */
+    /* 1 for the owning writer queue. Freed when the last reference drops. */
     _Atomic unsigned refs;
 } record_batch_t;
 

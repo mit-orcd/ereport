@@ -885,7 +885,9 @@ CACHE_DROPPED=0
 cache_label() {
   if [[ "$CACHE_STATE" == "hot" ]]; then
     printf 'hot'
-  elif [[ "$CACHE_DROPPED" == "1" ]]; then
+  elif [[ "$CACHE_DROPPED" == "1" || "${UNIT_CACHE_DROPPED:-0}" == "1" ]]; then
+    # UNIT_CACHE_DROPPED is the drop that started this tool-rep. Honor it
+    # even if a later subshell reset CACHE_DROPPED.
     printf 'cold'
   else
     printf 'warm'

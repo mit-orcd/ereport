@@ -134,17 +134,9 @@ crawl_sidecar.o: crawl_sidecar.c crawl_sidecar.h crawl_bin_format.h crawl_bin_ca
 crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_codec.h crawl_bin_format.h crawl_bin_chunks.h
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_bin_block.c -o crawl_bin_block.o
 
-# Basename trigram extraction, shared by ereport_index (index time) and ecrawl (crawl-time journals).
+# Basename trigram extraction for ereport_index.
 trigram_extract.o: trigram_extract.c trigram_extract.h
 	$(CC) $(CFLAGS) -c trigram_extract.c -o trigram_extract.o
-
-# Crawl-time trigram journal format: writer (ecrawl) and reader (ereport_index).
-crawl_trijournal.o: crawl_trijournal.c crawl_trijournal.h crawl_bin_format.h
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c crawl_trijournal.c -o crawl_trijournal.o
-
-# ecrawl's journal pool: tees writer-bound batches, extracts codes, writes .tij files.
-ecrawl_trijournal.o: ecrawl_trijournal.c ecrawl_trijournal.h ecrawl_wire.h crawl_trijournal.h trigram_extract.h crawl_bin_format.h
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -c ecrawl_trijournal.c -o ecrawl_trijournal.o
 
 test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
 	$(CC) $(CFLAGS) -o $@ test_crawl_codec.c crawl_bin_codec.o
@@ -155,11 +147,8 @@ test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o crawl_bin_c
 test_crawl_catalog: test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o $(ZSTD_LIBS)
 
-test_crawl_trijournal: test_crawl_trijournal.c crawl_trijournal.o
-	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_trijournal.c crawl_trijournal.o $(ZSTD_LIBS)
-
-ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o trigram_extract.h trigram_extract.o crawl_trijournal.h crawl_trijournal.o ecrawl_wire.h ecrawl_trijournal.h ecrawl_trijournal.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o trigram_extract.o crawl_trijournal.o ecrawl_trijournal.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o ecrawl_wire.h
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
@@ -173,8 +162,8 @@ ecrawl_query: ecrawl_query.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_
 ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o trigram_extract.h trigram_extract.o crawl_trijournal.h crawl_trijournal.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o trigram_extract.o crawl_trijournal.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o trigram_extract.h trigram_extract.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o trigram_extract.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
@@ -185,7 +174,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog test_crawl_trijournal *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
+	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
 	rm -rf __pycache__
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -196,11 +185,10 @@ serve-public:
 	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
-check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog test_crawl_trijournal
+check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog
 	./test_crawl_codec
 	./test_crawl_block_filter
 	./test_crawl_catalog
-	./test_crawl_trijournal
 	./scripts/test/test.sh
 
 # Larger fixture under ./test (see scripts/test/test_setup.sh), then same correlation as check

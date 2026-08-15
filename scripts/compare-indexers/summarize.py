@@ -395,13 +395,6 @@ PIPELINE_PHASES = [
         "ecrawl + ereport_index",
         [("crawl", [("ecrawl", "write")]), ("trigram index", [("ereport_index", "make")])],
     ),
-    (
-        "ecrawl + ereport_index (journal)",
-        [
-            ("crawl", [("ecrawl_trij", "write")]),
-            ("trigram index", [("ereport_index_trij", "make")]),
-        ],
-    ),
     # Crawl-only statx variants: the capture is identical to ecrawl/write, so
     # there is no index half to re-measure.
     ("ecrawl --statx", [("crawl", [("ecrawl", "write_statx")])]),

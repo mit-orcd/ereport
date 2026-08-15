@@ -38,19 +38,21 @@
 #include "crawl_fpcache.h"
 #include "path_canon.h"
 #include "trigram_extract.h"
-#include "crawl_trijournal.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 /*
+ * 4: path_kids.bin is a children CSR (off / child_ids / subtree_n) so --search expands a
+ *    directory hit in O(subtree) instead of scanning paths.bin. Readers reject older
+ *    versions — rebuild with `--make`.
  * 3: trigrams are taken from each path's basename only (segment-once). path_isdir.bin
  *    records which path_ids are directories so --search can expand a directory hit to its
- *    descendants. Readers reject older versions — rebuild with `--make`.
+ *    descendants.
  * 2: durable paths.bin and tri_postings.bin are zstd-compressed (EPATH002 / chunked postings).
  */
-#define INDEX_VERSION 3
+#define INDEX_VERSION 4
 /*
  * Top bits of the 24-bit trigram used to partition records into tmp_trigrams_<bucket>_w<shard>.bin
  * during the index phase, and into one merge segment per bucket during the merge phase.
@@ -97,10 +99,11 @@ static int g_durable_zstd_level = -1; /* -1 = parse EREPORT_INDEX_ZSTD_LEVEL on 
 static char g_subtree_buf[PATH_MAX];
 static const char *g_subtree_prefix = NULL;
 
-/* --journal-dir <path>: crawl-time trigram journals (ecrawl --trigram-journal). A shard whose
- * journal passes the five-fact live check is replayed straight into the write-batch pipeline,
- * skipping capture parse, catalog load, path reconstruction, and extraction for that shard. */
-static const char *g_journal_dir = NULL;
+/* Directory-hit expansion via path_kids.bin: walk the CSR unless the hit subtree is so large
+ * that a sequential paths.bin prefix scan is cheaper. Cap is min(1% of corpus, 1M), but a
+ * small corpus always walks. */
+#define KIDS_EXPAND_MAX_IDS 1000000ULL
+#define KIDS_EXPAND_SMALL_CORPUS 64ULL
 
 /* Directory-boundary prefix test: matches `prefix` itself and `prefix/...` but not `prefixfoo`.
  * (Mirrors ereport.c's starts_with_dir_prefix.) */
@@ -392,7 +395,6 @@ typedef struct {
 typedef struct {
     atomic_uint remaining_chunks;
     crawl_bin_catalog_t *catalog;
-    int use_journal; /* --journal-dir validation passed: replay the shard's .tij, skip the capture */
 } file_state_t;
 
 /*
@@ -439,6 +441,8 @@ typedef struct {
 
 static int paths_index_open(const char *paths_path, paths_index_t *pi);
 static void paths_index_close(paths_index_t *pi);
+static int load_path_isdir_bits(const char *index_dir, uint64_t npaths, uint8_t **out_bits, size_t *out_bytes);
+static int path_isdir_bit(const uint8_t *bits, uint64_t path_id);
 
 typedef struct {
     uid_t target_uid;
@@ -527,7 +531,13 @@ typedef struct {
     uint64_t dir_index_bytes;
     uint64_t rowgroup_index_bytes;
     double dir_index_sec;
+    int path_kids_built;
+    uint64_t path_kids_edges;
+    uint64_t path_kids_bytes;
+    double path_kids_sec;
 } build_ctx_t;
+
+static int build_path_kids_sidecar(build_ctx_t *ctx);
 
 typedef struct {
     work_queue_t *queue;
@@ -2047,7 +2057,7 @@ static int argv_skip_verbose_prefix(int argc, char **argv) {
 static void die_usage(const char *argv0) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [--no-dir-index] [--journal-dir <path>] [username|uid] [bin_dir ...]\n"
+            "  %s --make [--index-dir <path>] [--subtree <abs-path>] [--path-rewrite OLD=NEW] [--no-dir-index] [username|uid] [bin_dir ...]\n"
             "  %s --resume-merge --index-dir <path>\n"
             "  %s --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]\n"
             "  Optional --verbose anywhere: detailed stderr progress, queue-wait stats, rusage, and I/O counters\n"
@@ -2066,10 +2076,6 @@ static void die_usage(const char *argv0) {
             "    that directory (full absolute paths kept), mirroring `ereport --subtree` so search covers just that subtree.\n"
             "    Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW while indexing\n"
             "    (bins unchanged), e.g. /data1/group=/orcd/data; applied before --subtree.\n"
-            "    Optional --journal-dir <path>: replay crawl-time trigram journals (ecrawl --trigram-journal DIR)\n"
-            "    instead of parsing captures for shards whose journal matches the live .bin (basename, size, mtime,\n"
-            "    catalog offset/entries). Missing or stale journals fall back to the capture parse per shard.\n"
-            "    Journals that were replayed are deleted once the index build succeeds.\n"
             "    Also writes the directory-index sidecars dirs.idx and rowgroups.idx (~24 bytes per directory)\n"
             "    that `ecrawl_query --index-dir` uses to answer a subtree rollup without reading every catalog\n"
             "    row, and to scan only the row groups that can hold the subtree. --no-dir-index skips that phase;\n"
@@ -2512,54 +2518,9 @@ static void *chunk_prep_worker_main(void *arg) {
 
         if (i >= pool->path_count) break;
 
-        /* A valid crawl-time trigram journal replaces the capture parse for this shard with
-         * replay work items. The v2 block table lets one shard's journal split into parallel
-         * block-range chunks (start_offset/end_offset carry block indices then); a table-less
-         * or single-block journal stays one whole-shard [0, UINT64_MAX) replay chunk.
-         * Missing/stale journals fall back to today's path. */
-        if (g_journal_dir) {
-            trij_reader_t jr;
-
-            if (trij_reader_open_validate(&jr, g_journal_dir, pool->paths[i], NULL) == 1) {
-                size_t cap = 0;
-                int split = trij_reader_load_block_table(&jr) == 0 && jr.block_count > 1 &&
-                            jr.hdr.record_count > 0;
-
-                r = 0;
-                if (split) {
-                    /* ~4 work units per parse worker, whole blocks, balanced by entries. */
-                    uint64_t want = (uint64_t)parse_index_thread_count() * 4ULL;
-                    uint64_t per = (jr.hdr.record_count + want - 1ULL) / want;
-                    uint64_t b = 0;
-
-                    while (b < jr.block_count && r == 0) {
-                        uint64_t e = b;
-                        uint64_t acc = 0;
-
-                        do {
-                            acc += jr.blocks[e].n_entries;
-                            e++;
-                        } while (e < jr.block_count && acc < per);
-                        r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap,
-                                                   pool->paths[i], b, e, i);
-                        b = e;
-                    }
-                } else {
-                    r = crawl_bin_append_chunk(&local_chunks, &local_count, &cap, pool->paths[i], 0,
-                                               UINT64_MAX, i);
-                }
-                trij_reader_close(&jr);
-                if (r == 0) pool->file_states[i].use_journal = 1;
-            } else {
-                r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
-                                                    pool->chunk_targets[i], parse_index_thread_count(),
-                                                    &local_chunks, &local_count, &fc);
-            }
-        } else {
-            r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
-                                                pool->chunk_targets[i], parse_index_thread_count(),
-                                                &local_chunks, &local_count, &fc);
-        }
+        r = crawl_bin_build_chunks_for_file(&index_chunk_stdio, mk_io_tls_flush, pool->paths[i], i,
+                                            pool->chunk_targets[i], parse_index_thread_count(),
+                                            &local_chunks, &local_count, &fc);
         pool->prep_rc[(int)i] = r;
         pool->prep_chunks[(int)i] = local_chunks;
         pool->prep_chunk_counts[(int)i] = local_count;
@@ -3997,131 +3958,6 @@ static int mk_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_
     return 0;
 }
 
-/* Replay one shard's crawl-time trigram journal: entries already carry the full path, uid, type,
- * and sorted-unique basename codes, so there is no catalog, no block reader, and no extraction.
- * Filters re-apply in the capture path's order: uid, --path-rewrite, --subtree. */
-static int process_chunk_make_journal(worker_arg_t *worker, const file_chunk_t *chunk) {
-    build_ctx_t *ctx = worker->ctx;
-    index_run_stats_t *rs = ctx->run_stats;
-    write_queue_t *write_queue = worker->write_queue;
-    write_batch_t *batch = NULL;
-    uint64_t scanned_local = 0;
-    uint64_t scanned_published = 0;
-    trij_reader_t jr;
-    int rc = -1;
-
-    memset(&jr, 0, sizeof(jr));
-    jr.fd = -1;
-    if (trij_reader_open_validate(&jr, g_journal_dir, chunk->path, NULL) != 1) {
-        /* Validated during chunk prep; turning stale mid-run means the shard is being rewritten
-         * under us — count it bad rather than silently indexing nothing. */
-        fprintf(stderr, "warn: journal for %s turned stale mid-run\n", chunk->path);
-        atomic_fetch_add(&rs->bad_input_files, 1U);
-        return -1;
-    }
-
-    /* Chunk prep stashed a block range in the chunk offsets for journaled shards;
-     * [0, UINT64_MAX) means the whole journal (no table or a single block). */
-    if (chunk->start_offset != 0 || chunk->end_offset != UINT64_MAX) {
-        if (trij_reader_load_block_table(&jr) != 0 ||
-            trij_reader_set_block_range(&jr, chunk->start_offset,
-                                        chunk->end_offset - chunk->start_offset) != 0) {
-            fprintf(stderr, "warn: journal block table for %s unreadable mid-run\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            trij_reader_close(&jr);
-            return -1;
-        }
-    }
-
-    for (;;) {
-        const char *path;
-        size_t path_len;
-        uint64_t uid;
-        uint8_t type;
-        const uint32_t *codes;
-        size_t code_count;
-        int got = trij_reader_next(&jr, &path, &path_len, &uid, &type, &codes, &code_count);
-
-        if (got == 0) {
-            rc = 0;
-            break;
-        }
-        if (got < 0) {
-            fprintf(stderr, "warn: corrupt journal for %s\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            break;
-        }
-
-        scanned_local++;
-        if (g_verbose && scanned_local - scanned_published >= (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) {
-            uint64_t delta =
-                ((scanned_local - scanned_published) / (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE) *
-                (uint64_t)SCANNED_RECORDS_PUBLISH_STRIDE;
-            atomic_fetch_add_explicit(&rs->scanned_records, delta, memory_order_relaxed);
-            scanned_published += delta;
-        }
-
-        if (!ctx->aggregate_all_users && (uid_t)uid != ctx->target_uid) continue;
-
-        if (path_len == 0 || path_len >= PATH_MAX) {
-            fprintf(stderr, "warn: journal path out of range in %s\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            break;
-        }
-        /* Rewrite/subtree need a NUL-terminated path; write_batch_append copies what survives. */
-        if (trigram_ensure_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
-            fprintf(stderr, "warn: path alloc failed in %s\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            break;
-        }
-        memcpy(worker->path_buf, path, path_len);
-        worker->path_buf[path_len] = '\0';
-
-        if (g_rewrite_from) {
-            (void)rewrite_path_prefix(worker->path_buf, PATH_MAX);
-        }
-        if (g_subtree_prefix && !subtree_path_under_prefix(worker->path_buf)) continue;
-
-        if (!batch) {
-            batch = write_batch_create();
-            if (!batch) {
-                fprintf(stderr, "warn: failed to allocate write batch for %s\n", chunk->path);
-                atomic_fetch_add(&rs->bad_input_files, 1U);
-                break;
-            }
-        }
-        if (write_batch_append(batch, worker->path_buf, strlen(worker->path_buf), codes, code_count,
-                               type == (uint8_t)'d') != 0) {
-            fprintf(stderr, "warn: failed to append write batch for %s\n", chunk->path);
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            break;
-        }
-
-        if (batch->count >= worker->write_batch_flush_at) {
-            if (write_queue_push(write_queue, batch) != 0) {
-                fprintf(stderr, "warn: failed to queue write batch for %s\n", chunk->path);
-                atomic_fetch_add(&rs->bad_input_files, 1U);
-                write_batch_destroy(batch);
-                batch = NULL;
-                break;
-            }
-            batch = NULL;
-        }
-    }
-
-    trij_reader_close(&jr);
-    if (scanned_local > scanned_published)
-        atomic_fetch_add_explicit(&rs->scanned_records, scanned_local - scanned_published, memory_order_relaxed);
-    if (batch) {
-        if (write_queue_push(write_queue, batch) != 0) {
-            atomic_fetch_add(&rs->bad_input_files, 1U);
-            write_batch_destroy(batch);
-        }
-    }
-    finalize_chunk_file_progress(rs, worker->file_states, chunk->file_index);
-    return rc;
-}
-
 static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     build_ctx_t *ctx = worker->ctx;
     index_run_stats_t *rs = ctx->run_stats;
@@ -4137,9 +3973,6 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     memset(&br, 0, sizeof(br));
     dir_cache.id = 0;
     dir_cache.len = 0;
-
-    if (file_states[chunk->file_index].use_journal)
-        return process_chunk_make_journal(worker, chunk);
 
     fp = ei_shard_fopen(chunk->path, "rb");
     if (!fp) {
@@ -4895,6 +4728,8 @@ static int write_meta_file(const build_ctx_t *ctx) {
     if (ctx->dir_index_built) fprintf(fp, "dir_index_dirs=%" PRIu64 "\n", ctx->dir_index_dirs);
     fprintf(fp, "rowgroup_index=%d\n", ctx->rowgroup_index_built ? 1 : 0);
     if (ctx->rowgroup_index_built) fprintf(fp, "rowgroup_index_groups=%" PRIu64 "\n", ctx->dir_index_groups);
+    fprintf(fp, "path_kids=%d\n", ctx->path_kids_built ? 1 : 0);
+    if (ctx->path_kids_built) fprintf(fp, "path_kids_edges=%" PRIu64 "\n", ctx->path_kids_edges);
 
     if (mk_fclose(fp) != 0) return -1;
     return 0;
@@ -6069,6 +5904,10 @@ static int resume_merge_index_dir(const char *index_dir) {
         return 1;
     }
     memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+    if (build_path_kids_sidecar(&ctx) != 0) {
+        fprintf(stderr, "ereport_index: resume-merge could not write path_kids.bin in %s\n", ctx.index_dir);
+        return 1;
+    }
     if (write_meta_file(&ctx) != 0) {
         fprintf(stderr, "ereport_index: could not write meta.txt in %s\n", ctx.index_dir);
         return 1;
@@ -6077,6 +5916,12 @@ static int resume_merge_index_dir(const char *index_dir) {
     printf("mode=resume_merge\n");
     printf("index_dir=%s\n", ctx.index_dir);
     printf("indexed_paths=%" PRIu64 "\n", ctx.indexed_paths);
+    printf("path_kids=%d\n", ctx.path_kids_built ? 1 : 0);
+    if (ctx.path_kids_built) {
+        printf("path_kids_edges=%" PRIu64 "\n", ctx.path_kids_edges);
+        printf("path_kids_bytes=%" PRIu64 "\n", ctx.path_kids_bytes);
+        printf("path_kids_sec=%.3f\n", ctx.path_kids_sec);
+    }
     printf("unique_trigrams=%" PRIu64 "\n", ctx.unique_trigrams);
     printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
     printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
@@ -6296,7 +6141,6 @@ static int build_index_dir(const char *user_spec,
     double t0 = now_sec();
     double t1;
     double chunk_prep_sec = 0.0;
-    uint64_t journal_shards_deleted = 0;
     int stats_thread_started = 0;
     int threads = parse_index_thread_count();
     int trigram_threads = parse_trigram_thread_count(threads);
@@ -6596,7 +6440,6 @@ static int build_index_dir(const char *user_spec,
 
     for (i = 0; i < path_count; i++) {
         if (atomic_load(&file_states[i].remaining_chunks) == 0U) continue;
-        if (file_states[i].use_journal) continue; /* journal replay needs no directory catalog */
         if (index_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
             fprintf(stderr, "ereport_index: cannot load directory catalog from %s\n", paths[i]);
             if (stats_thread_started) {
@@ -7063,6 +6906,30 @@ static int build_index_dir(const char *user_spec,
 
     paths_writer_free(&ctx);
 
+    if (build_path_kids_sidecar(&ctx) != 0) {
+        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+        free(tids);
+        free(args);
+        pthread_mutex_destroy(&queue.mutex);
+        pthread_mutex_destroy(&write_queue.mutex);
+        pthread_cond_destroy(&write_queue.has_batch);
+        pthread_cond_destroy(&write_queue.has_space);
+        pthread_mutex_destroy(&trigram_queue.mutex);
+        pthread_cond_destroy(&trigram_queue.has_job);
+        pthread_cond_destroy(&trigram_queue.has_space);
+        free(trigram_tids);
+        trigram_tids = NULL;
+        free(tw_worker_args);
+        tw_worker_args = NULL;
+        for (i = 0; i < path_count; i++) free(paths[i]);
+        free(paths);
+        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+        free(chunks);
+        index_free_file_states(file_states, path_count);
+        parallel_bucket_io_shutdown(&ctx);
+        return 1;
+    }
+
     ctx.index_phase_sec = now_sec() - t0;
     ctx.index_workers_used = threads_used;
     ctx.trigram_writer_workers_used = trigram_threads_used;
@@ -7138,28 +7005,6 @@ static int build_index_dir(const char *user_spec,
         }
     }
 
-    /* The index is complete; journals that were validated and replayed are dead weight
-     * (a cache bound to a capture that is now indexed), so remove them. Stale or
-     * missing journals were never consumed and stay untouched. Deletion failure is
-     * advisory only. */
-    if (g_journal_dir) {
-        for (i = 0; i < path_count; i++) {
-            char jpath[PATH_MAX];
-            const char *base;
-
-            if (!file_states[i].use_journal) continue;
-            base = strrchr(paths[i], '/');
-            base = base ? base + 1 : paths[i];
-            if (trij_journal_path(jpath, sizeof(jpath), g_journal_dir, base, 0) != 0) continue;
-            if (unlink(jpath) != 0 && errno != ENOENT) {
-                fprintf(stderr, "ereport_index: warn: cannot delete consumed journal %s: %s\n", jpath,
-                        strerror(errno));
-                continue;
-            }
-            journal_shards_deleted++;
-        }
-    }
-
     t1 = now_sec();
     clear_status_line();
     printf("mode=make\n");
@@ -7170,13 +7015,6 @@ static int build_index_dir(const char *user_spec,
     printf("input_layout=%s\n", g_input_layout);
     if (g_input_uid_shards) printf("input_uid_shards=%u\n", g_input_uid_shards);
     printf("input_files=%" PRIu64 "\n", ctx.input_files);
-    if (g_journal_dir) {
-        uint64_t jn = 0;
-        for (i = 0; i < path_count; i++)
-            if (file_states[i].use_journal) jn++;
-        printf("journal_shards=%" PRIu64 "\n", jn);
-        printf("journal_shards_deleted=%" PRIu64 "\n", journal_shards_deleted);
-    }
     printf("scanned_records=%" PRIu64 "\n", ctx.scanned_records);
     printf("index_dir=%s\n", ctx.index_dir);
     printf("indexed_paths=%" PRIu64 "\n", ctx.indexed_paths);
@@ -7198,6 +7036,12 @@ static int build_index_dir(const char *user_spec,
         printf("rowgroup_index_bytes=%" PRIu64 "\n", ctx.rowgroup_index_bytes);
     }
     printf("dir_index_sec=%.3f\n", ctx.dir_index_sec);
+    printf("path_kids=%d\n", ctx.path_kids_built ? 1 : 0);
+    if (ctx.path_kids_built) {
+        printf("path_kids_edges=%" PRIu64 "\n", ctx.path_kids_edges);
+        printf("path_kids_bytes=%" PRIu64 "\n", ctx.path_kids_bytes);
+        printf("path_kids_sec=%.3f\n", ctx.path_kids_sec);
+    }
     printf("elapsed_sec=%.3f\n", t1 - t0);
     if (g_verbose) {
         printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
@@ -7583,6 +7427,402 @@ static char *read_path_by_id(paths_reader_t *pr, FILE *offsets_fp, uint64_t path
     return buf;
 }
 
+#define KIDS_MAGIC "EKIDS001"
+#define KIDS_HDR_BYTES 32
+#define KIDS_FORMAT_VERSION 1u
+
+typedef struct {
+    uint64_t hash;
+    uint64_t path_id;
+    char *path;
+} kids_dir_ent_t;
+
+typedef struct {
+    kids_dir_ent_t *slots;
+    size_t cap;
+    size_t used;
+} kids_dir_map_t;
+
+typedef struct {
+    uint64_t parent;
+    uint64_t child;
+} kids_edge_t;
+
+static uint64_t kids_fnv1a(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    const unsigned char *p = (const unsigned char *)s;
+
+    while (*p) {
+        h ^= (uint64_t)*p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int kids_dir_map_init(kids_dir_map_t *m, size_t hint) {
+    size_t cap = 16;
+
+    while (cap < hint * 2 + 16) cap <<= 1;
+    m->slots = (kids_dir_ent_t *)calloc(cap, sizeof(*m->slots));
+    if (!m->slots) return -1;
+    m->cap = cap;
+    m->used = 0;
+    return 0;
+}
+
+static void kids_dir_map_free(kids_dir_map_t *m) {
+    size_t i;
+
+    if (m->slots) {
+        for (i = 0; i < m->cap; i++) free(m->slots[i].path);
+        free(m->slots);
+    }
+    memset(m, 0, sizeof(*m));
+}
+
+static int kids_dir_map_grow(kids_dir_map_t *m) {
+    kids_dir_ent_t *old = m->slots;
+    size_t old_cap = m->cap;
+    size_t ncap = old_cap * 2;
+    size_t i;
+
+    m->slots = (kids_dir_ent_t *)calloc(ncap, sizeof(*m->slots));
+    if (!m->slots) {
+        m->slots = old;
+        return -1;
+    }
+    m->cap = ncap;
+    m->used = 0;
+    for (i = 0; i < old_cap; i++) {
+        kids_dir_ent_t *e = &old[i];
+        size_t j;
+
+        if (!e->path) continue;
+        j = (size_t)(e->hash & (ncap - 1));
+        while (m->slots[j].path) j = (j + 1) & (ncap - 1);
+        m->slots[j] = *e;
+        m->used++;
+    }
+    free(old);
+    return 0;
+}
+
+static int kids_dir_map_put(kids_dir_map_t *m, const char *path, uint64_t path_id) {
+    uint64_t h;
+    size_t i;
+    char *copy;
+
+    if (m->used * 10 >= m->cap * 7 && kids_dir_map_grow(m) != 0) return -1;
+    h = kids_fnv1a(path);
+    i = (size_t)(h & (m->cap - 1));
+    for (;;) {
+        kids_dir_ent_t *e = &m->slots[i];
+
+        if (!e->path) {
+            copy = strdup(path);
+            if (!copy) return -1;
+            e->hash = h;
+            e->path_id = path_id;
+            e->path = copy;
+            m->used++;
+            return 0;
+        }
+        if (e->hash == h && strcmp(e->path, path) == 0) {
+            e->path_id = path_id;
+            return 0;
+        }
+        i = (i + 1) & (m->cap - 1);
+    }
+}
+
+static int kids_dir_map_get(const kids_dir_map_t *m, const char *path, uint64_t *out_id) {
+    uint64_t h = kids_fnv1a(path);
+    size_t i = (size_t)(h & (m->cap - 1));
+
+    for (;;) {
+        const kids_dir_ent_t *e = &m->slots[i];
+
+        if (!e->path) return 0;
+        if (e->hash == h && strcmp(e->path, path) == 0) {
+            *out_id = e->path_id;
+            return 1;
+        }
+        i = (i + 1) & (m->cap - 1);
+    }
+}
+
+/* Parent directory of a stored path. "/a/b" → "/a", "/a" → "/", "a" → none. */
+static int kids_path_dirname(const char *path, char *out, size_t cap) {
+    const char *slash;
+
+    if (!path || !path[0]) return -1;
+    slash = strrchr(path, '/');
+    if (!slash) return -1;
+    if (slash == path) {
+        if (path[1] == '\0') return -1;
+        if (cap < 2) return -1;
+        out[0] = '/';
+        out[1] = '\0';
+        return 0;
+    }
+    {
+        size_t n = (size_t)(slash - path);
+
+        if (n >= cap) return -1;
+        memcpy(out, path, n);
+        out[n] = '\0';
+        return 0;
+    }
+}
+
+static int cmp_u64_asc(const void *a, const void *b) {
+    uint64_t aa = *(const uint64_t *)a;
+    uint64_t bb = *(const uint64_t *)b;
+
+    if (aa < bb) return -1;
+    if (aa > bb) return 1;
+    return 0;
+}
+
+static int kids_edge_cmp(const void *a, const void *b) {
+    const kids_edge_t *aa = (const kids_edge_t *)a;
+    const kids_edge_t *bb = (const kids_edge_t *)b;
+
+    if (aa->parent < bb->parent) return -1;
+    if (aa->parent > bb->parent) return 1;
+    if (aa->child < bb->child) return -1;
+    if (aa->child > bb->child) return 1;
+    return 0;
+}
+
+static uint64_t kids_subtree_compute(uint64_t id, const uint64_t *off, const uint64_t *child_ids, uint64_t *subtree_n,
+                                     uint8_t *seen, uint64_t n_paths) {
+    uint64_t s = 1;
+    uint64_t i;
+
+    if (id >= n_paths) return 0;
+    if (seen[id] == 2) return subtree_n[id];
+    if (seen[id] == 1) return 1; /* cycle: count self only */
+    seen[id] = 1;
+    for (i = off[id]; i < off[id + 1]; i++) s += kids_subtree_compute(child_ids[i], off, child_ids, subtree_n, seen, n_paths);
+    subtree_n[id] = s;
+    seen[id] = 2;
+    return s;
+}
+
+static int path_kids_file_ok(const char *index_dir, uint64_t npaths) {
+    char path[PATH_MAX];
+    unsigned char hdr[KIDS_HDR_BYTES];
+    FILE *fp;
+    uint32_t version;
+    uint64_t n, edges;
+    uint64_t need;
+
+    if (build_path(path, sizeof(path), index_dir, "path_kids.bin") != 0) return 0;
+    fp = fopen(path, "rb");
+    if (!fp) return 0;
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || memcmp(hdr, KIDS_MAGIC, 8) != 0) {
+        fclose(fp);
+        return 0;
+    }
+    memcpy(&version, hdr + 8, sizeof(version));
+    memcpy(&n, hdr + 16, sizeof(n));
+    memcpy(&edges, hdr + 24, sizeof(edges));
+    fclose(fp);
+    if (version != KIDS_FORMAT_VERSION || n != npaths) return 0;
+    need = (uint64_t)KIDS_HDR_BYTES + 8ULL * (n + 1ULL) + 8ULL * edges + 8ULL * n;
+    {
+        struct stat st;
+
+        if (stat(path, &st) != 0 || (uint64_t)st.st_size < need) return 0;
+    }
+    return 1;
+}
+
+static int build_path_kids_sidecar(build_ctx_t *ctx) {
+    char paths_p[PATH_MAX], off_p[PATH_MAX], kids_p[PATH_MAX];
+    FILE *paths_fp = NULL, *offsets_fp = NULL, *kids_fp = NULL;
+    paths_index_t pi;
+    paths_reader_t pr;
+    uint8_t *isdir = NULL;
+    size_t isdir_bytes = 0;
+    kids_dir_map_t dmap;
+    kids_edge_t *edges = NULL;
+    size_t edge_n = 0, edge_cap = 0;
+    uint64_t *off = NULL, *child_ids = NULL, *subtree_n = NULL;
+    uint8_t *seen = NULL;
+    uint64_t n = ctx->indexed_paths;
+    uint64_t pid;
+    double t0 = now_sec();
+    int rc = -1;
+    unsigned char hdr[KIDS_HDR_BYTES];
+    uint32_t v32;
+    uint64_t v64;
+
+    memset(&pi, 0, sizeof(pi));
+    memset(&pr, 0, sizeof(pr));
+    memset(&dmap, 0, sizeof(dmap));
+    ctx->path_kids_built = 0;
+    ctx->path_kids_edges = 0;
+    ctx->path_kids_bytes = 0;
+    ctx->path_kids_sec = 0.0;
+
+    if (n == 0) {
+        if (build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") != 0) return -1;
+        kids_fp = mk_fopen(kids_p, "wb");
+        if (!kids_fp) return -1;
+        memset(hdr, 0, sizeof(hdr));
+        memcpy(hdr, KIDS_MAGIC, 8);
+        v32 = KIDS_FORMAT_VERSION;
+        memcpy(hdr + 8, &v32, sizeof(v32));
+        if (mk_fwrite(hdr, 1, sizeof(hdr), kids_fp) != sizeof(hdr) || mk_fclose(kids_fp) != 0) return -1;
+        ctx->path_kids_built = 1;
+        ctx->path_kids_sec = now_sec() - t0;
+        return 0;
+    }
+
+    if (path_kids_file_ok(ctx->index_dir, n)) {
+        struct stat st;
+
+        if (build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") == 0 && stat(kids_p, &st) == 0)
+            ctx->path_kids_bytes = (uint64_t)st.st_size;
+        ctx->path_kids_built = 1;
+        ctx->path_kids_sec = now_sec() - t0;
+        return 0;
+    }
+
+    if (build_path(paths_p, sizeof(paths_p), ctx->index_dir, "paths.bin") != 0 ||
+        build_path(off_p, sizeof(off_p), ctx->index_dir, "path_offsets.bin") != 0 ||
+        build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") != 0)
+        return -1;
+    if (load_path_isdir_bits(ctx->index_dir, n, &isdir, &isdir_bytes) != 0) {
+        fprintf(stderr, "ereport_index: path_kids: cannot read path_isdir.bin\n");
+        return -1;
+    }
+    if (paths_index_open(paths_p, &pi) != 0) goto out;
+    paths_fp = fopen(paths_p, "rb");
+    offsets_fp = fopen(off_p, "rb");
+    if (!paths_fp || !offsets_fp || paths_reader_init(&pr, paths_fp, &pi) != 0) {
+        fprintf(stderr, "ereport_index: path_kids: cannot open paths.bin\n");
+        goto out;
+    }
+    if (kids_dir_map_init(&dmap, (size_t)(n / 8 + 16)) != 0) goto out;
+
+    for (pid = 0; pid < n; pid++) {
+        char *path;
+
+        if (!path_isdir_bit(isdir, pid)) continue;
+        path = read_path_by_id(&pr, offsets_fp, pid);
+        if (!path) continue;
+        if (kids_dir_map_put(&dmap, path, pid) != 0) {
+            free(path);
+            goto out;
+        }
+        free(path);
+    }
+
+    for (pid = 0; pid < n; pid++) {
+        char *path;
+        char parent[PATH_MAX];
+        uint64_t parent_id;
+
+        path = read_path_by_id(&pr, offsets_fp, pid);
+        if (!path) continue;
+        if (kids_path_dirname(path, parent, sizeof(parent)) != 0) {
+            free(path);
+            continue;
+        }
+        free(path);
+        if (!kids_dir_map_get(&dmap, parent, &parent_id)) continue;
+        if (edge_n == edge_cap) {
+            size_t nc = edge_cap ? edge_cap * 2 : 1024;
+            kids_edge_t *ne = (kids_edge_t *)realloc(edges, nc * sizeof(*ne));
+
+            if (!ne) goto out;
+            edges = ne;
+            edge_cap = nc;
+        }
+        edges[edge_n].parent = parent_id;
+        edges[edge_n].child = pid;
+        edge_n++;
+    }
+    kids_dir_map_free(&dmap);
+
+    if (edge_n > 1) qsort(edges, edge_n, sizeof(*edges), kids_edge_cmp);
+
+    off = (uint64_t *)calloc((size_t)n + 1U, sizeof(*off));
+    child_ids = edge_n ? (uint64_t *)malloc(edge_n * sizeof(*child_ids)) : NULL;
+    subtree_n = (uint64_t *)calloc((size_t)n, sizeof(*subtree_n));
+    seen = (uint8_t *)calloc((size_t)n, 1);
+    if (!off || !subtree_n || !seen || (edge_n && !child_ids)) goto out;
+
+    {
+        uint64_t ei = 0, p;
+
+        for (p = 0; p < n; p++) {
+            off[p] = ei;
+            while (ei < (uint64_t)edge_n && edges[ei].parent == p) {
+                child_ids[ei] = edges[ei].child;
+                ei++;
+            }
+        }
+        off[n] = ei;
+    }
+    free(edges);
+    edges = NULL;
+
+    for (pid = 0; pid < n; pid++) {
+        if (!seen[pid]) kids_subtree_compute(pid, off, child_ids, subtree_n, seen, n);
+    }
+
+    kids_fp = mk_fopen(kids_p, "wb");
+    if (!kids_fp) goto out;
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, KIDS_MAGIC, 8);
+    v32 = KIDS_FORMAT_VERSION;
+    memcpy(hdr + 8, &v32, sizeof(v32));
+    v64 = n;
+    memcpy(hdr + 16, &v64, sizeof(v64));
+    v64 = (uint64_t)edge_n;
+    memcpy(hdr + 24, &v64, sizeof(v64));
+    if (mk_fwrite(hdr, 1, sizeof(hdr), kids_fp) != sizeof(hdr) ||
+        mk_fwrite(off, sizeof(*off), (size_t)n + 1U, kids_fp) != (size_t)n + 1U ||
+        (edge_n && mk_fwrite(child_ids, sizeof(*child_ids), edge_n, kids_fp) != edge_n) ||
+        mk_fwrite(subtree_n, sizeof(*subtree_n), (size_t)n, kids_fp) != (size_t)n || mk_fclose(kids_fp) != 0) {
+        if (kids_fp) {
+            mk_fclose(kids_fp);
+            unlink(kids_p);
+        }
+        fprintf(stderr, "ereport_index: fwrite path_kids.bin failed\n");
+        goto out;
+    }
+    kids_fp = NULL;
+    {
+        struct stat st;
+
+        if (stat(kids_p, &st) == 0) ctx->path_kids_bytes = (uint64_t)st.st_size;
+    }
+    ctx->path_kids_built = 1;
+    ctx->path_kids_edges = (uint64_t)edge_n;
+    ctx->path_kids_sec = now_sec() - t0;
+    rc = 0;
+
+out:
+    if (rc != 0) fprintf(stderr, "ereport_index: failed to write path_kids.bin in %s\n", ctx->index_dir);
+    free(isdir);
+    free(edges);
+    free(off);
+    free(child_ids);
+    free(subtree_n);
+    free(seen);
+    kids_dir_map_free(&dmap);
+    paths_reader_free(&pr);
+    if (paths_fp) fclose(paths_fp);
+    if (offsets_fp) fclose(offsets_fp);
+    paths_index_close(&pi);
+    return rc;
+}
+
 static int collect_query_trigrams(const char *term, uint32_t **out_codes, size_t *out_count) {
     char *lower = ascii_lower_dup(term);
     uint32_t *codes = NULL;
@@ -7812,6 +8052,133 @@ static int path_isdir_bit(const uint8_t *bits, uint64_t path_id) {
 }
 
 typedef struct {
+    uint64_t *off;
+    uint64_t *child_ids;
+    uint64_t *subtree_n;
+    uint64_t n_paths;
+    uint64_t n_edges;
+} path_kids_t;
+
+static void path_kids_free(path_kids_t *k) {
+    if (!k) return;
+    free(k->off);
+    free(k->child_ids);
+    free(k->subtree_n);
+    memset(k, 0, sizeof(*k));
+}
+
+static int load_path_kids(const char *index_dir, uint64_t npaths, path_kids_t *out) {
+    char path[PATH_MAX];
+    unsigned char hdr[KIDS_HDR_BYTES];
+    FILE *fp;
+    uint32_t version;
+    uint64_t n, edges;
+
+    memset(out, 0, sizeof(*out));
+    if (build_path(path, sizeof(path), index_dir, "path_kids.bin") != 0) return -1;
+    fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "missing path_kids.bin in %s (rebuild with ereport_index --make)\n", index_dir);
+        return -1;
+    }
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || memcmp(hdr, KIDS_MAGIC, 8) != 0) {
+        fprintf(stderr, "path_kids.bin in %s is not EKIDS001; rebuild with ereport_index --make\n", index_dir);
+        fclose(fp);
+        return -1;
+    }
+    memcpy(&version, hdr + 8, sizeof(version));
+    memcpy(&n, hdr + 16, sizeof(n));
+    memcpy(&edges, hdr + 24, sizeof(edges));
+    if (version != KIDS_FORMAT_VERSION || n != npaths) {
+        fprintf(stderr, "path_kids.bin in %s does not match this index; rebuild with ereport_index --make\n",
+                index_dir);
+        fclose(fp);
+        return -1;
+    }
+    out->n_paths = n;
+    out->n_edges = edges;
+    out->off = (uint64_t *)malloc((size_t)(n + 1ULL) * sizeof(*out->off));
+    out->subtree_n = n ? (uint64_t *)malloc((size_t)n * sizeof(*out->subtree_n)) : NULL;
+    out->child_ids = edges ? (uint64_t *)malloc((size_t)edges * sizeof(*out->child_ids)) : NULL;
+    if ((n && (!out->off || !out->subtree_n)) || (edges && !out->child_ids) || (!n && !out->off)) {
+        fclose(fp);
+        path_kids_free(out);
+        return -1;
+    }
+    if (fread(out->off, sizeof(*out->off), (size_t)n + 1U, fp) != (size_t)n + 1U ||
+        (edges && fread(out->child_ids, sizeof(*out->child_ids), (size_t)edges, fp) != (size_t)edges) ||
+        (n && fread(out->subtree_n, sizeof(*out->subtree_n), (size_t)n, fp) != (size_t)n)) {
+        fprintf(stderr, "path_kids.bin in %s is truncated\n", index_dir);
+        fclose(fp);
+        path_kids_free(out);
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+static uint64_t kids_expand_cap(uint64_t npaths) {
+    uint64_t pct;
+
+    if (npaths <= KIDS_EXPAND_SMALL_CORPUS) return npaths;
+    pct = npaths / 100ULL;
+    if (pct < KIDS_EXPAND_SMALL_CORPUS) pct = KIDS_EXPAND_SMALL_CORPUS;
+    if (pct > KIDS_EXPAND_MAX_IDS) pct = KIDS_EXPAND_MAX_IDS;
+    return pct;
+}
+
+/* Collect path_id and every descendant via the CSR into ids (caller-owned, grown). */
+static int kids_walk_collect(const path_kids_t *k, uint64_t root, uint8_t *seen, uint64_t **ids, size_t *n,
+                             size_t *cap) {
+    uint64_t *stack = NULL;
+    size_t sn = 0, scap = 0;
+
+    if (root >= k->n_paths) return 0;
+    stack = (uint64_t *)malloc(16 * sizeof(*stack));
+    if (!stack) return -1;
+    scap = 16;
+    stack[sn++] = root;
+    while (sn) {
+        uint64_t id = stack[--sn];
+        uint64_t i;
+
+        if (id >= k->n_paths || seen[id]) continue;
+        seen[id] = 1;
+        if (*n == *cap) {
+            size_t nc = *cap ? *cap * 2 : 64;
+            uint64_t *ni = (uint64_t *)realloc(*ids, nc * sizeof(*ni));
+
+            if (!ni) {
+                free(stack);
+                return -1;
+            }
+            *ids = ni;
+            *cap = nc;
+        }
+        (*ids)[(*n)++] = id;
+        for (i = k->off[id]; i < k->off[id + 1]; i++) {
+            uint64_t c = k->child_ids[i];
+
+            if (c >= k->n_paths || seen[c]) continue;
+            if (sn == scap) {
+                size_t nc = scap * 2;
+                uint64_t *ns = (uint64_t *)realloc(stack, nc * sizeof(*ns));
+
+                if (!ns) {
+                    free(stack);
+                    return -1;
+                }
+                stack = ns;
+                scap = nc;
+            }
+            stack[sn++] = c;
+        }
+    }
+    free(stack);
+    return 0;
+}
+
+typedef struct {
     const char *paths_path;
     const char *offsets_path;
     const paths_index_t *paths_index;
@@ -8003,6 +8370,7 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         size_t hit_n = 0;
         size_t hit_cap = 0;
         char **dir_prefs = NULL;
+        uint64_t *dir_ids = NULL;
         size_t dir_n = 0;
         size_t dir_cap = 0;
         uint8_t *isdir_bits = NULL;
@@ -8012,6 +8380,9 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         char **final_paths = NULL;
         size_t final_n = 0;
         size_t final_cap = 0;
+        path_kids_t kids;
+
+        memset(&kids, 0, sizeof(kids));
 
         /* One shared header/chunk-table/dictionary load; the workers below only add a FILE* and a
          * decompression context each, so the table does not get duplicated per thread. */
@@ -8162,27 +8533,62 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
             if (dir_n == dir_cap) {
                 size_t nc = dir_cap ? dir_cap * 2 : 16;
                 char **np = (char **)realloc(dir_prefs, nc * sizeof(*np));
+                uint64_t *nid;
 
                 if (!np) {
                     for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
                     free(hit_ids);
                     free(hit_paths);
                     free(dir_prefs);
+                    free(dir_ids);
                     free(isdir_bits);
                     free(current.ids);
                     current.ids = NULL;
                     goto out;
                 }
                 dir_prefs = np;
+                nid = (uint64_t *)realloc(dir_ids, nc * sizeof(*nid));
+                if (!nid) {
+                    for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
+                    free(hit_ids);
+                    free(hit_paths);
+                    free(dir_prefs);
+                    free(dir_ids);
+                    free(isdir_bits);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
+                }
+                dir_ids = nid;
                 dir_cap = nc;
             }
-            dir_prefs[dir_n++] = hit_paths[ki];
+            dir_prefs[dir_n] = hit_paths[ki];
+            dir_ids[dir_n] = hit_ids[ki];
+            dir_n++;
             need_expand = 1;
         }
 
         if (need_expand) {
-            size_t hi = 0;
-            uint64_t pid;
+            uint64_t expand_est = 0;
+            int use_scan = 0;
+
+            if (load_path_kids(index_dir, indexed_paths_corpus, &kids) != 0) {
+                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                free(hit_ids);
+                free(hit_paths);
+                free(dir_prefs);
+                free(dir_ids);
+                free(isdir_bits);
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
+            }
+            for (ki = 0; ki < dir_n; ki++) {
+                uint64_t id = dir_ids[ki];
+
+                if (id < kids.n_paths) expand_est += kids.subtree_n[id];
+            }
+            use_scan = expand_est > kids_expand_cap(indexed_paths_corpus);
 
             paths_reader_free(&serial_pr);
             if (paths_fp) {
@@ -8201,85 +8607,201 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                 free(hit_ids);
                 free(hit_paths);
                 free(dir_prefs);
+                free(dir_ids);
                 free(isdir_bits);
+                path_kids_free(&kids);
                 free(current.ids);
                 current.ids = NULL;
                 goto out;
             }
 
-            for (pid = 0; pid < indexed_paths_corpus; pid++) {
-                int at_hit = (hi < hit_n && hit_ids[hi] == pid);
-                char *path;
+            if (!use_scan) {
+                uint8_t *seen = NULL;
+                uint64_t *walk_ids = NULL;
+                size_t walk_n = 0, walk_cap = 0;
+                size_t hi = 0;
 
-                if (final_n == final_cap) {
-                    size_t nc = final_cap ? final_cap * 2 : (hit_n ? hit_n * 2 : 64);
-                    uint64_t *ni;
-                    char **np;
-
-                    ni = (uint64_t *)realloc(final_ids, nc * sizeof(*ni));
-                    if (!ni) {
+                if (indexed_paths_corpus > 0) {
+                    seen = (uint8_t *)calloc((size_t)indexed_paths_corpus, 1);
+                    if (!seen) {
                         for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                        for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
                         free(hit_ids);
                         free(hit_paths);
-                        free(final_ids);
-                        free(final_paths);
                         free(dir_prefs);
+                        free(dir_ids);
                         free(isdir_bits);
+                        path_kids_free(&kids);
                         free(current.ids);
                         current.ids = NULL;
                         goto out;
                     }
-                    final_ids = ni;
-                    np = (char **)realloc(final_paths, nc * sizeof(*np));
-                    if (!np) {
-                        for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                        for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
-                        free(hit_ids);
-                        free(hit_paths);
-                        free(final_ids);
-                        free(final_paths);
-                        free(dir_prefs);
-                        free(isdir_bits);
-                        free(current.ids);
-                        current.ids = NULL;
-                        goto out;
-                    }
-                    final_paths = np;
-                    final_cap = nc;
                 }
+                for (ki = 0; ki < hit_n; ki++) {
+                    if (kids_walk_collect(&kids, hit_ids[ki], seen, &walk_ids, &walk_n, &walk_cap) != 0) {
+                        free(seen);
+                        free(walk_ids);
+                        for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
+                        free(hit_ids);
+                        free(hit_paths);
+                        free(dir_prefs);
+                        free(dir_ids);
+                        free(isdir_bits);
+                        path_kids_free(&kids);
+                        free(current.ids);
+                        current.ids = NULL;
+                        goto out;
+                    }
+                }
+                /* Basename file hits that are not under a matching dir stay in the result. */
+                for (ki = 0; ki < hit_n; ki++) {
+                    uint64_t id = hit_ids[ki];
 
-                if (at_hit) {
-                    final_ids[final_n] = pid;
-                    final_paths[final_n] = hit_paths[hi];
-                    hit_paths[hi] = NULL;
+                    if (id >= indexed_paths_corpus || (seen && seen[id])) continue;
+                    if (kids_walk_collect(&kids, id, seen, &walk_ids, &walk_n, &walk_cap) != 0) {
+                        free(seen);
+                        free(walk_ids);
+                        for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
+                        free(hit_ids);
+                        free(hit_paths);
+                        free(dir_prefs);
+                        free(dir_ids);
+                        free(isdir_bits);
+                        path_kids_free(&kids);
+                        free(current.ids);
+                        current.ids = NULL;
+                        goto out;
+                    }
+                }
+                free(seen);
+                if (walk_n > 1) qsort(walk_ids, walk_n, sizeof(*walk_ids), cmp_u64_asc);
+                final_cap = walk_n ? walk_n : 1;
+                final_ids = (uint64_t *)malloc(final_cap * sizeof(*final_ids));
+                final_paths = (char **)malloc(final_cap * sizeof(*final_paths));
+                if (!final_ids || !final_paths) {
+                    free(walk_ids);
+                    free(final_ids);
+                    free(final_paths);
+                    for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                    free(hit_ids);
+                    free(hit_paths);
+                    free(dir_prefs);
+                    free(dir_ids);
+                    free(isdir_bits);
+                    path_kids_free(&kids);
+                    free(current.ids);
+                    current.ids = NULL;
+                    goto out;
+                }
+                for (ki = 0; ki < walk_n; ki++) {
+                    uint64_t id = walk_ids[ki];
+                    char *path = NULL;
+
+                    while (hi < hit_n && hit_ids[hi] < id) hi++;
+                    if (hi < hit_n && hit_ids[hi] == id) {
+                        path = hit_paths[hi];
+                        hit_paths[hi] = NULL;
+                        hi++;
+                    } else {
+                        path = read_path_by_id(&serial_pr, offsets_fp, id);
+                    }
+                    if (!path) continue;
+                    final_ids[final_n] = id;
+                    final_paths[final_n] = path;
                     final_n++;
-                    hi++;
-                    continue;
                 }
+                free(walk_ids);
+                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                free(hit_ids);
+                free(hit_paths);
+                hit_ids = final_ids;
+                hit_paths = final_paths;
+                hit_n = final_n;
+                final_ids = NULL;
+                final_paths = NULL;
+            } else {
+                size_t hi = 0;
+                uint64_t pid;
 
-                path = read_path_by_id(&serial_pr, offsets_fp, pid);
-                if (!path) continue;
-                if (!path_is_under_any_dir(path, dir_prefs, dir_n)) {
-                    free(path);
-                    continue;
+                for (pid = 0; pid < indexed_paths_corpus; pid++) {
+                    int at_hit = (hi < hit_n && hit_ids[hi] == pid);
+                    char *path;
+
+                    if (final_n == final_cap) {
+                        size_t nc = final_cap ? final_cap * 2 : (hit_n ? hit_n * 2 : 64);
+                        uint64_t *ni;
+                        char **np;
+
+                        ni = (uint64_t *)realloc(final_ids, nc * sizeof(*ni));
+                        if (!ni) {
+                            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                            for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
+                            free(hit_ids);
+                            free(hit_paths);
+                            free(final_ids);
+                            free(final_paths);
+                            free(dir_prefs);
+                            free(dir_ids);
+                            free(isdir_bits);
+                            path_kids_free(&kids);
+                            free(current.ids);
+                            current.ids = NULL;
+                            goto out;
+                        }
+                        final_ids = ni;
+                        np = (char **)realloc(final_paths, nc * sizeof(*np));
+                        if (!np) {
+                            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                            for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
+                            free(hit_ids);
+                            free(hit_paths);
+                            free(final_ids);
+                            free(final_paths);
+                            free(dir_prefs);
+                            free(dir_ids);
+                            free(isdir_bits);
+                            path_kids_free(&kids);
+                            free(current.ids);
+                            current.ids = NULL;
+                            goto out;
+                        }
+                        final_paths = np;
+                        final_cap = nc;
+                    }
+
+                    if (at_hit) {
+                        final_ids[final_n] = pid;
+                        final_paths[final_n] = hit_paths[hi];
+                        hit_paths[hi] = NULL;
+                        final_n++;
+                        hi++;
+                        continue;
+                    }
+
+                    path = read_path_by_id(&serial_pr, offsets_fp, pid);
+                    if (!path) continue;
+                    if (!path_is_under_any_dir(path, dir_prefs, dir_n)) {
+                        free(path);
+                        continue;
+                    }
+                    final_ids[final_n] = pid;
+                    final_paths[final_n] = path;
+                    final_n++;
                 }
-                final_ids[final_n] = pid;
-                final_paths[final_n] = path;
-                final_n++;
+                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
+                free(hit_ids);
+                free(hit_paths);
+                hit_ids = final_ids;
+                hit_paths = final_paths;
+                hit_n = final_n;
+                final_ids = NULL;
+                final_paths = NULL;
             }
-            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-            free(hit_ids);
-            free(hit_paths);
-            hit_ids = final_ids;
-            hit_paths = final_paths;
-            hit_n = final_n;
-            final_ids = NULL;
-            final_paths = NULL;
         }
 
         free(dir_prefs);
+        free(dir_ids);
         free(isdir_bits);
+        path_kids_free(&kids);
         paths_reader_free(&serial_pr);
         if (paths_fp) {
             fclose(paths_fp);
@@ -8507,15 +9029,6 @@ int main(int argc, char **argv) {
             if (strcmp(argv[ai], "--no-dir-index") == 0) {
                 g_dir_index = 0;
                 ai++;
-                continue;
-            }
-            if (strcmp(argv[ai], "--journal-dir") == 0) {
-                if (ai + 2 > argc || argv[ai + 1][0] == '\0') {
-                    fprintf(stderr, "ereport_index: --journal-dir requires a path\n");
-                    return 2;
-                }
-                g_journal_dir = argv[ai + 1];
-                ai += 2;
                 continue;
             }
             break;

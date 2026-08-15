@@ -85,6 +85,7 @@ ECRAWL_CRAWL_THREADS=24 ./ecrawl --no-write /path/to/filesystem-tree
 Notes:
 
 - `--no-write` crawls and reports metrics without writing shard files. Hardlink dedup stays on (`hardlink_dedup=on`): each regular-file inode credits `st_size` once, matching write-mode `total_bytes` and `du`/`dut` semantics.
+- `--statx` and `--iouring` mostly do not help; leave them off. `--statx` is a wash. `--iouring` can win cold on wide local directories and is a large NFS regression.
 - `--verbose` enables the full end-of-run diagnostics only; it does not imply mid-run progress.
 - `--progress` prints a cheap live `files=` / `entries=` (and `bytes=` when accounted) line, driven by a per-worker dirent count that accumulates across directories (every `ECRAWL_DONATE_ENTRY_CHECK_EVERY` names, default 4096; `0` disables donation but not progress), coalesced to about two updates per second. The line goes to stderr, or to stdout with `--count` so it sits with the census. There is no dedicated progress thread. Omit it for dut-quiet timed walks.
 - `--no-stat` walks names only and never reads an inode, streaming each path to stdout instead of writing a capture. It implies `--no-write` and rejects an `output-dir`, because a record needs the uid, size, inode and mtime that only `stat` provides. Recursion is driven entirely by the `d_type` that `getdents64` already returns; on a filesystem that reports `DT_UNKNOWN` the walk falls back to one `fstatat` for those entries alone and counts them in `dtype_unknown_fallbacks`. Because stdout is the path stream, the run summary goes to stderr, so `./ecrawl --no-stat /tree | sort` is a clean path list. Counts are limited to what `d_type` can prove (files, dirs, symlinks, other) — no byte totals.
@@ -459,7 +460,7 @@ The images below are illustrative mockups of the layout (fonts and spacing may d
 
 `ereport_index` builds and searches an on-disk trigram index over crawl path strings—either for one resolved Unix user or for every UID when no user is selected (see `--make` disambiguation below; same idea as `ereport` all-users mode: all uid-shard files, no UID filter on records).
 
-Indexing is **segment-once**: trigrams are taken only from each path's basename (the final component). Parent directory names are not re-trigrammed onto every child. Directory records still contribute their own basename trigrams, and `--search` expands a matching directory to its descendants so middle-segment hits remain complete.
+Indexing is **segment-once**: trigrams are taken only from each path's basename (the final component). Parent directory names are not re-trigrammed onto every child. Directory records still contribute their own basename trigrams, and `--search` expands a matching directory via `path_kids.bin` (immediate-children CSR) so middle-segment hits remain complete. Huge directory hits fall back to a sequential prefix scan of `paths.bin`.
 
 The search is a case-insensitive substring match on individual path segments (slashes separate segments; matches do not span `/`). For example:
 
@@ -605,17 +606,18 @@ Current index format:
 
 Current files under `<username>/index/`:
 
-- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields; `trigrams=basename` on version 3+)
+- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields; `trigrams=basename` on version 3+; `path_kids=1` on version 4+)
 - `path_offsets.bin`
 - `paths.bin`
-- `path_isdir.bin` — bit-packed directory flags (one bit per `path_id`) for search-time descendant expansion
+- `path_isdir.bin` — bit-packed directory flags (one bit per `path_id`) so `--search` can tell directory hits from file hits
+- `path_kids.bin` — required children CSR (`off` / `child_ids` / `subtree_n`) for directory-hit expansion; a missing file is a hard error
 - `tri_keys.bin`
 - `tri_postings.bin`
 - `dirs.idx`, `rowgroups.idx` — the directory-index sidecars, unless `--no-dir-index` was passed
 
 #### Directory-index sidecars (`dirs.idx`, `rowgroups.idx`)
 
-Unlike the five files above, these two have nothing to do with trigram search. They are a lookup structure over the *shards*, written into the same directory because that is where a build already has every shard open and a place to put derived state. `ecrawl_query --index-dir DIR` reads them to answer a `--subtree` query without parsing every catalog row, and to scan only the row groups a subtree can touch; see [`ecrawl_query`](#index-dir-answering-from-the-directory-index-sidecars) and the [format reference](binary-format.md#directory-index-sidecars-dirsidx-rowgroupsidx).
+Unlike the trigram-index files above, these two have nothing to do with trigram search. They are a lookup structure over the *shards*, written into the same directory because that is where a build already has every shard open and a place to put derived state. `ecrawl_query --index-dir DIR` reads them to answer a `--subtree` query without parsing every catalog row, and to scan only the row groups a subtree can touch; see [`ecrawl_query`](#index-dir-answering-from-the-directory-index-sidecars) and the [format reference](binary-format.md#directory-index-sidecars-dirsidx-rowgroupsidx).
 
 They are written in a phase of their own after the trigram merge, which is why `--make` reports `dir_index_sec` separately. The phase is not allowed to fail a build: a shard it cannot summarise makes it warn, remove the partial files and leave the trigram index complete. Nothing else reads them, and no index version was bumped for them — nothing keys on the extra `meta.txt` lines, and a reader that does not find the files falls back to the catalogs.
 
@@ -623,11 +625,15 @@ Cost, measured on a 1.13M-record capture of 21726 directories: `dirs.idx` 509 Ki
 
 `--make` reports `dir_index=1`, `dir_index_dirs`, `dir_index_bytes`, `rowgroup_index_groups`, `rowgroup_index_bytes` and `dir_index_sec` on stdout, and `meta.txt` records `dir_index`, `dir_index_dirs`, `rowgroup_index` and `rowgroup_index_groups`. Those are advisory: a reader validates the sidecars against the shards themselves, not against `meta.txt`.
 
+#### Index version 4 (children CSR)
+
+Version 4 keeps the version-3 basename-trigram layout and adds `path_kids.bin`: a dense CSR keyed by `path_id` with immediate children and a `subtree_n` count (1 + descendants). `--search` intersects basename postings, verifies candidates, then if any hit is a directory walks that CSR (or, when the hit subtree is huge, the existing sequential prefix scan of `paths.bin`) so segment-anywhere semantics stay intact without re-emitting parent trigrams during `--make`.
+
+There is no dual-read path for older indexes: `--search` and `--resume-merge` require `ereport_index_version=4` in `meta.txt`. A v3 index must be rebuilt. `path_kids.bin` is required; `--search` does not fall back to a full-corpus scan when it is missing.
+
 #### Index version 3 (basename trigrams)
 
-Version 3 keeps the version-2 compression layout and changes what is inverted: each path contributes trigrams from its basename only. `path_isdir.bin` is written beside `path_offsets.bin`. `--search` intersects basename postings, verifies candidates, then if any hit is a directory walks the corpus for paths under those directory prefixes so segment-anywhere semantics stay intact without re-emitting parent trigrams during `--make`.
-
-There is no dual-read path for older indexes: `--search` and `--resume-merge` require `ereport_index_version=3` in `meta.txt`.
+Version 3 kept the version-2 compression layout and changed what is inverted: each path contributed trigrams from its basename only, with `path_isdir.bin` beside `path_offsets.bin`. Directory-hit expansion walked every path in `paths.bin`. Superseded by version 4.
 
 #### Compression (index version 2+)
 

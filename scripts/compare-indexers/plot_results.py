@@ -25,6 +25,7 @@ try:
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.patches import Patch
     from matplotlib.ticker import FuncFormatter, LogLocator
+    from matplotlib.transforms import ScaledTranslation
 except ImportError:
     sys.stderr.write(
         "ERROR: matplotlib is required for charts. Rerun init.sh with "
@@ -54,18 +55,6 @@ PIPELINES = [
         "ecrawl",  # label when only the first phase ran
     ),
     (
-        # Same build with crawl-time journals: the crawl row carries the extra
-        # journal bytes, the index row is the parallel replay of those journals.
-        # Two lines: as one it is the widest y-tick label and outgrows the
-        # fixed left margin of the single-panel build figures.
-        "ecrawl + ereport_index\n(journal)",
-        [
-            ((("ecrawl_trij", "write"),), "crawl"),
-            ((("ereport_index_trij", "make"),), "trigram index"),
-        ],
-        "ecrawl (journal)",
-    ),
-    (
         # Two stages, not two alternatives: the scan crawls into index-free
         # tables, which is not a database anyone queries, and the three CREATE
         # INDEX statements are what make them queryable. Charting the scan alone
@@ -82,14 +71,14 @@ PIPELINES = [
         # syscall differs. Crawl-only pipelines: the ereport_index half is
         # byte-identical to the baseline's, so re-running it would measure
         # nothing new.
-        "ecrawl --statx",
+        "ecrawl\n(--statx)",
         [((("ecrawl", "write_statx"),), "crawl")],
-        "ecrawl --statx",
+        "ecrawl\n(--statx)",
     ),
     (
-        "ecrawl --io_uring",
+        "ecrawl\n(--io_uring)",
         [((("ecrawl", "write_iouring"),), "crawl")],
-        "ecrawl --io_uring",
+        "ecrawl\n(--io_uring)",
     ),
     ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "dir2index")], None),
     (
@@ -104,16 +93,22 @@ PIPELINES = [
 ]
 INDEX_ORDER = [
     "ecrawl + ereport_index",
-    "ecrawl + ereport_index\n(journal)",
     "ecrawl",
-    "ecrawl (journal)",
-    "ecrawl --statx",
-    "ecrawl --io_uring",
+    "ecrawl\n(--statx)",
+    "ecrawl\n(--io_uring)",
     "Robinhood",
     "Robinhood (scan only)",
     "GUFI (dir2index)",
     "GUFI + rollup",
     "XDU",
+]
+# Figures 3–4 are "unindexed tree to queryable index". The statx / io_uring
+# write rows are crawl-only (ereport_index was not re-run), so ranking them
+# against the full pipeline is a shorter bar for less work.
+BUILD_ORDER = [
+    label
+    for label in INDEX_ORDER
+    if label not in ("ecrawl\n(--statx)", "ecrawl\n(--io_uring)")
 ]
 
 # Walk-only rows store nothing. They are not one peer group: find/fd (and
@@ -122,10 +117,10 @@ INDEX_ORDER = [
 # draw those as two panels.
 WALK_VARIANTS = ("walk", "nowrite", "nostat", "nowrite_statx", "nowrite_iouring")
 WALK_LABELS = {
-    ("ecrawl", "nostat"): "ecrawl --no-stat --count",
-    ("ecrawl", "nowrite"): "ecrawl --no-write",
-    ("ecrawl", "nowrite_statx"): "ecrawl --no-write\n--statx",
-    ("ecrawl", "nowrite_iouring"): "ecrawl --no-write\n--io_uring",
+    ("ecrawl", "nostat"): "ecrawl\n(--no-stat --count)",
+    ("ecrawl", "nowrite"): "ecrawl\n(--no-write)",
+    ("ecrawl", "nowrite_statx"): "ecrawl\n(--no-write --statx)",
+    ("ecrawl", "nowrite_iouring"): "ecrawl\n(--no-write --io_uring)",
     ("find", "walk"): "find",
     ("fd", "walk"): "fd",
     ("du", "walk"): "du",
@@ -133,12 +128,12 @@ WALK_LABELS = {
     ("dut", "walk"): "dut",
 }
 # Names-only peers: timed job returns a regular-file count (answer_files=).
-WALK_NAMES_ORDER = ["ecrawl --no-stat --count", "fd", "find"]
+WALK_NAMES_ORDER = ["ecrawl\n(--no-stat --count)", "fd", "find"]
 # Metadata + size peers: timed job returns apparent bytes (answer_bytes=).
 WALK_META_ORDER = [
-    "ecrawl --no-write",
-    "ecrawl --no-write\n--statx",
-    "ecrawl --no-write\n--io_uring",
+    "ecrawl\n(--no-write)",
+    "ecrawl\n(--no-write --statx)",
+    "ecrawl\n(--no-write --io_uring)",
     "dut",
     "dua",
     "du",
@@ -177,16 +172,15 @@ QUERY_TITLES = {
 # the common colour vision deficiencies and in greyscale print.
 COLORS = {
     "ecrawl + ereport_index": "#0072B2",
-    "ecrawl + ereport_index\n(journal)": "#E69F00",
     "ecrawl": "#0072B2",
-    "ecrawl (journal)": "#E69F00",
-    "ecrawl --no-stat --count": "#0072B2",
-    "ecrawl --no-write": "#56B4E9",
-    # Same hue, lighter tints: same tool, different inode-read syscall.
-    "ecrawl --statx": "#56B4E9",
-    "ecrawl --io_uring": "#A6CEE3",
-    "ecrawl --no-write\n--statx": "#8FCDE9",
-    "ecrawl --no-write\n--io_uring": "#C4E3F2",
+    "ecrawl\n(--no-stat --count)": "#0072B2",
+    "ecrawl\n(--no-write)": "#1A6FA8",
+    # Same family, darker bases: lightness is reserved for cold vs hot.
+    # Pale tints as the cold colour made --io_uring's pair look like one bar.
+    "ecrawl\n(--statx)": "#1A6FA8",
+    "ecrawl\n(--io_uring)": "#0A4E7A",
+    "ecrawl\n(--no-write --statx)": "#1A6FA8",
+    "ecrawl\n(--no-write --io_uring)": "#0A4E7A",
     "ereport": "#0072B2",
     "ecrawl_query": "#0072B2",
     "ereport_index": "#56B4E9",
@@ -269,6 +263,44 @@ def cache_states(rows):
         {row.get("cache") or "" for row in rows},
         key=lambda name: (CACHE_ORDER.get(name, 3), name),
     ) or [""]
+
+
+def metric_mean(dataset, key, tool, metric):
+    if not dataset:
+        return None
+    return dataset.get(key, {}).get(tool, {}).get(metric, (None, None))[0]
+
+
+def tool_rank_mean(datasets, key, tool, metric):
+    """That tool's ranking number: its cold mean, else warm, else any series.
+
+    A tool recorded as warm (no privilege to drop) still has to compete with
+    the cold bars; ranking only the cold dataset would bury it.
+    """
+    by_cache = {}
+    for dataset in datasets:
+        mean = metric_mean(dataset, key, tool, metric)
+        if mean is not None:
+            by_cache.setdefault(dataset.get("cache") or "", mean)
+    for want in ("cold", "warm", "hot", ""):
+        if want in by_cache:
+            return by_cache[want]
+    if by_cache:
+        return next(iter(by_cache.values()))
+    return None
+
+
+def sort_tools_best_first(tools, datasets, key, metric, higher_better):
+    """Best at the start of the list (top after invert_yaxis), by each tool's cold."""
+
+    def sort_key(tool):
+        mean = tool_rank_mean(datasets, key, tool, metric)
+        if mean is None:
+            return (1, 0.0)
+        value = -mean if higher_better else mean
+        return (0, value)
+
+    return sorted(tools, key=sort_key)
 
 
 def rows_for_cache(rows, cache):
@@ -713,13 +745,19 @@ def count_disagrees(query, value, expected):
     return value != expected
 
 
-def ordered_keys(order, datasets, key):
-    """Names from `order` that any dataset has data for, plus anything unlisted,
-    so a tool added to the harness still charts instead of silently vanishing."""
+def ordered_keys(order, datasets, key, extras=True):
+    """Names from `order` that any dataset has data for.
+
+    Unlisted names are appended so a tool added to the harness still charts
+    instead of silently vanishing, unless `extras` is false (build time/rate
+    must not pick up crawl-only write variants).
+    """
     present = set()
     for dataset in datasets:
         present.update(dataset.get(key, {}).keys())
     listed = [name for name in order if name in present]
+    if not extras:
+        return listed
     return listed + sorted(present.difference(listed))
 
 
@@ -793,6 +831,18 @@ def wrap_caption(text, fig_width_in, fontsize=8.5):
     )
 
 
+# Cold is the tool colour. Later passes lighten toward white. 0.45 left a pale
+# base (io_uring) looking like one bar; 0.62 is a clear dark/light pair.
+CACHE_SHADES = (0.0, 0.62, 0.78, 0.88)
+
+
+def cache_shades(n):
+    shades = list(CACHE_SHADES[:n])
+    while len(shades) < n:
+        shades.append(CACHE_SHADES[-1])
+    return shades
+
+
 def shade(color, amount):
     """Lighten toward white. Keeps a tool recognisable across datasets while
     still separating the datasets, which a second hue would not."""
@@ -815,96 +865,64 @@ def style_axis(axis, xlabel=None, log=False):
         axis.set_xlabel(xlabel)
 
 
-def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None,
-              v_shift=0):
-    """Value at the end of the bar, which beats making the reader trace gridlines."""
+def _label_transform(axis, dx_pt=4.0, dy_pt=0.0):
+    """Data coords plus a point offset. invert_yaxis cannot desync x/y."""
+    shift = ScaledTranslation(dx_pt / 72.0, dy_pt / 72.0, axis.figure.dpi_scale_trans)
+    return axis.transData + shift
+
+
+def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None):
+    """Value at the end of the bar, optically centered on that bar.
+
+    va='center' lines up the font bbox, whose unused descent parks digits
+    above the bar. A small downward shift puts the ink on the bar.
+    """
     offset = x * 1.12 if log else x
-    axis.annotate(
+    # ~0.3 em: enough to cancel descent, not enough to drop onto the next bar.
+    optical = -2.5 if not sub else 0.0
+    trans = _label_transform(axis, 4.0, optical)
+    axis.text(
+        offset,
+        y,
         text,
-        xy=(offset, y),
-        xytext=(4, (-4 if sub else 0) + v_shift),
-        textcoords="offset points",
-        va="center" if not sub else "bottom",
+        transform=trans,
+        va="bottom" if sub else "center",
         ha="left",
         fontsize=8.5,
         color=color,
         fontweight=weight,
+        clip_on=False,
+        zorder=6,
     )
     if sub:
-        # The phase split, kept subordinate to the total it adds up to.
-        axis.annotate(
+        axis.text(
+            offset,
+            y,
             sub,
-            xy=(offset, y),
-            xytext=(4, -3 + v_shift),
-            textcoords="offset points",
+            transform=trans,
             va="top",
             ha="left",
             fontsize=7.5,
             color="#666666",
-        )
-
-
-def is_ecrawl_row(tool):
-    """Suite rows: ecrawl walks, the journal pipeline, ereport / ecrawl_query."""
-    head = tool.split("\n", 1)[0].strip()
-    return head.startswith("ecrawl") or head.startswith("ereport")
-
-
-def row_badge_tags(tool, winner, loser):
-    """Tiny pills: suite identity, then best/worst. Two kinds, stacked if both."""
-    tags = []
-    if is_ecrawl_row(tool):
-        tags.append(("ecrawl", "#D6EAF8", "#005A8C"))
-    if winner and tool == winner:
-        tags.append(("best", "#D8F0D8", "#1B5E20"))
-    elif loser and tool == loser:
-        tags.append(("worst", "#F4D6D6", "#7F1D1D"))
-    return tags
-
-
-def draw_row_badges(axis, y, tags):
-    """Left-edge chips on the bar row. Small on purpose: a scan aid, not a key."""
-    x_off = 2.0
-    for text, face, ink in tags:
-        axis.annotate(
-            text,
-            xy=(0.0, y),
-            xycoords=("axes fraction", "data"),
-            xytext=(x_off, 0),
-            textcoords="offset points",
-            fontsize=5.5,
-            fontweight="bold",
-            color=ink,
-            va="center",
-            ha="left",
-            bbox={
-                "boxstyle": "round,pad=0.12,rounding_size=0.35",
-                "facecolor": face,
-                "edgecolor": ink,
-                "linewidth": 0.35,
-                "alpha": 0.92,
-            },
-            zorder=6,
             clip_on=False,
+            zorder=6,
         )
-        x_off += 4.0 + 0.52 * 5.5 * len(text)
 
 
-def badge_ranked_rows(axis, tools, positions, eligible=None):
-    """Mark the suite and the two ends of an already-sorted ranking (worst first).
+def datasets_with_metric(datasets, key, metric):
+    """Drop a cache series that has no bar on this figure.
 
-    `eligible` is the set that may win or lose (query panels drop DISAGREES
-    rows so a wrong-and-fast bar cannot take 'best').
+    A warm-only walk row would otherwise open a third slot on the build
+    charts, which have no warm values, and stretch every label off its bar.
     """
-    if not tools:
-        return
-    pool = [tool for tool in tools if eligible is None or tool in eligible]
-    winner = pool[-1] if len(pool) > 1 else None
-    loser = pool[0] if len(pool) > 1 else None
-    for y, tool in zip(positions, tools):
-        tags = row_badge_tags(tool, winner, loser)
-        if tags:
-            draw_row_badges(axis, y, tags)
+    return [
+        dataset
+        for dataset in datasets
+        if any(
+            dataset.get(key, {}).get(tool, {}).get(metric, (None, None))[0] is not None
+            for tool in dataset.get(key, {})
+        )
+    ]
 
 
 def fits_inside(fig, axis, value, text, fontsize=7.5):
@@ -927,11 +945,14 @@ def index_figure(datasets, out_dir, spec):
     key = spec["key"]
     metric = spec.get("metric", "time")
     formatter = spec.get("formatter", fmt_seconds)
+    datasets = datasets_with_metric(datasets, key, metric)
     # Rates go the other way round: the best bar is the longest one, not the
     # shortest, and everything that assumes "less is better" has to be told.
     higher_better = spec.get("better") == "higher"
 
-    tools = ordered_keys(spec["order"], datasets, key)
+    tools = ordered_keys(
+        spec["order"], datasets, key, extras=not spec.get("only_order")
+    )
     # A tool with no value for *this* column would otherwise take a row label
     # and draw nothing beside it, which reads as a zero rather than a gap.
     tools = [
@@ -946,23 +967,10 @@ def index_figure(datasets, out_dir, spec):
         return [], None
     multi = len(datasets) > 1
 
-    # Worst at the top so the eye lands on the winner at the bottom, the way a
-    # ranking reads. Rank on the worst dataset that has the tool, so one
-    # dataset missing a tool does not banish it to the bottom.
-    def sort_key(tool):
-        means = [
-            dataset[key].get(tool, {}).get(metric, (None, None))[0]
-            for dataset in datasets
-        ]
-        means = [m for m in means if m is not None]
-        if not means:
-            return 0.0
-        return min(means) if higher_better else -max(means)
-
-    tools = sorted(tools, key=sort_key)
-    shades = [0.0, 0.45, 0.68, 0.8][: len(datasets)]
-    while len(shades) < len(datasets):
-        shades.append(0.8)
+    # Cold best at the top. Hot bars share that order so a cache win cannot
+    # reshuffle the ranking.
+    tools = sort_tools_best_first(tools, datasets, key, metric, higher_better)
+    shades = cache_shades(len(datasets))
 
     # A phase split adds a second line of text per bar, which needs the room.
     split_rows = spec.get("split", True) and any(
@@ -1097,7 +1105,6 @@ def index_figure(datasets, out_dir, spec):
 
     axis.set_yticks(positions)
     axis.set_yticklabels(tools, fontsize=9)
-    badge_ranked_rows(axis, tools, positions)
     # The walk-only line is annotated above the first bar, so it needs a band of
     # its own up there.
     axis.set_ylim(-(1.0 if floor else 0.7), len(tools) - 0.3)
@@ -1132,9 +1139,9 @@ def index_figure(datasets, out_dir, spec):
     else:
         axis.set_xlim(low, high * (1.55 if split_rows else 1.22))
 
-    # Cold/hot storage (and similar) often print the same multi-line note twice;
-    # collapse those onto the tool row so the copies cannot stack on each other.
-    draw = []
+    # Same note on every series of a row (index size, cold vs hot) is one
+    # label on the tool row. Different values stay on their own bars.
+    placed = []
     if multi:
         by_row = {}
         for item in pending:
@@ -1143,26 +1150,21 @@ def index_figure(datasets, out_dir, spec):
             items = by_row[row]
             keys = [
                 (text, split, note, segmented)
-                for _, _, _, _, _, text, split, note, segmented in items
+                for _r, _i, _y, _m, _s, text, split, note, segmented in items
             ]
             if len(items) > 1 and len(set(keys)) == 1:
-                _, _, _, _, _, text, split, note, segmented = items[0]
-                mean = max(m for _, _, _, m, _, _, _, _, _ in items if m is not None)
-                std = max((s or 0) for _, _, _, _, s, _, _, _, _ in items)
-                # Centered on the tool row; dataset_index 0 keeps v_shift neutral.
-                draw.append(
-                    (positions[row], 0, mean, std, text, split, note, segmented)
-                )
+                mean = max(m for _r, _i, _y, m, _s, *_rest in items if m is not None)
+                std = max((s or 0) for _r, _i, _y, _m, s, *_rest in items)
+                _r, _i, _y, _mean, _std, text, split, note, segmented = items[0]
+                placed.append((positions[row], mean, std, text, split, note, segmented))
             else:
-                for _, dataset_index, y, mean, std, text, split, note, segmented in items:
-                    draw.append(
-                        (y, dataset_index, mean, std, text, split, note, segmented)
-                    )
+                for _r, _i, y, mean, std, text, split, note, segmented in items:
+                    placed.append((y, mean, std, text, split, note, segmented))
     else:
-        for _, dataset_index, y, mean, std, text, split, note, segmented in pending:
-            draw.append((y, dataset_index, mean, std, text, split, note, segmented))
+        for _r, _i, y, mean, std, text, split, note, segmented in pending:
+            placed.append((y, mean, std, text, split, note, segmented))
 
-    for y, dataset_index, mean, std, text, split, note, segmented in draw:
+    for y, mean, std, text, split, note, segmented in placed:
         end = mean + (std or 0)
         sub = note or None
         if split:
@@ -1173,21 +1175,22 @@ def index_figure(datasets, out_dir, spec):
             if segmented or not log or not fits_inside(fig, axis, mean, split):
                 sub = split if sub is None else "{}\n{}".format(split, sub)
             else:
-                axis.annotate(
+                inside = axis.get_yaxis_transform() + ScaledTranslation(
+                    0, -2.5 / 72.0, axis.figure.dpi_scale_trans
+                )
+                axis.text(
+                    0.008,
+                    y,
                     split,
-                    xy=(0.008, y),
-                    xycoords=axis.get_yaxis_transform(),
+                    transform=inside,
                     va="center",
                     ha="left",
                     fontsize=7.5,
                     color="white",
                     zorder=5,
+                    clip_on=False,
                 )
-        # When cold/hot labels differ, nudge multi-line notes apart vertically.
-        v_shift = 0
-        if multi and len(datasets) > 1 and sub:
-            v_shift = (0.5 - dataset_index) * 10
-        bar_label(axis, y, end, text, log, sub=sub, v_shift=v_shift)
+        bar_label(axis, y, end, text, log, sub=sub)
 
     if floor:
         name, value = floor
@@ -1370,7 +1373,8 @@ INDEX_FIGURES = [
         "heading": "building, elapsed time",
         "panel_title": "How long it takes to build a queryable index",
         "key": "index",
-        "order": INDEX_ORDER,
+        "order": BUILD_ORDER,
+        "only_order": True,
         "metric": "time",
         "formatter": fmt_seconds,
         "xlabel": "Elapsed seconds",
@@ -1385,7 +1389,8 @@ INDEX_FIGURES = [
         "heading": "building, throughput",
         "panel_title": "Files per second, building the index",
         "key": "index",
-        "order": INDEX_ORDER,
+        "order": BUILD_ORDER,
+        "only_order": True,
         "metric": "rate",
         "better": "higher",
         "formatter": fmt_rate,
@@ -1437,24 +1442,19 @@ def _walk_panel_tools(datasets, key, order, metric):
 
 
 def _sort_walk_tools(tools, datasets, key, metric, higher_better):
-    def sort_key(tool):
-        means = [
-            dataset[key].get(tool, {}).get(metric, (None, None))[0]
-            for dataset in datasets
-        ]
-        means = [m for m in means if m is not None]
-        if not means:
-            return 0.0
-        return min(means) if higher_better else -max(means)
+    return sort_tools_best_first(tools, datasets, key, metric, higher_better)
 
-    return sorted(tools, key=sort_key)
+
+def _packed_ys(position, count, span=0.72):
+    """Bar centers for one tool, packed around the y-tick with no empty slots."""
+    slot = span / max(count, 1)
+    return [position + (i - (count - 1) / 2.0) * slot for i in range(count)]
 
 
 def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_better,
                      shades, xlabel, panel_title):
     """One peer-group ranking; independent x-scale from the sibling panel."""
     multi = len(datasets) > 1
-    bar_h = 0.72 / len(datasets)
     positions = list(range(len(tools)))
     values = [
         dataset[key].get(tool, {}).get(metric, (None, None))[0]
@@ -1464,13 +1464,16 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
     positive = [v for v in values if v and v > 0]
     log = bool(positive) and max(positive) / min(positive) >= LOG_RANGE
     pending = []
-    for dataset_index, dataset in enumerate(datasets):
-        offset = (dataset_index - (len(datasets) - 1) / 2.0) * bar_h
-        for row, tool in enumerate(tools):
+    for row, tool in enumerate(tools):
+        present = []
+        for dataset_index, dataset in enumerate(datasets):
             mean, std = dataset[key].get(tool, {}).get(metric, (None, None))
-            y = positions[row] + offset
-            if mean is None:
-                continue
+            if mean is not None:
+                present.append((dataset_index, mean, std))
+        bar_h = 0.72 / max(len(present), 1)
+        for y, (dataset_index, mean, std) in zip(
+            _packed_ys(positions[row], len(present)), present
+        ):
             base = shade(COLORS.get(tool, "#4C72B0"), shades[dataset_index])
             axis.barh(
                 y,
@@ -1490,7 +1493,6 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
 
     axis.set_yticks(positions)
     axis.set_yticklabels(tools, fontsize=9)
-    badge_ranked_rows(axis, tools, positions)
     axis.set_ylim(-0.7, len(tools) - 0.3)
     axis.invert_yaxis()
     axis.set_title(panel_title, fontsize=10, fontweight="bold", loc="left", pad=4)
@@ -1512,12 +1514,9 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
         axis.set_xlim(low, high * (4.0 if higher_better else 2.6))
     else:
         axis.set_xlim(low, high * 1.22)
-    for y, dataset_index, mean, std, text in pending:
+    for y, _dataset_index, mean, std, text in pending:
         end = mean + (std or 0)
-        v_shift = 0
-        if multi and len(datasets) > 1:
-            v_shift = (0.5 - dataset_index) * 10
-        bar_label(axis, y, end, text, log, v_shift=v_shift)
+        bar_label(axis, y, end, text, log)
 
 
 def _walk_ytick_gutter(tools, page_width_in):
@@ -1533,7 +1532,9 @@ def _walk_ytick_gutter(tools, page_width_in):
     )
     tick_pt = 9.0
     label_in = longest * tick_pt * 0.62 / 72.0
-    return min(0.24, max(0.08, (label_in + 0.18) / page_width_in))
+    # One-line names (same as figures 3–5) are wider than the old two-line
+    # split; 0.24 clipped "ecrawl --no-write --io_uring" into the left bars.
+    return min(0.30, max(0.08, (label_in + 0.18) / page_width_in))
 
 
 def _walk_panel_positions(left_margin, mid_gap, right_margin=0.04):
@@ -1597,6 +1598,7 @@ def walk_figure(datasets, out_dir, spec):
     key = spec["key"]
     metric = spec.get("metric", "time")
     formatter = spec.get("formatter", fmt_seconds)
+    datasets = datasets_with_metric(datasets, key, metric)
     higher_better = spec.get("better") == "higher"
     panels = spec["panels"]
     panel_tools = []
@@ -1608,9 +1610,7 @@ def walk_figure(datasets, out_dir, spec):
         return [], None
 
     multi = len(datasets) > 1
-    shades = [0.0, 0.45, 0.68, 0.8][: len(datasets)]
-    while len(shades) < len(datasets):
-        shades.append(0.8)
+    shades = cache_shades(len(datasets))
 
     page = LETTER_LANDSCAPE
     printable = page[1] - 2 * LETTER_MARGIN
@@ -1744,7 +1744,23 @@ def plot_index(datasets, out_dir):
     return outputs, figures
 
 
-def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
+def query_rank_mean(datasets, tool, query):
+    """That tool's ranking time for this query: cold, else warm, else any."""
+    by_cache = {}
+    for dataset in datasets or ():
+        pair = dataset.get("queries", {}).get("stats", {}).get((tool, query))
+        if pair and pair[0] is not None:
+            by_cache.setdefault(dataset.get("cache") or "", pair[0])
+    for want in ("cold", "warm", "hot", ""):
+        if want in by_cache:
+            return by_cache[want]
+    if by_cache:
+        return next(iter(by_cache.values()))
+    return None
+
+
+def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages,
+                 rank_datasets=None):
     """One Letter portrait page: three query panels for a single cache state.
 
     Cold and hot each get their own page. Panels fill the sheet with enough
@@ -1800,10 +1816,19 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
 
     for row, query in enumerate(queries):
         axis = axes[row][0]
-        # Fastest at the bottom, so each panel reads as a ranking.
+        # Cold fastest at the top (hot pages keep that order). invert_yaxis
+        # puts y=0 at the top, matching the walk and build figures.
+        rank_pool = rank_datasets or [dataset]
+
+        def query_sort_key(tool):
+            mean = query_rank_mean(rank_pool, tool, query)
+            if mean is None:
+                return (1, stats[(tool, query)][0])
+            return (0, mean)
+
         entries = sorted(
             (t for t in QUERY_ORDER if (t, query) in stats),
-            key=lambda t: -stats[(t, query)][0],
+            key=query_sort_key,
         )
         positions = list(range(len(entries)))
         # Reason -> the tools it applies to, for the bars that missed the
@@ -1860,13 +1885,8 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
 
         axis.set_yticks(positions)
         axis.set_yticklabels(entries, fontsize=9)
-        ok = {
-            tool
-            for tool in entries
-            if wrong_answer(dataset["queries"], reference, tool, query) is None
-        }
-        badge_ranked_rows(axis, entries, positions, eligible=ok)
         axis.set_ylim(-0.75, max(1, len(entries)) - 0.25)
+        axis.invert_yaxis()
         axis.set_xscale("log")
         axis.set_xlim(lo, hi)
         style_axis(axis, None, True)
@@ -2039,6 +2059,7 @@ def plot_queries(datasets, out_dir):
             bounds,
             number,
             len(pages),
+            rank_datasets=usable,
         )
         for number, (dataset, chunk) in enumerate(pages, start=1)
     ]

@@ -83,7 +83,7 @@ So inode reads are roughly 6x the cost of the walk that finds the names, which i
 ### `ereport_index`: trigram index build (`--make`)
 
 - Same chunk boundaries as `ereport` — Parallel chunk readers; rows can skip path bytes when building for a single UID (`fseek` past unmatched records).
-- Basename-only trigrams — Each path emits trigrams for its final component only (segment-once). Parent names are indexed when those directories appear as their own records; `--search` expands directory hits via `path_isdir.bin` instead of re-posting parents onto every child during `--make`.
+- Basename-only trigrams — Each path emits trigrams for its final component only (segment-once). Parent names are indexed when those directories appear as their own records; `--search` expands directory hits by walking `path_kids.bin` (immediate-children CSR) instead of re-posting parents onto every child during `--make`. Huge directory hits keep a sequential prefix scan of `paths.bin` so expansion does not random-read most of the corpus.
 - Ordered path stream — A single paths writer thread appends `paths.bin` / `path_offsets.bin` in strict path-id order so the index remains coherent while many trigram workers run.
 - Producer–consumer queues — Parse workers → paths writer → trigram job queue (bounded) → trigram workers → `tmp_trigrams_*.bin`. Bounded queues apply backpressure instead of unbounded RAM; tuning env vars trade memory vs blocking (see metrics like `writeq_parse_waits` / `trigramq_paths_waits`).
 - Sliced bulk enqueue — Trigram jobs from a write batch are enqueued in slices that fit current queue depth, so partial capacity is used instead of waiting until an entire batch fits.

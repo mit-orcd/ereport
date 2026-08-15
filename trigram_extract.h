@@ -5,10 +5,9 @@
 #include <stdint.h>
 
 /*
- * Basename trigram extraction, shared by ereport_index (index time) and ecrawl
- * (crawl-time trigram journals). Trigrams are 24-bit rolling-window codes over
- * the ASCII-lowercased final path component; parents are indexed when those
- * entries appear as their own basenames.
+ * Basename trigram extraction for ereport_index. Trigrams are 24-bit
+ * rolling-window codes over the ASCII-lowercased final path component; parents
+ * are indexed when those entries appear as their own basenames.
  */
 
 /* Scratch buffers grown by trigram_ensure_buf; passing NULL scratch mallocs per call. */

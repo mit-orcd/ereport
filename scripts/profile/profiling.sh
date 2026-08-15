@@ -10,12 +10,6 @@
 #   REPORT_DIR           output/fixture root   (/data1/erbmi1/ereport)
 #
 # Options:
-#   TRIJOURNAL=0         set 1 to exercise crawl-time trigram journals: step1
-#                        crawls with --trigram-journal $REPORT_DIR/journals and
-#                        builds the index with --journal-dir (a successful --make
-#                        deletes the journals it consumed); step2 enables the
-#                        per-fixture journals (kept at <bin-root>/<fixture>/journals)
-#                        via DO_TRIJOURNAL / EREPORT_INDEX_JOURNALS.
 #   STAT_IMPL=fstatat    inode-read syscall for every ecrawl pass in step1/step2:
 #                        fstatat (default) | statx (--statx) | iouring
 #                        (--iouring). One impl per run; compare across runs.
@@ -38,13 +32,8 @@ data_dir=${DATA_DIR:-/data1/erbmi1/ecrawl-synt}
 report_dir=${REPORT_DIR:-/data1/erbmi1/ereport}
 bin_dir="$report_dir/bin"
 idx_dir="$report_dir/index"
-trijournal=${TRIJOURNAL:-0}
 stat_impl=${STAT_IMPL:-fstatat}
 
-# step2's fixture scripts each have their own knob; drive both from TRIJOURNAL.
-if [[ "$trijournal" == "1" ]]; then
-  export DO_TRIJOURNAL=1 EREPORT_INDEX_JOURNALS=1
-fi
 case "$stat_impl" in
   fstatat|statx|iouring) export ECRAWL_STAT_IMPL="$stat_impl" ;;
   *) echo "ERROR: STAT_IMPL must be fstatat|statx|iouring (got '$stat_impl')" >&2; exit 2 ;;
@@ -74,13 +63,7 @@ function step1() {
   DISK_BUDGET_BYTES=$((200 * 1024 * 1024 * 1024)) DEPTH_SLICE_ENABLE=1 SYNTH_PROFILE=extreme "$scripts_root/fixtures/generate-ecrawl-adversarial-tree.sh" "$data_dir"
   # Crawled twice on purpose: --verbose turns on the per-call I/O counter atomics,
   # so the quiet run is the one whose capture and timing the later steps use.
-  local jdir="$report_dir/journals"
-  local crawl_args=() make_args=()
-  if [[ "$trijournal" == "1" ]]; then
-    mkdir -p "$jdir"
-    crawl_args=(--trigram-journal "$jdir")
-    make_args=(--journal-dir "$jdir")
-  fi
+  local crawl_args=()
   case "$stat_impl" in
     statx) crawl_args+=(--statx) ;;
     iouring) crawl_args+=(--iouring) ;;
@@ -89,7 +72,7 @@ function step1() {
   ECRAWL_CRAWL_THREADS=64 "$bin_root/ecrawl" "${crawl_args[@]}" "$data_dir" "$bin_dir"
   ECRAWL_QUERY_THREADS=64 "$bin_root/ecrawl_query" --top 10 "$bin_dir"
   EREPORT_THREADS=64 "$bin_root/ereport" --bucket-details 4 --report-dir "$report_dir" mtime "$bin_dir"
-  EREPORT_INDEX_THREADS=64 "$bin_root/ereport_index" --make --index-dir "$idx_dir" "${make_args[@]}" "$bin_dir"
+  EREPORT_INDEX_THREADS=64 "$bin_root/ereport_index" --make --index-dir "$idx_dir" "$bin_dir"
 }
 
 function step2() {

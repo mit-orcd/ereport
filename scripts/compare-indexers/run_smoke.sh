@@ -28,7 +28,8 @@
 #   DO_NOSTAT=0          1: also time ecrawl --no-stat --count (file-count peer
 #                        of find/fd; answer_files= in notes)
 #   DO_STATX=0           1: also time ecrawl write+--no-write with --statx
-#   DO_IOURING=0         1: also time ecrawl write+--no-write with --iouring
+#   DO_IOURING=0         1: also time extra write+--no-write rows with --iouring
+#   ECRAWL_COLD_IOURING=1  default write/nowrite use --iouring on a cold pass
 #
 set -euo pipefail
 # shellcheck source=lib.sh
