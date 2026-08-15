@@ -992,6 +992,97 @@ run_ecrawl_statx_tests() {
     pass "ecrawl --statx / --iouring"
 }
 
+# --progress used to piggyback on the per-directory donate counter, so a bushy
+# tree (every dir well under 4096 names) printed nothing. The line must appear
+# for every walk mode, on stderr except --count (stdout, with the census).
+run_ecrawl_progress_tests() {
+    local td=$1
+    local tree="${td}/progress_walk" d i nlines
+
+    section_int "[integration] ecrawl --progress (walk-mode combinations)"
+
+    mkdir -p "$tree"
+    for d in 0 1 2 3 4 5 6 7 8 9; do
+        mkdir -p "${tree}/d${d}"
+        for i in 0 1 2 3 4; do
+            echo x >"${tree}/d${d}/f${i}"
+        done
+    done
+
+    expect_progress_line() {
+        local tag=$1 file=$2
+        if grep -qE 'files=.*entries=.*el=' "$file"; then
+            summary_add PASS "ecrawl --progress ${tag}" "live line"
+            [[ "$SUMMARY" == 1 ]] || printf '  %sOK:%s ecrawl --progress %s — live line%s\n' "$G" "$Z" "$tag" "$Z"
+        else
+            summary_add FAIL "ecrawl --progress ${tag}" "no files=/entries= line"
+            SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+            printf '  %sFAIL:%s ecrawl --progress %s: no live line in %s%s\n' "$R" "$Z" "$tag" "$file" "$Z" >&2
+        fi
+    }
+
+    "$ECRAWL" --progress --no-write "$tree" >"${td}/prog_nw.out" 2>"${td}/prog_nw.err" ||
+        die "ecrawl --progress --no-write failed"
+    expect_progress_line "--no-write" "${td}/prog_nw.err"
+
+    "$ECRAWL" --progress --statx --no-write "$tree" >"${td}/prog_sx.out" 2>"${td}/prog_sx.err" ||
+        die "ecrawl --progress --statx --no-write failed"
+    expect_progress_line "--statx --no-write" "${td}/prog_sx.err"
+
+    "$ECRAWL" --progress --no-stat "$tree" >"${td}/prog_ns.out" 2>"${td}/prog_ns.err" ||
+        die "ecrawl --progress --no-stat failed"
+    expect_progress_line "--no-stat" "${td}/prog_ns.err"
+    if grep -qE 'files=.*entries=.*el=' "${td}/prog_ns.out"; then
+        summary_add FAIL "ecrawl --progress --no-stat: stdout stays paths" "progress leaked onto stdout"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+        printf '  %sFAIL:%s ecrawl --progress --no-stat leaked a live line onto stdout%s\n' "$R" "$Z" "$Z" >&2
+    else
+        summary_add PASS "ecrawl --progress --no-stat: stdout stays paths" "progress on stderr"
+    fi
+
+    "$ECRAWL" --progress --no-stat --count "$tree" >"${td}/prog_ct.out" 2>"${td}/prog_ct.err" ||
+        die "ecrawl --progress --no-stat --count failed"
+    expect_progress_line "--no-stat --count" "${td}/prog_ct.out"
+
+    "$ECRAWL" --progress --no-stat --contains f0 "$tree" >"${td}/prog_co.out" 2>"${td}/prog_co.err" ||
+        die "ecrawl --progress --no-stat --contains failed"
+    expect_progress_line "--no-stat --contains" "${td}/prog_co.err"
+
+    "$ECRAWL" --progress "$tree" "${td}/prog_cap" >"${td}/prog_wr.out" 2>"${td}/prog_wr.err" ||
+        die "ecrawl --progress (write) failed"
+    expect_progress_line "write" "${td}/prog_wr.err"
+
+    # Donation off must not silence progress (the cadence used to be the same counter).
+    ECRAWL_DONATE_ENTRY_CHECK_EVERY=0 \
+        "$ECRAWL" --progress --no-write "$tree" >"${td}/prog_don0.out" 2>"${td}/prog_don0.err" ||
+        die "ecrawl --progress with DONATE_ENTRY_CHECK_EVERY=0 failed"
+    expect_progress_line "DONATE_ENTRY_CHECK_EVERY=0" "${td}/prog_don0.err"
+
+    # Each dir has 5 names; a per-dir counter of 8 never trips. Cumulative must.
+    ECRAWL_DONATE_ENTRY_CHECK_EVERY=8 \
+        "$ECRAWL" --progress --no-write "$tree" >"${td}/prog_cad.out" 2>"${td}/prog_cad.err" ||
+        die "ecrawl --progress cadence=8 failed"
+    nlines=$(grep -cE 'files=.*entries=.*el=' "${td}/prog_cad.err" || true)
+    if [[ "${nlines:-0}" -ge 2 ]]; then
+        summary_add PASS "ecrawl --progress bushy cadence=8" "lines=${nlines}"
+        [[ "$SUMMARY" == 1 ]] || printf '  %sOK:%s ecrawl --progress bushy cadence=8 — %s lines%s\n' "$G" "$Z" "$nlines" "$Z"
+    else
+        summary_add FAIL "ecrawl --progress bushy cadence=8" "lines=${nlines} (want >= 2)"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+        printf '  %sFAIL:%s ecrawl --progress bushy cadence=8: %s live lines (want >= 2)%s\n' \
+            "$R" "$Z" "$nlines" "$Z" >&2
+    fi
+
+    if "$ECRAWL" --progress --no-write --iouring "$tree" >"${td}/prog_io.out" 2>"${td}/prog_io.err"; then
+        expect_progress_line "--iouring --no-write" "${td}/prog_io.err"
+    else
+        summary_add SKIP "ecrawl --progress --iouring" "unavailable"
+    fi
+
+    rm -rf "$tree" "${td}/prog_cap" "${td}"/prog_*.out "${td}"/prog_*.err
+    pass "ecrawl --progress"
+}
+
 # ERCBIN09: the catalog rollup fast path must agree with the record scan wherever
 # it claims to apply, must decline where it cannot be exact, and the gid/mode
 # columns the columnar format brought back must filter correctly.
@@ -2278,6 +2369,8 @@ run_integration() {
     run_ecrawl_no_stat_tests "$td"
 
     run_ecrawl_statx_tests "$td"
+
+    run_ecrawl_progress_tests "$td"
 
     run_edelete_tests "$td" "$root_abs"
 

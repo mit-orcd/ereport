@@ -20,10 +20,10 @@
  *     uid shard before writing so interleaved path order does not thrash the per-writer shard LRU (fopen/fclose).
  *   - Writer threads pause shard writes when output filesystem free space falls below 10 GiB
  *     (checked every 30 seconds via statvfs); crawl workers keep running until writer queues fill.
- *   - Live progress is opt-in (--progress). Workers publish TLS file/entry/byte totals on the
- *     donate-entry check cadence (every DEFAULT_DONATE_ENTRY_CHECK_EVERY dirents); a coalesced
- *     stderr line is printed on that same path. Without --progress there is no stats thread and
- *     no GLOBAL_PERF_FLUSH_EVERY atomic multipack.
+ *   - Live progress is opt-in (--progress). Each worker counts dirents across directories (not
+ *     per readdir) and publishes TLS file/entry/byte totals every DEFAULT_DONATE_ENTRY_CHECK_EVERY
+ *     names; a coalesced line is printed on that path (stderr, or stdout with --count). Without
+ *     --progress there is no stats thread and no GLOBAL_PERF_FLUSH_EVERY atomic multipack.
  *   - Each run clears prior crawl outputs in the chosen output-dir: uid_shard_*.bin, matching *.bin.ckpt,
  *     and crawl_manifest.txt (uid.txt/gid.txt are reopened truncated). An interrupted crawl has nothing to
  *     resume across runs; only in-process shard reopen (LRU) reloads checkpoints for shards written this run.
@@ -33,7 +33,7 @@
  *
  * Usage:
  *   ./ecrawl [--no-write] [--progress] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
- *   --progress: cheap live files=/entries= on stderr (donate-entry cadence).
+ *   --progress: cheap live files=/entries= (dirent cadence, across directories).
  *   --verbose: full metrics to stdout at exit.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
  * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
@@ -394,6 +394,7 @@ typedef struct {
     worker_aux_stats_t aux;
     nostat_ctx_t nostat;
     pthread_mutex_t emit_stats_lock;
+    size_t progress_since; /* accounted entries at last --progress publish; lives across directories */
 } worker_arg_t;
 
 /* Coalesce global-queue subdirectory tasks into fewer queue pushes (see discovered_dir_batch_*). */
@@ -736,8 +737,9 @@ static int g_print0 = 0;
 static char *g_contains_lower = NULL;
 static size_t g_contains_len = 0;
 static int g_verbose = 0;
-/* --progress: publish TLS totals on donate-entry checks and print a coalesced stderr line. */
+/* --progress: publish TLS totals every g_progress_every dirents (across directories). */
 static int g_progress = 0;
+static size_t g_progress_every = DEFAULT_DONATE_ENTRY_CHECK_EVERY;
 static int g_crawl_threads = DEFAULT_CRAWL_THREADS;
 
 /* Per-worker published totals for --progress (plain stores; owning thread only). */
@@ -1774,12 +1776,18 @@ static void format_duration(double sec, char *out, size_t out_sz) {
     snprintf(out, out_sz, "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, hours, minutes, seconds);
 }
 
+/* --count owns stdout for the census; live counts belong there too. Everyone else uses stderr
+ * so a --no-stat path stream (or the write-mode summary) stays clean. */
+static FILE *progress_stream(void) {
+    return (g_no_stat && g_nostat_count) ? stdout : stderr;
+}
+
 static void clear_status_line(void) {
     if (isatty(STDOUT_FILENO)) {
         printf("\r\033[2K\r");
         fflush(stdout);
     }
-    if (g_progress && isatty(STDERR_FILENO)) {
+    if (g_progress && progress_stream() == stderr && isatty(STDERR_FILENO)) {
         fprintf(stderr, "\r\033[2K\r");
         fflush(stderr);
     }
@@ -1801,7 +1809,28 @@ static void progress_publish(worker_arg_t *wa) {
     pthread_mutex_unlock(&wa->emit_stats_lock);
 }
 
-/* Coalesced stderr progress line; only one thread wins the last-print CAS per interval. */
+static void progress_print_line(uint64_t files, uint64_t entries, uint64_t bytes) {
+    FILE *fp = progress_stream();
+    double elapsed_sec;
+    char fe[32], ff[32], fb[32], el[32];
+    int tty;
+
+    elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
+    human_decimal((double)files, ff, sizeof(ff));
+    human_decimal((double)entries, fe, sizeof(fe));
+    human_decimal((double)bytes, fb, sizeof(fb));
+    format_duration(elapsed_sec, el, sizeof(el));
+    tty = isatty(fileno(fp));
+    if (bytes > 0ULL) {
+        fprintf(fp, "%sfiles=%s entries=%s bytes=%s el=%s%s", tty ? "\r" : "", ff, fe, fb, el,
+                tty ? "            " : "\n");
+    } else {
+        fprintf(fp, "%sfiles=%s entries=%s el=%s%s", tty ? "\r" : "", ff, fe, el, tty ? "            " : "\n");
+    }
+    fflush(fp);
+}
+
+/* Coalesced progress line; only one thread wins the last-print CAS per interval. */
 static void progress_maybe_print(void) {
     struct timespec ts;
     unsigned long long now_ns;
@@ -1810,9 +1839,6 @@ static void progress_maybe_print(void) {
     uint64_t files = 0;
     uint64_t bytes = 0;
     size_t i;
-    double elapsed_sec;
-    char fe[32], ff[32], fb[32], el[32];
-    int tty;
 
     if (!g_progress || !g_progress_slots) return;
 
@@ -1827,21 +1853,21 @@ static void progress_maybe_print(void) {
         files += g_progress_slots[i].files;
         bytes += g_progress_slots[i].bytes;
     }
+    progress_print_line(files, entries, bytes);
+}
 
-    elapsed_sec = g_run_start_sec > 0.0 ? now_sec() - g_run_start_sec : 0.0;
-    human_decimal((double)files, ff, sizeof(ff));
-    human_decimal((double)entries, fe, sizeof(fe));
-    human_decimal((double)bytes, fb, sizeof(fb));
-    format_duration(elapsed_sec, el, sizeof(el));
-    tty = isatty(STDERR_FILENO);
-    if (bytes > 0ULL) {
-        fprintf(stderr, "%sfiles=%s entries=%s bytes=%s el=%s%s", tty ? "\r" : "", ff, fe, fb, el,
-                tty ? "            " : "\n");
-    } else {
-        fprintf(stderr, "%sfiles=%s entries=%s el=%s%s", tty ? "\r" : "", ff, fe, el,
-                tty ? "            " : "\n");
-    }
-    fflush(stderr);
+/* Accounted entries, across directories: a bushy tree of 10-name dirs never hit the old
+ * per-readdir counter, so --progress stayed silent on the trees people actually walk.
+ * Tick after account_entry_* so the first line is not files=0. */
+static void progress_tick(worker_arg_t *wa) {
+    uint64_t n;
+
+    if (!g_progress || !wa) return;
+    n = wa->stats.total_entries;
+    if (n - (uint64_t)wa->progress_since < (uint64_t)g_progress_every) return;
+    wa->progress_since = (size_t)n;
+    progress_publish(wa);
+    progress_maybe_print();
 }
 
 static inline size_t id_registry_hash(uint32_t id) {
@@ -2383,7 +2409,8 @@ static void print_usage(const char *prog) {
             "--contains: keep paths whose full path contains <text>, case-insensitive "
             "(same rule as ereport_index --search). Requires --no-stat.\n"
             "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n"
-            "--progress: cheap live files=/entries= on stderr (donate-entry cadence); not implied by --verbose.\n"
+            "--progress: cheap live files=/entries= (donate-entry cadence, counted across directories); "
+            "stderr, or stdout with --count. Not implied by --verbose.\n"
             "--statx: read inodes with statx(2) asking only for the fields this mode consumes "
             "(--no-write: type/size/blocks/nlink/ino; capture: BASIC_STATS).\n"
             "--iouring: batch each directory's inode reads through a per-worker io_uring "
@@ -4106,6 +4133,9 @@ static void crawl_run_task(dir_stack_t *task, worker_arg_t *arg, crawl_identity_
 }
 
 static void crawl_identity_destroy(crawl_identity_t *ci, worker_arg_t *arg) {
+    /* Last slot write so a short walk (never hit g_progress_every) still has totals for the
+     * post-join line. Do not print here: idle workers would flash files=0. */
+    progress_publish(arg);
     /* Last fold for this owner, under its lock like every other fold. */
     pthread_mutex_lock(&arg->emit_stats_lock);
     perf_flush_local(&arg->perf);
@@ -4299,15 +4329,11 @@ static int should_donate_to_idle(const shared_state_t *shared, const dir_stack_t
 }
 
 static void donate_spill_on_entries(shared_state_t *shared, dir_stack_t *stack, task_queue_t *queue,
-                                    worker_aux_stats_t *aux, size_t *entries_since_check, worker_arg_t *wa) {
+                                    worker_aux_stats_t *aux, size_t *entries_since_check) {
     size_t want;
 
     if (*entries_since_check < g_donate_entry_check_every_cfg) return;
     *entries_since_check = 0;
-    if (g_progress && wa) {
-        progress_publish(wa);
-        progress_maybe_print();
-    }
     if (!should_donate_to_idle(shared, stack)) return;
 
     /* One per idle peer, capped by what is on the stack: enough to wake them, not so much that a
@@ -4586,7 +4612,7 @@ static void crawl_dir_entries_iouring(ecrawl_dir_reader_t *rd, int dir_fd, const
             }
             if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
             entries_since_donate_check++;
-            donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
+            donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
             name_len = strlen(ent_name);
             slot = &u->slots[u->batch];
             if (name_len >= sizeof(slot->name)) {
@@ -4601,6 +4627,7 @@ static void crawl_dir_entries_iouring(ecrawl_dir_reader_t *rd, int dir_fd, const
                 crawl_iouring_dispatch(dir_path, dir_path_len, ent_name, name_len, ent_dtype, &st, shared,
                                        stats, perf, emit, stack, queue, aux, disc_batch,
                                        &dirs_since_donate_check);
+                progress_tick(wa);
                 continue;
             }
             memcpy(slot->name, ent_name, name_len + 1);
@@ -4661,6 +4688,7 @@ static void crawl_dir_entries_iouring(ecrawl_dir_reader_t *rd, int dir_fd, const
             crawl_iouring_dispatch(dir_path, dir_path_len, slot->name, slot->name_len, slot->dtype, &st,
                                    shared, stats, perf, emit, stack, queue, aux, disc_batch,
                                    &dirs_since_donate_check);
+            progress_tick(wa);
         }
     }
     donate_spill_if_needed(shared, stack, queue, aux);
@@ -4715,6 +4743,7 @@ static int process_directory_iterative(dir_stack_t *stack,
              * never reads its inode. Directories are printed here, on pop, so each appears once. */
             dir_path_len = work.path_len;
             account_entry_dtype(stats, perf, DT_DIR);
+            progress_tick(wa);
             dirmatch_begin(&wa->nostat, dir_path, dir_path_len, work.ancestor_matched, &dm);
             if (!g_nostat_count && dm.all_match && pathout_emit(&wa->nostat, dir_path, dir_path_len) != 0) {
                 stats_add_error(shared);
@@ -4738,6 +4767,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                 {
                     uint64_t contrib = account_entry_shared(emit, shared, stats, perf, &st);
 
+                    progress_tick(wa);
                     dir_path_len = work.path_len;
                     if (emit_record(emit, dir_path, dir_path_len, &st, contrib) != 0) {
                         fprintf(stderr, "ERROR worker emit_record %s: %s\n", dir_path, strerror(errno));
@@ -4794,7 +4824,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
                     entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
                     child_name_len = strlen(ent_name);
 
                     /* Filesystems without d_type support report DT_UNKNOWN, and we cannot recurse
@@ -4841,6 +4871,7 @@ static int process_directory_iterative(dir_stack_t *stack,
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
                         account_entry_dtype(stats, perf, child_d_type);
+                        progress_tick(wa);
                         /* --count tallies only; skip path assembly and the stdout stream. */
                         if (!g_nostat_count && dirmatch_hit(&wa->nostat, &dm, ent_name, child_name_len)) {
                             char child[PATH_MAX];
@@ -4873,12 +4904,13 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                     if (strcmp(ent_name, ".") == 0 || strcmp(ent_name, "..") == 0) continue;
                     entries_since_donate_check++;
-                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check, wa);
+                    donate_spill_on_entries(shared, stack, queue, aux, &entries_since_donate_check);
 
                     child_name_len = strlen(ent_name);
                     if (child_d_type == DT_DIR) {
                         crawl_handle_dirent_dt_dir(dir_fd, dir_path, dir_path_len, ent_name, child_name_len,
                                                    shared, stats, perf, emit, stack, queue, aux, &disc_b);
+                        progress_tick(wa);
                         dirs_since_donate_check++;
                         donate_spill_periodic(shared, stack, queue, aux, &dirs_since_donate_check);
                     } else {
@@ -4908,6 +4940,7 @@ static int process_directory_iterative(dir_stack_t *stack,
 
                             record_ids_from_stat(&child_st);
                             contrib = account_entry_shared(emit, shared, stats, perf, &child_st);
+                            progress_tick(wa);
                             if (!g_no_write) {
                                 char child[PATH_MAX];
                                 size_t child_path_len = dir_path_len + child_name_len +
@@ -6343,6 +6376,10 @@ int main(int argc, char **argv) {
     g_iouring_min_batch = parse_ecrawl_iouring_min_batch(g_iouring_depth);
     g_donate_check_every_cfg     = parse_ecrawl_donate_check_every();
     g_donate_entry_check_every_cfg = parse_ecrawl_donate_entry_check_every();
+    /* 0 disables entry-driven donation (SIZE_MAX); progress still uses the default cadence. */
+    g_progress_every = (g_donate_entry_check_every_cfg == (size_t)SIZE_MAX)
+                           ? (size_t)DEFAULT_DONATE_ENTRY_CHECK_EVERY
+                           : g_donate_entry_check_every_cfg;
     g_donate_chunk_force_max_cfg = parse_ecrawl_donate_chunk_force_max();
     g_force_donate_count_cfg     = parse_ecrawl_force_donate_at();
     g_donate_all_busy_min_stack_cfg              = parse_ecrawl_donate_all_busy_min_stack();
@@ -6592,7 +6629,7 @@ int main(int argc, char **argv) {
         disk_monitor_started = 1;
     }
 
-    /* No 1 Hz stats thread: default is silent; --progress prints on donate-entry cadence. */
+    /* No 1 Hz stats thread: default is silent; --progress prints on the dirent cadence. */
     stats_thread_started = 0;
     (void)stats_thread;
     (void)sizeof(&stats_thread_main);
@@ -6754,6 +6791,8 @@ int main(int argc, char **argv) {
         stats_stop_request();
         pthread_join(stats_thread, NULL);
     }
+    if (g_progress)
+        progress_print_line(shared.total_files, shared.total_entries, shared.total_bytes);
     clear_status_line();
 
     /* Resolve uid/gid names here rather than leaving it to id_registry_destroy at the end of main.
