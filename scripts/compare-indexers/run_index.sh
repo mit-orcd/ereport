@@ -13,11 +13,14 @@
 #                                crawl writes per-shard journals, ereport_index
 #                                --journal-dir replays them; separate CSV rows)
 #   REPS=3 DROP_CACHES=0|1 THREADS=16
-#   CACHE_MODES="cold hot"    which passes each repetition makes. Every tool
-#                     builds its whole pipeline cold, then again hot, so a hot
-#                     ereport_index reads the shards the hot crawl just wrote.
-#                     The hot pass rebuilds into the same directory, so the disk
-#                     cost is unchanged and the surviving index is the hot one.
+#   CACHE_MODES="cold hot"    which passes each repetition makes. Walk-only
+#                     and write variants each do cold then hot back-to-back
+#                     (drop, timed, timed) so a "hot" row is the same command
+#                     again with the page cache still warm — not the leftover
+#                     of six other variants plus an index build. ereport_index
+#                     is its own pair after the write pair, reading the capture
+#                     that survived (the last write). Journal replay snapshots
+#                     the .tij files so the second --make still has journals.
 #   REPS_<TOOL>=n     repetitions for one tool, overriding REPS: REPS_GUFI=1
 #                     keeps a 29-minute rollup to a single pass while the cheap
 #                     rows still get their three. REPS_EREPORT_INDEX defaults to
@@ -294,15 +297,33 @@ run_ereport_index() {
   fi
 }
 
+# Hardlink (or copy) every file in src into dest so a later unlink in dest
+# leaves src intact. Same-filesystem hardlinks are how the journal snapshot
+# survives ereport_index deleting the replayed .tij files.
+hardlink_tree() {
+  local src=$1 dest=$2
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  if ! cp -al "$src/." "$dest/" 2>/dev/null; then
+    cp -a "$src/." "$dest/"
+  fi
+}
+
 # Journal-consuming twin of run_ereport_index: indexes the capture from
-# run_ecrawl_trij, replaying its per-shard journals. A successful build deletes
-# the replayed journals; every pass crawls first, so the next pass starts from
-# a full set again and no snapshot/restore is needed between passes.
+# run_ecrawl_trij, replaying its per-shard journals. --make deletes those
+# journals; when a snapshot path is in ecrawl_trij_journal_snap.txt this
+# pass hardlinks it into a throwaway dir so the next cache mode still has
+# a full set.
 run_ereport_index_trij() {
   local rep=$1
-  local bin_dir jdir
+  local bin_dir jdir snap
   bin_dir=$(cat "$OUT/ecrawl_trij_bin_dir.txt" 2>/dev/null || true)
+  snap=$(cat "$OUT/ecrawl_trij_journal_snap.txt" 2>/dev/null || true)
   jdir=$(cat "$OUT/ecrawl_trij_journal_dir.txt" 2>/dev/null || true)
+  if [[ -n "$snap" && -d "$snap" ]]; then
+    jdir="$WORK_ROOT/ecrawl_trij_journals_replay_r${rep}${RUN_TAG}"
+    hardlink_tree "$snap" "$jdir"
+  fi
   if [[ -z "$bin_dir" || ! -d "$bin_dir" || -z "$jdir" || ! -d "$jdir" ]]; then
     append_row ereport_index_trij make "$rep" skipped "" 0 "no_ecrawl_trij_bins"
     return 0
@@ -767,44 +788,64 @@ REPS_MAX=$(max_tool_reps $TOOLS)
 echo "==> repetitions: $(reps_plan $TOOLS ereport_index)"
 echo "==> cache passes per repetition: $CACHE_MODES"
 
+# First named mode keeps the untagged log names summarize.py looks up first.
+for_each_cache_mode() {
+  local mode pass=0
+  for mode in $CACHE_MODES; do
+    pass=$((pass + 1))
+    export CACHE_STATE=$mode
+    RUN_TAG=""
+    ((pass == 1)) || RUN_TAG="_$mode"
+    "$@"
+  done
+}
+
+# Each variant is its own cold/hot pair. Running every variant cold and then
+# every variant hot made "write hot" the first command after nostat (and, on
+# the last rep, after ereport_index) — a different experiment from write cold,
+# and not reproducible as a cache delta. Index is a pair of its own after the
+# write pair, so it cannot evict the tree between the two crawls.
+run_ecrawl_all_pairs() {
+  local rep=$1
+  local variants=(write)
+  [[ "${DO_NOWRITE:-0}" == "1" ]] && variants+=(nowrite)
+  [[ "${DO_STATX:-0}" == "1" ]] && variants+=(write_statx nowrite_statx)
+  [[ "${DO_IOURING:-0}" == "1" ]] && variants+=(write_iouring nowrite_iouring)
+  [[ "${DO_NOSTAT:-0}" == "1" ]] && variants+=(nostat)
+  local v
+  for v in "${variants[@]}"; do
+    printf '==> rep %d: ecrawl %s (cold/hot pair, %s)\n' "$rep" "$v" "$(date +%H:%M:%S)"
+    for_each_cache_mode run_ecrawl "$v" "$rep"
+  done
+  if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep"; then
+    printf '==> rep %d: ereport_index (cold/hot pair, %s)\n' "$rep" "$(date +%H:%M:%S)"
+    for_each_cache_mode run_ereport_index "$rep"
+  fi
+}
+
+run_ecrawl_trij_all_pairs() {
+  local rep=$1
+  local jdir snap
+  printf '==> rep %d: ecrawl_trij write (cold/hot pair, %s)\n' "$rep" "$(date +%H:%M:%S)"
+  for_each_cache_mode run_ecrawl_trij "$rep"
+  if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep" ecrawl_trij; then
+    jdir=$(cat "$OUT/ecrawl_trij_journal_dir.txt" 2>/dev/null || true)
+    if [[ -n "$jdir" && -d "$jdir" ]]; then
+      snap="$WORK_ROOT/ecrawl_trij_journals_snap_r${rep}"
+      hardlink_tree "$jdir" "$snap"
+      echo "$snap" >"$OUT/ecrawl_trij_journal_snap.txt"
+    fi
+    printf '==> rep %d: ereport_index_trij (cold/hot pair, %s)\n' "$rep" "$(date +%H:%M:%S)"
+    for_each_cache_mode run_ereport_index_trij "$rep"
+  fi
+}
+
 # One tool's whole pipeline, for whichever pass is current. Kept as a function so
 # the cold and hot passes run the same sequence rather than two copies of it.
+# ecrawl / ecrawl_trij do not use this: they pair each variant themselves.
 run_tool_pipeline() {
   local t=$1 rep=$2
   case "$t" in
-    ecrawl)
-      run_ecrawl write "$rep"
-      if [[ "${DO_NOWRITE:-0}" == "1" ]]; then
-        run_ecrawl nowrite "$rep"
-      fi
-      if [[ "${DO_STATX:-0}" == "1" ]]; then
-        run_ecrawl write_statx "$rep"
-        run_ecrawl nowrite_statx "$rep"
-      fi
-      if [[ "${DO_IOURING:-0}" == "1" ]]; then
-        run_ecrawl write_iouring "$rep"
-        run_ecrawl nowrite_iouring "$rep"
-      fi
-      if [[ "${DO_NOSTAT:-0}" == "1" ]]; then
-        run_ecrawl nostat "$rep"
-      fi
-      # Runs inside ecrawl's branch because it indexes the capture ecrawl just
-      # wrote, so REPS_ECRAWL is also its ceiling. Defaults to 1: the input is
-      # identical every time, so a second pass measures the same work twice --
-      # and that one pass is ecrawl's last, so the index and the capture the
-      # query phase reads are the pair that were made from each other.
-      if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep"; then
-        run_ereport_index "$rep"
-      fi
-      ;;
-    ecrawl_trij)
-      run_ecrawl_trij "$rep"
-      # Same gating as the plain pair: the journal replay is timed on
-      # ecrawl_trij's last reps and REPS_EREPORT_INDEX caps both pipelines.
-      if [[ "$INCLUDE_EREPORT_INDEX" == "1" ]] && ereport_index_rep "$rep" ecrawl_trij; then
-        run_ereport_index_trij "$rep"
-      fi
-      ;;
     gufi)
       run_gufi plain "$rep"
       if [[ "${GUFI_DO_ROLLUP:-1}" == "1" ]]; then
@@ -836,13 +877,22 @@ for ((rep = 1; rep <= REPS_MAX; rep++)); do
     # so each one still meets the cache state it would have met before per-tool
     # counts existed.
     ((rep <= t_reps)) || continue
+    case "$t" in
+      ecrawl)
+        run_ecrawl_all_pairs "$rep"
+        continue
+        ;;
+      ecrawl_trij)
+        run_ecrawl_trij_all_pairs "$rep"
+        continue
+        ;;
+    esac
     pass=0
     for mode in $CACHE_MODES; do
       pass=$((pass + 1))
-      # The whole pipeline runs cold, then the whole pipeline runs hot: a hot
-      # ereport_index has to read the shards a hot ecrawl just wrote, and a hot
-      # gufi_rollup the tree its own dir2index wrote, or the second pass is only
-      # half warm.
+      # Single-command tools, and coupled pairs (GUFI dir2index+rollup,
+      # Robinhood scan+indexes): the whole pipeline still runs cold, then hot,
+      # so a hot rollup reads the tree its own dir2index just wrote.
       export CACHE_STATE=$mode
       RUN_TAG=""
       ((pass == 1)) || RUN_TAG="_$mode"

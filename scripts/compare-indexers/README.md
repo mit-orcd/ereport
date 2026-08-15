@@ -940,10 +940,13 @@ to drop anything — a claim the run cannot make should not be in the data. The
 summary table and the charts key on that column, so cold and hot appear as two
 series rather than being averaged into a number neither of them measured.
 
-In the index phase each tool's **whole pipeline** runs cold and then hot, so a
-hot `ereport_index` reads the shards a hot `ecrawl` just wrote and a hot
-`gufi_rollup` the tree its own `dir2index` wrote. The hot pass rebuilds into the
-same directory, so the disk footprint is unchanged.
+In the index phase, `ecrawl` and `ecrawl_trij` pair each variant cold-then-hot
+(drop, timed, timed) so a hot write is the same command again, not the first
+command after six other walks and an index build. `ereport_index` is its own
+pair after the write pair. Other tools still run their whole pipeline cold and
+then hot, so a hot `gufi_rollup` reads the tree its own `dir2index` just wrote.
+The last write of a pair rebuilds into the same directory, so the disk
+footprint is unchanged.
 
 ### Query argument sets
 

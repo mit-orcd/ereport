@@ -124,8 +124,8 @@ WALK_VARIANTS = ("walk", "nowrite", "nostat", "nowrite_statx", "nowrite_iouring"
 WALK_LABELS = {
     ("ecrawl", "nostat"): "ecrawl --no-stat --count",
     ("ecrawl", "nowrite"): "ecrawl --no-write",
-    ("ecrawl", "nowrite_statx"): "ecrawl --no-write --statx",
-    ("ecrawl", "nowrite_iouring"): "ecrawl --no-write --io_uring",
+    ("ecrawl", "nowrite_statx"): "ecrawl --no-write\n--statx",
+    ("ecrawl", "nowrite_iouring"): "ecrawl --no-write\n--io_uring",
     ("find", "walk"): "find",
     ("fd", "walk"): "fd",
     ("du", "walk"): "du",
@@ -137,8 +137,8 @@ WALK_NAMES_ORDER = ["ecrawl --no-stat --count", "fd", "find"]
 # Metadata + size peers: timed job returns apparent bytes (answer_bytes=).
 WALK_META_ORDER = [
     "ecrawl --no-write",
-    "ecrawl --no-write --statx",
-    "ecrawl --no-write --io_uring",
+    "ecrawl --no-write\n--statx",
+    "ecrawl --no-write\n--io_uring",
     "dut",
     "dua",
     "du",
@@ -185,8 +185,8 @@ COLORS = {
     # Same hue, lighter tints: same tool, different inode-read syscall.
     "ecrawl --statx": "#56B4E9",
     "ecrawl --io_uring": "#A6CEE3",
-    "ecrawl --no-write --statx": "#8FCDE9",
-    "ecrawl --no-write --io_uring": "#C4E3F2",
+    "ecrawl --no-write\n--statx": "#8FCDE9",
+    "ecrawl --no-write\n--io_uring": "#C4E3F2",
     "ereport": "#0072B2",
     "ecrawl_query": "#0072B2",
     "ereport_index": "#56B4E9",
@@ -844,6 +844,69 @@ def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None,
         )
 
 
+def is_ecrawl_row(tool):
+    """Suite rows: ecrawl walks, the journal pipeline, ereport / ecrawl_query."""
+    head = tool.split("\n", 1)[0].strip()
+    return head.startswith("ecrawl") or head.startswith("ereport")
+
+
+def row_badge_tags(tool, winner, loser):
+    """Tiny pills: suite identity, then best/worst. Two kinds, stacked if both."""
+    tags = []
+    if is_ecrawl_row(tool):
+        tags.append(("ecrawl", "#D6EAF8", "#005A8C"))
+    if winner and tool == winner:
+        tags.append(("best", "#D8F0D8", "#1B5E20"))
+    elif loser and tool == loser:
+        tags.append(("worst", "#F4D6D6", "#7F1D1D"))
+    return tags
+
+
+def draw_row_badges(axis, y, tags):
+    """Left-edge chips on the bar row. Small on purpose: a scan aid, not a key."""
+    x_off = 2.0
+    for text, face, ink in tags:
+        axis.annotate(
+            text,
+            xy=(0.0, y),
+            xycoords=("axes fraction", "data"),
+            xytext=(x_off, 0),
+            textcoords="offset points",
+            fontsize=5.5,
+            fontweight="bold",
+            color=ink,
+            va="center",
+            ha="left",
+            bbox={
+                "boxstyle": "round,pad=0.12,rounding_size=0.35",
+                "facecolor": face,
+                "edgecolor": ink,
+                "linewidth": 0.35,
+                "alpha": 0.92,
+            },
+            zorder=6,
+            clip_on=False,
+        )
+        x_off += 4.0 + 0.52 * 5.5 * len(text)
+
+
+def badge_ranked_rows(axis, tools, positions, eligible=None):
+    """Mark the suite and the two ends of an already-sorted ranking (worst first).
+
+    `eligible` is the set that may win or lose (query panels drop DISAGREES
+    rows so a wrong-and-fast bar cannot take 'best').
+    """
+    if not tools:
+        return
+    pool = [tool for tool in tools if eligible is None or tool in eligible]
+    winner = pool[-1] if len(pool) > 1 else None
+    loser = pool[0] if len(pool) > 1 else None
+    for y, tool in zip(positions, tools):
+        tags = row_badge_tags(tool, winner, loser)
+        if tags:
+            draw_row_badges(axis, y, tags)
+
+
 def fits_inside(fig, axis, value, text, fontsize=7.5):
     """Whether a phase split can sit inside its bar instead of trailing it."""
     left = axis.get_xlim()[0]
@@ -1034,6 +1097,7 @@ def index_figure(datasets, out_dir, spec):
 
     axis.set_yticks(positions)
     axis.set_yticklabels(tools, fontsize=9)
+    badge_ranked_rows(axis, tools, positions)
     # The walk-only line is annotated above the first bar, so it needs a band of
     # its own up there.
     axis.set_ylim(-(1.0 if floor else 0.7), len(tools) - 0.3)
@@ -1426,6 +1490,7 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
 
     axis.set_yticks(positions)
     axis.set_yticklabels(tools, fontsize=9)
+    badge_ranked_rows(axis, tools, positions)
     axis.set_ylim(-0.7, len(tools) - 0.3)
     axis.invert_yaxis()
     axis.set_title(panel_title, fontsize=10, fontweight="bold", loc="left", pad=4)
@@ -1441,7 +1506,10 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
     low, high = axis.get_xlim()
     if log and positive:
         low = min(positive) / 4.0
-        axis.set_xlim(low, high * 2.6)
+        # Rate labels ("16.8M files/s") are wider than time labels ("1.13 s").
+        # 2.6x left the longest rate sitting in the mid-gap on top of the
+        # other panel's y-tick names.
+        axis.set_xlim(low, high * (4.0 if higher_better else 2.6))
     else:
         axis.set_xlim(low, high * 1.22)
     for y, dataset_index, mean, std, text in pending:
@@ -1450,6 +1518,78 @@ def _draw_walk_panel(axis, datasets, tools, key, metric, formatter, higher_bette
         if multi and len(datasets) > 1:
             v_shift = (0.5 - dataset_index) * 10
         bar_label(axis, y, end, text, log, v_shift=v_shift)
+
+
+def _walk_ytick_gutter(tools, page_width_in):
+    """Figure fraction reserved left of a walk panel for its y-tick names.
+
+    Each panel has its own names. Sizing only the page-left gutter (and leaving
+    a 4% mid-gap) puts the right panel's "ecrawl --no-write --io_uring" on top
+    of the left panel's bars.
+    """
+    longest = max(
+        (max(len(line) for line in tool.splitlines()) for tool in tools),
+        default=0,
+    )
+    tick_pt = 9.0
+    label_in = longest * tick_pt * 0.62 / 72.0
+    return min(0.24, max(0.08, (label_in + 0.18) / page_width_in))
+
+
+def _walk_panel_positions(left_margin, mid_gap, right_margin=0.04):
+    panel_width = (1.0 - left_margin - right_margin - mid_gap) / 2.0
+    return [
+        left_margin,
+        left_margin + panel_width + mid_gap,
+        panel_width,
+    ]
+
+
+def _fit_walk_panel_gutters(fig, axes, min_left=0.08, min_mid=0.04):
+    """Widen gutters from the rendered boxes so a name cannot cross into the
+    sibling panel. Never shrink below the character-count layout: a short
+    measurement is how the right-hand names ended up on the left-hand bars."""
+    if not any(axis is not None for axis in axes):
+        return
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fig_w = fig.bbox.width
+    pad = 0.012
+    widths = []
+    for axis in axes:
+        if axis is None:
+            widths.append(0.0)
+            continue
+        ax_left = axis.get_position().x0 * fig_w
+        extra = 0.0
+        for lab in axis.get_yticklabels():
+            extra = max(
+                extra,
+                max(0.0, ax_left - lab.get_window_extent(renderer=renderer).x0),
+            )
+        widths.append(extra / fig_w + pad)
+    left_margin = max(min_left, widths[0])
+    mid_gap = max(min_mid, widths[1] if len(widths) > 1 else 0.04)
+    if axes[0] is not None:
+        ax_right = axes[0].get_position().x1 * fig_w
+        overflow = 0.0
+        for artist in axes[0].texts:
+            overflow = max(
+                overflow,
+                max(0.0, artist.get_window_extent(renderer=renderer).x1 - ax_right),
+            )
+        if overflow:
+            mid_gap += overflow / fig_w + pad
+    usable = 1.0 - left_margin - 0.04 - mid_gap
+    if usable < 0.36:
+        return
+    x0_left, x0_right, panel_width = _walk_panel_positions(left_margin, mid_gap)
+    xs = (x0_left, x0_right)
+    for i, axis in enumerate(axes):
+        if axis is None:
+            continue
+        pos = axis.get_position()
+        axis.set_position([xs[i], pos.y0, panel_width, pos.height])
 
 
 def walk_figure(datasets, out_dir, spec):
@@ -1489,16 +1629,15 @@ def walk_figure(datasets, out_dir, spec):
     y_bottom, y_top, height = _page_band(page, content_in)
     fig = plt.figure(figsize=page)
 
-    # Size the left gutter to the longest y-tick label actually drawn, so a
-    # long name ("ecrawl --no-stat --count") is not clipped by a margin that
-    # was tuned for "du". Measure in points, convert to figure fraction.
-    longest = max((len(t) for tools in panel_tools for t in tools), default=0)
-    tick_pt = 9.0
-    label_in = longest * tick_pt * 0.62 / 72.0
-    left_margin = min(0.22, max(0.10, (label_in + 0.15) / page[0]))
-    mid_gap = 0.04
-    right_margin = 0.04
-    panel_width = (1.0 - left_margin - right_margin - mid_gap) / 2.0
+    # Each panel keeps its own y-tick gutter. The left margin is the names-only
+    # names; the mid-gap is the metadata panel's names. A single page-left
+    # gutter left the right-hand labels sitting on the left-hand bars.
+    left_tools = panel_tools[0] if panel_tools else []
+    right_tools = panel_tools[1] if len(panel_tools) > 1 else []
+    left_margin = _walk_ytick_gutter(left_tools, page[0])
+    mid_gap = _walk_ytick_gutter(right_tools, page[0]) if right_tools else 0.04
+    x0_left, x0_right, panel_width = _walk_panel_positions(left_margin, mid_gap)
+    panel_x0 = (x0_left, x0_right)
     axes_bottom = y_bottom + (caption_guess_in + xlabel_band_in) / height
     axes_height = axes_in / height
     axes = []
@@ -1506,8 +1645,7 @@ def walk_figure(datasets, out_dir, spec):
         if not tools:
             axes.append(None)
             continue
-        x0 = left_margin + i * (panel_width + mid_gap)
-        axis = fig.add_axes([x0, axes_bottom, panel_width, axes_height])
+        axis = fig.add_axes([panel_x0[i], axes_bottom, panel_width, axes_height])
         _draw_walk_panel(
             axis, datasets, tools, key, metric, formatter, higher_better,
             shades, spec["xlabel"], panels[i]["panel_title"],
@@ -1541,8 +1679,8 @@ def walk_figure(datasets, out_dir, spec):
     for i, axis in enumerate(axes):
         if axis is None:
             continue
-        x0 = left_margin + i * (panel_width + mid_gap)
-        axis.set_position([x0, axes_bottom, panel_width, axes_height])
+        axis.set_position([panel_x0[i], axes_bottom, panel_width, axes_height])
+    _fit_walk_panel_gutters(fig, axes, min_left=left_margin, min_mid=mid_gap)
 
     fig.text(0.05, y_top,
              "Figure {}: {}".format(spec["number"], spec["heading"]),
@@ -1722,6 +1860,12 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
 
         axis.set_yticks(positions)
         axis.set_yticklabels(entries, fontsize=9)
+        ok = {
+            tool
+            for tool in entries
+            if wrong_answer(dataset["queries"], reference, tool, query) is None
+        }
+        badge_ranked_rows(axis, entries, positions, eligible=ok)
         axis.set_ylim(-0.75, max(1, len(entries)) - 0.25)
         axis.set_xscale("log")
         axis.set_xlim(lo, hi)
