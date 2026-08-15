@@ -283,7 +283,7 @@ Metadata fidelity is exact and index lookups are fast (~1.4 µs per entry served
 
 ### FUSE support (optional)
 
-`ecrawl_mount` is built only when FUSE 2.x headers are found, exactly like `enfsprobe` and libnfs. `make` prints which way it resolved:
+`ecrawl_mount` is built only when FUSE 2.x headers are found. `make` prints which way it resolved:
 
 ```
 build: fuse enabled (-l:libfuse.so.2)

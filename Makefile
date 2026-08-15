@@ -23,30 +23,6 @@ ifeq ($(strip $(ZSTD_LIBS)),)
 ZSTD_LIBS := -lzstd
 endif
 
-# Optional NFS probe (needs libnfs, e.g. dnf install libnfs-devel)
-LIBNFS_CFLAGS ?= $(shell pkg-config --cflags libnfs 2>/dev/null)
-LIBNFS_LIBS ?= $(shell pkg-config --libs libnfs 2>/dev/null)
-ifneq ($(strip $(LIBNFS_LIBS)),)
-TARGETS += enfsprobe
-# Some libnfs.pc files only set Libs (-lnfs) and omit Cflags; then we must not
-# use #include <libnfs.h> without -I — use <nfsc/libnfs.h> instead.
-ifeq ($(strip $(LIBNFS_CFLAGS)),)
-ENFSPROBE_CPPFLAGS := -DENFSPROBE_NFSC_LIBNFS_H=1
-ENFSPROBE_LIBNFS_CFLAGS :=
-else
-ENFSPROBE_CPPFLAGS :=
-ENFSPROBE_LIBNFS_CFLAGS := $(LIBNFS_CFLAGS)
-endif
-ENFSPROBE_LIBNFS_LIBS := $(LIBNFS_LIBS)
-else
-ENFSPROBE_CPPFLAGS := -DENFSPROBE_NFSC_LIBNFS_H=1
-ENFSPROBE_LIBNFS_CFLAGS :=
-ENFSPROBE_LIBNFS_LIBS := -lnfs
-endif
-
-# dlopen/dlsym: optional nfs_set_version at runtime (missing on EL7 libnfs)
-ENFSPROBE_LIBDL := -ldl
-
 # Optional FUSE 2.x for ecrawl_mount (read-only mount of a crawl result).
 # Preferred source is fuse.pc from fuse-devel. RHEL/Rocky ship libfuse.so.2 in
 # the base fuse-libs package but put the headers in fuse-devel, which needs
@@ -69,8 +45,8 @@ FUSE_CPPFLAGS := -DFUSE_USE_VERSION=29 -D_FILE_OFFSET_BITS=64
 
 # ecrawl_mount is optional, so decide by asking the compiler whether <fuse.h> actually
 # resolves rather than by trusting that a fuse.pc implies usable headers. A .pc that sets
-# Libs but omits Cflags (same trap handled above for libnfs), or fuse-libs installed
-# without fuse-devel, would otherwise add the target and then fail the build.
+# Libs but omits Cflags, or fuse-libs installed without fuse-devel, would otherwise
+# add the target and then fail the build.
 FUSE_HAVE_HEADER := $(shell $(CC) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -E -include fuse.h -x c /dev/null >/dev/null 2>&1 && echo 1)
 # Headers present but no .pc: RHEL/Rocky ship libfuse.so.2 in base fuse-libs, and the
 # devel-only libfuse.so symlink -lfuse needs is absent, so name the soname directly.
@@ -95,7 +71,7 @@ FUSE_DEVEL_URL ?= http://10.1.10.195/install/engaging/rocky-8.10/repos/baseos/Pa
 # The fuse-headers recipe lives below `all` on purpose: make takes the first
 # target in the file as the default goal, so a rule here would break bare `make`.
 
-# Optional jemalloc for native C binaries (all linked targets except enfsprobe-static).
+# Optional jemalloc for native C binaries.
 # Auto-detected via pkg-config; needs jemalloc-devel (RHEL/Fedora) or libjemalloc-dev
 # (Debian/Ubuntu). The runtime-only package ships just libjemalloc.so.2 with no .pc,
 # so pkg-config correctly reports "not available" and the build silently falls back
@@ -203,9 +179,6 @@ ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bi
 ecrawl_mount: ecrawl_mount.c crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) $(FUSE_CPPFLAGS) $(FUSE_CFLAGS) -o $@ ecrawl_mount.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(FUSE_LIBS) $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-enfsprobe: enfsprobe.c
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
-
 # Standalone walk benchmark for inode access strategy (scripts/profile/ewalk-strategy-bench.sh).
 # Deliberately not in TARGETS: it is a measurement instrument, not part of the
 # product, so `make` and scripts/test/test.sh stay unaffected. Build with `make ewalkbench`.
@@ -216,36 +189,14 @@ enfsprobe: enfsprobe.c
 ewalkbench: ewalkbench.c
 	$(CC) $(CFLAGS) -g $(JEMALLOC_CFLAGS) -o $@ ewalkbench.c $(JEMALLOC_LIBS)
 
-# Fully static libnfs (needs libnfs.a — often unavailable on RHEL; try Fedora or build libnfs from source).
-enfsprobe-static: enfsprobe.c
-	$(CC) $(CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) -o $@ enfsprobe.c \
-	  -Wl,-Bstatic -lnfs -Wl,-Bdynamic $(ENFSPROBE_LIBDL)
-
-# Standalone directory: binary + libnfs.so.13; copy enfsprobe-dist/ to hosts without libnfs RPM.
-enfsprobe-dist: enfsprobe.c
-	rm -rf $@
-	mkdir -p $@
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ENFSPROBE_CPPFLAGS) $(ENFSPROBE_LIBNFS_CFLAGS) \
-	  -Wl,-rpath,'$$ORIGIN' -o $@/enfsprobe enfsprobe.c $(ENFSPROBE_LIBNFS_LIBS) $(ENFSPROBE_LIBDL) $(JEMALLOC_LIBS)
-	SO=; \
-	for d in $$(pkg-config --variable=libdir libnfs 2>/dev/null) /usr/lib64 /usr/lib; do \
-	  test -n "$$d" || continue; \
-	  if test -e "$$d/libnfs.so.13"; then SO=$$(realpath "$$d/libnfs.so.13"); break; fi; \
-	done; \
-	if test -z "$$SO" || test ! -f "$$SO"; then \
-	  echo "enfsprobe-dist: could not find libnfs.so.13 to bundle"; exit 1; \
-	fi; \
-	cp -a "$$SO" $@/libnfs.so.13
-	@echo "enfsprobe-dist: built $@/ (copy the directory; target still needs glibc, not libnfs RPM)"
-
 # Debug build
 debug: CFLAGS = -O0 -g -Wall -Wextra -pthread
 debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) enfsprobe enfsprobe-static ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog test_crawl_trijournal *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
-	rm -rf __pycache__ enfsprobe-dist
+	rm -f $(TARGETS) ecrawl_mount ewalkbench test_crawl_block_filter test_crawl_codec test_crawl_catalog test_crawl_trijournal *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
+	rm -rf __pycache__
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
 serve:
@@ -266,4 +217,4 @@ check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog te
 check-tree: $(TARGETS)
 	./scripts/test/test_full.sh
 
-.PHONY: all clean debug serve serve-public check check-tree jemalloc-note enfsprobe-static enfsprobe-dist fuse-headers
+.PHONY: all clean debug serve serve-public check check-tree jemalloc-note fuse-headers
