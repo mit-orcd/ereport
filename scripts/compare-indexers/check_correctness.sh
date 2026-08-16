@@ -205,8 +205,8 @@ check_gufi() {
     return 0
   fi
   local idx="$OUT/gufi_index"
+  # gufi_dir2index creates idx itself and exits 1 if the path already exists.
   rm -rf "$idx"
-  mkdir -p "$idx"
   if ! "$GUFI_DIR2INDEX" -n "$THREADS" "$TREE" "$idx" \
     >"$OUT/gufi.dir2index.txt" 2>"$OUT/gufi.dir2index.err.txt"; then
     echo "gufi: FAIL (gufi_dir2index nonzero exit)" | tee -a "$SUMMARY"

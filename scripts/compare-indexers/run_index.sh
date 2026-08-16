@@ -294,8 +294,8 @@ run_gufi() {
   fi
   local dest="$WORK_ROOT/gufi_${variant}_r${rep}"
   prune_prev_index "gufi_${variant}" "$rep"
+  # gufi_dir2index creates dest itself and exits 1 if the path already exists.
   rm -rf "$dest"
-  mkdir -p "$dest"
   if [[ "$variant" == "rollup" && ! -x "${GUFI_ROLLUP:-}" ]]; then
     append_row gufi rollup_index "$rep" skipped "" 0 "gufi_rollup_not_found"
     append_row gufi rollup_step "$rep" skipped "" 0 "gufi_rollup_not_found"
