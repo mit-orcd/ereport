@@ -4902,7 +4902,6 @@ typedef struct {
     uint64_t files;
     uint64_t dirs;
     uint64_t bytes;
-    uint64_t gen; /* slot is live only when gen == the table's current generation */
 } agg_tot_slot_t;
 
 typedef struct {
@@ -4918,16 +4917,13 @@ typedef struct {
     size_t tbl_mask;     /* slot count - 1, slot count a power of two */
     size_t tbl_used;
     size_t tbl_limit; /* stop inserting past this load; further rows go straight to the shared totals */
-    uint64_t gen;     /* current generation; slots with a stale gen are treated as empty */
     int atomic_mode;  /* 1: accumulate directly into shared row totals via relaxed atomics (no table) */
     atomic_int *fatal_atom;
 } agg_tot_par_wctx_t;
 
 /*
  * Returns this row's slot, or NULL when the table is full and the caller must fall back to atomics.
- * Liveness is the generation stamp, not a zeroed key, so the table is never memset between cells:
- * a stale-gen slot is empty regardless of its old key/counts. This removes the per-cell
- * nw*slots memset that faulted in the whole scratch matrix on every bucket page.
+ * Liveness is a nonzero key: the worker memsets its table before each cell, so a NULL key is empty.
  */
 static inline agg_tot_slot_t *agg_tot_slot_for(agg_tot_par_wctx_t *w, path_row_t *row) {
     uint64_t h = ((uint64_t)(uintptr_t)row >> 3) * 0x9E3779B97F4A7C15ULL;
@@ -4936,14 +4932,10 @@ static inline agg_tot_slot_t *agg_tot_slot_for(agg_tot_par_wctx_t *w, path_row_t
     for (;;) {
         agg_tot_slot_t *s = &w->tbl[i];
 
-        if (s->gen == w->gen && s->key == row) return s;
-        if (s->gen != w->gen) {
+        if (s->key == row) return s;
+        if (!s->key) {
             if (w->tbl_used >= w->tbl_limit) return NULL;
-            s->gen = w->gen;
             s->key = row;
-            s->files = 0;
-            s->dirs = 0;
-            s->bytes = 0;
             w->tbl_used++;
             return s;
         }
@@ -4959,7 +4951,7 @@ static void agg_tot_flush_table(agg_tot_par_wctx_t *w) {
     for (i = 0; i <= w->tbl_mask; i++) {
         agg_tot_slot_t *s = &w->tbl[i];
 
-        if (s->gen != w->gen || !s->key) continue;
+        if (!s->key) continue;
         if (s->files) __atomic_fetch_add(&s->key->total_files, s->files, __ATOMIC_RELAXED);
         if (s->dirs) __atomic_fetch_add(&s->key->total_dirs, s->dirs, __ATOMIC_RELAXED);
         if (s->bytes) __atomic_fetch_add(&s->key->total_bytes, s->bytes, __ATOMIC_RELAXED);
@@ -4979,9 +4971,9 @@ static void *agg_totals_par_worker(void *vp) {
         return NULL;
     }
 
-    /* No per-cell memset: liveness is the generation stamp (see agg_tot_slot_for), so the reused
-     * scratch's stale slots are simply ignored. This is what removes the first-touch page-fault
-     * storm that dominated the bucket-HTML phase on mega-dir corpora. */
+    /* Zero the worker's own table for this cell. The scratch pages stay resident across cells
+     * (one reused buffer per emit thread), so this is a plain rewrite, not a fault storm. */
+    if (!w->atomic_mode) memset(w->tbl, 0, (w->tbl_mask + 1) * sizeof(*w->tbl));
 
     for (ii = w->c_lo; ii < w->c_hi; ii++) {
         size_t i = w->use_ord_slice ? w->path_ord[ii] : ii;
@@ -5139,7 +5131,6 @@ static int aggregate_totals_for_page_n_atomic(path_row_map_t *maps,
 typedef struct {
     void *buf;
     size_t cap; /* bytes */
-    uint64_t gen; /* last generation stamped into buf's slots; 0 = buf never initialized */
 } agg_parts_scratch_t;
 
 static pthread_key_t g_agg_parts_key;
@@ -5158,9 +5149,8 @@ static void agg_parts_key_init(void) {
     g_agg_parts_key_ok = (pthread_key_create(&g_agg_parts_key, agg_parts_scratch_destroy) == 0);
 }
 
-/* At least need bytes with undefined contents, or NULL, which asks the caller to allocate its own.
- * Returns the scratch struct (not just the buffer) so the caller can drive the generation stamp. */
-static agg_parts_scratch_t *agg_parts_scratch_get(size_t need) {
+/* At least need bytes with undefined contents, or NULL, which asks the caller to allocate its own. */
+static void *agg_parts_scratch_get(size_t need) {
     agg_parts_scratch_t *s;
 
     pthread_once(&g_agg_parts_once, agg_parts_key_init);
@@ -5183,9 +5173,8 @@ static agg_parts_scratch_t *agg_parts_scratch_get(size_t need) {
         free(s->buf);
         s->buf = nb;
         s->cap = need;
-        s->gen = 0; /* new buffer: contents undefined, must be initialized before gen-stamping */
     }
-    return s;
+    return s->buf;
 }
 
 static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
@@ -5209,7 +5198,6 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     size_t want;
     size_t per;
     size_t t;
-    uint64_t cur_gen;
     atomic_int shared_fatal;
 
     if (!maps || nlevels < 1 || !records || lo >= hi) return -1;
@@ -5238,25 +5226,10 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
     atomic_init(&shared_fatal, 0);
 
     tables_owned = 0;
-    {
-        agg_parts_scratch_t *scr = agg_parts_scratch_get((size_t)nw * slots * sizeof(*tables));
-
-        if (scr) {
-            tables = (agg_tot_slot_t *)scr->buf;
-            if (scr->gen == 0) {
-                /* First use of this buffer: slots are undefined, so zero them once. Every later cell
-                 * just bumps the generation and never memsets (see agg_tot_slot_for). */
-                memset(tables, 0, (size_t)nw * slots * sizeof(*tables));
-                scr->gen = 1;
-            } else {
-                scr->gen++;
-            }
-            cur_gen = scr->gen;
-        } else {
-            tables = (agg_tot_slot_t *)calloc((size_t)nw * slots, sizeof(*tables));
-            tables_owned = 1;
-            cur_gen = 1; /* calloc zeroed: gen 0 slots read as empty, so start live-gen at 1 */
-        }
+    tables = (agg_tot_slot_t *)agg_parts_scratch_get((size_t)nw * slots * sizeof(*tables));
+    if (!tables) {
+        tables = (agg_tot_slot_t *)calloc((size_t)nw * slots, sizeof(*tables));
+        tables_owned = 1;
     }
     tp = (pthread_t *)malloc((size_t)nw * sizeof(pthread_t));
     ctxs = (agg_tot_par_wctx_t *)calloc((size_t)nw, sizeof(*ctxs));
@@ -5293,7 +5266,6 @@ static int aggregate_totals_for_page_n_parallel(path_row_map_t *maps,
         ctxs[started].tbl_mask = slots - 1;
         ctxs[started].tbl_used = 0;
         ctxs[started].tbl_limit = slots - slots / 4;
-        ctxs[started].gen = cur_gen;
         ctxs[started].atomic_mode = 0;
         ctxs[started].fatal_atom = &shared_fatal;
 
