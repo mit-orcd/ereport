@@ -518,7 +518,7 @@ tool has an equivalent of; `data_length + index_length` for the benchmark schema
 alone is recorded per repetition in the `tables_and_indexes=` note of the
 `robinhood/indexes` row.
 
-**Figure 6** gives each query a panel, ranked fastest-last, on a shared log time
+**Figure 6** gives each query a panel, ranked fastest at the top, on a shared log time
 axis, with **Q6 titled *[extra]*** so nobody reads it as one of the paper's five.
 Three things the earlier layout hid are now explicit:
 

@@ -221,10 +221,11 @@ LETTER_LANDSCAPE = (11.0, 8.5)
 LETTER_MARGIN = 0.45  # inches of clear paper around the content band
 # Fraction of the printable landscape height the index content band should use.
 INDEX_PAGE_FILL = 0.96
-# Minimum physical inches per tool row. Split labels need a bit more,
-# especially with cold/hot pairs where each bar can carry two annotation lines.
+# Minimum physical inches per tool row. Split labels need a bit more.
+# Figure 5 adds a per-file line under the phase split, so those rows are taller.
 INDEX_ROW_IN = 0.34
 INDEX_ROW_SPLIT_IN = 0.62
+INDEX_ROW_SIZE_IN = 0.95
 # Physical inches per bar inside a query panel, plus a fixed pad for its title
 # and the gap that keeps one panel's tick labels out of the next panel's bars.
 QUERY_BAR_IN = 0.28
@@ -874,39 +875,29 @@ def _label_transform(axis, dx_pt=4.0, dy_pt=0.0):
 def bar_label(axis, y, x, text, log, color="#222222", weight="normal", sub=None):
     """Value at the end of the bar, optically centered on that bar.
 
-    va='center' lines up the font bbox, whose unused descent parks digits
-    above the bar. A small downward shift puts the ink on the bar.
+    A note under the value is the same text object, so a three-line size
+    label stays one block on this y instead of growing up and down from it
+    and landing on the next bar.
     """
     offset = x * 1.12 if log else x
+    if sub:
+        text = "{}\n{}".format(text, sub)
     # ~0.3 em: enough to cancel descent, not enough to drop onto the next bar.
-    optical = -2.5 if not sub else 0.0
-    trans = _label_transform(axis, 4.0, optical)
+    trans = _label_transform(axis, 4.0, -2.5)
     axis.text(
         offset,
         y,
         text,
         transform=trans,
-        va="bottom" if sub else "center",
+        va="center",
         ha="left",
-        fontsize=8.5,
+        fontsize=8.5 if not sub else 8.0,
         color=color,
         fontweight=weight,
+        linespacing=1.35,
         clip_on=False,
         zorder=6,
     )
-    if sub:
-        axis.text(
-            offset,
-            y,
-            sub,
-            transform=trans,
-            va="top",
-            ha="left",
-            fontsize=7.5,
-            color="#666666",
-            clip_on=False,
-            zorder=6,
-        )
 
 
 def datasets_with_metric(datasets, key, metric):
@@ -995,6 +986,8 @@ def index_figure(datasets, out_dir, spec):
     if datasets[0].get("caveat"):
         header_in += 0.18
     row_in = INDEX_ROW_SPLIT_IN if split_rows else INDEX_ROW_IN
+    if split_rows and spec.get("per_file") and multi:
+        row_in = INDEX_ROW_SIZE_IN
     min_axes_in = row_in * len(tools) + (0.35 if floor else 0.12)
     # Tick labels and the x-axis title hang below the axes box; keep a dedicated
     # band so the caption/legend cannot collide with them on landscape pages.
@@ -1093,10 +1086,12 @@ def index_figure(datasets, out_dir, spec):
             text = formatter(mean) if mean else "0"
             note = None
             if spec.get("per_file") and entry.get("per_file"):
-                # The total says what the index costs to keep; this says what it
-                # costs per file, which is the number that carries to a tree of
-                # a different size.
-                note = "{} per file".format(fmt_bytes(entry["per_file"]))
+                # On the total line, not a third line: cold/hot already share
+                # one block, and a phase split under that is two lines, not
+                # three stacked into the next bar.
+                text = "{}  ·  {} per file".format(
+                    text, fmt_bytes(entry["per_file"])
+                )
             # Labels are placed once the axis limits are final, because whether
             # a split fits inside its bar depends on them.
             pending.append(
@@ -1135,12 +1130,16 @@ def index_figure(datasets, out_dir, spec):
             low = min(low, floor[1] / 1.8)
     if log:
         # Split / per-file notes are long; give them page width before clip.
-        axis.set_xlim(low, high * (4.2 if split_rows else 2.6))
+        extra = 5.5 if spec.get("per_file") else (4.2 if split_rows else 2.6)
+        axis.set_xlim(low, high * extra)
     else:
         axis.set_xlim(low, high * (1.55 if split_rows else 1.22))
 
-    # Same note on every series of a row (index size, cold vs hot) is one
-    # label on the tool row. Different values stay on their own bars.
+    # Same note on every series of a row is one label on the tool row.
+    # Index size is not a cache-state quantity: cold and hot differ by a
+    # last-rep byte or two, which used to force a three-line label onto each
+    # bar and stack them on top of each other. Always one label there, parked
+    # past the longer bar. Other figures still split when the texts differ.
     placed = []
     if multi:
         by_row = {}
@@ -1152,10 +1151,10 @@ def index_figure(datasets, out_dir, spec):
                 (text, split, note, segmented)
                 for _r, _i, _y, _m, _s, text, split, note, segmented in items
             ]
-            if len(items) > 1 and len(set(keys)) == 1:
-                mean = max(m for _r, _i, _y, m, _s, *_rest in items if m is not None)
-                std = max((s or 0) for _r, _i, _y, _m, s, *_rest in items)
-                _r, _i, _y, _mean, _std, text, split, note, segmented = items[0]
+            share = spec.get("per_file") or (len(items) > 1 and len(set(keys)) == 1)
+            if share:
+                pick = max(items, key=lambda it: it[3] if it[3] is not None else -1)
+                _r, _i, _y, mean, std, text, split, note, segmented = pick
                 placed.append((positions[row], mean, std, text, split, note, segmented))
             else:
                 for _r, _i, y, mean, std, text, split, note, segmented in items:
@@ -1744,23 +1743,7 @@ def plot_index(datasets, out_dir):
     return outputs, figures
 
 
-def query_rank_mean(datasets, tool, query):
-    """That tool's ranking time for this query: cold, else warm, else any."""
-    by_cache = {}
-    for dataset in datasets or ():
-        pair = dataset.get("queries", {}).get("stats", {}).get((tool, query))
-        if pair and pair[0] is not None:
-            by_cache.setdefault(dataset.get("cache") or "", pair[0])
-    for want in ("cold", "warm", "hot", ""):
-        if want in by_cache:
-            return by_cache[want]
-    if by_cache:
-        return next(iter(by_cache.values()))
-    return None
-
-
-def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages,
-                 rank_datasets=None):
+def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
     """One Letter portrait page: three query panels for a single cache state.
 
     Cold and hot each get their own page. Panels fill the sheet with enough
@@ -1816,19 +1799,12 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages,
 
     for row, query in enumerate(queries):
         axis = axes[row][0]
-        # Cold fastest at the top (hot pages keep that order). invert_yaxis
-        # puts y=0 at the top, matching the walk and build figures.
-        rank_pool = rank_datasets or [dataset]
-
-        def query_sort_key(tool):
-            mean = query_rank_mean(rank_pool, tool, query)
-            if mean is None:
-                return (1, stats[(tool, query)][0])
-            return (0, mean)
-
+        # Fastest on this page at the top. invert_yaxis puts y=0 at the top,
+        # matching the walk and build figures. Each cache state ranks itself:
+        # freezing hot to the cold order left a slower bar above a faster one.
         entries = sorted(
             (t for t in QUERY_ORDER if (t, query) in stats),
-            key=query_sort_key,
+            key=lambda tool: stats[(tool, query)][0],
         )
         positions = list(range(len(entries)))
         # Reason -> the tools it applies to, for the bars that missed the
@@ -2059,7 +2035,6 @@ def plot_queries(datasets, out_dir):
             bounds,
             number,
             len(pages),
-            rank_datasets=usable,
         )
         for number, (dataset, chunk) in enumerate(pages, start=1)
     ]
