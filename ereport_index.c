@@ -5,7 +5,7 @@
  * Copyright (c) 2026 Michel Erb — see LICENSE.
  */
 
-#define _GNU_SOURCE /* qsort_r for the lex radix leaf comparator */
+#define _GNU_SOURCE /* qsort_r for the lex mergesort serial base case */
 #define _XOPEN_SOURCE 700
 
 #include <ctype.h>
@@ -7497,169 +7497,105 @@ static int lex_off_id_cmp(const void *a, const void *b) {
 }
 
 /*
- * MSD radix over raw path bytes. Produces exactly the same permutation as a
- * byte-lex comparison sort (shorter string first, path_id tiebreak — the former
- * lex_ent_cmp mergesort) but touches each path byte O(1) times instead of
- * re-scanning shared prefixes on every comparison — the dominant cost of the
- * mergesort on mega-dir corpora where millions of paths share a long directory
- * prefix.
- *
- * Each key is its stored byte string. A per-record cursor (offset into the
- * string) walks one radix class per level so the prefix is never re-read.
- *
- * class: 0 = ENDED (string exhausted, sorts first — shorter-first), 1..256 =
- * byte value + 1. Identical strings (all levels equal) fall to path_id order,
- * which is a stable by-id sort of the tied range.
+ * Parallel mergesort over the decoded path entries, in byte-lex order (shorter
+ * string first, path_id tiebreak). Comparison-based is the right shape here:
+ * the paths are short and cache-resident through the merge tree and the merge
+ * passes stream linearly. An MSD radix over an index array was tried and
+ * profiled ~2x slower on mega-dir corpora — its per-level counting/scatter
+ * over the 160MB index/tmp arrays faulted a cache line per element per level,
+ * which dominated the prefix re-scanning it was meant to avoid.
  */
-#define LEX_RADIX_NCLASS 257
-#ifndef LEX_RADIX_LEAF
-#define LEX_RADIX_LEAF 64u
-#endif
-#ifndef LEX_RADIX_SPAWN_MIN
-#define LEX_RADIX_SPAWN_MIN (1u << 18) /* only hand a sub-bucket to a thread above this size */
+#ifndef LEX_SORT_SERIAL
+#define LEX_SORT_SERIAL (1u << 14) /* qsort_r serially below this run length */
 #endif
 
-static atomic_int g_lex_radix_active;
-static int g_lex_radix_max;
-static __thread unsigned short *g_lex_radix_cls;
-static __thread size_t g_lex_radix_cls_cap;
+static int lex_ent_cmp(const void *aa, const void *bb, void *ctx) {
+    const lex_ent_t *x = (const lex_ent_t *)aa;
+    const lex_ent_t *y = (const lex_ent_t *)bb;
+    size_t n = x->len < y->len ? x->len : y->len;
+    int c = memcmp(x->s, y->s, n);
+    (void)ctx;
 
-/* Leaf comparator: ctx is the lex_ent_t array. Full memcmp from the start is
- * correct here; the radix only guarantees a shared prefix, and memcmp from 0 is
- * still cheap at leaf sizes. Ties fall to path_id, then index for stability. */
-static int lex_radix_leaf_cmp(const void *aa, const void *bb, void *ctx) {
-    const lex_ent_t *ents = (const lex_ent_t *)ctx;
-    size_t ia = *(const size_t *)aa;
-    size_t ib = *(const size_t *)bb;
-    const lex_ent_t *x = &ents[ia];
-    const lex_ent_t *y = &ents[ib];
-
-    /* Full compare from the start is correct here; the radix only guarantees a
-     * shared prefix, and memcmp from 0 is still cheap at leaf sizes. */
-    {
-        size_t n = x->len < y->len ? x->len : y->len;
-        int c = memcmp(x->s, y->s, n);
-        if (c) return c;
-        if (x->len != y->len) return x->len < y->len ? -1 : 1;
-        if (x->path_id < y->path_id) return -1;
-        if (x->path_id > y->path_id) return 1;
-    }
-    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+    if (c) return c;
+    if (x->len != y->len) return x->len < y->len ? -1 : 1;
+    if (x->path_id < y->path_id) return -1;
+    if (x->path_id > y->path_id) return 1;
+    return 0;
 }
 
-static void lex_radix_sort(const lex_ent_t *ents, size_t *idx, size_t *tmp, uint32_t *pos, size_t n);
+/* Merge the sorted runs ents[0,mid) and ents[mid,n) through scratch. */
+static void lex_merge(lex_ent_t *ents, lex_ent_t *scratch, size_t mid, size_t n) {
+    size_t i = 0, j = mid, k = 0;
+
+    while (i < mid && j < n) {
+        const lex_ent_t *x = &ents[i];
+        const lex_ent_t *y = &ents[j];
+        size_t m = x->len < y->len ? x->len : y->len;
+        int c = memcmp(x->s, y->s, m);
+
+        if (c == 0) {
+            if (x->len != y->len) c = x->len < y->len ? -1 : 1;
+            else if (x->path_id != y->path_id) c = x->path_id < y->path_id ? -1 : 1;
+        }
+        if (c <= 0) { scratch[k++] = *x; i++; }
+        else        { scratch[k++] = *y; j++; }
+    }
+    if (i < mid) {
+        /* Right tail exhausted: append the left tail and copy the whole run back. */
+        memcpy(scratch + k, ents + i, (mid - i) * sizeof(*ents));
+        memcpy(ents, scratch, n * sizeof(*ents));
+    } else {
+        /* Left tail exhausted: the right tail is already in place in ents. */
+        memcpy(ents, scratch, k * sizeof(*ents));
+    }
+}
 
 typedef struct {
-    const lex_ent_t *ents;
-    size_t *idx;
-    size_t *tmp;
-    uint32_t *pos;
+    lex_ent_t *ents;
+    lex_ent_t *scratch;
     size_t n;
-} lex_radix_task_t;
+    int depth; /* remaining thread-split budget */
+} lex_sort_arg_t;
 
-static void *lex_radix_entry(void *vp) {
-    lex_radix_task_t *t = (lex_radix_task_t *)vp;
-    lex_radix_sort(t->ents, t->idx, t->tmp, t->pos, t->n);
-    free(t);
-    free(g_lex_radix_cls);
-    g_lex_radix_cls = NULL;
-    g_lex_radix_cls_cap = 0;
+static void lex_sort_rec(lex_ent_t *ents, lex_ent_t *scratch, size_t n, int depth);
+
+static void *lex_sort_th(void *vp) {
+    lex_sort_arg_t *a = (lex_sort_arg_t *)vp;
+    lex_sort_rec(a->ents, a->scratch, a->n, a->depth);
     return NULL;
 }
 
-static void lex_radix_sort(const lex_ent_t *ents, size_t *idx, size_t *tmp, uint32_t *pos, size_t n) {
-    size_t count[LEX_RADIX_NCLASS];
-    size_t off[LEX_RADIX_NCLASS];
-    size_t cur[LEX_RADIX_NCLASS];
+/*
+ * scratch is partitioned exactly like ents at every level, so each thread owns
+ * a disjoint scratch range; the parent merges only after both halves join.
+ * depth bounds the total number of live threads to roughly its initial value.
+ */
+static void lex_sort_rec(lex_ent_t *ents, lex_ent_t *scratch, size_t n, int depth) {
+    size_t mid;
 
-descend:
-    if (n <= 1) return;
-    if (n <= (size_t)LEX_RADIX_LEAF) {
-        qsort_r(idx, n, sizeof(size_t), lex_radix_leaf_cmp, (void *)ents);
+    if (n < 2) return;
+    if (n <= (size_t)LEX_SORT_SERIAL || depth <= 0) {
+        qsort_r(ents, n, sizeof(*ents), lex_ent_cmp, NULL);
         return;
     }
-    if (g_lex_radix_cls_cap < n) {
-        unsigned short *nb = (unsigned short *)realloc(g_lex_radix_cls, n * sizeof(*nb));
-        if (!nb) {
-            qsort_r(idx, n, sizeof(size_t), lex_radix_leaf_cmp, (void *)ents);
-            return;
-        }
-        g_lex_radix_cls = nb;
-        g_lex_radix_cls_cap = n;
-    }
+    mid = n / 2;
+    {
+        lex_sort_arg_t arg;
+        pthread_t th;
 
-    memset(count, 0, sizeof(count));
-    {
-        size_t i;
-        for (i = 0; i < n; i++) {
-            size_t r = idx[i];
-            uint32_t p = pos[r];
-            const lex_ent_t *e = &ents[r];
-            int c = (p < e->len) ? ((int)(unsigned char)e->s[p] + 1) : 0;
-            g_lex_radix_cls[i] = (unsigned short)c;
-            count[c]++;
-            if (p < e->len) pos[r] = p + 1; /* consume the byte we just classified */
+        arg.ents = ents;
+        arg.scratch = scratch;
+        arg.n = mid;
+        arg.depth = depth - 1;
+        if (pthread_create(&th, NULL, lex_sort_th, &arg) == 0) {
+            lex_sort_rec(ents + mid, scratch + mid, n - mid, depth - 1);
+            pthread_join(th, NULL);
+        } else {
+            lex_sort_rec(ents, scratch, mid, depth - 1);
+            lex_sort_rec(ents + mid, scratch + mid, n - mid, depth - 1);
         }
     }
-
-    /* Shared-prefix fast path: one nonempty class means the permutation is
-     * unchanged; descend in place (cursors already advanced). */
-    {
-        int nonempty = 0;
-        int single = -1;
-        int c;
-        for (c = 0; c < LEX_RADIX_NCLASS && nonempty < 2; c++)
-            if (count[c]) { nonempty++; single = c; }
-        if (nonempty == 1) {
-            if (single == 0) return; /* all ended here: fully sorted */
-            goto descend;
-        }
-    }
-
-    {
-        size_t acc = 0;
-        int c;
-        for (c = 0; c < LEX_RADIX_NCLASS; c++) { off[c] = acc; cur[c] = acc; acc += count[c]; }
-    }
-    {
-        size_t i;
-        for (i = 0; i < n; i++) { int c = g_lex_radix_cls[i]; tmp[cur[c]++] = idx[i]; }
-    }
-    memcpy(idx, tmp, n * sizeof(size_t));
-
-    /* Class 0 (ENDED) is fully placed. Recurse on 1..256, spawning threads for
-     * large sub-buckets while the global budget lasts. */
-    {
-        pthread_t th[LEX_RADIX_NCLASS];
-        int nth = 0;
-        int c;
-        for (c = 1; c < LEX_RADIX_NCLASS; c++) {
-            if (count[c] <= 1) continue;
-            if (count[c] > (size_t)LEX_RADIX_SPAWN_MIN) {
-                int prev = atomic_fetch_add(&g_lex_radix_active, 1);
-                if (prev < g_lex_radix_max) {
-                    lex_radix_task_t *t = (lex_radix_task_t *)malloc(sizeof(*t));
-                    if (t) {
-                        t->ents = ents;
-                        t->idx = idx + off[c];
-                        t->tmp = tmp + off[c];
-                        t->pos = pos;
-                        t->n = count[c];
-                        if (pthread_create(&th[nth], NULL, lex_radix_entry, t) == 0) { nth++; continue; }
-                        free(t);
-                    }
-                    atomic_fetch_sub(&g_lex_radix_active, 1);
-                } else {
-                    atomic_fetch_sub(&g_lex_radix_active, 1);
-                }
-            }
-            lex_radix_sort(ents, idx + off[c], tmp + off[c], pos, count[c]);
-        }
-        {
-            int i;
-            for (i = 0; i < nth; i++) { pthread_join(th[i], NULL); atomic_fetch_sub(&g_lex_radix_active, 1); }
-        }
-    }
+    lex_merge(ents, scratch, mid, n);
 }
 
 typedef struct {
@@ -7938,35 +7874,16 @@ static int sort_paths_bin_lex(build_ctx_t *ctx, int skip_if_lex) {
         free(inv);
     }
 
-    /* MSD radix over raw path bytes: sort an index array, then permute ents by
-     * it. Same permutation as lex_ent_cmp mergesort, O(1) byte touches per path
-     * instead of re-scanning shared prefixes per comparison. */
+    /* Parallel mergesort over the decoded entries: byte-lex order, shorter
+     * string first, path_id tiebreak. Comparison-based wins here — the paths
+     * are short and cache-resident through the merge tree; an MSD radix over
+     * an index array profiled ~2x slower on mega-dir corpora. */
     {
-        size_t *ridx = (size_t *)malloc((size_t)n * sizeof(*ridx));
-        size_t *rtmp = (size_t *)malloc((size_t)n * sizeof(*rtmp));
-        uint32_t *rpos = (uint32_t *)calloc((size_t)n, sizeof(*rpos));
-        lex_ent_t *sorted = (lex_ent_t *)malloc((size_t)n * sizeof(*sorted));
+        lex_ent_t *scratch = (lex_ent_t *)malloc((size_t)n * sizeof(*scratch));
 
-        if (!ridx || !rtmp || !rpos || !sorted) {
-            free(ridx);
-            free(rtmp);
-            free(rpos);
-            free(sorted);
-            goto out;
-        }
-        for (i = 0; i < n; i++) ridx[i] = (size_t)i;
-        g_lex_radix_max = nth > 1 ? nth * 4 : 0;
-        atomic_store(&g_lex_radix_active, 0);
-        lex_radix_sort(ents, ridx, rtmp, rpos, (size_t)n);
-        free(g_lex_radix_cls);
-        g_lex_radix_cls = NULL;
-        g_lex_radix_cls_cap = 0;
-        for (i = 0; i < n; i++) sorted[i] = ents[ridx[i]];
-        memcpy(ents, sorted, (size_t)n * sizeof(*ents));
-        free(ridx);
-        free(rtmp);
-        free(rpos);
-        free(sorted);
+        if (!scratch) goto out;
+        lex_sort_rec(ents, scratch, (size_t)n, nth);
+        free(scratch);
     }
 
     new_off = (uint64_t *)malloc((size_t)(n + 1ULL) * sizeof(*new_off));
