@@ -460,7 +460,7 @@ The images below are illustrative mockups of the layout (fonts and spacing may d
 
 `ereport_index` builds and searches an on-disk trigram index over crawl path strings—either for one resolved Unix user or for every UID when no user is selected (see `--make` disambiguation below; same idea as `ereport` all-users mode: all uid-shard files, no UID filter on records).
 
-Indexing is **segment-once**: trigrams are taken only from each path's basename (the final component). Parent directory names are not re-trigrammed onto every child. Directory records still contribute their own basename trigrams, and `--search` expands a matching directory via `path_kids.bin` (immediate-children CSR) so middle-segment hits remain complete. Huge directory hits fall back to a sequential prefix scan of `paths.bin`.
+Indexing is **segment-once**: trigrams are taken only from each path's basename (the final component). Parent directory names are not re-trigrammed onto every child. Directory records still contribute their own basename trigrams, and `--search` expands a matching directory by a prefix scan of lex-sorted `paths.bin` so middle-segment hits remain complete.
 
 The search is a case-insensitive substring match on individual path segments (slashes separate segments; matches do not span `/`). For example:
 
@@ -558,7 +558,7 @@ Roughly two phases:
 
 1. Scan / index — Input `.bin` files are listed, then chunk boundaries are mapped in parallel (same idea as `ereport`, using `EREPORT_INDEX_THREADS`, capped by how many bin files exist). Parallel workers then read each chunk (record headers first). For a single-user build, rows whose UID does not match skip reading the path string (`fseek` past it). For an all-users `--make` (no resolved username as the first argument), every matched layout row’s path is indexed (no UID filter). Parsed paths are batched to a paths writer thread that appends `paths.bin` and `path_offsets.bin` in strict order, then enqueues linked trigram jobs from each write batch to the trigram queue in slices that fit current free depth (fewer mutex rounds than per-path enqueue, without stalling until an entire batch fits). Multiple trigram writer threads append `tmp_trigrams_*.bin` shard files in parallel (lazy `FILE*` handles and LRU eviction per `EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS`; requires sufficient `ulimit -n`). For each path, trigram codes are sorted by bucket and written with batched `fwrite`s per bucket (fewer lock rounds and syscalls than one write per trigram). Chunk input files use large stdio buffers; trigram code lists use a cheap hybrid sort/dedup for uniqueness. The trigram job queue depth defaults to 4096 parsed paths between the paths writer and trigram workers; override with `EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH` (see above).
 
-2. Merge — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs multiple worker threads that write per-bucket segment files, then a single thread stitches postings offsets and concatenates blobs. Reads prefer `mmap` with `malloc`+`read` fallback; sorting uses LSD radix on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers.
+2. Merge — Temp per-bucket trigram files are sorted and merged into `tri_keys.bin` + `tri_postings.bin`. When enough buckets have data, merge runs multiple worker threads that write per-bucket segment files, then a single thread stitches postings offsets and concatenates blobs. Reads prefer `mmap` with `malloc`+`read` fallback; sorting uses LSD radix on packed records. During indexing, the builder records which trigram buckets were touched so merge can skip `stat`-ing thousands of empty bucket paths. All heavy merge I/O uses large buffers. In parallel with merge, `--make` lex-sorts `paths.bin` (path_ids unchanged) so directory-hit expansion is a prefix scan.
 
 At `--make` start, `ereport_index` prints one stderr line with effective parse workers, trigram workers, trigram job queue depth, and write batch path cap. Final stdout stats include `trigram_queue_depth` and `write_batch_paths` for the run.
 
@@ -606,11 +606,10 @@ Current index format:
 
 Current files under `<username>/index/`:
 
-- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields; `trigrams=basename` on version 3+; `path_kids=1` on version 4+)
-- `path_offsets.bin`
-- `paths.bin`
+- `meta.txt` — small key/value record written at end of `--make` / `--resume-merge` (includes `indexed_paths=` corpus size and format/version fields; `trigrams=basename` on version 3+; `paths_order=lex` on version 5+)
+- `path_offsets.bin` — remapped when `paths.bin` is lex-sorted so `path_id` still finds its row
+- `paths.bin` — written in arrival order, then rewritten in lexicographic path order (`path_ids` do not change). `--search` expands a directory hit by scanning the contiguous `prefix/` run
 - `path_isdir.bin` — bit-packed directory flags (one bit per `path_id`) so `--search` can tell directory hits from file hits
-- `path_kids.bin` — required children CSR (`off` / `child_ids` / `subtree_n`) for directory-hit expansion; a missing file is a hard error
 - `tri_keys.bin`
 - `tri_postings.bin`
 - `dirs.idx`, `rowgroups.idx` — the directory-index sidecars, unless `--no-dir-index` was passed
@@ -625,15 +624,19 @@ Cost, measured on a 1.13M-record capture of 21726 directories: `dirs.idx` 509 Ki
 
 `--make` reports `dir_index=1`, `dir_index_dirs`, `dir_index_bytes`, `rowgroup_index_groups`, `rowgroup_index_bytes` and `dir_index_sec` on stdout, and `meta.txt` records `dir_index`, `dir_index_dirs`, `rowgroup_index` and `rowgroup_index_groups`. Those are advisory: a reader validates the sidecars against the shards themselves, not against `meta.txt`.
 
+#### Index version 5 (lex-sorted `paths.bin`)
+
+Version 5 keeps the version-3 basename-trigram layout and drops `path_kids.bin`. After the paths writer closes, `--make` lex-sorts `paths.bin` (and rewrites `path_offsets.bin` so `path_id` still finds its row) in parallel with the trigram merge. `--search` intersects basename postings, verifies candidates, then if any hit is a directory prefix-scans the contiguous descendant run. `path_ids` are not renumbered, so postings do not move.
+
+There is no dual-read path for older indexes: `--search` requires `ereport_index_version=5` and `paths_order=lex` in `meta.txt`. A v4 index must be rebuilt.
+
 #### Index version 4 (children CSR)
 
-Version 4 keeps the version-3 basename-trigram layout and adds `path_kids.bin`: a dense CSR keyed by `path_id` with immediate children and a `subtree_n` count (1 + descendants). `--search` intersects basename postings, verifies candidates, then if any hit is a directory walks that CSR (or, when the hit subtree is huge, the existing sequential prefix scan of `paths.bin`) so segment-anywhere semantics stay intact without re-emitting parent trigrams during `--make`.
-
-There is no dual-read path for older indexes: `--search` and `--resume-merge` require `ereport_index_version=4` in `meta.txt`. A v3 index must be rebuilt. `path_kids.bin` is required; `--search` does not fall back to a full-corpus scan when it is missing.
+Version 4 kept the version-3 basename-trigram layout and added `path_kids.bin`, a dense CSR of immediate children. Superseded by version 5: the sidecar was ~24 bytes per path and directory expansion still random-fetched `path_id`s.
 
 #### Index version 3 (basename trigrams)
 
-Version 3 kept the version-2 compression layout and changed what is inverted: each path contributed trigrams from its basename only, with `path_isdir.bin` beside `path_offsets.bin`. Directory-hit expansion walked every path in `paths.bin`. Superseded by version 4.
+Version 3 kept the version-2 compression layout and changed what is inverted: each path contributed trigrams from its basename only, with `path_isdir.bin` beside `path_offsets.bin`. Directory-hit expansion walked every path in `paths.bin`. Superseded by version 4, then 5.
 
 #### Compression (index version 2+)
 
@@ -641,7 +644,7 @@ The two files that dominate index size are zstd-compressed; the two that are ran
 
 - `paths.bin` — `EPATH002`: a 40-byte header, then the path bytes in independently compressed chunks of at most 256 KiB, then a chunk table (one row per chunk: logical start, file offset, stored and raw length). Chunks are cut on path boundaries, so a lookup decompresses exactly one chunk. The header records where the table starts, because the chunk count is only known once the last path is written. A chunk whose `stored_len` equals its `raw_len` is stored verbatim.
 - `tri_postings.bin` — a posting list of at most 512 bytes stays bare delta-varints, since a frame header would cost more than the payload; anything larger is written as a sequence of independently decodable chunks of at most 128 KiB of varints, each prefixed by `[u32 raw_len][u32 stored_len][u8 is_zstd]`. Which of the two a list uses is in the previously unused `reserved` field of its `tri_keys.bin` record. Chunking rather than one frame per list keeps writer memory bounded on trigrams whose posting lists run to hundreds of MiB.
-- `path_offsets.bin` — unchanged, and still offsets into the *uncompressed* path stream, so path-id arithmetic and `--resume-merge` are unaffected by any of this.
+- `path_offsets.bin` — start of each `path_id` in the uncompressed stream. After the v5 lex rewrite those starts are not a prefix-sum in file order; `--search` takes the path length from the NUL in the chunk.
 - `tri_keys.bin` — unchanged 24-byte records, binary-searched at query time; `postings_bytes` now measures the compressed span.
 
 `EREPORT_INDEX_ZSTD_LEVEL` (default 3) sets the level for both files. The `tmp_trigrams_*.bin` scratch files, which only live for the duration of one `--make`, do not use zstd at all: they are `EITG0002` frames of delta-varints over runs of one path id with ascending trigrams, which encodes them about as small as zstd level 3 did for a fraction of the CPU.

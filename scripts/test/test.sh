@@ -2183,14 +2183,18 @@ run_integration() {
         tail -n 80 "${td}/ei.stderr" >&2 || true
         die "ereport_index --make failed"
     }
-    [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" && -f "${idx_make}/path_isdir.bin" && -f "${idx_make}/path_kids.bin" ]] ||
-        die "ereport_index did not write tri_keys.bin / paths.bin / path_isdir.bin / path_kids.bin under ${idx_make}"
-    summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin+path_isdir.bin+path_kids.bin written"
+    [[ -f "${idx_make}/tri_keys.bin" && -f "${idx_make}/paths.bin" && -f "${idx_make}/path_isdir.bin" ]] ||
+        die "ereport_index did not write tri_keys.bin / paths.bin / path_isdir.bin under ${idx_make}"
+    [[ ! -f "${idx_make}/path_kids.bin" ]] ||
+        die "ereport_index --make still wrote path_kids.bin"
+    summary_add PASS "ereport_index --make" "tri_keys.bin+paths.bin+path_isdir.bin written"
 
     expect_eq "ereport_index: paths.bin magic" "EPATH002" "$(head -c 8 "${idx_make}/paths.bin")" \
         "paths.bin uses the compressed EPATH002 layout"
-    expect_eq "ereport_index: meta version" "4" "$(kv_last ereport_index_version "${idx_make}/meta.txt")" \
-        "meta.txt records the children-CSR index version"
+    expect_eq "ereport_index: meta version" "5" "$(kv_last ereport_index_version "${idx_make}/meta.txt")" \
+        "meta.txt records the lex-sorted paths index version"
+    expect_eq "ereport_index: paths order" "lex" "$(kv_last paths_order "${idx_make}/meta.txt")" \
+        "meta.txt records that paths.bin is lex-sorted"
     expect_eq "ereport_index: trigrams scope" "basename" "$(kv_last trigrams "${idx_make}/meta.txt")" \
         "meta.txt records basename-only trigrams"
 
@@ -2229,8 +2233,8 @@ run_integration() {
         tail -n 40 "${td}/segonce_search.err" >&2 || true
         die "ereport_index --search failed on segment-once fixture"
     }
-    [[ -f "${seg_idx}/path_kids.bin" ]] ||
-        die "ereport_index --make did not write path_kids.bin for the segment-once fixture"
+    expect_eq "ereport_index segment-once: paths order" "lex" "$(kv_last paths_order "${seg_idx}/meta.txt")" \
+        "segment-once index is lex-sorted"
     grep -q 'leaf_only\.dat$' "${td}/segonce_search.out" ||
         die "ereport_index --search unique_dir_xyz did not expand to nested/leaf_only.dat"
     summary_add PASS "ereport_index segment-once expand" "directory hit returns descendant file"
@@ -2270,7 +2274,7 @@ run_integration() {
     # An older index version must be rejected rather than misread.
     local idx_stale="${td}/index_stale"
     cp -r "$idx_make" "$idx_stale"
-    sed -i 's/^ereport_index_version=4$/ereport_index_version=2/' "${idx_stale}/meta.txt"
+    sed -i 's/^ereport_index_version=5$/ereport_index_version=2/' "${idx_stale}/meta.txt"
     if "$EREPORT_INDEX" --search --index-dir "$idx_stale" sub >/dev/null 2>"${td}/ei_stale.err"; then
         die "ereport_index --search accepted an index whose meta.txt claims version 2"
     fi

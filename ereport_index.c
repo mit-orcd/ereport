@@ -5,6 +5,7 @@
  * Copyright (c) 2026 Michel Erb — see LICENSE.
  */
 
+#define _GNU_SOURCE /* qsort_r for the lex radix leaf comparator */
 #define _XOPEN_SOURCE 700
 
 #include <ctype.h>
@@ -44,15 +45,16 @@
 #endif
 
 /*
- * 4: path_kids.bin is a children CSR (off / child_ids / subtree_n) so --search expands a
- *    directory hit in O(subtree) instead of scanning paths.bin. Readers reject older
- *    versions — rebuild with `--make`.
+ * 5: --make lex-sorts paths.bin (path_ids stay put; path_offsets.bin is rewritten). Directory
+ *    hits expand by a prefix scan of that file. Readers reject older versions — rebuild.
+ * 4: path_kids.bin children CSR. Superseded: the sidecar was ~24 bytes/path and the expand
+ *    still random-fetched path_ids.
  * 3: trigrams are taken from each path's basename only (segment-once). path_isdir.bin
  *    records which path_ids are directories so --search can expand a directory hit to its
  *    descendants.
  * 2: durable paths.bin and tri_postings.bin are zstd-compressed (EPATH002 / chunked postings).
  */
-#define INDEX_VERSION 4
+#define INDEX_VERSION 5
 /*
  * Top bits of the 24-bit trigram used to partition records into tmp_trigrams_<bucket>_w<shard>.bin
  * during the index phase, and into one merge segment per bucket during the merge phase.
@@ -98,12 +100,6 @@ static int g_durable_zstd_level = -1; /* -1 = parse EREPORT_INDEX_ZSTD_LEVEL on 
  * directory are indexed (full absolute paths kept), so the index mirrors an ereport --subtree report. */
 static char g_subtree_buf[PATH_MAX];
 static const char *g_subtree_prefix = NULL;
-
-/* Directory-hit expansion via path_kids.bin: walk the CSR unless the hit subtree is so large
- * that a sequential paths.bin prefix scan is cheaper. Cap is min(1% of corpus, 1M), but a
- * small corpus always walks. */
-#define KIDS_EXPAND_MAX_IDS 1000000ULL
-#define KIDS_EXPAND_SMALL_CORPUS 64ULL
 
 /* Directory-boundary prefix test: matches `prefix` itself and `prefix/...` but not `prefixfoo`.
  * (Mirrors ereport.c's starts_with_dir_prefix.) */
@@ -402,8 +398,8 @@ typedef struct {
  * independently so a search can decompress exactly one chunk per hit. Chunks are cut on path boundaries,
  * so no path ever straddles two of them.
  *
- * path_offsets.bin keeps storing offsets into the *uncompressed* stream, which is what makes this a local
- * change: path-id arithmetic, --resume-merge and the offsets file are all untouched.
+ * path_offsets.bin stores the uncompressed-stream start of each path_id. After the lex rewrite
+ * those starts are no longer a prefix-sum in file order: length is the NUL in the chunk.
  *
  *   [header PATHS_HDR_BYTES][chunk frames…][chunk table]
  *
@@ -531,13 +527,19 @@ typedef struct {
     uint64_t dir_index_bytes;
     uint64_t rowgroup_index_bytes;
     double dir_index_sec;
-    int path_kids_built;
-    uint64_t path_kids_edges;
-    uint64_t path_kids_bytes;
-    double path_kids_sec;
+    int paths_order_lex;
+    double paths_sort_sec;
 } build_ctx_t;
 
-static int build_path_kids_sidecar(build_ctx_t *ctx);
+static int sort_paths_bin_lex(build_ctx_t *ctx, int skip_if_lex);
+
+typedef struct {
+    build_ctx_t *ctx;
+    int skip_if_lex;
+    int rc;
+} paths_sort_job_t;
+
+static void *paths_sort_job_main(void *arg);
 
 typedef struct {
     work_queue_t *queue;
@@ -2080,6 +2082,8 @@ static void die_usage(const char *argv0) {
             "    that `ecrawl_query --index-dir` uses to answer a subtree rollup without reading every catalog\n"
             "    row, and to scan only the row groups that can hold the subtree. --no-dir-index skips that phase;\n"
             "    they are rebuildable, and a reader that cannot find or verify them falls back to the catalogs.\n"
+            "    After the paths writer closes, --make lex-sorts paths.bin (path_ids unchanged) in parallel with\n"
+            "    the trigram merge so directory-hit expansion is a prefix scan. No path_kids.bin sidecar.\n"
             "  --resume-merge: After paths.bin and path_offsets.bin exist, rebuild tri_keys.bin and tri_postings.bin\n"
             "    from remaining tmp_trigrams_*.bin and merge_seg_* files (e.g. after OOM during merge). Requires\n"
             "    --index-dir. Deletes partial tri_keys.bin / tri_postings.bin first.\n"
@@ -4728,8 +4732,7 @@ static int write_meta_file(const build_ctx_t *ctx) {
     if (ctx->dir_index_built) fprintf(fp, "dir_index_dirs=%" PRIu64 "\n", ctx->dir_index_dirs);
     fprintf(fp, "rowgroup_index=%d\n", ctx->rowgroup_index_built ? 1 : 0);
     if (ctx->rowgroup_index_built) fprintf(fp, "rowgroup_index_groups=%" PRIu64 "\n", ctx->dir_index_groups);
-    fprintf(fp, "path_kids=%d\n", ctx->path_kids_built ? 1 : 0);
-    if (ctx->path_kids_built) fprintf(fp, "path_kids_edges=%" PRIu64 "\n", ctx->path_kids_edges);
+    fprintf(fp, "paths_order=%s\n", ctx->paths_order_lex ? "lex" : "arrival");
 
     if (mk_fclose(fp) != 0) return -1;
     return 0;
@@ -5898,16 +5901,35 @@ static int resume_merge_index_dir(const char *index_dir) {
         }
     }
 
-    if (process_trigram_buckets_resume(&ctx) != 0) {
-        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
-        fprintf(stderr, "ereport_index: resume-merge failed in %s\n", ctx.index_dir);
-        return 1;
+    {
+        paths_sort_job_t sort_job;
+        pthread_t sort_tid;
+        int sort_live = 0;
+
+        memset(&sort_job, 0, sizeof(sort_job));
+        sort_job.ctx = &ctx;
+        sort_job.skip_if_lex = 1;
+        if (pthread_create(&sort_tid, NULL, paths_sort_job_main, &sort_job) == 0) {
+            sort_live = 1;
+        } else if (sort_paths_bin_lex(&ctx, 1) != 0) {
+            memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+            fprintf(stderr, "ereport_index: resume-merge could not lex-sort paths.bin in %s\n", ctx.index_dir);
+            return 1;
+        }
+        if (process_trigram_buckets_resume(&ctx) != 0) {
+            if (sort_live) pthread_join(sort_tid, NULL);
+            memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+            fprintf(stderr, "ereport_index: resume-merge failed in %s\n", ctx.index_dir);
+            return 1;
+        }
+        if (sort_live) pthread_join(sort_tid, NULL);
+        if (sort_job.rc != 0) {
+            memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+            fprintf(stderr, "ereport_index: resume-merge could not lex-sort paths.bin in %s\n", ctx.index_dir);
+            return 1;
+        }
     }
     memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
-    if (build_path_kids_sidecar(&ctx) != 0) {
-        fprintf(stderr, "ereport_index: resume-merge could not write path_kids.bin in %s\n", ctx.index_dir);
-        return 1;
-    }
     if (write_meta_file(&ctx) != 0) {
         fprintf(stderr, "ereport_index: could not write meta.txt in %s\n", ctx.index_dir);
         return 1;
@@ -5916,12 +5938,8 @@ static int resume_merge_index_dir(const char *index_dir) {
     printf("mode=resume_merge\n");
     printf("index_dir=%s\n", ctx.index_dir);
     printf("indexed_paths=%" PRIu64 "\n", ctx.indexed_paths);
-    printf("path_kids=%d\n", ctx.path_kids_built ? 1 : 0);
-    if (ctx.path_kids_built) {
-        printf("path_kids_edges=%" PRIu64 "\n", ctx.path_kids_edges);
-        printf("path_kids_bytes=%" PRIu64 "\n", ctx.path_kids_bytes);
-        printf("path_kids_sec=%.3f\n", ctx.path_kids_sec);
-    }
+    printf("paths_order=%s\n", ctx.paths_order_lex ? "lex" : "arrival");
+    printf("paths_sort_sec=%.3f\n", ctx.paths_sort_sec);
     printf("unique_trigrams=%" PRIu64 "\n", ctx.unique_trigrams);
     printf("merge_phase_sec=%.3f\n", ctx.merge_phase_sec);
     printf("merge_buckets_nonempty=%u\n", ctx.merge_buckets_nonempty);
@@ -6906,29 +6924,39 @@ static int build_index_dir(const char *user_spec,
 
     paths_writer_free(&ctx);
 
-    if (build_path_kids_sidecar(&ctx) != 0) {
-        memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
-        free(tids);
-        free(args);
-        pthread_mutex_destroy(&queue.mutex);
-        pthread_mutex_destroy(&write_queue.mutex);
-        pthread_cond_destroy(&write_queue.has_batch);
-        pthread_cond_destroy(&write_queue.has_space);
-        pthread_mutex_destroy(&trigram_queue.mutex);
-        pthread_cond_destroy(&trigram_queue.has_job);
-        pthread_cond_destroy(&trigram_queue.has_space);
-        free(trigram_tids);
-        trigram_tids = NULL;
-        free(tw_worker_args);
-        tw_worker_args = NULL;
-        for (i = 0; i < path_count; i++) free(paths[i]);
-        free(paths);
-        for (i = 0; i < chunk_count; i++) free(chunks[i].path);
-        free(chunks);
-        index_free_file_states(file_states, path_count);
-        parallel_bucket_io_shutdown(&ctx);
-        return 1;
-    }
+    {
+        paths_sort_job_t sort_job;
+        pthread_t sort_tid;
+        int sort_live = 0;
+
+        memset(&sort_job, 0, sizeof(sort_job));
+        sort_job.ctx = &ctx;
+        sort_job.skip_if_lex = 0;
+        if (pthread_create(&sort_tid, NULL, paths_sort_job_main, &sort_job) == 0) {
+            sort_live = 1;
+        } else if (sort_paths_bin_lex(&ctx, 0) != 0) {
+            memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
+            free(tids);
+            free(args);
+            pthread_mutex_destroy(&queue.mutex);
+            pthread_mutex_destroy(&write_queue.mutex);
+            pthread_cond_destroy(&write_queue.has_batch);
+            pthread_cond_destroy(&write_queue.has_space);
+            pthread_mutex_destroy(&trigram_queue.mutex);
+            pthread_cond_destroy(&trigram_queue.has_job);
+            pthread_cond_destroy(&trigram_queue.has_space);
+            free(trigram_tids);
+            trigram_tids = NULL;
+            free(tw_worker_args);
+            tw_worker_args = NULL;
+            for (i = 0; i < path_count; i++) free(paths[i]);
+            free(paths);
+            for (i = 0; i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            index_free_file_states(file_states, path_count);
+            parallel_bucket_io_shutdown(&ctx);
+            return 1;
+        }
 
     ctx.index_phase_sec = now_sec() - t0;
     ctx.index_workers_used = threads_used;
@@ -6967,6 +6995,11 @@ static int build_index_dir(const char *user_spec,
     {
         int merge_rc = process_trigram_buckets(&ctx);
 
+        if (sort_live) {
+            pthread_join(sort_tid, NULL);
+            if (sort_job.rc != 0) merge_rc = -1;
+        }
+
         if (getrusage(RUSAGE_SELF, &ru_after_merge) == 0) ru_have_merge = 1;
 
         memlog_shutdown(&ml_storage, &memlog_tid, &memlog_started);
@@ -7004,6 +7037,7 @@ static int build_index_dir(const char *user_spec,
             return 1;
         }
     }
+    }
 
     t1 = now_sec();
     clear_status_line();
@@ -7036,12 +7070,8 @@ static int build_index_dir(const char *user_spec,
         printf("rowgroup_index_bytes=%" PRIu64 "\n", ctx.rowgroup_index_bytes);
     }
     printf("dir_index_sec=%.3f\n", ctx.dir_index_sec);
-    printf("path_kids=%d\n", ctx.path_kids_built ? 1 : 0);
-    if (ctx.path_kids_built) {
-        printf("path_kids_edges=%" PRIu64 "\n", ctx.path_kids_edges);
-        printf("path_kids_bytes=%" PRIu64 "\n", ctx.path_kids_bytes);
-        printf("path_kids_sec=%.3f\n", ctx.path_kids_sec);
-    }
+    printf("paths_order=%s\n", ctx.paths_order_lex ? "lex" : "arrival");
+    printf("paths_sort_sec=%.3f\n", ctx.paths_sort_sec);
     printf("elapsed_sec=%.3f\n", t1 - t0);
     if (g_verbose) {
         printf("trigram_queue_depth=%zu\n", trigram_queue_depth_cfg);
@@ -7270,10 +7300,9 @@ static int intersect_postings(const u64_vec_t *a, const u64_vec_t *b, u64_vec_t 
     return 0;
 }
 
-static int read_path_offsets(FILE *fp, uint64_t path_id, uint64_t *off0, uint64_t *off1) {
+static int read_path_offset(FILE *fp, uint64_t path_id, uint64_t *off0) {
     if (fseeko(fp, (off_t)(path_id * sizeof(uint64_t)), SEEK_SET) != 0) return -1;
     if (fread(off0, sizeof(*off0), 1, fp) != 1) return -1;
-    if (fread(off1, sizeof(*off1), 1, fp) != 1) return -1;
     return 0;
 }
 
@@ -7405,21 +7434,22 @@ static int paths_reader_load_chunk(paths_reader_t *pr, uint64_t ci) {
 }
 
 static char *read_path_by_id(paths_reader_t *pr, FILE *offsets_fp, uint64_t path_id) {
-    uint64_t off0, off1, ci;
+    uint64_t off0, ci;
     size_t len, in_chunk;
     char *buf;
 
-    if (read_path_offsets(offsets_fp, path_id, &off0, &off1) != 0) return NULL;
-    if (off1 < off0) return NULL;
-    len = (size_t)(off1 - off0);
-    if (len == 0) return NULL;
+    /* After a lex rewrite, path_id i and i+1 are not adjacent in the stream, so
+     * offsets[i+1] - offsets[i] is not the length. The path is NUL-terminated
+     * inside its chunk; that is the length. */
+    if (read_path_offset(offsets_fp, path_id, &off0) != 0) return NULL;
 
     ci = paths_find_chunk(pr->pi, off0);
     if (ci >= pr->pi->chunk_count) return NULL;
     in_chunk = (size_t)(off0 - pr->pi->table[ci].logical_start);
-    /* Chunks are cut on path boundaries, so a path never spans two of them. */
-    if (in_chunk + len > pr->pi->table[ci].raw_len) return NULL;
+    if (in_chunk >= pr->pi->table[ci].raw_len) return NULL;
     if (paths_reader_load_chunk(pr, ci) != 0) return NULL;
+    len = strlen((const char *)(pr->raw + in_chunk)) + 1;
+    if (in_chunk + len > pr->pi->table[ci].raw_len) return NULL;
 
     buf = (char *)malloc(len);
     if (!buf) return NULL;
@@ -7427,400 +7457,748 @@ static char *read_path_by_id(paths_reader_t *pr, FILE *offsets_fp, uint64_t path
     return buf;
 }
 
-#define KIDS_MAGIC "EKIDS001"
-#define KIDS_HDR_BYTES 32
-#define KIDS_FORMAT_VERSION 1u
-
-typedef struct {
-    uint64_t hash;
-    uint64_t path_id;
-    char *path;
-} kids_dir_ent_t;
-
-typedef struct {
-    kids_dir_ent_t *slots;
-    size_t cap;
-    size_t used;
-} kids_dir_map_t;
-
-typedef struct {
-    uint64_t parent;
-    uint64_t child;
-} kids_edge_t;
-
-static uint64_t kids_fnv1a(const char *s) {
-    uint64_t h = 14695981039346656037ULL;
-    const unsigned char *p = (const unsigned char *)s;
-
-    while (*p) {
-        h ^= (uint64_t)*p++;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
-static int kids_dir_map_init(kids_dir_map_t *m, size_t hint) {
-    size_t cap = 16;
-
-    while (cap < hint * 2 + 16) cap <<= 1;
-    m->slots = (kids_dir_ent_t *)calloc(cap, sizeof(*m->slots));
-    if (!m->slots) return -1;
-    m->cap = cap;
-    m->used = 0;
-    return 0;
-}
-
-static void kids_dir_map_free(kids_dir_map_t *m) {
-    size_t i;
-
-    if (m->slots) {
-        for (i = 0; i < m->cap; i++) free(m->slots[i].path);
-        free(m->slots);
-    }
-    memset(m, 0, sizeof(*m));
-}
-
-static int kids_dir_map_grow(kids_dir_map_t *m) {
-    kids_dir_ent_t *old = m->slots;
-    size_t old_cap = m->cap;
-    size_t ncap = old_cap * 2;
-    size_t i;
-
-    m->slots = (kids_dir_ent_t *)calloc(ncap, sizeof(*m->slots));
-    if (!m->slots) {
-        m->slots = old;
-        return -1;
-    }
-    m->cap = ncap;
-    m->used = 0;
-    for (i = 0; i < old_cap; i++) {
-        kids_dir_ent_t *e = &old[i];
-        size_t j;
-
-        if (!e->path) continue;
-        j = (size_t)(e->hash & (ncap - 1));
-        while (m->slots[j].path) j = (j + 1) & (ncap - 1);
-        m->slots[j] = *e;
-        m->used++;
-    }
-    free(old);
-    return 0;
-}
-
-static int kids_dir_map_put(kids_dir_map_t *m, const char *path, uint64_t path_id) {
-    uint64_t h;
-    size_t i;
-    char *copy;
-
-    if (m->used * 10 >= m->cap * 7 && kids_dir_map_grow(m) != 0) return -1;
-    h = kids_fnv1a(path);
-    i = (size_t)(h & (m->cap - 1));
-    for (;;) {
-        kids_dir_ent_t *e = &m->slots[i];
-
-        if (!e->path) {
-            copy = strdup(path);
-            if (!copy) return -1;
-            e->hash = h;
-            e->path_id = path_id;
-            e->path = copy;
-            m->used++;
-            return 0;
-        }
-        if (e->hash == h && strcmp(e->path, path) == 0) {
-            e->path_id = path_id;
-            return 0;
-        }
-        i = (i + 1) & (m->cap - 1);
-    }
-}
-
-static int kids_dir_map_get(const kids_dir_map_t *m, const char *path, uint64_t *out_id) {
-    uint64_t h = kids_fnv1a(path);
-    size_t i = (size_t)(h & (m->cap - 1));
-
-    for (;;) {
-        const kids_dir_ent_t *e = &m->slots[i];
-
-        if (!e->path) return 0;
-        if (e->hash == h && strcmp(e->path, path) == 0) {
-            *out_id = e->path_id;
-            return 1;
-        }
-        i = (i + 1) & (m->cap - 1);
-    }
-}
-
-/* Parent directory of a stored path. "/a/b" → "/a", "/a" → "/", "a" → none. */
-static int kids_path_dirname(const char *path, char *out, size_t cap) {
-    const char *slash;
-
-    if (!path || !path[0]) return -1;
-    slash = strrchr(path, '/');
-    if (!slash) return -1;
-    if (slash == path) {
-        if (path[1] == '\0') return -1;
-        if (cap < 2) return -1;
-        out[0] = '/';
-        out[1] = '\0';
-        return 0;
-    }
-    {
-        size_t n = (size_t)(slash - path);
-
-        if (n >= cap) return -1;
-        memcpy(out, path, n);
-        out[n] = '\0';
-        return 0;
-    }
-}
-
-static int cmp_u64_asc(const void *a, const void *b) {
-    uint64_t aa = *(const uint64_t *)a;
-    uint64_t bb = *(const uint64_t *)b;
-
-    if (aa < bb) return -1;
-    if (aa > bb) return 1;
-    return 0;
-}
-
-static int kids_edge_cmp(const void *a, const void *b) {
-    const kids_edge_t *aa = (const kids_edge_t *)a;
-    const kids_edge_t *bb = (const kids_edge_t *)b;
-
-    if (aa->parent < bb->parent) return -1;
-    if (aa->parent > bb->parent) return 1;
-    if (aa->child < bb->child) return -1;
-    if (aa->child > bb->child) return 1;
-    return 0;
-}
-
-static uint64_t kids_subtree_compute(uint64_t id, const uint64_t *off, const uint64_t *child_ids, uint64_t *subtree_n,
-                                     uint8_t *seen, uint64_t n_paths) {
-    uint64_t s = 1;
-    uint64_t i;
-
-    if (id >= n_paths) return 0;
-    if (seen[id] == 2) return subtree_n[id];
-    if (seen[id] == 1) return 1; /* cycle: count self only */
-    seen[id] = 1;
-    for (i = off[id]; i < off[id + 1]; i++) s += kids_subtree_compute(child_ids[i], off, child_ids, subtree_n, seen, n_paths);
-    subtree_n[id] = s;
-    seen[id] = 2;
-    return s;
-}
-
-static int path_kids_file_ok(const char *index_dir, uint64_t npaths) {
+static int meta_has_paths_order_lex(const char *index_dir) {
     char path[PATH_MAX];
-    unsigned char hdr[KIDS_HDR_BYTES];
     FILE *fp;
-    uint32_t version;
-    uint64_t n, edges;
-    uint64_t need;
+    char buf[512];
+    int yes = 0;
 
-    if (build_path(path, sizeof(path), index_dir, "path_kids.bin") != 0) return 0;
-    fp = fopen(path, "rb");
+    if (build_path(path, sizeof(path), index_dir, "meta.txt") != 0) return 0;
+    fp = fopen(path, "r");
     if (!fp) return 0;
-    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || memcmp(hdr, KIDS_MAGIC, 8) != 0) {
-        fclose(fp);
-        return 0;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (strncmp(buf, "paths_order=lex", 15) == 0) {
+            yes = 1;
+            break;
+        }
     }
-    memcpy(&version, hdr + 8, sizeof(version));
-    memcpy(&n, hdr + 16, sizeof(n));
-    memcpy(&edges, hdr + 24, sizeof(edges));
     fclose(fp);
-    if (version != KIDS_FORMAT_VERSION || n != npaths) return 0;
-    need = (uint64_t)KIDS_HDR_BYTES + 8ULL * (n + 1ULL) + 8ULL * edges + 8ULL * n;
-    {
-        struct stat st;
-
-        if (stat(path, &st) != 0 || (uint64_t)st.st_size < need) return 0;
-    }
-    return 1;
+    return yes;
 }
 
-static int build_path_kids_sidecar(build_ctx_t *ctx) {
+typedef struct {
+    const char *s;
+    uint32_t len;
+    uint64_t path_id;
+} lex_ent_t;
+
+typedef struct {
+    uint64_t off;
+    uint64_t id;
+} lex_off_id_t;
+
+static int lex_off_id_cmp(const void *a, const void *b) {
+    const lex_off_id_t *x = (const lex_off_id_t *)a;
+    const lex_off_id_t *y = (const lex_off_id_t *)b;
+
+    if (x->off < y->off) return -1;
+    if (x->off > y->off) return 1;
+    return 0;
+}
+
+/*
+ * MSD radix over raw path bytes. Produces exactly the same permutation as a
+ * byte-lex comparison sort (shorter string first, path_id tiebreak — the former
+ * lex_ent_cmp mergesort) but touches each path byte O(1) times instead of
+ * re-scanning shared prefixes on every comparison — the dominant cost of the
+ * mergesort on mega-dir corpora where millions of paths share a long directory
+ * prefix.
+ *
+ * Each key is its stored byte string. A per-record cursor (offset into the
+ * string) walks one radix class per level so the prefix is never re-read.
+ *
+ * class: 0 = ENDED (string exhausted, sorts first — shorter-first), 1..256 =
+ * byte value + 1. Identical strings (all levels equal) fall to path_id order,
+ * which is a stable by-id sort of the tied range.
+ */
+#define LEX_RADIX_NCLASS 257
+#ifndef LEX_RADIX_LEAF
+#define LEX_RADIX_LEAF 64u
+#endif
+#ifndef LEX_RADIX_SPAWN_MIN
+#define LEX_RADIX_SPAWN_MIN (1u << 18) /* only hand a sub-bucket to a thread above this size */
+#endif
+
+static atomic_int g_lex_radix_active;
+static int g_lex_radix_max;
+static __thread unsigned short *g_lex_radix_cls;
+static __thread size_t g_lex_radix_cls_cap;
+
+/* Leaf comparator: ctx is the lex_ent_t array. Full memcmp from the start is
+ * correct here; the radix only guarantees a shared prefix, and memcmp from 0 is
+ * still cheap at leaf sizes. Ties fall to path_id, then index for stability. */
+static int lex_radix_leaf_cmp(const void *aa, const void *bb, void *ctx) {
+    const lex_ent_t *ents = (const lex_ent_t *)ctx;
+    size_t ia = *(const size_t *)aa;
+    size_t ib = *(const size_t *)bb;
+    const lex_ent_t *x = &ents[ia];
+    const lex_ent_t *y = &ents[ib];
+
+    /* Full compare from the start is correct here; the radix only guarantees a
+     * shared prefix, and memcmp from 0 is still cheap at leaf sizes. */
+    {
+        size_t n = x->len < y->len ? x->len : y->len;
+        int c = memcmp(x->s, y->s, n);
+        if (c) return c;
+        if (x->len != y->len) return x->len < y->len ? -1 : 1;
+        if (x->path_id < y->path_id) return -1;
+        if (x->path_id > y->path_id) return 1;
+    }
+    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+}
+
+static void lex_radix_sort(const lex_ent_t *ents, size_t *idx, size_t *tmp, uint32_t *pos, size_t n);
+
+typedef struct {
+    const lex_ent_t *ents;
+    size_t *idx;
+    size_t *tmp;
+    uint32_t *pos;
+    size_t n;
+} lex_radix_task_t;
+
+static void *lex_radix_entry(void *vp) {
+    lex_radix_task_t *t = (lex_radix_task_t *)vp;
+    lex_radix_sort(t->ents, t->idx, t->tmp, t->pos, t->n);
+    free(t);
+    free(g_lex_radix_cls);
+    g_lex_radix_cls = NULL;
+    g_lex_radix_cls_cap = 0;
+    return NULL;
+}
+
+static void lex_radix_sort(const lex_ent_t *ents, size_t *idx, size_t *tmp, uint32_t *pos, size_t n) {
+    size_t count[LEX_RADIX_NCLASS];
+    size_t off[LEX_RADIX_NCLASS];
+    size_t cur[LEX_RADIX_NCLASS];
+
+descend:
+    if (n <= 1) return;
+    if (n <= (size_t)LEX_RADIX_LEAF) {
+        qsort_r(idx, n, sizeof(size_t), lex_radix_leaf_cmp, (void *)ents);
+        return;
+    }
+    if (g_lex_radix_cls_cap < n) {
+        unsigned short *nb = (unsigned short *)realloc(g_lex_radix_cls, n * sizeof(*nb));
+        if (!nb) {
+            qsort_r(idx, n, sizeof(size_t), lex_radix_leaf_cmp, (void *)ents);
+            return;
+        }
+        g_lex_radix_cls = nb;
+        g_lex_radix_cls_cap = n;
+    }
+
+    memset(count, 0, sizeof(count));
+    {
+        size_t i;
+        for (i = 0; i < n; i++) {
+            size_t r = idx[i];
+            uint32_t p = pos[r];
+            const lex_ent_t *e = &ents[r];
+            int c = (p < e->len) ? ((int)(unsigned char)e->s[p] + 1) : 0;
+            g_lex_radix_cls[i] = (unsigned short)c;
+            count[c]++;
+            if (p < e->len) pos[r] = p + 1; /* consume the byte we just classified */
+        }
+    }
+
+    /* Shared-prefix fast path: one nonempty class means the permutation is
+     * unchanged; descend in place (cursors already advanced). */
+    {
+        int nonempty = 0;
+        int single = -1;
+        int c;
+        for (c = 0; c < LEX_RADIX_NCLASS && nonempty < 2; c++)
+            if (count[c]) { nonempty++; single = c; }
+        if (nonempty == 1) {
+            if (single == 0) return; /* all ended here: fully sorted */
+            goto descend;
+        }
+    }
+
+    {
+        size_t acc = 0;
+        int c;
+        for (c = 0; c < LEX_RADIX_NCLASS; c++) { off[c] = acc; cur[c] = acc; acc += count[c]; }
+    }
+    {
+        size_t i;
+        for (i = 0; i < n; i++) { int c = g_lex_radix_cls[i]; tmp[cur[c]++] = idx[i]; }
+    }
+    memcpy(idx, tmp, n * sizeof(size_t));
+
+    /* Class 0 (ENDED) is fully placed. Recurse on 1..256, spawning threads for
+     * large sub-buckets while the global budget lasts. */
+    {
+        pthread_t th[LEX_RADIX_NCLASS];
+        int nth = 0;
+        int c;
+        for (c = 1; c < LEX_RADIX_NCLASS; c++) {
+            if (count[c] <= 1) continue;
+            if (count[c] > (size_t)LEX_RADIX_SPAWN_MIN) {
+                int prev = atomic_fetch_add(&g_lex_radix_active, 1);
+                if (prev < g_lex_radix_max) {
+                    lex_radix_task_t *t = (lex_radix_task_t *)malloc(sizeof(*t));
+                    if (t) {
+                        t->ents = ents;
+                        t->idx = idx + off[c];
+                        t->tmp = tmp + off[c];
+                        t->pos = pos;
+                        t->n = count[c];
+                        if (pthread_create(&th[nth], NULL, lex_radix_entry, t) == 0) { nth++; continue; }
+                        free(t);
+                    }
+                    atomic_fetch_sub(&g_lex_radix_active, 1);
+                } else {
+                    atomic_fetch_sub(&g_lex_radix_active, 1);
+                }
+            }
+            lex_radix_sort(ents, idx + off[c], tmp + off[c], pos, count[c]);
+        }
+        {
+            int i;
+            for (i = 0; i < nth; i++) { pthread_join(th[i], NULL); atomic_fetch_sub(&g_lex_radix_active, 1); }
+        }
+    }
+}
+
+typedef struct {
+    const char *paths_path;
+    const paths_index_t *pi;
+    unsigned char **raw;
+    atomic_int *err;
+    uint64_t lo;
+    uint64_t hi;
+} lex_dec_arg_t;
+
+static void *lex_dec_th(void *p) {
+    lex_dec_arg_t *a = (lex_dec_arg_t *)p;
+    FILE *fp;
+    ZSTD_DCtx *dctx = NULL;
+    unsigned char *stored = NULL;
+    uint64_t ci;
+
+    if (a->lo >= a->hi) return NULL;
+    fp = fopen(a->paths_path, "rb");
+    if (!fp) {
+        atomic_store_explicit(a->err, 1, memory_order_relaxed);
+        return NULL;
+    }
+    if (a->pi->max_stored) {
+        stored = (unsigned char *)malloc(a->pi->max_stored);
+        dctx = ZSTD_createDCtx();
+        if (!stored || !dctx) {
+            atomic_store_explicit(a->err, 1, memory_order_relaxed);
+            free(stored);
+            if (dctx) ZSTD_freeDCtx(dctx);
+            fclose(fp);
+            return NULL;
+        }
+    }
+    for (ci = a->lo; ci < a->hi; ci++) {
+        const paths_chunk_ent_t *ent = &a->pi->table[ci];
+
+        if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
+        if (fseeko(fp, (off_t)ent->file_off, SEEK_SET) != 0) {
+            atomic_store_explicit(a->err, 1, memory_order_relaxed);
+            break;
+        }
+        if (ent->stored_len == ent->raw_len) {
+            if (fread(a->raw[ci], 1, ent->raw_len, fp) != ent->raw_len) {
+                atomic_store_explicit(a->err, 1, memory_order_relaxed);
+                break;
+            }
+        } else {
+            size_t dlen;
+
+            if (!stored || !dctx || fread(stored, 1, ent->stored_len, fp) != ent->stored_len) {
+                atomic_store_explicit(a->err, 1, memory_order_relaxed);
+                break;
+            }
+            dlen = ZSTD_decompressDCtx(dctx, a->raw[ci], ent->raw_len, stored, ent->stored_len);
+            if (ZSTD_isError(dlen) || dlen != ent->raw_len) {
+                atomic_store_explicit(a->err, 1, memory_order_relaxed);
+                break;
+            }
+        }
+    }
+    free(stored);
+    if (dctx) ZSTD_freeDCtx(dctx);
+    fclose(fp);
+    return NULL;
+}
+
+typedef struct {
+    unsigned char *raw;
+    uint32_t raw_len;
+    unsigned char *stored;
+    uint32_t stored_len;
+    uint64_t logical_start;
+} lex_out_chunk_t;
+
+typedef struct {
+    lex_out_chunk_t *chunks;
+    size_t lo;
+    size_t hi;
+    int level;
+    atomic_int *err;
+} lex_enc_arg_t;
+
+static void *lex_enc_th(void *p) {
+    lex_enc_arg_t *a = (lex_enc_arg_t *)p;
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    size_t i;
+
+    if (!cctx) {
+        atomic_store_explicit(a->err, 1, memory_order_relaxed);
+        return NULL;
+    }
+    for (i = a->lo; i < a->hi; i++) {
+        lex_out_chunk_t *ch = &a->chunks[i];
+        size_t bound = ZSTD_compressBound(ch->raw_len);
+        size_t clen;
+
+        if (atomic_load_explicit(a->err, memory_order_relaxed)) break;
+        ch->stored = (unsigned char *)malloc(bound);
+        if (!ch->stored) {
+            atomic_store_explicit(a->err, 1, memory_order_relaxed);
+            break;
+        }
+        clen = ZSTD_compressCCtx(cctx, ch->stored, bound, ch->raw, ch->raw_len, a->level);
+        if (!ZSTD_isError(clen) && clen < ch->raw_len) {
+            ch->stored_len = (uint32_t)clen;
+        } else {
+            memcpy(ch->stored, ch->raw, ch->raw_len);
+            ch->stored_len = ch->raw_len;
+        }
+    }
+    ZSTD_freeCCtx(cctx);
+    return NULL;
+}
+
+static int lex_nthreads(void) {
+    int nth = parse_index_thread_count();
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+
+    if (ncpu > 0 && nth > (int)ncpu) nth = (int)ncpu;
+    if (nth < 1) nth = 1;
+    return nth;
+}
+
+static int sort_paths_bin_lex(build_ctx_t *ctx, int skip_if_lex) {
     char paths_p[PATH_MAX], off_p[PATH_MAX], kids_p[PATH_MAX];
-    FILE *paths_fp = NULL, *offsets_fp = NULL, *kids_fp = NULL;
+    char paths_tmp[PATH_MAX], off_tmp[PATH_MAX];
     paths_index_t pi;
-    paths_reader_t pr;
-    uint8_t *isdir = NULL;
-    size_t isdir_bytes = 0;
-    kids_dir_map_t dmap;
-    kids_edge_t *edges = NULL;
-    size_t edge_n = 0, edge_cap = 0;
-    uint64_t *off = NULL, *child_ids = NULL, *subtree_n = NULL;
-    uint8_t *seen = NULL;
-    uint64_t n = ctx->indexed_paths;
-    uint64_t pid;
+    unsigned char **raw = NULL;
+    lex_ent_t *ents = NULL;
+    uint64_t *old_off = NULL, *new_off = NULL;
+    lex_out_chunk_t *out_ch = NULL;
+    FILE *fp = NULL, *ofp = NULL;
+    uint64_t n, i, logical;
+    size_t out_n = 0, out_cap = 0;
+    int nth, rc = -1;
+    atomic_int dec_err, enc_err;
     double t0 = now_sec();
-    int rc = -1;
-    unsigned char hdr[KIDS_HDR_BYTES];
+    unsigned char hdr[PATHS_HDR_BYTES];
+    uint64_t table_offset;
     uint32_t v32;
     uint64_t v64;
 
-    memset(&pi, 0, sizeof(pi));
-    memset(&pr, 0, sizeof(pr));
-    memset(&dmap, 0, sizeof(dmap));
-    ctx->path_kids_built = 0;
-    ctx->path_kids_edges = 0;
-    ctx->path_kids_bytes = 0;
-    ctx->path_kids_sec = 0.0;
-
+    ctx->paths_order_lex = 0;
+    ctx->paths_sort_sec = 0.0;
+    n = ctx->indexed_paths;
     if (n == 0) {
-        if (build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") != 0) return -1;
-        kids_fp = mk_fopen(kids_p, "wb");
-        if (!kids_fp) return -1;
-        memset(hdr, 0, sizeof(hdr));
-        memcpy(hdr, KIDS_MAGIC, 8);
-        v32 = KIDS_FORMAT_VERSION;
-        memcpy(hdr + 8, &v32, sizeof(v32));
-        if (mk_fwrite(hdr, 1, sizeof(hdr), kids_fp) != sizeof(hdr) || mk_fclose(kids_fp) != 0) return -1;
-        ctx->path_kids_built = 1;
-        ctx->path_kids_sec = now_sec() - t0;
+        ctx->paths_order_lex = 1;
+        ctx->paths_sort_sec = now_sec() - t0;
         return 0;
     }
-
-    if (path_kids_file_ok(ctx->index_dir, n)) {
-        struct stat st;
-
-        if (build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") == 0 && stat(kids_p, &st) == 0)
-            ctx->path_kids_bytes = (uint64_t)st.st_size;
-        ctx->path_kids_built = 1;
-        ctx->path_kids_sec = now_sec() - t0;
+    if (skip_if_lex && meta_has_paths_order_lex(ctx->index_dir)) {
+        ctx->paths_order_lex = 1;
+        ctx->paths_sort_sec = now_sec() - t0;
         return 0;
     }
-
     if (build_path(paths_p, sizeof(paths_p), ctx->index_dir, "paths.bin") != 0 ||
         build_path(off_p, sizeof(off_p), ctx->index_dir, "path_offsets.bin") != 0 ||
-        build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") != 0)
-        return -1;
-    if (load_path_isdir_bits(ctx->index_dir, n, &isdir, &isdir_bytes) != 0) {
-        fprintf(stderr, "ereport_index: path_kids: cannot read path_isdir.bin\n");
+        build_path(paths_tmp, sizeof(paths_tmp), ctx->index_dir, "paths.bin.lex") != 0 ||
+        build_path(off_tmp, sizeof(off_tmp), ctx->index_dir, "path_offsets.bin.lex") != 0) {
+        fprintf(stderr, "ereport_index: path_sort: path too long\n");
         return -1;
     }
-    if (paths_index_open(paths_p, &pi) != 0) goto out;
-    paths_fp = fopen(paths_p, "rb");
-    offsets_fp = fopen(off_p, "rb");
-    if (!paths_fp || !offsets_fp || paths_reader_init(&pr, paths_fp, &pi) != 0) {
-        fprintf(stderr, "ereport_index: path_kids: cannot open paths.bin\n");
+    memset(&pi, 0, sizeof(pi));
+    if (paths_index_open(paths_p, &pi) != 0) return -1;
+    if (pi.chunk_count == 0) {
+        fprintf(stderr, "ereport_index: path_sort: empty chunk table for %" PRIu64 " paths\n", n);
         goto out;
     }
-    if (kids_dir_map_init(&dmap, (size_t)(n / 8 + 16)) != 0) goto out;
+    atomic_init(&dec_err, 0);
+    atomic_init(&enc_err, 0);
 
-    for (pid = 0; pid < n; pid++) {
-        char *path;
+    old_off = (uint64_t *)malloc((size_t)(n + 1ULL) * sizeof(*old_off));
+    ofp = fopen(off_p, "rb");
+    if (!old_off || !ofp ||
+        fread(old_off, sizeof(*old_off), (size_t)(n + 1ULL), ofp) != (size_t)(n + 1ULL)) {
+        fprintf(stderr, "ereport_index: path_sort: cannot read path_offsets.bin\n");
+        goto out;
+    }
+    fclose(ofp);
+    ofp = NULL;
 
-        if (!path_isdir_bit(isdir, pid)) continue;
-        path = read_path_by_id(&pr, offsets_fp, pid);
-        if (!path) continue;
-        if (kids_dir_map_put(&dmap, path, pid) != 0) {
-            free(path);
+    raw = (unsigned char **)calloc((size_t)pi.chunk_count, sizeof(*raw));
+    if (!raw) goto out;
+    for (i = 0; i < pi.chunk_count; i++) {
+        raw[i] = (unsigned char *)malloc(pi.table[i].raw_len);
+        if (!raw[i]) goto out;
+    }
+
+    nth = lex_nthreads();
+    {
+        int nw = nth;
+        pthread_t *tids;
+        lex_dec_arg_t *args;
+        int w;
+
+        if ((uint64_t)nw > pi.chunk_count) nw = (int)pi.chunk_count;
+        if (nw < 1) nw = 1;
+        tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+        args = (lex_dec_arg_t *)calloc((size_t)nw, sizeof(*args));
+        if (!tids || !args) {
+            free(tids);
+            free(args);
             goto out;
         }
-        free(path);
-    }
-
-    for (pid = 0; pid < n; pid++) {
-        char *path;
-        char parent[PATH_MAX];
-        uint64_t parent_id;
-
-        path = read_path_by_id(&pr, offsets_fp, pid);
-        if (!path) continue;
-        if (kids_path_dirname(path, parent, sizeof(parent)) != 0) {
-            free(path);
-            continue;
+        for (w = 0; w < nw; w++) {
+            uint64_t span = (pi.chunk_count + (uint64_t)nw - 1ULL) / (uint64_t)nw;
+            args[w].paths_path = paths_p;
+            args[w].pi = &pi;
+            args[w].raw = raw;
+            args[w].err = &dec_err;
+            args[w].lo = (uint64_t)w * span;
+            args[w].hi = args[w].lo + span;
+            if (args[w].hi > pi.chunk_count) args[w].hi = pi.chunk_count;
         }
-        free(path);
-        if (!kids_dir_map_get(&dmap, parent, &parent_id)) continue;
-        if (edge_n == edge_cap) {
-            size_t nc = edge_cap ? edge_cap * 2 : 1024;
-            kids_edge_t *ne = (kids_edge_t *)realloc(edges, nc * sizeof(*ne));
-
-            if (!ne) goto out;
-            edges = ne;
-            edge_cap = nc;
-        }
-        edges[edge_n].parent = parent_id;
-        edges[edge_n].child = pid;
-        edge_n++;
-    }
-    kids_dir_map_free(&dmap);
-
-    if (edge_n > 1) qsort(edges, edge_n, sizeof(*edges), kids_edge_cmp);
-
-    off = (uint64_t *)calloc((size_t)n + 1U, sizeof(*off));
-    child_ids = edge_n ? (uint64_t *)malloc(edge_n * sizeof(*child_ids)) : NULL;
-    subtree_n = (uint64_t *)calloc((size_t)n, sizeof(*subtree_n));
-    seen = (uint8_t *)calloc((size_t)n, 1);
-    if (!off || !subtree_n || !seen || (edge_n && !child_ids)) goto out;
-
-    {
-        uint64_t ei = 0, p;
-
-        for (p = 0; p < n; p++) {
-            off[p] = ei;
-            while (ei < (uint64_t)edge_n && edges[ei].parent == p) {
-                child_ids[ei] = edges[ei].child;
-                ei++;
+        for (w = 0; w < nw; w++) {
+            if (pthread_create(&tids[w], NULL, lex_dec_th, &args[w]) != 0) {
+                int j;
+                atomic_store_explicit(&dec_err, 1, memory_order_relaxed);
+                for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
+                free(tids);
+                free(args);
+                goto out;
             }
         }
-        off[n] = ei;
-    }
-    free(edges);
-    edges = NULL;
-
-    for (pid = 0; pid < n; pid++) {
-        if (!seen[pid]) kids_subtree_compute(pid, off, child_ids, subtree_n, seen, n);
-    }
-
-    kids_fp = mk_fopen(kids_p, "wb");
-    if (!kids_fp) goto out;
-    memset(hdr, 0, sizeof(hdr));
-    memcpy(hdr, KIDS_MAGIC, 8);
-    v32 = KIDS_FORMAT_VERSION;
-    memcpy(hdr + 8, &v32, sizeof(v32));
-    v64 = n;
-    memcpy(hdr + 16, &v64, sizeof(v64));
-    v64 = (uint64_t)edge_n;
-    memcpy(hdr + 24, &v64, sizeof(v64));
-    if (mk_fwrite(hdr, 1, sizeof(hdr), kids_fp) != sizeof(hdr) ||
-        mk_fwrite(off, sizeof(*off), (size_t)n + 1U, kids_fp) != (size_t)n + 1U ||
-        (edge_n && mk_fwrite(child_ids, sizeof(*child_ids), edge_n, kids_fp) != edge_n) ||
-        mk_fwrite(subtree_n, sizeof(*subtree_n), (size_t)n, kids_fp) != (size_t)n || mk_fclose(kids_fp) != 0) {
-        if (kids_fp) {
-            mk_fclose(kids_fp);
-            unlink(kids_p);
+        for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+        free(tids);
+        free(args);
+        if (atomic_load_explicit(&dec_err, memory_order_relaxed)) {
+            fprintf(stderr, "ereport_index: path_sort: decompress failed\n");
+            goto out;
         }
-        fprintf(stderr, "ereport_index: fwrite path_kids.bin failed\n");
+    }
+
+    ents = (lex_ent_t *)malloc((size_t)n * sizeof(*ents));
+    if (!ents) goto out;
+    {
+        uint64_t filled = 0;
+
+        for (i = 0; i < pi.chunk_count; i++) {
+            const unsigned char *p = raw[i];
+            const unsigned char *end = raw[i] + pi.table[i].raw_len;
+
+            while (p < end) {
+                size_t slen = strlen((const char *)p);
+
+                if (filled >= n) {
+                    fprintf(stderr, "ereport_index: path_sort: more paths in paths.bin than path_offsets.bin\n");
+                    goto out;
+                }
+                ents[filled].s = (const char *)p;
+                ents[filled].len = (uint32_t)slen;
+                ents[filled].path_id = UINT64_MAX;
+                filled++;
+                p += slen + 1;
+            }
+        }
+        if (filled != n) {
+            fprintf(stderr, "ereport_index: path_sort: paths.bin has %" PRIu64 " paths, expected %" PRIu64 "\n",
+                    filled, n);
+            goto out;
+        }
+    }
+    {
+        lex_off_id_t *inv = (lex_off_id_t *)malloc((size_t)n * sizeof(*inv));
+        uint64_t k;
+
+        if (!inv) goto out;
+        for (k = 0; k < n; k++) {
+            inv[k].off = old_off[k];
+            inv[k].id = k;
+        }
+        qsort(inv, (size_t)n, sizeof(*inv), lex_off_id_cmp);
+        for (k = 0; k < n; k++) ents[k].path_id = inv[k].id;
+        free(inv);
+    }
+
+    /* MSD radix over raw path bytes: sort an index array, then permute ents by
+     * it. Same permutation as lex_ent_cmp mergesort, O(1) byte touches per path
+     * instead of re-scanning shared prefixes per comparison. */
+    {
+        size_t *ridx = (size_t *)malloc((size_t)n * sizeof(*ridx));
+        size_t *rtmp = (size_t *)malloc((size_t)n * sizeof(*rtmp));
+        uint32_t *rpos = (uint32_t *)calloc((size_t)n, sizeof(*rpos));
+        lex_ent_t *sorted = (lex_ent_t *)malloc((size_t)n * sizeof(*sorted));
+
+        if (!ridx || !rtmp || !rpos || !sorted) {
+            free(ridx);
+            free(rtmp);
+            free(rpos);
+            free(sorted);
+            goto out;
+        }
+        for (i = 0; i < n; i++) ridx[i] = (size_t)i;
+        g_lex_radix_max = nth > 1 ? nth * 4 : 0;
+        atomic_store(&g_lex_radix_active, 0);
+        lex_radix_sort(ents, ridx, rtmp, rpos, (size_t)n);
+        free(g_lex_radix_cls);
+        g_lex_radix_cls = NULL;
+        g_lex_radix_cls_cap = 0;
+        for (i = 0; i < n; i++) sorted[i] = ents[ridx[i]];
+        memcpy(ents, sorted, (size_t)n * sizeof(*ents));
+        free(ridx);
+        free(rtmp);
+        free(rpos);
+        free(sorted);
+    }
+
+    new_off = (uint64_t *)malloc((size_t)(n + 1ULL) * sizeof(*new_off));
+    if (!new_off) goto out;
+    logical = 0;
+    out_cap = (size_t)(pi.total_logical / (uint64_t)PATHS_CHUNK_RAW) + 4u;
+    if (out_cap < 1) out_cap = 1;
+    out_ch = (lex_out_chunk_t *)calloc(out_cap, sizeof(*out_ch));
+    if (!out_ch) goto out;
+    {
+        unsigned char *cur = NULL;
+        size_t cur_len = 0;
+        uint64_t cur_logical = 0;
+
+        for (i = 0; i < n; i++) {
+            size_t need = (size_t)ents[i].len + 1u;
+
+            new_off[ents[i].path_id] = logical;
+            if (cur && cur_len + need > PATHS_CHUNK_RAW) {
+                if (out_n == out_cap) {
+                    size_t nc = out_cap * 2;
+                    lex_out_chunk_t *p = (lex_out_chunk_t *)realloc(out_ch, nc * sizeof(*p));
+
+                    if (!p) {
+                        free(cur);
+                        goto out;
+                    }
+                    memset(p + out_cap, 0, (nc - out_cap) * sizeof(*p));
+                    out_ch = p;
+                    out_cap = nc;
+                }
+                out_ch[out_n].raw = cur;
+                out_ch[out_n].raw_len = (uint32_t)cur_len;
+                out_ch[out_n].logical_start = cur_logical;
+                out_n++;
+                cur = NULL;
+                cur_len = 0;
+            }
+            if (!cur) {
+                cur = (unsigned char *)malloc(PATHS_CHUNK_RAW);
+                if (!cur) goto out;
+                cur_logical = logical;
+                cur_len = 0;
+            }
+            memcpy(cur + cur_len, ents[i].s, need);
+            cur_len += need;
+            logical += (uint64_t)need;
+        }
+        if (cur) {
+            if (out_n == out_cap) {
+                size_t nc = out_cap + 1;
+                lex_out_chunk_t *p = (lex_out_chunk_t *)realloc(out_ch, nc * sizeof(*p));
+
+                if (!p) {
+                    free(cur);
+                    goto out;
+                }
+                memset(p + out_cap, 0, sizeof(*p));
+                out_ch = p;
+                out_cap = nc;
+            }
+            out_ch[out_n].raw = cur;
+            out_ch[out_n].raw_len = (uint32_t)cur_len;
+            out_ch[out_n].logical_start = cur_logical;
+            out_n++;
+        }
+        new_off[n] = logical;
+    }
+
+    for (i = 0; i < pi.chunk_count; i++) {
+        free(raw[i]);
+        raw[i] = NULL;
+    }
+    free(raw);
+    raw = NULL;
+    free(ents);
+    ents = NULL;
+    free(old_off);
+    old_off = NULL;
+
+    {
+        int nw = nth;
+        pthread_t *tids;
+        lex_enc_arg_t *args;
+        int w;
+
+        if (out_n == 0) {
+            fprintf(stderr, "ereport_index: path_sort: no output chunks\n");
+            goto out;
+        }
+        if ((size_t)nw > out_n) nw = (int)out_n;
+        if (nw < 1) nw = 1;
+        tids = (pthread_t *)calloc((size_t)nw, sizeof(*tids));
+        args = (lex_enc_arg_t *)calloc((size_t)nw, sizeof(*args));
+        if (!tids || !args) {
+            free(tids);
+            free(args);
+            goto out;
+        }
+        for (w = 0; w < nw; w++) {
+            size_t span = (out_n + (size_t)nw - 1) / (size_t)nw;
+            args[w].chunks = out_ch;
+            args[w].lo = (size_t)w * span;
+            args[w].hi = args[w].lo + span;
+            if (args[w].hi > out_n) args[w].hi = out_n;
+            args[w].level = durable_zstd_level();
+            args[w].err = &enc_err;
+        }
+        for (w = 0; w < nw; w++) {
+            if (pthread_create(&tids[w], NULL, lex_enc_th, &args[w]) != 0) {
+                int j;
+                atomic_store_explicit(&enc_err, 1, memory_order_relaxed);
+                for (j = 0; j < w; j++) pthread_join(tids[j], NULL);
+                free(tids);
+                free(args);
+                goto out;
+            }
+        }
+        for (w = 0; w < nw; w++) pthread_join(tids[w], NULL);
+        free(tids);
+        free(args);
+        if (atomic_load_explicit(&enc_err, memory_order_relaxed)) {
+            fprintf(stderr, "ereport_index: path_sort: compress failed\n");
+            goto out;
+        }
+    }
+
+    fp = mk_fopen(paths_tmp, "wb");
+    if (!fp) {
+        fprintf(stderr, "ereport_index: path_sort: fopen %s: %s\n", paths_tmp, strerror(errno));
         goto out;
     }
-    kids_fp = NULL;
-    {
-        struct stat st;
-
-        if (stat(kids_p, &st) == 0) ctx->path_kids_bytes = (uint64_t)st.st_size;
+    memset(hdr, 0, sizeof(hdr));
+    if (mk_fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) {
+        fprintf(stderr, "ereport_index: path_sort: write header: %s\n", strerror(errno));
+        goto out;
     }
-    ctx->path_kids_built = 1;
-    ctx->path_kids_edges = (uint64_t)edge_n;
-    ctx->path_kids_sec = now_sec() - t0;
+    table_offset = PATHS_HDR_BYTES;
+    {
+        paths_chunk_ent_t *table = (paths_chunk_ent_t *)calloc(out_n, sizeof(*table));
+        size_t ci;
+
+        if (!table) goto out;
+        for (ci = 0; ci < out_n; ci++) {
+            table[ci].logical_start = out_ch[ci].logical_start;
+            table[ci].file_off = table_offset;
+            table[ci].stored_len = out_ch[ci].stored_len;
+            table[ci].raw_len = out_ch[ci].raw_len;
+            if (mk_fwrite(out_ch[ci].stored, 1, out_ch[ci].stored_len, fp) != out_ch[ci].stored_len) {
+                fprintf(stderr, "ereport_index: path_sort: write chunk: %s\n", strerror(errno));
+                free(table);
+                goto out;
+            }
+            table_offset += (uint64_t)out_ch[ci].stored_len;
+        }
+        if (mk_fwrite(table, sizeof(*table), out_n, fp) != out_n) {
+            fprintf(stderr, "ereport_index: path_sort: write chunk table: %s\n", strerror(errno));
+            free(table);
+            goto out;
+        }
+        free(table);
+    }
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, PATHS_MAGIC, sizeof(PATHS_MAGIC));
+    v32 = PATHS_FORMAT_VERSION;
+    memcpy(hdr + 8, &v32, sizeof(v32));
+    v32 = (uint32_t)durable_zstd_level();
+    memcpy(hdr + 12, &v32, sizeof(v32));
+    v64 = (uint64_t)out_n;
+    memcpy(hdr + 16, &v64, sizeof(v64));
+    memcpy(hdr + 24, &table_offset, sizeof(table_offset));
+    memcpy(hdr + 32, &logical, sizeof(logical));
+    if (fflush(fp) != 0 || fseeko(fp, 0, SEEK_SET) != 0 ||
+        mk_fwrite(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || mk_fclose(fp) != 0) {
+        fprintf(stderr, "ereport_index: path_sort: finalize paths.bin: %s\n", strerror(errno));
+        fp = NULL;
+        goto out;
+    }
+    fp = NULL;
+
+    ofp = mk_fopen(off_tmp, "wb");
+    if (!ofp || mk_fwrite(new_off, sizeof(*new_off), (size_t)(n + 1ULL), ofp) != (size_t)(n + 1ULL) ||
+        mk_fclose(ofp) != 0) {
+        fprintf(stderr, "ereport_index: path_sort: write path_offsets.bin: %s\n", strerror(errno));
+        ofp = NULL;
+        goto out;
+    }
+    ofp = NULL;
+
+    if (rename(paths_tmp, paths_p) != 0 || rename(off_tmp, off_p) != 0) {
+        fprintf(stderr, "ereport_index: path_sort: rename: %s\n", strerror(errno));
+        goto out;
+    }
+    if (build_path(kids_p, sizeof(kids_p), ctx->index_dir, "path_kids.bin") == 0) unlink(kids_p);
+
+    ctx->paths_order_lex = 1;
+    ctx->paths_sort_sec = now_sec() - t0;
     rc = 0;
 
 out:
-    if (rc != 0) fprintf(stderr, "ereport_index: failed to write path_kids.bin in %s\n", ctx->index_dir);
-    free(isdir);
-    free(edges);
-    free(off);
-    free(child_ids);
-    free(subtree_n);
-    free(seen);
-    kids_dir_map_free(&dmap);
-    paths_reader_free(&pr);
-    if (paths_fp) fclose(paths_fp);
-    if (offsets_fp) fclose(offsets_fp);
+    if (fp) mk_fclose(fp);
+    if (ofp) fclose(ofp);
+    if (raw) {
+        for (i = 0; i < pi.chunk_count; i++) free(raw[i]);
+        free(raw);
+    }
+    if (out_ch) {
+        size_t ci;
+        for (ci = 0; ci < out_n; ci++) {
+            free(out_ch[ci].raw);
+            free(out_ch[ci].stored);
+        }
+        /* packing may have stopped mid-way with unused cap slots */
+        free(out_ch);
+    }
+    free(ents);
+    free(old_off);
+    free(new_off);
     paths_index_close(&pi);
+    if (rc != 0) {
+        unlink(paths_tmp);
+        unlink(off_tmp);
+        fprintf(stderr, "ereport_index: failed to lex-sort paths.bin in %s\n", ctx->index_dir);
+    }
     return rc;
+}
+
+static void *paths_sort_job_main(void *arg) {
+    paths_sort_job_t *j = (paths_sort_job_t *)arg;
+
+    j->rc = sort_paths_bin_lex(j->ctx, j->skip_if_lex);
+    return NULL;
 }
 
 static int collect_query_trigrams(const char *term, uint32_t **out_codes, size_t *out_count) {
@@ -7884,20 +8262,26 @@ static int check_index_version(const char *index_dir) {
     FILE *fp;
     char buf[512];
     int version = -1;
+    int have_lex = 0;
 
     if (build_path(path, sizeof(path), index_dir, "meta.txt") != 0) return -1;
     fp = fopen(path, "r");
     if (fp) {
         while (fgets(buf, sizeof(buf), fp)) {
             int tmp;
-            if (sscanf(buf, "ereport_index_version=%d", &tmp) == 1) {
-                version = tmp;
-                break;
-            }
+            if (sscanf(buf, "ereport_index_version=%d", &tmp) == 1) version = tmp;
+            if (strncmp(buf, "paths_order=lex", 15) == 0) have_lex = 1;
         }
         fclose(fp);
     }
-    if (version == INDEX_VERSION) return 0;
+    if (version == INDEX_VERSION) {
+        if (!have_lex) {
+            fprintf(stderr, "index in %s is missing paths_order=lex; rebuild with 'ereport_index --make'\n",
+                    index_dir);
+            return -1;
+        }
+        return 0;
+    }
     if (version < 0)
         fprintf(stderr, "no ereport_index_version in %s/meta.txt; rebuild with 'ereport_index --make'\n", index_dir);
     else
@@ -7995,20 +8379,6 @@ enum {
     SEARCH_INTERSECT_STOP_RATIO = 64
 };
 
-static int path_is_under_any_dir(const char *path, char **dirs, size_t ndirs) {
-    size_t i;
-
-    for (i = 0; i < ndirs; i++) {
-        size_t n;
-
-        if (!dirs[i]) continue;
-        n = strlen(dirs[i]);
-        if (n == 0) continue;
-        if (strncmp(path, dirs[i], n) == 0 && path[n] == '/') return 1;
-    }
-    return 0;
-}
-
 static int load_path_isdir_bits(const char *index_dir, uint64_t npaths, uint8_t **out_bits, size_t *out_bytes) {
     char path[PATH_MAX];
     FILE *fp;
@@ -8052,130 +8422,277 @@ static int path_isdir_bit(const uint8_t *bits, uint64_t path_id) {
 }
 
 typedef struct {
-    uint64_t *off;
-    uint64_t *child_ids;
-    uint64_t *subtree_n;
-    uint64_t n_paths;
-    uint64_t n_edges;
-} path_kids_t;
+    char **keys;
+    size_t cap;
+    size_t used;
+} path_set_t;
 
-static void path_kids_free(path_kids_t *k) {
-    if (!k) return;
-    free(k->off);
-    free(k->child_ids);
-    free(k->subtree_n);
-    memset(k, 0, sizeof(*k));
+static uint64_t path_set_hash(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    const unsigned char *p = (const unsigned char *)s;
+
+    while (*p) {
+        h ^= (uint64_t)*p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
-static int load_path_kids(const char *index_dir, uint64_t npaths, path_kids_t *out) {
-    char path[PATH_MAX];
-    unsigned char hdr[KIDS_HDR_BYTES];
-    FILE *fp;
-    uint32_t version;
-    uint64_t n, edges;
+static int path_set_init(path_set_t *set, size_t hint) {
+    size_t cap = 16;
 
-    memset(out, 0, sizeof(*out));
-    if (build_path(path, sizeof(path), index_dir, "path_kids.bin") != 0) return -1;
-    fp = fopen(path, "rb");
-    if (!fp) {
-        fprintf(stderr, "missing path_kids.bin in %s (rebuild with ereport_index --make)\n", index_dir);
-        return -1;
-    }
-    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) || memcmp(hdr, KIDS_MAGIC, 8) != 0) {
-        fprintf(stderr, "path_kids.bin in %s is not EKIDS001; rebuild with ereport_index --make\n", index_dir);
-        fclose(fp);
-        return -1;
-    }
-    memcpy(&version, hdr + 8, sizeof(version));
-    memcpy(&n, hdr + 16, sizeof(n));
-    memcpy(&edges, hdr + 24, sizeof(edges));
-    if (version != KIDS_FORMAT_VERSION || n != npaths) {
-        fprintf(stderr, "path_kids.bin in %s does not match this index; rebuild with ereport_index --make\n",
-                index_dir);
-        fclose(fp);
-        return -1;
-    }
-    out->n_paths = n;
-    out->n_edges = edges;
-    out->off = (uint64_t *)malloc((size_t)(n + 1ULL) * sizeof(*out->off));
-    out->subtree_n = n ? (uint64_t *)malloc((size_t)n * sizeof(*out->subtree_n)) : NULL;
-    out->child_ids = edges ? (uint64_t *)malloc((size_t)edges * sizeof(*out->child_ids)) : NULL;
-    if ((n && (!out->off || !out->subtree_n)) || (edges && !out->child_ids) || (!n && !out->off)) {
-        fclose(fp);
-        path_kids_free(out);
-        return -1;
-    }
-    if (fread(out->off, sizeof(*out->off), (size_t)n + 1U, fp) != (size_t)n + 1U ||
-        (edges && fread(out->child_ids, sizeof(*out->child_ids), (size_t)edges, fp) != (size_t)edges) ||
-        (n && fread(out->subtree_n, sizeof(*out->subtree_n), (size_t)n, fp) != (size_t)n)) {
-        fprintf(stderr, "path_kids.bin in %s is truncated\n", index_dir);
-        fclose(fp);
-        path_kids_free(out);
-        return -1;
-    }
-    fclose(fp);
+    while (cap < hint * 2u + 16u) cap *= 2u;
+    set->keys = (char **)calloc(cap, sizeof(*set->keys));
+    if (!set->keys) return -1;
+    set->cap = cap;
+    set->used = 0;
     return 0;
 }
 
-static uint64_t kids_expand_cap(uint64_t npaths) {
-    uint64_t pct;
-
-    if (npaths <= KIDS_EXPAND_SMALL_CORPUS) return npaths;
-    pct = npaths / 100ULL;
-    if (pct < KIDS_EXPAND_SMALL_CORPUS) pct = KIDS_EXPAND_SMALL_CORPUS;
-    if (pct > KIDS_EXPAND_MAX_IDS) pct = KIDS_EXPAND_MAX_IDS;
-    return pct;
+static void path_set_free(path_set_t *set) {
+    free(set->keys);
+    memset(set, 0, sizeof(*set));
 }
 
-/* Collect path_id and every descendant via the CSR into ids (caller-owned, grown). */
-static int kids_walk_collect(const path_kids_t *k, uint64_t root, uint8_t *seen, uint64_t **ids, size_t *n,
-                             size_t *cap) {
-    uint64_t *stack = NULL;
-    size_t sn = 0, scap = 0;
+/* Returns 1 if s was new (caller keeps ownership in the set), 0 if already present. */
+static int path_set_add(path_set_t *set, char *s) {
+    uint64_t h;
+    size_t i, cap;
 
-    if (root >= k->n_paths) return 0;
-    stack = (uint64_t *)malloc(16 * sizeof(*stack));
-    if (!stack) return -1;
-    scap = 16;
-    stack[sn++] = root;
-    while (sn) {
-        uint64_t id = stack[--sn];
-        uint64_t i;
+    if (!s || !set->keys) return 0;
+    if (set->used * 2u >= set->cap) {
+        size_t ncap = set->cap * 2u;
+        char **nk = (char **)calloc(ncap, sizeof(*nk));
+        size_t j;
 
-        if (id >= k->n_paths || seen[id]) continue;
-        seen[id] = 1;
-        if (*n == *cap) {
-            size_t nc = *cap ? *cap * 2 : 64;
-            uint64_t *ni = (uint64_t *)realloc(*ids, nc * sizeof(*ni));
+        if (!nk) return -1;
+        for (j = 0; j < set->cap; j++) {
+            char *k = set->keys[j];
+            uint64_t hh;
+            size_t ii;
 
-            if (!ni) {
-                free(stack);
-                return -1;
-            }
-            *ids = ni;
-            *cap = nc;
+            if (!k) continue;
+            hh = path_set_hash(k);
+            ii = (size_t)(hh & (uint64_t)(ncap - 1u));
+            while (nk[ii]) ii = (ii + 1u) & (ncap - 1u);
+            nk[ii] = k;
         }
-        (*ids)[(*n)++] = id;
-        for (i = k->off[id]; i < k->off[id + 1]; i++) {
-            uint64_t c = k->child_ids[i];
+        free(set->keys);
+        set->keys = nk;
+        set->cap = ncap;
+    }
+    cap = set->cap;
+    h = path_set_hash(s);
+    i = (size_t)(h & (uint64_t)(cap - 1u));
+    for (;;) {
+        if (!set->keys[i]) {
+            set->keys[i] = s;
+            set->used++;
+            return 1;
+        }
+        if (strcmp(set->keys[i], s) == 0) return 0;
+        i = (i + 1u) & (cap - 1u);
+    }
+}
 
-            if (c >= k->n_paths || seen[c]) continue;
-            if (sn == scap) {
-                size_t nc = scap * 2;
-                uint64_t *ns = (uint64_t *)realloc(stack, nc * sizeof(*ns));
+static int path_is_under_dir(const char *path, const char *dir) {
+    size_t n;
 
-                if (!ns) {
-                    free(stack);
+    if (!path || !dir) return 0;
+    n = strlen(dir);
+    if (n == 0) return 0;
+    if (n == 1 && dir[0] == '/') return path[0] == '/' && path[1] != '\0';
+    if (strncmp(path, dir, n) != 0) return 0;
+    return path[n] == '/';
+}
+
+static int cmp_cstr_ptr(const void *a, const void *b) {
+    const char *aa = *(char *const *)a;
+    const char *bb = *(char *const *)b;
+
+    if (!aa) return bb ? 1 : 0;
+    if (!bb) return -1;
+    return strcmp(aa, bb);
+}
+
+static size_t minimize_dir_prefs(char **dirs, size_t n) {
+    size_t i, w = 0;
+
+    if (n <= 1) return n;
+    qsort(dirs, n, sizeof(*dirs), cmp_cstr_ptr);
+    for (i = 0; i < n; i++) {
+        if (!dirs[i]) continue;
+        if (w > 0 && path_is_under_dir(dirs[i], dirs[w - 1])) continue;
+        dirs[w++] = dirs[i];
+    }
+    return w;
+}
+
+static const char *chunk_last_path(paths_reader_t *pr, uint64_t ci) {
+    const unsigned char *p, *end, *last;
+
+    if (paths_reader_load_chunk(pr, ci) != 0) return NULL;
+    p = pr->raw;
+    end = pr->raw + pr->pi->table[ci].raw_len;
+    last = p;
+    while (p < end) {
+        last = p;
+        while (p < end && *p) p++;
+        if (p < end) p++;
+    }
+    return (const char *)last;
+}
+
+/* First chunk that may hold a path >= needle. */
+static uint64_t lex_chunk_ge(paths_reader_t *pr, const char *needle) {
+    uint64_t lo = 0, hi = pr->pi->chunk_count;
+
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        const char *last = chunk_last_path(pr, mid);
+
+        if (!last) return pr->pi->chunk_count;
+        if (strcmp(last, needle) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static int final_push(uint64_t **ids, char ***paths, size_t *n, size_t *cap, uint64_t id, char *path) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        uint64_t *ni = (uint64_t *)realloc(*ids, nc * sizeof(*ni));
+        char **np;
+
+        if (!ni) return -1;
+        *ids = ni;
+        np = (char **)realloc(*paths, nc * sizeof(*np));
+        if (!np) return -1;
+        *paths = np;
+        *cap = nc;
+    }
+    (*ids)[*n] = id;
+    (*paths)[*n] = path;
+    (*n)++;
+    return 0;
+}
+
+static int lex_scan_children(paths_reader_t *pr, const char *dir, path_set_t *set, uint64_t **ids,
+                             char ***paths, size_t *n, size_t *cap) {
+    char child_pref[PATH_MAX];
+    size_t plen;
+    uint64_t ci;
+    int whole_tree = 0;
+
+    if (!dir || !pr->pi) return 0;
+    plen = strlen(dir);
+    if (plen == 0) return 0;
+    if (plen == 1 && dir[0] == '/') {
+        child_pref[0] = '/';
+        child_pref[1] = '\0';
+        plen = 0;
+        whole_tree = 1;
+        ci = 0;
+    } else {
+        if (plen + 2 > sizeof(child_pref)) return -1;
+        memcpy(child_pref, dir, plen);
+        child_pref[plen] = '/';
+        child_pref[plen + 1] = '\0';
+        ci = lex_chunk_ge(pr, child_pref);
+    }
+    for (; ci < pr->pi->chunk_count; ci++) {
+        const unsigned char *p, *end;
+
+        if (paths_reader_load_chunk(pr, ci) != 0) return -1;
+        p = pr->raw;
+        end = pr->raw + pr->pi->table[ci].raw_len;
+        while (p < end) {
+            const char *s = (const char *)p;
+            size_t slen = strlen(s);
+            int under;
+
+            if (whole_tree) under = !(s[0] == '/' && s[1] == '\0');
+            else under = strncmp(s, child_pref, plen + 1) == 0;
+            if (!under) {
+                if (!whole_tree && strcmp(s, child_pref) > 0) return 0;
+                p += slen + 1;
+                continue;
+            }
+            {
+                char *copy = (char *)malloc(slen + 1);
+                int added;
+
+                if (!copy) return -1;
+                memcpy(copy, s, slen + 1);
+                added = path_set_add(set, copy);
+                if (added < 0) {
+                    free(copy);
                     return -1;
                 }
-                stack = ns;
-                scap = nc;
+                if (added == 0) {
+                    free(copy);
+                } else if (final_push(ids, paths, n, cap, UINT64_MAX, copy) != 0) {
+                    return -1;
+                }
             }
-            stack[sn++] = c;
+            p += slen + 1;
         }
     }
-    free(stack);
     return 0;
+}
+
+/*
+ * Union basename hits with every descendant of each directory hit, via a lex prefix
+ * scan. Consumes hit_paths (transfers or frees). hit_ids is not freed.
+ */
+static int expand_dir_hits_lex(paths_reader_t *pr, char **dir_prefs, size_t dir_n, uint64_t *hit_ids,
+                               char **hit_paths, size_t hit_n, uint64_t **out_ids, char ***out_paths,
+                               size_t *out_n) {
+    path_set_t set;
+    uint64_t *ids = NULL;
+    char **paths = NULL;
+    size_t n = 0, cap = 0, i;
+    size_t keep;
+
+    *out_ids = NULL;
+    *out_paths = NULL;
+    *out_n = 0;
+    memset(&set, 0, sizeof(set));
+    if (path_set_init(&set, hit_n + 16) != 0) return -1;
+    keep = minimize_dir_prefs(dir_prefs, dir_n);
+
+    for (i = 0; i < hit_n; i++) {
+        char *p = hit_paths[i];
+        int added;
+
+        hit_paths[i] = NULL;
+        if (!p) continue;
+        added = path_set_add(&set, p);
+        if (added < 0) {
+            free(p);
+            goto fail;
+        }
+        if (added == 0) {
+            free(p);
+            continue;
+        }
+        if (final_push(&ids, &paths, &n, &cap, hit_ids ? hit_ids[i] : UINT64_MAX, p) != 0) goto fail;
+    }
+    for (i = 0; i < keep; i++) {
+        if (lex_scan_children(pr, dir_prefs[i], &set, &ids, &paths, &n, &cap) != 0) goto fail;
+    }
+    path_set_free(&set);
+    *out_ids = ids;
+    *out_paths = paths;
+    *out_n = n;
+    return 0;
+
+fail:
+    path_set_free(&set);
+    for (i = 0; i < n; i++) free(paths[i]);
+    free(ids);
+    free(paths);
+    return -1;
 }
 
 typedef struct {
@@ -8379,11 +8896,6 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         uint64_t *final_ids = NULL;
         char **final_paths = NULL;
         size_t final_n = 0;
-        size_t final_cap = 0;
-        path_kids_t kids;
-
-        memset(&kids, 0, sizeof(kids));
-
         /* One shared header/chunk-table/dictionary load; the workers below only add a FILE* and a
          * decompression context each, so the table does not get duplicated per thread. */
         if (current.count > 0 && paths_index_open(paths_path, &paths_index) != 0) {
@@ -8569,27 +9081,6 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
         }
 
         if (need_expand) {
-            uint64_t expand_est = 0;
-            int use_scan = 0;
-
-            if (load_path_kids(index_dir, indexed_paths_corpus, &kids) != 0) {
-                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                free(hit_ids);
-                free(hit_paths);
-                free(dir_prefs);
-                free(dir_ids);
-                free(isdir_bits);
-                free(current.ids);
-                current.ids = NULL;
-                goto out;
-            }
-            for (ki = 0; ki < dir_n; ki++) {
-                uint64_t id = dir_ids[ki];
-
-                if (id < kids.n_paths) expand_est += kids.subtree_n[id];
-            }
-            use_scan = expand_est > kids_expand_cap(indexed_paths_corpus);
-
             paths_reader_free(&serial_pr);
             if (paths_fp) {
                 fclose(paths_fp);
@@ -8609,199 +9100,34 @@ static int search_index_dir(const char *term, const char *index_dir, uint64_t sk
                 free(dir_prefs);
                 free(dir_ids);
                 free(isdir_bits);
-                path_kids_free(&kids);
                 free(current.ids);
                 current.ids = NULL;
                 goto out;
             }
-
-            if (!use_scan) {
-                uint8_t *seen = NULL;
-                uint64_t *walk_ids = NULL;
-                size_t walk_n = 0, walk_cap = 0;
-                size_t hi = 0;
-
-                if (indexed_paths_corpus > 0) {
-                    seen = (uint8_t *)calloc((size_t)indexed_paths_corpus, 1);
-                    if (!seen) {
-                        for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                        free(hit_ids);
-                        free(hit_paths);
-                        free(dir_prefs);
-                        free(dir_ids);
-                        free(isdir_bits);
-                        path_kids_free(&kids);
-                        free(current.ids);
-                        current.ids = NULL;
-                        goto out;
-                    }
-                }
-                for (ki = 0; ki < hit_n; ki++) {
-                    if (kids_walk_collect(&kids, hit_ids[ki], seen, &walk_ids, &walk_n, &walk_cap) != 0) {
-                        free(seen);
-                        free(walk_ids);
-                        for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
-                        free(hit_ids);
-                        free(hit_paths);
-                        free(dir_prefs);
-                        free(dir_ids);
-                        free(isdir_bits);
-                        path_kids_free(&kids);
-                        free(current.ids);
-                        current.ids = NULL;
-                        goto out;
-                    }
-                }
-                /* Basename file hits that are not under a matching dir stay in the result. */
-                for (ki = 0; ki < hit_n; ki++) {
-                    uint64_t id = hit_ids[ki];
-
-                    if (id >= indexed_paths_corpus || (seen && seen[id])) continue;
-                    if (kids_walk_collect(&kids, id, seen, &walk_ids, &walk_n, &walk_cap) != 0) {
-                        free(seen);
-                        free(walk_ids);
-                        for (size_t j = 0; j < hit_n; j++) free(hit_paths[j]);
-                        free(hit_ids);
-                        free(hit_paths);
-                        free(dir_prefs);
-                        free(dir_ids);
-                        free(isdir_bits);
-                        path_kids_free(&kids);
-                        free(current.ids);
-                        current.ids = NULL;
-                        goto out;
-                    }
-                }
-                free(seen);
-                if (walk_n > 1) qsort(walk_ids, walk_n, sizeof(*walk_ids), cmp_u64_asc);
-                final_cap = walk_n ? walk_n : 1;
-                final_ids = (uint64_t *)malloc(final_cap * sizeof(*final_ids));
-                final_paths = (char **)malloc(final_cap * sizeof(*final_paths));
-                if (!final_ids || !final_paths) {
-                    free(walk_ids);
-                    free(final_ids);
-                    free(final_paths);
-                    for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                    free(hit_ids);
-                    free(hit_paths);
-                    free(dir_prefs);
-                    free(dir_ids);
-                    free(isdir_bits);
-                    path_kids_free(&kids);
-                    free(current.ids);
-                    current.ids = NULL;
-                    goto out;
-                }
-                for (ki = 0; ki < walk_n; ki++) {
-                    uint64_t id = walk_ids[ki];
-                    char *path = NULL;
-
-                    while (hi < hit_n && hit_ids[hi] < id) hi++;
-                    if (hi < hit_n && hit_ids[hi] == id) {
-                        path = hit_paths[hi];
-                        hit_paths[hi] = NULL;
-                        hi++;
-                    } else {
-                        path = read_path_by_id(&serial_pr, offsets_fp, id);
-                    }
-                    if (!path) continue;
-                    final_ids[final_n] = id;
-                    final_paths[final_n] = path;
-                    final_n++;
-                }
-                free(walk_ids);
+            if (expand_dir_hits_lex(&serial_pr, dir_prefs, dir_n, hit_ids, hit_paths, hit_n, &final_ids,
+                                    &final_paths, &final_n) != 0) {
                 for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
                 free(hit_ids);
                 free(hit_paths);
-                hit_ids = final_ids;
-                hit_paths = final_paths;
-                hit_n = final_n;
-                final_ids = NULL;
-                final_paths = NULL;
-            } else {
-                size_t hi = 0;
-                uint64_t pid;
-
-                for (pid = 0; pid < indexed_paths_corpus; pid++) {
-                    int at_hit = (hi < hit_n && hit_ids[hi] == pid);
-                    char *path;
-
-                    if (final_n == final_cap) {
-                        size_t nc = final_cap ? final_cap * 2 : (hit_n ? hit_n * 2 : 64);
-                        uint64_t *ni;
-                        char **np;
-
-                        ni = (uint64_t *)realloc(final_ids, nc * sizeof(*ni));
-                        if (!ni) {
-                            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                            for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
-                            free(hit_ids);
-                            free(hit_paths);
-                            free(final_ids);
-                            free(final_paths);
-                            free(dir_prefs);
-                            free(dir_ids);
-                            free(isdir_bits);
-                            path_kids_free(&kids);
-                            free(current.ids);
-                            current.ids = NULL;
-                            goto out;
-                        }
-                        final_ids = ni;
-                        np = (char **)realloc(final_paths, nc * sizeof(*np));
-                        if (!np) {
-                            for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                            for (ki = 0; ki < final_n; ki++) free(final_paths[ki]);
-                            free(hit_ids);
-                            free(hit_paths);
-                            free(final_ids);
-                            free(final_paths);
-                            free(dir_prefs);
-                            free(dir_ids);
-                            free(isdir_bits);
-                            path_kids_free(&kids);
-                            free(current.ids);
-                            current.ids = NULL;
-                            goto out;
-                        }
-                        final_paths = np;
-                        final_cap = nc;
-                    }
-
-                    if (at_hit) {
-                        final_ids[final_n] = pid;
-                        final_paths[final_n] = hit_paths[hi];
-                        hit_paths[hi] = NULL;
-                        final_n++;
-                        hi++;
-                        continue;
-                    }
-
-                    path = read_path_by_id(&serial_pr, offsets_fp, pid);
-                    if (!path) continue;
-                    if (!path_is_under_any_dir(path, dir_prefs, dir_n)) {
-                        free(path);
-                        continue;
-                    }
-                    final_ids[final_n] = pid;
-                    final_paths[final_n] = path;
-                    final_n++;
-                }
-                for (ki = 0; ki < hit_n; ki++) free(hit_paths[ki]);
-                free(hit_ids);
-                free(hit_paths);
-                hit_ids = final_ids;
-                hit_paths = final_paths;
-                hit_n = final_n;
-                final_ids = NULL;
-                final_paths = NULL;
+                free(dir_prefs);
+                free(dir_ids);
+                free(isdir_bits);
+                free(current.ids);
+                current.ids = NULL;
+                goto out;
             }
+            free(hit_ids);
+            free(hit_paths);
+            hit_ids = final_ids;
+            hit_paths = final_paths;
+            hit_n = final_n;
+            final_ids = NULL;
+            final_paths = NULL;
         }
 
         free(dir_prefs);
         free(dir_ids);
         free(isdir_bits);
-        path_kids_free(&kids);
         paths_reader_free(&serial_pr);
         if (paths_fp) {
             fclose(paths_fp);

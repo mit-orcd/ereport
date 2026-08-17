@@ -210,7 +210,7 @@ run_clean() {
   { echo "index_dir=$indexdir"
     echo "index_dir_size=$(du -sh "$indexdir" 2>/dev/null | cut -f1)"
     echo "index_files=$(find "$indexdir" -type f 2>/dev/null | wc -l)"
-    for f in tri_keys.bin tri_postings.bin paths.bin path_offsets.bin path_kids.bin meta.txt; do
+    for f in tri_keys.bin tri_postings.bin paths.bin path_offsets.bin meta.txt; do
       [[ -e "$indexdir/$f" ]] && echo "size_$f=$(stat -c %s "$indexdir/$f" 2>/dev/null)"
     done
   } >"$dest/index_size${sfx}.txt"
