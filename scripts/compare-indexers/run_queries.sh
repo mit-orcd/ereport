@@ -23,7 +23,7 @@
 #   GUFI_ROLLUP_INDEX_DIR=...   the same index after gufi_rollup
 #   XDU_INDEX_DIR=...
 #
-# Env: TOOLS="find fd du dua dut ecrawl_suite gufi xdu robinhood" REPS=3
+# Env: TOOLS="find fd du dua dut ecrawl_suite ecrawl_walk gufi xdu robinhood" REPS=3
 #      REPS_<TOOL>=n overrides REPS for one tool, e.g. REPS_ROBINHOOD=1
 #      CACHE_MODES="cold hot"  per tool: all cold reps (drop, then Q1–Q6 on
 #                     set 1), then all hot reps (same work, warmed by the last
@@ -45,7 +45,7 @@ TS=$(date +%Y%m%d-%H%M%S)
 OUT=${2:-"$COMPARE_DIR/results/queries-$TS"}
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
-TOOLS=${TOOLS:-"find fd du dua dut ecrawl_suite gufi xdu robinhood"}
+TOOLS=${TOOLS:-"find fd du dua dut ecrawl_suite ecrawl_walk gufi xdu robinhood"}
 
 echo "==> threads: $(thread_plan)"
 raise_nofile
@@ -363,6 +363,14 @@ search_filter_script() {
     "$EREPORT_INDEX_BIN" "$1" "$2" "$3"
 }
 
+# The same prefilter-then-exact pipeline, but with no index at all: ecrawl's
+# names-only walk streams the paths that hold the needle, then the identical
+# basename-anchored grep lands on find's answer. This is fd's live-search peer.
+walk_filter_script() {
+  printf 'set -o pipefail; %q --no-stat --contains %q %q | grep -E -- %q' \
+    "$ECRAWL_BIN" "$1" "$TREE" "$2"
+}
+
 # ---- ecrawl suite ----
 #
 # Q1/Q2 run the trigram index for the smallest candidate set it can produce, then
@@ -472,6 +480,41 @@ q_suite() {
   else
     append_q ecrawl_query Q4 "$rep" ok "${el:-}" "${bytes:-0}" \
       "${answered:-answered_from_unknown}; records_scanned=${scanned:-?}; du_sb_semantics"
+  fi
+}
+
+# ---- ecrawl live walk (no index) ----
+#
+# The name queries Q1/Q2/Q6 with no capture and no trigram index: ecrawl walks
+# names only and streams the paths holding the needle, then the same
+# basename-anchored grep the index uses lands on find's exact answer. The walk
+# is the whole cost, so this measures how a multithreaded live search fares
+# against fd -- the index's answer is faster still, but it has to be built first.
+q_ecrawl_walk() {
+  local rep=$1 q
+  # grep exits 1 on no match, which is an empty answer rather than a failure.
+  local TOLERATE_EXIT1=1
+  local EXIT1_NOTE="walk_prefilter_then_exact_filter; no_match"
+  local NOTE="walk_prefilter_then_exact_filter"
+  if ! tool_available ecrawl; then
+    for q in Q1 Q2 Q6; do
+      append_q ecrawl_walk "$q" "$rep" skipped "" 0 "need_ecrawl_binary"
+    done
+    return 0
+  fi
+  [[ -n "$Q1_NAME" ]] &&
+    time_count ecrawl_walk Q1 "$rep" bash -c "$(walk_filter_script "$Q1_NAME" "$Q1_ERE")"
+  # Unlike the trigram index the walk needs no three-character run, but it is
+  # handed the same term so the two prefilters narrow to the same candidates.
+  if [[ -n "$Q2_INDEX_TERM" ]]; then
+    time_count ecrawl_walk Q2 "$rep" bash -c "$(walk_filter_script "$Q2_INDEX_TERM" "$Q2_ERE")"
+  else
+    append_q ecrawl_walk Q2 "$rep" skipped "" 0 "glob_has_no_literal_run_to_prefilter"
+  fi
+  if [[ -n "$Q6_INDEX_TERM" ]]; then
+    time_count ecrawl_walk Q6 "$rep" bash -c "$(walk_filter_script "$Q6_INDEX_TERM" "$Q6_ERE")"
+  else
+    append_q ecrawl_walk Q6 "$rep" skipped "" 0 "glob_has_no_literal_run_to_prefilter"
   fi
 }
 
@@ -937,6 +980,7 @@ run_one_tool() {
     dua) q_dua "$rep" ;;
     dut) q_dut "$rep" ;;
     ecrawl_suite|suite) q_suite "$rep" ;;
+    ecrawl_walk) q_ecrawl_walk "$rep" ;;
     gufi) q_gufi "$rep" ;;
     xdu) q_xdu "$rep" ;;
     robinhood) q_robinhood "$rep" ;;

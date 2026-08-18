@@ -990,7 +990,7 @@ select_arg_set() {
 # is rejected rather than silently ignored, which is the whole failure mode a
 # per-tool knob invites. Deliberately not spelled REPS_*, or the check below
 # would read this list as a tool of its own.
-KNOWN_REPS_TOOLS="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
+KNOWN_REPS_TOOLS="ecrawl ecrawl_suite ecrawl_walk suite ereport_index gufi xdu robinhood find fd du dua dut"
 
 # Crawl and index are one pipeline, so the index follows the crawl's count
 # unless the caller pins it lower (last N write reps of each cache series).
@@ -1082,6 +1082,7 @@ count_find() {
 tool_available() {
   case "$1" in
     ecrawl) have_cmd "$ECRAWL_BIN" ;;
+    ecrawl_walk) have_cmd "$ECRAWL_BIN" ;;
     ereport) have_cmd "$EREPORT_BIN" ;;
     ereport_index) have_cmd "$EREPORT_INDEX_BIN" ;;
     ecrawl_query) have_cmd "$ECRAWL_QUERY_BIN" ;;

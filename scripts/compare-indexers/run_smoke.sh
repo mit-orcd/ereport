@@ -134,6 +134,7 @@ elif [[ "$SYNTH_PROFILE" == "tiny" && "$WITH_EXTERNALS" != "1" ]]; then
   TOOLS_Q="find du ecrawl_suite"
 else
   TOOLS_Q="find ecrawl_suite"
+  tool_available ecrawl && TOOLS_Q+=" ecrawl_walk"
   baseline_candidate fd && TOOLS_Q+=" fd"
   tool_available du && TOOLS_Q+=" du"
   baseline_candidate dua && TOOLS_Q+=" dua"

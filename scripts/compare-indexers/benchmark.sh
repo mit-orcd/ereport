@@ -222,7 +222,7 @@ usage() {
 # script deliberately does not source lib.sh, and a typo has to be caught here:
 # rejected at the command line it costs a retype, accepted it costs a whole run
 # at a repetition count nobody chose.
-REPS_TOOL_NAMES="ecrawl ecrawl_suite suite ereport_index gufi xdu robinhood find fd du dua dut"
+REPS_TOOL_NAMES="ecrawl ecrawl_suite ecrawl_walk suite ereport_index gufi xdu robinhood find fd du dua dut"
 
 reps_valid() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1)); }
 

@@ -598,6 +598,14 @@ through a basename-anchored `grep -E` that reproduces the glob. The answer is
 `find`'s, not an approximation of it; `query_params.txt` records the term and
 the regex, and `COMMANDS.txt` shows the pipeline as it ran.
 
+The **ecrawl (live walk)** row answers Q1, Q2 and Q6 with the same term and
+`grep -E`, but no index at all: `ecrawl --no-stat --contains <term>` streams the
+paths holding the needle straight off the names-only walk, so the timed cost is
+the multithreaded traversal plus a short `grep`. It is fd's live-search peer —
+the trigram index answers faster, but only after a crawl and a build; the live
+walk answers on a cold tree with nothing stored. It is skipped for Q3–Q5:
+`--no-stat` reads no inodes, so it has no size or type predicate to select with.
+
 Q3, Q4 and Q5 go to `ecrawl_query`, which selects records straight out of the
 capture: `--size-gt N` for the size predicate, `--subtree DIR` for the two
 subtree questions, `--type f` for regular files, and `--list` to print paths the

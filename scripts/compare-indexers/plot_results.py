@@ -148,6 +148,7 @@ QUERY_ORDER = [
     "GUFI",
     "GUFI + rollup",
     "XDU",
+    "ecrawl (live walk)",
     "find",
     "fd",
     "du",
@@ -183,6 +184,9 @@ COLORS = {
     "ecrawl\n(--no-write --io_uring)": "#0A4E7A",
     "ereport": "#0072B2",
     "ecrawl_query": "#0072B2",
+    # A walker, but the project's own: keep the ecrawl blue so it reads as the
+    # family fd is measured against, not as one of the neutral walkers.
+    "ecrawl (live walk)": "#0072B2",
     "ereport_index": "#56B4E9",
     "Robinhood": "#D55E00",
     "Robinhood (scan only)": "#D55E00",
@@ -622,6 +626,9 @@ QUERY_TOOL_LABELS = {
     "ereport_index": "ereport_index",
     "ereport": "ereport",
     "ecrawl_query": "ecrawl_query",
+    # The index-free name search: ecrawl --no-stat --contains plus the exact
+    # grep, fd's live-search peer. No capture, no trigram index.
+    "ecrawl_walk": "ecrawl (live walk)",
     "robinhood": "Robinhood",
     "gufi": "GUFI",
     # The same wrappers reading the index gufi_rollup produced. A separate series
