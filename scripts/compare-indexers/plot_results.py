@@ -903,29 +903,66 @@ def fits_inside(fig, axis, value, text, fontsize=7.5):
     return width_pt > 0.55 * fontsize * len(text) + 14
 
 
-def _segment_value_labels(axis, y, parts, dataset_index, n_datasets, bar_h,
-                          log, formatter):
+def _segment_bounds(low, right, values, log):
+    """Boundary x-positions for a stacked bar's segments.
+
+    On a linear axis the boundaries are just the cumulative values, which are
+    already proportional to the shares. On a log axis that would compress the
+    later phases (a 50/50 split reads as 80/20), so instead each boundary is
+    placed where the segment's *on-screen* width is proportional to its value:
+    cumulative fraction f lands at low * (right/low)**f. That splits the bar's
+    rendered span [low, right] by value while the right edge stays at the
+    truthful total.
+    """
+    if not log:
+        bounds = [0.0]
+        for v in values:
+            bounds.append(bounds[-1] + v)
+        return bounds
+    total = sum(values)
+    bounds = [low]
+    acc = 0.0
+    for v in values:
+        acc += v
+        frac = acc / total if total else 0.0
+        bounds.append(low * (right / low) ** frac)
+    return bounds
+
+
+def _segment_value_labels(axis, y, parts, total, dataset_index, n_datasets,
+                          bar_h, log, formatter):
     """One value label per phase, centred on its own segment of the bar.
 
     The labels sit just off the bar -- above the upper bar of a multi-cache
     row, below the lower one -- so they land in the gaps between rows rather
-    than on a neighbouring bar. On a log axis a segment's visual centre is the
-    geometric mean of its ends, and the first segment's left edge is the axis
-    minimum (the bar is drawn from 0, which the log scale clamps away).
+    than on a neighbouring bar. Each is centred on its segment's proportional
+    span (geometric mean on a log axis), then nudged back on-canvas when a
+    thin sliver phase would otherwise push it off the axis edge.
     """
     offset = bar_h * 0.43 + 0.05
     above = dataset_index <= (n_datasets - 1) / 2.0
     label_y = y - offset if above else y + offset
-    low = axis.get_xlim()[0]
-    left = 0.0
-    for name, value in parts:
-        a = max(left, low) if log else left
-        b = left + value
+    low, high = axis.get_xlim()
+    bounds = _segment_bounds(low, total, [v for _, v in parts], log)
+    dpi = axis.figure.dpi
+
+    def to_px(x):
+        return axis.transData.transform([(x, 0.0)])[0][0]
+
+    left_px, right_px = to_px(low), to_px(high)
+    for part_no, (name, value) in enumerate(parts):
+        a, b = bounds[part_no], bounds[part_no + 1]
         center = math.sqrt(a * b) if log and a > 0 else (a + b) / 2.0
+        label = "{} {}".format(formatter(value), name)
+        # A thin sliver phase would push its label off the axis edge; clamp the
+        # centre so the text stays on the canvas beside its segment instead.
+        half_px = (0.55 * 7.0 * len(label) + 6.0) * dpi / 72.0 / 2.0
+        centre_px = min(max(to_px(center), left_px + half_px), right_px - half_px)
+        center = axis.transData.inverted().transform([(centre_px, 0.0)])[0][0]
         axis.text(
             center,
             label_y,
-            "{} {}".format(formatter(value), name),
+            label,
             va="center",
             ha="center",
             fontsize=7,
@@ -933,7 +970,6 @@ def _segment_value_labels(axis, y, parts, dataset_index, n_datasets, bar_h,
             clip_on=False,
             zorder=6,
         )
-        left += value
 
 
 def index_figure(datasets, out_dir, spec):
@@ -1032,6 +1068,17 @@ def index_figure(datasets, out_dir, spec):
     # linear axis, which made a run containing GUFI's rollup unreadable: at
     # 495 s against 4.6 s the other three tools were slivers on the axis.
     log = bool(positive) and max(positive) / min(positive) >= LOG_RANGE
+    # On a log axis the segments are drawn with proportional on-screen widths
+    # (see _segment_bounds), anchored at this left edge; it is also the axis
+    # minimum, so the first phase starts exactly where the axis does. The floor
+    # line is the point of the panel it appears on, and on a log axis it usually
+    # sits left of every bar, so it has to pull the limit out with it or it is
+    # simply clipped away.
+    seg_low = None
+    if log and positive:
+        seg_low = min(positive) / 4.0
+        if floor:
+            seg_low = min(seg_low, floor[1] / 1.8)
     part_index = 0 if metric == "time" else 1
     pending = []
     for dataset_index, dataset in enumerate(datasets):
@@ -1054,25 +1101,25 @@ def index_figure(datasets, out_dir, spec):
             parts = parts if all(v is not None for _, v in parts) else []
             # A log axis cannot be read additively, so the phases usually go
             # in the label there instead of pretending the segments sum by
-            # length. A spec can still ask for the segments (the storage
-            # figure does): each boundary then sits at the phase's own value
-            # on the axis, which stays truthful even though the segment
-            # lengths stop being proportional to the shares.
+            # length. A spec can still ask for the segments (the storage and
+            # build figures do): the boundaries are then placed so each
+            # segment's on-screen width is proportional to its phase's value
+            # (see _segment_bounds), keeping the shares readable on the log
+            # axis while the right edge stays at the truthful total.
             segmented = bool(parts) and (not log or spec.get("segment_log"))
             if segmented:
-                left = 0.0
+                bounds = _segment_bounds(seg_low, mean, [v for _, v in parts], log)
                 for part_no, (_, value) in enumerate(parts):
                     axis.barh(
                         y,
-                        value,
-                        left=left,
+                        bounds[part_no + 1] - bounds[part_no],
+                        left=bounds[part_no],
                         height=bar_h * 0.86,
                         color=shade(base, min(0.78, 0.42 * part_no)),
                         edgecolor="white",
                         linewidth=0.8,
                         zorder=3,
                     )
-                    left += value
             else:
                 axis.barh(
                     y,
@@ -1131,13 +1178,8 @@ def index_figure(datasets, out_dir, spec):
     # also drop the left edge below the smallest bar, or the smallest index
     # looks like it took no space at all.
     low, high = axis.get_xlim()
-    if log and positive:
-        low = min(positive) / 4.0
-        # The floor line is the point of the panel it appears on, and on a log
-        # axis it usually sits left of every bar, so it has to pull the limit
-        # out with it or it is simply clipped away.
-        if floor:
-            low = min(low, floor[1] / 1.8)
+    if log and seg_low:
+        low = seg_low
     if log:
         # Split / per-file notes are long; give them page width before clip.
         extra = 5.5 if spec.get("per_file") else (4.2 if split_rows else 2.6)
@@ -1189,7 +1231,7 @@ def index_figure(datasets, out_dir, spec):
             # Each phase value sits on its own segment, so the end of the bar
             # keeps just the total.
             _segment_value_labels(
-                axis, y, parts, di, len(datasets), bar_h, log, formatter
+                axis, y, parts, mean, di, len(datasets), bar_h, log, formatter
             )
         elif split:
             # A segmented bar's numbers go underneath the value, where they
