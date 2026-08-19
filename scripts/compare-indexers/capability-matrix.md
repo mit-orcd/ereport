@@ -20,7 +20,7 @@ Three more fairness decisions shape every number here. Each phase is measured **
 | **ereport** | Age×size reports, `--subtree` aggregates | Consumes crawl bins (HTML + stdout stats) |
 | **ereport_index** | Path trigram search | `paths.bin` / `tri_keys.bin` / `tri_postings.bin` (extra post-crawl index) |
 | **ecrawl_query** | Record selection over the capture: `--subtree`, `--size-gt`, `--type`, `--list` | Consumes crawl bins; stores nothing |
-| **ecrawl (live walk)** | Index-free name search: `ecrawl --no-stat --contains` + exact `grep -E` | None (no capture, no index) |
+| **ecrawl (live walk)** | Index-free name search (`ecrawl --no-stat --contains` + exact `grep -E`) and subtree file count (`ecrawl --no-stat --count`) | None (no capture, no index) |
 
 ## Privileges
 
@@ -82,7 +82,9 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
    row answers Q1/Q2/Q6 with the *same* term and `grep -E`, but no index at all: `ecrawl --no-stat
    --contains <term>` streams the paths holding the needle straight off the walk, so its time is the
    multithreaded traversal alone. It is fd's live-search peer — the index answers faster, but has to be
-   built first; the live walk answers on a cold tree with nothing stored.
+   built first; the live walk answers on a cold tree with nothing stored. For Q5 the same walk tallies
+   `d_type` under the seeded subtree (`ecrawl --no-stat --count`), the live counterpart to
+   `ecrawl_query`'s dir-index answer and to find/fd's traversal.
 2. **Q3 reads the capture, not an index; Q4 and Q5 read the capture plus the dir-index sidecars.**
    `ecrawl_query` selects records with `--size-gt` / `--type` / `--subtree`. Q3 has no path to
    prune by and always pays a full pass over the shards. Q4 and Q5 are given `--index-dir`, so a

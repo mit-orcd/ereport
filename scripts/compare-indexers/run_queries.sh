@@ -490,6 +490,9 @@ q_suite() {
 # basename-anchored grep the index uses lands on find's exact answer. The walk
 # is the whole cost, so this measures how a multithreaded live search fares
 # against fd -- the index's answer is faster still, but it has to be built first.
+# Q5 is the same idea for a subtree file count: --no-stat --count tallies d_type
+# under the seeded subtree, the live counterpart to ecrawl_query's dir-index
+# answer and to find/fd's walk.
 q_ecrawl_walk() {
   local rep=$1 q
   # grep exits 1 on no match, which is an empty answer rather than a failure.
@@ -497,7 +500,7 @@ q_ecrawl_walk() {
   local EXIT1_NOTE="walk_prefilter_then_exact_filter; no_match"
   local NOTE="walk_prefilter_then_exact_filter"
   if ! tool_available ecrawl; then
-    for q in Q1 Q2 Q6; do
+    for q in Q1 Q2 Q5 Q6; do
       append_q ecrawl_walk "$q" "$rep" skipped "" 0 "need_ecrawl_binary"
     done
     return 0
@@ -515,6 +518,30 @@ q_ecrawl_walk() {
     time_count ecrawl_walk Q6 "$rep" bash -c "$(walk_filter_script "$Q6_INDEX_TERM" "$Q6_ERE")"
   else
     append_q ecrawl_walk Q6 "$rep" skipped "" 0 "glob_has_no_literal_run_to_prefilter"
+  fi
+  # Q5 counts regular files under the seeded subtree, so it cannot reuse
+  # time_count (which tallies stdout lines): --no-stat --count prints one census
+  # line per type, and the answer is the files= line. Timed like Q4 instead.
+  if [[ -z "$Q5_SUBTREE" ]]; then
+    append_q ecrawl_walk Q5 "$rep" skipped "" 0 "no_q5_subtree_seeded"
+  else
+    local stem="ecrawl_walk_Q5_r${rep}${RUN_TAG}"
+    local tfile="$OUT/${stem}.time.txt"
+    set +e
+    time_cmd "$tfile" "$ECRAWL_BIN" --no-stat --count "$Q5_SUBTREE" \
+      >"$OUT/${stem}.out.txt" 2>"$OUT/${stem}.err.txt"
+    local st=$?
+    set -e
+    local el files
+    el=$(elapsed_from_time_v "$tfile" || echo "")
+    files=$(sed -n 's/^files=//p' "$OUT/${stem}.out.txt" | tail -1 || true)
+    if [[ $st -ne 0 ]]; then
+      append_q ecrawl_walk Q5 "$rep" fail "${el:-}" 0 "exit=$st"
+    elif [[ -z "$files" ]]; then
+      append_q ecrawl_walk Q5 "$rep" fail "${el:-}" 0 "no_files_line_in_census"
+    else
+      append_q ecrawl_walk Q5 "$rep" ok "${el:-}" "$files" "walk_count_dtype"
+    fi
   fi
 }
 

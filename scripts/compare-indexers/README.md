@@ -607,8 +607,12 @@ The **ecrawl (live walk)** row answers Q1, Q2 and Q6 with the same term and
 paths holding the needle straight off the names-only walk, so the timed cost is
 the multithreaded traversal plus a short `grep`. It is fd's live-search peer —
 the trigram index answers faster, but only after a crawl and a build; the live
-walk answers on a cold tree with nothing stored. It is skipped for Q3–Q5:
-`--no-stat` reads no inodes, so it has no size or type predicate to select with.
+walk answers on a cold tree with nothing stored. Q5 it answers with a count
+rather than a search: `ecrawl --no-stat --count <subtree>` tallies `d_type`
+under the seeded subtree, so the regular-file total comes straight off the walk
+with no inodes read — the live counterpart to `ecrawl_query`'s dir-index answer.
+It is still skipped for Q3 and Q4: those need a size threshold or a byte total,
+which live in the inode and `--no-stat` does not read.
 
 Q3, Q4 and Q5 go to `ecrawl_query`, which selects records straight out of the
 capture: `--size-gt N` for the size predicate, `--subtree DIR` for the two
