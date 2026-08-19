@@ -393,22 +393,22 @@ GUFI_DIR2INDEX = [("gufi", "plain"), ("gufi", "rollup_index")]
 PIPELINE_PHASES = [
     (
         "ecrawl + ereport_index",
-        [("crawl", [("ecrawl", "write")]), ("trigram index", [("ereport_index", "make")])],
+        [("crawl", [("ecrawl", "write")]), ("index", [("ereport_index", "make")])],
     ),
     # Crawl-only statx variants: the capture is identical to ecrawl/write, so
     # there is no index half to re-measure.
     ("ecrawl --statx", [("crawl", [("ecrawl", "write_statx")])]),
     ("ecrawl --io_uring", [("crawl", [("ecrawl", "write_iouring")])]),
-    ("GUFI (dir2index)", [("dir2index", GUFI_DIR2INDEX)]),
+    ("GUFI (dir2index)", [("index", GUFI_DIR2INDEX)]),
     (
         "GUFI + rollup",
-        [("dir2index", GUFI_DIR2INDEX), ("rollup", [("gufi", "rollup_step")])],
+        [("index", GUFI_DIR2INDEX), ("rollup", [("gufi", "rollup_step")])],
     ),
     # The scan fills index-free tables, which is not a database anyone queries,
     # so what Robinhood costs is the scan plus the three CREATE INDEX statements.
     (
         "robinhood (scan + indexes)",
-        [("scan", [("robinhood", "scan")]), ("indexes", [("robinhood", "indexes")])],
+        [("crawl", [("robinhood", "scan")]), ("index", [("robinhood", "indexes")])],
     ),
 ]
 

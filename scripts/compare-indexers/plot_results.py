@@ -49,7 +49,7 @@ PIPELINES = [
         "ecrawl + ereport_index",
         [
             ((("ecrawl", "write"),), "crawl"),
-            ((("ereport_index", "make"),), "trigram index"),
+            ((("ereport_index", "make"),), "index"),
         ],
         "ecrawl",  # label when only the first phase ran
     ),
@@ -60,8 +60,8 @@ PIPELINES = [
         # billed Robinhood for half of what it costs.
         "Robinhood",
         [
-            ((("robinhood", "scan"),), "scan"),
-            ((("robinhood", "indexes"),), "indexes"),
+            ((("robinhood", "scan"),), "crawl"),
+            ((("robinhood", "indexes"),), "index"),
         ],
         "Robinhood (scan only)",
     ),
@@ -79,13 +79,13 @@ PIPELINES = [
         [((("ecrawl", "write_iouring"),), "crawl")],
         "ecrawl\n(--io_uring)",
     ),
-    ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "dir2index")], None),
+    ("GUFI (dir2index)", [(GUFI_DIR2INDEX, "index")], None),
     (
         # An alternative to the row above, never an addition to it: rollup is a
         # second pass over the index that copies each directory's rows up into
         # its ancestors so a query opens fewer databases.
         "GUFI + rollup",
-        [(GUFI_DIR2INDEX, "dir2index"), ((("gufi", "rollup_step"),), "rollup")],
+        [(GUFI_DIR2INDEX, "index"), ((("gufi", "rollup_step"),), "rollup")],
         None,
     ),
     ("XDU", [((("xdu", "index"),), "index")], None),
@@ -903,6 +903,39 @@ def fits_inside(fig, axis, value, text, fontsize=7.5):
     return width_pt > 0.55 * fontsize * len(text) + 14
 
 
+def _segment_value_labels(axis, y, parts, dataset_index, n_datasets, bar_h,
+                          log, formatter):
+    """One value label per phase, centred on its own segment of the bar.
+
+    The labels sit just off the bar -- above the upper bar of a multi-cache
+    row, below the lower one -- so they land in the gaps between rows rather
+    than on a neighbouring bar. On a log axis a segment's visual centre is the
+    geometric mean of its ends, and the first segment's left edge is the axis
+    minimum (the bar is drawn from 0, which the log scale clamps away).
+    """
+    offset = bar_h * 0.43 + 0.05
+    above = dataset_index <= (n_datasets - 1) / 2.0
+    label_y = y - offset if above else y + offset
+    low = axis.get_xlim()[0]
+    left = 0.0
+    for name, value in parts:
+        a = max(left, low) if log else left
+        b = left + value
+        center = math.sqrt(a * b) if log and a > 0 else (a + b) / 2.0
+        axis.text(
+            center,
+            label_y,
+            "{} {}".format(formatter(value), name),
+            va="center",
+            ha="center",
+            fontsize=7,
+            color="#444444",
+            clip_on=False,
+            zorder=6,
+        )
+        left += value
+
+
 def index_figure(datasets, out_dir, spec):
     """One figure, one horizontal ranking.
 
@@ -1072,7 +1105,7 @@ def index_figure(datasets, out_dir, spec):
             # Labels are placed once the axis limits are final, because whether
             # a split fits inside its bar depends on them.
             pending.append(
-                (row, dataset_index, y, mean, std, text, split, note, segmented)
+                (row, dataset_index, y, mean, std, text, split, note, segmented, parts)
             )
 
     axis.set_yticks(positions)
@@ -1117,6 +1150,9 @@ def index_figure(datasets, out_dir, spec):
     # last-rep byte or two, which used to force a three-line label onto each
     # bar and stack them on top of each other. Always one label there, parked
     # past the longer bar. Other figures still split when the texts differ.
+    # Per-segment labels need every bar's own phase list, so a row cannot
+    # collapse to one shared label the way the size figure does.
+    seg_labels = spec.get("segment_labels")
     placed = []
     if multi:
         by_row = {}
@@ -1126,24 +1162,36 @@ def index_figure(datasets, out_dir, spec):
             items = by_row[row]
             keys = [
                 (text, split, note, segmented)
-                for _r, _i, _y, _m, _s, text, split, note, segmented in items
+                for _r, _i, _y, _m, _s, text, split, note, segmented, _p in items
             ]
-            share = spec.get("per_file") or (len(items) > 1 and len(set(keys)) == 1)
+            share = not seg_labels and (
+                spec.get("per_file") or (len(items) > 1 and len(set(keys)) == 1)
+            )
             if share:
                 pick = max(items, key=lambda it: it[3] if it[3] is not None else -1)
-                _r, _i, _y, mean, std, text, split, note, segmented = pick
-                placed.append((positions[row], mean, std, text, split, note, segmented))
+                _r, di, _y, mean, std, text, split, note, segmented, parts = pick
+                placed.append(
+                    (positions[row], mean, std, text, split, note, segmented, parts, di)
+                )
             else:
-                for _r, _i, y, mean, std, text, split, note, segmented in items:
-                    placed.append((y, mean, std, text, split, note, segmented))
+                for _r, di, y, mean, std, text, split, note, segmented, parts in items:
+                    placed.append(
+                        (y, mean, std, text, split, note, segmented, parts, di)
+                    )
     else:
-        for _r, _i, y, mean, std, text, split, note, segmented in pending:
-            placed.append((y, mean, std, text, split, note, segmented))
+        for _r, di, y, mean, std, text, split, note, segmented, parts in pending:
+            placed.append((y, mean, std, text, split, note, segmented, parts, di))
 
-    for y, mean, std, text, split, note, segmented in placed:
+    for y, mean, std, text, split, note, segmented, parts, di in placed:
         end = mean + (std or 0)
         sub = note or None
-        if split:
+        if segmented and seg_labels and parts:
+            # Each phase value sits on its own segment, so the end of the bar
+            # keeps just the total.
+            _segment_value_labels(
+                axis, y, parts, di, len(datasets), bar_h, log, formatter
+            )
+        elif split:
             # A segmented bar's numbers go underneath the value, where they
             # cannot fight the segment boundary; the per-file note takes a
             # second line there rather than replacing them.
@@ -1309,6 +1357,12 @@ INDEX_FIGURES = [
         "formatter": fmt_seconds,
         "xlabel": "Elapsed seconds",
         "floor": True,
+        # Build bars split into their crawl/index phases even on the log axis,
+        # each phase value sitting on its own segment (Figure 5 does the same
+        # for size). The reader tuning a pipeline needs the per-phase numbers,
+        # not just the total.
+        "segment_log": True,
+        "segment_labels": True,
         # The dashed line explains itself where it is drawn.
     },
     {
@@ -1961,15 +2015,15 @@ def plot_queries(datasets, out_dir):
 ANSWER_BUILD_PHASES = {
     "ereport_index": [
         ((("ecrawl", "write"),), "crawl"),
-        ((("ereport_index", "make"),), "trigram index"),
+        ((("ereport_index", "make"),), "index"),
     ],
     "Robinhood": [
-        ((("robinhood", "scan"),), "scan"),
-        ((("robinhood", "indexes"),), "indexes"),
+        ((("robinhood", "scan"),), "crawl"),
+        ((("robinhood", "indexes"),), "index"),
     ],
-    "GUFI": [((("gufi", "plain"),), "dir2index")],
+    "GUFI": [((("gufi", "plain"),), "index")],
     "GUFI + rollup": [
-        ((("gufi", "rollup_index"),), "dir2index"),
+        ((("gufi", "rollup_index"),), "index"),
         ((("gufi", "rollup_step"),), "rollup"),
     ],
     "XDU": [((("xdu", "index"),), "index")],
@@ -1983,7 +2037,7 @@ def answer_build_phases(label, query):
         # sidecars that the same ereport_index --make build wrote.
         phases = [((("ecrawl", "write"),), "crawl")]
         if query in ("Q4", "Q5"):
-            phases.append(((("ereport_index", "make"),), "trigram index"))
+            phases.append(((("ereport_index", "make"),), "index"))
         return phases
     return ANSWER_BUILD_PHASES.get(label, [])
 

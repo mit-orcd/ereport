@@ -418,9 +418,13 @@ compares directly with a bar on page one.
 The two rate figures use the same words as everything else here: a tool either
 **walks** the tree (Figures 1 and 2) or **builds** an index from it (Figures 3
 and 4), the denominator of both rates is the same file count, and both say
-*files per second*. Phase names inside a bar — `crawl`, `scan`, `dir2index`,
-`rollup`, `indexes`, `trigram index` — are the tools' own names for their own
-commands, and are the one place the vocabulary varies on purpose.
+*files per second*. Phase names inside a bar are standardised so the same word
+means the same thing for every tool: `crawl` for the pass that reads the tree
+(ecrawl's capture, Robinhood's scan), `index` for the pass that makes it
+queryable (the ereport_index build, Robinhood's `CREATE INDEX`s, GUFI's
+`dir2index`), and `rollup` for GUFI's optional second pass that copies rows up
+the tree. Figure 3 segments each build bar into those phases and labels every
+segment with its own value; Figure 5 does the same for the bytes they write.
 
 Two questions, each asked twice. **Elapsed seconds** are what actually happened
 and are exactly the `elapsed_s` column of `SUMMARY_TABLE.txt` — no conversion,
