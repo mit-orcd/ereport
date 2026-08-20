@@ -1748,6 +1748,28 @@ def plot_index(datasets, out_dir):
     return outputs, figures
 
 
+# A panel note sits under the title at fontsize 7.5; the panel is ~6.8in wide,
+# so ~115 chars a line keeps the wrapped note inside the page's right edge.
+NOTE_WRAP_CHARS = 115
+
+
+def _panel_note(axis, title, notes):
+    """Panel title with the footnote wrapped under it, so a long note stays on
+    the page instead of running off the right edge."""
+    if not notes:
+        axis.set_title(title, fontsize=10, fontweight="bold", loc="left", pad=6)
+        return
+    lines = textwrap.wrap("  ·  ".join(notes), NOTE_WRAP_CHARS) or [""]
+    axis.set_title(
+        title, fontsize=10, fontweight="bold", loc="left", pad=6 + 9 * len(lines)
+    )
+    axis.text(
+        0.0, 1.01, "\n".join(lines), transform=axis.transAxes,
+        fontsize=7.5, color="#666666", va="bottom", ha="left",
+        linespacing=1.3, clip_on=False,
+    )
+
+
 def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
     """One Letter portrait page: three query panels for a single cache state.
 
@@ -1810,10 +1832,9 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
             key=lambda tool: stats[(tool, query)][0],
         )
         positions = list(range(len(entries)))
-        # Reason -> the tools it applies to, for the bars that missed the
-        # reference because they answer a different question.
-        semantics = {}
-        mismatch_notes = []
+        # The ✗ bars' "answered N, not M" detail moved to Figure 8; the panel
+        # only needs to know one is there so it can point at that page.
+        any_wrong = False
         for y, tool in zip(positions, entries):
             mean, std = stats[(tool, query)]
             mismatch = wrong_answer(dataset["queries"], reference, tool, query)
@@ -1836,19 +1857,10 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
                 )
             text = fmt_seconds(mean)
             if wrong:
-                # Keep the bar label short; the full disagreement goes in the
-                # panel note so a long "answered N, not M" cannot run into the
-                # next bar or the panel above.
-                answered, expected_value, ref_tool = mismatch
+                # The cross on the bar points to Figure 8, which lists what
+                # the tool answered instead and why; this panel has no room.
                 text += "  \u2717"
-                mismatch_notes.append(
-                    "{} answered {:,}, not {:,} (per {})".format(
-                        tool, answered, expected_value, ref_tool
-                    )
-                )
-                why = ANSWER_SEMANTICS.get((tool, query))
-                if why:
-                    semantics.setdefault(why, []).append(tool)
+                any_wrong = True
             bar_label(
                 axis,
                 y,
@@ -1892,39 +1904,28 @@ def query_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
                 missing["rollup"].append(tool)
             else:
                 missing["unsupported"].append(tool)
-        notes = list(mismatch_notes)
-        for why, who in semantics.items():
-            notes.append("{}: {}".format(", ".join(who), why))
+        # Wrong answers and failures are itemised on the Figure 8 page; the
+        # panel just marks them and points there. Only the by-design gaps (no
+        # primitive, needs the rollup) keep an inline note, because Figure 8
+        # counts those without listing them.
+        see8 = []
+        if any_wrong:
+            see8.append("✗ answer differs from the reference")
+        if missing["failed"]:
+            see8.append("failed to run")
+        notes = []
+        if see8:
+            notes.append("; ".join(see8) + " — see Figure 8")
         if missing["rollup"]:
             notes.append(
                 "needs the rolled-up index: " + ", ".join(missing["rollup"])
             )
         if missing["unsupported"]:
             notes.append("no equivalent query: " + ", ".join(missing["unsupported"]))
-        if missing["failed"]:
-            notes.append("failed: " + ", ".join(missing["failed"]))
         # Notes sit under the title, not in the plot: top-right annotations
         # collided with short bars' value labels and with long bars that reach
         # the right edge.
-        axis.set_title(
-            title,
-            fontsize=10,
-            fontweight="bold",
-            loc="left",
-            pad=14 if notes else 6,
-        )
-        if notes:
-            axis.text(
-                0.0,
-                1.01,
-                "  \u00b7  ".join(notes),
-                transform=axis.transAxes,
-                fontsize=7.5,
-                color="#666666",
-                va="bottom",
-                ha="left",
-                clip_on=False,
-            )
+        _panel_note(axis, title, notes)
 
     axes[-1][0].set_xlabel("Elapsed time (log scale)", fontsize=9, labelpad=6)
 
@@ -2174,8 +2175,9 @@ def answer_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
             key=lambda tool: bars[(tool, query)][1][0],
         )
         positions = list(range(len(entries)))
-        semantics = {}
-        mismatch_notes = []
+        # The ✗ bars' "answered N, not M" detail moved to Figure 8; the panel
+        # only needs to know one is there so it can point at that page.
+        any_wrong = False
         for y, tool in zip(positions, entries):
             segments, (mean, std) = bars[(tool, query)]
             mismatch = wrong_answer(dataset["queries"], reference, tool, query)
@@ -2203,16 +2205,10 @@ def answer_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
                 )
             text = fmt_seconds(mean)
             if wrong:
-                answered, expected_value, ref_tool = mismatch
+                # The cross on the bar points to Figure 8, which lists what
+                # the tool answered instead and why; this panel has no room.
                 text += "  ✗"
-                mismatch_notes.append(
-                    "{} answered {:,}, not {:,} (per {})".format(
-                        tool, answered, expected_value, ref_tool
-                    )
-                )
-                why = ANSWER_SEMANTICS.get((tool, query))
-                if why:
-                    semantics.setdefault(why, []).append(tool)
+                any_wrong = True
             bar_label(
                 axis,
                 y,
@@ -2238,10 +2234,11 @@ def answer_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
 
         title = "{}  ·  {}".format(query, QUERY_TITLES.get(query, ""))
 
-        # Say why a tool has no bar, split the same way Figure 6 splits it,
-        # plus the one cause Figure 6 cannot have: a query that ran against
-        # an index whose build never succeeded here.
-        missing = {"unsupported": [], "failed": [], "rollup": [], "build": []}
+        # Say why a tool has no bar, split the same way Figure 6 splits it. A
+        # tool with no row for the query (state None) simply does not answer it
+        # -- ereport_index has no byte-total Q4, ecrawl_query covers the suite
+        # there -- so that is by design, not a build failure, and gets no note.
+        missing = {"unsupported": [], "failed": [], "rollup": []}
         for tool in QUERY_ORDER:
             state = states.get((tool, query))
             if state == "fail":
@@ -2251,40 +2248,24 @@ def answer_figure(dataset, queries, rows_per_query, bounds, page_no, pages):
                     missing["rollup"].append(tool)
                 else:
                     missing["unsupported"].append(tool)
-            elif (tool, query) not in bars:
-                missing["build"].append(tool)
-        notes = list(mismatch_notes)
-        for why, who in semantics.items():
-            notes.append("{}: {}".format(", ".join(who), why))
+        # Wrong answers and failures are itemised on the Figure 8 page; the
+        # panel just marks them and points there. Only the by-design gaps keep
+        # an inline note (Figure 8 counts, not lists, them).
+        see8 = []
+        if any_wrong:
+            see8.append("✗ answer differs from the reference")
+        if missing["failed"]:
+            see8.append("failed to run")
+        notes = []
+        if see8:
+            notes.append("; ".join(see8) + " — see Figure 8")
         if missing["rollup"]:
             notes.append(
                 "needs the rolled-up index: " + ", ".join(missing["rollup"])
             )
         if missing["unsupported"]:
             notes.append("no equivalent query: " + ", ".join(missing["unsupported"]))
-        if missing["failed"]:
-            notes.append("failed: " + ", ".join(missing["failed"]))
-        if missing["build"]:
-            notes.append("no successful build row: " + ", ".join(missing["build"]))
-        axis.set_title(
-            title,
-            fontsize=10,
-            fontweight="bold",
-            loc="left",
-            pad=14 if notes else 6,
-        )
-        if notes:
-            axis.text(
-                0.0,
-                1.01,
-                "  ·  ".join(notes),
-                transform=axis.transAxes,
-                fontsize=7.5,
-                color="#666666",
-                va="bottom",
-                ha="left",
-                clip_on=False,
-            )
+        _panel_note(axis, title, notes)
 
     axes[-1][0].set_xlabel("Elapsed time (log scale)", fontsize=9, labelpad=6)
 
@@ -2628,7 +2609,7 @@ class _SummaryPage:
 def _failures_page(summary):
     """Render the collected failures onto one or more pages."""
     pager = _SummaryPage()
-    pager.text("What didn't go well", fs=13, weight="bold", height=0.030)
+    pager.text("Figure 8: what didn't go well", fs=13, weight="bold", height=0.030)
     n_wrong = len(summary["wrong"])
     n_failed = len(summary["failed"])
     n_build = len(summary["builds"])
