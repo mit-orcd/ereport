@@ -147,6 +147,31 @@ export TOOLS="$TOOLS_Q"
 
 "$COMPARE_DIR/run_queries.sh" "$SYNTH_ROOT" "$RESULTS_ROOT/queries"
 
+# Figure 9 describes the tree from these; keep them with the results so the
+# chart deck can be re-rendered without the synth root still being around.
+for f in FIXTURE_MANIFEST.txt QUERY_SEEDS.txt; do
+  [[ -f "$SYNTH_ROOT/$f" ]] && cp "$SYNTH_ROOT/$f" "$RESULTS_ROOT/$f" || true
+done
+
+# Measured per-subdirectory counts for Figure 9. The generator manifest's
+# [derived] counts are computed from the build parameters, so they can disagree
+# with the tree as built; walk each top-level directory (in parallel) instead.
+_stats_tmp=$(mktemp -d)
+for d in "$SYNTH_ROOT"/*/; do
+  d=${d%/}
+  (
+    find "$d" -printf '%y\n' 2>/dev/null | awk -v n="${d##*/}" '
+      {if ($1=="f") f++; else if ($1=="d") dd++; else if ($1=="l") l++}
+      END {printf "%s\t%d\t%d\t%d\n", n, f, dd, l}'
+  ) >"$_stats_tmp/${d##*/}" &
+done
+wait
+{
+  echo "# Measured per-subdirectory counts: name, files, dirs, symlinks (find -printf '%y')"
+  cat "$_stats_tmp"/*
+} >"$RESULTS_ROOT/TREE_STATS.txt"
+rm -rf "$_stats_tmp"
+
 python3 "$COMPARE_DIR/summarize.py" "$RESULTS_ROOT/index" "$RESULTS_ROOT/queries" \
   --out "$RESULTS_ROOT/SUMMARY_TABLE.txt" >/dev/null
 

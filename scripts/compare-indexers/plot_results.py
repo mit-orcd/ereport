@@ -12,6 +12,7 @@ matching the paper's Set 1 / Set 2 comparison.
 import argparse
 import csv
 import math
+import re
 import statistics
 import sys
 import textwrap
@@ -2605,6 +2606,28 @@ class _SummaryPage:
             x += width
         self.y -= self.LINE
 
+    def command_line(self, command):
+        """One shell command on a single line, syntax-highlighted. The font
+        shrinks to fit rather than wrapping, so a copy-paste stays one line."""
+        x0 = self.left + 0.035
+        avail = self.right - x0
+
+        def char_w(fs):
+            return (fs * CMD_CHAR_EM / 72.0) / self.page_w
+
+        fs = CMD_FS
+        if len(command) * char_w(fs) > avail:
+            fs = avail / (len(command) * CMD_CHAR_EM / 72.0 / self.page_w)
+            fs = max(4.5, fs)
+        self.ensure(self.LINE)
+        x = x0
+        for index, token in enumerate(command.split()):
+            color, weight = _cmd_token_style(token, index)
+            self.fig.text(x, self.y, token, family="monospace", fontsize=fs,
+                          color=color, fontweight=weight, va="top", ha="left")
+            x += (len(token) + 1) * char_w(fs)
+        self.y -= self.LINE
+
 
 def _failures_page(summary):
     """Render the collected failures onto one or more pages."""
@@ -2729,6 +2752,397 @@ def plot_failures(datasets, out_dir):
     return outputs, figures
 
 
+# --- Figure 9: test data & command reference ------------------------------
+
+# What each generated subdirectory of the synth tree is *for*. The counts come
+# from FIXTURE_MANIFEST.txt (copied into the results dir by run_smoke.sh); the
+# intent lives here because the manifest records counts, not purpose.
+# Largest first, so the layout reads as "what dominates the tree" down to the
+# edge cases. query_seeds is described separately (it holds the Q1-Q6 seeds).
+SYNTH_SUBDIR_ORDER = [
+    "single_huge_dir",
+    "wide_shallow",
+    "one_dir",
+    "few_dirs",
+    "many_dirs",
+    "ereport_badge_fixtures",
+    "neutral_flat",
+    "depth_slash_profile",
+    "links_and_specials",
+    "deep_skinny_chain",
+    "real_large_files",
+]
+SYNTH_SUBDIR_NOTES = {
+    "single_huge_dir": "one flat megadir of tiny regular files, sharded into "
+                       "per-directory buckets; pins a crawl thread on readdir "
+                       "+ fstatat",
+    "wide_shallow": "many sibling directories with a moderate file count each; "
+                    "the wide-fanout, parallel-friendly case",
+    "one_dir": "1M files in a single flat directory - the flat end of the "
+               "directory-fanout series",
+    "few_dirs": "the same 1M files spread across ~200 directories",
+    "many_dirs": "the same 1M files spread across ~200,000 directories - the "
+                 "fanout extreme of the series",
+    "ereport_badge_fixtures": "heat-map badge cells (skew / dense / deep / "
+                              "multi-age) for the ereport report",
+    "neutral_flat": "many shallow files in a hex-sharded directory tree; "
+                    "dilutes the heat-map margins",
+    "depth_slash_profile": "a path-depth distribution: a mass of files at mid "
+                           "depth and a deep plateau",
+    "links_and_specials": "symlinks (relative, absolute, broken, to-directory, "
+                          "chained), hardlinks and sparse targets",
+    "deep_skinny_chain": "a deep chain of single-child directories; almost no "
+                         "parallelism until the wide part is done",
+    "real_large_files": "genuinely written, non-sparse large files",
+}
+QUERY_SEED_NOTES = {
+    "Q1": "one unique planted basename (answer: 1)",
+    "Q2": "a glob family with a near-miss control (answer: 5)",
+    "Q3": "sparse files planted above and below the threshold (answer: 5)",
+    "Q4": "total bytes under query_seeds/large_subdir",
+    "Q5": "files under query_seeds/large_subdir (the 2000-file bulk/ dir)",
+    "Q6": "a mid-name token with directory and prefix controls (answer: 7)",
+}
+
+# (display name, build base-labels, query label prefix) in deck order. The base
+# label is the COMMANDS.txt label with the _rN[_hot][_aN] suffix stripped.
+REFERENCE_TOOLS = [
+    ("ecrawl", ["ecrawl_write", "ecrawl_nowrite", "ecrawl_nostat"], None),
+    ("ereport_index", ["ereport_index"], "ereport_index"),
+    ("ecrawl_query", [], "ecrawl_query"),
+    ("ecrawl (live walk)", [], "ecrawl_walk"),
+    ("find", ["find_walk"], "find"),
+    ("fd", ["fd_walk"], "fd"),
+    ("du", ["du_walk"], "du"),
+    ("dua", ["dua_walk"], "dua"),
+    ("dut", ["dut_walk"], "dut"),
+    ("GUFI", ["gufi_plain"], "gufi"),
+    ("GUFI + rollup", ["gufi_rollup", "gufi_rollup_step"], "gufi_rollup"),
+    ("XDU", ["xdu"], "xdu"),
+    ("Robinhood", ["robinhood", "robinhood_indexes"], "robinhood"),
+]
+BUILD_LABEL_NOTES = {
+    "ecrawl_write": "crawl + write paths.bin",
+    "ecrawl_nowrite": "crawl only, nothing written (walk baseline)",
+    "ecrawl_nostat": "crawl with no stat, count only (fastest walk)",
+    "ereport_index": "build the name index from paths.bin",
+    "find_walk": "walk + count files",
+    "fd_walk": "walk + count files",
+    "du_walk": "walk + total bytes",
+    "dua_walk": "walk + total bytes",
+    "dut_walk": "walk + total bytes",
+    "gufi_plain": "dir2index (per-directory index)",
+    "gufi_rollup": "dir2index (for the rolled-up index)",
+    "gufi_rollup_step": "rollup the per-directory index",
+    "xdu": "build the index",
+    "robinhood": "scan the tree into MariaDB",
+    "robinhood_indexes": "create the SQL indexes",
+}
+
+
+def _load_fixture_manifest(source):
+    """[derived] per-subdirectory counts + header, from FIXTURE_MANIFEST.txt."""
+    info = {"dirs": {}, "total": None, "symlinks": None, "profile": None,
+            "root": None, "host": None}
+    try:
+        lines = (Path(source) / "FIXTURE_MANIFEST.txt").read_text().splitlines()
+    except OSError:
+        return info
+    section = None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = line.strip("[]")
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if section == "params" and key == "SYNTH_PROFILE":
+            info["profile"] = value
+        elif section == "derived":
+            if key == "total.files":
+                info["total"] = value
+            elif key == "total.symlinks":
+                info["symlinks"] = value
+            elif key.endswith(".files"):
+                info["dirs"][key[:-len(".files")]] = value
+        elif section is None:
+            if key == "root":
+                info["root"] = value
+            elif key == "host":
+                info["host"] = value
+    return info
+
+
+def _load_tree_stats(source):
+    """name -> (files, dirs, symlinks), from the measured TREE_STATS.txt.
+
+    These are walked off the finished tree, so unlike the generator manifest's
+    [derived] counts (computed from build parameters) they match the tree as
+    it actually stood at benchmark time.
+    """
+    stats = {}
+    try:
+        lines = (Path(source) / "TREE_STATS.txt").read_text().splitlines()
+    except OSError:
+        return stats
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        try:
+            stats[parts[0].strip()] = (
+                int(parts[1]), int(parts[2]), int(parts[3]))
+        except ValueError:
+            continue
+    return stats
+
+
+def _load_command_reference(source):
+    """base label -> clean command, first occurrence wins, in execution order.
+
+    The base label strips the _rN[_hot][_aN] rep/cache/arg-set suffix, so one
+    command stands for all its repetitions. The unescaped '(as written)' form
+    is preferred over the %q-escaped argv where the logger recorded one; a
+    multi-line '(as written)' block (the fd walk) is joined onto one line.
+    """
+    commands = {}
+    for sub in ("index", "queries"):
+        try:
+            lines = (Path(source) / sub / "COMMANDS.txt").read_text().splitlines()
+        except OSError:
+            continue
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) < 3 or not parts[0][:1].isdigit():
+                continue
+            label, argv = parts[1].strip(), parts[2].strip()
+            clean = argv
+            if i < len(lines):
+                marker = lines[i].split("\t", 2)
+                if len(marker) >= 3 and marker[1].strip() == "(as written)":
+                    block = [marker[2]]
+                    i += 1
+                    while i < len(lines) and lines[i] and \
+                            not lines[i][0].isdigit() and \
+                            not lines[i].startswith("#"):
+                        block.append(lines[i])
+                        i += 1
+                    clean = "; ".join(x.strip() for x in block if x.strip())
+            base = re.sub(r"_r\d+(_hot)?(_a\d+)?$", "", label)
+            if base and base not in commands:
+                commands[base] = clean
+    return commands
+
+
+def _command_vars(env, commands):
+    """Long as-run path -> short $VAR, so the reference commands fit on one
+    line and are easy to reuse: set the vars (listed above the commands), then
+    paste any of them. Returns (substitutions longest-path-first, legend)."""
+    pairs = []
+
+    def add(path, var):
+        if path:
+            pairs.append((path, var))
+
+    add(env.get("rbh_config_fs_path"), "$TREE")
+    add(env.get("work_root"), "$INDEXES")
+    add(env.get("rbh_config"), "$RBH_CONF")
+    for key in ("gufi_dir2index", "xdu_bin", "rbh_scan", "dut_bin"):
+        path = env.get(key, "")
+        base = None
+        for marker in ("/bin/", "/sbin/"):
+            if marker in path:
+                base = path.split(marker)[0]
+                break
+        if base:
+            add(base, "$PREFIX")
+            break
+    ecrawl = env.get("ecrawl_bin", "")
+    if "/" in ecrawl:
+        add(ecrawl.rsplit("/", 1)[0], "$EREPORT")
+    # The results dir is not in env.txt; recover it from a command path that
+    # writes under .../index/ or .../queries/ (the dua sentinel, rbh SQL).
+    for cmd in commands.values():
+        match = re.search(r"(/\S*?)/(?:index|queries)/", cmd)
+        if match:
+            add(match.group(1), "$RESULTS")
+            break
+    # Longest path first, so a nested path is replaced before its parent.
+    subs = sorted(set(pairs), key=lambda pair: len(pair[0]), reverse=True)
+    legend_order = ["$TREE", "$INDEXES", "$RESULTS", "$PREFIX", "$EREPORT",
+                    "$RBH_CONF"]
+    legend = sorted(
+        ((var, path) for path, var in subs),
+        key=lambda pair: legend_order.index(pair[0])
+        if pair[0] in legend_order else len(legend_order),
+    )
+    return subs, legend
+
+
+def _reference_page(source, total_files=None):
+    """Render the test-data layout and the per-tool command reference."""
+    manifest = _load_fixture_manifest(source)
+    tree_stats = _load_tree_stats(source)
+    commands = _load_command_reference(source)
+    env = find_kv(Path(source), "env.txt")
+    subs, legend = _command_vars(env, commands)
+
+    def shorten(cmd):
+        for path, var in subs:
+            cmd = cmd.replace(path, var)
+        return cmd
+
+    pager = _SummaryPage()
+    pager.text("Figure 9: test data & command reference", fs=13, weight="bold",
+               height=0.030)
+
+    # -- the test data --
+    pager.text("The test data", fs=11, weight="bold", height=0.026)
+    if total_files is None and (manifest["total"] or "").isdigit():
+        total_files = int(manifest["total"])
+    if total_files is None and tree_stats:
+        total_files = sum(files for files, _, _ in tree_stats.values())
+    total_str = "{:,}".format(total_files) if total_files else "several million"
+    pager.paragraph(
+        "A synthetic tree at {}, {} regular files across these subdirectories "
+        "(plus the planted query seeds). Each stresses a different crawl "
+        "shape. The file and directory counts are measured off the tree as "
+        "benchmarked, not from the generator's parameters.".format(
+            manifest["root"] or "<synth root>", total_str),
+        fs=9, color="#555555", height=0.018)
+    pager.gap(0.006)
+
+    def count_str(name):
+        if name in tree_stats:
+            files, dirs, symlinks = tree_stats[name]
+            parts = ["{:,} files".format(files), "{:,} dirs".format(dirs)]
+            if symlinks:
+                parts.append("{:,} symlinks".format(symlinks))
+            return " · ".join(parts)
+        # Fall back to the generator manifest's file count (no dir count).
+        files = manifest["dirs"].get(name)
+        if (files or "").isdigit():
+            return "{:,} files".format(int(files))
+        return ""
+
+    for name in SYNTH_SUBDIR_ORDER:
+        note = SYNTH_SUBDIR_NOTES.get(name)
+        if not note:
+            continue
+        label = name + "/"
+        counts = count_str(name)
+        if counts:
+            label += "   " + counts
+        pager.text(label, fs=9.5, weight="bold", family="monospace",
+                   height=0.020)
+        pager.paragraph(note, indent=0.03, fs=8.5, color="#555555",
+                        height=0.017, width_chars=104)
+    seeds_label = "query_seeds/"
+    seeds_counts = count_str("query_seeds")
+    if seeds_counts:
+        seeds_label += "   " + seeds_counts
+    pager.text(seeds_label, fs=9.5, weight="bold", family="monospace",
+               height=0.020)
+    pager.paragraph(
+        "the planted Q1-Q6 artifacts (large_subdir, named, infix):",
+        indent=0.03, fs=8.5, color="#555555", height=0.017, width_chars=104)
+    for query in QUERIES:
+        note = QUERY_SEED_NOTES.get(query, "")
+        pager.text(
+            "{} — {}:  {}".format(query, QUERY_TITLES.get(query, query), note),
+            indent=0.05, fs=8.5, height=0.018)
+    pager.gap(0.014)
+
+    # -- the commands --
+    pager.ensure(0.08)
+    pager.text("The commands", fs=11, weight="bold", height=0.026)
+    pager.paragraph(
+        "The exact command each tool ran, one per build or query (rep 1; the "
+        "other reps and cache states repeat it unchanged). Each is a single "
+        "line, so it copies and pastes cleanly. The long benchmark paths are "
+        "written as the variables below - set them once, then any command "
+        "runs as shown. In a bash -c wrapper, $1 / $2 are the walk tree and "
+        "extra arguments.",
+        fs=9, color="#555555", height=0.018)
+    pager.gap(0.006)
+    if legend:
+        for var, path in legend:
+            pager.ensure(pager.LINE)
+            pager.fig.text(pager.left + 0.035, pager.y, var + "=",
+                           family="monospace", fontsize=CMD_FS,
+                           color=CMD_FLAG, fontweight="bold", va="top",
+                           ha="left")
+            pager.fig.text(pager.left + 0.035
+                           + (len(var) + 1) * pager.char_w, pager.y, path,
+                           family="monospace", fontsize=CMD_FS,
+                           color=CMD_PATH, va="top", ha="left")
+            pager.y -= pager.LINE
+        pager.gap(0.010)
+    for display, build_labels, query_prefix in REFERENCE_TOOLS:
+        entries = []
+        for base in build_labels:
+            if base in commands:
+                entries.append((BUILD_LABEL_NOTES.get(base, base),
+                                commands[base]))
+        if query_prefix:
+            for query in QUERIES:
+                cmd = commands.get("{}_{}".format(query_prefix, query))
+                if cmd:
+                    entries.append(
+                        ("{} — {}".format(query, QUERY_TITLES.get(query, query)),
+                         cmd))
+        if not entries:
+            continue
+        pager.ensure(0.07)
+        pager.text(display, fs=10.5, weight="bold",
+                   color=COLORS.get(display, "#222222"), height=0.024)
+        for label, cmd in entries:
+            # The pipe-through-grep wrappers lead with a boilerplate
+            # 'set -o pipefail;' that adds nothing to a reference.
+            if cmd.startswith("set -o pipefail; "):
+                cmd = cmd[len("set -o pipefail; "):]
+            pager.text(label, indent=0.02, fs=8, color="#777777",
+                       family="monospace", height=0.017)
+            pager.command_line(shorten(cmd))
+        pager.gap(0.010)
+    return pager.figures
+
+
+def plot_reference(datasets, out_dir):
+    """Figure 9: the test-data layout and each tool's exact commands, appended
+    after the failures page in all_charts.pdf and saved on its own too."""
+    source = datasets[0]["source"] if datasets else "."
+    total_files = datasets[0].get("file_count") if datasets else None
+    figures = _reference_page(source, total_files)
+    for stale in out_dir.glob("figure9_reference*"):
+        stale.unlink()
+    outputs = []
+    for number, fig in enumerate(figures, start=1):
+        stem = ("figure9_reference" if len(figures) == 1
+                else "figure9_reference_p{}".format(number))
+        path = out_dir / (stem + ".png")
+        fig.savefig(str(path), dpi=200)
+        outputs.append(path)
+    pdf_path = out_dir / "figure9_reference.pdf"
+    with PdfPages(str(pdf_path)) as pdf:
+        for fig in figures:
+            pdf.savefig(fig)
+    outputs.append(pdf_path)
+    return outputs, figures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="+", type=Path)
@@ -2798,8 +3212,11 @@ def main():
     query_outputs, query_figures = plot_queries(datasets, out_dir)
     answer_outputs, answer_figures = plot_time_to_answer(datasets, out_dir)
     failure_outputs, failure_figures = plot_failures(datasets, out_dir)
-    outputs = index_outputs + query_outputs + answer_outputs + failure_outputs
-    figures = index_figures + query_figures + answer_figures + failure_figures
+    reference_outputs, reference_figures = plot_reference(datasets, out_dir)
+    outputs = (index_outputs + query_outputs + answer_outputs + failure_outputs
+               + reference_outputs)
+    figures = (index_figures + query_figures + answer_figures + failure_figures
+               + reference_figures)
     if not outputs:
         sys.stderr.write("ERROR: no successful benchmark rows to plot\n")
         return 1
