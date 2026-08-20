@@ -14,6 +14,7 @@ import csv
 import math
 import statistics
 import sys
+import textwrap
 from pathlib import Path
 
 try:
@@ -2394,6 +2395,359 @@ def plot_time_to_answer(datasets, out_dir):
     return outputs, figures
 
 
+# ---- "What didn't go well" summary page ----------------------------------
+#
+# Every figure before this one ranks the tools that worked. This page lists
+# the ones that did not: queries a tool answered with the wrong number (it ran
+# cleanly, the answer just is not the reference's) and queries that failed
+# outright, each next to the exact command that produced it so the row can be
+# reproduced. Skips are counted, not itemised: a tool with no primitive for a
+# question not running it is the design, not a defect.
+
+CMD_FS = 8.0
+# DejaVu Sans Mono advances ~0.602 em per glyph; close enough to wrap the
+# highlighted command without a renderer round-trip.
+CMD_CHAR_EM = 0.602
+CMD_BINARY = "#0B3D91"
+CMD_FLAG = "#7B2CBF"
+CMD_PATH = "#1B7A43"
+CMD_OP = "#8C8C8C"
+CMD_TEXT = "#222222"
+
+
+def _cmd_token_style(token, index):
+    """Colour and weight for one shell token: the binary, then operators,
+    flags, paths and plain arguments."""
+    if index == 0:
+        return CMD_BINARY, "bold"
+    if token in ("|", "||", "&&", ";") or ">" in token:
+        return CMD_OP, "normal"
+    if token.startswith("-"):
+        return CMD_FLAG, "normal"
+    if "/" in token:
+        return CMD_PATH, "normal"
+    return CMD_TEXT, "normal"
+
+
+def _load_commands(source):
+    """label -> exact argv, from the queries/ and index/ COMMANDS.txt logs."""
+    commands = {}
+    for sub in ("queries", "index"):
+        path = Path(source) / sub / "COMMANDS.txt"
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) < 3:
+                continue
+            commands.setdefault(parts[1].strip(), parts[2].strip())
+    return commands
+
+
+def _query_command(commands, csv_tool, query, arg_set, cache):
+    """The exact argv a (tool, query, argument set) ran, if it was logged.
+    Extra argument sets only run in the hot pass, so their label carries the
+    set number; set 1 runs cold and hot."""
+    labels = []
+    if arg_set and arg_set != "1":
+        labels.append("{}_{}_r1_hot_a{}".format(csv_tool, query, arg_set))
+    labels.append(
+        "{}_{}_r1{}".format(csv_tool, query, "_hot" if cache == "hot" else "")
+    )
+    labels.append("{}_{}_r1".format(csv_tool, query))
+    for label in labels:
+        if label in commands:
+            return commands[label]
+    prefix = "{}_{}_".format(csv_tool, query)
+    for label, command in commands.items():
+        if label.startswith(prefix):
+            return command
+    return None
+
+
+def _build_command(commands, tool, variant):
+    for label in (
+        "{}_{}_r1".format(tool, variant),
+        "{}_{}_r1_hot".format(tool, variant),
+    ):
+        if label in commands:
+            return commands[label]
+    prefix = "{}_{}_".format(tool, variant)
+    for label, command in commands.items():
+        if label.startswith(prefix):
+            return command
+    return None
+
+
+def collect_failures(datasets):
+    """Wrong answers, run failures and build failures, grouped for the page.
+
+    A wrong answer is an ok row whose count disagrees with the reference tool
+    (the same check that hatches a bar); a failure is a row that errored. Both
+    are grouped by (tool, query) so several argument sets of one cause read as
+    one item, and each carries the command that produced it.
+    """
+    display_to_csv = {label: tool for tool, label in QUERY_TOOL_LABELS.items()}
+    wrong = {}
+    failed = {}
+    builds = {}
+    skipped = set()
+    for dataset in datasets:
+        queries = dataset["queries"]
+        reference = reference_counts(queries)
+        cache = dataset.get("cache") or ""
+        commands = _load_commands(dataset["source"])
+        for (label, query, arg_set), value in sorted(queries["counts"].items()):
+            expected = reference.get((query, arg_set))
+            if not expected or expected[0] == label:
+                continue
+            if not count_disagrees(query, value, expected[1]):
+                continue
+            entry = wrong.setdefault((label, query), {
+                "tool": label, "query": query, "arg_sets": [],
+                "answered": value, "expected": expected[1], "ref": expected[0],
+                "command": None,
+            })
+            if arg_set not in entry["arg_sets"]:
+                entry["arg_sets"].append(arg_set)
+            if entry["command"] is None:
+                entry["command"] = _query_command(
+                    commands, display_to_csv.get(label, label), query, arg_set,
+                    cache)
+        for (label, query), status in sorted(queries["states"].items()):
+            if status == "fail":
+                entry = failed.setdefault((label, query), {
+                    "tool": label, "query": query,
+                    "note": (queries["notes"].get((label, query)) or "error"),
+                    "command": None,
+                })
+                if entry["command"] is None:
+                    entry["command"] = _query_command(
+                        commands, display_to_csv.get(label, label), query, "1",
+                        cache)
+            elif status == "skipped":
+                skipped.add((label, query))
+        for row in dataset.get("index_rows", []):
+            status = (row.get("status") or "").strip()
+            if not status or status == "ok":
+                continue
+            key = (row.get("tool", ""), row.get("variant", ""))
+            entry = builds.setdefault(key, {
+                "tool": key[0], "variant": key[1], "status": status,
+                "note": (row.get("notes") or "").strip(), "command": None,
+            })
+            if entry["command"] is None:
+                entry["command"] = _build_command(commands, key[0], key[1])
+    order = {tool: index for index, tool in enumerate(QUERY_ORDER)}
+
+    def by_deck(entry):
+        return (order.get(entry["tool"], len(order)), entry.get("query", ""))
+
+    return {
+        "wrong": sorted(wrong.values(), key=by_deck),
+        "failed": sorted(failed.values(), key=by_deck),
+        "builds": sorted(
+            builds.values(), key=lambda entry: (entry["tool"], entry["variant"])
+        ),
+        "skipped": len(skipped),
+    }
+
+
+class _SummaryPage:
+    """Top-down text cursor over one or more Letter pages. Content taller than
+    one page flows onto the next, so a long failure list never clips."""
+
+    LINE = 0.020
+
+    def __init__(self):
+        self.page_w, self.page_h = LETTER_PORTRAIT
+        self.left = LETTER_MARGIN / self.page_w
+        self.right = 1.0 - self.left
+        self.top = 1.0 - LETTER_MARGIN / self.page_h
+        self.bottom = LETTER_MARGIN / self.page_h
+        self.char_w = (CMD_FS * CMD_CHAR_EM / 72.0) / self.page_w
+        self.figures = []
+        self._new_page()
+
+    def _new_page(self):
+        self.fig = plt.figure(figsize=LETTER_PORTRAIT)
+        self.figures.append(self.fig)
+        self.y = self.top
+
+    def ensure(self, height):
+        if self.y - height < self.bottom:
+            self._new_page()
+
+    def gap(self, height):
+        self.y -= height
+
+    def text(self, text, indent=0.0, fs=9.0, color="#222222", weight="normal",
+             style="normal", height=LINE, family=None):
+        self.ensure(height)
+        self.fig.text(self.left + indent, self.y, text, fontsize=fs, color=color,
+                      fontweight=weight, fontstyle=style, va="top", ha="left",
+                      family=family or "sans-serif")
+        self.y -= height
+
+    def paragraph(self, text, width_chars=104, **kwargs):
+        for line in textwrap.wrap(text, width_chars) or [""]:
+            self.text(line, **kwargs)
+
+    def command(self, command):
+        """One shell command, syntax-highlighted and wrapped to the margin."""
+        x0 = self.left + 0.035
+        tokens = command.split()
+        lines = 1
+        x = x0
+        for token in tokens:
+            width = (len(token) + 1) * self.char_w
+            if x + width > self.right and x > x0:
+                lines += 1
+                x = x0
+            x += width
+        self.ensure(lines * self.LINE)
+        x = x0
+        for index, token in enumerate(tokens):
+            color, weight = _cmd_token_style(token, index)
+            width = (len(token) + 1) * self.char_w
+            if x + width > self.right and x > x0:
+                x = x0
+                self.y -= self.LINE
+            self.fig.text(x, self.y, token, family="monospace", fontsize=CMD_FS,
+                          color=color, fontweight=weight, va="top", ha="left")
+            x += width
+        self.y -= self.LINE
+
+
+def _failures_page(summary):
+    """Render the collected failures onto one or more pages."""
+    pager = _SummaryPage()
+    pager.text("What didn't go well", fs=13, weight="bold", height=0.030)
+    n_wrong = len(summary["wrong"])
+    n_failed = len(summary["failed"])
+    n_build = len(summary["builds"])
+    intro = (
+        "{} wrong answer{}, {} failed quer{}, {} build/index failure{}. Each "
+        "is shown with the exact command that produced it, so the row can be "
+        "reproduced. Separately, {} tool/query cells were skipped by design "
+        "(the tool has no primitive for the question); those are expected "
+        "empty cells, not problems, and are not listed."
+    ).format(
+        n_wrong, "" if n_wrong == 1 else "s",
+        n_failed, "y" if n_failed == 1 else "ies",
+        n_build, "" if n_build == 1 else "s",
+        summary["skipped"],
+    )
+    pager.paragraph(intro, fs=9, color="#555555", height=0.018)
+    pager.gap(0.010)
+
+    if not (n_wrong or n_failed or n_build):
+        pager.text(
+            "Everything that ran produced the reference answer.",
+            fs=10, color="#1B7A43", weight="bold", height=0.024,
+        )
+        return pager.figures
+
+    if summary["wrong"]:
+        pager.text("Wrong answer", fs=11, weight="bold", color="#B00020",
+                   height=0.026)
+        pager.paragraph(
+            "The tool ran cleanly but the number is not the reference's. The "
+            "timing next to it in the figures answers a different question.",
+            fs=8.5, color="#555555", height=0.017)
+        pager.gap(0.006)
+        for entry in summary["wrong"]:
+            tool, query = entry["tool"], entry["query"]
+            title = QUERY_TITLES.get(query, query)
+            pager.ensure(0.10)
+            pager.text(
+                "{} · {} — {}".format(tool, query, title),
+                fs=10, weight="bold", color=COLORS.get(tool, "#222222"),
+                height=0.024)
+            pager.paragraph(
+                "returned {:,}, but {} (the reference) reports {:,}".format(
+                    entry["answered"], entry["ref"], entry["expected"]),
+                indent=0.02, fs=9, height=0.019, width_chars=100)
+            semantics = ANSWER_SEMANTICS.get((tool, query))
+            if semantics:
+                pager.paragraph(
+                    "definitional, not a bug: {}".format(semantics),
+                    indent=0.02, fs=8.5, color="#555555", style="italic",
+                    height=0.018, width_chars=100)
+            if len(entry["arg_sets"]) > 1:
+                pager.text(
+                    "argument sets affected: {}".format(
+                        ", ".join(sorted(entry["arg_sets"]))),
+                    indent=0.02, fs=8.5, color="#555555", height=0.018)
+            if entry["command"]:
+                pager.command(entry["command"])
+            pager.gap(0.012)
+
+    if summary["failed"]:
+        pager.text("Failed to run", fs=11, weight="bold", color="#B00020",
+                   height=0.026)
+        pager.gap(0.004)
+        for entry in summary["failed"]:
+            tool, query = entry["tool"], entry["query"]
+            pager.ensure(0.09)
+            pager.text(
+                "{} · {} — {}".format(tool, query, QUERY_TITLES.get(query, query)),
+                fs=10, weight="bold", color=COLORS.get(tool, "#222222"),
+                height=0.024)
+            pager.paragraph(
+                "the command returned an error ({})".format(entry["note"]),
+                indent=0.02, fs=9, height=0.019, width_chars=100)
+            if entry["command"]:
+                pager.command(entry["command"])
+            pager.gap(0.012)
+
+    if summary["builds"]:
+        pager.text("Build / index failed", fs=11, weight="bold",
+                   color="#B00020", height=0.026)
+        pager.gap(0.004)
+        for entry in summary["builds"]:
+            pager.ensure(0.09)
+            pager.text(
+                "{} · {}".format(entry["tool"], entry["variant"]),
+                fs=10, weight="bold", height=0.024)
+            detail = "status: {}".format(entry["status"])
+            if entry["note"]:
+                detail += " — {}".format(entry["note"])
+            pager.paragraph(detail, indent=0.02, fs=9, height=0.019,
+                            width_chars=100)
+            if entry["command"]:
+                pager.command(entry["command"])
+            pager.gap(0.012)
+
+    return pager.figures
+
+
+def plot_failures(datasets, out_dir):
+    """The 'what didn't go well' page: wrong answers and failures with their
+    commands, appended last to all_charts.pdf and saved on its own too."""
+    figures = _failures_page(collect_failures(datasets))
+    for stale in out_dir.glob("figure8_failures*"):
+        stale.unlink()
+    outputs = []
+    for number, fig in enumerate(figures, start=1):
+        stem = "figure8_failures" if len(figures) == 1 else "figure8_failures_p{}".format(number)
+        path = out_dir / (stem + ".png")
+        fig.savefig(str(path), dpi=200)
+        outputs.append(path)
+    pdf_path = out_dir / "figure8_failures.pdf"
+    with PdfPages(str(pdf_path)) as pdf:
+        for fig in figures:
+            pdf.savefig(fig)
+    outputs.append(pdf_path)
+    return outputs, figures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="+", type=Path)
@@ -2462,8 +2816,9 @@ def main():
     index_outputs, index_figures = plot_index(datasets, out_dir)
     query_outputs, query_figures = plot_queries(datasets, out_dir)
     answer_outputs, answer_figures = plot_time_to_answer(datasets, out_dir)
-    outputs = index_outputs + query_outputs + answer_outputs
-    figures = index_figures + query_figures + answer_figures
+    failure_outputs, failure_figures = plot_failures(datasets, out_dir)
+    outputs = index_outputs + query_outputs + answer_outputs + failure_outputs
+    figures = index_figures + query_figures + answer_figures + failure_figures
     if not outputs:
         sys.stderr.write("ERROR: no successful benchmark rows to plot\n")
         return 1
