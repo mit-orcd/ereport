@@ -32,7 +32,7 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
  * Usage:
- *   ./ecrawl [--no-write] [--progress] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+ *   ./ecrawl [--no-write] [--progress] [--verbose] <start-path> [output-dir]
  *   --progress: cheap live files=/entries= (dirent cadence, across directories).
  *   --verbose: full metrics to stdout at exit.
  * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
@@ -747,11 +747,6 @@ static atomic_uint g_disk_low = 0;
 static atomic_uint g_disk_monitor_stop = 0;
 static atomic_uint g_disk_wait_disabled = 0;
 static char g_output_dir[PATH_MAX] = ".";
-/* When set, bin records store paths under this root instead of the physical crawl start-path. */
-static char g_record_root_buf[PATH_MAX];
-static const char *g_record_root = NULL;
-static char g_phys_prefix[PATH_MAX];
-static size_t g_phys_prefix_len = 0;
 /* Canonical crawl root: absolute, from argv or realpath(relative). */
 static char g_start_path_canon[PATH_MAX];
 static id_registry_t g_uid_registry;
@@ -1062,6 +1057,10 @@ static int uring_stat_probe(uring_stat_ctx_t *u) {
     slot->name_len = 1;
     uring_prep_slot(u, 0, AT_FDCWD, slot);
     if (uring_submit_wait_all(u, 1) != 0) return -1;
+    /* The probe is ring setup, not a directory batch: io_uring_batches must
+     * count only real submissions (the MIN_BATCH tests expect 0 when every
+     * directory goes inline). */
+    ATOMIC_SUB_RELAXED(&g_io_uring_batches, 1);
     if (u->res[0] == -EINVAL || u->res[0] == -EOPNOTSUPP || u->res[0] == -ENOSYS) return -1;
     return 0;
 }
@@ -2349,11 +2348,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] "
             "[--statx] [--iouring] [--progress] "
-            "[--verbose] [--record-root <abs-path>] <start-path> [output-dir]\n",
+            "[--verbose] <start-path> [output-dir]\n",
             prog);
     fprintf(stderr, "Example: %s /data1\n", prog);
     fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
-    fprintf(stderr, "Example: %s --record-root /storage/srv07 /mnt/server07 crawl_srv07\n", prog);
     fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
     fprintf(stderr, "Count: %s --no-stat --count /data1\n", prog);
     fprintf(stderr, "Search: %s --no-stat --contains slurm- /data1\n", prog);
@@ -2408,8 +2406,6 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
             "Diagnostics (with --verbose): ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive "
             "seconds with zero rolling-window entries once the window is warm (default 5; 0=off).\n");
-    fprintf(stderr,
-            "--record-root: store paths in .bin as <root>/<relative-to-start-path> (resolved to absolute).\n");
     fprintf(stderr,
             "Default output is a concise summary. --verbose prints full metrics to stdout at exit.\n");
 }
@@ -3800,60 +3796,6 @@ static int ensure_pending_capacity(pending_batch_t *p, size_t need) {
     return 0;
 }
 
-static int init_record_path_prefix(const char *start_path) {
-    if (snprintf(g_phys_prefix, sizeof(g_phys_prefix), "%s", start_path) >= (int)sizeof(g_phys_prefix)) return -1;
-    path_rstrip_slashes(g_phys_prefix);
-    g_phys_prefix_len = strlen(g_phys_prefix);
-    return 0;
-}
-
-/* Map physical path to stored path when --record-root is set. */
-static int map_path_for_record(const char *path, size_t path_len, char *out, size_t out_sz, size_t *out_len) {
-    char tmp[PATH_MAX];
-    const char *rel;
-    int n;
-
-    if (!path || path_len >= sizeof(tmp)) return -1;
-    memcpy(tmp, path, path_len);
-    tmp[path_len] = '\0';
-
-    if (!g_record_root) {
-        if (path_len >= out_sz) return -1;
-        memcpy(out, path, path_len);
-        out[path_len] = '\0';
-        *out_len = path_len;
-        return 0;
-    }
-
-    if (strncmp(tmp, g_phys_prefix, g_phys_prefix_len) != 0 ||
-        !(tmp[g_phys_prefix_len] == '/' || tmp[g_phys_prefix_len] == '\0')) {
-        static int warned_record_root_prefix;
-        if (!warned_record_root_prefix) {
-            warned_record_root_prefix = 1;
-            fprintf(stderr,
-                    "warn: path does not start with crawl root %s — storing raw path "
-                    "(further occurrences suppressed)\n",
-                    g_phys_prefix);
-        }
-        if (path_len >= out_sz) return -1;
-        memcpy(out, path, path_len);
-        *out_len = path_len;
-        return 0;
-    }
-
-    rel = tmp + g_phys_prefix_len;
-    if (*rel == '/') rel++;
-
-    if (*rel == '\0') {
-        n = snprintf(out, out_sz, "%s", g_record_root);
-    } else {
-        n = snprintf(out, out_sz, "%s/%s", g_record_root, rel);
-    }
-    if (n < 0 || (size_t)n >= out_sz) return -1;
-    *out_len = (size_t)n;
-    return 0;
-}
-
 static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, const struct stat *st,
                        uint64_t byte_credit) {
     bin_record_hdr_t hdr;
@@ -3863,9 +3805,6 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     int writer_index;
     size_t record_len;
     size_t frame_len;
-    char path_buf[PATH_MAX];
-    const char *path_write = path;
-    size_t path_len_write = path_len;
     unsigned char *full_data = NULL;
     size_t full_len = 0;
     unsigned char *ready_data = NULL;
@@ -3874,14 +3813,12 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     if (!ctx || !path || !st) return -1;
     if (g_no_write) return 0;
 
-    if (map_path_for_record(path, path_len, path_buf, sizeof(path_buf), &path_len_write) != 0) return -1;
-    if (path_len_write > UINT16_MAX) return -1;
-    path_write = path_buf;
+    if (path_len > UINT16_MAX) return -1;
 
     memset(&hdr, 0, sizeof(hdr));
     /* Wire-format: parent_dir_id==0 + full stored path in name bytes; writer splits to the on-disk form. */
     hdr.parent_dir_id = 0;
-    hdr.name_len = (uint16_t)path_len_write;
+    hdr.name_len = (uint16_t)path_len;
     hdr.type = (uint8_t)file_type_char(st->st_mode);
     hdr.uid = (uint64_t)st->st_uid;
     hdr.gid = (uint64_t)st->st_gid;
@@ -3899,7 +3836,7 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     writer_index = (int)(shard % (uint32_t)ctx->writer_threads);
     pending = &ctx->pending[writer_index];
 
-    record_len = sizeof(hdr) + path_len_write;
+    record_len = sizeof(hdr) + path_len;
     memset(&frame, 0, sizeof(frame));
     frame.shard = shard;
     frame.data_len = (uint32_t)record_len;
@@ -3924,9 +3861,9 @@ static int emit_record(emit_context_t *ctx, const char *path, size_t path_len, c
     pending->len += sizeof(frame);
     memcpy(pending->data + pending->len, &hdr, sizeof(hdr));
     pending->len += sizeof(hdr);
-    if (path_len_write > 0) {
-        memcpy(pending->data + pending->len, path_write, path_len_write);
-        pending->len += path_len_write;
+    if (path_len > 0) {
+        memcpy(pending->data + pending->len, path, path_len);
+        pending->len += path_len;
     }
 
     if (pending->len >= RECORD_BATCH_BYTES) pending_batch_take(pending, &ready_data, &ready_len);
@@ -5785,7 +5722,6 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
     fprintf(fp, "layout=uid_shards\n");
     fprintf(fp, "seed_mode=root_only\n");
     fprintf(fp, "start_path=%s\n", start_path);
-    if (g_record_root && g_record_root[0] != '\0') fprintf(fp, "record_root=%s\n", g_record_root);
     fprintf(fp, "split_depth=%d\n", g_split_depth);
     fprintf(fp, "byte_accounting=unique_regular_files\n");
     fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);
@@ -5849,7 +5785,6 @@ static void print_verbose_full_stats(FILE *fp, const shared_state_t *shared, dou
     human_decimal(min_ops, min_ops_buf, sizeof(min_ops_buf));
 
     fprintf(fp, "start_path=%s\n", start_path);
-    if (g_record_root) fprintf(fp, "record_root=%s\n", g_record_root);
     fprintf(fp, "no_write=%d\n", g_no_write);
     fprintf(fp, "stat_impl=%s\n", g_iouring_statx ? "iouring" : (g_statx_mode ? "statx" : "fstatat"));
     fprintf(fp, "statx_mask=0x%x\n", (g_statx_mode || g_iouring_statx) ? g_statx_mask : 0u);
@@ -6051,55 +5986,6 @@ int main(int argc, char **argv) {
             g_progress = 1;
             continue;
         }
-        if (strcmp(argv[i], "--record-root") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "--record-root requires a path\n");
-                print_usage(argv[0]);
-                return 2;
-            }
-            i++;
-            if (snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", argv[i]) >= (int)sizeof(g_record_root_buf)) {
-                fprintf(stderr, "--record-root path too long\n");
-                return 2;
-            }
-            path_rstrip_slashes(g_record_root_buf);
-            if (g_record_root_buf[0] == '\0') {
-                fprintf(stderr, "--record-root invalid\n");
-                return 2;
-            }
-            if (g_record_root_buf[0] != '/') {
-                char joined[PATH_MAX];
-                char cwd[PATH_MAX];
-
-                if (!getcwd(cwd, sizeof(cwd))) {
-                    fprintf(stderr, "--record-root: getcwd: %s\n", strerror(errno));
-                    return 2;
-                }
-                if (snprintf(joined, sizeof(joined), "%s/%s", cwd, g_record_root_buf) >= (int)sizeof(joined)) {
-                    fprintf(stderr, "--record-root path too long\n");
-                    return 2;
-                }
-                if (snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", joined) >= (int)sizeof(g_record_root_buf)) {
-                    fprintf(stderr, "--record-root path too long\n");
-                    return 2;
-                }
-            }
-            {
-                char can[PATH_MAX];
-                int nr;
-
-                if (realpath(g_record_root_buf, can)) {
-                    nr = snprintf(g_record_root_buf, sizeof(g_record_root_buf), "%s", can);
-                    if (nr < 0 || (size_t)nr >= sizeof(g_record_root_buf)) {
-                        fprintf(stderr, "--record-root path too long after resolution\n");
-                        return 2;
-                    }
-                }
-            }
-            path_rstrip_slashes(g_record_root_buf);
-            g_record_root = g_record_root_buf;
-            continue;
-        }
         if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -6155,10 +6041,6 @@ int main(int argc, char **argv) {
 
     if (path_resolve_existing(positionals[0], g_start_path_canon, "ecrawl: start-path ") != 0) return 2;
     start_path = g_start_path_canon;
-    if (init_record_path_prefix(start_path) != 0) {
-        fprintf(stderr, "ERROR crawl start-path too long for record mapping\n");
-        return 1;
-    }
     if (positional_count >= 2) {
         int n = snprintf(g_output_dir, sizeof(g_output_dir), "%s", positionals[1]);
         if (n < 0 || (size_t)n >= sizeof(g_output_dir)) {
@@ -6595,7 +6477,6 @@ int main(int argc, char **argv) {
 
         if (!g_verbose) {
             fprintf(sumfp, "start_path=%s\n", start_path);
-            if (g_record_root) fprintf(sumfp, "record_root=%s\n", g_record_root);
             fprintf(sumfp, "no_write=%d\n", g_no_write);
             fprintf(sumfp, "no_stat=%d\n", g_no_stat);
             fprintf(sumfp, "stat_impl=%s\n",

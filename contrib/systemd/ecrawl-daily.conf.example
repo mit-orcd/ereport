@@ -14,8 +14,9 @@
 #       output_dir — where crawl output is written on *this* host (required if you use RSYNC_DEST);
 #                    parent dirs are created if missing (mkdir -p); on a failed run known ecrawl
 #                    artifact filenames under output_dir may be deleted (see ecrawl-daily.sh header).
-#       record_root — optional --record-root; empty → omit --record-root
-#     Empty middle/right columns still need tabs (e.g. path<TAB><TAB>).
+#     An empty output_dir still needs the tab (e.g. path<TAB>). A third column is ignored with a
+#     warning: ecrawl --record-root was removed — relabel paths at report time with
+#     ereport --path-rewrite OLD=NEW.
 
 ECRAWL_BIN=/opt/ereport/ecrawl
 
@@ -25,7 +26,7 @@ RSYNC_DEST=backup.example.com:/var/lib/ereport-crawl/
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
 
-# --- jobs (TAB-separated: start_path, output_dir, record_root) ---
+# --- jobs (TAB-separated: start_path, output_dir) ---
 ---jobs---
-/mnt/server-a/data	/var/lib/ecrawl/server-a	
-/mnt/server-b/home	/var/lib/ecrawl/server-b	/mnt/server-b/home
+/mnt/server-a/data	/var/lib/ecrawl/server-a
+/mnt/server-b/home	/var/lib/ecrawl/server-b

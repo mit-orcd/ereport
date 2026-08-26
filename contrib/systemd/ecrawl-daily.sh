@@ -208,6 +208,8 @@ sync_crawl_outputs() {
 
 main() {
 	local jobs_fail=0 start_path output_dir record_root line section=directives key val
+	# record_root: third job column from the old config format; ecrawl no longer
+	# takes --record-root (relabel at report time with ereport --path-rewrite).
 	local -a ecrawl_cmd job_lines
 
 	[[ -r "$CONF" ]] || die "cannot read config: $CONF"
@@ -233,7 +235,7 @@ main() {
 			continue
 		fi
 		if [[ "$line" != *$'\t'* ]]; then
-			die "job lines must be tab-separated (start_path<TAB>output_dir<TAB>record_root): $line"
+			die "job lines must be tab-separated (start_path<TAB>output_dir): $line"
 		fi
 		job_lines+=("$line")
 	done <"$CONF"
@@ -262,7 +264,7 @@ main() {
 		record_root="${record_root#"${record_root%%[![:space:]]*}"}"
 		record_root="${record_root%"${record_root##*[![:space:]]}"}"
 		if [[ -n "$record_root" ]]; then
-			ecrawl_cmd+=(--record-root "$record_root")
+			echo "ecrawl-daily: ignoring record_root '$record_root' (ecrawl --record-root was removed; relabel at report time with ereport --path-rewrite)" >&2
 		fi
 		ecrawl_cmd+=("$start_path")
 		output_dir="${output_dir#"${output_dir%%[![:space:]]*}"}"

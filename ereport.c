@@ -7,7 +7,8 @@
  * Parallel reader for crawl bin files produced by ecrawl.
  * Emits the original HTML summary plus per-bucket drilldown pages with
  * dense level-1/level-2 directory summaries. Path search in index.html uses
- * GET /<user>/search on eserve (ereport_index trigram index under ./index/).
+ * GET /<user>/search on eserve (ereport_index trigram index under ./index/);
+ * the search box is hidden unless the page URL carries a ?search parameter.
  *
  * Build:
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
@@ -938,7 +939,7 @@ static int g_subtree_from_index = 0;
 
 /* --path-rewrite OLD=NEW: when g_rewrite_from is non-NULL, every reconstructed path at or under OLD has its
  * OLD prefix replaced with NEW (directory-boundary match), purely at read time — the on-disk bins are never
- * modified. Lets a crawl stored under one record-root be reported/heat-mapped as if it lived elsewhere
+ * modified. Lets a crawl stored under one root be reported/heat-mapped as if it lived elsewhere
  * (e.g. relabel /data1/group as /orcd/data). Applied before --subtree, so --subtree is given in NEW terms. */
 static const char *g_rewrite_from = NULL;
 static size_t g_rewrite_from_len = 0;
@@ -2034,8 +2035,9 @@ static int read_uid_shard_layout(const char *dirpath, uint32_t *uid_shards_out) 
 }
 
 /*
- * Prefer record_root (logical storage id) when present in crawl_manifest.txt,
- * else start_path (filesystem crawl root). Returns 0 when a path was filled.
+ * Prefer record_root (logical storage id, written by crawls from before the
+ * ecrawl --record-root removal) when present in crawl_manifest.txt, else
+ * start_path (filesystem crawl root). Returns 0 when a path was filled.
  */
 static int read_manifest_storage_display_path(const char *bin_dir, char *out, size_t out_sz) {
     char manifest_path[PATH_MAX];
@@ -9726,14 +9728,18 @@ static int emit_html(const char *report_path,
         html_escape(out, username);
     fprintf(out, "</title>\n");
     fprintf(out, "<style>\n");
-    fprintf(out, "body{font-family:Arial,sans-serif;margin:24px;color:#222}\n");
+    fprintf(out, "body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,sans-serif;"
+            "margin:28px auto;padding:0 24px;max-width:1280px;box-sizing:border-box;color:#1f2328;line-height:1.5;"
+            "-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}\n");
+    fprintf(out, "a{color:#175cd3}\n");
+    fprintf(out, "a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid #2d6a9f;outline-offset:2px;border-radius:4px}\n");
     fprintf(out, "body.drawer-open{overflow:hidden}\n");
     fprintf(out, "h1{margin-bottom:8px}\n");
-    fprintf(out, ".report-title{font-size:1.35rem;margin:0 0 18px}\n");
-    fprintf(out, ".report-aggregate-note{margin:0 0 18px;font-size:13px;color:#444;line-height:1.45;max-width:720px}\n");
+    fprintf(out, ".report-title{font-size:1.5rem;margin:0 0 10px;letter-spacing:-0.01em;color:#111827}\n");
+    fprintf(out, ".report-aggregate-note{margin:0 0 18px;font-size:13px;color:#4b5563;line-height:1.45;max-width:720px}\n");
     fprintf(out, ".report-stats{margin-top:28px;padding-top:22px;border-top:1px solid #ddd}\n");
     fprintf(out, ".report-stats>h2{font-size:1.15rem;margin:0 0 14px}\n");
-    fprintf(out, ".report-sources-section{margin-bottom:20px;padding:14px 16px;background:#f9f9f7;border:1px solid #e8e4dc;border-radius:8px}\n");
+    fprintf(out, ".report-sources-section{margin-bottom:20px;padding:16px 18px;background:#fff;border:1px solid #e7e5e0;border-radius:10px;box-shadow:0 1px 2px rgba(16,24,40,.05)}\n");
     fprintf(out, ".report-sources-section h3{font-size:0.95rem;margin:0 0 8px;color:#444;font-weight:600}\n");
     fprintf(out, ".report-sources-section .lead{margin:0 0 10px;font-size:13px;color:#555;line-height:1.45}\n");
     fprintf(out, ".report-sources-list{margin:8px 0 0;padding-left:22px;line-height:1.55;color:#333;font-size:13px}\n");
@@ -9741,9 +9747,9 @@ static int emit_html(const char *report_path,
             ".stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%%,220px),1fr));gap:14px;"
             "margin-top:4px}\n");
     fprintf(out, ".stats-foot{margin:12px 0 0;font-size:12px;color:#666;line-height:1.45;max-width:920px}\n");
-    fprintf(out, ".stats-card{margin:0;padding:14px 16px;background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;"
-                "min-width:0}\n");
-    fprintf(out, ".stats-card h3{font-size:0.92rem;margin:0 0 12px;color:#333;font-weight:600}\n");
+    fprintf(out, ".stats-card{margin:0;padding:16px 18px;background:#fff;border:1px solid #e7e7e7;border-radius:10px;"
+                "box-shadow:0 1px 2px rgba(16,24,40,.05);min-width:0}\n");
+    fprintf(out, ".stats-card h3{font-size:0.92rem;margin:0 0 12px;color:#1f2937;font-weight:600}\n");
     fprintf(out, ".stats-dl{margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px 14px;font-size:13px;align-items:baseline}\n");
     fprintf(out, ".stats-dl dt{margin:0;color:#666;font-weight:500}\n");
     fprintf(out, ".stats-dl dd{margin:0;color:#222;text-align:right;word-break:break-word}\n");
@@ -9760,9 +9766,9 @@ static int emit_html(const char *report_path,
     fprintf(out, ".bucket-help .bucket-help-body ul{margin:0;padding-left:1.35em}\n");
     fprintf(out, ".bucket-help .bucket-help-body li{margin:0 0 8px;line-height:1.5}\n");
     fprintf(out, ".bucket-help .bucket-help-body li:last-child{margin-bottom:0}\n");
-    fprintf(out, "th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}\n");
+    fprintf(out, "th,td{border:1px solid #d4d4d4;padding:4px 6px;text-align:right}\n");
     fprintf(out, "th:first-child,td:first-child{text-align:left}\n");
-    fprintf(out, "th{background:#f4f4f4}\n");
+    fprintf(out, "th{background:#f6f7f7}\n");
     fprintf(out, "table.heatmap th.heatmap-corner{font-weight:600;background-color:transparent;background-image:none}\n");
     fprintf(out, "table.heatmap th.heatmap-th-neutral{font-weight:600;background-color:transparent;background-image:none}\n");
     fprintf(out, "table.heatmap th.heatmap-th-neutral[scope=row]{min-width:9em;vertical-align:middle}\n");
@@ -9822,14 +9828,17 @@ static int emit_html(const char *report_path,
     fprintf(out, ".drawer-actions a,.drawer-actions button{font:inherit;font-size:13px;border:1px solid #c9b991;background:#fff8e8;color:#5a4214;padding:7px 10px;border-radius:6px;text-decoration:none;cursor:pointer}\n");
     fprintf(out, ".drawer-actions button{background:#fff}\n");
     fprintf(out, ".drawer-frame{border:0;width:100%%;flex:1;background:#fff}\n");
-    fprintf(out, "@media (max-width:900px){body{margin:14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
+    fprintf(out, "@media (max-width:900px){body{margin:14px auto;padding:0 14px}.drawer{width:100vw}.drawer-head{padding:12px 14px}}\n");
     fprintf(out, ".path-search{margin:0 0 22px}\n");
+    fprintf(out, ".path-search[hidden]{display:none!important}\n");
     fprintf(out, ".path-search label{display:block;font-weight:600;margin-bottom:6px}\n");
     fprintf(out,
             ".path-search-field-wrap{position:relative;display:inline-block;width:min(520px,95vw);vertical-align:top}\n");
     fprintf(out,
-            ".path-search-field-wrap input[type=text]{width:100%%;box-sizing:border-box;padding:8px 36px 8px "
-            "8px;font-size:14px;border-radius:4px;transition:background-color .22s ease,border-color .22s ease}\n");
+            ".path-search-field-wrap input[type=text]{width:100%%;box-sizing:border-box;padding:9px 36px 9px "
+            "12px;font-size:14px;border-radius:8px;transition:background-color .22s ease,border-color .22s ease,box-shadow .15s ease}\n");
+    fprintf(out,
+            ".path-search-field-wrap input[type=text]:focus{outline:none;box-shadow:0 0 0 3px rgba(45,106,159,.18)}\n");
     fprintf(out, ".path-search-input--neutral{background:#fff;border:1px solid #ccc}\n");
     fprintf(out, ".path-search-input--waiting{background:#fffde7;border:1px solid #ffe082}\n");
     fprintf(out, ".path-search-input--ok{background:#e8f5e9;border:1px solid #a5d6a7}\n");
@@ -9840,10 +9849,11 @@ static int emit_html(const char *report_path,
             "animation:pathSearchSpin .65s linear infinite;pointer-events:none;vertical-align:middle}\n");
     fprintf(out, ".path-search-spinner[hidden]{display:none!important}\n");
     fprintf(out, "@keyframes pathSearchSpin{to{transform:rotate(360deg)}}\n");
-    fprintf(out, ".path-search-panel{margin-top:12px;padding:12px 14px;border:1px solid #dadada;border-radius:8px;background:#f9f9f9;max-height:min(55vh,480px);overflow:auto;font-size:13px}\n");
+    fprintf(out, ".path-search-panel{margin-top:12px;padding:14px 16px;border:1px solid #e5e5e5;border-radius:10px;background:#fafafa;box-shadow:0 1px 2px rgba(16,24,40,.05);max-height:min(55vh,480px);overflow:auto;font-size:13px}\n");
     fprintf(out, ".path-search-panel[hidden]{display:none!important}\n");
     fprintf(out, ".path-search-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}\n");
-    fprintf(out, ".path-search-panel-head button{font:inherit;font-size:12px;padding:4px 10px;border:1px solid #bbb;border-radius:4px;background:#fff;cursor:pointer}\n");
+    fprintf(out, ".path-search-panel-head button{font:inherit;font-size:12px;padding:4px 10px;border:1px solid #d0d5dd;border-radius:6px;background:#fff;color:#344054;cursor:pointer}\n");
+    fprintf(out, ".path-search-panel-head button:hover{background:#f9fafb}\n");
     fprintf(out, ".path-search-caption{font-size:12px;color:#555;margin:0 0 8px}\n");
     fprintf(out, ".path-search-preview{font-size:13px}\n");
     fprintf(out, ".path-search-preview ul{margin:0;padding-left:20px}\n");
@@ -9853,7 +9863,8 @@ static int emit_html(const char *report_path,
     fprintf(out, ".path-search-results-list{margin:8px 0;padding-left:22px;font-size:13px}\n");
     fprintf(out, ".path-search-results-list li{margin:4px 0;word-break:break-all}\n");
     fprintf(out, ".path-search-pager{display:flex;gap:12px;margin-top:12px;align-items:center;flex-wrap:wrap}\n");
-    fprintf(out, ".path-search-pager button{padding:6px 14px;font-size:14px;cursor:pointer;border:1px solid #bbb;border-radius:4px;background:#f8f8f8}\n");
+    fprintf(out, ".path-search-pager button{padding:6px 14px;font-size:14px;cursor:pointer;border:1px solid #d0d5dd;border-radius:6px;background:#fff;color:#344054}\n");
+    fprintf(out, ".path-search-pager button:hover:not(:disabled){background:#f9fafb}\n");
     fprintf(out, ".path-search-pager button:disabled{opacity:0.45;cursor:not-allowed}\n");
     fprintf(out, ".path-search-hint{font-size:12px;color:#666;margin:6px 0 12px;line-height:1.4;max-width:min(720px,100%%)}\n");
     fprintf(out, "</style>\n");
@@ -9883,9 +9894,13 @@ static int emit_html(const char *report_path,
                 BUCKET_DETAIL_LEVELS_MAX);
     }
 
-    fprintf(out, "<section class=\"path-search\" aria-label=\"Path search\">\n");
-    fprintf(out, "<label for=\"path-search-input\">Search paths</label>\n");
-    fprintf(out, "<p class=\"path-search-hint\">Type at least three characters. Results appear below as you type; press Enter for full pages of matches. Use Hide to close the results panel.</p>\n");
+    /* The search box is opt-in: it only works when the report is served alongside a
+     * trigram index, which is not always built. Hidden unless the URL carries
+     * ?search (the inline script below unhides it), so index-less deployments never
+     * show a control that cannot answer. */
+    fprintf(out, "<section class=\"path-search\" id=\"path-search\" aria-label=\"Path search\" hidden>\n");
+    fprintf(out, "<label for=\"path-search-input\">Find a file or folder</label>\n");
+    fprintf(out, "<p class=\"path-search-hint\">Type at least 3 characters of a name. Matches appear as you type; press Enter for full pages of results. Use Hide to close the results panel.</p>\n");
     fprintf(out,
             "<div class=\"path-search-field-wrap\" id=\"path-search-field-wrap\">"
             "<span class=\"path-search-spinner\" id=\"path-search-spinner\" hidden aria-hidden=\"true\"></span>"
@@ -10288,6 +10303,13 @@ static int emit_html(const char *report_path,
     fprintf(out, "<script>\n");
     fputs("(function(){\n", out);
     fputs("'use strict';\n", out);
+    /* Search is opt-in via the URL (?search or ?search=1): the box stays hidden
+     * unless the report publisher linked it that way (see the section comment). */
+    fputs("var pathSearchSection=document.getElementById('path-search');\n", out);
+    fputs("var pathSearchEnabled=false;\n", out);
+    fputs("try{pathSearchEnabled=new URLSearchParams(window.location.search).has('search');}\n", out);
+    fputs("catch(e){pathSearchEnabled=/[?&]search([=&]|$)/.test(window.location.search);}\n", out);
+    fputs("if(pathSearchEnabled&&pathSearchSection)pathSearchSection.hidden=false;\n", out);
     fputs("var ageNames=['<30d','30-90d','90-180d','180-365d','1-3y','3y+'];\n", out);
     fputs("var sizeNames=['<4K','4K-1M','1M-100M','100M-1G','1G-10G','10G+'];\n", out);
     fputs("var bucketDrawer=document.getElementById('bucket-drawer');\n", out);

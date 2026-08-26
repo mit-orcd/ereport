@@ -4,7 +4,7 @@ The shortest path from crawl → HTML → search index → HTTP, plus how to rea
 
 ## Typical workflow
 
-For multiple crawl outputs (e.g. several servers), run `ecrawl` once per output directory (often with distinct `--record-root` values), then pass all of those directories to one `ereport` / `ereport_index --make` command so the report and search index stay unified. For an all-users aggregate report (`./ereport ctime …`), build the matching index with `ereport_index --make dir1 dir2 …` where the first argument is not a valid username/uid on this host—pass the same `bin_dir` list as for `ereport` (for example directory names only).
+For multiple crawl outputs (e.g. several servers), run `ecrawl` once per output directory, then pass all of those directories to one `ereport` / `ereport_index --make` command so the report and search index stay unified. To relabel a crawl's stored paths (say to one root per server), use `--path-rewrite OLD=NEW` at report/index time rather than re-crawling. For an all-users aggregate report (`./ereport ctime …`), build the matching index with `ereport_index --make dir1 dir2 …` where the first argument is not a valid username/uid on this host—pass the same `bin_dir` list as for `ereport` (for example directory names only).
 
 ### 1. Crawl a filesystem
 

@@ -30,7 +30,7 @@ typedef struct crawl_result {
     uint32_t uid_shards; /* 0 unless "layout=uid_shards" was present */
     int uid_shard_digits;
     char *start_path;  /* filesystem root the crawl walked */
-    char *record_root; /* ecrawl --record-root rewrite, if any */
+    char *record_root; /* crawl-time path rewrite, if the manifest has one (legacy: ecrawl --record-root was removed; relabel at read time with --path-rewrite) */
 
     crawl_result_shard_t *shards; /* ascending by shard number */
     size_t shard_count;
@@ -52,8 +52,9 @@ void crawl_result_free(crawl_result_t *cr);
 int crawl_result_open(const char *dir, crawl_result_t *cr);
 
 /*
- * The path the stored records are rooted at: record_root when the crawl used
- * one, else start_path, else NULL when no manifest was found.
+ * The path the stored records are rooted at: record_root when the manifest
+ * carries one (only crawls from before the ecrawl --record-root removal do),
+ * else start_path, else NULL when no manifest was found.
  */
 const char *crawl_result_stored_root(const crawl_result_t *cr);
 

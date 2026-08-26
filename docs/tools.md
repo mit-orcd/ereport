@@ -29,7 +29,7 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] [--verbose] [--record-root <abs-path>] <start-path> [output-dir]
+./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] [--verbose] <start-path> [output-dir]
 ```
 
 Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
@@ -76,7 +76,6 @@ Examples:
 ./ecrawl --no-stat --print0 /path/to/filesystem-tree | xargs -0 ls -l
 ECRAWL_CRAWL_THREADS=8 ./ecrawl /path/to/filesystem-tree
 ./ecrawl /path/to/filesystem-tree host-a_apr-17-2026_15-03-01
-./ecrawl --record-root /storage/srv-a /mnt/server-a crawl_srv_a
 ECRAWL_UID_SHARDS=4096 ECRAWL_WRITER_THREADS=4 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_MAX_OPEN_SHARDS=1024 ./ecrawl /path/to/filesystem-tree /tmp/crawl-output
 ECRAWL_CRAWL_THREADS=24 ./ecrawl --no-write /path/to/filesystem-tree
@@ -93,7 +92,7 @@ Notes:
 - `--contains <text>` (requires `--no-stat`) keeps only paths whose **full path** contains `text`, case-insensitively — the same rule as `ereport_index --search`, and equivalent to `find /tree | grep -iF text`. It is not a glob: `*` and `?` match themselves. Matching is cheap because a directory whose own path already matches short-circuits its whole subtree, and non-matching directories compare each child name against a small window instead of rebuilding the full path.
 - `--print0` (requires `--no-stat`) NUL-separates the stream, for paths containing newlines.
 - `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--progress` for live counts and `--verbose` for end-of-run metrics.
-- `--record-root <path>` rewrites stored paths: each record’s path becomes `<record-root>/<path-relative-to-start-path>` instead of the live mount path. Use one distinct root per storage server so merged reports and search hits stay identifiable (for example `/storage/srv-a/...` vs `/storage/srv-b/...`). The crawl still walks `start-path` on disk; only the strings written into `.bin` files change. The root is turned into an absolute path (relative roots use the current working directory); if that path exists on disk it is also canonicalized with `realpath(3)`.
+- `--record-root` was removed: stored paths are always the canonical on-disk path. To relabel a crawl's paths (for example one root per storage server), rewrite them at report/index time with `ereport --path-rewrite OLD=NEW` / `ereport_index --make --path-rewrite OLD=NEW`.
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
@@ -362,7 +361,7 @@ Final stdout summary includes `delete_all` (`1` when the one-argument form was u
 
 Outputs:
 
-- `./<username>/index.html` — heat map, path search box (uses server-side index when served via `eserve`), full statistics below the table
+- `./<username>/index.html` — heat map, full statistics below the table, and an optional path search box (uses the server-side index when served via `eserve`). The search box is hidden unless the page URL carries a `?search` parameter (e.g. `index.html?search=1`), so index-less deployments never show a control that cannot answer — add the parameter to links only where the index exists.
 - `./<username>/bucket_aX_sY.html` — per age/size cell; brief summary HTML unless you pass `--bucket-details N` (see below). With `--bucket-details`, each page lists directory rollup tables for N path levels below the shared prefix inside that bucket.
 - `./all_users/` — same layout; `./all_users/bucket_aX_sY.html` is a brief summary unless `--bucket-details` is used (heat-map totals on `index.html` always match the crawl).
 
@@ -427,7 +426,7 @@ Bucket drill-down:
 
 Subtree scoping:
 
-- `--subtree PATH` (absolute) restricts the whole analysis to records at or under `PATH`, as if only that directory had been crawled — useful for zooming into one lab/group inside a larger `--record-root` crawl without re-crawling. Place it before the username (if any) and time basis. The subtree directory itself is included, and matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
+- `--subtree PATH` (absolute) restricts the whole analysis to records at or under `PATH`, as if only that directory had been crawled — useful for zooming into one lab/group inside a larger crawl without re-crawling. Place it before the username (if any) and time basis. The subtree directory itself is included, and matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
 - Full absolute paths are kept in the report (records are filtered, not rewritten); all heat-map totals, badges, distinct-user counts, and bucket-detail tables are scoped to the subtree. On its own it forces per-record path reconstruction, so it is a bit slower than the default histogram-only fast path even without `--bucket-details`.
 - `--index-dir DIR` — where `ereport_index --make` left `dirs.idx` / `rowgroups.idx` (see [dir-index sidecars](#index-dir-answering-from-the-directory-index-sidecars)). Only `--subtree` uses them, and only as a shortcut to what the scan already computes: the subtree root is resolved once per shard from `dirs.idx`, row groups whose DFS sketch cannot reach it are never opened, and membership becomes a bit test on the record's `parent_dir_id` instead of a rebuilt path and a string compare — which also retires the reconstruction the histogram-only path was forced into. The report is byte-identical either way; `subtree_from=dir_index` plus `rowgroups_kept` / `rowgroups_total` / `rowgroup_records_kept` on stdout say the route was taken. A missing, stale or truncated sidecar, one that does not name every shard being read, or a `--subtree` that names something other than a directory falls back to the path-prefix behaviour with the same output. Ignored under `--path-rewrite` (the filter then runs in a namespace the catalogs know nothing about) and for `--subtree /`.
 - `Scanned records` counts the whole capture either way. Pruning changes how much of it is decoded, not what the report stands for, so the records in dropped row groups are credited back; `rowgroup_records_kept` is what was actually read.
@@ -445,7 +444,7 @@ Interactive search in `index.html` requires `ereport_index --make` (see below), 
 
 The checked-in `all_users/` tree is a static report generated from a synthetic adversarial layout (with `--bucket-details`), kept in the repo so you can browse the UI without running a crawl. File paths inside those HTML files use placeholders such as `demo-volume/example-user/…` instead of real home directories, volume names, or host-specific prefixes.
 
-- `all_users/index.html` — aggregate heat map, search box (needs HTTP + index for live search), and corpus-wide statistics for all UIDs in the crawl.
+- `all_users/index.html` — aggregate heat map, search box (hidden unless the URL carries `?search`; needs HTTP + index for live search), and corpus-wide statistics for all UIDs in the crawl.
 - `all_users/bucket_aX_sY.html` — Bucket details for one age×size cell: header metadata, optional Dense / Deep / Skew badges, and directory rollup tables when drill-down was enabled at generation time.
 
 Open the HTML directly in a browser, or serve the tree with `eserve.py` / `make serve` as described below.

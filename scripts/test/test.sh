@@ -530,6 +530,21 @@ sum_unique_regular_bytes() {
         awk '!seen[$1]++ { s += $2 } END { printf "%.0f\n", s + 0 }'
 }
 
+# --keep-html: copy every *.html a phase produced into $KEEP_HTML_DIR/<name>/
+# before the phase temp dir is torn down, so the report UI can be browsed after
+# the run. Paths under each snapshot mirror the report layout. No-op otherwise.
+KEEP_HTML=${KEEP_HTML:-0}
+KEEP_HTML_DIR=""
+keep_html() {
+    [[ "$KEEP_HTML" == 1 ]] || return 0
+    local name=$1 root=$2
+    [[ -d "$root" ]] || return 0
+    local dest="$KEEP_HTML_DIR/$name"
+    mkdir -p "$dest"
+    (cd "$root" && find . -type f -name '*.html' -print0 | xargs -0 -r cp --parents -t "$dest")
+    log "keep-html: $name -> $dest"
+}
+
 run_fs_correlation() {
     local root=$1
     local fs_fail=0
@@ -694,6 +709,10 @@ run_fs_correlation() {
         printf '%s  records:%s ecrawl entries=%s ereport single scanned=(skipped) all-users scanned=%s\n' \
             "$D" "$Z" "$entries" "$au_scanned"
     fi
+
+    # Snapshot the reports now, while they exist: later checks can die and the
+    # EXIT trap removes $td.
+    keep_html fs "$td"
 
     section_fs "[2] Crawl bins: ereport all-users vs ecrawl — reader must agree with what ecrawl wrote"
     expect_eq_continue "all-users: ereport.files vs ecrawl.files" "$crawl_files" "$au_files" \
@@ -1391,19 +1410,19 @@ dirx_multishard_tests() {
     rm -rf "$tree" "$out" "$idx"
 }
 
-# What the sidecars are keyed on is the path the capture stored, which is not
-# always the path on disk: ecrawl --record-root relabels it at crawl time and
-# ereport_index --path-rewrite relabels it again for the trigram index. The
-# hashes must follow the stored spelling, because that is what a query without
-# a sidecar matches against.
+# What the sidecars are keyed on is the path the capture stored. That spelling
+# is fixed at crawl time (the canonical on-disk path); ereport_index
+# --path-rewrite relabels only what the trigram index stores and does not touch
+# the catalogs. The hashes must follow the stored spelling, because that is
+# what a query without a sidecar matches against.
 dirx_stored_path_tests() {
     local td=$1
     local tree="${td}/dirx_rr_tree" out="${td}/dirx_rr_crawl" idx="${td}/dirx_rr_idx"
     local idx2="${td}/dirx_rw_idx" idx3="${td}/dirx_dup_idx"
     local out_b="${td}/dirx_rr_crawl_b"
-    local stored="/dirx-virtual/srv07" i
+    local stored i
 
-    section_int "[integration] dir-index sidecars — stored paths (--record-root, --path-rewrite)"
+    section_int "[integration] dir-index sidecars — stored paths (--path-rewrite)"
 
     mkdir -p "$tree/sub/inner" "$tree/other"
     for ((i = 0; i < 8; i++)); do
@@ -1413,36 +1432,28 @@ dirx_stored_path_tests() {
     done
     local tree_abs
     tree_abs=$(cd "$tree" && pwd -P)
+    stored=$tree_abs
 
-    ECRAWL_CRAWL_THREADS=2 "$ECRAWL" --record-root "$stored" "$tree_abs" "$out" \
+    ECRAWL_CRAWL_THREADS=2 "$ECRAWL" "$tree_abs" "$out" \
         >"${td}/dirx_rr.crawl.log" 2>&1 || {
         tail -n 20 "${td}/dirx_rr.crawl.log" >&2 || true
-        die "ecrawl --record-root failed"
+        die "ecrawl failed"
     }
     EREPORT_INDEX_THREADS=2 "$EREPORT_INDEX" --make --index-dir "$idx" "$out" \
         >"${td}/dirx_rr.make.out" 2>"${td}/dirx_rr.make.err" || {
         tail -n 20 "${td}/dirx_rr.make.err" >&2 || true
-        die "ereport_index --make failed on a --record-root capture"
+        die "ereport_index --make failed"
     }
 
     dirx_analyze "${td}/dirx_rr.plain" "$out" --subtree "${stored}/sub"
     dirx_analyze "${td}/dirx_rr.idx" "$out" --subtree "${stored}/sub" --index-dir "$idx"
     dirx_analyze "${td}/dirx_rr.exact" "$out" --subtree "${stored}/sub" --exact
-    expect_eq_continue "--record-root: the stored path is what the sidecar indexed" "dir_index" \
+    expect_eq_continue "stored path: the stored path is what the sidecar indexed" "dir_index" \
         "$(dirx_kv answered_from "${td}/dirx_rr.idx")" || true
-    dirx_same "--record-root: dir_index vs catalog_rollup" "${td}/dirx_rr.plain" "${td}/dirx_rr.idx" || true
-    dirx_same "--record-root: dir_index vs --exact scan" "${td}/dirx_rr.exact" "${td}/dirx_rr.idx" || true
-    expect_eq_continue "--record-root: bytes vs du -sb of the real tree" \
+    dirx_same "stored path: dir_index vs catalog_rollup" "${td}/dirx_rr.plain" "${td}/dirx_rr.idx" || true
+    dirx_same "stored path: dir_index vs --exact scan" "${td}/dirx_rr.exact" "${td}/dirx_rr.idx" || true
+    expect_eq_continue "stored path: bytes vs du -sb of the real tree" \
         "$(du -sb "${tree_abs}/sub" | awk '{print $1}')" "$(dirx_kv bytes "${td}/dirx_rr.idx")" || true
-
-    # The path the tree actually has on disk was never stored, so neither route
-    # can find it -- and they have to be missing it in the same way.
-    dirx_analyze "${td}/dirx_rr.real.plain" "$out" --subtree "${tree_abs}/sub"
-    dirx_analyze "${td}/dirx_rr.real.idx" "$out" --subtree "${tree_abs}/sub" --index-dir "$idx"
-    expect_eq_continue "--record-root: the on-disk path is not in the capture" "0" \
-        "$(dirx_kv entries "${td}/dirx_rr.real.idx")" || true
-    dirx_same "--record-root: an absent path agrees either way" \
-        "${td}/dirx_rr.real.plain" "${td}/dirx_rr.real.idx" || true
 
     # --path-rewrite relabels what the trigram index stores. The sidecars are
     # built from the catalogs, which it does not touch, so a subtree query keeps
@@ -1639,6 +1650,9 @@ ereport_dirx_tests() {
         >"${idir}.stdout" 2>"${idir}.stderr" || true
     expect_eq_continue "ereport --subtree [${tag}]: an absent subtree matches nothing either way" \
         "$(kv_last matched_records "${pdir}.stdout")" "$(kv_last matched_records "${idir}.stdout")" || true
+
+    # The details variant is the richest of the byte-identical report trees.
+    keep_html "subtree-${tag}" "${td}/ere_${tag}_details_idx"
 
     rm -rf "${td}/ere_${tag}"_*
 }
@@ -2105,6 +2119,9 @@ run_integration() {
     summary_metric "synthetic ereport all-users: distinct_uids" "$dist"
     summary_metric "synthetic ereport all-users: scanned/matched" "${sscan}/${smat}"
 
+    # Snapshot now: more checks follow, and on die the EXIT trap removes $td.
+    keep_html integration "$td"
+
     section_int "[integration] ereport all-users vs ecrawl"
     expect_eq "all_users: distinct_uids (single uid in crawl)" "1" "$dist" \
         "only one uid appears in this tiny crawl"
@@ -2296,12 +2313,17 @@ for arg in "$@"; do
     case "$arg" in
         --summary) SUMMARY=1 ;;
         --edelete-only) EDELETE_ONLY=1 ;;
+        --keep-html) KEEP_HTML=1 ;;
+        --keep-html=*) KEEP_HTML=1; KEEP_HTML_DIR="${arg#*=}" ;;
         -h|--help)
             cat <<EOF
-Usage: $0 [--summary] [--edelete-only] [/path/to/tree]
+Usage: $0 [--summary] [--edelete-only] [--keep-html[=DIR]] [/path/to/tree]
   --summary       collect results into copy/paste-friendly box tables (Metrics + Checks)
                   printed at the end (no ANSI; pastes into slides / screenshots cleanly).
   --edelete-only  run edelete smoke + synthetic probes only (requires ./edelete; no ecrawl/ereport).
+  --keep-html     snapshot every HTML report the run generates into DIR (default:
+                  ./ereport-test-html) before the phase temp dirs are torn down,
+                  so the report UI can be browsed afterwards.
   /path/...       optional crawl root for filesystem correlation (SKIP_FS=1 to skip).
 EOF
             exit 0
@@ -2310,6 +2332,12 @@ EOF
         *) ROOT="$arg" ;;
     esac
 done
+
+if [[ "$KEEP_HTML" == 1 ]]; then
+    KEEP_HTML_DIR=${KEEP_HTML_DIR:-./ereport-test-html}
+    mkdir -p "$KEEP_HTML_DIR" || die "cannot create --keep-html directory: $KEEP_HTML_DIR"
+    KEEP_HTML_DIR=$(cd "$KEEP_HTML_DIR" && pwd -P)
+fi
 
 if [[ "$EDELETE_ONLY" == 1 && -n "$ROOT" ]]; then
     die "--edelete-only cannot be combined with a filesystem correlation root path"
@@ -2345,6 +2373,10 @@ if [[ -n "${SKIP_FS:-}" ]] || [[ -z "${ROOT}" ]] || [[ ! -d "${ROOT}" ]]; then
     fi
 else
     run_phase run_fs_correlation "$ROOT"
+fi
+
+if [[ "$KEEP_HTML" == 1 ]]; then
+    log "keep-html: report snapshots kept under $KEEP_HTML_DIR"
 fi
 
 render_summary
