@@ -44,6 +44,12 @@
 #define _GNU_SOURCE /* qsort_r for thread-safe index sorts (parallel path-order merge sort). */
 #define _XOPEN_SOURCE 700
 
+#if defined(__APPLE__)
+/* glibc-only unlocked stdio; macOS has no fread_unlocked, and its plain fread already
+ * takes the FILE lock, so it is the functional equivalent. */
+#define fread_unlocked fread
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -62,6 +68,7 @@
 #include <sys/time.h>
 
 #include "alloc_tuning.h"
+#include "compat_qsort_r.h"
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
@@ -2712,11 +2719,6 @@ static size_t dense_cell_total_nodes(const dense_cell_map_t *m) {
     return m->count;
 }
 
-typedef struct {
-    atomic_int gate; /* 0 spin, 1 run, 2 abort (pthread_create failure) */
-    pthread_barrier_t mid;
-} dmerge_sync_t;
-
 /* Merge src's bucket range into dst by STEALING (relinking) src nodes rather than allocating a
  * fresh dst node and copying the parent for each. On a duplicate parent the counts are folded and
  * the now-redundant src node is freed; otherwise the src node is relinked straight into dst,
@@ -4133,7 +4135,7 @@ static void matched_records_ms_parallel(const matched_record_t *items,
 
     if (n <= PATH_ORD_QSORT_THRESH) {
         if (n <= 1) return;
-        qsort_r(ord + lo, n, sizeof(size_t), matched_path_ord_cmp_r, (void *)items);
+        ereport_qsort_r(ord + lo, n, sizeof(size_t), matched_path_ord_cmp_r, (void *)items);
         return;
     }
 
@@ -4386,13 +4388,13 @@ static void path_radix_sort(size_t *idx, size_t *tmp, path_tcur_t *curs, size_t 
 descend:
     if (n <= 1) return;
     if (n <= PATH_RADIX_LEAF) {
-        qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
+        ereport_qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
         return;
     }
     if (g_path_radix_cls_cap < n) {
         unsigned short *nb = (unsigned short *)realloc(g_path_radix_cls, n * sizeof(*nb));
         if (!nb) { /* no scratch: fall back to comparator sort for this bucket */
-            qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
+            ereport_qsort_r(idx, n, sizeof(size_t), matched_path_radix_leaf_cmp, (void *)curs);
             return;
         }
         g_path_radix_cls = nb;

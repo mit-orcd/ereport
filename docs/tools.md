@@ -204,7 +204,7 @@ The `nlink > 1` bail-out still applies: a subtree containing a hardlink falls th
 
 ## `ecrawl_mount`
 
-`ecrawl_mount` mounts a crawl output directory as a read-only FUSE filesystem, so any POSIX tool — `find`, `ls`, `stat`, `du`, `tree`, `df`, `fd`, `rsync -n`, shell globbing — can walk a crawl without the source filesystem being reachable. It is an optional build target: see [FUSE support](#fuse-support-optional) below.
+`ecrawl_mount` mounts a crawl output directory as a read-only FUSE filesystem, so any POSIX tool — `find`, `ls`, `stat`, `du`, `tree`, `df`, `fd`, `rsync -n`, shell globbing — can walk a crawl without the source filesystem being reachable. It is an optional build target: see [FUSE support](#fuse-support-optional) below. Linux only — not supported on macOS, where macFUSE mounts of this filesystem can wedge the VFS badly enough to hang `umount`/`mount`.
 
 ```bash
 ./ecrawl_mount /path/to/crawl-out ~/mnt
@@ -283,7 +283,7 @@ Metadata fidelity is exact and index lookups are fast (~1.4 µs per entry served
 
 ### FUSE support (optional)
 
-`ecrawl_mount` is built only when FUSE 2.x headers are found. `make` prints which way it resolved:
+`ecrawl_mount` is built only when FUSE 2.x headers are found, and never on macOS (Linux-only target). `make` prints which way it resolved:
 
 ```
 build: fuse enabled (-l:libfuse.so.2)

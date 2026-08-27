@@ -22,6 +22,12 @@
 #define PATH_MAX 4096
 #endif
 
+/* macOS names the sub-second mtime field st_mtimespec; glibc's st_mtim spelling is
+ * used throughout this file. */
+#if defined(__APPLE__) && !defined(st_mtim)
+#define st_mtim st_mtimespec
+#endif
+
 /* True when [off, off+len) lies inside a mapping of map_len bytes, without overflowing. */
 static int sidecar_span_ok(uint64_t off, uint64_t len, size_t map_len) {
     if (len > (uint64_t)map_len) return 0;

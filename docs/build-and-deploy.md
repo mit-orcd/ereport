@@ -26,7 +26,7 @@ make clean
 
 ### Optional: FUSE for `ecrawl_mount`
 
-`ecrawl_mount` is built only when FUSE 2.x headers are present, so a host without them produces a link line identical to a vanilla build. `make` reports which way it resolved:
+`ecrawl_mount` is Linux-only; the Makefile skips it on macOS (macFUSE mounts of this filesystem can wedge the VFS). Elsewhere it is built only when FUSE 2.x headers are present, so a host without them produces a link line identical to a vanilla build. `make` reports which way it resolved:
 
 ```
 build: fuse enabled (-l:libfuse.so.2)

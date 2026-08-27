@@ -43,6 +43,12 @@
 #include <unistd.h>
 #include <limits.h>
 
+#if defined(__APPLE__)
+/* glibc-only unlocked stdio; macOS has no fread_unlocked, and its plain fread already
+ * takes the FILE lock, so it is the functional equivalent. */
+#define fread_unlocked fread
+#endif
+
 #include "crawl_bin_format.h"
 #include "alloc_tuning.h"
 #include "crawl_bin_block.h"

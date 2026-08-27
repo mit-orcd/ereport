@@ -9,7 +9,7 @@ Small C tools for crawling filesystem metadata into compact binary records and t
 | [`ecrawl`](docs/tools.md#ecrawl) | Parallel filesystem crawler; writes compact, uid-sharded binary metadata records. |
 | [`ecrawl_repair`](docs/tools.md#ecrawl_repair) | Rebuilds `*.bin.ckpt` sidecars, truncates incomplete shard tails, quarantines unrepairable shards. |
 | [`ecrawl_query`](docs/tools.md#ecrawl_query) | Read-only directory-shape stats (parent, path-depth, and top-parent histograms). |
-| [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Mounts a crawl as a read-only FUSE filesystem, so `find`/`ls`/`du` work on it without the source tree. Optional target (needs FUSE). |
+| [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Mounts a crawl as a read-only FUSE filesystem, so `find`/`ls`/`du` work on it without the source tree. Optional target (needs FUSE). Linux only; not supported on macOS. |
 | [`edelete`](docs/tools.md#edelete) | Parallel deleter for non-directory paths — everything under a path, or only entries older than an age threshold. Dry-run by default; never follows symlinks. |
 | [`ereport`](docs/tools.md#ereport) | Turns crawl output into `index.html`, an age×size heat map with bucket drill-down pages, and a path-search box. |
 | [`ereport_index`](docs/tools.md#ereport_index) | Builds and searches the trigram index behind path-substring search. |
@@ -98,7 +98,7 @@ find ~/mnt -mtime +365 -size +1G         # any POSIX tool works
 ./ecrawl_mount --dry-run crawl-out       # index stats only, no mount
 ```
 
-Metadata-only, as that is all a crawl holds: sizes, timestamps, uid, nlink, and inode numbers are exact, so `find`, `du --apparent-size`, and `wc -c` agree with the live tree byte for byte. Contents are not stored, so `read()` returns zeros; permissions are synthesized (`0555`/`0444`) and `readlink` fails, because the format records neither mode nor symlink targets. Optional target: needs FUSE 2.x, no root. Details: [docs/tools.md#ecrawl_mount](docs/tools.md#ecrawl_mount).
+Metadata-only, as that is all a crawl holds: sizes, timestamps, uid, nlink, and inode numbers are exact, so `find`, `du --apparent-size`, and `wc -c` agree with the live tree byte for byte. Contents are not stored, so `read()` returns zeros; permissions are synthesized (`0555`/`0444`) and `readlink` fails, because the format records neither mode nor symlink targets. Optional target: needs FUSE 2.x, no root. Linux only — not supported on macOS. Details: [docs/tools.md#ecrawl_mount](docs/tools.md#ecrawl_mount).
 
 ### `eserve.py` — serve reports + search
 

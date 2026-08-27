@@ -3,6 +3,10 @@
  * so ordinary POSIX tools (find, ls, stat, du, fd, rsync -n) can walk a crawl
  * without the source filesystem being present.
  *
+ * Linux only. Not supported on macOS: macFUSE mounts of this filesystem can
+ * wedge the VFS badly enough to hang umount/mount, and the Makefile does not
+ * build this target on Darwin.
+ *
  * The view is metadata-only, because that is all a crawl records:
  *   - read() returns zeros up to the recorded st_size. Sizes, and therefore
  *     `wc -c` and `du`, are exact; contents are not stored and never were.

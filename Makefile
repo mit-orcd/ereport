@@ -4,6 +4,11 @@ PYTHON3 ?= python3
 
 # Flags
 CFLAGS = -O2 -Wall -Wextra -Wunused-parameter -pthread
+# macOS: sources set _XOPEN_SOURCE/_GNU_SOURCE, which hides BSD extensions (qsort_r,
+# major/minor, O_DIRECTORY) unless _DARWIN_C_SOURCE is also on the command line.
+ifeq ($(shell uname -s),Darwin)
+CFLAGS += -D_DARWIN_C_SOURCE
+endif
 SERVE_ROOT ?= .
 SERVE_PORT ?= 8000
 SERVE_BIND ?= 127.0.0.1
@@ -13,14 +18,28 @@ SERVE_INDEX_DIR ?=
 # Targets
 TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_query edelete
 
+UNAME_S := $(shell uname -s)
+
 # zstd: required for the v6 uid_shard_*.bin block-compressed record format.
 # Auto-detected via pkg-config; falls back to a bare -lzstd link (libzstd.so is a
-# base-system library on RHEL). If libzstd is truly absent the link fails, which
+# base-system library on RHEL). On macOS zstd comes from Homebrew, which keeps it
+# keg-only (not in the default compiler search path), so without pkg-config point
+# at the brew prefix explicitly. If libzstd is truly absent the link fails, which
 # is the intended hard requirement.
 ZSTD_CFLAGS ?= $(shell pkg-config --cflags libzstd 2>/dev/null)
 ZSTD_LIBS ?= $(shell pkg-config --libs libzstd 2>/dev/null)
 ifeq ($(strip $(ZSTD_LIBS)),)
+ifeq ($(UNAME_S),Darwin)
+ZSTD_BREW := $(firstword $(wildcard /opt/homebrew/opt/zstd /usr/local/opt/zstd))
+ifneq ($(strip $(ZSTD_BREW)),)
+ZSTD_CFLAGS := -I$(ZSTD_BREW)/include
+ZSTD_LIBS := -L$(ZSTD_BREW)/lib -lzstd
+else
 ZSTD_LIBS := -lzstd
+endif
+else
+ZSTD_LIBS := -lzstd
+endif
 endif
 
 # Optional FUSE 2.x for ecrawl_mount (read-only mount of a crawl result).
@@ -30,6 +49,11 @@ endif
 # RPM into FUSE_PREFIX so an unprivileged user can still build. In that case we
 # link -l:libfuse.so.2 against the system library rather than -lfuse, because
 # the devel-only libfuse.so symlink is not present.
+# ecrawl_mount is Linux-only. macFUSE mounts of this filesystem can wedge the VFS
+# badly enough to hang umount/mount, so the FUSE target is not supported on macOS.
+ifeq ($(UNAME_S),Darwin)
+FUSE_NOTE := ecrawl_mount is not supported on macOS; skipping (Linux-only FUSE target)
+else
 FUSE_PREFIX ?= $(HOME)/.local/fuse-devel
 FUSE_CFLAGS ?= $(shell pkg-config --cflags fuse 2>/dev/null)
 FUSE_LIBS ?= $(shell pkg-config --libs fuse 2>/dev/null)
@@ -61,6 +85,7 @@ TARGETS += ecrawl_mount
 FUSE_NOTE := fuse enabled ($(strip $(FUSE_LIBS)))
 else
 FUSE_NOTE := fuse headers not found; skipping optional ecrawl_mount (get them with: make fuse-headers)
+endif
 endif
 
 # Header-only install of fuse-devel into FUSE_PREFIX, no root required. The

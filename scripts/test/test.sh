@@ -13,8 +13,22 @@
 #   SKIP_FUSE=1 ./scripts/test/test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
 # Requires: bash, coreutils, all Makefile targets built (default: the repo root, two levels up).
+# On macOS the GNU userland comes from Homebrew: brew install coreutils findutils gnu-sed.
 
 set -euo pipefail
+
+# macOS: this harness uses GNU-only flags throughout (stat -c, du -sb, date +%N, find -printf,
+# xargs -r, cp --parents, sed -i). Homebrew installs those tools g-prefixed; put each formula's
+# gnubin dir first in PATH so the stock names resolve to the GNU versions for the whole script.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    for _f in gnu-sed findutils coreutils; do
+        for _p in /opt/homebrew/opt /usr/local/opt; do
+            [[ -d "$_p/$_f/libexec/gnubin" ]] && PATH="$_p/$_f/libexec/gnubin:$PATH"
+        done
+    done
+    unset _f _p
+    export PATH
+fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
@@ -150,6 +164,18 @@ kv_last() {
 # Monotonic wall seconds (fractional when date supports %N).
 now_sec() {
     date +%s.%N 2>/dev/null || awk -v s="$SECONDS" 'BEGIN{printf "%.3f", s + 0}'
+}
+
+# Apparent-size total of a tree under ecrawl's accounting: every entry's st_size counts
+# (directories included), and a multiply-linked non-directory inode is credited once.
+# `du -sb` cannot be the reference for this: its apparent-size path reports st_size only
+# for regular files and symlinks (usable_st_size in coreutils src/system.h), dropping
+# directory sizes on every OS — only filesystems whose directories report st_size 0 ever
+# agreed with it. find -printf is the same outside opinion with the right semantics.
+tree_apparent_bytes() {
+    find "$1" -printf '%y %n %D:%i %s\n' | LC_ALL=C awk '
+        $1 != "d" && $2 > 1 { if (seen[$3]++) next }
+        { s += $4 } END { printf "%.0f\n", s + 0 }'
 }
 
 # Sets _timed_result and _timed_sec (wall seconds for "$@").
@@ -775,12 +801,28 @@ run_fs_correlation() {
 # rm walk the whole mounted view.
 EMOUNT_MP=""
 
+# Mounted-ness probe: /proc/mounts on Linux; macFUSE has no /proc, so parse mount(8)
+# output ("... on <mp> (macfuse, ...)") there.
+emount_is_mounted() {
+    local mp=$1
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        mount | grep -qF " on ${mp} " 2>/dev/null
+    else
+        grep -qF " ${mp} fuse" /proc/mounts 2>/dev/null
+    fi
+}
+
 emount_unmount() {
     local mp=$1 i
     [[ -n "$mp" ]] || return 0
     for i in 1 2 3 4 5; do
-        grep -qF " ${mp} fuse" /proc/mounts 2>/dev/null || { EMOUNT_MP=""; return 0; }
-        fusermount -u "$mp" 2>/dev/null && { EMOUNT_MP=""; return 0; }
+        emount_is_mounted "$mp" || { EMOUNT_MP=""; return 0; }
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            # macFUSE: no fusermount; a plain umount detaches a user-owned mount.
+            umount "$mp" 2>/dev/null && { EMOUNT_MP=""; return 0; }
+        else
+            fusermount -u "$mp" 2>/dev/null && { EMOUNT_MP=""; return 0; }
+        fi
         sleep 0.3
     done
     printf '%swarn:%s could not unmount %s\n' "$Y" "$Z" "$mp" >&2
@@ -879,7 +921,7 @@ run_ecrawl_no_stat_tests() {
 run_ecrawl_statx_tests() {
     local td=$1
     local st="${td}/statx_walk" err="${td}/statx.err"
-    local modes="base statx iouring" m keys k v_base v_new mismatch shard_base shard_new
+    local modes="base" m keys k v_base v_new mismatch shard_base shard_new
 
     section_int "[integration] ecrawl --statx / --iouring (inode-read variants)"
 
@@ -891,15 +933,25 @@ run_ecrawl_statx_tests() {
     ln -s ../a "${st}/c/link_a"
     st=$(cd "$st" && pwd -P)
 
+    # statx(2) is Linux-only: if this build has no statx support the flag must refuse
+    # cleanly; skip those legs (same contract as the io_uring probe below).
+    if "$ECRAWL" --no-write --statx "$st" >/dev/null 2>"$err"; then
+        modes="$modes statx"
+    elif grep -q "no statx support" "$err"; then
+        summary_add SKIP "ecrawl --statx" "built without statx support"
+        log "note: ecrawl built without statx; --statx legs skipped"
+    else
+        die "ecrawl --no-write --statx failed: $(tail -n1 "$err")"
+    fi
+
     # If this build has no io_uring support the flag must refuse cleanly; skip those legs.
-    if ! "$ECRAWL" --no-write --iouring "$st" >/dev/null 2>"$err"; then
-        if grep -q "no io_uring support" "$err"; then
-            modes="base statx"
-            summary_add SKIP "ecrawl --iouring" "built without io_uring support"
-            log "note: ecrawl built without io_uring; --iouring legs skipped"
-        else
-            die "ecrawl --no-write --iouring failed: $(tail -n1 "$err")"
-        fi
+    if "$ECRAWL" --no-write --iouring "$st" >/dev/null 2>"$err"; then
+        modes="$modes iouring"
+    elif grep -q "no io_uring support" "$err"; then
+        summary_add SKIP "ecrawl --iouring" "built without io_uring support"
+        log "note: ecrawl built without io_uring; --iouring legs skipped"
+    else
+        die "ecrawl --no-write --iouring failed: $(tail -n1 "$err")"
     fi
 
     local -A nw_sum=()
@@ -982,16 +1034,20 @@ run_ecrawl_statx_tests() {
 
     # --no-stat + --statx: the only inode reads left (crawl root, d_type-less probes) go through
     # statx with a STATX_TYPE-only mask; the path list must still equal find.
-    find "$st" | LC_ALL=C sort >"${td}/statx_nostat.ref"
-    "$ECRAWL" --no-stat --statx "$st" 2>"$err" | LC_ALL=C sort >"${td}/statx_nostat.out" ||
-        die "ecrawl --no-stat --statx failed"
-    expect_eq_continue "ecrawl --no-stat --statx: path set equals find" \
-        "$(cksum <"${td}/statx_nostat.ref" | cut -d' ' -f1)" \
-        "$(cksum <"${td}/statx_nostat.out" | cut -d' ' -f1)" "STATX_TYPE mask path"
-    "$ECRAWL" --no-stat --statx --verbose "$st" >/dev/null 2>"$err" ||
-        die "ecrawl --no-stat --statx --verbose failed"
-    expect_le_continue "ecrawl --no-stat --statx: inode reads" 1 \
-        "$(kv_last io_lstat_calls "$err")" "root only"
+    if [[ "$modes" == *statx* ]]; then
+        find "$st" | LC_ALL=C sort >"${td}/statx_nostat.ref"
+        "$ECRAWL" --no-stat --statx "$st" 2>"$err" | LC_ALL=C sort >"${td}/statx_nostat.out" ||
+            die "ecrawl --no-stat --statx failed"
+        expect_eq_continue "ecrawl --no-stat --statx: path set equals find" \
+            "$(cksum <"${td}/statx_nostat.ref" | cut -d' ' -f1)" \
+            "$(cksum <"${td}/statx_nostat.out" | cut -d' ' -f1)" "STATX_TYPE mask path"
+        "$ECRAWL" --no-stat --statx --verbose "$st" >/dev/null 2>"$err" ||
+            die "ecrawl --no-stat --statx --verbose failed"
+        expect_le_continue "ecrawl --no-stat --statx: inode reads" 1 \
+            "$(kv_last io_lstat_calls "$err")" "root only"
+    else
+        summary_add SKIP "ecrawl --no-stat --statx" "built without statx support"
+    fi
 
     rm -rf "$st" "$err" "${td}"/statx_nw_* "${td}"/statx_cap_* "${td}"/statx_nw_inline.out \
         "${td}"/statx_nostat.*
@@ -1031,9 +1087,11 @@ run_ecrawl_progress_tests() {
         die "ecrawl --progress --no-write failed"
     expect_progress_line "--no-write" "${td}/prog_nw.err"
 
-    "$ECRAWL" --progress --statx --no-write "$tree" >"${td}/prog_sx.out" 2>"${td}/prog_sx.err" ||
-        die "ecrawl --progress --statx --no-write failed"
-    expect_progress_line "--statx --no-write" "${td}/prog_sx.err"
+    if "$ECRAWL" --progress --statx --no-write "$tree" >"${td}/prog_sx.out" 2>"${td}/prog_sx.err"; then
+        expect_progress_line "--statx --no-write" "${td}/prog_sx.err"
+    else
+        summary_add SKIP "ecrawl --progress --statx" "unavailable (no statx support)"
+    fi
 
     "$ECRAWL" --progress --no-stat "$tree" >"${td}/prog_ns.out" 2>"${td}/prog_ns.err" ||
         die "ecrawl --progress --no-stat failed"
@@ -1137,7 +1195,7 @@ run_v8_rollup_tests() {
     for k in entries files dirs symlinks other bytes; do
         expect_eq "rollup equals exact scan: ${k}" "$(kv_last "$k" "$scan")" "$(kv_last "$k" "$roll")"
     done
-    expect_eq "rollup bytes match du -sb" "$(du -sb "${tree_abs}/clean" | awk '{print $1}')" \
+    expect_eq "rollup bytes match apparent-size sum" "$(tree_apparent_bytes "${tree_abs}/clean")" \
         "$(kv_last bytes "$roll")"
 
     # A record with nlink > 1 in scope makes crawl-time credit and scan-time
@@ -1232,6 +1290,11 @@ dirx_same() {
 dirx_build_uid_shim() {
     local so=$1 src="${so}.c" cc c
 
+    # Linux/glibc only: LD_PRELOAD interposing the __xstat/__lxstat/SYS_newfstatat
+    # plumbing. macOS/BSD have neither those symbols nor LD_PRELOAD (the equivalent
+    # would be a DYLD_INSERT_LIBRARIES shim, which this source is not).
+    [[ "$(uname -s)" == "Linux" ]] || return 1
+
     for c in "${CC:-}" cc gcc clang; do
         [[ -n "$c" ]] || continue
         if command -v "$c" >/dev/null 2>&1; then
@@ -1316,8 +1379,8 @@ dirx_multishard_tests() {
     section_int "[integration] dir-index sidecars — a subtree spanning uid shards"
 
     if ! dirx_build_uid_shim "$so"; then
-        log "skip: no C compiler for the ownership shim; multi-shard cases need one"
-        summary_add SKIP "dir-index multi-shard" "no compiler for the uid shim"
+        log "skip: uid ownership shim unavailable (Linux/glibc LD_PRELOAD interposer only)"
+        summary_add SKIP "dir-index multi-shard" "uid shim unavailable on this platform"
         return 0
     fi
 
@@ -1379,7 +1442,7 @@ dirx_multishard_tests() {
         "$(find "$top" -type d | wc -l | tr -d ' ')" "$(dirx_kv dirs "$sidecar")" || true
     expect_eq_continue "multi-shard: files vs find -type f" \
         "$(find "$top" -type f | wc -l | tr -d ' ')" "$(dirx_kv files "$sidecar")" || true
-    expect_eq_continue "multi-shard: bytes vs du -sb" "$(du -sb "$top" | awk '{print $1}')" \
+    expect_eq_continue "multi-shard: bytes vs apparent-size sum" "$(tree_apparent_bytes "$top")" \
         "$(dirx_kv bytes "$sidecar")" "byte total is right across shards" || true
 
     # The crawl root: every shard holds a piece, and the root's own record sits
@@ -1452,8 +1515,8 @@ dirx_stored_path_tests() {
         "$(dirx_kv answered_from "${td}/dirx_rr.idx")" || true
     dirx_same "stored path: dir_index vs catalog_rollup" "${td}/dirx_rr.plain" "${td}/dirx_rr.idx" || true
     dirx_same "stored path: dir_index vs --exact scan" "${td}/dirx_rr.exact" "${td}/dirx_rr.idx" || true
-    expect_eq_continue "stored path: bytes vs du -sb of the real tree" \
-        "$(du -sb "${tree_abs}/sub" | awk '{print $1}')" "$(dirx_kv bytes "${td}/dirx_rr.idx")" || true
+    expect_eq_continue "stored path: bytes vs apparent-size sum of the real tree" \
+        "$(tree_apparent_bytes "${tree_abs}/sub")" "$(dirx_kv bytes "${td}/dirx_rr.idx")" || true
 
     # --path-rewrite relabels what the trigram index stores. The sidecars are
     # built from the catalogs, which it does not touch, so a subtree query keeps
@@ -1727,7 +1790,7 @@ run_dir_index_tests() {
         "$(dirx_kv answered_from "$exact")" || true
     dirx_same "dir_index vs catalog_rollup" "$plain" "$sidecar" hardlink_dupes records_scanned || true
     dirx_same "dir_index vs --exact scan" "$exact" "$sidecar" hardlink_dupes || true
-    expect_eq_continue "dir_index bytes vs du -sb" "$(du -sb "$target" | awk '{print $1}')" \
+    expect_eq_continue "dir_index bytes vs apparent-size sum" "$(tree_apparent_bytes "$target")" \
         "$(dirx_kv bytes "$sidecar")" || true
 
     # The point of the sidecar: the catalog route reads every directory row in
@@ -1898,6 +1961,12 @@ run_ecrawl_mount_tests() {
 
     section_int "[integration] ecrawl_mount (smoke)"
 
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        log "skip: ecrawl_mount is not supported on macOS (Linux-only FUSE target)"
+        summary_add SKIP "ecrawl_mount" "not supported on macOS"
+        return 0
+    fi
+
     if [[ ! -x "$ECRAWL_MOUNT" ]]; then
         log "skip: ${ECRAWL_MOUNT} not built (needs FUSE headers: make fuse-headers)"
         summary_add SKIP "ecrawl_mount" "binary not built"
@@ -1931,7 +2000,11 @@ run_ecrawl_mount_tests() {
 
     mkdir -p "$mp"
     log "ecrawl_mount ${crawl_out} -> ${mp}"
-    if ! "$ECRAWL_MOUNT" "$crawl_out" "$mp" >"${td}/emount.out" 2>"${td}/emount.err"; then
+    # Success is the mount appearing, not the exit code: libfuse can return 0 even
+    # when the mount failed (the error is printed by a daemonized child).
+    if "$ECRAWL_MOUNT" "$crawl_out" "$mp" >"${td}/emount.out" 2>"${td}/emount.err" && emount_is_mounted "$mp"; then
+        :
+    else
         tail -n 20 "${td}/emount.err" >&2 || true
         log "skip: mount failed on this host (unprivileged FUSE may be disabled)"
         summary_add SKIP "ecrawl_mount live mount" "mount refused"
@@ -2023,9 +2096,12 @@ run_integration() {
     au_out="${td}/ereport_all.stdout"
     au_err="${td}/ereport_all.stderr"
 
+    # The EXIT trap needs a global copy of the temp dir: a set -e abort discards the
+    # function stack (and its locals) before the trap runs, leaving $td unbound.
+    INT_TD=$td
     cleanup_int() {
         emount_cleanup_hook
-        rm -rf "$td"
+        [[ -n "${INT_TD:-}" ]] && rm -rf "$INT_TD"
     }
     trap cleanup_int EXIT
 

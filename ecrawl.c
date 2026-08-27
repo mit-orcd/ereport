@@ -58,7 +58,11 @@
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/sysmacros.h>
+#if defined(__has_include)
+#  if __has_include(<sys/sysmacros.h>)
+#    include <sys/sysmacros.h> /* glibc makedev(); on macOS <sys/types.h> provides it */
+#  endif
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
@@ -158,6 +162,12 @@
 #define DEFAULT_GETDENTS_BUF (1024U * 1024U)
 #define MIN_GETDENTS_BUF 4096U
 #define MAX_GETDENTS_BUF (64U * 1024U * 1024U)
+
+/* Raw getdents64(2) batch reads are Linux-only; elsewhere the directory reader always
+ * uses the libc opendir/readdir path (same behaviour, one readdir per entry). */
+#if defined(__linux__) && defined(SYS_getdents64)
+#define ECRAWL_HAVE_GETDENTS64 1
+#endif
 
 /* Fold thread-local perf into the global progress counters every N accounted entries so TTY obj/s and totals
  * stay live without an atomic RMW per entry. A batch is also flushed when the rolling window rolls, so the
@@ -834,6 +844,10 @@ static int ecrawl_plstat(const char *path, struct stat *st) {
  * never see zeroed fields. */
 static int g_statx_mode = 0;    /* --statx */
 static int g_iouring_statx = 0; /* --iouring (IORING_OP_STATX; same mask as --statx) */
+#if defined(__linux__)
+#define ECRAWL_HAVE_STATX 1
+#endif
+#ifdef ECRAWL_HAVE_STATX
 static unsigned g_statx_mask = STATX_BASIC_STATS;
 
 static void ecrawl_statx_select_mask(void) {
@@ -894,6 +908,12 @@ static void ecrawl_install_statx_profile(void) {
     ecrawl_io_lstat = ecrawl_statx_lstat;
     ecrawl_io_fstatat_nf = ecrawl_statx_fstatat_nf;
 }
+#else
+/* statx(2) is Linux-only. main() rejects --statx/--iouring on this build, so the profile
+ * installer is never asked to do anything; keep the symbol so the call site compiles. */
+static unsigned g_statx_mask = 0;
+static void ecrawl_install_statx_profile(void) { }
+#endif
 
 /* ----- per-worker io_uring for batched statx -------------------------------------------------------
  * The walk loop is otherwise one synchronous fstatat per entry; with --iouring each worker
@@ -4277,6 +4297,7 @@ static int ecrawl_dir_reader_open(ecrawl_dir_reader_t *r, const char *path, char
     r->buf_off = 0;
     r->dirp = NULL;
     r->path = path;
+#ifdef ECRAWL_HAVE_GETDENTS64
     if (buf && buf_cap >= MIN_GETDENTS_BUF) {
         int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0) return -1;
@@ -4284,6 +4305,7 @@ static int ecrawl_dir_reader_open(ecrawl_dir_reader_t *r, const char *path, char
         if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_opendir_calls, 1);
         return 0;
     }
+#endif
     r->dirp = ecrawl_io_opendir(path); /* counts opendir in verbose via the fn pointer */
     if (!r->dirp) return -1;
     return 0;
@@ -4302,7 +4324,9 @@ static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out,
         struct dirent *de = ecrawl_io_readdir(r->dirp);
         if (!de) return 0;
         *name_out = de->d_name;
-#if defined(_DIRENT_HAVE_D_TYPE) && defined(DT_UNKNOWN)
+/* glibc sets _DIRENT_HAVE_D_TYPE; macOS/BSD dirent always carries d_type but defines no
+ * such macro, so name Apple explicitly or every entry degrades to a DT_UNKNOWN probe stat. */
+#if (defined(_DIRENT_HAVE_D_TYPE) || defined(__APPLE__)) && defined(DT_UNKNOWN)
         *type_out = de->d_type;
 #else
         *type_out = DT_UNKNOWN;
@@ -4310,6 +4334,7 @@ static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out,
         if (ino_out) *ino_out = (uint64_t)de->d_ino;
         return 1;
     }
+#ifdef ECRAWL_HAVE_GETDENTS64
     for (;;) {
         struct ecrawl_linux_dirent64 *d;
         if (r->buf_off >= r->buf_len) {
@@ -4332,6 +4357,9 @@ static int ecrawl_dir_reader_next(ecrawl_dir_reader_t *r, const char **name_out,
         if (g_verbose) ATOMIC_ADD_RELAXED(&g_io_readdir_calls, 1);
         return 1;
     }
+#else
+    return -1; /* fd >= 0 only happens with the raw getdents64 path */
+#endif
 }
 
 static void ecrawl_dir_reader_close(ecrawl_dir_reader_t *r) {
@@ -6032,6 +6060,12 @@ int main(int argc, char **argv) {
 #ifndef ECRAWL_HAVE_IOURING
     if (g_iouring_statx) {
         fprintf(stderr, "--iouring: this build has no io_uring support (missing <linux/io_uring.h> or arch syscall numbers)\n");
+        return 2;
+    }
+#endif
+#ifndef ECRAWL_HAVE_STATX
+    if (g_statx_mode) {
+        fprintf(stderr, "--statx: this build has no statx support (statx(2) is Linux-only)\n");
         return 2;
     }
 #endif

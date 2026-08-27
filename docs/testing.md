@@ -42,7 +42,7 @@ This is the only check that compares a crawl against the live tree it came from 
 
 `atime` is deliberately excluded from the per-entry comparison: the crawl froze it, while walking the live tree during the test keeps moving it, so comparing it would be racy rather than meaningful.
 
-Skips are reported rather than treated as failures, since `ecrawl_mount` is an optional target: the section is skipped when the binary was not built, when `SKIP_FUSE=1` is set, when the host has no `/dev/fuse` or `fusermount`, or when the mount itself is refused (unprivileged FUSE disabled). The mountpoint lives under the integration temp directory and the cleanup trap unmounts it before removing that directory, so a failed run cannot leave a stale mount behind.
+Skips are reported rather than treated as failures, since `ecrawl_mount` is an optional target: the section is skipped on macOS (Linux-only target), when the binary was not built, when `SKIP_FUSE=1` is set, when the host has no `/dev/fuse` or `fusermount`, or when the mount itself is refused (unprivileged FUSE disabled). The mountpoint lives under the integration temp directory and the cleanup trap unmounts it before removing that directory, so a failed run cannot leave a stale mount behind.
 - `scripts/test/test_setup.sh` — Removes and recreates `./test` (default: `…/ereport/test`) with a deep chain (`deep/seg001/…`), a wide branch layout (`wide/b00/…`), symlinks, hardlinks, and root files. Tune size with `DEPTH`, `BRANCHES`, `FILES_WIDE`.
 - `scripts/test/test_full.sh` — Runs `test_setup.sh` and then `test.sh` on that tree (same as `make check-tree`).
 

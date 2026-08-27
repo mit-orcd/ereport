@@ -32,6 +32,7 @@
 #include <zstd.h>
 
 #include "alloc_tuning.h"
+#include "compat_qsort_r.h"
 #include "crawl_bin_block.h"
 #include "crawl_bin_catalog.h"
 #include "crawl_bin_chunks.h"
@@ -42,6 +43,11 @@
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
+
+/* macOS names the sub-second mtime field st_mtimespec; keep glibc's st_mtim spelling. */
+#if defined(__APPLE__) && !defined(st_mtim)
+#define st_mtim st_mtimespec
 #endif
 
 /*
@@ -7575,7 +7581,7 @@ static void lex_sort_rec(lex_ent_t *ents, lex_ent_t *scratch, size_t n, int dept
 
     if (n < 2) return;
     if (n <= (size_t)LEX_SORT_SERIAL || depth <= 0) {
-        qsort_r(ents, n, sizeof(*ents), lex_ent_cmp, NULL);
+        ereport_qsort_r(ents, n, sizeof(*ents), lex_ent_cmp, NULL);
         return;
     }
     mid = n / 2;
