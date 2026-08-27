@@ -486,8 +486,11 @@ run_edelete_tests() {
         own_temp=1
         log "edelete test suite (synthetic tree)"
         td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_edelete.XXXXXX")
+        # Global copy for the EXIT trap: a set -e abort discards the function
+        # stack (and its locals) before the trap runs, leaving $td unbound.
+        EDELETE_TD=$td
         cleanup_edelete() {
-            rm -rf "$td"
+            [[ -n "${EDELETE_TD:-}" ]] && rm -rf "$EDELETE_TD"
         }
         trap cleanup_edelete EXIT
         mkdir -p "${td}/walk/sub"
@@ -602,8 +605,11 @@ run_fs_correlation() {
     ere_all_out="${td}/ereport_all.stdout"
     ere_all_log="${td}/ereport_all.stderr"
 
+    # The EXIT trap needs a global copy of the temp dir: a set -e abort discards the
+    # function stack (and its locals) before the trap runs, leaving $td unbound.
+    FS_TD=$td
     cleanup_fs() {
-        rm -rf "$td"
+        [[ -n "${FS_TD:-}" ]] && rm -rf "$FS_TD"
     }
     trap cleanup_fs EXIT
 
