@@ -18,7 +18,7 @@
  * Checkpoint segments are 32 MiB apart, which is coarser than the thread budget on a
  * small capture, so segments are subdivided at block boundaries (see
  * parse_split_target_bytes) — without that a capture under 32 MiB ran on one core.
- * The parent-directory map is shared by all workers (stripe-locked inserts, atomic
+ * The parent-directory map is shared by all workers (CAS-published inserts, atomic
  * per-parent counters) rather than built per worker and merged; see parent_map_t.
  */
 
@@ -58,6 +58,10 @@
 #include "crawl_fpcache.h"
 #include "crawl_sidecar.h"
 #include "path_canon.h"
+
+#if defined(__x86_64__)
+#include <cpuid.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -145,8 +149,18 @@ static int query_list_buffered(void) {
     return g_query.list_paths && (g_query.list_level != 0U || g_query.sum);
 }
 
+/* Listing is sparse when a record filter can omit an ancestor of a listed path.
+ * Dense listings (no uid/gid/size/type/perm, and no non-root --subtree) have every
+ * ancestor listed, so --list --level can root at the shallowest listed path (found
+ * while slicing) and skip Pass 1. */
+static int query_list_sparse(void) {
+    return g_query.have_uid || g_query.have_gid || g_query.have_size_gt || g_query.type_filter ||
+           g_query.perm_mode || (g_query.subtree && !g_query.subtree_is_root);
+}
+
 /* The subtree's own directory record, contributed by the one shard that holds it. */
 static _Atomic uint64_t g_subtree_self_count;
+static _Atomic uint64_t g_catalogs_loaded; /* shard catalogs materialized; 0 when the sidecar serves membership */
 static _Atomic uint64_t g_subtree_self_bytes;
 
 /* Permission-bit test against the recorded st_mode. */
@@ -175,14 +189,6 @@ static int g_top_deep = 0;
 #define ANALYZE_HASH_BUCKETS_MIN 4096U
 #define ANALYZE_HASH_BUCKETS_MAX (1U << 26)
 #define ANALYZE_DEPTH_BINS 64U
-/*
- * Insert locks per worker thread. Only chain insertion is serialized, and only against the threads that
- * draw the same stripe, so more stripes than threads keeps that collision rare while the array stays small
- * (a mutex per stripe, not per bucket).
- */
-#define ANALYZE_INSERT_STRIPES_PER_THREAD 8U
-#define ANALYZE_INSERT_STRIPES_MAX 4096U
-
 /*
  * Child records under one directory, split by type.
  *
@@ -260,8 +266,6 @@ typedef struct parent_arena {
 typedef struct {
     _Atomic(parent_node_t *) *buckets;
     size_t bucket_mask;               /* buckets is a power of two; bucket = hash & bucket_mask */
-    pthread_mutex_t *stripes;
-    size_t stripe_count;              /* power of two; stripe = bucket & (stripe_count - 1) */
     _Atomic(parent_arena_t *) arenas; /* every worker arena, so free() and the report can walk them */
 } parent_map_t;
 
@@ -275,7 +279,7 @@ typedef struct {
  *
  * The array this replaces memoised dir_id -> parent node, which still meant resolving each
  * directory the first time: build the path, hash it, probe the bucket array, walk a chain, take a
- * stripe lock to publish. On a flat tree that came to 22% of the run in parent_map_get_or_add and
+ * CAS to publish. On a flat tree that came to 22% of the run in parent_map_get_or_add and
  * another 25% in pthread_mutex_lock/unlock, all of it inside the scan and all of it contended.
  * Counting into a dense array indexed by the id the record already carries has none of that, and
  * neighbouring records usually land on the same or a neighbouring line.
@@ -322,6 +326,7 @@ typedef struct {
     int have_hull;
     int empty; /* nothing in this shard can match: its chunks are retired unread */
     int whole; /* subtree covers the entire catalog */
+    int sidecar_mem; /* DFS ranges came from dirs.idx; membership does not need dfs_index[] */
 } shard_subtree_t;
 
 static inline uint64_t shard_sub_root_at(const shard_subtree_t *s, size_t i) {
@@ -369,13 +374,15 @@ typedef struct {
     query_hardlink_t *hl;
     size_t hl_count;
     size_t hl_cap;
-    char *out; /* path output, flushed to stdout in large batches */
-    size_t out_len;
-    size_t out_cap;
-    size_t out_lines; /* complete '\n'-terminated lines currently in out[] */
-    query_listrec_t *lrec;
+    /* Path bytes live in fixed-size segments so a buffered --level/--sum listing
+     * never realloc-copies earlier output. Streaming --list flushes and recycles. */
+    struct query_out_seg *out_head;
+    struct query_out_seg *out_tail;
+    size_t out_len;   /* total bytes across every live segment */
+    size_t out_lines; /* complete '\n'-terminated lines currently buffered */
+    struct query_lrec_seg *lrec_head;
+    struct query_lrec_seg *lrec_tail;
     size_t lrec_count;
-    size_t lrec_cap;
     uint64_t blocks_decompressed;
     uint64_t blocks_skipped;
     uint64_t records_skipped;
@@ -423,6 +430,9 @@ typedef struct {
     crawl_bin_catalog_t *shard_cat;        /* array[name_count] */
     analyze_dir_counts_t **shard_cnt;      /* array[name_count]; per-shard dir_id -> child counts */
     shard_subtree_t *shard_sub;            /* array[name_count]; query mode with --subtree only */
+    crawl_sidecar_t sidecar;               /* kept open for scan membership when dirs.idx is live */
+    crawl_sidecar_scope_t *sidecar_scope;  /* per-shard DFS ranges; borrowed by shard_sub */
+    int sidecar_mem;                       /* membership comes from the sidecar, not the catalog */
     unsigned char *shard_cat_state;       /* SHARD_CAT_* */
     _Atomic uint64_t *shard_chunks_left;  /* per shard; catalog freed when it reaches 0 */
     pthread_mutex_t shard_cat_lock;
@@ -440,7 +450,7 @@ typedef struct {
      * dir_ids are per shard, so the same path in two shards is two ids and only a string can tell
      * that they are one directory. With a single shard there is nothing to merge: dir_id already
      * identifies the directory, every one of them is distinct, and the fold can hand the report a
-     * node directly -- no hash, no bucket, no stripe lock. That is the flat-tree case, and it is
+     * node directly -- no hash, no bucket, no insert CAS. That is the flat-tree case, and it is
      * where the map was costing 22% in parent_map_get_or_add plus 25% in mutex lock and unlock.
      */
     int fold_use_map;
@@ -872,16 +882,16 @@ static uint32_t analyze_hash_parent(const char *s, size_t len) {
 }
 
 /*
- * nthreads: workers that will share the map, which sets how finely inserts are striped.
- * expect_parents: upper bound on distinct parents, summed from the shard catalogs' entry counts.
+ * nthreads: retained so call sites stay stable; inserts are CAS-published and no
+ * longer striped. expect_parents: upper bound on distinct parents, summed from the
+ * shard catalogs' entry counts.
  */
 static parent_map_t *parent_map_new(unsigned nthreads, uint64_t expect_parents) {
     parent_map_t *m = (parent_map_t *)calloc(1, sizeof(*m));
     uint64_t want_buckets;
     size_t nbuckets;
-    size_t want;
-    size_t i;
 
+    (void)nthreads;
     if (!m) return NULL;
 
     want_buckets = expect_parents + expect_parents / 2ULL; /* ~0.67 load at the bound */
@@ -897,27 +907,6 @@ static parent_map_t *parent_map_new(unsigned nthreads, uint64_t expect_parents) 
     if (!m->buckets) {
         free(m);
         return NULL;
-    }
-
-    want = (size_t)(nthreads ? nthreads : 1U) * (size_t)ANALYZE_INSERT_STRIPES_PER_THREAD;
-    if (want > (size_t)ANALYZE_INSERT_STRIPES_MAX) want = (size_t)ANALYZE_INSERT_STRIPES_MAX;
-    m->stripe_count = 1U;
-    while (m->stripe_count < want) m->stripe_count <<= 1;
-
-    m->stripes = (pthread_mutex_t *)calloc(m->stripe_count, sizeof(*m->stripes));
-    if (!m->stripes) {
-        free(m->buckets);
-        free(m);
-        return NULL;
-    }
-    for (i = 0; i < m->stripe_count; i++) {
-        if (pthread_mutex_init(&m->stripes[i], NULL) != 0) {
-            while (i > 0U) pthread_mutex_destroy(&m->stripes[--i]);
-            free(m->stripes);
-            free(m->buckets);
-            free(m);
-            return NULL;
-        }
     }
     return m;
 }
@@ -974,7 +963,6 @@ static void *parent_arena_alloc(parent_arena_t *a, size_t sz) {
 
 static void parent_map_free(parent_map_t *m) {
     parent_arena_t *a;
-    size_t bi;
 
     if (!m) return;
     /* Nodes and path bytes live in the arenas; the bucket chains are just pointers into them. */
@@ -992,8 +980,6 @@ static void parent_map_free(parent_map_t *m) {
         free(a);
         a = anext;
     }
-    for (bi = 0; bi < m->stripe_count; bi++) pthread_mutex_destroy(&m->stripes[bi]);
-    free(m->stripes);
     free(m->buckets);
     free(m);
 }
@@ -1085,9 +1071,9 @@ static parent_node_t *parent_chain_find(parent_node_t *from, const parent_node_t
  * run (nodes are never moved or freed until the report is done with them), so callers may memo the pointer.
  *
  * A hit — the common case once a chunk gets going — takes no lock at all: the chain is append-at-head and
- * its nodes are immutable, so a reader either misses a concurrent insert or sees it complete. The stripe
- * lock is held only to publish, and only across the part of the chain that grew since the unlocked walk;
- * the node itself is built before the lock is taken.
+ * its nodes are immutable, so a reader either misses a concurrent insert or sees it complete. Publish is
+ * a CAS on the bucket head, matching the lock-free emit membership table; the node is built before the
+ * CAS, and a lost race rewinds the arena bump.
  *
  * The node comes from the caller's arena in one bump, node and path together. Losing the publish race
  * rewinds that bump, so the bytes are handed to the next insert rather than freed.
@@ -1096,9 +1082,8 @@ static parent_node_t *parent_map_get_or_add(parent_map_t *m, parent_arena_t *are
                                             size_t parent_len) {
     uint32_t hx = analyze_hash_parent(parent, parent_len);
     size_t bi = (size_t)hx & m->bucket_mask;
-    pthread_mutex_t *lock = &m->stripes[bi & (m->stripe_count - 1U)];
-    parent_node_t *head = atomic_load_explicit(&m->buckets[bi], memory_order_acquire);
-    parent_node_t *node = parent_chain_find(head, NULL, hx, parent, parent_len);
+    parent_node_t *cur = atomic_load_explicit(&m->buckets[bi], memory_order_acquire);
+    parent_node_t *node = parent_chain_find(cur, NULL, hx, parent, parent_len);
     parent_arena_block_t *mark_blk;
     size_t mark_used;
 
@@ -1122,13 +1107,10 @@ static parent_node_t *parent_map_get_or_add(parent_map_t *m, parent_arena_t *are
     atomic_init(&node->c.nsym, 0ULL);
     atomic_init(&node->c.nother, 0ULL);
 
-    pthread_mutex_lock(lock);
-    {
-        parent_node_t *cur = atomic_load_explicit(&m->buckets[bi], memory_order_acquire);
-        parent_node_t *raced = parent_chain_find(cur, head, hx, parent, parent_len);
+    for (;;) {
+        parent_node_t *raced = parent_chain_find(cur, NULL, hx, parent, parent_len);
 
         if (raced) {
-            pthread_mutex_unlock(lock);
             /* Give the bytes back. The arena is bumped only by its owner and nothing else allocated
              * from it since the mark, so either we are still in the marked block, or the allocation
              * opened a fresh one in which our node is the only occupant. Rewinding both cases keeps
@@ -1142,10 +1124,10 @@ static parent_node_t *parent_map_get_or_add(parent_map_t *m, parent_arena_t *are
             return raced;
         }
         atomic_store_explicit(&node->next, cur, memory_order_relaxed);
-        atomic_store_explicit(&m->buckets[bi], node, memory_order_release);
+        if (atomic_compare_exchange_weak_explicit(&m->buckets[bi], &cur, node, memory_order_release,
+                                                  memory_order_acquire))
+            return node;
     }
-    pthread_mutex_unlock(lock);
-    return node;
 }
 
 /* Writes the parent into `parent` and reports its length, which the map wants anyway. */
@@ -1845,16 +1827,149 @@ static void query_note_subtree_self(const crawl_bin_catalog_t *cat, const shard_
 
 static void subtree_free(shard_subtree_t *s) {
     if (!s) return;
-    free(s->root_ids);
-    free(s->ranges);
-    free(s->parent_ids);
+    if (!s->sidecar_mem) {
+        /* Sidecar-backed entries borrow their arrays from the pool's scope. */
+        free(s->root_ids);
+        free(s->ranges);
+        free(s->parent_ids);
+    }
     memset(s, 0, sizeof(*s));
+}
+
+/*
+ * Fill membership state from the dir-index scope instead of the catalog, so the
+ * scan never materializes the shard's catalog. root_ids/ranges/parent_ids are
+ * borrowed from the scope, which the pool keeps alive until the workers join.
+ *
+ * The dir_id hull is looser than subtree_build's: parent-before-child id
+ * assignment makes every in-subtree id larger than the root's, so
+ * [min(root,parent ids), max_dir_id] is a safe superset. Row-group pruning has
+ * already done the coarse skipping; the per-record range test stays exact.
+ */
+static void query_subtree_from_scope(const crawl_sidecar_scope_t *sp, uint64_t max_dir_id, shard_subtree_t *out) {
+    size_t i;
+
+    memset(out, 0, sizeof(*out));
+    out->max_dir_id = max_dir_id;
+    out->sidecar_mem = 1;
+    out->nroots = sp->nroots;
+    out->root_id = sp->root;
+    out->root_ids = sp->roots;
+    out->ranges = (query_dfs_range_t *)sp->ranges; /* same {lo,hi} layout */
+    out->dfs_lo = sp->dfs_lo;
+    out->dfs_hi = sp->dfs_hi;
+    out->parent_ids = sp->parents;
+    out->nparents = sp->nparents;
+    out->empty = !sp->in_shard;
+    if (sp->nroots || sp->nparents) {
+        uint64_t lo = UINT64_MAX;
+
+        for (i = 0; i < sp->nroots; i++)
+            if (sp->roots[i] < lo) lo = sp->roots[i];
+        for (i = 0; i < sp->nparents; i++)
+            if (sp->parents[i] < lo) lo = sp->parents[i];
+        out->pid_lo = lo;
+        out->pid_hi = max_dir_id;
+        out->have_hull = 1;
+    }
+}
+
+/* Range test on a DFS position, the sidecar route's half of subtree_contains. */
+static int query_subtree_dfs_in(const shard_subtree_t *s, uint64_t p) {
+    size_t i;
+
+    if (s->nroots == 1U) return p >= s->dfs_lo && p < s->dfs_hi;
+    for (i = 0; i < s->nroots; i++)
+        if (p >= s->ranges[i].lo && p < s->ranges[i].hi) return 1;
+    return 0;
+}
+
+/*
+ * The subtree's own directory record, credited without a catalog: the scope
+ * carries each root's self-record flag and size. Only for scans that project no
+ * names; with names the scan recognises the record itself (see query_needs_names).
+ */
+static void query_note_subtree_self_scope(const crawl_sidecar_scope_t *sp) {
+    size_t i;
+
+    if (query_needs_names() || !sp) return;
+    if (g_query.type_filter && g_query.type_filter != 'd') return;
+    for (i = 0; i < sp->nroots; i++) {
+        if (!sp->self_flags[i]) continue;
+        if (g_query.have_size_gt && sp->self_bytes[i] <= g_query.size_gt) continue;
+        atomic_fetch_add_explicit(&g_subtree_self_count, 1ULL, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_subtree_self_bytes, sp->self_bytes[i], memory_order_relaxed);
+    }
 }
 
 static pthread_mutex_t g_query_out_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* One batch per worker per flush: bigger batches mean fewer turns on the mutex and fewer
  * write() calls for the same listing. */
 #define QUERY_OUT_FLUSH_BYTES (1024U * 1024U)
+#define QUERY_OUT_SEG_BYTES (2U * 1024U * 1024U)
+#define QUERY_LREC_SEG_CAP 4096U
+
+typedef struct query_out_seg {
+    struct query_out_seg *next;
+    size_t used;
+    size_t lines;
+    char data[QUERY_OUT_SEG_BYTES];
+} query_out_seg_t;
+
+typedef struct query_lrec_seg {
+    struct query_lrec_seg *next;
+    size_t count;
+    size_t cap;
+    query_listrec_t rec[QUERY_LREC_SEG_CAP];
+} query_lrec_seg_t;
+
+static void query_out_segs_free(query_out_seg_t *s) {
+    while (s) {
+        query_out_seg_t *n = s->next;
+
+        free(s);
+        s = n;
+    }
+}
+
+static void query_lrec_segs_free(query_lrec_seg_t *s) {
+    while (s) {
+        query_lrec_seg_t *n = s->next;
+
+        free(s);
+        s = n;
+    }
+}
+
+static int query_out_seg_push(query_result_t *qr) {
+    query_out_seg_t *s = (query_out_seg_t *)malloc(sizeof(*s));
+
+    if (!s) return -1;
+    s->next = NULL;
+    s->used = 0;
+    s->lines = 0;
+    if (qr->out_tail)
+        qr->out_tail->next = s;
+    else
+        qr->out_head = s;
+    qr->out_tail = s;
+    return 0;
+}
+
+static int query_lrec_seg_push(query_result_t *qr) {
+    query_lrec_seg_t *s = (query_lrec_seg_t *)malloc(sizeof(*s));
+
+    if (!s) return -1;
+    s->next = NULL;
+    s->count = 0;
+    s->cap = QUERY_LREC_SEG_CAP;
+    if (qr->lrec_tail)
+        qr->lrec_tail->next = s;
+    else
+        qr->lrec_head = s;
+    qr->lrec_tail = s;
+    return 0;
+}
 
 /*
  * Paths go straight to fd 1: stdio would copy every batch into its own buffer on the way to
@@ -1862,61 +1977,109 @@ static pthread_mutex_t g_query_out_mutex = PTHREAD_MUTEX_INITIALIZER;
  * stderr in --list mode), so the two never interleave.
  */
 static void query_out_flush(query_result_t *qr) {
-    size_t off = 0;
+    query_out_seg_t *s;
 
-    if (!qr->out || qr->out_len == 0U) return;
+    if (!qr->out_head || qr->out_len == 0U) return;
     pthread_mutex_lock(&g_query_out_mutex);
-    while (off < qr->out_len) {
-        ssize_t w = write(STDOUT_FILENO, qr->out + off, qr->out_len - off);
+    for (s = qr->out_head; s; s = s->next) {
+        size_t off = 0;
 
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            qr->oom = 1;
-            break;
+        while (off < s->used) {
+            ssize_t w = write(STDOUT_FILENO, s->data + off, s->used - off);
+
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                qr->oom = 1;
+                break;
+            }
+            off += (size_t)w;
         }
-        off += (size_t)w;
+        if (qr->oom) break;
     }
     pthread_mutex_unlock(&g_query_out_mutex);
+    /* Recycle the first segment; drop the rest so a streaming listing stays at 2 MiB. */
+    s = qr->out_head;
+    if (s) {
+        query_out_segs_free(s->next);
+        s->next = NULL;
+        s->used = 0;
+        s->lines = 0;
+        qr->out_tail = s;
+    }
     qr->out_len = 0;
     qr->out_lines = 0;
 }
 
 static int query_out_append(query_result_t *qr, const char *path, size_t len) {
-    if (qr->out_len + len + 1U > qr->out_cap) {
-        if (!query_list_buffered()) query_out_flush(qr);
-        if (qr->out_len + len + 1U > qr->out_cap) {
-            size_t nc = qr->out_cap ? qr->out_cap : QUERY_OUT_FLUSH_BYTES;
-            char *np;
+    size_t need = len + 1U;
+    query_out_seg_t *s;
 
-            while (nc < qr->out_len + len + 1U) nc <<= 1;
-            np = (char *)realloc(qr->out, nc);
-            if (!np) return -1;
-            qr->out = np;
-            qr->out_cap = nc;
-        }
+    if (need > QUERY_OUT_SEG_BYTES) return -1;
+    if (!query_list_buffered() && qr->out_len + need > QUERY_OUT_FLUSH_BYTES) query_out_flush(qr);
+    s = qr->out_tail;
+    if (!s || s->used + need > QUERY_OUT_SEG_BYTES) {
+        if (query_out_seg_push(qr) != 0) return -1;
+        s = qr->out_tail;
     }
-    memcpy(qr->out + qr->out_len, path, len);
-    qr->out_len += len;
-    qr->out[qr->out_len++] = '\n';
+    memcpy(s->data + s->used, path, len);
+    s->used += len;
+    s->data[s->used++] = '\n';
+    s->lines++;
+    qr->out_len += need;
     qr->out_lines++;
     if (!query_list_buffered() && qr->out_len >= QUERY_OUT_FLUSH_BYTES) query_out_flush(qr);
     return 0;
 }
 
 static int query_lrec_append(query_result_t *qr, uint64_t size, uint8_t type, uint32_t hl_idx) {
-    if (qr->lrec_count == qr->lrec_cap) {
-        size_t nc = qr->lrec_cap ? qr->lrec_cap * 2U : 4096U;
-        query_listrec_t *np = (query_listrec_t *)realloc(qr->lrec, nc * sizeof(*np));
+    query_lrec_seg_t *s = qr->lrec_tail;
 
-        if (!np) return -1;
-        qr->lrec = np;
-        qr->lrec_cap = nc;
+    if (!s || s->count == s->cap) {
+        if (query_lrec_seg_push(qr) != 0) return -1;
+        s = qr->lrec_tail;
     }
-    qr->lrec[qr->lrec_count].size = size;
-    qr->lrec[qr->lrec_count].type = type;
-    qr->lrec[qr->lrec_count].hl_idx = hl_idx;
+    s->rec[s->count].size = size;
+    s->rec[s->count].type = type;
+    s->rec[s->count].hl_idx = hl_idx;
+    s->count++;
     qr->lrec_count++;
     return 0;
+}
+
+typedef struct {
+    query_lrec_seg_t *seg;
+    size_t off;
+} query_lrec_cur_t;
+
+static int query_lrec_cur_seek(query_result_t *qr, size_t idx, query_lrec_cur_t *c) {
+    query_lrec_seg_t *s = qr->lrec_head;
+
+    while (s) {
+        if (idx < s->count) {
+            c->seg = s;
+            c->off = idx;
+            return 0;
+        }
+        idx -= s->count;
+        s = s->next;
+    }
+    c->seg = NULL;
+    c->off = 0;
+    return -1;
+}
+
+static query_listrec_t *query_lrec_cur_get(query_lrec_cur_t *c) {
+    if (!c->seg || c->off >= c->seg->count) return NULL;
+    return &c->seg->rec[c->off];
+}
+
+static void query_lrec_cur_next(query_lrec_cur_t *c) {
+    if (!c->seg) return;
+    c->off++;
+    if (c->off >= c->seg->count) {
+        c->seg = c->seg->next;
+        c->off = 0;
+    }
 }
 
 static int query_path_is_under(const char *parent, const char *child) {
@@ -2025,7 +2188,7 @@ typedef struct {
     size_t count;
 } query_hmap_t;
 
-static uint32_t query_hash_path(const char *s, size_t len) {
+static uint32_t query_hash_path_fnv(const char *s, size_t len) {
     uint64_t h = 0xcbf29ce484222325ULL ^ ((uint64_t)len * ANALYZE_HASH_M);
     size_t i = 0;
 
@@ -2047,6 +2210,57 @@ static uint32_t query_hash_path(const char *s, size_t len) {
     h *= ANALYZE_HASH_M;
     h ^= h >> 29;
     return (uint32_t)h;
+}
+
+#if defined(__x86_64__)
+static int query_cpu_has_sse42(void) {
+    static int cached = -1;
+    unsigned eax, ebx, ecx, edx;
+
+    if (cached >= 0) return cached;
+#if defined(__SSE4_2__)
+    cached = 1;
+    return 1;
+#else
+    cached = 0;
+    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) cached = (ecx & bit_SSE4_2) ? 1 : 0;
+    return cached;
+#endif
+}
+
+__attribute__((target("sse4.2")))
+static uint32_t query_hash_path_crc(const char *s, size_t len) {
+    uint64_t seed = 0xcbf29ce484222325ULL ^ ((uint64_t)len * ANALYZE_HASH_M);
+    unsigned long long c = (unsigned long long)(uint32_t)seed;
+    size_t i = 0;
+    uint64_t h;
+
+    for (; i + 8U <= len; i += 8U) c = __builtin_ia32_crc32di(c, analyze_hash_read8(s + i));
+    h = (uint64_t)(uint32_t)c;
+    if (i < len) {
+        uint64_t tail;
+
+        if (len >= 8U) {
+            tail = analyze_hash_read8(s + len - 8U);
+        } else {
+            unsigned char buf[8] = {0};
+
+            memcpy(buf, s + i, len - i);
+            memcpy(&tail, buf, sizeof(tail));
+        }
+        h = analyze_hash_mix(h, tail);
+    }
+    h *= ANALYZE_HASH_M;
+    h ^= h >> 29;
+    return (uint32_t)h;
+}
+#endif
+
+static uint32_t query_hash_path(const char *s, size_t len) {
+#if defined(__x86_64__)
+    if (query_cpu_has_sse42()) return query_hash_path_crc(s, len);
+#endif
+    return query_hash_path_fnv(s, len);
 }
 
 static int query_hmap_init(query_hmap_t *m, size_t expect) {
@@ -2184,6 +2398,92 @@ static size_t query_path_prefix_len(const char *s, size_t len, unsigned want) {
     return i;
 }
 
+/*
+ * Dense --level skips the membership set, but the level root is still the
+ * shallowest *listed* path — in a valid capture the root directory's own record,
+ * an ancestor of everything else — not the first component of each path (the
+ * capture root's parents are not records). The shallowest listed path is found
+ * while slicing (fewest components wins, lexicographically first breaks ties,
+ * which only corrupt captures can reach) and Pass 2 roots every line at it.
+ */
+typedef struct {
+    const char *p;
+    size_t len;
+    unsigned ncomp;
+} query_dense_root_t;
+
+static unsigned query_path_ncomp(const char *s, size_t len) {
+    size_t i = 0;
+    unsigned d = 0;
+
+    while (i < len && s[i] == '/') i++;
+    if (i < len) {
+        d = 1;
+        for (; i < len; i++)
+            if (s[i] == '/' && i + 1U < len && s[i + 1U] != '/') d++;
+    }
+    return d;
+}
+
+static void query_dense_root_consider(query_dense_root_t *r, const char *s, size_t len) {
+    unsigned nc = query_path_ncomp(s, len);
+    size_t n;
+    int c;
+
+    if (!r->p || nc < r->ncomp) goto take;
+    if (nc > r->ncomp) return;
+    n = len < r->len ? len : r->len;
+    c = memcmp(s, r->p, n);
+    if (c < 0 || (c == 0 && len < r->len)) goto take;
+    return;
+take:
+    r->p = s;
+    r->len = len;
+    r->ncomp = nc;
+}
+
+/* The dense Pass 2 root: the shallowest listed path when it is a component-
+ * boundary ancestor of this line. An all-slashes root means the crawl was of "/",
+ * and the membership walk never roots at the all-slashes prefix, so the first
+ * component wins there. A line the root is not an ancestor of roots at itself,
+ * exactly what the membership walk would conclude. */
+static unsigned query_level_root_dense(const query_dense_root_t *r, const char *s, size_t len,
+                                       size_t *root_len) {
+    if (r->ncomp == 0U) {
+        size_t i = 0;
+
+        while (i < len && s[i] == '/') i++;
+        if (i == len) {
+            *root_len = len;
+            return 0;
+        }
+        *root_len = query_path_prefix_len(s, len, 1U);
+        return 1;
+    }
+    if (len >= r->len && memcmp(s, r->p, r->len) == 0 && (len == r->len || s[r->len] == '/')) {
+        *root_len = r->len;
+        return r->ncomp;
+    }
+    *root_len = len;
+    return query_path_ncomp(s, len);
+}
+
+/* Line count of [s, s+n), folding each line into the dense-root tracker when given. */
+static size_t query_count_lines(const char *s, size_t n, query_dense_root_t *root) {
+    const char *end = s + n;
+    size_t lines = 0;
+
+    while (s < end) {
+        const char *nl = (const char *)memchr(s, '\n', (size_t)(end - s));
+
+        if (!nl) break;
+        if (root) query_dense_root_consider(root, s, (size_t)(nl - s));
+        lines++;
+        s = nl + 1;
+    }
+    return lines;
+}
+
 static int cmp_hslot_path(const void *pa, const void *pb) {
     const query_hslot_t *a = *(const query_hslot_t *const *)pa;
     const query_hslot_t *b = *(const query_hslot_t *const *)pb;
@@ -2272,7 +2572,8 @@ static int query_hl_seen(query_hlseen_t **tabp, size_t *maskp, size_t *countp, u
  */
 typedef struct {
     unsigned buf;      /* index into res[] */
-    size_t begin, end; /* byte range of res[buf].out; begin sits on a line boundary */
+    query_out_seg_t *seg;
+    size_t begin, end; /* byte range of seg->data; begin sits on a line boundary */
     size_t lines;      /* pass 1 fills: complete lines in the range */
     size_t line_lo;    /* index of the range's first line within the buffer */
 } query_emit_task_t;
@@ -2284,6 +2585,8 @@ typedef struct {
     size_t ntasks;
     _Atomic size_t cursor;
     int sum;
+    int dense; /* no record filters: skip pass 1 / mset, root at the shallowest listed path */
+    query_dense_root_t dense_root; /* filled while slicing when dense */
     /* Pass 2 per-thread outputs, indexed by thread slot. */
     query_hmap_t *keys;
     query_sumbucket_t **buckets;
@@ -2335,8 +2638,8 @@ static void query_emit_pass1_run(query_emit_ctx_t *c) {
 
     while ((t = atomic_fetch_add_explicit(&c->cursor, 1, memory_order_relaxed)) < c->ntasks) {
         query_emit_task_t *task = &c->tasks[t];
-        char *s = c->res[task->buf].out + task->begin;
-        char *end = c->res[task->buf].out + task->end;
+        char *s = c->res[task->buf].out_head ? task->seg->data + task->begin : NULL;
+        char *end = s ? task->seg->data + task->end : NULL;
         size_t lines = 0;
 
         while (s < end) {
@@ -2370,11 +2673,14 @@ static void query_emit_pass2_run(query_emit_ctx_t *c, unsigned me) {
     while ((t = atomic_fetch_add_explicit(&c->cursor, 1, memory_order_relaxed)) < c->ntasks) {
         query_emit_task_t *task = &c->tasks[t];
         query_result_t *qr = &c->res[task->buf];
-        char *s = qr->out + task->begin;
-        char *end = qr->out + task->end;
+        char *s = task->seg->data + task->begin;
+        char *end = task->seg->data + task->end;
         size_t r = task->line_lo;
         size_t rcount = c->sum ? task->line_lo + task->lines : (size_t)-1;
+        query_lrec_cur_t lcur;
 
+        memset(&lcur, 0, sizeof(lcur));
+        if (c->sum && query_lrec_cur_seek(qr, task->line_lo, &lcur) != 0) rcount = task->line_lo;
         if (c->sum && rcount > qr->lrec_count) rcount = qr->lrec_count;
         while (s < end && r < rcount) {
             char *nl = (char *)memchr(s, '\n', (size_t)(end - s));
@@ -2386,11 +2692,17 @@ static void query_emit_pass2_run(query_emit_ctx_t *c, unsigned me) {
             if (len == 0U) { /* cannot happen; keeps the walk total */
                 s = nl + 1;
                 r++;
+                if (c->sum) query_lrec_cur_next(&lcur);
                 continue;
             }
             if (last_root && query_path_is_under_len(last_root, last_root_len, s, len)) {
                 root_len = last_root_len;
                 root_nc = last_root_nc;
+            } else if (c->dense) {
+                root_nc = query_level_root_dense(&c->dense_root, s, len, &root_len);
+                last_root = s;
+                last_root_len = root_len;
+                last_root_nc = root_nc;
             } else {
                 root_nc = query_level_root_nc(&c->mset, s, len, &root_len);
                 last_root = s;
@@ -2412,11 +2724,19 @@ static void query_emit_pass2_run(query_emit_ctx_t *c, unsigned me) {
                 }
                 if (c->sum) {
                     query_sumbucket_t *b;
-                    uint64_t size = qr->lrec[r].size;
-                    uint8_t type = qr->lrec[r].type;
+                    query_listrec_t *lr = query_lrec_cur_get(&lcur);
+                    uint64_t size;
+                    uint8_t type;
 
-                    if (qr->lrec[r].hl_idx != UINT32_MAX) {
-                        const query_hardlink_t *hl = &qr->hl[qr->lrec[r].hl_idx];
+                    if (!lr) {
+                        c->oom[me] = 1;
+                        return;
+                    }
+                    size = lr->size;
+                    type = lr->type;
+
+                    if (lr->hl_idx != UINT32_MAX) {
+                        const query_hardlink_t *hl = &qr->hl[lr->hl_idx];
                         int dup;
 
                         pthread_mutex_lock(&c->hl_lock);
@@ -2457,6 +2777,7 @@ static void query_emit_pass2_run(query_emit_ctx_t *c, unsigned me) {
             }
             s = nl + 1;
             r++;
+            if (c->sum) query_lrec_cur_next(&lcur);
         }
     }
 }
@@ -2526,6 +2847,7 @@ static void query_list_emit_level_hash(query_result_t *res, unsigned n, unsigned
     memset(&c, 0, sizeof(c));
     c.res = res;
     c.sum = g_query.sum ? 1 : 0;
+    c.dense = !query_list_sparse();
     for (i = 0; i < n; i++) {
         total += res[i].out_lines;
         total_bytes += res[i].out_len;
@@ -2533,9 +2855,9 @@ static void query_list_emit_level_hash(query_result_t *res, unsigned n, unsigned
     if (!total) return;
     if (T < 1U) T = 1U;
 
-    /* Pre-sized to the exact line count: the load factor can never reach the grow
-     * threshold, which is what lets pass 1 insert into it lock-free. */
-    if (query_hmap_init(&c.mset, total) != 0) {
+    /* Sparse listings need Pass 1 membership so Pass 2 can find the shallowest
+     * listed ancestor. Dense listings skip the table: every ancestor is listed. */
+    if (!c.dense && query_hmap_init(&c.mset, total) != 0) {
         fprintf(stderr, "ecrawl_query: --level: out of memory, listing suppressed\n");
         goto done;
     }
@@ -2545,7 +2867,7 @@ static void query_list_emit_level_hash(query_result_t *res, unsigned n, unsigned
      * another. */
     {
         size_t slice = total_bytes / ((size_t)T * 4U) + 1U;
-        size_t cap = (size_t)T * 4U + n + 2U;
+        size_t cap = (size_t)T * 8U + n + 16U;
 
         c.tasks = (query_emit_task_t *)malloc(cap * sizeof(*c.tasks));
         if (!c.tasks) {
@@ -2553,37 +2875,57 @@ static void query_list_emit_level_hash(query_result_t *res, unsigned n, unsigned
             goto done;
         }
         for (i = 0; i < n; i++) {
-            size_t begin = 0, blen = res[i].out_len;
+            query_out_seg_t *seg;
 
-            while (begin < blen) {
-                size_t want = begin + slice, end;
+            for (seg = res[i].out_head; seg; seg = seg->next) {
+                size_t begin = 0, blen = seg->used;
 
-                if (want >= blen) {
-                    end = blen;
-                } else {
-                    char *nl = (char *)memchr(res[i].out + want, '\n', blen - want);
+                while (begin < blen) {
+                    size_t want = begin + slice, end;
 
-                    end = nl ? (size_t)(nl - res[i].out) + 1U : blen;
+                    if (c.ntasks == cap) {
+                        size_t ncap = cap * 2U;
+                        query_emit_task_t *nt = (query_emit_task_t *)realloc(c.tasks, ncap * sizeof(*nt));
+
+                        if (!nt) {
+                            fprintf(stderr, "ecrawl_query: --level: out of memory, listing suppressed\n");
+                            goto done;
+                        }
+                        c.tasks = nt;
+                        cap = ncap;
+                    }
+                    if (want >= blen) {
+                        end = blen;
+                    } else {
+                        char *nl = (char *)memchr(seg->data + want, '\n', blen - want);
+
+                        end = nl ? (size_t)(nl - seg->data) + 1U : blen;
+                    }
+                    c.tasks[c.ntasks].buf = (unsigned)i;
+                    c.tasks[c.ntasks].seg = seg;
+                    c.tasks[c.ntasks].begin = begin;
+                    c.tasks[c.ntasks].end = end;
+                    c.tasks[c.ntasks].lines =
+                        c.dense ? query_count_lines(seg->data + begin, end - begin, &c.dense_root) : 0;
+                    c.tasks[c.ntasks].line_lo = 0;
+                    c.ntasks++;
+                    begin = end;
                 }
-                c.tasks[c.ntasks].buf = (unsigned)i;
-                c.tasks[c.ntasks].begin = begin;
-                c.tasks[c.ntasks].end = end;
-                c.tasks[c.ntasks].lines = 0;
-                c.tasks[c.ntasks].line_lo = 0;
-                c.ntasks++;
-                begin = end;
             }
         }
     }
 
-    /* Pass 1: every matching path into the shared membership set. Lines stay
-     * '\n'-terminated: a reconstructed path can contain a NUL byte (corrupt name in
-     * the capture), and the whole emit is length-aware so a NUL must never become a
-     * line boundary. */
-    query_emit_run_threads(&c, T, 1);
+    if (!c.dense) {
+        /* Pass 1: every matching path into the shared membership set. Lines stay
+         * '\n'-terminated: a reconstructed path can contain a NUL byte (corrupt name in
+         * the capture), and the whole emit is length-aware so a NUL must never become a
+         * line boundary. */
+        query_emit_run_threads(&c, T, 1);
+    }
 
     /* Pass 2 walks lrec[] alongside the lines, so each task needs the index of its
-     * first line: prefix-sum the pass-1 line counts (tasks are in buffer order). */
+     * first line: prefix-sum the line counts (tasks are in buffer order). Dense
+     * listings counted while slicing; sparse listings take the Pass 1 counts. */
     {
         size_t run = 0;
         unsigned cur_buf = 0;
@@ -2747,48 +3089,122 @@ static int cmp_sumrec(const void *pa, const void *pb) {
     return strcmp(((const query_sumrec_t *)pa)->path, ((const query_sumrec_t *)pb)->path);
 }
 
-/* First link in sorted order keeps the bytes; later links of the same inode contribute
- * zero, so per-row bytes sum to the same deduped grand total query_report prints. */
-static void query_sum_hardlink_zero(query_sumrec_t *a, size_t k, query_result_t *res) {
-    size_t total = 0, i, cap = 1, mask;
-    size_t *tab;
+/*
+ * Sort slices are pulled off an atomic cursor so a slow qsort (data-dependent)
+ * idles nobody: 4xT slices keep every emit thread busy until the last one.
+ */
+typedef struct {
+    query_sumrec_t *a;
+    const size_t *lo, *hi;
+    size_t nparts;
+    _Atomic size_t cursor;
+} query_sumsort_ctx_t;
 
-    for (i = 0; i < k; i++)
-        if (a[i].hl_idx != UINT32_MAX) total++;
-    if (!total) return;
-    while (cap < total * 2U) cap <<= 1;
-    mask = cap - 1U;
-    tab = (size_t *)calloc(cap, sizeof(*tab)); /* 0 = empty, else index+1 */
-    if (!tab) return; /* count every link: the oom policy of query_hardlink_bytes */
-    for (i = 0; i < k; i++) {
-        const query_hardlink_t *e;
-        uint64_t h;
-        size_t slot;
+static void *query_sumsort_thread(void *vp) {
+    query_sumsort_ctx_t *c = (query_sumsort_ctx_t *)vp;
+    size_t t;
 
-        if (a[i].hl_idx == UINT32_MAX) continue;
-        e = &res[a[i].worker].hl[a[i].hl_idx];
-        h = e->inode * 1099511628211ULL;
-        h ^= ((uint64_t)e->dev_major << 32) | (uint64_t)e->dev_minor;
-        h *= 1099511628211ULL;
-        slot = (size_t)(h >> 24) & mask;
-        for (;;) {
-            if (!tab[slot]) {
-                tab[slot] = i + 1U;
-                break;
-            }
-            {
-                size_t j = tab[slot] - 1U;
-                const query_hardlink_t *c = &res[a[j].worker].hl[a[j].hl_idx];
+    while ((t = atomic_fetch_add_explicit(&c->cursor, 1, memory_order_relaxed)) < c->nparts) {
+        if (c->hi[t] > c->lo[t]) qsort(c->a + c->lo[t], c->hi[t] - c->lo[t], sizeof(*c->a), cmp_sumrec);
+    }
+    return NULL;
+}
 
-                if (c->inode == e->inode && c->dev_major == e->dev_major && c->dev_minor == e->dev_minor) {
-                    a[i].size = 0;
-                    break;
-                }
-            }
-            slot = (slot + 1U) & mask;
+/* Min-heap of partition indices, keyed by each partition's current head record. */
+static int query_sum_part_less(const query_sumrec_t *a, const size_t *cur, size_t x, size_t y) {
+    return cmp_sumrec(&a[cur[x]], &a[cur[y]]) < 0;
+}
+
+static void query_sum_heap_down(const query_sumrec_t *a, const size_t *cur, size_t *hp, size_t hn, size_t i) {
+    for (;;) {
+        size_t l = 2U * i + 1U, r = l + 1U, best = i, tmp;
+
+        if (l < hn && query_sum_part_less(a, cur, hp[l], hp[best])) best = l;
+        if (r < hn && query_sum_part_less(a, cur, hp[r], hp[best])) best = r;
+        if (best == i) return;
+        tmp = hp[i];
+        hp[i] = hp[best];
+        hp[best] = tmp;
+        i = best;
+    }
+}
+
+typedef struct {
+    query_sumframe_t *st;
+    size_t st_n, st_cap;
+    char *buf;
+    size_t *blen;
+    int *berr;
+} query_sumwalk_t;
+
+static void query_sumwalk_feed(query_sumwalk_t *w, const query_sumrec_t *r) {
+    uint64_t sf = 0, sd = 0, sl = 0, so = 0;
+
+    if (*w->berr) return;
+    if (r->type == 'f')
+        sf = 1;
+    else if (r->type == 'd')
+        sd = 1;
+    else if (r->type == 'l')
+        sl = 1;
+    else
+        so = 1;
+    while (w->st_n && !query_path_is_under(w->st[w->st_n - 1U].path, r->path)) {
+        query_sumframe_t e = w->st[--w->st_n];
+
+        query_sumout_row(w->buf, w->blen, w->berr, e.f, e.d, e.l, e.o, e.b, e.path, strlen(e.path));
+        if (w->st_n) {
+            w->st[w->st_n - 1U].f += e.f;
+            w->st[w->st_n - 1U].d += e.d;
+            w->st[w->st_n - 1U].l += e.l;
+            w->st[w->st_n - 1U].o += e.o;
+            w->st[w->st_n - 1U].b += e.b;
         }
     }
-    free(tab);
+    if (r->type == 'd') {
+        if (w->st_n == w->st_cap) {
+            size_t nc = w->st_cap ? w->st_cap * 2U : 64U;
+            query_sumframe_t *np = (query_sumframe_t *)realloc(w->st, nc * sizeof(*np));
+
+            if (!np) {
+                *w->berr = 1;
+                return;
+            }
+            w->st = np;
+            w->st_cap = nc;
+        }
+        w->st[w->st_n].path = r->path;
+        w->st[w->st_n].f = sf;
+        w->st[w->st_n].d = sd;
+        w->st[w->st_n].l = sl;
+        w->st[w->st_n].o = so;
+        w->st[w->st_n].b = r->size;
+        w->st_n++;
+    } else {
+        if (w->st_n) {
+            w->st[w->st_n - 1U].f += sf;
+            w->st[w->st_n - 1U].d += sd;
+            w->st[w->st_n - 1U].l += sl;
+            w->st[w->st_n - 1U].o += so;
+            w->st[w->st_n - 1U].b += r->size;
+        }
+        query_sumout_row(w->buf, w->blen, w->berr, sf, sd, sl, so, r->size, r->path, strlen(r->path));
+    }
+}
+
+static void query_sumwalk_finish(query_sumwalk_t *w) {
+    while (w->st_n) {
+        query_sumframe_t e = w->st[--w->st_n];
+
+        query_sumout_row(w->buf, w->blen, w->berr, e.f, e.d, e.l, e.o, e.b, e.path, strlen(e.path));
+        if (w->st_n) {
+            w->st[w->st_n - 1U].f += e.f;
+            w->st[w->st_n - 1U].d += e.d;
+            w->st[w->st_n - 1U].l += e.l;
+            w->st[w->st_n - 1U].o += e.o;
+            w->st[w->st_n - 1U].b += e.b;
+        }
+    }
 }
 
 /*
@@ -2797,13 +3213,25 @@ static void query_sum_hardlink_zero(query_sumrec_t *a, size_t k, query_result_t 
  * stderr totals. Every matching path prints, a dir's row after its children (du order),
  * because its counts are not final until they have been seen. (--level --sum is served by
  * query_list_emit_level_hash, which needs no global sort.)
+ *
+ * Sort is the wall: partition the gathered records, qsort each slice on emit_threads,
+ * then k-way merge in lex order into the du stack walk. Hardlink bytes stay on the
+ * lexicographically first path (same as the old serial qsort + query_sum_hardlink_zero).
  */
-static void query_list_emit_sum(query_result_t *res, unsigned n) {
+static void query_list_emit_sum(query_result_t *res, unsigned n, unsigned threads) {
     size_t total = 0, k = 0, i;
     query_sumrec_t *a;
     char *buf;
     size_t blen = 0;
     int berr = 0;
+    unsigned T = threads;
+    query_sumwalk_t walk;
+    query_hlseen_t *hl_tab = NULL;
+    size_t hl_mask = 0, hl_count = 0;
+    size_t nparts, p;
+    size_t *plo = NULL, *pcur = NULL, *phi = NULL;
+    size_t *heap = NULL;
+    pthread_t *th = NULL;
 
     for (i = 0; i < n; i++) total += res[i].lrec_count;
     if (!total) return;
@@ -2816,105 +3244,133 @@ static void query_list_emit_sum(query_result_t *res, unsigned n) {
         return;
     }
     for (i = 0; i < n; i++) {
-        char *s = res[i].out;
-        char *end = res[i].out + res[i].out_len;
-        size_t r = 0;
+        query_out_seg_t *os;
+        query_lrec_cur_t lcur;
 
-        while (s < end && r < res[i].lrec_count) {
-            char *nl = (char *)memchr(s, '\n', (size_t)(end - s));
+        if (query_lrec_cur_seek(&res[i], 0, &lcur) != 0 && res[i].lrec_count) {
+            fprintf(stderr, "ecrawl_query: --sum: listing/lrec mismatch, listing suppressed\n");
+            goto out;
+        }
+        for (os = res[i].out_head; os; os = os->next) {
+            char *s = os->data;
+            char *end = os->data + os->used;
 
-            if (!nl) break;
-            *nl = '\0';
-            a[k].path = s;
-            a[k].size = res[i].lrec[r].size;
-            a[k].type = res[i].lrec[r].type;
-            a[k].hl_idx = res[i].lrec[r].hl_idx;
-            a[k].worker = (uint32_t)i;
-            k++;
-            r++;
-            s = nl + 1;
+            while (s < end) {
+                char *nl = (char *)memchr(s, '\n', (size_t)(end - s));
+                query_listrec_t *lr;
+
+                if (!nl) break;
+                *nl = '\0';
+                lr = query_lrec_cur_get(&lcur);
+                if (!lr) break;
+                a[k].path = s;
+                a[k].size = lr->size;
+                a[k].type = lr->type;
+                a[k].hl_idx = lr->hl_idx;
+                a[k].worker = (uint32_t)i;
+                k++;
+                query_lrec_cur_next(&lcur);
+                s = nl + 1;
+            }
         }
     }
-    qsort(a, k, sizeof(*a), cmp_sumrec);
-    query_sum_hardlink_zero(a, k, res);
+    if (!k) {
+        free(a);
+        free(buf);
+        return;
+    }
+    if (T < 1U) T = 1U;
+    nparts = (size_t)T * 4U;
+    if (nparts > k) nparts = k;
 
+    plo = (size_t *)malloc(nparts * sizeof(*plo));
+    pcur = (size_t *)malloc(nparts * sizeof(*pcur));
+    phi = (size_t *)malloc(nparts * sizeof(*phi));
+    if (!plo || !pcur || !phi) {
+        fprintf(stderr, "ecrawl_query: --sum: out of memory, listing suppressed\n");
+        goto out;
+    }
     {
-        /* Sorted order is DFS order, so a dir's matching descendants are contiguous:
-         * pop and print a dir row once the walk moves past its subtree, propagating
-         * its counts into the nearest matching ancestor. */
-        query_sumframe_t *st = NULL;
-        size_t st_n = 0, st_cap = 0;
+        size_t part_sz = k / nparts;
 
-        for (i = 0; i < k; i++) {
-            uint64_t sf = 0, sd = 0, sl = 0, so = 0;
-
-            if (a[i].type == 'f')
-                sf = 1;
-            else if (a[i].type == 'd')
-                sd = 1;
-            else if (a[i].type == 'l')
-                sl = 1;
-            else
-                so = 1;
-            while (st_n && !query_path_is_under(st[st_n - 1U].path, a[i].path)) {
-                query_sumframe_t e = st[--st_n];
-
-                query_sumout_row(buf, &blen, &berr, e.f, e.d, e.l, e.o, e.b, e.path, strlen(e.path));
-                if (st_n) {
-                    st[st_n - 1U].f += e.f;
-                    st[st_n - 1U].d += e.d;
-                    st[st_n - 1U].l += e.l;
-                    st[st_n - 1U].o += e.o;
-                    st[st_n - 1U].b += e.b;
-                }
-            }
-            if (a[i].type == 'd') {
-                /* Self counts ride the frame; the pop above is what credits the parent. */
-                if (st_n == st_cap) {
-                    size_t nc = st_cap ? st_cap * 2U : 64U;
-                    query_sumframe_t *np = (query_sumframe_t *)realloc(st, nc * sizeof(*np));
-
-                    if (!np) {
-                        berr = 1;
-                        break;
-                    }
-                    st = np;
-                    st_cap = nc;
-                }
-                st[st_n].path = a[i].path;
-                st[st_n].f = sf;
-                st[st_n].d = sd;
-                st[st_n].l = sl;
-                st[st_n].o = so;
-                st[st_n].b = a[i].size;
-                st_n++;
-            } else {
-                if (st_n) {
-                    st[st_n - 1U].f += sf;
-                    st[st_n - 1U].d += sd;
-                    st[st_n - 1U].l += sl;
-                    st[st_n - 1U].o += so;
-                    st[st_n - 1U].b += a[i].size;
-                }
-                query_sumout_row(buf, &blen, &berr, sf, sd, sl, so, a[i].size, a[i].path, strlen(a[i].path));
-            }
+        for (p = 0; p < nparts; p++) {
+            plo[p] = p * part_sz;
+            phi[p] = (p + 1U == nparts) ? k : (p + 1U) * part_sz;
+            pcur[p] = plo[p];
         }
-        while (st_n) {
-            query_sumframe_t e = st[--st_n];
-
-            query_sumout_row(buf, &blen, &berr, e.f, e.d, e.l, e.o, e.b, e.path, strlen(e.path));
-            if (st_n) {
-                st[st_n - 1U].f += e.f;
-                st[st_n - 1U].d += e.d;
-                st[st_n - 1U].l += e.l;
-                st[st_n - 1U].o += e.o;
-                st[st_n - 1U].b += e.b;
-            }
-        }
-        free(st);
     }
+
+    if (nparts == 1U) {
+        qsort(a, k, sizeof(*a), cmp_sumrec);
+    } else {
+        query_sumsort_ctx_t sctx;
+        unsigned started = 0, ti;
+
+        sctx.a = a;
+        sctx.lo = plo;
+        sctx.hi = phi;
+        sctx.nparts = nparts;
+        atomic_init(&sctx.cursor, 0);
+        th = (pthread_t *)malloc(T * sizeof(*th));
+        if (th) {
+            for (ti = 0; ti < T; ti++) {
+                if (pthread_create(&th[ti], NULL, query_sumsort_thread, &sctx) != 0) break;
+                started++;
+            }
+        }
+        /* The main thread sorts alongside the helpers, or alone when none started. */
+        query_sumsort_thread(&sctx);
+        for (ti = 0; ti < started; ti++) pthread_join(th[ti], NULL);
+    }
+
+    memset(&walk, 0, sizeof(walk));
+    walk.buf = buf;
+    walk.blen = &blen;
+    walk.berr = &berr;
+
+    heap = (size_t *)malloc(nparts * sizeof(*heap));
+    if (!heap) {
+        fprintf(stderr, "ecrawl_query: --sum: out of memory, listing suppressed\n");
+        goto out_walk;
+    }
+    {
+        size_t hn = 0;
+
+        for (p = 0; p < nparts; p++)
+            if (pcur[p] < phi[p]) heap[hn++] = p;
+        for (p = hn / 2U; p-- > 0U;) query_sum_heap_down(a, pcur, heap, hn, p);
+        while (hn) {
+            size_t best = heap[0];
+            query_sumrec_t rec = a[pcur[best]++];
+            const query_hardlink_t *hl;
+
+            if (rec.hl_idx != UINT32_MAX) {
+                hl = &res[rec.worker].hl[rec.hl_idx];
+                if (query_hl_seen(&hl_tab, &hl_mask, &hl_count, hl->inode,
+                                  ((uint64_t)hl->dev_major << 32) | (uint64_t)hl->dev_minor))
+                    rec.size = 0;
+            }
+            query_sumwalk_feed(&walk, &rec);
+            if (berr) break;
+            /* The root's key only grew, so a sift-down restores the heap either way. */
+            if (pcur[best] >= phi[best]) heap[0] = heap[--hn];
+            if (hn) query_sum_heap_down(a, pcur, heap, hn, 0);
+        }
+    }
+    query_sumwalk_finish(&walk);
     query_sumout_flush(buf, &blen, &berr);
     if (berr) fprintf(stderr, "ecrawl_query: --sum: output failed, listing may be truncated\n");
+
+out_walk:
+    free(walk.st);
+
+out:
+    free(hl_tab);
+    free(heap);
+    free(th);
+    free(plo);
+    free(pcur);
+    free(phi);
     free(buf);
     free(a);
 }
@@ -3116,8 +3572,42 @@ static const crawl_bin_catalog_t *query_cat_lazy_get(query_cat_lazy_t *lz) {
     return lz->cat;
 }
 
+/*
+ * Membership scratch for a sidecar-backed subtree scan: one row-read walk per
+ * worker plus a last-parent memo. Records arrive sorted by parent_dir_id, so
+ * the memo absorbs sibling runs and the walk's cached catalog chunk absorbs the
+ * rest -- a catalog chunk is decoded at most once per (task, shard) pair.
+ */
+typedef struct {
+    crawl_dirx_walk_t *walk;
+    uint64_t pid;
+    int in;
+    int live;
+} query_memb_t;
+
+/* dir_id -> DFS position via the sidecar's chunk table, then the range test.
+ * Returns -1 when the sidecar cannot read a row it promised at open. */
+static int query_sidecar_contains(analyze_pool_t *p, size_t fi, const shard_subtree_t *sub, query_memb_t *mb,
+                                  uint64_t pid, int *out) {
+    bin_dir_catalog_entry_t ent;
+    unsigned char namebuf[256];
+
+    if (mb->live && mb->pid == pid) {
+        *out = mb->in;
+        return 0;
+    }
+    if (crawl_dirx_read_row(&p->sidecar.dirs[fi], mb->walk, pid, CRAWL_CAT_SUBTREE, &ent, namebuf,
+                            sizeof(namebuf), NULL, NULL) != 0)
+        return -1;
+    *out = query_subtree_dfs_in(sub, ent.dfs_index);
+    mb->pid = pid;
+    mb->in = *out;
+    mb->live = 1;
+    return 0;
+}
+
 static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_exclusive,
-                               query_cat_lazy_t *lz, const shard_subtree_t *sub,
+                               query_cat_lazy_t *lz, const shard_subtree_t *sub, query_memb_t *mb,
                                crawl_bin_block_reader_t *br, query_path_cache_t *pcache,
                                char *fullpath_buf, size_t fullpath_sz, query_result_t *qr,
                                uint64_t *nrec_out) {
@@ -3230,7 +3720,11 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
 
             in_scope = 1;
             if (g_query.subtree && !(sub && sub->whole)) {
-                in_scope = subtree_contains(sub, pid);
+                if (sub && sub->sidecar_mem) {
+                    if (query_sidecar_contains(lz->pool, lz->fi, sub, mb, pid, &in_scope) != 0) return -1;
+                } else {
+                    in_scope = subtree_contains(sub, pid);
+                }
                 /*
                  * The subtree's own directory record hangs off its parent, so the
                  * membership array never claims it, yet du counts it. Namesake
@@ -3242,17 +3736,29 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
                 if (!in_scope && rec_name && rtype == (uint8_t)'d' &&
                     (size_t)nlen == g_query.sub_base_len &&
                     memcmp(rec_name, g_query.sub_base, g_query.sub_base_len) == 0) {
-                    const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
+                    if (sub && sub->sidecar_mem) {
+                        /* pid's path is the subtree's parent exactly when the
+                         * sidecar resolved it into the scope's parent set. */
+                        size_t pi;
 
-                    if (!cat) return -1;
-                    {
-                        size_t plen = 0;
+                        for (pi = 0; pi < sub->nparents; pi++)
+                            if (sub->parent_ids[pi] == pid) {
+                                in_scope = 1;
+                                break;
+                            }
+                    } else {
+                        const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
 
-                        prefix_live = 0;
-                        if (crawl_bin_catalog_entry_path_len(cat, pid, (const char *)rec_name, (size_t)nlen,
-                                                             fullpath_buf, fullpath_sz, &plen) == 0 &&
-                            plen == g_query.subtree_len && memcmp(fullpath_buf, g_query.subtree, plen) == 0)
-                            in_scope = 1;
+                        if (!cat) return -1;
+                        {
+                            size_t plen = 0;
+
+                            prefix_live = 0;
+                            if (crawl_bin_catalog_entry_path_len(cat, pid, (const char *)rec_name, (size_t)nlen,
+                                                                 fullpath_buf, fullpath_sz, &plen) == 0 &&
+                                plen == g_query.subtree_len && memcmp(fullpath_buf, g_query.subtree, plen) == 0)
+                                in_scope = 1;
+                        }
                     }
                 }
                 if (!in_scope) continue;
@@ -3399,8 +3905,10 @@ static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, s
                  * The imm_child_* rollups are only read by the rollup fast path, which loads its own. */
                 unsigned cat_fields = p->shard_sub ? CRAWL_CAT_SUBTREE : 0U;
 
-                if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, fsz, cat_fields, &p->shard_cat[fi]) == 0)
+                if (crawl_bin_catalog_load_sel(fp, fh.catalog_offset, fsz, cat_fields, &p->shard_cat[fi]) == 0) {
                     st = SHARD_CAT_READY;
+                    atomic_fetch_add_explicit(&g_catalogs_loaded, 1ULL, memory_order_relaxed);
+                }
                 /* The loader already frees + re-inits the struct on failure. */
             }
             /* The counts share the catalog's lifetime and its dir_id space. Unlike the memo they
@@ -3414,8 +3922,9 @@ static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, s
                     st = SHARD_CAT_FAILED;
                 }
             }
-            /* Subtree membership belongs to the catalog: same lifetime, built once. */
-            if (st == SHARD_CAT_READY && p->shard_sub) {
+            /* Subtree membership belongs to the catalog: same lifetime, built once.
+             * A sidecar-backed shard already has its membership from the scope. */
+            if (st == SHARD_CAT_READY && p->shard_sub && !p->shard_sub[fi].sidecar_mem) {
                 if (subtree_build(&p->shard_cat[fi], &p->shard_sub[fi], 1) != 0) {
                     crawl_bin_catalog_free(&p->shard_cat[fi]);
                     st = SHARD_CAT_FAILED;
@@ -3735,7 +4244,7 @@ static int analyze_process_chunk(const char *full_path, uint64_t start_off, uint
 }
 
 static int query_process_chunk(const char *full_path, uint64_t start_off, uint64_t end_off, uint64_t file_sz,
-                               query_cat_lazy_t *lz, const shard_subtree_t *sub,
+                               query_cat_lazy_t *lz, const shard_subtree_t *sub, query_memb_t *mb,
                                crawl_bin_block_reader_t *br, query_path_cache_t *pcache,
                                char *fullpath_buf, size_t fullpath_sz,
                                query_result_t *qr, uint64_t *nrec_out) {
@@ -3752,7 +4261,7 @@ static int query_process_chunk(const char *full_path, uint64_t start_off, uint64
         crawl_fpcache_fclose(fp);
         return -1;
     }
-    rc = query_scan_fp_until(fp, start_off, end_off, lz, sub, br, pcache, fullpath_buf, fullpath_sz, qr, nrec_out);
+    rc = query_scan_fp_until(fp, start_off, end_off, lz, sub, mb, br, pcache, fullpath_buf, fullpath_sz, qr, nrec_out);
     crawl_fpcache_fclose(fp);
     return rc;
 }
@@ -3764,23 +4273,26 @@ static void *query_worker_main(void *arg) {
     char *fullpath_buf = (char *)malloc(PATH_MAX);
     crawl_bin_block_reader_t br;
     query_path_cache_t pcache;
+    query_memb_t mb;
     size_t last_shard = (size_t)-1;
 
     memset(&br, 0, sizeof(br));
     memset(&pcache, 0, sizeof(pcache));
+    memset(&mb, 0, sizeof(mb));
 
     if (!fullpath_buf) {
         atomic_fetch_add_explicit(&p->failures, 1, memory_order_relaxed);
         return NULL;
     }
-    if (g_query.list_paths) {
-        qr->out = (char *)malloc(QUERY_OUT_FLUSH_BYTES * 2U);
-        if (!qr->out) {
+    if (p->sidecar_mem) {
+        mb.walk = crawl_dirx_walk_new();
+        if (!mb.walk) {
             free(fullpath_buf);
             atomic_fetch_add_explicit(&p->failures, 1, memory_order_relaxed);
             return NULL;
         }
-        qr->out_cap = QUERY_OUT_FLUSH_BYTES * 2U;
+    }
+    if (g_query.list_paths) {
         /* A miss just rebuilds the path, so a failed allocation costs speed, not answers. */
         (void)query_path_cache_init(&pcache);
     }
@@ -3796,6 +4308,7 @@ static void *query_worker_main(void *arg) {
         if (c->file_index != last_shard) {
             /* dir_ids are per shard: a cached path from the previous one would be wrong. */
             query_path_cache_reset(&pcache);
+            mb.live = 0;
             last_shard = c->file_index;
         }
         {
@@ -3803,10 +4316,11 @@ static void *query_worker_main(void *arg) {
             query_cat_lazy_t lz;
 
             query_cat_lazy_init(&lz, p, c->file_index, c->path);
-            /* --subtree filters records against membership state that is built from the
-             * catalog, so that mode has to resolve it before scanning. Every other query
-             * defers until a matched record needs a path. */
-            if (g_query.subtree && !query_cat_lazy_get(&lz)) {
+            /* --subtree filters records against membership state, so that mode has to
+             * resolve it before scanning: from the catalog normally, from the dir-index
+             * scope when the sidecar is live. Every other query defers the catalog until
+             * a matched record needs a path. */
+            if (g_query.subtree && !(sub && sub->sidecar_mem) && !query_cat_lazy_get(&lz)) {
                 ar = -1;
             } else if (sub && sub->empty) {
                 /* The subtree is not in this shard's catalog, and neither is its parent, so
@@ -3814,7 +4328,7 @@ static void *query_worker_main(void *arg) {
                 ar = 0;
             } else {
                 ar = query_process_chunk(c->path, c->start_offset, c->end_offset,
-                                         p->shard_file_sizes[c->file_index], &lz, sub, &br, &pcache,
+                                         p->shard_file_sizes[c->file_index], &lz, sub, &mb, &br, &pcache,
                                          fullpath_buf, PATH_MAX, qr, &nrec);
             }
             analyze_release_shard_chunk(p, c->file_index, NULL, NULL, NULL);
@@ -3837,6 +4351,7 @@ static void *query_worker_main(void *arg) {
     qr->path_hits_hash += pcache.hits_hash;
     qr->path_misses += pcache.misses;
     query_path_cache_free(&pcache);
+    crawl_dirx_walk_free(mb.walk);
     free(fullpath_buf);
     return NULL;
 }
@@ -4144,18 +4659,18 @@ out:
  *
  * The pruning itself is shared (crawl_rgix_build_chunks); what is analyze's own
  * is the split policy and the two by-products the scan wants anyway -- the
- * shard sizes and the capture's directory count.
+ * shard sizes and the capture's directory count. The caller computes the scope
+ * (and keeps it alive when the scan will test membership against it).
  */
 static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const char *dir_path, char **names,
-                                               size_t name_count, uint64_t **shard_sizes_out,
+                                               size_t name_count, const crawl_sidecar_scope_t *scope,
+                                               uint64_t **shard_sizes_out,
                                                crawl_bin_file_chunk_t **chunks_out, size_t *chunk_count_out,
                                                uint64_t *chunk_bytes_total_out, uint64_t *dir_count_total_out,
                                                unsigned nthreads, crawl_rgix_prune_stats_t *st) {
-    crawl_sidecar_scope_t *scope = NULL;
     const char **paths = NULL;
     uint64_t *sizes = NULL;
     uint64_t dir_sum = 0;
-    uint64_t rows_read = 0;
     size_t fi;
 
     memset(st, 0, sizeof(*st));
@@ -4168,9 +4683,8 @@ static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const 
     if (!sc->have_dirs || !sc->have_groups) return -1;
 
     sizes = (uint64_t *)calloc(name_count, sizeof(*sizes));
-    scope = (crawl_sidecar_scope_t *)calloc(name_count, sizeof(*scope));
     paths = (const char **)calloc(name_count, sizeof(*paths));
-    if (!sizes || !scope || !paths) goto fail;
+    if (!sizes || !paths) goto fail;
 
     for (fi = 0; fi < name_count; fi++) {
         char full[PATH_MAX];
@@ -4182,10 +4696,6 @@ static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const 
         dir_sum += sc->dirs[fi].catalog_entries;
     }
 
-    if (crawl_sidecar_scope_subtree(sc, g_query.subtree, g_query.subtree_len, g_query.sub_parent, scope,
-                                    &rows_read) != 0)
-        goto fail;
-    for (fi = 0; fi < name_count; fi++) query_warn_dup_subtree(scope[fi].nroots, names[fi]);
     if (crawl_rgix_build_chunks(sc, paths, name_count, scope, nthreads, (unsigned)ANALYZE_JOBS_PER_THREAD,
                                 ANALYZE_SPLIT_MIN_BYTES, ANALYZE_SPLIT_MAX_BYTES, chunks_out, chunk_count_out,
                                 chunk_bytes_total_out, st) != 0)
@@ -4199,8 +4709,6 @@ static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const 
 
     for (fi = 0; fi < name_count; fi++) free((void *)paths[fi]);
     free(paths);
-    crawl_sidecar_scope_release_n(scope, name_count);
-    free(scope);
     *shard_sizes_out = sizes;
     *dir_count_total_out = dir_sum;
     return 0;
@@ -4211,8 +4719,6 @@ fail:
         free(paths);
     }
     free(sizes);
-    crawl_sidecar_scope_release_n(scope, name_count);
-    free(scope);
     memset(st, 0, sizeof(*st));
     *chunks_out = NULL;
     *chunk_count_out = 0;
@@ -4298,6 +4804,7 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
     fprintf(out, "bytes=%" PRIu64 "\n", sum.bytes);
     fprintf(out, "hardlink_dupes=%" PRIu64 "\n", dupes);
     fprintf(out, "records_scanned=%" PRIu64 "\n", records_scanned);
+    fprintf(out, "catalogs_loaded=%" PRIu64 "\n", atomic_load_explicit(&g_catalogs_loaded, memory_order_relaxed));
     fprintf(out, "blocks_decompressed=%" PRIu64 "\n", sum.blocks_decompressed);
     fprintf(out, "blocks_skipped=%" PRIu64 "\n", sum.blocks_skipped);
     fprintf(out, "records_skipped_by_block_filter=%" PRIu64 "\n", sum.records_skipped);
@@ -4331,8 +4838,8 @@ static void query_results_free(query_result_t *res, unsigned n) {
     if (!res) return;
     for (i = 0; i < n; i++) {
         free(res[i].hl);
-        free(res[i].out);
-        free(res[i].lrec);
+        query_out_segs_free(res[i].out_head);
+        query_lrec_segs_free(res[i].lrec_head);
     }
     free(res);
 }
@@ -4711,6 +5218,14 @@ static uint64_t parse_split_target_bytes(const char *dir_path, char **names, siz
     return target;
 }
 
+/* Drop the sidecar and scope the pool may own; both are zeroed when it never took them. */
+static void query_pool_sidecar_drop(analyze_pool_t *p) {
+    crawl_sidecar_close(&p->sidecar);
+    crawl_sidecar_scope_release_n(p->sidecar_scope, p->name_count);
+    free(p->sidecar_scope);
+    p->sidecar_scope = NULL;
+}
+
 static int run_analyze(const char *dir_path, char **names, size_t name_count, unsigned nthreads) {
     pthread_t *threads = NULL;
     pthread_t stats_thread;
@@ -4729,6 +5244,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     unsigned dj;
     int rc = 0;
     crawl_sidecar_t sidecar;
+    crawl_sidecar_scope_t *sidecar_scope = NULL;
     int have_sidecar = 0;
     const char *skip_env = getenv("ECRAWL_QUERY_BLOCK_SKIP");
 
@@ -4736,8 +5252,12 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     g_query.block_skip = !(skip_env && strcmp(skip_env, "0") == 0);
 
     memset(&sidecar, 0, sizeof(sidecar));
-    if (g_index_dir && g_query.active && g_query.subtree && !g_query.subtree_is_root)
-        have_sidecar = (analyze_sidecar_open_named(g_index_dir, dir_path, names, name_count, &sidecar) == 0);
+    /* --index-dir names the sidecars explicitly; without it, probe the crawl output
+     * dir, which is where a capture-local index lives. Absent files just degrade to
+     * the catalog path. */
+    if (g_query.active && g_query.subtree && !g_query.subtree_is_root)
+        have_sidecar = (analyze_sidecar_open_named(g_index_dir ? g_index_dir : dir_path, dir_path, names,
+                                                   name_count, &sidecar) == 0);
 
     /*
      * A plain subtree aggregate is already summed in the catalogs, so answer it
@@ -4765,6 +5285,27 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     }
 
     double chunk_prep_sec = 0.0;
+    /* The scope locates the subtree in every shard once, up front: the row-group
+     * pruning reads it, and when no listing needs paths the scan keeps it for
+     * per-record membership instead of materializing any catalog. A sidecar that
+     * cannot place the subtree is dropped, not fatal. */
+    if (have_sidecar) {
+        uint64_t scope_rows = 0;
+        size_t fi;
+
+        sidecar_scope = (crawl_sidecar_scope_t *)calloc(name_count, sizeof(*sidecar_scope));
+        if (!sidecar_scope ||
+            crawl_sidecar_scope_subtree(&sidecar, g_query.subtree, g_query.subtree_len, g_query.sub_parent,
+                                        sidecar_scope, &scope_rows) != 0) {
+            crawl_sidecar_scope_release_n(sidecar_scope, name_count);
+            free(sidecar_scope);
+            sidecar_scope = NULL;
+            crawl_sidecar_close(&sidecar);
+            have_sidecar = 0;
+        } else {
+            for (fi = 0; fi < name_count; fi++) query_warn_dup_subtree(sidecar_scope[fi].nroots, names[fi]);
+        }
+    }
     {
         double t_prep0 = analyze_now_sec();
         uint64_t split_target = parse_split_target_bytes(dir_path, names, name_count, nthreads);
@@ -4774,13 +5315,16 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
          * query can match, so the scan list is built from the survivors instead of
          * from every .ckpt segment. Purely a reduction of the same byte ranges. */
         if (have_sidecar)
-            built = analyze_build_chunks_from_rowgroups(&sidecar, dir_path, names, name_count, &shard_sizes,
+            built = analyze_build_chunks_from_rowgroups(&sidecar, dir_path, names, name_count, sidecar_scope,
+                                                        &shard_sizes,
                                                         &chunks, &chunk_count, &chunk_byte_sum, &dir_count_total,
                                                         nthreads, &g_rgix_stats);
         if (built != 0 &&
             analyze_build_all_chunks(dir_path, names, name_count, &shard_sizes, &chunks, &chunk_count,
                                      &chunk_byte_sum, &dir_count_total, split_target) != 0) {
             crawl_sidecar_close(&sidecar);
+            crawl_sidecar_scope_release_n(sidecar_scope, name_count);
+            free(sidecar_scope);
             fprintf(stderr, "ecrawl_query: failed to build chunk job list\n");
             return 1;
         }
@@ -4788,10 +5332,12 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
          * is the one phase no worker helps with, so report it separately. */
         chunk_prep_sec = analyze_now_sec() - t_prep0;
     }
-    crawl_sidecar_close(&sidecar);
     g_parse_chunk_jobs = chunk_count;
     if (chunk_count == 0U) {
         fprintf(stderr, "ecrawl_query: no parse chunks produced\n");
+        crawl_sidecar_close(&sidecar);
+        crawl_sidecar_scope_release_n(sidecar_scope, name_count);
+        free(sidecar_scope);
         free(shard_sizes);
         return 1;
     }
@@ -4833,15 +5379,44 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
     atomic_init(&pool.analyze_stop_stats, 0);
     analyze_shard_cat_sync_init(&pool);
 
+    /* A live sidecar serves subtree membership when no listing needs paths; the
+     * pool then owns it (and the scope shard_sub borrows from) until the workers
+     * have joined. --list still loads catalogs for path reconstruction, so the
+     * sidecar's job ends with the chunk list there. */
+    pool.sidecar_mem = (have_sidecar && !g_query.list_paths);
+    if (pool.sidecar_mem) {
+        pool.sidecar = sidecar;
+        pool.sidecar_scope = sidecar_scope;
+        memset(&sidecar, 0, sizeof(sidecar));
+        sidecar_scope = NULL;
+    } else {
+        crawl_sidecar_close(&sidecar);
+        crawl_sidecar_scope_release_n(sidecar_scope, name_count);
+        free(sidecar_scope);
+        sidecar_scope = NULL;
+    }
+
     /* Shared per-shard catalogs (loaded once on demand) + remaining-chunk counts. */
     if (g_query.active && g_query.subtree && !g_query.subtree_is_root) {
         pool.shard_sub = (shard_subtree_t *)calloc(name_count, sizeof(*pool.shard_sub));
         if (!pool.shard_sub) {
             perror("ecrawl_query: alloc");
+            crawl_sidecar_close(&pool.sidecar);
+            crawl_sidecar_scope_release_n(pool.sidecar_scope, name_count);
+            free(pool.sidecar_scope);
             analyze_shard_cat_sync_destroy(&pool);
             crawl_bin_free_chunk_array_rows(chunks, chunk_count);
             free(shard_sizes);
             return 1;
+        }
+        if (pool.sidecar_mem) {
+            size_t fi2;
+
+            for (fi2 = 0; fi2 < name_count; fi2++) {
+                query_subtree_from_scope(&pool.sidecar_scope[fi2], pool.sidecar.dirs[fi2].max_dir_id,
+                                         &pool.shard_sub[fi2]);
+                query_note_subtree_self_scope(&pool.sidecar_scope[fi2]);
+            }
         }
     }
     pool.shard_cat = (crawl_bin_catalog_t *)calloc(name_count, sizeof(*pool.shard_cat));
@@ -4858,6 +5433,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         free(pool.shard_cat_state);
         free(pool.shard_cnt);
         free(pool.shard_chunks_left);
+        query_pool_sidecar_drop(&pool);
         analyze_shard_cat_sync_destroy(&pool);
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
         free(shard_sizes);
@@ -4883,6 +5459,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             perror("ecrawl_query: alloc");
             free(pool.depth_hist);
             free(threads);
+            query_pool_sidecar_drop(&pool);
             analyze_free_shard_catalogs(&pool, name_count);
             analyze_shard_cat_sync_destroy(&pool);
             crawl_bin_free_chunk_array_rows(chunks, chunk_count);
@@ -4896,6 +5473,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         free(pool.depth_hist);
         free(threads);
         query_results_free(pool.qres, nthreads);
+        query_pool_sidecar_drop(&pool);
         analyze_free_shard_catalogs(&pool, name_count);
         analyze_shard_cat_sync_destroy(&pool);
         crawl_bin_free_chunk_array_rows(chunks, chunk_count);
@@ -4942,6 +5520,7 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
             query_results_free(pool.qres, nthreads);
             pool.qres = NULL;
             free(threads);
+            query_pool_sidecar_drop(&pool);
             analyze_free_shard_catalogs(&pool, name_count);
             analyze_shard_cat_sync_destroy(&pool);
             crawl_bin_free_chunk_array_rows(pool.chunks, pool.chunk_count);
@@ -4966,14 +5545,15 @@ static int run_analyze(const char *dir_path, char **names, size_t name_count, un
         if (g_query.list_level)
             query_list_emit_level_hash(pool.qres, nthreads, emit_threads);
         else if (g_query.sum)
-            query_list_emit_sum(pool.qres, nthreads);
+            query_list_emit_sum(pool.qres, nthreads, emit_threads);
         query_report(pool.qres, nthreads, atomic_load_explicit(&pool.analyze_records_done, memory_order_relaxed),
                      analyze_now_sec() - sctx.t0, chunk_prep_sec);
         query_results_free(pool.qres, nthreads);
         pool.qres = NULL;
+        query_pool_sidecar_drop(&pool);
         analyze_free_shard_catalogs(&pool, name_count);
         analyze_shard_cat_sync_destroy(&pool);
-        crawl_bin_free_chunk_array_rows(pool.chunks, pool.chunk_count);
+        crawl_bin_free_chunk_array_rows(pool.chunks, chunk_count);
         free(pool.shard_file_sizes);
         free(pool.depth_hist);
         if (atomic_load_explicit(&pool.failures, memory_order_relaxed) > 0) rc = 1;

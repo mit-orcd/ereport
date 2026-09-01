@@ -406,6 +406,8 @@ void crawl_sidecar_scope_release(crawl_sidecar_scope_t *sp) {
     free(sp->ranges);
     free(sp->parents);
     free(sp->parent_dfs);
+    free(sp->self_flags);
+    free(sp->self_bytes);
     memset(sp, 0, sizeof(*sp));
 }
 
@@ -416,9 +418,11 @@ void crawl_sidecar_scope_release_n(crawl_sidecar_scope_t *scope, size_t n) {
     for (i = 0; i < n; i++) crawl_sidecar_scope_release(&scope[i]);
 }
 
-static int scope_push_root(crawl_sidecar_scope_t *sp, uint64_t did, uint64_t lo, uint64_t hi, int self) {
-    uint64_t *nr;
+static int scope_push_root(crawl_sidecar_scope_t *sp, uint64_t did, uint64_t lo, uint64_t hi, int self,
+                           uint64_t self_sz) {
+    uint64_t *nr, *sb;
     crawl_dfs_range_t *ng;
+    unsigned char *sf;
     size_t n = sp->nroots;
 
     nr = (uint64_t *)realloc(sp->roots, (n + 1U) * sizeof(*nr));
@@ -427,9 +431,17 @@ static int scope_push_root(crawl_sidecar_scope_t *sp, uint64_t did, uint64_t lo,
     ng = (crawl_dfs_range_t *)realloc(sp->ranges, (n + 1U) * sizeof(*ng));
     if (!ng) return -1;
     sp->ranges = ng;
+    sf = (unsigned char *)realloc(sp->self_flags, (n + 1U) * sizeof(*sf));
+    if (!sf) return -1;
+    sp->self_flags = sf;
+    sb = (uint64_t *)realloc(sp->self_bytes, (n + 1U) * sizeof(*sb));
+    if (!sb) return -1;
+    sp->self_bytes = sb;
     sp->roots[n] = did;
     sp->ranges[n].lo = lo;
     sp->ranges[n].hi = hi;
+    sp->self_flags[n] = self ? (unsigned char)CRAWL_DIR_FLAG_SELF_RECORD : (unsigned char)0;
+    sp->self_bytes[n] = self_sz;
     sp->nroots = n + 1U;
     if (self) sp->self_record = 1;
     if (n == 0) {
@@ -506,7 +518,7 @@ int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, 
                 goto done;
             }
             if (scope_push_root(sp, root_ids[i], ent.dfs_index, ent.dfs_index + ent.dfs_subtree_dirs,
-                                (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1 : 0) != 0) {
+                                (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1 : 0, ent.self_bytes) != 0) {
                 free(root_ids);
                 free(par_ids);
                 goto done;

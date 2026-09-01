@@ -12,7 +12,9 @@
 #   ECRAWL_QUERY EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
 #   SKIP_FUSE=1 ./scripts/test/test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
-# Requires: bash, coreutils, all Makefile targets built (default: the repo root, two levels up).
+# Requires: bash, coreutils, the Makefile tools built (default: the repo root, two
+# levels up). test_query_subtree_dups is not part of `make all`; this script runs
+# `make test_query_subtree_dups` for the in-tree default so a bare `make` is enough.
 # On macOS the GNU userland comes from Homebrew: brew install coreutils findutils gnu-sed.
 
 set -euo pipefail
@@ -1374,6 +1376,27 @@ run_v8_rollup_tests() {
     expect_eq "--level 1 --sum is thread-count independent" "$sum1" "$sum1_par"
     expect_eq "--level 2 --sum is thread-count independent" "$sum2" "$sum2_par"
 
+    # An unfiltered listing is dense: the level walk skips its Pass 1 line count
+    # entirely. The output must still equal a match-everything filter that forces
+    # the sparse walk, at either thread count. --perm /0000 matches everything.
+    local dense1 sparse1 dense4 sparse4 dsum1 dsum4
+    dense1=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    sparse1=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --perm /0000 --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    dense4=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    sparse4=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --perm /0000 --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    expect_eq "dense --list --level 1 equals the match-everything sparse walk" "$sparse1" "$dense1"
+    expect_eq "dense --list --level 1 is thread-count independent" "$dense1" "$dense4"
+    expect_eq "sparse --list --level 1 is thread-count independent" "$sparse1" "$sparse4"
+    dsum1=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --list --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    dsum4=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --list --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    expect_eq "--list --sum is thread-count independent without a filter" "$dsum1" "$dsum4"
+
     # Plain --list --sum prints every match, a dir's row after its children (du order).
     local sumall
     sumall=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --list --sum --subtree "${tree_abs}/foo" "$out" 2>/dev/null |
@@ -2031,6 +2054,30 @@ run_dir_index_tests() {
     fi
     summary_metric "row groups kept for the target subtree" "${rg_kept:-?}/${rg_total:-?}"
 
+    # 4b. The scan path itself needs no catalog when the sidecar is live:
+    #     membership comes from dirs.idx row reads, so catalogs_loaded stays 0
+    #     while the totals still match the catalog route exactly.
+    dirx_analyze "${td}/dirx.q5c.plain" "$out" --subtree "$target" --exact
+    dirx_analyze "${td}/dirx.q5c.idx" "$out" --subtree "$target" --exact --index-dir "$idx"
+    dirx_same "--exact scan: sidecar membership equals the catalog" \
+        "${td}/dirx.q5c.plain" "${td}/dirx.q5c.idx" hardlink_dupes || true
+    expect_eq_continue "--exact --index-dir loads no shard catalog" "0" \
+        "$(dirx_kv catalogs_loaded "${td}/dirx.q5c.idx")" || true
+    if [[ "$(dirx_kv catalogs_loaded "${td}/dirx.q5c.plain")" != "0" ]]; then
+        summary_add PASS "--exact without sidecars loads catalogs" \
+            "catalogs_loaded=$(dirx_kv catalogs_loaded "${td}/dirx.q5c.plain")"
+    else
+        summary_add FAIL "--exact without sidecars loads catalogs" "catalogs_loaded=0"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+        printf '  %sFAIL:%s --exact without sidecars loaded no catalog; the parity check compared a route with itself%s\n' \
+            "$R" "$Z" "$Z" >&2
+    fi
+    # Names projected (--uid): the subtree's own record is recognised from the
+    # scope's parent set instead of a catalog path rebuild.
+    dirx_analyze "${td}/dirx.q5u.idx" "$out" --subtree "$target" --uid "$(id -u)" --index-dir "$idx"
+    expect_eq_continue "filtered scan with sidecars loads no catalog" "0" \
+        "$(dirx_kv catalogs_loaded "${td}/dirx.q5u.idx")" || true
+
     # 5. --list: the totals can agree while the path set does not, so compare
     #    the paths themselves, pruned against unpruned.
     dirx_analyze "${td}/dirx.list.plain" "$out" --subtree "$target" --type f --list
@@ -2097,6 +2144,21 @@ run_dir_index_tests() {
     expect_eq_continue "absent index dir: falls back" "catalog_rollup" \
         "$(dirx_kv answered_from "${td}/dirx.noidx")" || true
     dirx_same "absent index dir: same totals" "$plain" "${td}/dirx.noidx" || true
+
+    # Auto-open: sidecars sitting in the crawl output dir are used without
+    # --index-dir; the flag only overrides where they are looked for. Kept after
+    # the no-flag checks above so the probe cannot change what they measured.
+    cp -p "${idx}/dirs.idx" "${idx}/rowgroups.idx" "$out"/
+    dirx_analyze "${td}/dirx.auto" "$out" --subtree "$target"
+    expect_eq_continue "auto-open: sidecars in the crawl dir answer without --index-dir" "dir_index" \
+        "$(dirx_kv answered_from "${td}/dirx.auto")" || true
+    dirx_same "auto-open vs explicit --index-dir" "$sidecar" "${td}/dirx.auto" || true
+    dirx_analyze "${td}/dirx.auto.exact" "$out" --subtree "$target" --exact
+    expect_eq_continue "auto-open: the scan route uses them too" "0" \
+        "$(dirx_kv catalogs_loaded "${td}/dirx.auto.exact")" || true
+    dirx_same "auto-open --exact vs catalog route" "${td}/dirx.q5c.plain" "${td}/dirx.auto.exact" \
+        hardlink_dupes || true
+    rm -f "$out/dirs.idx" "$out/rowgroups.idx"
 
     # 7. The phase is on by default and off on request.
     EREPORT_INDEX_THREADS="${EREPORT_INDEX_THREADS:-4}" \
@@ -2606,6 +2668,12 @@ need_exe "$EREPORT"
 need_exe "$EDELETE"
 need_exe "$EREPORT_INDEX"
 need_exe "$ECRAWL_QUERY"
+# Not a `make all` target. Rebuild when using the in-tree default so `make &&
+# ./scripts/test/test.sh` keeps working after a clean or a codec change.
+if [[ "$QUERY_SUBTREE_DUPS" == "$REPO_ROOT/test_query_subtree_dups" ]]; then
+    make -C "$REPO_ROOT" test_query_subtree_dups ||
+        die "make test_query_subtree_dups failed in ${REPO_ROOT}"
+fi
 need_exe "$QUERY_SUBTREE_DUPS"
 
 run_phase run_integration

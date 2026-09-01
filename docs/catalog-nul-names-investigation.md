@@ -388,8 +388,9 @@ Thread balance (bythread overhead): `--list --sum` 80.8% on one PID (serial
 43% on one PID then even scan; default one fat PID at 12% plus ~4.8% × 16
 workers (fold lock); `--level` 49 PIDs, even ~4–6%.
 
-New / confirmed hot paths (children % from the post-union reports). None of
-these are checked off:
+New / confirmed hot paths (children % from the post-union reports). (7), (8),
+(9) and (11) are landed as of the 2026-09-01 second pass (see the landed note
+below); the rest were already done or are inherent:
 
 7. **`--list --sum` (no `--level`) is the worst query: 116.1 s, `qsort_r`
    60.5% of cycles, 81% of samples on one thread.** Serial global sort of
@@ -445,3 +446,23 @@ unfiltered / ~6 of 11 s filtered → (11) 8.6 of 9.3 s rollup, 3.7 of 6.7 s
 + suffix) → (2) realloc 7% of `--level` → (10) decode_u64 on leftover
 groups / `--make`. (5) is moot if (1)/(8) land; (6) zstd is inherent.
 (10) and (12) are the only follow-ups that can move `benchmark.sh`.
+
+**Landed 2026-09-01 (second pass), all validated by `scripts/test/test.sh`:**
+(1)/(8) dense listings skip Pass 1 — `query_list_sparse` gates the membership
+pass, and with every ancestor listed the level root is the shallowest listed
+path (the capture root), found while the output is sliced
+(`--perm /0000` match-everything agrees with the dense walk at 1 and 4
+threads). (4)/(7) `--list --sum` sorts 4×T slices of the gathered records off
+an atomic cursor and k-way merges them through a min-heap into the du walk;
+hardlink bytes still land on the lexicographically first path. (11) `--subtree`
+auto-probes the crawl output dir for `dirs.idx`/`rowgroups.idx` when
+`--index-dir` is not given, and when the sidecar is live and no `--list` needs
+paths the scan takes membership from per-parent catalog-row reads through the
+sidecar's chunk table (one cached chunk per worker, last-parent memo) instead
+of materializing any shard catalog — the stats block's new `catalogs_loaded=0`
+says so, and `--exact` totals are unchanged. (9) `parent_map_get_or_add`
+publishes with a bucket-head CAS; the stripe mutexes are gone. (2) worker
+`out`/`lrec` are linked 2 MiB / 4096-entry segments, so a buffered
+`--level`/`--sum` never realloc-copies earlier output. (5) `query_hash_path`
+dispatches to SSE4.2 `crc32` when the CPU has it (only the filtered Pass 1
+still hashes). Left: (6) zstd, which is inherent.

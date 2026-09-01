@@ -124,6 +124,10 @@ typedef struct {
     uint64_t *parents;    /* nparents parent dir_ids (path-equal to sub_parent) */
     uint64_t *parent_dfs; /* parallel DFS positions */
     size_t nparents;
+    /* Per-root self record (the subtree's own directory record): flag and size,
+     * so a consumer that never loads the catalog can still credit it. */
+    unsigned char *self_flags; /* nroots entries; CRAWL_DIR_FLAG_SELF_RECORD */
+    uint64_t *self_bytes;      /* nroots entries; valid where self_flags is set */
 } crawl_sidecar_scope_t;
 
 /*
