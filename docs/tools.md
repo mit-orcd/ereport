@@ -152,7 +152,7 @@ Usage:
 
 ```bash
 ./ecrawl_query [--verbose] [--top[,dim...] N] <crawl-output-dir>
-./ecrawl_query [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--perm MODE] [--list] [--exact] [--index-dir DIR] <crawl-output-dir>
+./ecrawl_query [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--uid N] [--perm MODE] [--list] [--level N] [--sum] [--exact] [--index-dir DIR] <crawl-output-dir>
 ```
 
 Examples:
@@ -167,14 +167,24 @@ ECRAWL_QUERY_THREADS=32 ./ecrawl_query -v /path/to/crawl-out
 
 ### Query form
 
-Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--perm` / `--list` switches from directory-shape reporting to record selection. Filters combine with AND, and the totals come back as `key=value` lines: `entries`, `files`, `dirs`, `symlinks`, `other`, `bytes`, `hardlink_dupes`, `records_scanned`, block-skip diagnostics, `answered_from`, `elapsed_sec`. `bytes` is apparent size with each multiply-linked inode counted once, so it matches `du -sb`.
+Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--uid` / `--perm` / `--list` switches from directory-shape reporting to record selection. Filters combine with AND, and the totals come back as `key=value` lines: `entries`, `files`, `dirs`, `symlinks`, `other`, `bytes`, `hardlink_dupes`, `records_scanned`, block-skip diagnostics, `answered_from`, `elapsed_sec`. `bytes` is apparent size with each multiply-linked inode counted once, so it matches `du -sb`.
 
 - `--subtree DIR` — records at or under `DIR`, including `DIR` itself, as `du` counts it.
 - `--size-gt N` — strictly larger than `N` bytes (`find -size +Nc`).
 - `--type C` — one of `f d l c b p s o` (`find -type`).
 - `--gid N` — numeric group owner.
+- `--uid N` — numeric user owner. Opens only `uid_shard_(N & (uid_shards-1))` from `crawl_manifest.txt`; colliding uids in that shard are still filtered. A uid whose shard file is absent is empty success (zeros), not an error. `--uid` and `--gid` are independent: `st_uid` is not `st_gid`.
 - `--perm MODE` — octal permission bits in the three `find -perm` forms: `0644` exactly these bits, `-0002` all of these bits, `/0022` any of these bits.
 - `--list` — print each matching path on stdout; the totals move to stderr.
+- `--level N` — with `--list` only (`N >= 1`); without `--list` it is a usage error. Matching paths are buffered and collapsed instead of streamed (a hash set finds each path's level-1 root; only the distinct output prefixes are sorted). Level 1 is each matching path that has no matching ancestor (slash-boundary prefix). Level N is the unique prefixes truncated to `(level-1 components) + N - 1`, so two matches at different absolute depths can both be level 1. A reconstructed path that contains a NUL byte (a corrupt name in the capture) is folded and counted by its full bytes but prints cut at the NUL, the way `%s` output has always shown it:
+
+  ```text
+  foo/faa/file1
+  foo/blu/fee/file2
+  --level 1 → foo/faa and foo/blu/fee
+  --level 2 → the two files
+  ```
+- `--sum` — with `--list` only (usage error otherwise): each printed path becomes `files,dirs,symlinks,other,bytes,path`, counting the matching records at or under the path. A directory counts itself, so the rows roll up to the stderr totals. Bytes follow du semantics: a multiply-linked inode is credited once — without `--level` to its first path in sorted order, with `--level` to its first path in scan order (either way each inode's bytes land in exactly one row and the grand total is unchanged). With `--level N` the rows are the collapsed prefixes; without it every matching path prints, a directory's row after its children (du order). Like `--level`, `--sum` buffers every match before printing, so memory grows with the match count.
 - `--exact` — never answer from the catalog rollups; always scan the records.
 - `--index-dir DIR` — use the `dirs.idx` / `rowgroups.idx` sidecars an `ereport_index --make --index-dir DIR` run left there. Optional and advisory: see below.
 
@@ -183,9 +193,12 @@ Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--perm` / `--li
 ./ecrawl_query --subtree /data/lab/jones /path/to/crawl-out             # bytes + counts under a subtree
 ./ecrawl_query --type f --perm -0002 --list /path/to/crawl-out          # world-writable files
 ./ecrawl_query --type f --gid 2001 /path/to/crawl-out                   # files owned by a group
+./ecrawl_query --uid 142698 --type f /path/to/crawl-out                 # files owned by a user (one shard)
+./ecrawl_query --uid 142698 --list --level 1 /path/to/crawl-out         # matching dirs with no matching ancestor
+./ecrawl_query --uid 142698 --list --level 1 --sum /path/to/crawl-out   # ... with per-dir f,d,s,o,bytes columns
 ```
 
-Two v8 storage features do the work here. Row groups whose column zone maps cannot match the `--size-gt` / `--type` / `--gid` filters are skipped without decompressing, and only the columns a query names are decoded — `ECRAWL_QUERY_BLOCK_SKIP=0` disables the skipping for comparison.
+Two v8 storage features do the work here. Row groups whose column zone maps cannot match the `--size-gt` / `--type` / `--gid` / `--uid` filters are skipped without decompressing, and only the columns a query names are decoded — `ECRAWL_QUERY_BLOCK_SKIP=0` disables the skipping for comparison.
 
 More importantly, a bare `--subtree DIR` aggregate is answered from the per-directory rollups the crawl already computed, reading no records at all (`records_scanned=0`), so its cost is O(directories) rather than O(files). That shortcut is taken only when it provably equals the scan; in particular it is skipped when any record in the subtree has `nlink > 1`, because crawl-time hardlink credit is attributed to the first link seen anywhere in the tree while a scan dedups within the subtree. `answered_from=catalog_rollup` or `answered_from=record_scan` says which ran, and `--exact` forces the scan. See [binary-format.md](binary-format.md#dfs-ordering-and-subtree-rollups-v8).
 
@@ -230,7 +243,7 @@ The consequences worth knowing:
 - `du --apparent-size`, `wc -c`, and `dd` are byte-exact; `cat`, `grep`, and `md5sum` see a file of NUL bytes.
 - Real `st_ino` and `st_nlink` mean `du` deduplicates hardlinks the same way it does on the live tree.
 - `find -type l` is correct, but `ls -l` prints an I/O error for each symlink because the target was never captured.
-- Permissions are uniform, so `find -perm` is meaningless **on the mount**. The capture does record real `mode` and `gid`; the mount's in-memory index omits them, because it holds the whole namespace resident and two more fields per entry is a cost paid on every mount for a read-only view that cannot honour the bits anyway. Use `ecrawl_query --perm` / `--gid` to query them from the capture directly.
+- Permissions are uniform, so `find -perm` is meaningless **on the mount**. The capture does record real `mode` and `gid`; the mount's in-memory index omits them, because it holds the whole namespace resident and two more fields per entry is a cost paid on every mount for a read-only view that cannot honour the bits anyway. Use `ecrawl_query --perm` / `--gid` / `--uid` to query them from the capture directly.
 
 ### The index
 

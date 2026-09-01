@@ -1160,12 +1160,14 @@ run_v8_rollup_tests() {
     local td=$1
     local tree="${td}/v8_tree" out="${td}/v8_crawl" log="${td}/v8.crawl.log"
 
-    section_int "[integration] ERCBIN09 catalog rollups + gid/perm filters"
+    section_int "[integration] ERCBIN09 catalog rollups + gid/uid/perm filters"
 
     # clean/ has no multiply-linked file anywhere below it, so the rollup is
     # provably exact there. linked/y.txt has its twin outside the subtree, which
     # is exactly the case the rollup cannot answer.
     mkdir -p "${tree}/clean/inner" "${tree}/linked" "${tree}/outside" "${tree}/perm"
+    chmod 0755 "$tree" "${tree}/clean" "${tree}/clean/inner" "${tree}/linked" \
+        "${tree}/outside" "${tree}/perm"
     head -c 10 /dev/zero >"${tree}/clean/x1.bin"
     head -c 20 /dev/zero >"${tree}/clean/inner/x2.bin"
     head -c 30 /dev/zero >"${tree}/outside/y.bin"
@@ -1178,6 +1180,16 @@ run_v8_rollup_tests() {
     chmod 0666 "${tree}/perm/ww.bin"
     chmod 0444 "${tree}/perm/ro.bin"
     chmod 0700 "${tree}/perm/ex.bin"
+
+    # Two matching lineages at different absolute depths, with no matching
+    # ancestor: --list --level 1 must name the two dirs, not foo. chmod, not
+    # chown — the harness cannot assume it can change owners.
+    mkdir -p "${tree}/foo/faa" "${tree}/foo/blu/fee"
+    echo x >"${tree}/foo/faa/file1"
+    echo y >"${tree}/foo/blu/fee/file2"
+    chmod 0755 "${tree}/foo" "${tree}/foo/blu"
+    chmod 0777 "${tree}/foo/faa" "${tree}/foo/blu/fee" \
+        "${tree}/foo/faa/file1" "${tree}/foo/blu/fee/file2"
 
     local tree_abs
     tree_abs=$(cd "$tree" && pwd -P)
@@ -1235,6 +1247,124 @@ run_v8_rollup_tests() {
     expect_eq "--perm /0111 finds the one executable file" "${tree_abs}/perm/ex.bin" \
         "$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" $psub --type f --perm /0111 --list "$out" 2>/dev/null)"
     summary_add PASS "ERCBIN09 gid/perm filters" "gid-match+gid-miss+perm exact/all/any"
+
+    # uid is a column the same way gid is, plus a shard prune: --uid N opens only
+    # uid_shard_(N & (uid_shards-1)). A miss that hashes to an absent shard is
+    # still empty success, not "no shards".
+    local u ubogus
+    local anyu="${td}/v8.anyuid" mineu="${td}/v8.myuid" nou="${td}/v8.nouid"
+    local bothu="${td}/v8.uidgid" andmiss="${td}/v8.uidgid.miss"
+    u=$(id -u)
+    ubogus=$((u + 40000))
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f "$out" >"$anyu" 2>&1 || die "--type f (uid ref) failed"
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --uid "$u" "$out" >"$mineu" 2>&1 || die "--uid query failed"
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --uid "$ubogus" "$out" >"$nou" 2>&1 ||
+        die "--uid miss query failed"
+    expect_eq "--uid selects every record in a single-owner tree" \
+        "$(kv_last entries "$anyu")" "$(kv_last entries "$mineu")"
+    expect_eq "--uid on an absent user matches nothing" "0" "$(kv_last entries "$nou")"
+    expect_eq "--uid miss still prints uid=" "$ubogus" "$(kv_last uid "$nou")"
+
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --uid "$u" --gid "$g" "$out" >"$bothu" 2>&1 ||
+        die "--uid --gid AND query failed"
+    expect_eq "--uid and --gid AND still matches a single-owner tree" \
+        "$(kv_last entries "$anyu")" "$(kv_last entries "$bothu")"
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --uid "$u" --gid "$bogus" "$out" >"$andmiss" 2>&1 ||
+        die "--uid --gid miss query failed"
+    expect_eq "--uid AND a missing --gid matches nothing" "0" "$(kv_last entries "$andmiss")"
+    summary_add PASS "ERCBIN09 uid filter" "uid-match+uid-miss+uid+gid AND"
+
+    local lev_rc=0
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --level 1 "$out" >/dev/null 2>"${td}/v8.level.err" || lev_rc=$?
+    expect_eq "--level without --list is a usage error" "2" "$lev_rc"
+    if grep -q 'requires --list' "${td}/v8.level.err"; then
+        summary_add PASS "--level usage mentions --list" "stderr"
+    else
+        summary_add FAIL "--level usage mentions --list" "stderr=$(cat "${td}/v8.level.err")"
+        SUMMARY_FAILS=$((SUMMARY_FAILS + 1))
+        printf '  %sFAIL:%s --level without --list did not mention --list%s\n' "$R" "$Z" "$Z" >&2
+    fi
+
+    # Matching paths are a forest: faa and fee have no matching ancestor, so they
+    # are both level 1 despite different slash-counts. Level 2 is the two files.
+    local lev1 lev2
+    lev1=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    lev2=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 2 "$out" 2>/dev/null |
+        paste -sd, -)
+    expect_eq "--list --level 1 is each match with no matching ancestor" \
+        "${tree_abs}/foo/blu/fee,${tree_abs}/foo/faa" "$lev1"
+    expect_eq "--list --level 2 is the unique prefixes one component deeper" \
+        "${tree_abs}/foo/blu/fee/file2,${tree_abs}/foo/faa/file1" "$lev2"
+    summary_add PASS "ERCBIN09 --list --level" "level1=dirs+level2=files"
+
+    # --sum: each row is files,dirs,symlinks,other,bytes,path over the matching
+    # records at or under the path; a directory counts itself, so rows roll up.
+    local sum_rc=0
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --sum "$out" >/dev/null 2>&1 || sum_rc=$?
+    expect_eq "--sum without --list is a usage error" "2" "$sum_rc"
+
+    local faa_b fee_b blu_b foo_b
+    faa_b=$(( $(stat -c%s "${tree}/foo/faa") + $(stat -c%s "${tree}/foo/faa/file1") ))
+    fee_b=$(( $(stat -c%s "${tree}/foo/blu/fee") + $(stat -c%s "${tree}/foo/blu/fee/file2") ))
+    blu_b=$(( $(stat -c%s "${tree}/foo/blu") + fee_b ))
+    foo_b=$(( $(stat -c%s "${tree}/foo") + blu_b + faa_b ))
+
+    local sum1 sum2
+    sum1=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 1 --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    sum2=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 2 --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    expect_eq "--level 1 --sum aggregates each lineage root" \
+        "1,1,0,0,${fee_b},${tree_abs}/foo/blu/fee;1,1,0,0,${faa_b},${tree_abs}/foo/faa" "$sum1"
+    expect_eq "--level 2 --sum is the files one component deeper" \
+        "1,0,0,0,2,${tree_abs}/foo/blu/fee/file2;1,0,0,0,2,${tree_abs}/foo/faa/file1" "$sum2"
+
+    # The parallel --level emit (threads > 1) must print the same rows as the
+    # single-threaded walk: same sorted prefixes, same aggregates.
+    local lev1_par lev2_par sum1_par sum2_par
+    lev1_par=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 1 "$out" 2>/dev/null |
+        paste -sd, -)
+    lev2_par=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 2 "$out" 2>/dev/null |
+        paste -sd, -)
+    sum1_par=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 1 --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    sum2_par=$(ECRAWL_QUERY_THREADS=4 "$ECRAWL_QUERY" --uid "$u" --perm 0777 --list --level 2 --sum "$out" 2>/dev/null |
+        paste -sd';' -)
+    expect_eq "--list --level 1 is thread-count independent" "$lev1" "$lev1_par"
+    expect_eq "--list --level 2 is thread-count independent" "$lev2" "$lev2_par"
+    expect_eq "--level 1 --sum is thread-count independent" "$sum1" "$sum1_par"
+    expect_eq "--level 2 --sum is thread-count independent" "$sum2" "$sum2_par"
+
+    # Plain --list --sum prints every match, a dir's row after its children (du order).
+    local sumall
+    sumall=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --list --sum --subtree "${tree_abs}/foo" "$out" 2>/dev/null |
+        paste -sd';' -)
+    expect_eq "--list --sum rolls children into each directory row" \
+        "1,0,0,0,2,${tree_abs}/foo/blu/fee/file2;1,1,0,0,${fee_b},${tree_abs}/foo/blu/fee;1,2,0,0,${blu_b},${tree_abs}/foo/blu;1,0,0,0,2,${tree_abs}/foo/faa/file1;1,1,0,0,${faa_b},${tree_abs}/foo/faa;2,4,0,0,${foo_b},${tree_abs}/foo" \
+        "$sumall"
+
+    # A multiply-linked inode is credited once, to its first path in sorted order:
+    # linked/ sorts before outside/, so y_hard.bin keeps the 30 bytes.
+    local hl_keep hl_drop
+    hl_keep=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --list --sum "$out" 2>/dev/null |
+        grep -F ",${tree_abs}/linked/y_hard.bin")
+    hl_drop=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --list --sum "$out" 2>/dev/null |
+        grep -F ",${tree_abs}/outside/y.bin")
+    expect_eq "--sum credits a hardlink at the first path in sorted order" \
+        "1,0,0,0,30,${tree_abs}/linked/y_hard.bin" "$hl_keep"
+    expect_eq "--sum zeroes the duplicate link's bytes" \
+        "1,0,0,0,0,${tree_abs}/outside/y.bin" "$hl_drop"
+
+    # With --level the credit goes to the first link in scan order instead, so which
+    # row holds the 30 bytes is unspecified -- but exactly one row does.
+    local hl_level_sum
+    hl_level_sum=$(ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --type f --list --level 1 --sum "$out" 2>/dev/null |
+        grep -E ",${tree_abs}/(linked/y_hard|outside/y)\.bin" |
+        awk -F, '{s += $5} END {print s}')
+    expect_eq "--level --sum credits a hardlink's bytes to exactly one row" \
+        "30" "$hl_level_sum"
+    summary_add PASS "ERCBIN09 --list --sum" "usage+level+du-order+hardlink-first-wins"
 
     rm -rf "$tree" "$out"
 }
@@ -1832,7 +1962,7 @@ run_dir_index_tests() {
     #    chunk list comes from the surviving groups instead of every checkpoint
     #    segment. Fewer bytes read, identical answer.
     local filt
-    for filt in "--type f" "--size-gt 100 --type f" "--type d" "--gid $(id -g)"; do
+    for filt in "--type f" "--size-gt 100 --type f" "--type d" "--gid $(id -g)" "--uid $(id -u)"; do
         # shellcheck disable=SC2086
         dirx_analyze "${td}/dirx.q5.plain" "$out" --subtree "$target" $filt
         # shellcheck disable=SC2086

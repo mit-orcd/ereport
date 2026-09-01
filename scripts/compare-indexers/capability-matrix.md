@@ -39,7 +39,7 @@ Three more fairness decisions shape every number here. Each phase is measured **
 | Size | yes | yes | yes | yes |
 | atime | yes | yes | yes | yes |
 | mtime / ctime | yes | yes | no | yes |
-| uid / ownership | yes | yes | no (partition≈top dir) | yes — uid, gid and mode, queryable via `ecrawl_query --gid` / `--perm` |
+| uid / ownership | yes | yes | no (partition≈top dir) | yes — uid, gid and mode, queryable via `ecrawl_query --uid` / `--gid` / `--perm` |
 | inode / nlink / type | yes | yes | no | yes |
 | Allocated / sparse | policy-dependent | possible via SQL | optional disk vs apparent at index | yes (manifest + accounting) |
 

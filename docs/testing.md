@@ -21,7 +21,7 @@ The harnesses live in [`scripts/test/`](../scripts/test/). Prefer `make check` /
 
 - Three-way agreement on the target subtree, a deep leaf, `s0`, and the crawl root: `answered_from` is `catalog_rollup` / `dir_index` / `record_scan` as expected, and `entries`, `files`, `dirs`, `symlinks`, `other` and `bytes` match across all three, with `bytes` also checked against `du -sb`.
 - `--list` path sets, compared pruned against unpruned; `records_scanned` must not go *up* under pruning.
-- Filtered scans (`--type f`, `--size-gt`, `--type d`, `--gid`) agree on every aggregate. `records_scanned` is deliberately not compared: reading fewer records for the same answer is the point.
+- Filtered scans (`--type f`, `--size-gt`, `--type d`, `--gid`, `--uid`) agree on every aggregate. `records_scanned` is deliberately not compared: reading fewer records for the same answer is the point.
 - Staleness, each of which must come back with the catalog rollup's own numbers rather than merely "not `dir_index`": a shard whose mtime moved, a shard that grew by a byte, a truncated `dirs.idx`, and an index directory that does not exist. Restoring the shard puts the sidecar back in use. A truncated `rowgroups.idx` is the optional half — the aggregate still comes from `dirs.idx` and only the scan loses its pruning.
 - The hardlink guard: `nlink > 1` in scope makes crawl-time hardlink credit and scan-time dedup legitimately disagree, so both rollup routes must decline to `record_scan`.
 - A subtree the capture never saw: not an error, and the same answer either way.

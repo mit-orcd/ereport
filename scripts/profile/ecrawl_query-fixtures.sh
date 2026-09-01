@@ -72,6 +72,7 @@
 #   QUERY_SIZE_GT=524288000    strict byte threshold substituted for @SIZE@.
 #   QUERY_TYPE=f               record type substituted for @TYPE@.
 #   QUERY_GID=$(id -g)         group id substituted for @GID@.
+#   QUERY_UID=$(id -u)         user id substituted for @UID@.
 #   QUERY_OUTPUT_SINK=/dev/null  listed paths destination; use a regular file or
 #                              production pipe to measure output backpressure.
 #   QUERY_VARIANTS=            newline-separated "name|env|args" list overriding
@@ -163,6 +164,7 @@ QUERY_SIZE_GT=${QUERY_SIZE_GT:-524288000}
 QUERY_TYPE=${QUERY_TYPE:-f}
 QUERY_OUTPUT_SINK=${QUERY_OUTPUT_SINK:-/dev/null}
 QUERY_GID=${QUERY_GID:-$(id -g)}
+QUERY_UID=${QUERY_UID:-$(id -u)}
 MANYSHARD_COPIES=${MANYSHARD_COPIES:-0}
 MANYSHARD_SOURCE=${MANYSHARD_SOURCE:-}
 
@@ -171,9 +173,9 @@ MANYSHARD_SOURCE=${MANYSHARD_SOURCE:-}
 # `env` is a space-separated VAR=VAL list applied to that pass only (empty for
 # most). `args` are appended after the binary, before the bin dir. Placeholders
 # are substituted per fixture: @ROOT@ is the crawl's start_path from
-# crawl_manifest.txt, @GID@ is QUERY_GID, @SIZE@ is QUERY_SIZE_GT, @TYPE@ is
-# QUERY_TYPE. A variant naming @ROOT@ is skipped for a fixture whose manifest has
-# no start_path rather than being run against a wrong path.
+# crawl_manifest.txt, @GID@ is QUERY_GID, @UID@ is QUERY_UID, @SIZE@ is
+# QUERY_SIZE_GT, @TYPE@ is QUERY_TYPE. A variant naming @ROOT@ is skipped for a
+# fixture whose manifest has no start_path rather than being run against a wrong path.
 #
 # The set is chosen so each pass isolates one cost, and several exist only as the
 # A/B partner of another:
@@ -194,6 +196,19 @@ MANYSHARD_SOURCE=${MANYSHARD_SOURCE:-}
 #                       runs per record and paths are rebuilt.
 #   gid-match           gid is RLE'd and near-constant per uid shard, so its zone
 #                       map usually prunes whole groups.
+#   uid-match           uid is CONST inside a shard, so --uid opens that shard
+#                       only and the zone map keeps or skips each group.
+#   uid-miss            a uid whose shard file is absent: empty success, the
+#                       open-nothing counterpart to uid-match.
+#   uid-list            --uid with --list: path reconstruction on the matching
+#                       shard, the control for uid-list-level1.
+#   uid-list-level1     same predicate, collapsed to relative depth 1. The delta
+#                       against uid-list is sort+collapse versus streaming every
+#                       matching path.
+#   uid-list-level1-sum adds --sum: per-row files/dirs/symlinks/other/bytes over
+#                       the records under each prefix. The delta against
+#                       uid-list-level1 is the per-record metadata carry plus the
+#                       aggregation walk.
 #   perm-any            a bit test, which no zone map can prune: every group is
 #                       decoded. The floor for a mode predicate.
 QUERY_VARIANTS_DEFAULT=(
@@ -205,6 +220,11 @@ QUERY_VARIANTS_DEFAULT=(
   "subtree-exact|| --subtree @ROOT@ --exact"
   "subtree-list|| --subtree @ROOT@ --type @TYPE@ --list"
   "gid-match|| --gid @GID@ --type @TYPE@"
+  "uid-match|| --uid @UID@ --type @TYPE@"
+  "uid-miss|| --uid 1 --type @TYPE@"
+  "uid-list|| --uid @UID@ --type @TYPE@ --list"
+  "uid-list-level1|| --uid @UID@ --list --level 1"
+  "uid-list-level1-sum|| --uid @UID@ --list --level 1 --sum"
   "perm-any|| --perm /0444 --type @TYPE@"
 )
 if [[ -n "${QUERY_VARIANTS:-}" ]]; then
@@ -317,6 +337,7 @@ build_variant_argv() {
   if [[ "$args" == *"@ROOT@"* && -z "$root" ]]; then return 1; fi
   args=${args//@ROOT@/$root}
   args=${args//@GID@/$QUERY_GID}
+  args=${args//@UID@/$QUERY_UID}
   args=${args//@SIZE@/$QUERY_SIZE_GT}
   args=${args//@TYPE@/$QUERY_TYPE}
   # shellcheck disable=SC2206 - deliberate word splitting of the variant's args
@@ -530,7 +551,7 @@ profile_one() {
   echo "ecrawl_query_bin=$ECRAWL_QUERY_BIN"
   echo "config: analyze_threads=$ECRAWL_QUERY_THREADS analyze_top=${ANALYZE_TOP:-off}"
   echo "modes: strace=$DO_STRACE perf=$DO_PERF sched=$DO_SCHED reps=$REPS"
-  echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE gid=$QUERY_GID sink=$QUERY_OUTPUT_SINK"
+  echo "query: enabled=$DO_QUERY size_gt=$QUERY_SIZE_GT type=$QUERY_TYPE gid=$QUERY_GID uid=$QUERY_UID sink=$QUERY_OUTPUT_SINK"
   echo "query_variants: $(printf '%s ' "${QVARIANTS[@]%%|*}")"
   echo "manyshard: copies=$MANYSHARD_COPIES source=${MANYSHARD_SOURCE:-first-fixture}"
   echo "sched_fixtures: $SCHED_FIXTURES"
@@ -871,6 +892,10 @@ PAIRS = [
      "what row group zone-map skipping is worth"),
     ("size-skipall", "size-matchall",
      "everything pruned vs nothing pruned (selectivity spread)"),
+    ("uid-list-level1", "uid-list",
+     "relative --level collapse vs full --list"),
+    ("uid-list-level1-sum", "uid-list-level1",
+     "per-prefix aggregation cost of --sum"),
 ]
 ab = []
 for fast, slow, why in PAIRS:
