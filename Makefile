@@ -16,7 +16,7 @@ SERVE_BIND ?= 127.0.0.1
 SERVE_INDEX_DIR ?=
 
 # Targets
-TARGETS = ereport ereport_index ecrawl ecrawl_repair ecrawl_query edelete
+TARGETS = ereport ereport_index ecrawl ecrawl_query edelete
 
 UNAME_S := $(shell uname -s)
 
@@ -172,14 +172,14 @@ test_crawl_block_filter: test_crawl_block_filter.c crawl_bin_block.o crawl_bin_c
 test_crawl_catalog: test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o
 	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_crawl_catalog.c crawl_bin_catalog.o crawl_bin_codec.o $(ZSTD_LIBS)
 
+test_query_subtree_dups: test_query_subtree_dups.c crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o
+	$(CC) $(CFLAGS) $(ZSTD_CFLAGS) -o $@ test_query_subtree_dups.c crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS)
+
 ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o ecrawl_wire.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 edelete: edelete.c path_canon.h path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
-
-ecrawl_repair: ecrawl_repair.c crawl_ckpt.h crawl_bin_format.h path_canon.h
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ ecrawl_repair.c $(JEMALLOC_LIBS)
 
 ecrawl_query: ecrawl_query.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_query.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
@@ -199,7 +199,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
+	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog test_query_subtree_dups *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
 	rm -rf __pycache__
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -210,7 +210,7 @@ serve-public:
 	$(PYTHON3) eserve.py --bind 0.0.0.0 --port $(SERVE_PORT) $(if $(SERVE_INDEX_DIR),--index-dir "$(SERVE_INDEX_DIR)") $(SERVE_ROOT)
 
 # Self-test: tiny temp tree + key=value stat cross-checks (ecrawl + ereport)
-check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog
+check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog test_query_subtree_dups
 	./test_crawl_codec
 	./test_crawl_block_filter
 	./test_crawl_catalog

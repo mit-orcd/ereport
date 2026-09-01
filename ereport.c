@@ -577,15 +577,21 @@ typedef struct {
     crawl_bin_catalog_t *catalog;
     /*
      * --subtree via dirs.idx. subtree_bits has one bit per dir_id, set when that directory is at
-     * or under the subtree root *in this shard*; the scan then tests a record's parent_dir_id
+     * or under any subtree root *in this shard*; the scan then tests a record's parent_dir_id
      * against it instead of rebuilding the record's path. NULL when the sidecar route is not in
      * use, which is what the scan reads to decide between the two.
      *
-     * subtree_root_parent is the root directory's own parent_dir_id here, because the root's own
-     * record hangs off that parent -- outside the bitmap -- and `path == prefix` is in scope.
+     * Duplicate catalog paths yield several roots; bits are the union of their descendants.
+     * subtree_root_parent is the first root's parent_dir_id; subtree_root_parents holds every
+     * parent when there is more than one, because the subtree's own record can hang off any
+     * duplicate parent -- outside the bitmap -- and `path == prefix` is in scope.
      */
     unsigned char *subtree_bits;
     uint64_t subtree_root_parent;
+    uint64_t *subtree_root_parents;
+    size_t n_subtree_root_parents;
+    uint64_t *subtree_roots;
+    size_t n_subtree_roots;
 } file_state_t;
 
 typedef struct {
@@ -8299,6 +8305,13 @@ static int finalize_chunk_file_progress(file_state_t *file_states,
     return 0;
 }
 
+static void ereport_drop_sidecar_scope(crawl_sidecar_scope_t **scope, size_t n) {
+    if (!scope || !*scope) return;
+    crawl_sidecar_scope_release_n(*scope, n);
+    free(*scope);
+    *scope = NULL;
+}
+
 static void ereport_free_file_states(file_state_t *fs, size_t n) {
     size_t i;
 
@@ -8311,6 +8324,10 @@ static void ereport_free_file_states(file_state_t *fs, size_t n) {
         }
         free(fs[i].subtree_bits);
         fs[i].subtree_bits = NULL;
+        free(fs[i].subtree_root_parents);
+        fs[i].subtree_root_parents = NULL;
+        free(fs[i].subtree_roots);
+        fs[i].subtree_roots = NULL;
     }
     free(fs);
 }
@@ -8334,6 +8351,10 @@ static void ereport_free_shard_catalogs(file_state_t *fs, size_t n) {
         /* Same lifetime, same reason: the subtree bitmaps are read only by the scan. */
         free(fs[i].subtree_bits);
         fs[i].subtree_bits = NULL;
+        free(fs[i].subtree_root_parents);
+        fs[i].subtree_root_parents = NULL;
+        free(fs[i].subtree_roots);
+        fs[i].subtree_roots = NULL;
     }
 }
 
@@ -8408,7 +8429,7 @@ fail:
 }
 
 /*
- * One bit per dir_id, set when that directory is at or under `root`.
+ * One bit per dir_id, set when that directory is at or under any of `roots`.
  *
  * The catalog ereport loads has the parent pointers but not the DFS permutation
  * (CRAWL_CAT_SUBTREE is ten more per-directory arrays, and this route exists to
@@ -8416,21 +8437,28 @@ fail:
  * out parent-first -- crawl_bin_format's writer interns a directory's parent
  * before the directory -- so one forward pass settles every descendant, and a
  * catalog that does not hold to that is reported as unusable rather than
- * half-believed. root == 0 means the subtree is not in this shard at all, which
+ * half-believed. nroots == 0 means the subtree is not in this shard at all, which
  * is an all-zero bitmap: every record here is out of scope.
  *
  * 1 bit per directory, so ~85 KB for a shard with 680k of them.
  */
-static unsigned char *ereport_subtree_bits(const crawl_bin_catalog_t *cat, uint64_t root) {
+static unsigned char *ereport_subtree_bits(const crawl_bin_catalog_t *cat, const uint64_t *roots, size_t nroots) {
     uint64_t n = cat->max_dir_id;
     unsigned char *bits;
     uint64_t d;
+    size_t i;
 
-    if (root > n) return NULL;
     bits = (unsigned char *)calloc((size_t)(n / 8ULL) + 1U, 1U);
     if (!bits) return NULL;
-    if (root == 0ULL) return bits;
-    bits[root >> 3] |= (unsigned char)(1U << (root & 7U));
+    for (i = 0; i < nroots; i++) {
+        uint64_t root = roots ? roots[i] : 0ULL;
+
+        if (root == 0ULL || root > n) {
+            free(bits);
+            return NULL;
+        }
+        bits[root >> 3] |= (unsigned char)(1U << (root & 7U));
+    }
 
     for (d = 2ULL; d <= n; d++) {
         uint64_t p = cat->parent_dir_id[d];
@@ -8594,6 +8622,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
      * or not applicable and the prefix compare below is the filter. */
     const unsigned char *sub_bits = file_states[chunk->file_index].subtree_bits;
     const uint64_t sub_root_parent = file_states[chunk->file_index].subtree_root_parent;
+    const uint64_t *sub_root_parents = file_states[chunk->file_index].subtree_root_parents;
+    const size_t n_sub_root_parents = file_states[chunk->file_index].n_subtree_root_parents;
     const uint64_t sub_max_dir_id =
         file_states[chunk->file_index].catalog ? file_states[chunk->file_index].catalog->max_dir_id : 0ULL;
 
@@ -8669,10 +8699,21 @@ static int read_one_chunk(const file_chunk_t *chunk,
             uint64_t p = r.parent_dir_id;
             int in_scope = (p <= sub_max_dir_id) && ((sub_bits[p >> 3] >> (p & 7U)) & 1U);
 
-            if (!in_scope && p == sub_root_parent && sub_root_parent != 0ULL &&
-                (size_t)r.name_len == g_subtree_base_len && rec_name &&
-                memcmp(rec_name, g_subtree_base, (size_t)r.name_len) == 0)
-                in_scope = 1;
+            if (!in_scope && rec_name && (size_t)r.name_len == g_subtree_base_len &&
+                memcmp(rec_name, g_subtree_base, (size_t)r.name_len) == 0) {
+                if (p == sub_root_parent && sub_root_parent != 0ULL)
+                    in_scope = 1;
+                else if (sub_root_parents) {
+                    size_t pi;
+
+                    for (pi = 0; pi < n_sub_root_parents; pi++) {
+                        if (p == sub_root_parents[pi]) {
+                            in_scope = 1;
+                            break;
+                        }
+                    }
+                }
+            }
             if (!in_scope) continue;
         }
 
@@ -10742,6 +10783,7 @@ int main(int argc, char **argv) {
     path_shape_view_t path_shape;
     crawl_sidecar_t sidecar;
     crawl_sidecar_scope_t *sidecar_scope = NULL; /* one per shard; NULL when --index-dir is not in play */
+    int sidecar_resolved = 0;
 
     memset(&sidecar, 0, sizeof(sidecar));
 
@@ -11259,13 +11301,13 @@ int main(int argc, char **argv) {
                     if (sidecar_scope[k].root != 0ULL) placed = 1;
             }
             if (!placed) {
-                free(sidecar_scope);
-                sidecar_scope = NULL;
+                ereport_drop_sidecar_scope(&sidecar_scope, path_count);
                 crawl_sidecar_close(&sidecar);
             } else if (g_ereport_verbose) {
                 fprintf(stderr, "ereport: dirs.idx resolved %s from %" PRIu64 " directory row(s)\n",
                         g_subtree_prefix, rows_read);
             }
+            sidecar_resolved = (sidecar_scope != NULL);
         }
     }
 
@@ -11273,6 +11315,8 @@ int main(int argc, char **argv) {
     if (!file_states) {
         size_t k;
         fprintf(stderr, "allocation failed\n");
+        ereport_drop_sidecar_scope(&sidecar_scope, path_count);
+        crawl_sidecar_close(&sidecar);
         for (k = 0; k < path_count; k++) free(paths[k]);
         free(paths);
         return 1;
@@ -11534,9 +11578,52 @@ chunks_ready:
         atomic_store(&run_stats.chunk_prep_files_done, 0ULL);
     }
 
-    /* The mappings and shard fds have served their purpose; the resolved per-shard roots in
-     * sidecar_scope are all the scan still needs. */
+    /* The mappings and shard fds have served their purpose; copy the resolved roots
+     * into file_states so the scan still has them after the sidecar is closed. */
     crawl_sidecar_close(&sidecar);
+    if (sidecar_scope) {
+        size_t fi;
+        int copy_ok = 1;
+
+        for (fi = 0; fi < path_count && copy_ok; fi++) {
+            crawl_sidecar_scope_t *sp = &sidecar_scope[fi];
+
+            file_states[fi].subtree_root_parent = sp->root_parent;
+            file_states[fi].n_subtree_roots = sp->nroots;
+            file_states[fi].n_subtree_root_parents = sp->nparents;
+            if (sp->nroots) {
+                file_states[fi].subtree_roots = (uint64_t *)malloc(sp->nroots * sizeof(uint64_t));
+                if (!file_states[fi].subtree_roots)
+                    copy_ok = 0;
+                else
+                    memcpy(file_states[fi].subtree_roots, sp->roots, sp->nroots * sizeof(uint64_t));
+            }
+            if (copy_ok && sp->nparents > 1U) {
+                file_states[fi].subtree_root_parents = (uint64_t *)malloc(sp->nparents * sizeof(uint64_t));
+                if (!file_states[fi].subtree_root_parents)
+                    copy_ok = 0;
+                else
+                    memcpy(file_states[fi].subtree_root_parents, sp->parents, sp->nparents * sizeof(uint64_t));
+            }
+        }
+        ereport_drop_sidecar_scope(&sidecar_scope, path_count);
+        if (!copy_ok) {
+            fprintf(stderr, "allocation failed\n");
+            if (stats_thread_started) {
+                ereport_stats_stop_request(&run_stats);
+                pthread_join(stats_thread, NULL);
+                clear_status_line();
+                stats_thread_started = 0;
+            }
+            for (i = 0; (size_t)i < chunk_count; i++) free(chunks[i].path);
+            free(chunks);
+            chunks = NULL;
+            for (i = 0; (size_t)i < path_count; i++) free(paths[i]);
+            free(paths);
+            ereport_free_file_states(file_states, path_count);
+            return 1;
+        }
+    }
 
     if (chunk_count == 0) {
         fprintf(stderr, "no readable chunk work found in %s\n", input_dirs_label);
@@ -11580,15 +11667,18 @@ chunks_ready:
      * path-prefix route, which is the same answer by a slower road -- and one already-pruned chunk
      * list stays correct either way, because a pruned group held no matching record to begin with.
      */
-    if (sidecar_scope) {
+    if (sidecar_resolved) {
         size_t fi;
         int ok = 1;
 
         for (fi = 0; fi < path_count && ok; fi++) {
             if (!file_states[fi].catalog) continue;
-            file_states[fi].subtree_bits = ereport_subtree_bits(file_states[fi].catalog, sidecar_scope[fi].root);
-            file_states[fi].subtree_root_parent = sidecar_scope[fi].root_parent;
+            file_states[fi].subtree_bits = ereport_subtree_bits(
+                file_states[fi].catalog, file_states[fi].subtree_roots, file_states[fi].n_subtree_roots);
             if (!file_states[fi].subtree_bits) ok = 0;
+            free(file_states[fi].subtree_roots);
+            file_states[fi].subtree_roots = NULL;
+            file_states[fi].n_subtree_roots = 0;
         }
         if (!ok) {
             fprintf(stderr, "ereport: dir index unusable for this capture; --subtree falls back to path matching\n");
@@ -11596,15 +11686,18 @@ chunks_ready:
                 free(file_states[fi].subtree_bits);
                 file_states[fi].subtree_bits = NULL;
                 file_states[fi].subtree_root_parent = 0ULL;
+                free(file_states[fi].subtree_root_parents);
+                file_states[fi].subtree_root_parents = NULL;
+                file_states[fi].n_subtree_root_parents = 0;
+                free(file_states[fi].subtree_roots);
+                file_states[fi].subtree_roots = NULL;
+                file_states[fi].n_subtree_roots = 0;
             }
             /* g_rgix_stats stays: the chunk list is already pruned, and the record credit below is
              * what keeps "Scanned records" meaning the same thing it did. */
         } else {
             g_subtree_from_index = 1;
         }
-        /* Everything the scan needs is now in the per-shard bitmaps. */
-        free(sidecar_scope);
-        sidecar_scope = NULL;
     }
 
     /* Now that the catalogs are in, the number of directories across the shards being read is known, and

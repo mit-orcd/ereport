@@ -2,7 +2,7 @@
 
 Status: **OPEN — root cause not yet identified.** Symptom characterized in detail;
 several latent bugs fixed along the way; writer-side tripwire in place.
-Last updated: 2026-09-01 (after the n1-capture analysis on node9901).
+Last updated: 2026-09-01 (after the post-union n1 full-option sweep).
 
 This document is the handoff for any future session picking up the hunt. It records
 what is known, what was ruled out, what was fixed, and what to do next. Do not
@@ -49,6 +49,28 @@ printing still cuts at the first NUL, matching historical `%s` behavior.
 - The capture also contains two records that reconstruct as `/` (name_len=0,
   uid 142698, type d, 6 bytes total). Unexplained but benign; possibly a
   restart/checkpoint edge in the 9.6 h crawl.
+- **The corruption silently broke `--subtree` queries** (found 2026-09-01 via
+  the full-option perf sweep; **query-side union landed**). Duplicate catalog
+  directory entries meant a subtree path used to resolve to ONE dir_id branch,
+  and the DFS-range block filter then skipped records attached under the
+  duplicate branches. Measured on the n1 capture before the union: `--subtree
+  /data1/group/jbt/001/from_om/weka/arsalans --exact` returned 12,642,318
+  entries while the path-string-based `--uid 142698 --list --level 1 --sum`
+  attributed 122,623,571 records to the same path; `--subtree /data1 --exact`
+  returned 687,808,524 of the true 978,235,888 (30% of all records invisible).
+  `--subtree` now collects every dir_id whose reconstructed path equals the
+  query and unions their DFS ranges (catalog rollup, record scan, and sidecar
+  prune). Post-fix on the same n1 capture (node9901, 2026-09-01): `--subtree
+  /data1 --exact` reports entries=978,231,323 of records_scanned=978,235,888
+  (the remaining 4,565 are the two `/` records plus 4,563 skipped by the
+  parent-dir hull); `--uid 142698 --subtree
+  /data1/group/jbt/001/from_om/weka/arsalans --exact` reports entries=122,623,571,
+  matching the `--list --level 1 --sum` rollup. The 12:20 full-option sweep
+  (no `--uid` on `--exact`) reproduced the same 122,623,571; the hardlink
+  subtree `home/arsalans` also gained the second catalog clone (77,202 →
+  78,445). `--list`-family queries were already path-string-based and
+  unaffected. Zeroed names still will not `memcmp`-match a normal subtree
+  string. Writer-side healing of those names is a follow-on.
 
 ## Root-cause hypothesis (current best)
 
@@ -157,11 +179,14 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
    max_open_shards=64). A trip fires at the moment of corruption and names the
    phase (create vs eviction-write vs final-write). This is the single most
    informative experiment available.
-2. **Aggressive-purge repro** (running as of 2026-09-01): round 4 reruns the
-   deep-tree loop with `MALLOC_CONF=tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0`
-   so freed runs are purged (MADV_DONTNEED) immediately — if the mechanism is
-   use-after-free followed by purge, this widens the window from ~10 s of decay
-   to zero. Results: `/data1/erbmi1/deep-captures-purge.log` on node9901.
+2. **Aggressive-purge repro** (2026-09-01, round 4 — **clean**): the deep-tree
+   loop rerun with `MALLOC_CONF=tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0`
+   so freed runs are purged (MADV_DONTNEED) immediately — if the mechanism were
+   use-after-free followed by purge, this widened the window from ~10 s of decay
+   to zero. 15/15 iterations clean (no tripwire, probe bad=0). Result log:
+   `/data1/erbmi1/deep-captures-purge.log` on node9901. The UAF+purge vector is
+   not confirmed at this scale/duration; remaining differentiators are
+   production crawl duration (9.6 h vs 1 min) and the weka environment.
 3. **Fault-injection variant**: since the disk-reload path only runs after a
    reopen failure (see findings above), a repro that injects reopen errors
    (LD_PRELOAD on fopen/fread, or an env-gated test hook) would exercise
@@ -171,9 +196,18 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
    bad entries were contiguous in *time* at the writer. Also produce the bad-entry
    nlen histogram to settle the 48 B vs 64 B class question.
 5. **TSan build** on a host with a working runtime, if (1)–(4) point at a race.
-6. When the root cause is found: fix, then decide whether `ecrawl_repair` should
-   gain a pass that detects (and where possible heals via twins) zeroed catalog
-   names in existing captures.
+6. When the root cause is found: fix, then decide whether a one-off pass should
+   detect (and where possible heal via twins) zeroed catalog names in existing
+   captures.
+7. **Query-side duplicate tolerance — landed.** `--subtree` unions every
+   catalog (and sidecar) dir_id whose reconstructed path equals the query, so
+   a corrupt capture with duplicate directory entries no longer silently
+   undercounts. Writer-side NUL / hash-table corruption remains open; until
+   that is fixed, `probe_dup` still describes how damaged a capture is, but
+  it is no longer a "do not run --subtree" check. The 12:20 n1 sweep confirmed
+  the unioned counts and that `subtree_find_dirs` is ~1% of samples; remaining
+  `--subtree` cost is catalog load (follow-up 11). Zeroed names still do not
+  match a normal subtree string.
 
 ## Artifacts and where they live
 
@@ -190,6 +224,10 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
 - Capture under analysis: `/data1/ereport/hstor006-n1-mgmt_aug-26-2026_14-38-44/`
   on node9901 (also `~/orcd/scratch/ereport/hstor006-n1-mgmt_aug-26-2026_14-38-44/`
   on ORCD). Shard of interest: `uid_shard_362.bin` (uid 142698 = arsalans).
+- Query profiles (gitignored `logs/`): `logs/ecrawl_query_prof.tgz` (12:20
+  post-union pack; extracted `logs/prof_new/`) and `logs/prof/` (10:42
+  pre-union). Recipe: `ecrawl_query.txt`. `--index-dir` profiles were not
+  included.
 - node9901 scratch: `/tmp/ereport-hl` (repo copy + build), `/tmp/ereport-asan`
   (ASan build). **/tmp does not survive reboots** — rebuild from home if gone.
 - Build/run on node9901: `rsync -a --delete --exclude=.git ~/git/ereport/
@@ -238,3 +276,104 @@ Ordered by expected value:
    `memchr` line-split could be fused with hashing into one pass over the bytes.
    Both are moot for unfiltered queries if (1) lands.
 6. **zstd decode (~6%)** is inherent and already parallel; nothing to do.
+
+### Full-option perf sweep (logs/ecrawl_query_prof.tgz, 2026-09-01)
+
+Two packs of the same recipe (`ecrawl_query.txt` v2, `ECRAWL_QUERY_THREADS=16`,
+n1 capture `hstor006-n1-mgmt_aug-26-2026_14-38-44` on node9901, dwarf / 997 Hz):
+
+- **Pre-union** `logs/prof/` (~10:42) — first sweep; some filter walls were
+  missing from the bundle and were guessed from sample counts.
+- **Post-union** `logs/ecrawl_query_prof.tgz` (12:20, extracted to
+  `logs/prof_new/`) — complete `out.*.txt` + `stats.*.txt`. This is the
+  source of truth for walls. None of follow-ups (1)–(12) were implemented
+  between the two packs; union is a correctness change.
+
+`--subtree` "does not exist here; matching the capture literally" is expected
+on node9901. Duplicate-union stderr fired: 4× `weka/arsalans` and 2×
+`home/arsalans` in `uid_shard_362.bin`. Recipe §16 (`--index-dir` sidecar
+profiles) was not run. Leftover `logs/report.level1.txt` /
+`logs/report.sum.txt` at the logs/ root are a 07:55 pair, not this sweep.
+
+Post-union `elapsed_sec` (stdout for filter/subtree, stderr stats for
+`--list`; default/`--top,deep` emit shape histograms with no elapsed):
+
+| query | wall | entries | answered_from | records_scanned | notes |
+|---|---|---|---|---|---|
+| default | — (127 CPU-s) | shape / 978,235,888 rec | fold | — | `parent_map_get_or_add` 57% |
+| `--top,deep` 50 | — (136 CPU-s) | same fold | fold | — | same, 53% |
+| `--uid` 142698 | 0.223 s | 127,821,098 | record_scan | 128,175,044 | VERIFY matched; 1 shard |
+| `--gid` 167149 | 0.765 s | 468,818,647 | record_scan | 978,235,888 | 496M zonemap skips |
+| subtree `home/arsalans` | 6.391 s | **78,445** (was 77,202) | record_scan | 590,739,564 | nlink>1, no rollup; k=2 |
+| subtree `om5/arsalans` | **9.323 s** | 1 (2 bytes) | **catalog_rollup** | 0 | 139,836,804 dirs examined |
+| subtree `--exact` `weka/arsalans` | 6.688 s | **122,623,571** (was 12,642,318) | record_scan | 595,000,297 | same scanned, 10× matches |
+| `--size-gt` 1G | 0.068 s | 92,131 | record_scan | 978,235,888 | 953M skipped |
+| `--type` l | 0.197 s | 4,400,807 | record_scan | 978,235,888 | 890M skipped |
+| `--perm` -0002 | 1.491 s | 22,649,446 | record_scan | 978,235,888 | 0 skipped; 23 CPU-s ≠ 23 s wall |
+| `--uid --list` | 4.190 s | 127,821,098 | record_scan | 128,175,044 | stdout `/dev/null` |
+| `--uid --list --level` 1 | 10.651 s | 127,821,098 | record_scan | 128,175,044 | |
+| `--uid --list --level` 1 `--sum` | 10.703 s | 127,821,098 | record_scan | 128,175,044 | |
+| `--uid --list --sum` (no `--level`) | **116.065 s** | 127,821,098 | record_scan | 128,175,044 | worst query |
+| `--uid --list --level` 3 | 10.847 s | 127,821,098 | record_scan | 128,175,044 | |
+| `--list --level` 1 (no uid) | 51.462 s | 978,235,888 | record_scan | 978,235,888 | |
+
+Union vs pre-union walls are noise except the two trees that gained DFS
+ranges: `--exact` 6.167 → 6.688 s, `home/arsalans` 6.080 → 6.391 s.
+`subtree_find_dirs` is ~1% of samples. `records_scanned` stayed 595,000,297
+(`--exact`) and 590,739,564 (home); `blocks_decompressed` rose 4,480 → 25,638
+and 3,230 → 7,699 — same shards, denser hull hits, not a new I/O class.
+
+The 12:20 pack also replaces the first-sweep CPU-sample guesses. `--perm`
+is 1.49 s wall (23 CPU-s across 16 threads), not a 23 s query; `--uid` is
+0.223 s wall (3 CPU-s). Filter totals are already fast; zonemaps explain
+size/type/gid; `--perm` has no zonemap.
+
+Thread balance (bythread overhead): `--list --sum` 80.8% on one PID (serial
+`qsort`); subtree rollup 100% one PID (catalog load, no workers); `--exact`
+43% on one PID then even scan; default one fat PID at 12% plus ~4.8% × 16
+workers (fold lock); `--level` 49 PIDs, even ~4–6%.
+
+New / confirmed hot paths (children % from the post-union reports). None of
+these are checked off:
+
+7. **`--list --sum` (no `--level`) is the worst query: 116.1 s, `qsort_r`
+   60.5% of cycles, 81% of samples on one thread.** Serial global sort of
+   127.8M paths in `query_list_emit_sum`. Parallelize: per-thread sort +
+   k-way merge, or hash-aggregate by path first and sort only unique dirs.
+   Owns ~70 s of the 116 s wall.
+8. **Unfiltered `--list --level` 1: Pass 1 = 69% of all cycles** (51.5 s
+   wall, `query_hash_path` 54%). Confirms follow-up (1): skip the membership
+   pass when no filters are active. Filtered `--uid --level` 1/3/`--sum` are
+   still ~10.7 s with Pass 1 at 54–56% (~6 s); skip-Pass-1 helps those too
+   but less.
+9. **Default/`--top,deep` are fold-bound: `parent_map_get_or_add` = 57% /
+   53%**, mutex lock 22% / 21%, `parent_chain_find` 21% / 20%, fold worker
+   76% / 71%. Catalog load is only 3%. The stripe-locked shared parent map
+   serializes 133.9M inserts. Options: per-worker maps + parallel merge, or
+   the lock-free CAS insert pattern now proven in the emit mset.
+10. **`crawl_bin_codec_decode_u64` = 50–58% of every filter scan**
+    (perm/uid/gid/sizegt/type_l), zstd 12–20%. The byte-at-a-time varint
+    decoder is the universal *scan* bottleneck, but the walls are already
+    0.07–1.5 s. A 1-byte fast path would help `--perm` most (full decode,
+    0 skipped). Do this after (7)–(9) and (11).
+11. **Every `--subtree` query is catalog-load-bound, including the rollup
+    shortcut.** `crawl_bin_catalog_load_sel` is 92% of the 9.32 s
+    `om5/arsalans` rollup (`decode_u64` 49% + zstd 39%, 1 PID, 0 records
+    scanned), 83% of the 6.39 s hardlink `home/arsalans` scan (rollup
+    correctly skipped, `nlink>1`), and 55% of the 6.69 s `--exact` (then
+    the 122M-record scan). Loading 140M catalog rows to answer one directory
+    is **slower than scanning 122M matching records**. The
+    `dirs.idx`/`rowgroups.idx` sidecars (`--index-dir`) exist for exactly
+    this and were not profiled (recipe §16 still commented). Alternatively
+    make catalog loads lazier. Union itself is not the cost.
+12. **Plain `--list` is path-reconstruction-bound: `dir_path_len` 33% +
+    memmove 16% + reader 24%** (4.19 s). The path builder prepends
+    components with memmove, making each path O(depth²) byte-moves; building
+    back-to-front into the buffer end is O(depth). Measure `query_path_cache`
+    hit rate before rewriting (follow-up 3).
+
+Ranked by measured wall those still own: (7) 70 of 116 s → (8) 36 of 51 s
+unfiltered / ~6 of 11 s filtered → (11) 8.6 of 9.3 s rollup, 3.7 of 6.7 s
+`--exact` → (9) default fold → (12) ~2 of 4.2 s `--list` → (2) realloc 7% of
+`--level` → (10) sub-second filter scans. (5) is moot if (1)/(8) land; (6)
+zstd is inherent.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_repair / ecrawl_query /
+# Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_query /
 # edelete / ereport_index, optional live-tree correlation with find/fd.
 #
 # Usage:
@@ -9,7 +9,7 @@
 #   ./scripts/test/test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./scripts/test/test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./scripts/test/test.sh
-#   ECRAWL_REPAIR ECRAWL_QUERY EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
+#   ECRAWL_QUERY EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
 #   SKIP_FUSE=1 ./scripts/test/test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
 # Requires: bash, coreutils, all Makefile targets built (default: the repo root, two levels up).
@@ -34,10 +34,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 ECRAWL="${ECRAWL:-$REPO_ROOT/ecrawl}"
 EREPORT="${EREPORT:-$REPO_ROOT/ereport}"
-ECRAWL_REPAIR="${ECRAWL_REPAIR:-$REPO_ROOT/ecrawl_repair}"
 ECRAWL_QUERY="${ECRAWL_QUERY:-$REPO_ROOT/ecrawl_query}"
 EDELETE="${EDELETE:-$REPO_ROOT/edelete}"
 EREPORT_INDEX="${EREPORT_INDEX:-$REPO_ROOT/ereport_index}"
+QUERY_SUBTREE_DUPS="${QUERY_SUBTREE_DUPS:-$REPO_ROOT/test_query_subtree_dups}"
 # Optional target: only built when FUSE headers were available (see 'make fuse-headers').
 ECRAWL_MOUNT="${ECRAWL_MOUNT:-$REPO_ROOT/ecrawl_mount}"
 
@@ -1151,6 +1151,44 @@ run_ecrawl_progress_tests() {
 
     rm -rf "$tree" "${td}/prog_cap" "${td}"/prog_*.out "${td}"/prog_*.err
     pass "ecrawl --progress"
+}
+
+# Duplicate catalog dir_ids reconstructing to the same path: --subtree must union
+# every DFS range. A clean crawl cannot produce this; the helper writes a synthetic
+# shard with two /dup roots, each holding one file.
+run_subtree_dup_tests() {
+    local td=$1
+    local out="${td}/dup_catalog"
+    local exact="${td}/dup.exact" roll="${td}/dup.roll"
+    local exact_err="${td}/dup.exact.err" roll_err="${td}/dup.roll.err"
+    local k
+
+    section_int "[integration] --subtree unions duplicate catalog dir_ids"
+
+    mkdir -p "$out"
+    "$QUERY_SUBTREE_DUPS" "$out" || die "test_query_subtree_dups failed to write the synthetic shard"
+
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --subtree /dup --exact "$out" >"$exact" 2>"$exact_err" || {
+        tail -n 40 "$exact_err" >&2 || true
+        die "--subtree /dup --exact on the duplicate-dir shard failed"
+    }
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --subtree /dup "$out" >"$roll" 2>"$roll_err" || {
+        tail -n 40 "$roll_err" >&2 || true
+        die "--subtree /dup rollup on the duplicate-dir shard failed"
+    }
+
+    expect_eq "duplicate-dir --exact entries" "4" "$(kv_last entries "$exact")" \
+        "both /dup dirs and both files, not the first branch only"
+    expect_eq "duplicate-dir --exact files" "2" "$(kv_last files "$exact")"
+    expect_eq "duplicate-dir --exact dirs" "2" "$(kv_last dirs "$exact")"
+    expect_eq "duplicate-dir --exact bytes" "8222" "$(kv_last bytes "$exact")"
+    expect_eq "duplicate-dir rollup answered_from" "catalog_rollup" "$(kv_last answered_from "$roll")"
+    for k in entries files dirs symlinks other bytes; do
+        expect_eq "duplicate-dir rollup equals exact: ${k}" "$(kv_last "$k" "$exact")" "$(kv_last "$k" "$roll")"
+    done
+    grep -q "duplicate catalog entries" "$exact_err" || die "exact scan did not warn about duplicate catalog entries"
+    grep -q "duplicate catalog entries" "$roll_err" || die "rollup did not warn about duplicate catalog entries"
+    summary_add PASS "subtree duplicate catalog union" "exact=4 rollup-parity"
 }
 
 # ERCBIN09: the catalog rollup fast path must agree with the record scan wherever
@@ -2342,14 +2380,7 @@ run_integration() {
     expect_eq "all_users: matched_records vs scanned" "$sscan" "$smat" \
         "all-users keeps every row (matched == scanned)"
 
-    section_int "[integration] ecrawl_repair, ecrawl_query, edelete, ereport_index (smoke)"
-
-    log "ecrawl_repair --dry-run (sidecar rules vs crawl_bin_load_ckpt)"
-    "$ECRAWL_REPAIR" --dry-run "$crawl_out" >"${td}/repair.stdout" 2>"${td}/repair.stderr" || {
-        tail -n 40 "${td}/repair.stderr" >&2 || true
-        die "ecrawl_repair --dry-run failed"
-    }
-    summary_add PASS "ecrawl_repair --dry-run" "ran ok"
+    section_int "[integration] ecrawl_query, edelete, ereport_index (smoke)"
 
     log "ecrawl_query (shard scan / parent histogram smoke)"
     "$ECRAWL_QUERY" --top 5 "$crawl_out" >"${td}/analyze.stdout" 2>"${td}/analyze.stderr" || {
@@ -2394,6 +2425,8 @@ run_integration() {
     summary_add PASS "ecrawl_query block skipping" "parity+strict-boundary+all-skip+accounting"
 
     run_v8_rollup_tests "$td"
+
+    run_subtree_dup_tests "$td"
 
     run_dir_index_tests "$td"
 
@@ -2570,9 +2603,10 @@ fi
 
 need_exe "$ECRAWL"
 need_exe "$EREPORT"
-need_exe "$ECRAWL_REPAIR"
 need_exe "$EDELETE"
 need_exe "$EREPORT_INDEX"
+need_exe "$ECRAWL_QUERY"
+need_exe "$QUERY_SUBTREE_DUPS"
 
 run_phase run_integration
 

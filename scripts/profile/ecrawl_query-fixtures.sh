@@ -572,7 +572,7 @@ profile_one() {
   [[ "$HAVE_PERF"   == "1" ]] && echo "perf_version=$(perf --version 2>&1 | head -n1)"
   echo
   echo "## ecrawl_query-related env"
-  env | grep -E '^ECRAWL_QUERY_|^ECRAWL_REPAIR_' | sort || true
+  env | grep -E '^ECRAWL_QUERY_' | sort || true
 } >"$RESULTS_DIR/env.txt"
 
 echo "ecrawl_query profile starting; results -> $RESULTS_DIR"

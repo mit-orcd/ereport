@@ -96,16 +96,34 @@ typedef struct {
     const void *chunk_view; /* which view `chunk` was decoded from */
 } crawl_dirx_walk_t;
 
-/* Where one shard's subtree sits, resolved once per shard. */
+/* One half-open DFS interval [lo, hi). */
 typedef struct {
-    uint64_t root;        /* dir_id of the subtree root in this shard; 0 when absent */
-    uint64_t root_parent; /* the root row's parent_dir_id; 0 when root is absent */
-    uint64_t dfs_lo;      /* the subtree's half-open DFS range; empty when lo >= hi */
+    uint64_t lo, hi;
+} crawl_dfs_range_t;
+
+/* Where one shard's subtree sits, resolved once per shard.
+ *
+ * A corrupt catalog can store several dir_ids that reconstruct to the same path
+ * (duplicate hash-table inserts). `root` / `dfs_lo` / `dfs_hi` describe the first
+ * hit so k=1 callers stay a single compare; `roots` / `ranges` hold every hit
+ * (including the first) so membership and row-group pruning union the branches.
+ * nroots==0 means the path is absent here. Free inner arrays with
+ * crawl_sidecar_scope_release. */
+typedef struct {
+    uint64_t root;        /* first matching dir_id; 0 when absent */
+    uint64_t root_parent; /* first root's parent_dir_id; 0 when root is absent */
+    uint64_t dfs_lo;      /* first range; empty when lo >= hi */
     uint64_t dfs_hi;
-    uint64_t dfs_par; /* the parent's DFS position, for the subtree's own record */
+    uint64_t dfs_par; /* first parent's DFS position, for the subtree's own record */
     int have_par;
-    int self_record; /* CRAWL_DIR_FLAG_SELF_RECORD: this shard holds the root's own record */
+    int self_record; /* OR of CRAWL_DIR_FLAG_SELF_RECORD over every matching root */
     int in_shard;    /* the shard can hold something: root or parent resolved */
+    uint64_t *roots;          /* nroots dir_ids; NULL when nroots==0 */
+    crawl_dfs_range_t *ranges; /* nroots DFS ranges, parallel to roots */
+    size_t nroots;
+    uint64_t *parents;    /* nparents parent dir_ids (path-equal to sub_parent) */
+    uint64_t *parent_dfs; /* parallel DFS positions */
+    size_t nparents;
 } crawl_sidecar_scope_t;
 
 /*
@@ -155,14 +173,27 @@ int crawl_dirx_read_row(const crawl_dirx_view_t *v, crawl_dirx_walk_t *w, uint64
 int crawl_dirx_path_of(const crawl_dirx_view_t *v, uint64_t did, crawl_dirx_walk_t *w, char *out, size_t out_sz,
                        size_t *len_out, uint64_t *rows_read);
 
-/* The dir_id in this shard whose stored path is exactly `path`, or 0. */
+/* The first dir_id in this shard whose stored path is exactly `path`, or 0. */
 uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
                            uint64_t *rows_read);
 
 /*
+ * Every dir_id whose stored path is exactly `path`. Same-path catalog duplicates
+ * share a hash and sit adjacent in dirs.idx; this returns them all.
+ * *ids_out is malloc'd on success (NULL when n==0). Returns 0, or -1 on OOM /
+ * a row the sidecar promised but could not read.
+ */
+int crawl_dirx_lookup_all(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
+                          uint64_t **ids_out, size_t *n_out, uint64_t *rows_read);
+
+void crawl_sidecar_scope_release(crawl_sidecar_scope_t *sp);
+void crawl_sidecar_scope_release_n(crawl_sidecar_scope_t *scope, size_t n);
+
+/*
  * Locate `subtree` in every shard, filling scope[0..sc->shard_count).
  * sub_parent is the subtree's parent directory ("" when that is the capture
- * root). Returns 0, or -1 when a row the sidecar promised could not be read --
+ * root). Duplicate catalog paths are unioned into each shard's range list.
+ * Returns 0, or -1 when a row the sidecar promised could not be read --
  * which means the sidecar is not usable and the caller must fall back.
  */
 int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, size_t subtree_len,

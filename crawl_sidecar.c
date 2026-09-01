@@ -345,13 +345,18 @@ int crawl_dirx_path_of(const crawl_dirx_view_t *v, uint64_t did, crawl_dirx_walk
 /*
  * Binary search to the first entry with the path's hash, then every entry
  * sharing it is rebuilt and compared. Hash equality is a hint; the string
- * decides.
+ * decides. Duplicate catalog paths share a hash, so they sit adjacent and
+ * all of them are returned.
  */
-uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
-                           uint64_t *rows_read) {
+int crawl_dirx_lookup_all(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
+                          uint64_t **ids_out, size_t *n_out, uint64_t *rows_read) {
     uint64_t h = crawl_sidecar_path_hash(path, plen);
     uint64_t lo = 0, hi = v->ent_count;
+    uint64_t *ids = NULL;
+    size_t n = 0, cap = 0;
 
+    *ids_out = NULL;
+    *n_out = 0;
     while (lo < hi) {
         uint64_t mid = lo + (hi - lo) / 2ULL;
 
@@ -363,7 +368,95 @@ uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t 
 
         if (crawl_dirx_path_of(v, v->ents[lo].dir_id, w, w->path, sizeof(w->path), &got, rows_read) != 0)
             continue;
-        if (got == plen && memcmp(w->path, path, plen) == 0) return v->ents[lo].dir_id;
+        if (got == plen && memcmp(w->path, path, plen) == 0) {
+            if (n == cap) {
+                size_t nc = cap ? cap * 2U : 4U;
+                uint64_t *p = (uint64_t *)realloc(ids, nc * sizeof(*p));
+
+                if (!p) {
+                    free(ids);
+                    return -1;
+                }
+                ids = p;
+                cap = nc;
+            }
+            ids[n++] = v->ents[lo].dir_id;
+        }
+    }
+    *ids_out = ids;
+    *n_out = n;
+    return 0;
+}
+
+uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
+                           uint64_t *rows_read) {
+    uint64_t *ids = NULL;
+    size_t n = 0;
+    uint64_t first = 0;
+
+    if (crawl_dirx_lookup_all(v, path, plen, w, &ids, &n, rows_read) != 0) return 0;
+    if (n) first = ids[0];
+    free(ids);
+    return first;
+}
+
+void crawl_sidecar_scope_release(crawl_sidecar_scope_t *sp) {
+    if (!sp) return;
+    free(sp->roots);
+    free(sp->ranges);
+    free(sp->parents);
+    free(sp->parent_dfs);
+    memset(sp, 0, sizeof(*sp));
+}
+
+void crawl_sidecar_scope_release_n(crawl_sidecar_scope_t *scope, size_t n) {
+    size_t i;
+
+    if (!scope) return;
+    for (i = 0; i < n; i++) crawl_sidecar_scope_release(&scope[i]);
+}
+
+static int scope_push_root(crawl_sidecar_scope_t *sp, uint64_t did, uint64_t lo, uint64_t hi, int self) {
+    uint64_t *nr;
+    crawl_dfs_range_t *ng;
+    size_t n = sp->nroots;
+
+    nr = (uint64_t *)realloc(sp->roots, (n + 1U) * sizeof(*nr));
+    if (!nr) return -1;
+    sp->roots = nr;
+    ng = (crawl_dfs_range_t *)realloc(sp->ranges, (n + 1U) * sizeof(*ng));
+    if (!ng) return -1;
+    sp->ranges = ng;
+    sp->roots[n] = did;
+    sp->ranges[n].lo = lo;
+    sp->ranges[n].hi = hi;
+    sp->nroots = n + 1U;
+    if (self) sp->self_record = 1;
+    if (n == 0) {
+        sp->root = did;
+        sp->dfs_lo = lo;
+        sp->dfs_hi = hi;
+    }
+    return 0;
+}
+
+static int scope_push_parent(crawl_sidecar_scope_t *sp, uint64_t did, uint64_t dfs) {
+    uint64_t *np, *nd;
+    size_t n = sp->nparents;
+
+    np = (uint64_t *)realloc(sp->parents, (n + 1U) * sizeof(*np));
+    if (!np) return -1;
+    sp->parents = np;
+    nd = (uint64_t *)realloc(sp->parent_dfs, (n + 1U) * sizeof(*nd));
+    if (!nd) return -1;
+    sp->parent_dfs = nd;
+    sp->parents[n] = did;
+    sp->parent_dfs[n] = dfs;
+    sp->nparents = n + 1U;
+    if (n == 0) {
+        sp->root_parent = did;
+        sp->dfs_par = dfs;
+        sp->have_par = 1;
     }
     return 0;
 }
@@ -384,35 +477,63 @@ int crawl_sidecar_scope_subtree(const crawl_sidecar_t *sc, const char *subtree, 
         crawl_sidecar_scope_t *sp = &scope[fi];
         bin_dir_catalog_entry_t ent;
         unsigned char namebuf[256];
-        uint64_t parent;
+        uint64_t *root_ids = NULL, *par_ids = NULL;
+        size_t nroot = 0, npar = 0, i;
 
-        sp->root = crawl_dirx_lookup(v, subtree, subtree_len, walk, rows_read);
-        /* The subtree's own record hangs off its parent, outside the DFS range, so
-         * the groups holding that parent's children have to be reachable too. */
-        parent = crawl_dirx_lookup(v, sub_parent, strlen(sub_parent), walk, rows_read);
-        if (parent == 0ULL && sub_parent[0] == '\0' && v->max_dir_id >= 1ULL) parent = 1ULL;
+        if (crawl_dirx_lookup_all(v, subtree, subtree_len, walk, &root_ids, &nroot, rows_read) != 0)
+            goto done;
+        if (crawl_dirx_lookup_all(v, sub_parent, strlen(sub_parent), walk, &par_ids, &npar, rows_read) != 0) {
+            free(root_ids);
+            goto done;
+        }
+        if (npar == 0 && sub_parent[0] == '\0' && v->max_dir_id >= 1ULL) {
+            uint64_t *p = (uint64_t *)malloc(sizeof(*p));
 
-        if (sp->root != 0ULL) {
-            if (crawl_dirx_read_row(v, walk, sp->root, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
-                                    rows_read) != 0)
+            if (!p) {
+                free(root_ids);
                 goto done;
-            sp->root_parent = ent.parent_dir_id;
-            sp->dfs_lo = ent.dfs_index;
-            sp->dfs_hi = sp->dfs_lo + ent.dfs_subtree_dirs;
-            sp->self_record = (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1 : 0;
+            }
+            p[0] = 1ULL;
+            par_ids = p;
+            npar = 1;
         }
-        if (parent != 0ULL) {
-            if (crawl_dirx_read_row(v, walk, parent, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
-                                    rows_read) != 0)
+
+        for (i = 0; i < nroot; i++) {
+            if (crawl_dirx_read_row(v, walk, root_ids[i], CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                    rows_read) != 0) {
+                free(root_ids);
+                free(par_ids);
                 goto done;
-            sp->dfs_par = ent.dfs_index;
-            sp->have_par = 1;
+            }
+            if (scope_push_root(sp, root_ids[i], ent.dfs_index, ent.dfs_index + ent.dfs_subtree_dirs,
+                                (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) ? 1 : 0) != 0) {
+                free(root_ids);
+                free(par_ids);
+                goto done;
+            }
+            if (i == 0) sp->root_parent = ent.parent_dir_id;
         }
-        sp->in_shard = (sp->root != 0ULL || sp->have_par);
+        for (i = 0; i < npar; i++) {
+            if (crawl_dirx_read_row(v, walk, par_ids[i], CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                    rows_read) != 0) {
+                free(root_ids);
+                free(par_ids);
+                goto done;
+            }
+            if (scope_push_parent(sp, par_ids[i], ent.dfs_index) != 0) {
+                free(root_ids);
+                free(par_ids);
+                goto done;
+            }
+        }
+        free(root_ids);
+        free(par_ids);
+        sp->in_shard = (sp->nroots != 0 || sp->have_par);
     }
     rc = 0;
 
 done:
+    if (rc != 0) crawl_sidecar_scope_release_n(scope, sc->shard_count);
     crawl_dirx_walk_free(walk);
     return rc;
 }
@@ -433,8 +554,8 @@ static int rgix_buckets_hit(const unsigned char *bits, unsigned lo_bit, unsigned
  */
 int crawl_rgix_group_survives(const crawl_rgix_group_t *g, uint64_t dfs_domain, const crawl_sidecar_scope_t *sp,
                               int *interval_out, int *bitmap_out) {
-    uint64_t lo = sp->dfs_lo, hi = sp->dfs_hi;
     int iv = 0, bm = 0;
+    size_t i;
 
     if (g->flags & CRAWL_RGIX_GRP_UNKNOWN) {
         /* The sketch is incomplete, so it proves nothing. */
@@ -442,18 +563,26 @@ int crawl_rgix_group_survives(const crawl_rgix_group_t *g, uint64_t dfs_domain, 
         *bitmap_out = 1;
         return 1;
     }
-    if (g->dfs_min <= g->dfs_max) {
-        if (lo < hi && g->dfs_max >= lo && g->dfs_min < hi) iv = 1;
-        if (sp->have_par && sp->dfs_par >= g->dfs_min && sp->dfs_par <= g->dfs_max) iv = 1;
+    if (g->dfs_min > g->dfs_max) {
+        *interval_out = 0;
+        *bitmap_out = 0;
+        return 0;
+    }
+    for (i = 0; i < sp->nroots; i++) {
+        uint64_t lo = sp->ranges[i].lo, hi = sp->ranges[i].hi;
 
+        if (lo < hi && g->dfs_max >= lo && g->dfs_min < hi) iv = 1;
         if (lo < hi && rgix_buckets_hit(g->buckets, crawl_rgix_bucket_of(lo, dfs_domain),
                                         crawl_rgix_bucket_of(hi - 1ULL, dfs_domain)))
             bm = 1;
-        if (sp->have_par) {
-            unsigned pb = crawl_rgix_bucket_of(sp->dfs_par, dfs_domain);
+    }
+    for (i = 0; i < sp->nparents; i++) {
+        uint64_t p = sp->parent_dfs[i];
+        unsigned pb;
 
-            if (rgix_buckets_hit(g->buckets, pb, pb)) bm = 1;
-        }
+        if (p >= g->dfs_min && p <= g->dfs_max) iv = 1;
+        pb = crawl_rgix_bucket_of(p, dfs_domain);
+        if (rgix_buckets_hit(g->buckets, pb, pb)) bm = 1;
     }
     *interval_out = iv;
     *bitmap_out = bm;

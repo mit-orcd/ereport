@@ -11,11 +11,11 @@ __pycache__/
 /ecrawl
 /ereport
 /ereport_index
-/ecrawl_repair
 /ecrawl_query
 /test_crawl_block_filter
 /test_crawl_catalog
 /test_crawl_codec
+/test_query_subtree_dups
 /edelete
 /ecrawl_mount
 .codex

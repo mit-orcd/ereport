@@ -13,6 +13,9 @@ depth/parent clustered), plus duplicate directory entries (e.g. four `data1` dir
 under pid=1). Leading hypothesis: a zeroing event hitting jemalloc 48-byte
 size-class runs (name buffers + hash-table entries), breaking HT chains.
 
+`--subtree` now unions every path-equal catalog dir_id (query-side duplicate
+tolerance has landed); writer-side NUL / hash-table corruption is still open.
+
 Before changing catalog creation/writing/reading code, or starting any related
 debugging or repro work, read `docs/catalog-nul-names-investigation.md` — it records
 the established facts (do not re-derive them), what was already ruled out (reader

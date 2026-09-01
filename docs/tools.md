@@ -2,7 +2,7 @@
 
 Full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`. For a brief overview and quick start, see the [README](../README.md). Tuning knobs are collected in [environment-variables.md](environment-variables.md); design rationale is in [performance.md](performance.md).
 
-Contents: [`ecrawl`](#ecrawl) · [`ecrawl_repair`](#ecrawl_repair) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
+Contents: [`ecrawl`](#ecrawl) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
 
 ## `ecrawl`
 
@@ -111,29 +111,6 @@ With `--verbose`, full metrics also include `stat_batch_unexpected_dir_total`, `
 
 Interpret these as counts of blocking episodes, not wall-clock time. Summary `WARN` lines for unexpected batched directories always go to stderr, even when stdout is concise.
 
-## `ecrawl_repair`
-
-Use `ecrawl_repair` when a crawl directory has `uid_shard_*.bin` files but `ereport` or `ereport_index --make` cannot map chunks because `.ckpt` sidecars are missing or invalid—or when you want to confirm sidecars match `crawl_bin_load_ckpt()` in `crawl_bin_chunks.c` (the shared loader used by `ereport` and `ereport_index`) before running readers.
-
-It does not modify the `ecrawl` or `ereport` programs; it operates only on crawl output files in the directory you pass. Behavior highlights:
-
-- Parallel shard rescans — Set `ECRAWL_REPAIR_THREADS` (default 16, minimum 1).
-- Incomplete tail — If the record stream fails because the last record is truncated (common after a crashed crawl), `ecrawl_repair` `truncate`s the shard `.bin` to the last complete record boundary, rescans, and writes `*.bin.ckpt`. If `truncate` fails, the shard is treated like other corrupt files (see below).
-- `*.bin.ckpt` — Written (or overwritten) next to each repaired shard using the same on-disk layout `ecrawl` uses.
-- Corrupt / unusable shards — Shards that cannot be salvaged (unrecognized container header, damaged middle of the file, or truncate failure) are `rename`’d into `corrupt_shards/` under the crawl directory (optional `*.bin.ckpt` beside them moves too when possible). `ereport` only scans `uid_shard_*.bin` in the crawl directory root, so quarantined files are excluded until you move or fix them manually.
-- Captures from another format version — A shard whose header carries an `ERCBIN` magic other than the current one is refused, reported by name, and left exactly where it is (not quarantined, not rewritten): the record region and the catalog tail changed independently across versions, so a header rewrite would produce a file that passes the magic check with a catalog the reader cannot parse. Re-crawl the tree; there is no conversion path.
-- Summary line — After processing, stderr prints aggregate tail-truncation stats (shard count, bytes removed, original vs new totals in bytes and human-readable KiB/MiB/…) when any truncation occurred—or would-be stats with `--dry-run`.
-- `--dry-run` — Does not `truncate`, `rename` to `corrupt_shards/`, or write `.ckpt`; still reports what would happen.
-- `--verbose` — Per-shard progress on stdout (and `ok` on successful exit).
-- Exit status — On a normal run (not `--dry-run`), exit 0 means every remaining top-level `uid_shard_*.bin` has an `ereport`-compatible sidecar; exit nonzero if operational errors occurred, verification failed, or every shard was quarantined so `ereport` would see no shard files.
-
-Usage:
-
-```bash
-./ecrawl_repair [--dry-run] [--verbose] <crawl-output-dir>
-ECRAWL_REPAIR_THREADS=32 ./ecrawl_repair /path/to/crawl-out
-```
-
 ## `ecrawl_query`
 
 `ecrawl_query` reads `uid_shard_*.bin` shards in a crawl output directory (read-only—no shard or `.ckpt` writes) and prints aggregate directory-shape metrics on stdout.
@@ -169,7 +146,7 @@ ECRAWL_QUERY_THREADS=32 ./ecrawl_query -v /path/to/crawl-out
 
 Passing any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--uid` / `--perm` / `--list` switches from directory-shape reporting to record selection. Filters combine with AND, and the totals come back as `key=value` lines: `entries`, `files`, `dirs`, `symlinks`, `other`, `bytes`, `hardlink_dupes`, `records_scanned`, block-skip diagnostics, `answered_from`, `elapsed_sec`. `bytes` is apparent size with each multiply-linked inode counted once, so it matches `du -sb`.
 
-- `--subtree DIR` — records at or under `DIR`, including `DIR` itself, as `du` counts it.
+- `--subtree DIR` — records at or under `DIR`, including `DIR` itself, as `du` counts it. When a capture's catalog stores several dir_ids that reconstruct to the same path (duplicate hash-table inserts), every match is unioned rather than taking the first hit.
 - `--size-gt N` — strictly larger than `N` bytes (`find -size +Nc`).
 - `--type C` — one of `f d l c b p s o` (`find -type`).
 - `--gid N` — numeric group owner.
@@ -206,7 +183,7 @@ More importantly, a bare `--subtree DIR` aggregate is answered from the per-dire
 
 Both routes above are still linear in the capture rather than the subtree. The rollup has to parse every catalog row in every shard to reach the one row holding the answer, and a filtered scan splits work on `.ckpt` boundaries, which know nothing about which directories a byte range covers. `--index-dir DIR` points `ecrawl_query` at the `dirs.idx` and `rowgroups.idx` an `ereport_index --make` run wrote there and removes both:
 
-- A bare `--subtree` aggregate becomes a hash lookup in `dirs.idx` plus a short chain of `pread`s up the parent chain — 8 rows read where the catalog route examined 21726 directories, on the tree these were measured against. It reports `answered_from=dir_index`.
+- A bare `--subtree` aggregate becomes a hash lookup in `dirs.idx` plus a short chain of `pread`s up the parent chain — 8 rows read where the catalog route examined 21726 directories, on the tree these were measured against. It reports `answered_from=dir_index`. Duplicate catalog paths for the same directory are unioned, matching the catalog route.
 - A filtered `--subtree` scan builds its parse jobs from the row groups whose DFS sketch can reach the subtree, instead of from every checkpoint segment. On the same capture, a single mid-level directory kept 5 of 129 row groups and scanned 44129 of 1134121 records. `rowgroups_total`, `rowgroups_kept`, `rowgroups_kept_interval`, `rowgroups_kept_bitmap`, `rowgroup_bytes_total` and `rowgroup_bytes_kept` report what pruning did.
 
 Two properties make this safe to point at an index dir you are not sure about. Every hash hit is confirmed by rebuilding the directory's path from its parent chain and comparing it byte-for-byte to the query, so a hash collision costs a wasted read rather than a wrong answer. And the sidecars are bound to the exact shards they were built from — basename, size, mtime, catalog offset, catalog entry count — so a sidecar that is absent, truncated, or describing shards that have since changed is dropped silently and the query runs as it would have without the flag. Nothing here changes an answer, only how long it takes.
@@ -441,7 +418,7 @@ Subtree scoping:
 
 - `--subtree PATH` (absolute) restricts the whole analysis to records at or under `PATH`, as if only that directory had been crawled — useful for zooming into one lab/group inside a larger crawl without re-crawling. Place it before the username (if any) and time basis. The subtree directory itself is included, and matching is on a directory boundary (so `…/jones` does not match `…/jones2`).
 - Full absolute paths are kept in the report (records are filtered, not rewritten); all heat-map totals, badges, distinct-user counts, and bucket-detail tables are scoped to the subtree. On its own it forces per-record path reconstruction, so it is a bit slower than the default histogram-only fast path even without `--bucket-details`.
-- `--index-dir DIR` — where `ereport_index --make` left `dirs.idx` / `rowgroups.idx` (see [dir-index sidecars](#index-dir-answering-from-the-directory-index-sidecars)). Only `--subtree` uses them, and only as a shortcut to what the scan already computes: the subtree root is resolved once per shard from `dirs.idx`, row groups whose DFS sketch cannot reach it are never opened, and membership becomes a bit test on the record's `parent_dir_id` instead of a rebuilt path and a string compare — which also retires the reconstruction the histogram-only path was forced into. The report is byte-identical either way; `subtree_from=dir_index` plus `rowgroups_kept` / `rowgroups_total` / `rowgroup_records_kept` on stdout say the route was taken. A missing, stale or truncated sidecar, one that does not name every shard being read, or a `--subtree` that names something other than a directory falls back to the path-prefix behaviour with the same output. Ignored under `--path-rewrite` (the filter then runs in a namespace the catalogs know nothing about) and for `--subtree /`.
+- `--index-dir DIR` — where `ereport_index --make` left `dirs.idx` / `rowgroups.idx` (see [dir-index sidecars](#index-dir-answering-from-the-directory-index-sidecars)). Only `--subtree` uses them, and only as a shortcut to what the scan already computes: every catalog dir_id whose reconstructed path equals the subtree is resolved once per shard from `dirs.idx` (duplicate paths are unioned), row groups whose DFS sketch cannot reach any of those ranges are never opened, and membership becomes a bit test on the record's `parent_dir_id` instead of a rebuilt path and a string compare — which also retires the reconstruction the histogram-only path was forced into. The report is byte-identical either way; `subtree_from=dir_index` plus `rowgroups_kept` / `rowgroups_total` / `rowgroup_records_kept` on stdout say the route was taken. A missing, stale or truncated sidecar, one that does not name every shard being read, or a `--subtree` that names something other than a directory falls back to the path-prefix behaviour with the same output. Ignored under `--path-rewrite` (the filter then runs in a namespace the catalogs know nothing about) and for `--subtree /`.
 - `Scanned records` counts the whole capture either way. Pruning changes how much of it is decoded, not what the report stands for, so the records in dropped row groups are credited back; `rowgroup_records_kept` is what was actually read.
 - `manifest_*` lines (e.g. `total_allocated_bytes`) come from `crawl_manifest.txt` and still describe the whole crawl, not the subtree.
 
@@ -748,5 +725,5 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 - `crawl_bin_chunks.h` / `crawl_bin_chunks.c` — checkpoint-driven chunk boundaries (`crawl_bin_load_ckpt()`, `crawl_bin_build_chunks_for_file()`).
 - `crawl_result.h` / `crawl_result.c` — open a crawl directory: parse `crawl_manifest.txt`, enumerate finalized `uid_shard_*.bin` (skipping shards still being written), validate headers. Used by `ecrawl_mount`; `ereport` and `ereport_index` still carry their own uid-filtered copies of this logic and could migrate onto it.
 - `ecrawl_mount.c` — read-only FUSE view of a crawl (in-memory namespace index + libfuse 2.x high-level ops); optional target, built only when FUSE headers are present.
-- `crawl_ckpt.h` — shared on-disk checkpoint layout for `uid_shard_*.bin.ckpt` sidecars; included by `ecrawl`, `ereport`, `ereport_index`, `ecrawl_repair`, and `ecrawl_query`.
+- `crawl_ckpt.h` — shared on-disk checkpoint layout for `uid_shard_*.bin.ckpt` sidecars; included by `ecrawl`, `ereport`, `ereport_index`, and `ecrawl_query`.
 - HTML emitters in `ereport.c` follow a common argument order where practical: output path / `FILE*` target first, then `username`, `all_users`, `distinct_uids`, `basis_str`, then function-specific fields (e.g. age/size bucket indices, detail levels).

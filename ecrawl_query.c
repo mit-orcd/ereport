@@ -284,6 +284,10 @@ typedef struct {
  */
 typedef dircnt_t analyze_dir_counts_t;
 
+typedef struct {
+    uint64_t lo, hi;
+} query_dfs_range_t;
+
 /*
  * Where --subtree lands in one shard's catalog. Membership is the DFS range test
  * dfs_lo <= dfs_index[parent_dir_id] < dfs_hi, which is O(1) per record against
@@ -291,13 +295,21 @@ typedef dircnt_t analyze_dir_counts_t;
  * painted by walking every directory's parent chain; the permutation makes both
  * the extra pass and the extra allocation unnecessary. Built once per shard,
  * beside the catalog it indexes.
+ *
+ * Duplicate catalog paths (several dir_ids reconstructing to the same string)
+ * yield several disjoint DFS ranges; subtree_contains tests any of them.
  */
 typedef struct {
     const uint64_t *dfs_index; /* borrowed from the catalog; NULL if unavailable */
     uint64_t max_dir_id;
-    uint64_t root_id; /* 0 = no directory at the subtree path in this shard's catalog */
+    uint64_t root_id; /* first matching dir_id; 0 = none in this shard */
+    uint64_t *root_ids; /* all matching dir_ids; NULL when nroots<=1 (root_id is the one) */
+    size_t nroots;
     uint64_t dfs_lo;
     uint64_t dfs_hi;
+    query_dfs_range_t *ranges; /* nroots ranges; NULL when nroots<=1 */
+    uint64_t *parent_ids;
+    size_t nparents;
     /*
      * Every parent_dir_id this shard can match lies in [pid_lo, pid_hi] — the in-subtree
      * directories widened by the subtree's parent, which owns the subtree's own record.
@@ -312,14 +324,24 @@ typedef struct {
     int whole; /* subtree covers the entire catalog */
 } shard_subtree_t;
 
+static inline uint64_t shard_sub_root_at(const shard_subtree_t *s, size_t i) {
+    if (s->nroots <= 1U) return i == 0U ? s->root_id : 0ULL;
+    return s->root_ids[i];
+}
+
 static inline int subtree_contains(const shard_subtree_t *s, uint64_t dir_id) {
     uint64_t p;
+    size_t i;
 
     if (!s) return 0;
     if (s->whole) return 1;
-    if (!s->dfs_index || s->root_id == 0ULL || dir_id == 0ULL || dir_id > s->max_dir_id) return 0;
+    if (!s->dfs_index || s->nroots == 0U || dir_id == 0ULL || dir_id > s->max_dir_id) return 0;
     p = s->dfs_index[dir_id];
-    return p >= s->dfs_lo && p < s->dfs_hi;
+    if (s->nroots == 1U) return p >= s->dfs_lo && p < s->dfs_hi;
+    for (i = 0; i < s->nroots; i++) {
+        if (p >= s->ranges[i].lo && p < s->ranges[i].hi) return 1;
+    }
+    return 0;
 }
 
 /* One inode whose byte credit is deferred until the global hardlink merge. */
@@ -1617,20 +1639,44 @@ static int analyze_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end
     return 0;
 }
 
+static int query_u64_push(uint64_t **a, size_t *n, size_t *cap, uint64_t v) {
+    if (*n == *cap) {
+        size_t nc = *cap ? *cap * 2U : 4U;
+        uint64_t *p = (uint64_t *)realloc(*a, nc * sizeof(*p));
+
+        if (!p) return -1;
+        *a = p;
+        *cap = nc;
+    }
+    (*a)[(*n)++] = v;
+    return 0;
+}
+
 /*
- * dir_ids of the subtree and of its parent directory, in one pass over the catalog. Both are
- * matched on the last path component first — a memcmp against one name — so only namesakes
- * pay for a path rebuild. A path is unique within a catalog, so each hit ends that search.
+ * dir_ids of the subtree and of its parent directory, in one pass over the catalog.
+ * Matched on the last path component first — a memcmp against one name — so only
+ * namesakes pay for a path rebuild. A corrupt catalog can store several dir_ids
+ * that reconstruct to the same path; every hit is collected (length-aware: a
+ * NUL-padded name is not truncated by strcmp).
  */
-static void subtree_find_dirs(const crawl_bin_catalog_t *cat, uint64_t *root_out, uint64_t *parent_out) {
+static int subtree_find_dirs(const crawl_bin_catalog_t *cat, uint64_t **roots_out, size_t *nroots_out,
+                             uint64_t **parents_out, size_t *nparents_out) {
     const char *pbase;
-    size_t pbase_len;
+    size_t pbase_len, parent_plen;
     uint64_t did;
     char pathbuf[PATH_MAX];
+    uint64_t *roots = NULL, *parents = NULL;
+    size_t nroots = 0, nparents = 0, rcap = 0, pcap = 0;
 
-    *root_out = 0;
+    *roots_out = NULL;
+    *nroots_out = 0;
+    *parents_out = NULL;
+    *nparents_out = 0;
+    parent_plen = strlen(g_query.sub_parent);
     /* The capture root is dir 1 and its reconstructed path is the empty string. */
-    *parent_out = (g_query.sub_parent[0] == '\0' && cat->max_dir_id >= 1ULL) ? 1ULL : 0ULL;
+    if (g_query.sub_parent[0] == '\0' && cat->max_dir_id >= 1ULL) {
+        if (query_u64_push(&parents, &nparents, &pcap, 1ULL) != 0) return -1;
+    }
     {
         const char *slash = strrchr(g_query.sub_parent, '/');
 
@@ -1640,29 +1686,54 @@ static void subtree_find_dirs(const crawl_bin_catalog_t *cat, uint64_t *root_out
 
     for (did = 1; did <= cat->max_dir_id; did++) {
         size_t nlen = (size_t)cat->name_len[did];
-        int want_root = (*root_out == 0ULL && nlen == g_query.sub_base_len);
-        int want_parent = (*parent_out == 0ULL && nlen == pbase_len);
+        size_t plen = 0;
+        int maybe_root = (nlen == g_query.sub_base_len);
+        int maybe_parent = (nlen == pbase_len);
 
-        if (!want_root && !want_parent) continue;
+        if (!maybe_root && !maybe_parent) continue;
         if (!cat->name_comp[did]) continue;
-        if (want_root && memcmp(cat->name_comp[did], g_query.sub_base, nlen) != 0) want_root = 0;
-        if (want_parent && memcmp(cat->name_comp[did], pbase, nlen) != 0) want_parent = 0;
-        if (!want_root && !want_parent) continue;
-        if (crawl_bin_catalog_dir_path(cat, did, pathbuf, sizeof(pathbuf)) != 0) continue;
-        if (want_root && strcmp(pathbuf, g_query.subtree) == 0) *root_out = did;
-        else if (want_parent && strcmp(pathbuf, g_query.sub_parent) == 0) *parent_out = did;
-        if (*root_out != 0ULL && *parent_out != 0ULL) break;
+        if (maybe_root && memcmp(cat->name_comp[did], g_query.sub_base, nlen) != 0) maybe_root = 0;
+        if (maybe_parent && memcmp(cat->name_comp[did], pbase, nlen) != 0) maybe_parent = 0;
+        if (!maybe_root && !maybe_parent) continue;
+        if (crawl_bin_catalog_dir_path_len(cat, did, pathbuf, sizeof(pathbuf), &plen) != 0) continue;
+        if (maybe_root && plen == g_query.subtree_len && memcmp(pathbuf, g_query.subtree, plen) == 0) {
+            if (query_u64_push(&roots, &nroots, &rcap, did) != 0) {
+                free(roots);
+                free(parents);
+                return -1;
+            }
+        }
+        if (maybe_parent && plen == parent_plen && memcmp(pathbuf, g_query.sub_parent, plen) == 0) {
+            if (query_u64_push(&parents, &nparents, &pcap, did) != 0) {
+                free(roots);
+                free(parents);
+                return -1;
+            }
+        }
     }
+    *roots_out = roots;
+    *nroots_out = nroots;
+    *parents_out = parents;
+    *nparents_out = nparents;
+    return 0;
 }
 
+static void query_warn_dup_subtree(size_t nroots, const char *where) {
+    if (nroots <= 1U) return;
+    fprintf(stderr, "ecrawl_query: %zu duplicate catalog entries for %s in %s; unioning DFS ranges\n", nroots,
+            g_query.subtree, where ? where : "(shard)");
+}
+
+static void subtree_free(shard_subtree_t *s);
+
 /*
- * Locate g_query.subtree in one catalog and record its DFS range plus the dir_id hull the
+ * Locate g_query.subtree in one catalog and record its DFS range(s) plus the dir_id hull the
  * shard's records must fall inside.
  *
- * One pass over the directories to find the subtree's own dir_id by name -- a
- * component compare, so only namesakes cost a path rebuild -- and then the
- * range comes straight out of the permutation. Membership for every record is a
- * comparison against that range afterwards.
+ * One pass over the directories to find every dir_id whose reconstructed path equals
+ * the subtree -- a component compare, so only namesakes cost a path rebuild -- and then
+ * each range comes straight out of the permutation. Membership for every record is a
+ * comparison against those ranges afterwards.
  *
  * A shard whose catalog has no directory at the subtree path holds no record under it, and
  * the whole shard is skipped unless it can hold the subtree's own directory record — which
@@ -1674,7 +1745,8 @@ static void subtree_find_dirs(const crawl_bin_catalog_t *cat, uint64_t *root_out
  */
 static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out, int want_hull) {
     uint64_t did;
-    uint64_t parent_id;
+    uint64_t *roots = NULL, *parents = NULL;
+    size_t nroots = 0, nparents = 0, i;
 
     memset(out, 0, sizeof(*out));
     if (!cat) return -1;
@@ -1684,39 +1756,61 @@ static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out, i
         return 0;
     }
     if (!cat->dfs_index || !cat->dfs_subtree_dirs) {
-        /* A capture written before the post-pass, or a catalog loaded without
-         * the subtree group: refuse rather than silently matching nothing. */
         errno = EINVAL;
         return -1;
     }
 
-    subtree_find_dirs(cat, &out->root_id, &parent_id);
+    if (subtree_find_dirs(cat, &roots, &nroots, &parents, &nparents) != 0) return -1;
 
-    if (out->root_id == 0) {
-        if (parent_id == 0) {
-            out->empty = 1; /* neither the subtree nor its parent is here */
+    out->parent_ids = parents;
+    out->nparents = nparents;
+    out->nroots = nroots;
+    if (nroots == 0) {
+        free(roots);
+        if (nparents == 0) {
+            out->empty = 1;
             return 0;
         }
-        /* Only the subtree's own record can match, and it sits under this one directory. */
         if (want_hull) {
-            out->pid_lo = out->pid_hi = parent_id;
+            out->pid_lo = out->pid_hi = parents[0];
+            for (i = 1; i < nparents; i++) {
+                if (parents[i] < out->pid_lo) out->pid_lo = parents[i];
+                if (parents[i] > out->pid_hi) out->pid_hi = parents[i];
+            }
             out->have_hull = 1;
         }
         return 0;
     }
 
     out->dfs_index = cat->dfs_index;
-    out->dfs_lo = cat->dfs_index[out->root_id];
-    out->dfs_hi = out->dfs_lo + cat->dfs_subtree_dirs[out->root_id];
+    out->root_id = roots[0];
+    out->dfs_lo = cat->dfs_index[roots[0]];
+    out->dfs_hi = out->dfs_lo + cat->dfs_subtree_dirs[roots[0]];
+    if (nroots == 1U) {
+        free(roots);
+    } else {
+        out->root_ids = roots;
+        out->ranges = (query_dfs_range_t *)malloc(nroots * sizeof(*out->ranges));
+        if (!out->ranges) {
+            subtree_free(out);
+            return -1;
+        }
+        for (i = 0; i < nroots; i++) {
+            out->ranges[i].lo = cat->dfs_index[roots[i]];
+            out->ranges[i].hi = out->ranges[i].lo + cat->dfs_subtree_dirs[roots[i]];
+        }
+    }
 
     if (!want_hull) return 0;
 
-    out->pid_lo = parent_id ? parent_id : out->root_id;
+    out->pid_lo = nparents ? parents[0] : out->root_id;
     out->pid_hi = out->pid_lo;
+    for (i = 0; i < nparents; i++) {
+        if (parents[i] < out->pid_lo) out->pid_lo = parents[i];
+        if (parents[i] > out->pid_hi) out->pid_hi = parents[i];
+    }
     for (did = 1; did <= cat->max_dir_id; did++) {
-        uint64_t p = cat->dfs_index[did];
-
-        if (p < out->dfs_lo || p >= out->dfs_hi) continue;
+        if (!subtree_contains(out, did)) continue;
         if (did < out->pid_lo) out->pid_lo = did;
         if (did > out->pid_hi) out->pid_hi = did;
     }
@@ -1725,24 +1819,32 @@ static int subtree_build(const crawl_bin_catalog_t *cat, shard_subtree_t *out, i
 }
 
 /*
- * Credit the subtree's own directory record from the catalog of the one shard that holds it,
+ * Credit the subtree's own directory record from the catalog of the shards that hold it,
  * for the scans that no longer decode names and so cannot recognise it among the records.
- * Called once per shard, from the thread that built the catalog.
+ * Called once per shard, from the thread that built the catalog. Every matching root is
+ * credited: duplicate catalog entries are distinct rows, each with its own self_present.
  */
 static void query_note_subtree_self(const crawl_bin_catalog_t *cat, const shard_subtree_t *sub) {
-    uint64_t root = sub ? sub->root_id : 0ULL;
+    size_t i;
 
-    if (query_needs_names() || root == 0ULL || sub->whole) return;
-    if (!cat->self_present || !cat->self_bytes || !cat->self_present[root]) return;
+    if (query_needs_names() || !sub || sub->nroots == 0U || sub->whole) return;
+    if (!cat->self_present || !cat->self_bytes) return;
     if (g_query.type_filter && g_query.type_filter != 'd') return;
-    if (g_query.have_size_gt && cat->self_bytes[root] <= g_query.size_gt) return;
-    atomic_fetch_add_explicit(&g_subtree_self_count, 1ULL, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_subtree_self_bytes, cat->self_bytes[root], memory_order_relaxed);
+    for (i = 0; i < sub->nroots; i++) {
+        uint64_t root = shard_sub_root_at(sub, i);
+
+        if (root == 0ULL || !cat->self_present[root]) continue;
+        if (g_query.have_size_gt && cat->self_bytes[root] <= g_query.size_gt) continue;
+        atomic_fetch_add_explicit(&g_subtree_self_count, 1ULL, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_subtree_self_bytes, cat->self_bytes[root], memory_order_relaxed);
+    }
 }
 
 static void subtree_free(shard_subtree_t *s) {
     if (!s) return;
-    /* dfs_index is borrowed from the catalog, which owns it. */
+    free(s->root_ids);
+    free(s->ranges);
+    free(s->parent_ids);
     memset(s, 0, sizeof(*s));
 }
 
@@ -3085,10 +3187,14 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
                     const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
 
                     if (!cat) return -1;
-                    if (crawl_bin_catalog_entry_path(cat, pid, (const char *)rec_name, nlen, fullpath_buf,
-                                                     fullpath_sz) == 0 &&
-                        strcmp(fullpath_buf, g_query.subtree) == 0)
-                        in_scope = 1;
+                    {
+                        size_t plen = 0;
+
+                        if (crawl_bin_catalog_entry_path_len(cat, pid, (const char *)rec_name, (size_t)nlen,
+                                                             fullpath_buf, fullpath_sz, &plen) == 0 &&
+                            plen == g_query.subtree_len && memcmp(fullpath_buf, g_query.subtree, plen) == 0)
+                            in_scope = 1;
+                    }
                 }
                 if (!in_scope) continue;
             }
@@ -3239,6 +3345,7 @@ static const crawl_bin_catalog_t *analyze_get_shard_catalog(analyze_pool_t *p, s
                     crawl_bin_catalog_free(&p->shard_cat[fi]);
                     st = SHARD_CAT_FAILED;
                 } else {
+                    query_warn_dup_subtree(p->shard_sub[fi].nroots, full_path);
                     query_note_subtree_self(&p->shard_cat[fi], &p->shard_sub[fi]);
                 }
             }
@@ -3762,7 +3869,6 @@ static int query_try_rollup(const char *dir_path, char **names, size_t name_coun
         struct stat stt;
         crawl_bin_catalog_t cat;
         shard_subtree_t sub;
-        uint64_t root;
         int ok = 0;
 
         if (snprintf(full, sizeof(full), "%s/%s", dir_path, names[fi]) >= (int)sizeof(full)) return 0;
@@ -3784,33 +3890,41 @@ static int query_try_rollup(const char *dir_path, char **names, size_t name_coun
         }
 
         if (subtree_build(&cat, &sub, 0) != 0) {
+            subtree_free(&sub);
             crawl_bin_catalog_free(&cat);
             return 0;
         }
-        root = sub.root_id;
+        query_warn_dup_subtree(sub.nroots, names[fi]);
         out->dirs_scanned += cat.max_dir_id;
-        if (root != 0ULL) {
-            if (cat.subtree_nlink_gt1_count[root] != 0ULL) {
-                /* A multiply-linked file in scope makes the rollup and the scan
-                 * legitimately disagree; do not present it as the answer. */
-                crawl_bin_catalog_free(&cat);
-                return 0;
-            }
-            found_any = 1;
-            out->bytes += cat.subtree_bytes[root];
-            out->entries += cat.subtree_count[root];
-            out->files += cat.subtree_files[root];
-            out->dirs += cat.subtree_dirs[root];
-            out->symlinks += cat.subtree_symlinks[root];
-            /* The root directory's own record lives in exactly one shard -- the
-             * one owning it -- while every shard with a descendant carries a
-             * catalog row for the path. Count it where the record actually is. */
-            if (cat.self_present[root]) {
-                out->bytes += cat.self_bytes[root];
-                out->entries++;
-                out->dirs++;
+        {
+            size_t ri;
+
+            for (ri = 0; ri < sub.nroots; ri++) {
+                uint64_t root = shard_sub_root_at(&sub, ri);
+
+                if (root == 0ULL) continue;
+                if (cat.subtree_nlink_gt1_count[root] != 0ULL) {
+                    /* A multiply-linked file in scope makes the rollup and the scan
+                     * legitimately disagree; do not present it as the answer. */
+                    subtree_free(&sub);
+                    crawl_bin_catalog_free(&cat);
+                    return 0;
+                }
+                found_any = 1;
+                out->bytes += cat.subtree_bytes[root];
+                out->entries += cat.subtree_count[root];
+                out->files += cat.subtree_files[root];
+                out->dirs += cat.subtree_dirs[root];
+                out->symlinks += cat.subtree_symlinks[root];
+                /* Each matching root's own record is counted where the record actually is. */
+                if (cat.self_present[root]) {
+                    out->bytes += cat.self_bytes[root];
+                    out->entries++;
+                    out->dirs++;
+                }
             }
         }
+        subtree_free(&sub);
         crawl_bin_catalog_free(&cat);
     }
 
@@ -3862,33 +3976,46 @@ static int query_try_rollup_sidecar(const crawl_sidecar_t *sc, query_rollup_t *o
 
     for (fi = 0; fi < sc->shard_count; fi++) {
         const crawl_dirx_view_t *v = &sc->dirs[fi];
-        bin_dir_catalog_entry_t ent;
-        uint64_t root;
+        uint64_t *ids = NULL;
+        size_t n = 0, i;
+        char where[32];
 
-        root = crawl_dirx_lookup(v, g_query.subtree, g_query.subtree_len, walk, &rows_read);
-        if (root == 0ULL) continue;
-        if (crawl_dirx_read_row(v, walk, root, CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
-                                &rows_read) != 0)
+        if (crawl_dirx_lookup_all(v, g_query.subtree, g_query.subtree_len, walk, &ids, &n, &rows_read) != 0)
             goto done;
-        if (ent.subtree_nlink_gt1_count != 0ULL) {
-            /* Crawl-time hardlink credit lands with the first link seen anywhere in
-             * the tree; a scan dedups within the subtree. With one in scope the two
-             * legitimately differ, so this is not an answer. */
-            goto done;
+        if (n == 0) {
+            free(ids);
+            continue;
         }
-        found_any = 1;
-        out->bytes += ent.subtree_bytes;
-        out->entries += ent.subtree_count;
-        out->files += ent.subtree_files;
-        out->dirs += ent.subtree_dirs;
-        out->symlinks += ent.subtree_symlinks;
-        /* The root's own record lives in exactly one shard while every shard with a
-         * descendant carries a catalog row for the path; count it where it is. */
-        if (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) {
-            out->bytes += ent.self_bytes;
-            out->entries++;
-            out->dirs++;
+        snprintf(where, sizeof(where), "shard %zu", fi);
+        query_warn_dup_subtree(n, where);
+        for (i = 0; i < n; i++) {
+            bin_dir_catalog_entry_t ent;
+
+            if (crawl_dirx_read_row(v, walk, ids[i], CRAWL_CAT_SUBTREE, &ent, namebuf, sizeof(namebuf), NULL,
+                                    &rows_read) != 0) {
+                free(ids);
+                goto done;
+            }
+            if (ent.subtree_nlink_gt1_count != 0ULL) {
+                /* Crawl-time hardlink credit lands with the first link seen anywhere in
+                 * the tree; a scan dedups within the subtree. With one in scope the two
+                 * legitimately differ, so this is not an answer. */
+                free(ids);
+                goto done;
+            }
+            found_any = 1;
+            out->bytes += ent.subtree_bytes;
+            out->entries += ent.subtree_count;
+            out->files += ent.subtree_files;
+            out->dirs += ent.subtree_dirs;
+            out->symlinks += ent.subtree_symlinks;
+            if (ent.flags & CRAWL_DIR_FLAG_SELF_RECORD) {
+                out->bytes += ent.self_bytes;
+                out->entries++;
+                out->dirs++;
+            }
         }
+        free(ids);
     }
 
     if (found_any) {
@@ -3980,6 +4107,7 @@ static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const 
     if (crawl_sidecar_scope_subtree(sc, g_query.subtree, g_query.subtree_len, g_query.sub_parent, scope,
                                     &rows_read) != 0)
         goto fail;
+    for (fi = 0; fi < name_count; fi++) query_warn_dup_subtree(scope[fi].nroots, names[fi]);
     if (crawl_rgix_build_chunks(sc, paths, name_count, scope, nthreads, (unsigned)ANALYZE_JOBS_PER_THREAD,
                                 ANALYZE_SPLIT_MIN_BYTES, ANALYZE_SPLIT_MAX_BYTES, chunks_out, chunk_count_out,
                                 chunk_bytes_total_out, st) != 0)
@@ -3993,6 +4121,7 @@ static int analyze_build_chunks_from_rowgroups(const crawl_sidecar_t *sc, const 
 
     for (fi = 0; fi < name_count; fi++) free((void *)paths[fi]);
     free(paths);
+    crawl_sidecar_scope_release_n(scope, name_count);
     free(scope);
     *shard_sizes_out = sizes;
     *dir_count_total_out = dir_sum;
@@ -4004,6 +4133,7 @@ fail:
         free(paths);
     }
     free(sizes);
+    crawl_sidecar_scope_release_n(scope, name_count);
     free(scope);
     memset(st, 0, sizeof(*st));
     *chunks_out = NULL;

@@ -1,7 +1,7 @@
 # Testing and validation
 
 ```bash
-make check              # scripts/test/test.sh: integration + ecrawl_repair / edelete / ereport_index smokes (tiny /tmp tree; fast)
+make check              # scripts/test/test.sh: integration + ecrawl_query / edelete / ereport_index smokes (tiny /tmp tree; fast)
 make check-tree         # scripts/test/test_setup.sh then test.sh on ./test (needs all binaries built)
 ```
 
@@ -10,10 +10,10 @@ make check-tree         # scripts/test/test_setup.sh then test.sh on ./test (nee
 The harnesses live in [`scripts/test/`](../scripts/test/). Prefer `make check` / `make check-tree`, or call the scripts directly.
 
 - `scripts/test/test.sh` — runs two phases:
-  - Integration (always): `ecrawl` on a tiny `/tmp` tree, then `ereport` single-user (`mtime`, counts vs `ecrawl`) and all-users (incl. `distinct_uids`), then smoke tests on the same tree — `ecrawl_repair --dry-run`, `ecrawl_query`, `edelete` (dry-run), `ereport_index --make` (checks `tri_keys.bin` / `paths.bin` exist), and `ecrawl_mount` (see below).
+  - Integration (always): `ecrawl` on a tiny `/tmp` tree, then `ereport` single-user (`mtime`, counts vs `ecrawl`) and all-users (incl. `distinct_uids`), then smoke tests on the same tree — `ecrawl_query`, `edelete` (dry-run), `ereport_index --make` (checks `tri_keys.bin` / `paths.bin` exist), and `ecrawl_mount` (see below).
   - `./scripts/test/test.sh --edelete-only` — edelete smoke + synthetic probes only (needs `./edelete` built; skips ecrawl/ereport and filesystem correlation).
   - Filesystem correlation (only with a directory argument): one `find`/`fd` baseline — file/dir/symlink counts and unique regular-file bytes via `find %D:%i` (not `du`) — compared against `ecrawl` and against `ereport` all-users, plus `ecrawl` vs `ereport` all-users (`entries` ↔ `scanned_records`, etc.). Single-user checks are subset/consistency checks, skipped when no shard maps to that UID (uid-shard crawls omit empty shards). All checks print; any failure fails the step.
-  - Notes: expect strict equality only on quiescent trees (a busy tree drifts before `ecrawl` finishes); directory counts use `find -type d` so the crawl root is included (`fd` omits it); a `find` exit status of 1 on unreadable subdirs is tolerated; `SKIP_FS=1` skips only the correlation phase; `--summary` prints a copy/paste results table; `--keep-html[=DIR]` snapshots every HTML report the run generates into DIR (default `./ereport-test-html`) before the phase temp dirs are torn down, so the report UI can be browsed afterwards. Override binaries/threads via `ECRAWL`, `EREPORT`, `ECRAWL_REPAIR`, `ECRAWL_QUERY`, `EDELETE`, `EREPORT_INDEX`, `ECRAWL_MOUNT`, `ECRAWL_CRAWL_THREADS`, `EREPORT_THREADS`, `EREPORT_INDEX_THREADS`.
+  - Notes: expect strict equality only on quiescent trees (a busy tree drifts before `ecrawl` finishes); directory counts use `find -type d` so the crawl root is included (`fd` omits it); a `find` exit status of 1 on unreadable subdirs is tolerated; `SKIP_FS=1` skips only the correlation phase; `--summary` prints a copy/paste results table; `--keep-html[=DIR]` snapshots every HTML report the run generates into DIR (default `./ereport-test-html`) before the phase temp dirs are torn down, so the report UI can be browsed afterwards. Override binaries/threads via `ECRAWL`, `EREPORT`, `ECRAWL_QUERY`, `EDELETE`, `EREPORT_INDEX`, `ECRAWL_MOUNT`, `ECRAWL_CRAWL_THREADS`, `EREPORT_THREADS`, `EREPORT_INDEX_THREADS`.
 
 ### dir-index sidecar section
 

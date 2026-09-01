@@ -105,11 +105,11 @@ Note `dfs_subtree_dirs` counts *catalog* directories (path components) while `su
 
 ## Incomplete / invalid shards
 
-`ereport` and `ereport_index` reject a shard when `catalog_offset == 0`, `catalog_offset` is out of range, magic/version mismatch, or `crawl_bin_catalog_load()` fails (truncated catalog, bogus counts). Chunk mapping in `crawl_bin_chunks` caps the record region at `catalog_offset` when nonzero; when it is zero, loaders may still align checkpoints against EOF for diagnostics, but report and index consumers treat the shard as unusable until `ecrawl_repair` (or a fresh crawl) fixes it. `ecrawl_mount` skips unfinalized shards and reports how many it skipped. Bad-tail handling and `corrupt_shards/` quarantine are described under [`ecrawl_repair`](tools.md#ecrawl_repair).
+`ereport` and `ereport_index` reject a shard when `catalog_offset == 0`, `catalog_offset` is out of range, magic/version mismatch, or `crawl_bin_catalog_load()` fails (truncated catalog, bogus counts). Chunk mapping in `crawl_bin_chunks` caps the record region at `catalog_offset` when nonzero; when it is zero, loaders may still align checkpoints against EOF for diagnostics, but report and index consumers treat the shard as unusable until a fresh crawl replaces it. `ecrawl_mount` skips unfinalized shards and reports how many it skipped.
 
 ## Checkpoint sidecars (`*.bin.ckpt`)
 
-While crawling, `ecrawl` records block-aligned byte offsets at a fixed stride into `uid_shard_*.bin.ckpt`. Readers load those offsets to split each shard into valid segments without a preliminary full-file scan for boundaries, which lets many threads work on different byte ranges of the same file safely with no record torn across workers. Checkpoint offsets apply only to the record region (from just after the file header up to `catalog_offset` on finalized shards). If sidecars are missing or stale — for example after an interrupted crawl — run [`ecrawl_repair`](tools.md#ecrawl_repair) on the crawl output directory to rebuild them, and to truncate an incomplete last record when possible.
+While crawling, `ecrawl` records block-aligned byte offsets at a fixed stride into `uid_shard_*.bin.ckpt`. Readers load those offsets to split each shard into valid segments without a preliminary full-file scan for boundaries, which lets many threads work on different byte ranges of the same file safely with no record torn across workers. Checkpoint offsets apply only to the record region (from just after the file header up to `catalog_offset` on finalized shards). A missing or stale sidecar (for example after an interrupted crawl) is not rebuilt in place: `ecrawl_query` scans that shard as a single range from after the file header through EOF; `ereport` / `ereport_index` reject a shard that has no usable catalog tail. Re-crawl to get a complete capture.
 
 ## Directory-index sidecars (`dirs.idx`, `rowgroups.idx`)
 
@@ -166,7 +166,7 @@ Both sketches are stored because `dir_id` follows crawl arrival order and correl
 
 ## Operational notes
 
-- The code assumes local filesystem crawl data in `ERCBIN09` / format version 9 (nonzero `catalog_offset` and a trailing catalog). Use `ecrawl_repair` to regenerate missing sidecars without re-crawling.
+- The code assumes local filesystem crawl data in `ERCBIN09` / format version 9 (nonzero `catalog_offset` and a trailing catalog). Interrupted crawls leave shards without a catalog tail; re-crawl rather than patching sidecars.
 - `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
 - Shards are assigned by `uid & (uid_shards - 1)`, so one directory's children scatter across many shard files whenever its entries have different owners.
 - For per-user runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. All-users runs load every shard file, as do merged full-cluster crawls.

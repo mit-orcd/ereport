@@ -1,7 +1,7 @@
 /*
  * crawl_bin_block — columnar row-group (de)serialization for v8 uid_shard_*.bin
  * record regions. Shared by the writer (ecrawl), the chunker, and every reader
- * (ereport, ereport_index, ecrawl_query, ecrawl_repair, ecrawl_mount).
+ * (ereport, ereport_index, ecrawl_query, ecrawl_mount).
  *
  * The file keeps its historical name because it still owns "the record region",
  * but a v8 group is a set of per-column chunks rather than one interleaved

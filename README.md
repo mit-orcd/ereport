@@ -7,7 +7,6 @@ Small C tools for crawling filesystem metadata into compact binary records and t
 | Tool | Role |
 |------|------|
 | [`ecrawl`](docs/tools.md#ecrawl) | Parallel filesystem crawler; writes compact, uid-sharded binary metadata records. |
-| [`ecrawl_repair`](docs/tools.md#ecrawl_repair) | Rebuilds `*.bin.ckpt` sidecars, truncates incomplete shard tails, quarantines unrepairable shards. |
 | [`ecrawl_query`](docs/tools.md#ecrawl_query) | Read-only directory-shape stats (parent, path-depth, and top-parent histograms). |
 | [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Mounts a crawl as a read-only FUSE filesystem, so `find`/`ls`/`du` work on it without the source tree. Optional target (needs FUSE). Linux only; not supported on macOS. |
 | [`edelete`](docs/tools.md#edelete) | Parallel deleter for non-directory paths — everything under a path, or only entries older than an age threshold. Dry-run by default; never follows symlinks. |
@@ -80,14 +79,13 @@ Builds an on-disk trigram index over crawl path strings and answers case-insensi
 
 Build pipeline, `--resume-merge`, `ulimit` guidance, and JSON output: [docs/tools.md#ereport_index](docs/tools.md#ereport_index).
 
-### `ecrawl_repair` / `ecrawl_query` — maintenance & inspection
+### `ecrawl_query` — inspect a crawl
 
 ```bash
-./ecrawl_repair crawl-out                 # rebuild missing/stale .ckpt sidecars
 ./ecrawl_query --top 50 crawl-out       # directory-shape stats (read-only)
 ```
 
-Details: [docs/tools.md#ecrawl_repair](docs/tools.md#ecrawl_repair) · [docs/tools.md#ecrawl_query](docs/tools.md#ecrawl_query).
+Details: [docs/tools.md#ecrawl_query](docs/tools.md#ecrawl_query).
 
 ### `ecrawl_mount` — browse a crawl with ordinary tools
 
