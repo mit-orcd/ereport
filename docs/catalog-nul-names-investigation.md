@@ -2,7 +2,7 @@
 
 Status: **OPEN — root cause not yet identified.** Symptom characterized in detail;
 several latent bugs fixed along the way; writer-side tripwire in place.
-Last updated: 2026-09-01 (after the post-union n1 full-option sweep).
+Last updated: 2026-09-01 (n1 catalog forensics + TSan 1.2 B crawl).
 
 This document is the handoff for any future session picking up the hunt. It records
 what is known, what was ruled out, what was fixed, and what to do next. Do not
@@ -28,14 +28,32 @@ printing still cuts at the first NUL, matching historical `%s` behavior.
   `uid_shard_362.bin`. `cat_chunk_extract.py` parses the chunk headers and dumps
   NAME_BYTES without any catalog-reader code: zeros are in the file. The reader
   (`crawl_bin_catalog.c`) is exonerated.
-- Scale in shard 362 (`probe_cat2.c` survey): **16,633 bad entries** (name_len > 0
-  with NUL bytes present) out of ~78 M named directories.
-- The corruption is **length-selective**: bad names have `name_len` in **32..54**
-  (first survey said 32..43; the wider scan extended it). Long-named *good* entries
-  exist in the same length range, so length alone is not the trigger.
-- The corruption is **clustered**: bad entries sit at depths ~21–25 and concentrate
-  under a few parents (some parents have 135+ bad siblings). This is not a uniform
-  random process.
+- Scale in shard 362 (`probe_cat2.c` / `probe_forensics.c`): **16,633 bad entries**
+  (name_len > 0 with NUL bytes present) out of ~78.7 M named directories in that
+  shard. Capture-wide (all 264 n1 shards, 2026-09-01): **38,464 bad / 139,836,522
+  named** in **75 of 264** shards. Top dirty shards: 362 (16,633), 143 (10,860),
+  424 (2,358), 000 (2,136), 429 (1,950), 503 (1,925). 38,321 all-zero, 143 mixed.
+- The corruption is **length-selective and 48-byte-class-selective**. Capture-wide
+  **99.63%** of bad names are jemalloc 48 B class (`malloc(nlen+1)` with nlen ≤ 47).
+  Sharp onset at **nlen=32** (23,447 bad = 61% of all bad, 0.213% of nlen=32 names);
+  nlen 33–35 sit at ~0.04%; only 124 bad names have nlen < 32. cls64 = 78 and
+  cls_gt64 = 63 are small sibling clusters of long names (e.g. shard 482 nlen
+  48–61; shards 298/501 nlen=64). Shard 362's bad nlen range is **32–43 only**
+  (all 16,633 in cls48). The earlier "32–54" figure mixed in the *named*
+  histogram's long tail; long-named *good* entries exist in every length, so
+  length alone is not the trigger.
+- The corruption is **clustered by parent/sibling, not by allocation time**.
+  Capture-wide 95% of consecutive-bad dir_id runs have length 1, so this is not
+  one jemalloc-run wipe of thousands of adjacent allocations. Two regimes:
+  (1) **nlen=32 sibling bursts** — shard 143: 10,830 of 10,860 bad are nlen=32,
+  10,009 under one parent at depth 12, max consecutive dir_id run 555; shard 000:
+  1,967 nlen=32, 1,931 siblings, depth 11, max run 128. (2) **scattered groups
+  in shard 362** — depths 21–25 (peak 24: 10,375), 1,952 parents, max 138 bad
+  siblings, 12,256 of 12,728 runs isolated. Mixed names on 362 (40-sample hex
+  dump) are **16-byte-lane partial wipes** of otherwise-ASCII sim names
+  (`runNo12--X-88.530_Y-…`, `motorcycle-Idx…`): every sample has lead0 ∈
+  {0,16,32}; half have exactly 16 or 32 zero bytes. All-zero is the same
+  pattern covering the whole `name_len` window.
 - **61% of zeroed entries have a "twin"** (`probe_twin.c`): a same-parent,
   same-length sibling whose name bytes are intact.
 - **Duplicate directory entries exist** (`probe_dup.c`, `probe_rootkids.c`):
@@ -74,22 +92,26 @@ printing still cuts at the first NUL, matching historical `%s` behavior.
 
 ## Root-cause hypothesis (current best)
 
-A **zeroing event hits jemalloc 48-byte size-class runs**. Both things that get
-corrupted live in that class:
+A **zeroing event hits jemalloc 48-byte size-class slots**, in **16-byte
+granules**. Both things that get corrupted live in that class:
 
-- catalog name buffers for 32–54-char names (allocation = length prefix + bytes),
-- catalog hash-table entries.
+- catalog name buffers for nlen 32–47 (`malloc(nlen+1)` → 33–48 B → 48 B class),
+- catalog hash-table entries (~40 B).
 
-One event explains both observations: names zeroed in place, *and* HT entries
-zeroed/lost, which breaks chains and makes `shard_cat_ensure_dir` re-create already
-existing directories (the duplicates). The length selectivity (32–54) is the
-size-class signature; the clustering is consistent with whole runs/regions being
-zeroed at a point in time.
+One event still explains both observations: names zeroed in place (full 48 B
+slot → all-zero name; 16 or 32 B from an aligned start → the mixed 16-byte-lane
+pattern), *and* HT entries zeroed/lost, which breaks chains and makes
+`shard_cat_ensure_dir` re-create already existing directories (the duplicates).
+The nlen=32 onset is the size-class signature (33 B request). Sibling bursts
+of 32-char names are consistent with many same-class allocations sitting in
+one run; the 362 scatter says the event is not "wipe one whole run in dir_id
+order".
 
-Candidate vectors not yet excluded: a wild `memset`/`bzero` from an unrelated
-component, a bad `realloc` move, an `munmap`+re-`mmap` region handed out by jemalloc
-while a stale pointer still points into it, or a use-after-free whose freed run is
-reused and cleared.
+Candidate vectors not yet excluded: a wild 16/32/48-byte `memset`/`bzero` from
+an unrelated component, a bad `realloc` move, an `munmap`+re-`mmap` region
+handed out by jemalloc while a stale pointer still points into it, or a
+use-after-free whose freed run is reused and cleared. A data race in the
+production writer is now unlikely (TSan, below).
 
 ## Code-path findings that constrain repro design (2026-09-01)
 
@@ -107,12 +129,11 @@ reused and cleared.
 - **No cross-run resume**: startup deletes leftover shard files ("interrupted
   crawls are not resumed"), so the reload path is cold in normal operation and
   the production corruption happened in-memory during the single 9.6 h run.
-- **Size-class arithmetic**: HT entries are ~40 B (jemalloc 48 B class); name
-  blobs are `malloc(name_len+1)`, so nlen 32–46 → 48 B class, nlen 47–54 → 64 B
-  class. The 48 B-class hypothesis covers the observed 32–43 core exactly; the
-  44–54 tail either belongs to a second affected class or the boundary needs
-  re-measuring (a bad-entry nlen histogram from `probe_cat2`-style data would
-  settle it).
+- **Size-class arithmetic** (settled by `probe_forensics` nlen_bad, all 264
+  shards): HT entries are ~40 B (jemalloc 48 B class); name blobs are
+  `malloc(name_len+1)`, so nlen 32–47 → 48 B class, nlen 48–63 → 64 B class,
+  nlen ≥ 64 → larger. 99.63% of bad names are 48 B class. The 64 B / larger
+  tail (141 names) is real but small and sibling-clustered.
 
 ## What was ruled out
 
@@ -132,9 +153,26 @@ reused and cleared.
   `probe_cat2` bad=0 every run. Shape + half-production scale + fast local-NVMe
   crawls are not sufficient. Still untested: production-duration crawls (9.6 h vs
   1 min = ~600x smaller event window per crawl), weka latency/error patterns.
-- **TSan**: not run — `libtsan` is missing on node9901's gcc 11.5 install. Still
-  available as a vector if a data race is suspected (build on a host with a
-  complete TSan runtime).
+- **TSan on gcc 11 (node9901 / fstor007): no production writer race.** `libtsan`
+  **is** present at `/usr/lib/gcc/x86_64-redhat-linux/11/libtsan.so` (the earlier
+  "missing on gcc 11.5" note was wrong). Two tripwire+TSan crawls, glibc malloc
+  (no jemalloc), 32 crawl / 8 writer threads, 512 shards, `max_open_shards=64`:
+  - Synt 20 M entries / 986 k dirs (`/data1/erbmi1/ecrawl-synt`, node9901,
+    `tsan-crawl-20260901-134428`): exit 0, bad=0, tripwire empty, no TSan
+    reports, `good_nlen>=32=0`, 0 shard evictions.
+  - **1.219 B entries / 19.17 M dirs** (`/data1/erbmi1/home-storage-tree` on
+    **fstor007-mgmt**, `tsan-crawl-20260901-140356`, copied to gitignored
+    `logs/`): 4,836 s, `writer_failed=0`, probe **bad=0** on all 512 shards,
+    tripwire empty, **`good_nlen>=32=0`**, 0 evictions / 0 reopens.
+    `ecrawl_exit=66` is TSan's "found a warning" status. The **one** report is
+    a data race on tripwire-only `g_cat_tripwire` (unsynchronized lazy
+    `getenv` cache at `shard_cat_tripwire_enabled`); both threads write `1`.
+    Harmless, not in the committed tree. Re-arm with a once-init in `main` (or
+    `_Atomic`) so the next TSan run is clean.
+  These crawls **do not exercise the n1 signature**: TSan cannot use jemalloc,
+  and both trees have **zero** directory names of length ≥ 32, so the 48 B
+  name class is empty. They do make a production data race an unlikely cause
+  of the NULs.
 
 ## Fixes landed during this investigation (already in the tree)
 
@@ -172,13 +210,16 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
 
 ## Next steps (in order)
 
-1. **Tripwire a production-scale crawl.** Re-apply the tripwire first
-   (`git apply -R ~/ecrawl-cat-tripwire.patch`), then run that `ecrawl` against a
-   large, long tree (n1-like scale: tens of millions of dirs per shard, multi-hour;
-   match the original crawl's 32 crawl / 8 writer threads, 512 shards, default
-   max_open_shards=64). A trip fires at the moment of corruption and names the
-   phase (create vs eviction-write vs final-write). This is the single most
-   informative experiment available.
+1. **Tripwire a production-scale crawl (jemalloc, not TSan).** Re-apply the
+   tripwire first (`git apply -R ~/ecrawl-cat-tripwire.patch`; init
+   `g_cat_tripwire` once in `main` so TSan stays quiet if you mix the two), then
+   run **jemalloc** `ecrawl` against a large, long tree with **nlen ≥ 32
+   directory names** (n1-like: tens of millions of dirs per shard, multi-hour;
+   32 crawl / 8 writer threads, 512 shards, default max_open_shards=64).
+   `home-storage-tree` (1.2 B files) is the wrong shape: 19 M dirs, **zero**
+   names ≥ 32 chars. A trip fires at the moment of corruption and names the
+   phase (create vs eviction-write vs final-write). This is still the single
+   most informative experiment available.
 2. **Aggressive-purge repro** (2026-09-01, round 4 — **clean**): the deep-tree
    loop rerun with `MALLOC_CONF=tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0`
    so freed runs are purged (MADV_DONTNEED) immediately — if the mechanism were
@@ -191,11 +232,16 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
    reopen failure (see findings above), a repro that injects reopen errors
    (LD_PRELOAD on fopen/fread, or an env-gated test hook) would exercise
    `shard_cat_load_from_disk_catalog` mid-run at scale.
-4. **Heap forensics on the bad capture.** Map the on-disk offsets of zeroed name
-   blobs back to allocation order (offsets are append-ordered) to test whether the
-   bad entries were contiguous in *time* at the writer. Also produce the bad-entry
-   nlen histogram to settle the 48 B vs 64 B class question.
-5. **TSan build** on a host with a working runtime, if (1)–(4) point at a race.
+4. **Heap forensics on the bad capture — done (2026-09-01).** `~/probe_forensics.c`
+   over all 264 n1 shards (`/data1/erbmi1/nul-forensics-20260901-155824/`, summaries
+   in gitignored `logs/nul-forensics/`). Catalog flush is dir_id order, so
+   consecutive-bad runs **are** the time-contiguous test: 95% are isolated;
+   nlen=32 sibling bursts are the exception. nlen histogram settled 48 B vs 64 B
+   (99.63% cls48). Mixed-hex on shard 362 shows 16-byte-lane partial wipes.
+   Remaining: a live-heap dump during a reproducing crawl (needs (1)).
+5. **TSan — done for a race hunt** on 20 M synt and 1.2 B `home-storage-tree`
+   (see ruled-out). No production race; tripwire getenv race only. Does not
+   replace (1): need jemalloc + nlen≥32 names + duration.
 6. When the root cause is found: fix, then decide whether a one-off pass should
    detect (and where possible heal via twins) zeroed catalog names in existing
    captures.
@@ -212,12 +258,20 @@ Validation: Slurm jobs 21725032 (growfix) and 21727703 (oomfix) ran `test.sh` gr
 ## Artifacts and where they live
 
 - Probes (durable, in home): `~/probe_cat2.c` (corruption survey),
+  `~/probe_forensics.c` (per-shard nlen/class/clustering; `--tsv`),
+  `~/dump_mixed.c` (hex of mixed-NUL names), `~/nul-forensics-run.sh`,
   `~/probe_twin.c` (twin rate), `~/probe_dup.c` (duplicate groups),
   `~/probe_rootkids.c` (children of pid=1), `~/probe_rootrec.c` (the `/` records),
   `~/harvest_nul.py` (distinct zeroed-name prefixes), `~/cat_chunk_extract.py`
   (reader-independent on-disk check), `~/gen_tree.py` (small synthetic stress
   trees), `~/gen_deep_tree.py` (signature-shaped 36 M-dir tree),
   `~/deep-crawl-loop.sh` (tripwire crawl loop + per-run probe survey).
+- n1 forensics: `/data1/erbmi1/nul-forensics-20260901-155824/` on node9901
+  (all-shard `.txt` + shard 362 `.tsv` + mixed hex); gitignored copies of dirty
+  shards + `CAPTURE_WIDE.txt` in `logs/nul-forensics/`.
+- TSan crawls: `logs/tsan-crawl-20260901-134428/` (20 M synt) and the 1.2 B
+  pack currently unpacked at `logs/{env.txt,ecrawl.stdout,probe_summary.txt,tsan/,cap/}`
+  (`tsan-crawl-20260901-140356` on fstor007; 11 GB of shards in `logs/cap/`).
 - Synthetic trees on node9901: `/data1/erbmi1/deep-tree` (36.2 M dirs, round-3/4
   repro tree), `/data1/erbmi1/repro-tree` (~1 M dirs, rounds 1–2),
   `/data1/erbmi1/deep-captures*.log` (loop results).
@@ -264,10 +318,11 @@ Ordered by expected value:
    `query_out_append`/`query_lrec_append` double from a small initial cap, so a
    ~1 GB/worker output is copied ~2× (17 GB total here). Use chunked segment
    buffers (no copying) or pre-size from shard record counts.
-3. **Path reconstruction (10.4% + 4.7% memmove).** A `query_path_cache` already
-   exists (ecrawl_query.c:3602); measure its hit rate — DFS-ordered records should
-   hit often. If misses dominate, key the cache on consecutive records' parent
-   dir_id instead.
+3. **Path reconstruction (10.4% + 4.7% memmove).** A `query_path_cache`
+   exists (last-parent slot, then 8192-slot hash). `--list` stats now print
+   `path_cache_last_hits` / `path_cache_hash_hits` / `path_cache_misses`.
+   Row groups are sorted by parent_dir_id, so last-parent should dominate
+   sibling runs; wrap uses a generation bump rather than a slot walk.
 4. **`query_list_emit_sum` (`--list --sum` without `--level`) is still serial**
    (global sort of all matching records, ecrawl_query.c:2696). Parallelize like
    the level emit if that flag combination ever matters.
@@ -352,10 +407,16 @@ these are checked off:
    serializes 133.9M inserts. Options: per-worker maps + parallel merge, or
    the lock-free CAS insert pattern now proven in the emit mset.
 10. **`crawl_bin_codec_decode_u64` = 50–58% of every filter scan**
-    (perm/uid/gid/sizegt/type_l), zstd 12–20%. The byte-at-a-time varint
-    decoder is the universal *scan* bottleneck, but the walls are already
-    0.07–1.5 s. A 1-byte fast path would help `--perm` most (full decode,
-    0 skipped). Do this after (7)–(9) and (11).
+    (perm/uid/gid/sizegt/type_l), zstd 12–20%. Not a varint decoder: it is a
+    switch over CONST / RAW / FOR_BITPACK / RLE / DELTA. The generic
+    FOR_BITPACK arm used to walk bit-by-bit; it now extracts from a 64-bit
+    word (two loads when w ≥ 58). DELTA/REF CONST and FOR_BITPACK residuals
+    fuse zigzag + prefix-sum so reconstructed values are written once. This
+    is the piece that can move `benchmark.sh`: `ereport_index --make` cannot
+    zonemap-skip, and leftover Q3 groups still fully decode. Walls on the
+    filter totals themselves were already 0.07–1.5 s. Pass 1 / `--list --sum`
+    / fold / Q4–Q5 catalog-load (11) are out of scope for that harness —
+    Q4/Q5 already pass `--index-dir`.
 11. **Every `--subtree` query is catalog-load-bound, including the rollup
     shortcut.** `crawl_bin_catalog_load_sel` is 92% of the 9.32 s
     `om5/arsalans` rollup (`decode_u64` 49% + zstd 39%, 1 PID, 0 records
@@ -365,15 +426,22 @@ these are checked off:
     is **slower than scanning 122M matching records**. The
     `dirs.idx`/`rowgroups.idx` sidecars (`--index-dir`) exist for exactly
     this and were not profiled (recipe §16 still commented). Alternatively
-    make catalog loads lazier. Union itself is not the cost.
+    make catalog loads lazier. Union itself is not the cost. Benchmark Q4/Q5
+    already use `--index-dir`, so this does not show in `benchmark.sh`.
 12. **Plain `--list` is path-reconstruction-bound: `dir_path_len` 33% +
-    memmove 16% + reader 24%** (4.19 s). The path builder prepends
-    components with memmove, making each path O(depth²) byte-moves; building
-    back-to-front into the buffer end is O(depth). Measure `query_path_cache`
-    hit rate before rewriting (follow-up 3).
+    memmove 16% + reader 24%** (4.19 s, pre-change). `dir_path_len` already
+    walks parents then `memcpy`s root-to-leaf (not O(depth²) prepend).
+    `--make` and `--list` now keep the last parent prefix in the output
+    buffer and rewrite only the leaf on a hit; `--list` also checks
+    last-parent before the hash cache, and wrapping the 1 MiB arena bumps a
+    generation (stale slots miss, no table walk). Hit rate is in the
+    `--list` stats block.
+    Synth Q3/Q5 `--list` is too small to show this; a large production Q5
+    `--list` (or `--uid --list`) is the measurement.
 
 Ranked by measured wall those still own: (7) 70 of 116 s → (8) 36 of 51 s
 unfiltered / ~6 of 11 s filtered → (11) 8.6 of 9.3 s rollup, 3.7 of 6.7 s
-`--exact` → (9) default fold → (12) ~2 of 4.2 s `--list` → (2) realloc 7% of
-`--level` → (10) sub-second filter scans. (5) is moot if (1)/(8) land; (6)
-zstd is inherent.
+`--exact` → (9) default fold → (12) `--list` path assembly (now last-parent
++ suffix) → (2) realloc 7% of `--level` → (10) decode_u64 on leftover
+groups / `--make`. (5) is moot if (1)/(8) land; (6) zstd is inherent.
+(10) and (12) are the only follow-ups that can move `benchmark.sh`.

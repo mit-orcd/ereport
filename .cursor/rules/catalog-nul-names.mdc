@@ -8,10 +8,13 @@ alwaysApply: false
 
 There is an open, characterized-but-unsolved bug: the n1 production capture has
 directory-name components in the on-disk catalog whose bytes are zeroed while
-`name_len` stays correct (16,633 entries in `uid_shard_362.bin`, name lengths 32–54,
-depth/parent clustered), plus duplicate directory entries (e.g. four `data1` dirs
-under pid=1). Leading hypothesis: a zeroing event hitting jemalloc 48-byte
-size-class runs (name buffers + hash-table entries), breaking HT chains.
+`name_len` stays correct (38,464 entries in 75 of 264 shards; 16,633 of those in
+`uid_shard_362.bin`; 99.63% jemalloc 48-byte class, sharp onset at nlen=32;
+sibling-clustered; mixed leftovers are 16-byte-lane partial wipes), plus
+duplicate directory entries (e.g. four `data1` dirs under pid=1). Leading
+hypothesis: a 16/32/48-byte zeroing event hitting jemalloc 48-byte size-class
+slots (name buffers + hash-table entries), breaking HT chains. TSan on a 1.2 B
+entry crawl found no production writer race (one tripwire-only getenv race).
 
 `--subtree` now unions every path-equal catalog dir_id (query-side duplicate
 tolerance has landed); writer-side NUL / hash-table corruption is still open.
