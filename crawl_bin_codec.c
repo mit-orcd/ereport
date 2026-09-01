@@ -83,8 +83,37 @@ static void bitpack(const uint64_t *values, size_t count, uint64_t base, unsigne
     }
 }
 
-/* Hot path for CRAWL_ENC_FOR_BITPACK: width-specialized loops beat the generic
- * bit walker when a whole column uses a common width (uid/gid/mode/timestamps). */
+static size_t bitpack_bytes(size_t count, unsigned w) { return (count * (size_t)w + 7U) / 8U; }
+
+/* Up to 8 little-endian bytes; missing bytes (avail < 8) read as 0 so a tail
+ * value can use a word extract without reading past the packed payload. */
+static uint64_t load_u64le_avail(const unsigned char *src, size_t avail) {
+    uint64_t v = 0;
+    size_t n = avail < 8U ? avail : 8U;
+    size_t i;
+
+    if (n == 8U) return get_u64le(src);
+    for (i = 0; i < n; i++) v |= (uint64_t)src[i] << (8U * (unsigned)i);
+    return v;
+}
+
+/* Packed value i from a FOR_BITPACK payload of packed_len bytes. w is 1..64. */
+static uint64_t bitextract(const unsigned char *src, size_t packed_len, size_t i, unsigned w) {
+    size_t bit = i * (size_t)w;
+    size_t byte = bit >> 3;
+    unsigned off = (unsigned)(bit & 7U);
+    size_t remain = (byte < packed_len) ? packed_len - byte : 0U;
+    uint64_t mask = (w == 64U) ? ~0ULL : ((1ULL << w) - 1ULL);
+    uint64_t v = load_u64le_avail(src + byte, remain) >> off;
+
+    /* w >= 58 can spill past one 64-bit word when the bit offset is nonzero. */
+    if (off + w > 64U)
+        v |= load_u64le_avail(src + byte + 8U, remain > 8U ? remain - 8U : 0U) << (64U - off);
+    return v & mask;
+}
+
+/* Hot path for CRAWL_ENC_FOR_BITPACK: width-specialized loops beat a generic
+ * extract when a whole column uses a common width (uid/gid/mode/timestamps). */
 static void bitunpack(const unsigned char *src, size_t count, uint64_t base, unsigned w, uint64_t *dst) {
     size_t i;
 
@@ -131,28 +160,12 @@ static void bitunpack(const unsigned char *src, size_t count, uint64_t base, uns
         return;
     }
 
-    for (i = 0; i < count; i++) {
-        size_t bit = i * (size_t)w;
-        size_t byte = bit >> 3;
-        unsigned off = (unsigned)(bit & 7U);
-        unsigned got = 0;
-        uint64_t v = 0;
+    {
+        size_t packed_len = bitpack_bytes(count, w);
 
-        while (got < w) {
-            unsigned room = 8U - off;
-            unsigned take = w - got;
-
-            if (take > room) take = room;
-            v |= ((uint64_t)((src[byte] >> off) & (unsigned char)((1U << take) - 1U))) << got;
-            got += take;
-            byte++;
-            off = 0;
-        }
-        dst[i] = base + v;
+        for (i = 0; i < count; i++) dst[i] = base + bitextract(src, packed_len, i, w);
     }
 }
-
-static size_t bitpack_bytes(size_t count, unsigned w) { return (count * (size_t)w + 7U) / 8U; }
 
 /* Count runs of equal adjacent values, capped so a high-cardinality column stops
  * counting as soon as RLE is provably worse than the alternatives. */
@@ -423,13 +436,41 @@ int crawl_bin_codec_decode_u64(const unsigned char *src, size_t src_len, size_t 
 
         case CRAWL_ENC_DELTA: {
             uint8_t sub_enc;
-            uint64_t seed, sub_min;
+            uint64_t seed, sub_min, acc;
             const unsigned char *sub;
             size_t sub_len;
 
             if (residual_split(src, src_len, &sub_enc, &seed, &sub_min, &sub, &sub_len) != 0) return -1;
             dst[0] = seed;
             if (count == 1) return sub_len == 0 ? 0 : -1;
+            /* CONST and FOR_BITPACK residuals fuse zigzag + prefix-sum so the
+             * reconstructed values are written once. RLE/RAW still stage. */
+            if (sub_enc == (uint8_t)CRAWL_ENC_CONST) {
+                uint64_t step;
+
+                if (sub_len != 0) return -1;
+                step = zigzag_decode(sub_min);
+                acc = seed;
+                for (i = 1; i < count; i++) {
+                    acc += step;
+                    dst[i] = acc;
+                }
+                return 0;
+            }
+            if (sub_enc == (uint8_t)CRAWL_ENC_FOR_BITPACK) {
+                size_t nres = count - 1;
+                size_t packed_len;
+
+                if (bit_width == 0 || bit_width > 64) return -1;
+                packed_len = bitpack_bytes(nres, bit_width);
+                if (sub_len != packed_len) return -1;
+                acc = seed;
+                for (i = 0; i < nres; i++) {
+                    acc += zigzag_decode(sub_min + bitextract(sub, packed_len, i, bit_width));
+                    dst[i + 1] = acc;
+                }
+                return 0;
+            }
             if (crawl_bin_codec_decode_u64(sub, sub_len, count - 1, sub_enc, bit_width, sub_min, dst + 1) != 0)
                 return -1;
             for (i = 1; i < count; i++) dst[i] = dst[i - 1] + zigzag_decode(dst[i]);
@@ -455,6 +496,24 @@ int crawl_bin_codec_decode_ref_u64(const unsigned char *src, size_t src_len, siz
     }
     if (count == 0) return src_len == 0 ? 0 : -1;
     if (residual_split(src, src_len, &sub_enc, &seed, &sub_min, &sub, &sub_len) != 0) return -1;
+    if (sub_enc == (uint8_t)CRAWL_ENC_CONST) {
+        uint64_t step;
+
+        if (sub_len != 0) return -1;
+        step = zigzag_decode(sub_min);
+        for (i = 0; i < count; i++) dst[i] = ref[i] + step;
+        return 0;
+    }
+    if (sub_enc == (uint8_t)CRAWL_ENC_FOR_BITPACK) {
+        size_t packed_len;
+
+        if (bit_width == 0 || bit_width > 64) return -1;
+        packed_len = bitpack_bytes(count, bit_width);
+        if (sub_len != packed_len) return -1;
+        for (i = 0; i < count; i++)
+            dst[i] = ref[i] + zigzag_decode(sub_min + bitextract(sub, packed_len, i, bit_width));
+        return 0;
+    }
     if (crawl_bin_codec_decode_u64(sub, sub_len, count, sub_enc, bit_width, sub_min, dst) != 0) return -1;
     for (i = 0; i < count; i++) dst[i] = ref[i] + zigzag_decode(dst[i]);
     return 0;

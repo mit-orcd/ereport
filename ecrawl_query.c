@@ -379,6 +379,9 @@ typedef struct {
     uint64_t blocks_decompressed;
     uint64_t blocks_skipped;
     uint64_t records_skipped;
+    uint64_t path_hits_last; /* --list: same parent as the previous listed record */
+    uint64_t path_hits_hash; /* --list: 8192-slot dir_id cache */
+    uint64_t path_misses;    /* --list: catalog chain walk */
     int oom;
 } query_result_t;
 
@@ -2919,12 +2922,12 @@ static void query_list_emit_sum(query_result_t *res, unsigned n) {
 /*
  * Per-worker cache of reconstructed parent directory paths, keyed by dir_id.
  *
- * Building a path walks the parent chain and copies every component, so listing a megadir
- * paid that walk once per record before the single-entry memo, and once per parent switch
- * after it — records from different directories interleave inside a row group, so the memo
- * missed constantly. Direct-mapped and fixed size: a miss costs the walk that would have
- * happened anyway, and the whole cache is dropped when its arena fills, which keeps the
- * memory per worker flat no matter how many directories the shard holds.
+ * Building a path walks the parent chain and copies every component. Row groups
+ * are sorted by (parent_dir_id, name), so a last-parent slot hits on sibling
+ * runs; the 8192-slot hash covers chunk jumps and group boundaries. Direct-mapped
+ * and fixed size: a miss costs the walk that would have happened anyway. The
+ * arena is 1 MiB; wrapping bumps a generation so stale slots miss without
+ * walking the table. last[] survives the wrap, and memory per worker stays flat.
  */
 #define QUERY_PATH_CACHE_SLOTS 8192U /* power of two */
 #define QUERY_PATH_CACHE_ARENA (1024U * 1024U)
@@ -2933,18 +2936,29 @@ typedef struct {
     uint64_t key; /* dir_id + 1; 0 = empty slot */
     uint32_t off;
     uint32_t len;
+    uint32_t gen;
 } query_path_cache_ent_t;
 
 typedef struct {
     query_path_cache_ent_t *ent;
     char *arena;
     size_t arena_len;
+    uint32_t gen; /* bumped on wrap; slots with a different gen are empty */
+    uint64_t last_id; /* 0 = empty; else dir_id of last[] */
+    size_t last_len;
+    char last[PATH_MAX];
+    uint64_t hits_last;
+    uint64_t hits_hash;
+    uint64_t misses;
 } query_path_cache_t;
 
 static int query_path_cache_init(query_path_cache_t *c) {
     c->ent = (query_path_cache_ent_t *)calloc(QUERY_PATH_CACHE_SLOTS, sizeof(*c->ent));
     c->arena = (char *)malloc(QUERY_PATH_CACHE_ARENA);
     c->arena_len = 0;
+    c->gen = 1;
+    c->last_id = 0;
+    c->last_len = 0;
     if (!c->ent || !c->arena) {
         free(c->ent);
         free(c->arena);
@@ -2961,50 +2975,91 @@ static void query_path_cache_free(query_path_cache_t *c) {
     c->ent = NULL;
     c->arena = NULL;
     c->arena_len = 0;
+    c->last_id = 0;
 }
 
 /* Catalogs are per shard, so a dir_id means something different in each: start over. */
 static void query_path_cache_reset(query_path_cache_t *c) {
-    if (!c->ent) return;
-    memset(c->ent, 0, QUERY_PATH_CACHE_SLOTS * sizeof(*c->ent));
     c->arena_len = 0;
+    c->last_id = 0;
+    c->last_len = 0;
+    /* Bump gen rather than memset 8192 slots: lookups see a different gen and miss. */
+    if (c->gen == UINT32_MAX) {
+        if (c->ent) memset(c->ent, 0, QUERY_PATH_CACHE_SLOTS * sizeof(*c->ent));
+        c->gen = 1;
+    } else {
+        c->gen++;
+    }
 }
 
 static inline size_t query_path_cache_slot(uint64_t dir_id) {
     return (size_t)((dir_id * 0x9E3779B97F4A7C15ULL) >> 51) & (QUERY_PATH_CACHE_SLOTS - 1U);
 }
 
+static void query_path_cache_store(query_path_cache_t *c, uint64_t dir_id, const char *src, size_t len) {
+    query_path_cache_ent_t *e;
+
+    if (!c->ent || !c->arena) return;
+    if (len > QUERY_PATH_CACHE_ARENA) return;
+    if (c->arena_len + len > QUERY_PATH_CACHE_ARENA) {
+        /* Drop the hash (not last-parent): a generation bump makes every slot
+         * miss without walking 8192 entries per store. */
+        c->arena_len = 0;
+        if (c->gen == UINT32_MAX) {
+            memset(c->ent, 0, QUERY_PATH_CACHE_SLOTS * sizeof(*c->ent));
+            c->gen = 1;
+        } else {
+            c->gen++;
+        }
+    }
+    e = &c->ent[query_path_cache_slot(dir_id)];
+    if (len) memcpy(c->arena + c->arena_len, src, len);
+    e->key = dir_id + 1ULL;
+    e->off = (uint32_t)c->arena_len;
+    e->len = (uint32_t)len;
+    e->gen = c->gen;
+    c->arena_len += len;
+}
+
 /*
- * Parent path for dir_id, from the cache or from the catalog. Returns a pointer into the
- * cache arena, valid until the next call on this cache.
+ * Parent path for dir_id, from last-parent, the hash cache, or the catalog.
+ * Returns a pointer into c->last, valid until the next call on this cache.
  */
 static const char *query_parent_path(query_path_cache_t *c, const crawl_bin_catalog_t *cat, uint64_t dir_id,
                                      size_t *len_out, char *scratch, size_t scratch_sz) {
     query_path_cache_ent_t *e;
     size_t len = 0;
 
-    if (!c->ent) {
-        if (crawl_bin_catalog_dir_path_len(cat, dir_id, scratch, scratch_sz, &len) != 0) return NULL;
-        *len_out = len;
-        return scratch;
+    if (c->last_id == dir_id) {
+        *len_out = c->last_len;
+        c->hits_last++;
+        return c->last;
     }
 
-    e = &c->ent[query_path_cache_slot(dir_id)];
-    if (e->key == dir_id + 1ULL) {
-        *len_out = e->len;
-        return c->arena + e->off;
+    if (c->ent) {
+        e = &c->ent[query_path_cache_slot(dir_id)];
+        if (e->key == dir_id + 1ULL && e->gen == c->gen && (size_t)e->len < sizeof(c->last)) {
+            len = (size_t)e->len;
+            if (len) memcpy(c->last, c->arena + e->off, len);
+            c->last[len] = '\0';
+            c->last_id = dir_id;
+            c->last_len = len;
+            c->hits_hash++;
+            *len_out = len;
+            return c->last;
+        }
     }
 
     if (crawl_bin_catalog_dir_path_len(cat, dir_id, scratch, scratch_sz, &len) != 0) return NULL;
-    if (len + 1U > QUERY_PATH_CACHE_ARENA - c->arena_len) query_path_cache_reset(c);
-    e = &c->ent[query_path_cache_slot(dir_id)];
-    memcpy(c->arena + c->arena_len, scratch, len);
-    e->key = dir_id + 1ULL;
-    e->off = (uint32_t)c->arena_len;
-    e->len = (uint32_t)len;
-    c->arena_len += len;
+    c->misses++;
+    if (len >= sizeof(c->last)) return NULL;
+    if (len) memcpy(c->last, scratch, len);
+    c->last[len] = '\0';
+    c->last_id = dir_id;
+    c->last_len = len;
+    query_path_cache_store(c, dir_id, scratch, len);
     *len_out = len;
-    return c->arena + e->off;
+    return c->last;
 }
 
 /* Takes the four values rather than a bin_record_hdr_t: the caller reads columns and no
@@ -3069,6 +3124,9 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
     uint64_t nrec = 0;
     crawl_bin_chunk_stdio_t bio;
     char parent_path[PATH_MAX];
+    uint64_t last_list_pid = 0;
+    size_t last_list_plen = 0;
+    int prefix_live = 0;
 
     if (nrec_out) *nrec_out = 0;
     bio.fopen = NULL;
@@ -3190,6 +3248,7 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
                     {
                         size_t plen = 0;
 
+                        prefix_live = 0;
                         if (crawl_bin_catalog_entry_path_len(cat, pid, (const char *)rec_name, (size_t)nlen,
                                                              fullpath_buf, fullpath_sz, &plen) == 0 &&
                             plen == g_query.subtree_len && memcmp(fullpath_buf, g_query.subtree, plen) == 0)
@@ -3233,28 +3292,44 @@ static int query_scan_fp_until(FILE *fp, uint64_t start_off, uint64_t scan_end_e
 
             if (g_query.list_paths) {
                 size_t fullpath_len = 0;
-                const char *ppath;
                 size_t plen = 0;
 
-                {
+                if (prefix_live && last_list_pid == pid) {
+                    /* Same parent as the previous listed record: only the leaf changes. */
+                    plen = last_list_plen;
+                    pcache->hits_last++;
+                    if (plen == 0U) {
+                        if ((size_t)nlen + 2U > fullpath_sz) return -1;
+                        if (nlen > 0U) memcpy(fullpath_buf + 1, rec_name, nlen);
+                        fullpath_len = 1U + (size_t)nlen;
+                    } else {
+                        if (plen + 1U + (size_t)nlen + 1U > fullpath_sz) return -1;
+                        if (nlen > 0U) memcpy(fullpath_buf + plen + 1U, rec_name, nlen);
+                        fullpath_len = plen + 1U + (size_t)nlen;
+                    }
+                } else {
+                    const char *ppath;
                     const crawl_bin_catalog_t *cat = query_cat_lazy_get(lz);
 
                     if (!cat) return -1;
                     ppath = query_parent_path(pcache, cat, pid, &plen, parent_path, sizeof(parent_path));
                     if (!ppath) return -1;
+                    if (plen == 0U) {
+                        if ((size_t)nlen + 2U > fullpath_sz) return -1;
+                        fullpath_buf[0] = '/';
+                        if (nlen > 0U) memcpy(fullpath_buf + 1, rec_name, nlen);
+                        fullpath_len = 1U + (size_t)nlen;
+                    } else {
+                        if (plen + 1U + (size_t)nlen + 1U > fullpath_sz) return -1;
+                        memcpy(fullpath_buf, ppath, plen);
+                        fullpath_buf[plen] = '/';
+                        if (nlen > 0U) memcpy(fullpath_buf + plen + 1U, rec_name, nlen);
+                        fullpath_len = plen + 1U + (size_t)nlen;
+                    }
+                    last_list_pid = pid;
+                    last_list_plen = plen;
                 }
-                if (plen == 0U) {
-                    if ((size_t)nlen + 2U > fullpath_sz) return -1;
-                    fullpath_buf[0] = '/';
-                    if (nlen > 0U) memcpy(fullpath_buf + 1, rec_name, nlen);
-                    fullpath_len = 1U + (size_t)nlen;
-                } else {
-                    if (plen + 1U + (size_t)nlen + 1U > fullpath_sz) return -1;
-                    memcpy(fullpath_buf, ppath, plen);
-                    fullpath_buf[plen] = '/';
-                    if (nlen > 0U) memcpy(fullpath_buf + plen + 1U, rec_name, nlen);
-                    fullpath_len = plen + 1U + (size_t)nlen;
-                }
+                prefix_live = 1;
                 fullpath_buf[fullpath_len] = '\0';
                 if (query_out_append(qr, fullpath_buf, fullpath_len) != 0) {
                     qr->oom = 1;
@@ -3758,6 +3833,9 @@ static void *query_worker_main(void *arg) {
 
     if (!query_list_buffered()) query_out_flush(qr);
     crawl_bin_block_reader_free(&br);
+    qr->path_hits_last += pcache.hits_last;
+    qr->path_hits_hash += pcache.hits_hash;
+    qr->path_misses += pcache.misses;
     query_path_cache_free(&pcache);
     free(fullpath_buf);
     return NULL;
@@ -4183,6 +4261,9 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
         sum.blocks_decompressed += res[i].blocks_decompressed;
         sum.blocks_skipped += res[i].blocks_skipped;
         sum.records_skipped += res[i].records_skipped;
+        sum.path_hits_last += res[i].path_hits_last;
+        sum.path_hits_hash += res[i].path_hits_hash;
+        sum.path_misses += res[i].path_misses;
     }
     sum.bytes += query_hardlink_bytes(res, n, &dupes);
     for (i = 0; i < n; i++) sum.oom |= res[i].oom;
@@ -4220,6 +4301,11 @@ static void query_report(query_result_t *res, unsigned n, uint64_t records_scann
     fprintf(out, "blocks_decompressed=%" PRIu64 "\n", sum.blocks_decompressed);
     fprintf(out, "blocks_skipped=%" PRIu64 "\n", sum.blocks_skipped);
     fprintf(out, "records_skipped_by_block_filter=%" PRIu64 "\n", sum.records_skipped);
+    if (g_query.list_paths) {
+        fprintf(out, "path_cache_last_hits=%" PRIu64 "\n", sum.path_hits_last);
+        fprintf(out, "path_cache_hash_hits=%" PRIu64 "\n", sum.path_hits_hash);
+        fprintf(out, "path_cache_misses=%" PRIu64 "\n", sum.path_misses);
+    }
     fprintf(out, "parse_chunk_jobs=%zu\n", g_parse_chunk_jobs);
     fprintf(out, "chunk_prep_sec=%.6f\n", chunk_prep_sec);
     if (g_rgix_stats.used) {

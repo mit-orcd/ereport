@@ -236,6 +236,23 @@ int main(void) {
         }
     }
 
+    /* Word-extract tail: a long column at an unaligned width, so the last
+     * values sit in a partial 64-bit load rather than a full get_u64le. */
+    {
+        static const unsigned odd_w[] = {3U, 7U, 13U, 24U, 33U, 48U, 57U, 63U};
+        size_t wi;
+
+        for (wi = 0; wi < sizeof(odd_w) / sizeof(odd_w[0]); wi++) {
+            unsigned w = odd_w[wi];
+            char label[72];
+            uint64_t span = (w >= 64U) ? UINT64_MAX : ((1ULL << w) - 1ULL);
+
+            for (i = 0; i < n; i++) v[i] = (i % 2U) ? span : 0ULL;
+            snprintf(label, sizeof(label), "bit width %u long column (word extract)", w);
+            roundtrip(label, v, n, CRAWL_ENC_FOR_BITPACK);
+        }
+    }
+
     /* Degenerate lengths. */
     v[0] = 42;
     roundtrip("single value", v, 1, CRAWL_ENC_CONST);

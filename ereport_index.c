@@ -3920,14 +3920,17 @@ fail:
 
 /*
  * Last-parent cache for path reconstruction. crawl_bin_catalog_entry_path walks the parent chain to
- * the root for every record, and records under one directory are contiguous in crawl-bin output, so
- * a single slot absorbs nearly all of it: on a 12M-path index the walk was the whole cost of turning
- * a record into a path. Lives on the stack of one process_chunk_make call, which keeps it private to
- * the worker and scoped to a chunk -- a chunk never spans shards, so dir_ids cannot collide.
+ * the root for every record, and records under one directory are contiguous in crawl-bin output
+ * (row groups are sorted by parent_dir_id), so a single slot absorbs nearly all of it: on a
+ * 12M-path index the walk was the whole cost of turning a record into a path. Lives on the stack
+ * of one process_chunk_make call, which keeps it private to the worker and scoped to a chunk --
+ * a chunk never spans shards, so dir_ids cannot collide. live_out is the last `out` buffer that
+ * still holds this parent prefix, so a sibling rebuild only rewrites the leaf.
  */
 typedef struct {
-    uint64_t id; /* cached parent_dir_id (>1); 0 = empty */
+    uint64_t id; /* cached parent_dir_id; 0 = empty. 1 = synthetic root (path ""). */
     size_t len;
+    char *live_out; /* out that still holds dir[0,len); NULL if unknown */
     char dir[PATH_MAX];
 } mk_dir_cache_t;
 
@@ -3944,9 +3947,17 @@ static int mk_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_
     if (parent_dir_id == 1ULL) {
         /* Direct child of the synthetic root: path is /<name> (paths are absolute). */
         if (name_len + 2 > out_sz) return -1;
+        if (cache->id == 1ULL && cache->live_out == out) {
+            if (name_len > 0 && name) memcpy(out + 1, name, name_len);
+            out[1 + name_len] = '\0';
+            return 0;
+        }
         out[0] = '/';
         if (name_len > 0 && name) memcpy(out + 1, name, name_len);
         out[1 + name_len] = '\0';
+        cache->id = 1ULL;
+        cache->len = 0;
+        cache->live_out = out;
         return 0;
     }
 
@@ -3954,17 +3965,27 @@ static int mk_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t parent_
         if (crawl_bin_catalog_dir_path_len(cat, parent_dir_id, cache->dir, sizeof(cache->dir), &cache->len) !=
             0) {
             cache->id = 0;
+            cache->live_out = NULL;
             return -1;
         }
         cache->id = parent_dir_id;
+        cache->live_out = NULL;
     }
 
     plen = cache->len;
     if (plen + 1 + name_len + 1 > out_sz) return -1;
+    if (cache->live_out == out) {
+        /* Parent prefix already sits at out[0, plen). */
+        out[plen] = '/';
+        if (name_len > 0 && name) memcpy(out + plen + 1, name, name_len);
+        out[plen + 1 + name_len] = '\0';
+        return 0;
+    }
     memcpy(out, cache->dir, plen);
     if (plen > 0) out[plen++] = '/';
     if (name_len > 0 && name) memcpy(out + plen, name, name_len);
     out[plen + name_len] = '\0';
+    cache->live_out = out;
     return 0;
 }
 
@@ -3983,6 +4004,7 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
     memset(&br, 0, sizeof(br));
     dir_cache.id = 0;
     dir_cache.len = 0;
+    dir_cache.live_out = NULL;
 
     fp = ei_shard_fopen(chunk->path, "rb");
     if (!fp) {
@@ -4074,6 +4096,8 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
          * use the rewritten namespace. */
         if (g_rewrite_from) {
             (void)rewrite_path_prefix(pathbuf, PATH_MAX);
+            /* Rewrite mutates pathbuf, so the next sibling cannot reuse the prefix. */
+            dir_cache.live_out = NULL;
         }
 
         /* --subtree: only index records at or under the requested directory (full absolute path kept). */
