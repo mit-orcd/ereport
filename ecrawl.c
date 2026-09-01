@@ -2597,58 +2597,43 @@ static void shard_cat_destroy(shard_cat_t *c) {
 static int shard_cat_grow_arrays(shard_cat_t *c, uint64_t need_id) {
     uint64_t ncap = c->arr_cap ? c->arr_cap : 8;
     uint64_t i;
-    uint64_t *pp;
-    uint32_t *dp;
-    uint16_t *nl;
-    char **nm;
-    uint64_t *icb;
-    uint64_t *icc;
-    uint64_t *icl;
-    uint64_t *icmin;
-    uint64_t *icmax;
-    uint64_t *ichl;
-    uint64_t *icf;
-    uint64_t *icd;
-    uint64_t *ics;
-    uint64_t *slfb;
-    unsigned char *slfp;
+
+    /* Same-size realloc is a no-op with glibc/jemalloc but a full copy under
+     * ASan/valgrind; without this guard every new dir triggers 14 array copies
+     * (O(N^2) total) on such allocators. */
+    if (need_id < c->arr_cap) return 0;
 
     while (need_id >= ncap) ncap *= 2;
     if (need_id >= ncap) return -1;
 
-    pp = (uint64_t *)realloc(c->parent_dir_id, (size_t)ncap * sizeof(*pp));
-    dp = (uint32_t *)realloc(c->depth, (size_t)ncap * sizeof(*dp));
-    nl = (uint16_t *)realloc(c->name_len, (size_t)ncap * sizeof(*nl));
-    nm = (char **)realloc(c->name_comp, (size_t)ncap * sizeof(*nm));
-    icb = (uint64_t *)realloc(c->imm_child_bytes, (size_t)ncap * sizeof(*icb));
-    icc = (uint64_t *)realloc(c->imm_child_count, (size_t)ncap * sizeof(*icc));
-    icl = (uint64_t *)realloc(c->imm_child_ctime_led_count, (size_t)ncap * sizeof(*icl));
-    icmin = (uint64_t *)realloc(c->imm_child_min_eff_time, (size_t)ncap * sizeof(*icmin));
-    icmax = (uint64_t *)realloc(c->imm_child_max_eff_time, (size_t)ncap * sizeof(*icmax));
-    ichl = (uint64_t *)realloc(c->subtree_nlink_gt1_count, (size_t)ncap * sizeof(*ichl));
-    icf = (uint64_t *)realloc(c->subtree_files, (size_t)ncap * sizeof(*icf));
-    icd = (uint64_t *)realloc(c->subtree_dirs, (size_t)ncap * sizeof(*icd));
-    ics = (uint64_t *)realloc(c->subtree_symlinks, (size_t)ncap * sizeof(*ics));
-    slfb = (uint64_t *)realloc(c->self_bytes, (size_t)ncap * sizeof(*slfb));
-    slfp = (unsigned char *)realloc(c->self_present, (size_t)ncap);
-    if (!pp || !dp || !nl || !nm || !icb || !icc || !icl || !icmin || !icmax || !ichl || !icf || !icd ||
-        !ics || !slfb || !slfp)
-        return -1;
-    c->parent_dir_id = pp;
-    c->depth = dp;
-    c->name_len = nl;
-    c->name_comp = nm;
-    c->imm_child_bytes = icb;
-    c->imm_child_count = icc;
-    c->imm_child_ctime_led_count = icl;
-    c->imm_child_min_eff_time = icmin;
-    c->imm_child_max_eff_time = icmax;
-    c->subtree_nlink_gt1_count = ichl;
-    c->subtree_files = icf;
-    c->subtree_dirs = icd;
-    c->subtree_symlinks = ics;
-    c->self_bytes = slfb;
-    c->self_present = slfp;
+    /* Commit each realloc immediately. On OOM the arrays that already moved stay
+     * valid, the rest keep their old storage, and arr_cap is left unchanged, so
+     * every array still holds at least arr_cap entries and the catalog stays
+     * consistent. The old code stored into locals and assigned only after all
+     * succeeded: a mid-sequence failure left c-> fields pointing at memory the
+     * successful reallocs had already freed. */
+#define SHARD_CAT_GROW_ONE(field, type)                        \
+    do {                                                       \
+        type *p = (type *)realloc(c->field, (size_t)ncap * sizeof(*p)); \
+        if (!p) return -1;                                     \
+        c->field = p;                                          \
+    } while (0)
+    SHARD_CAT_GROW_ONE(parent_dir_id, uint64_t);
+    SHARD_CAT_GROW_ONE(depth, uint32_t);
+    SHARD_CAT_GROW_ONE(name_len, uint16_t);
+    SHARD_CAT_GROW_ONE(name_comp, char *);
+    SHARD_CAT_GROW_ONE(imm_child_bytes, uint64_t);
+    SHARD_CAT_GROW_ONE(imm_child_count, uint64_t);
+    SHARD_CAT_GROW_ONE(imm_child_ctime_led_count, uint64_t);
+    SHARD_CAT_GROW_ONE(imm_child_min_eff_time, uint64_t);
+    SHARD_CAT_GROW_ONE(imm_child_max_eff_time, uint64_t);
+    SHARD_CAT_GROW_ONE(subtree_nlink_gt1_count, uint64_t);
+    SHARD_CAT_GROW_ONE(subtree_files, uint64_t);
+    SHARD_CAT_GROW_ONE(subtree_dirs, uint64_t);
+    SHARD_CAT_GROW_ONE(subtree_symlinks, uint64_t);
+    SHARD_CAT_GROW_ONE(self_bytes, uint64_t);
+    SHARD_CAT_GROW_ONE(self_present, unsigned char);
+#undef SHARD_CAT_GROW_ONE
     for (i = c->arr_cap; i < ncap; i++) {
         c->parent_dir_id[i] = 0;
         c->depth[i] = 0;
@@ -2874,8 +2859,14 @@ static uint64_t shard_cat_ensure_dir(shard_cat_t *c, const char *path_z) {
     c->name_comp[nid] = comp_owned;
 
     if (shard_cat_ht_insert(c, path_owned, nid) != 0) {
+        /* OOM: roll the slot back entirely. Leaving name_len>0 with a NULL
+         * name_comp would segfault the next catalog write (memcpy from NULL). */
         free(comp_owned);
+        c->parent_dir_id[nid] = 0;
+        c->depth[nid] = 0;
+        c->name_len[nid] = 0;
         c->name_comp[nid] = NULL;
+        c->next_dir_id = nid;
         return 0;
     }
     return nid;
@@ -3951,6 +3942,7 @@ static int crawl_identity_init(crawl_identity_t *ci, worker_arg_t *arg) {
         ci->dirbuf = malloc(ci->dirbuf_cap);
         if (!ci->dirbuf) ci->dirbuf_cap = 0; /* fall back to libc readdir on OOM */
     }
+    memset(&ci->uring, 0, sizeof(ci->uring));
     ci->uring.fd = -1;
     ci->uring.dead = 0;
     if (g_iouring_statx) {

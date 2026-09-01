@@ -1022,6 +1022,10 @@ int crawl_bin_catalog_dir_path_len(const crawl_bin_catalog_t *c, uint64_t dir_id
         cur = c->parent_dir_id[cur];
     }
 
+    /* The walk must reach the synthetic root; stopping at the parts cap would
+     * otherwise emit a silently truncated path missing its shallow ancestors. */
+    if (cur != 1ULL) return -1;
+
     if (tot + 1 > out_sz) return -1;
     {
         /* Emit a '/' before every component so absolute paths keep their leading
