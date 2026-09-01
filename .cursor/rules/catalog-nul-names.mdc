@@ -1,0 +1,22 @@
+---
+description: Open investigation — NUL bytes in ecrawl catalog names (n1 capture). Read docs/catalog-nul-names-investigation.md before touching catalog write/read paths or starting related debugging.
+globs: ecrawl.c, crawl_bin_catalog.c, crawl_bin_format.h, crawl_bin_catalog.h
+alwaysApply: false
+---
+
+# Catalog NUL-names investigation (OPEN)
+
+There is an open, characterized-but-unsolved bug: the n1 production capture has
+directory-name components in the on-disk catalog whose bytes are zeroed while
+`name_len` stays correct (16,633 entries in `uid_shard_362.bin`, name lengths 32–54,
+depth/parent clustered), plus duplicate directory entries (e.g. four `data1` dirs
+under pid=1). Leading hypothesis: a zeroing event hitting jemalloc 48-byte
+size-class runs (name buffers + hash-table entries), breaking HT chains.
+
+Before changing catalog creation/writing/reading code, or starting any related
+debugging or repro work, read `docs/catalog-nul-names-investigation.md` — it records
+the established facts (do not re-derive them), what was already ruled out (reader
+exonerated; ASan/jemalloc synthetic repros all clean), the fixes already landed, the
+`ECRAWL_CAT_TRIPWIRE` instrumentation, and the ordered next steps.
+
+If you learn something new about this bug, update that document in the same change.
