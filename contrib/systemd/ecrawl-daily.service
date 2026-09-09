@@ -1,13 +1,13 @@
-# Install (adjust paths):
-#   sudo install -d /etc/ereport /usr/local/lib/ereport
-#   sudo install -m0644 ecrawl-daily.conf.example /etc/ereport/ecrawl-daily.conf
-#   sudo install -m0755 ecrawl-daily.sh /usr/local/lib/ereport/ecrawl-daily.sh
-#   sudo install -m0644 ecrawl-daily.service /etc/systemd/system/
-#   sudo install -m0644 ecrawl-daily.timer /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now ecrawl-daily.timer
+# Install (from the repo root):
+#   sudo contrib/systemd/install.sh            # units + wrapper + example config
+#   sudo contrib/systemd/install.sh --enable   # also: systemctl enable --now ecrawl-daily.timer
+# Manual install commands: see docs/build-and-deploy.md.
 #
-# Override User=/Group= if ecrawl must read restricted trees, write crawl output, or use rsync/ssh.
+# Customize without editing this unit (drop-ins survive reinstalls):
+#   sudo systemctl edit ecrawl-daily.service
+# e.g. User=/Group= if ecrawl must not run as root, or Environment= lines for
+# ecrawl tuning (see docs/environment-variables.md). ECRAWL_* tuning vars can
+# also be set directly in /etc/ereport/ecrawl-daily.conf.
 
 [Unit]
 Description=Run ecrawl on configured directories and rsync crawl output
@@ -18,8 +18,13 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/lib/ereport/ecrawl-daily.sh /etc/ereport/ecrawl-daily.conf
+# ecrawl keeps up to ECRAWL_MAX_OPEN_SHARDS shard files open per writer; the
+# default soft fd limit for services (1024) can force shard LRU churn on
+# mixed-UID trees, so give the crawl headroom.
+LimitNOFILE=65536
 # User=crawler
 # Group=crawler
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section on purpose: this service is started by
+# ecrawl-daily.timer only, never enabled on its own (a boot-time crawl is
+# almost never wanted).

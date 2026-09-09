@@ -11,6 +11,10 @@
 # uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
 # when the directory resolves with readlink -f to a real path that is not /, ., or ...
 #
+# Config directives: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE. Any other ECRAWL_*
+# directive is exported into ecrawl's environment (see docs/environment-variables.md), e.g.
+# ECRAWL_CRAWL_THREADS=16.
+#
 # Usage:
 #   ecrawl-daily.sh [/path/to/ecrawl-daily.conf]
 #
@@ -106,8 +110,16 @@ set_directive() {
 	RSYNC_DEST) RSYNC_DEST=$v ;;
 	RSYNC_RSH) RSYNC_RSH=$v ;;
 	RSYNC_DELETE) RSYNC_DELETE=$v ;;
+	ECRAWL_DAILY_*)
+		echo "ecrawl-daily: ignoring internal directive '$k'" >&2
+		;;
+	ECRAWL_*)
+		# Pass-through: exported so the ecrawl child inherits it (see
+		# docs/environment-variables.md), e.g. ECRAWL_CRAWL_THREADS=16.
+		export "$k=$v"
+		;;
 	*)
-		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE)" >&2
+		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE, or ECRAWL_* passthrough)" >&2
 		;;
 	esac
 }

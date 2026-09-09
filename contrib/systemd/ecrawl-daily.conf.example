@@ -8,7 +8,8 @@
 #     RSYNC_DEST only when you want sync; every mirrored job needs a non-empty output_dir column.
 #
 # Syntax:
-#   - Lines before ---jobs--- are directives: KEY=value
+#   - Lines before ---jobs--- are directives: KEY=value. Comments must be on their own
+#     lines — an inline '# ...' after a value becomes part of the value.
 #   - After ---jobs---, one crawl per line, TAB-separated:
 #       start_path — directory ecrawl walks
 #       output_dir — where crawl output is written on *this* host (required if you use RSYNC_DEST);
@@ -25,6 +26,12 @@ RSYNC_DEST=backup.example.com:/var/lib/ereport-crawl/
 # Optional: remote shell for rsync (same -e as rsync)
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
+
+# Optional: any other ECRAWL_* directive is exported into ecrawl's environment
+# (see docs/environment-variables.md), e.g.:
+# ECRAWL_CRAWL_THREADS=16
+# ECRAWL_WRITER_THREADS=4
+# ECRAWL_UID_SHARDS=256
 
 # --- jobs (TAB-separated: start_path, output_dir) ---
 ---jobs---

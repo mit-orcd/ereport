@@ -69,7 +69,32 @@ check "rsync ran to mirror/out4" [ -d "$T/mirror/out4" ]
 check "remote has manifest" [ -f "$T/mirror/out4/crawl_manifest.txt" ]
 check "local shards removed after successful rsync" bash -c "! compgen -G '$T/out4/uid_shard_*.bin' >/dev/null"
 
-echo "== 5. unit files parse (if systemd-analyze is around) =="
+echo "== 5. ECRAWL_* env passthrough from conf =="
+printf 'ECRAWL_BIN=%s\nECRAWL_UID_SHARDS=4\nBOGUS_KEY=1\n---jobs---\n%s\t%s\n' \
+	"$ECRAWL" "$T/tree" "$T/out5" >"$T/env.conf"
+bash "$SCRIPT" "$T/env.conf" >"$T/env.log" 2>&1
+check "exit 0" [ $? -eq 0 ]
+check "unknown directive still warned" grep -q "ignoring unknown directive 'BOGUS_KEY'" "$T/env.log"
+check "ECRAWL_UID_SHARDS=4 reached ecrawl (manifest)" grep -q "^uid_shards=4$" "$T/out5/crawl_manifest.txt"
+
+echo "== 6. install.sh into staged dirs =="
+EREPORT_CONFDIR="$T/stage/etc" EREPORT_LIBDIR="$T/stage/lib" EREPORT_UNITDIR="$T/stage/units" \
+	bash contrib/systemd/install.sh >"$T/install.log" 2>&1
+check "exit 0" [ $? -eq 0 ]
+check "wrapper installed executable" [ -x "$T/stage/lib/ecrawl-daily.sh" ]
+check "service installed" [ -f "$T/stage/units/ecrawl-daily.service" ]
+check "timer installed" [ -f "$T/stage/units/ecrawl-daily.timer" ]
+check "config installed from example" [ -f "$T/stage/etc/ecrawl-daily.conf" ]
+check "ExecStart rewritten to staged libdir" \
+	grep -q "^ExecStart=$T/stage/lib/ecrawl-daily.sh " "$T/stage/units/ecrawl-daily.service"
+echo "# local edit" >>"$T/stage/etc/ecrawl-daily.conf"
+EREPORT_CONFDIR="$T/stage/etc" EREPORT_LIBDIR="$T/stage/lib" EREPORT_UNITDIR="$T/stage/units" \
+	bash contrib/systemd/install.sh >>"$T/install.log" 2>&1
+check "re-run exit 0" [ $? -eq 0 ]
+check "existing config not clobbered" grep -q "# local edit" "$T/stage/etc/ecrawl-daily.conf"
+check "re-run reports keeping config" grep -q "keeping existing" "$T/install.log"
+
+echo "== 7. unit files parse (if systemd-analyze is around) =="
 if command -v systemd-analyze >/dev/null; then
 	# verify checks that ExecStart resolves, and we cannot install to
 	# /usr/local here, so verify copies whose ExecStart points at a staged

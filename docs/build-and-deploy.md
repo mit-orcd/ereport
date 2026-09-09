@@ -66,7 +66,16 @@ On a 14.9M-path crawl with `EREPORT_INDEX_THREADS=64`, linking against jemalloc 
 
 Optional units under `contrib/systemd/` run `ecrawl` on paths listed in `/etc/ereport/ecrawl-daily.conf`, then `rsync` each job’s `output_dir` (crawl shard data) under `RSYNC_DEST` (typically `RSYNC_DEST/<basename(output_dir)>/`, or directly into `RSYNC_DEST` when its last path component already matches that basename); after each successful sync the script deletes matching crawl artifact files locally (see `contrib/systemd/ecrawl-daily.conf.example`).
 
-Install (adjust paths if you install elsewhere):
+Install (from the repo root; idempotent — an existing `/etc/ereport/ecrawl-daily.conf` is never overwritten):
+
+```bash
+sudo contrib/systemd/install.sh            # units + wrapper + example config
+# edit /etc/ereport/ecrawl-daily.conf
+sudo systemctl enable --now ecrawl-daily.timer
+# or in one step: sudo contrib/systemd/install.sh --enable
+```
+
+Or install manually (adjust paths if you install elsewhere):
 
 ```bash
 sudo install -d /etc/ereport /usr/local/lib/ereport
@@ -79,4 +88,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ecrawl-daily.timer
 ```
 
-Set `User=` / `Group=` in `ecrawl-daily.service` if the job must not run as root. The same block appears as comments at the top of `contrib/systemd/ecrawl-daily.service`.
+Customizing:
+
+- The unit sets `LimitNOFILE=65536` so the default 1024 soft fd limit for services cannot force shard LRU churn on mixed-UID trees.
+- Prefer drop-ins over editing the shipped unit (drop-ins survive reinstalls): `sudo systemctl edit ecrawl-daily.service` — e.g. `User=` / `Group=` if the job must not run as root, or `Environment=` lines.
+- `ecrawl` tuning env vars can also be set directly in `ecrawl-daily.conf`: any `ECRAWL_*` directive other than `ECRAWL_BIN` is exported into the crawl environment (see `docs/environment-variables.md`), e.g. `ECRAWL_CRAWL_THREADS=16`.
+- The service has no `[Install]` section on purpose: it is started by `ecrawl-daily.timer` only, never enabled on its own.
