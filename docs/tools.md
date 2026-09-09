@@ -2,6 +2,8 @@
 
 Full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`. For a brief overview and quick start, see the [README](../README.md). Tuning knobs are collected in [environment-variables.md](environment-variables.md); design rationale is in [performance.md](performance.md).
 
+How to read this page: each tool section leads with what it does, basic usage, and examples — enough for common use. Tuning knobs, diagnostics counters, and format/build internals are grouped under clearly marked subsections at the end of each section; stop reading once the common commands do what you need.
+
 Contents: [`ecrawl`](#ecrawl) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
 
 ## `ecrawl`
@@ -46,24 +48,6 @@ Positional arguments are only `start-path` (required) and optionally `output-dir
 
 Unexpected directory: If `fstatat` reports a directory where `d_type` said otherwise (rare: wrong `d_type` or rename race), `ecrawl` counts `stat_batch_unexpected_dir_total`, prints a `WARN` block on stderr after the run (up to 100 example paths; message notes truncation), and does not descend into those paths—so totals may be incomplete if that warning appears.
 
-Optional environment variables (no CLI flags for these; see also [environment-variables.md](environment-variables.md)):
-
-| Variable | Meaning |
-|----------|---------|
-| `ECRAWL_CRAWL_THREADS` | Crawl threads (minimum 1, default 16; no fixed maximum—practical limits are RAM and OS thread capacity). |
-| `ECRAWL_WRITER_THREADS` | Writer threads for uid-sharded `.bin` output (default 8). |
-| `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
-| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 512). |
-| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 64 = every shard a writer owns at the default 512 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
-| `ECRAWL_DONATE_CHECK_EVERY` | During `readdir`, check whether to donate local directory-stack work every `N` `DT_DIR` pushes (default 64; `1` = check after every directory child). |
-| `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | During `readdir`, also check every `N` dirents (default 4096; `0` disables). The check above is driven by subdirectories found, so a deep narrow chain — one subdirectory per directory, however many files — never reaches the donation floor and walks single-threaded. This one fires on entries read instead, and when peers are idle it hands over the directories the worker is holding; the worker is mid-`readdir`, so it keeps working either way. |
-| `ECRAWL_DONATE_CHUNK_FORCE_MAX` | When the local stack exceeds `ECRAWL_FORCE_DONATE_AT`, donate up to this many directories per queue push (default 2048). |
-| `ECRAWL_FORCE_DONATE_AT` | Spill local directory stack to the global task queue when it holds more than this many pending dirs (default 4096). |
-| `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | When every crawl thread already holds a popped task, still allow proactive donation if the local stack is at least this deep and the global queue is below `started × ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` (default 64 dirs; range `donate_floor`…65536). |
-| `ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` | Caps global task-queue depth for that “all busy” donation path (default 4; range 1…256). |
-| `ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH` | Coalesce `fstatat`-discovered subdir enqueues into fewer global queue pushes (default 48 paths per flush; range 1…4096). |
-| `ECRAWL_STALL_HINT_SECONDS` | Retained for compatibility; the 1 Hz rolling-window stats thread was removed, so stall hints are not emitted. |
-
 Examples:
 
 ```bash
@@ -93,6 +77,28 @@ Notes:
 - `--print0` (requires `--no-stat`) NUL-separates the stream, for paths containing newlines.
 - `ECRAWL_DEBUG_LOG` (megadir CSV) and `ECRAWL_PROGRESS_LOG` (1 Hz CSV) were removed; use `--progress` for live counts and `--verbose` for end-of-run metrics.
 - `--record-root` was removed: stored paths are always the canonical on-disk path. To relabel a crawl's paths (for example one root per storage server), rewrite them at report/index time with `ereport --path-rewrite OLD=NEW` / `ereport_index --make --path-rewrite OLD=NEW`.
+
+### Tuning (environment variables)
+
+Optional environment variables (no CLI flags for these; see also [environment-variables.md](environment-variables.md)):
+
+| Variable | Meaning |
+|----------|---------|
+| `ECRAWL_CRAWL_THREADS` | Crawl threads (minimum 1, default 16; no fixed maximum—practical limits are RAM and OS thread capacity). |
+| `ECRAWL_WRITER_THREADS` | Writer threads for uid-sharded `.bin` output (default 8). |
+| `ECRAWL_WRITER_QUEUE_BATCHES` | Max pending record batches per uid-shard writer queue when writing output (default 64, range 4…4096); larger values buffer more ~1 MiB batches in RAM. Ignored with `--no-write`. |
+| `ECRAWL_UID_SHARDS` | Number of uid shards; must be a power of two (default 512). |
+| `ECRAWL_MAX_OPEN_SHARDS` | Per-writer shard file cache target (default 64 = every shard a writer owns at the default 512 shards / 8 writers, so many-UID workloads avoid LRU open/close churn); automatically capped against the process open-file limit. |
+| `ECRAWL_DONATE_CHECK_EVERY` | During `readdir`, check whether to donate local directory-stack work every `N` `DT_DIR` pushes (default 64; `1` = check after every directory child). |
+| `ECRAWL_DONATE_ENTRY_CHECK_EVERY` | During `readdir`, also check every `N` dirents (default 4096; `0` disables). The check above is driven by subdirectories found, so a deep narrow chain — one subdirectory per directory, however many files — never reaches the donation floor and walks single-threaded. This one fires on entries read instead, and when peers are idle it hands over the directories the worker is holding; the worker is mid-`readdir`, so it keeps working either way. |
+| `ECRAWL_DONATE_CHUNK_FORCE_MAX` | When the local stack exceeds `ECRAWL_FORCE_DONATE_AT`, donate up to this many directories per queue push (default 2048). |
+| `ECRAWL_FORCE_DONATE_AT` | Spill local directory stack to the global task queue when it holds more than this many pending dirs (default 4096). |
+| `ECRAWL_DONATE_ALL_BUSY_MIN_STACK` | When every crawl thread already holds a popped task, still allow proactive donation if the local stack is at least this deep and the global queue is below `started × ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` (default 64 dirs; range `donate_floor`…65536). |
+| `ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT` | Caps global task-queue depth for that “all busy” donation path (default 4; range 1…256). |
+| `ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH` | Coalesce `fstatat`-discovered subdir enqueues into fewer global queue pushes (default 48 paths per flush; range 1…4096). |
+| `ECRAWL_STALL_HINT_SECONDS` | Stderr hint when the rolling window of entries stays at 0 for N consecutive seconds after warmup (default 5; `0` disables). |
+
+### Diagnostics counters
 
 After every run (including non-verbose), stdout includes lightweight queue contention counters (relaxed atomics only; cheap to collect):
 
@@ -506,6 +512,10 @@ Default behavior:
 - `--make` with only crawl directories (first token not a system user) writes under `./all_users/index/` unless `--index-dir` is set.
 - `--make` with only `<username|uid>` and no `bin_dir` arguments reads crawl input from `./` (same idea as `ereport`).
 - `--search [--index-dir <path>] <term>` — optional `--index-dir` (same flag as `--make`). If omitted, the index directory defaults to `./index` relative to the current working directory.
+### Tuning (environment)
+
+The defaults are fine for typical builds; reach for these only when a phase is visibly the bottleneck (see `--make` summary metrics below). All are also listed in [environment-variables.md](environment-variables.md).
+
 - `EREPORT_INDEX_THREADS` — optional; if set to an integer in 1…4096, sets parallelism for `--make` (default 32 when unset or invalid): chunk-boundary mapping runs with up to this many scanners across distinct input `.bin` files (capped by file count), and parse/index uses the same count for parallel chunk readers (parse workers). Trigram writers default to the same count; override with `EREPORT_INDEX_TRIGRAM_THREADS` (below). This does not set trigram merge worker count. Merge uses up to 16 workers by default, capped by available RAM (each merge worker may hold about 2× the largest `tmp_trigrams_*.bin` bucket in memory during sort). Tune merge parallelism with `EREPORT_INDEX_MERGE_RAM_FRAC` / `EREPORT_INDEX_MERGE_MEMORY_MB` (see below). Raising thread count increases peak RAM mostly by having more workers fill bounded queues (paths writer depth is `EREPORT_INDEX_WRITEQ_MAX_BATCHES`).
 - `EREPORT_INDEX_TRIGRAM_THREADS` — optional; parallel writers appending to `tmp_trigrams_*.bin` during `--make`. Defaults to `EREPORT_INDEX_THREADS` (same integer range 1…4096). Use when trigram temp I/O is the bottleneck and you can afford more concurrent bucket files (subject to `EREPORT_INDEX_MAX_OPEN_TRIGRAM_BUCKETS` / `ulimit -n`).
 - `EREPORT_INDEX_TRIGRAM_QUEUE_DEPTH` — optional; bounded queue of path jobs between the paths writer and trigram workers (range 512…262144). When unset, default depth scales with `EREPORT_INDEX_TRIGRAM_THREADS` (64× workers, minimum 4096, capped at 16384) so high parallelism does not starve workers as easily; override explicitly for more headroom (uses more RAM).

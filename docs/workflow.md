@@ -1,57 +1,38 @@
 # Typical workflow and output semantics
 
-The shortest path from crawl → HTML → search index → HTTP, plus how to read the byte/capacity totals each tool reports.
+The common path from crawl → HTML report → search index → HTTP, then the variations (per-user, multi-server), then how to read the byte/capacity totals each tool reports. The [README](../README.md) quick start is this same path compressed to five commands.
 
-## Typical workflow
-
-For multiple crawl outputs (e.g. several servers), run `ecrawl` once per output directory, then pass all of those directories to one `ereport` / `ereport_index --make` command so the report and search index stay unified. To relabel a crawl's stored paths (say to one root per server), use `--path-rewrite OLD=NEW` at report/index time rather than re-crawling. For an all-users aggregate report (`./ereport ctime …`), build the matching index with `ereport_index --make dir1 dir2 …` where the first argument is not a valid username/uid on this host—pass the same `bin_dir` list as for `ereport` (for example directory names only).
+## The common path
 
 ### 1. Crawl a filesystem
 
 ```bash
-./ecrawl /path/to/filesystem-tree
+./ecrawl /path/to/filesystem-tree crawl-out
 ```
 
-This writes binary shard files into an auto-generated output directory unless you provide one explicitly.
+Writes binary shard files into `crawl-out`; omit the directory and a timestamped one is created in the current working directory.
 
-### 2. Build a per-user report
+### 2. Build the HTML report
 
 ```bash
-./ereport alice atime host-a_apr-17-2026_15-03-01
+./ereport mtime crawl-out
 ```
 
-This writes:
+All-users report under `./all_users/`:
 
 ```text
-alice/index.html
-alice/bucket_a0_s0.html
+all_users/index.html
+all_users/bucket_a0_s0.html
 ...
 ```
 
-### 3. Optionally build a search index
-
-One crawl output directory (default index location is `./<username>/index/`):
+### 3. Build the search index (optional)
 
 ```bash
-./ereport_index --make alice host-a_apr-17-2026_15-03-01
+./ereport_index --make crawl-out
 ```
 
-Several crawl output directories (merged index for the same user):
-
-```bash
-./ereport_index --make alice crawl_srv01 crawl_srv02 crawl_srv03
-```
-
-Omit directories to use `./` as the only input path: `./ereport_index --make alice`.
-
-All-users index (same crawl inputs as `./ereport ctime …`). Omit a username: list crawl dirs first so the first token is not resolved as a login or uid:
-
-```bash
-./ereport_index --make crawl_srv01 crawl_srv02
-./ereport_index --search --index-dir all_users/index foo
-```
-
-By default this writes under `./all_users/index/` (unless `--index-dir` points elsewhere):
+Writes under `./all_users/index/` (unless `--index-dir` points elsewhere):
 
 ```text
 all_users/index/meta.txt
@@ -61,29 +42,63 @@ all_users/index/tri_keys.bin
 all_users/index/tri_postings.bin
 ```
 
-For a single-user index (example user `alice`), the same filenames appear under `alice/index/`.
+Command-line search (the report's search box does the same over HTTP):
 
-### 4. Serve the results over HTTP
+```bash
+./ereport_index --search --index-dir all_users/index foo
+```
+
+### 4. Serve over HTTP
+
+```bash
+make serve SERVE_ROOT=./all_users SERVE_PORT=8000
+```
+
+Open `http://127.0.0.1:8000/index.html`. The search box talks to `eserve.py`, which needs `ereport_index` built (`make ereport_index`), on `PATH`, or named by `EREPORT_INDEX_BIN`.
+
+## Variations
+
+### Per-user report and index
+
+Put a username or uid first:
+
+```bash
+./ereport alice mtime crawl-out          # → ./alice/
+./ereport_index --make alice crawl-out   # → ./alice/index/
+```
+
+Omitting the time basis selects `effective` (max of atime/mtime/ctime per file). `./ereport_index --make alice` with no directory reads crawl input from `./`.
+
+### Merging several servers into one report
+
+Run `ecrawl` once per server, then pass every crawl directory to one command so the report and search index stay unified:
+
+```bash
+./ereport mtime crawl_srv01 crawl_srv02 crawl_srv03
+./ereport_index --make crawl_srv01 crawl_srv02 crawl_srv03
+```
+
+Every directory must use the same shard layout and `uid_shards` count. For an all-users index, the first argument after `--make` must not resolve as a login/uid on this host — listing crawl directories first takes care of that. To relabel a crawl's stored paths (say one root per server), use `--path-rewrite OLD=NEW` at report/index time rather than re-crawling.
+
+### Serving a per-user report
 
 Pick `SERVE_ROOT` depending on how you want URLs to look:
 
-Option A — Serve the user directory directly (`index.html` at site root):
+Option A — serve the user directory directly (`index.html` at site root):
 
 ```bash
 make serve-public SERVE_ROOT=./alice SERVE_PORT=8000
 ```
 
-Open `http://127.0.0.1:8000/index.html`. Search requests go to `http://127.0.0.1:8000/search?q=…` (handled by `eserve.py`).
+Open `http://127.0.0.1:8000/index.html`; search requests go to `http://127.0.0.1:8000/search?q=…`.
 
-Option B — Serve a parent directory (URL includes username):
+Option B — serve a parent directory (URL includes the username):
 
 ```bash
 make serve-public SERVE_ROOT=. SERVE_PORT=8000
 ```
 
-Open `http://127.0.0.1:8000/alice/index.html`. Search requests resolve to `http://127.0.0.1:8000/alice/search?q=…`.
-
-Ensure `ereport_index` is built (`make ereport_index`) or set `EREPORT_INDEX_BIN` before starting the server.
+Open `http://127.0.0.1:8000/alice/index.html`; search requests resolve to `http://127.0.0.1:8000/alice/search?q=…`.
 
 ## Output semantics
 
