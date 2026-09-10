@@ -1303,6 +1303,10 @@ run_sunburst_tests() {
         "$(grep -o '"files":[0-9]*' "$ujson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
         "per-user sunburst and the query engine agree on the same uid's subtree file count"
 
+    # Snapshot the main report for --keep-html; sunburst.html embeds the JSON
+    # (const SUNBURST = ...), so the *.html copy alone stays fully browsable.
+    keep_html sunburst "$rep"
+
     summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out"
 }
 
