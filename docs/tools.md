@@ -360,6 +360,8 @@ Outputs:
 
 - `./<username>/index.html` — heat map, full statistics below the table, and an optional path search box (uses the server-side index when served via `eserve`). The search box is hidden unless the page URL carries a `?search` parameter (e.g. `index.html?search=1`), so index-less deployments never show a control that cannot answer — add the parameter to links only where the index exists.
 - `./<username>/bucket_aX_sY.html` — per age/size cell; brief summary HTML unless you pass `--bucket-details N` (see below). With `--bucket-details`, each page lists directory rollup tables for N path levels below the shared prefix inside that bucket.
+- `./<username>/sunburst.html` — clickable sunburst chart of where the bytes live (see [Sunburst view](#sunburst-view) below); linked from `index.html`.
+- `./<username>/sunburst.json` — the same tree as a tool-agnostic data source (schema below).
 - `./all_users/` — same layout; `./all_users/bucket_aX_sY.html` is a brief summary unless `--bucket-details` is used (heat-map totals on `index.html` always match the crawl).
 
 Place `--bucket-details N` (`N` = 1…32) first, before the username (if any) and time basis. Omit it for fast runs and small bucket HTML (no path reads for drill-down tables).
@@ -381,8 +383,8 @@ Heat map (`index.html`):
 Usage:
 
 ```bash
-./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
-./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
+./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [--no-sunburst] [--sunburst-depth N] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [--no-sunburst] [--sunburst-depth N] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
 ```
 
 If you omit every `bin_dir`, `ereport` reads crawl `.bin` files from the current working directory (`./`).
@@ -428,6 +430,30 @@ Subtree scoping:
 - `--index-dir DIR` — where `ereport_index --make` left `dirs.idx` / `rowgroups.idx` (see [dir-index sidecars](#index-dir-answering-from-the-directory-index-sidecars)). Only `--subtree` uses them, and only as a shortcut to what the scan already computes: every catalog dir_id whose reconstructed path equals the subtree is resolved once per shard from `dirs.idx` (duplicate paths are unioned), row groups whose DFS sketch cannot reach any of those ranges are never opened, and membership becomes a bit test on the record's `parent_dir_id` instead of a rebuilt path and a string compare — which also retires the reconstruction the histogram-only path was forced into. The report is byte-identical either way; `subtree_from=dir_index` plus `rowgroups_kept` / `rowgroups_total` / `rowgroup_records_kept` on stdout say the route was taken. A missing, stale or truncated sidecar, one that does not name every shard being read, or a `--subtree` that names something other than a directory falls back to the path-prefix behaviour with the same output. Ignored under `--path-rewrite` (the filter then runs in a namespace the catalogs know nothing about) and for `--subtree /`.
 - `Scanned records` counts the whole capture either way. Pruning changes how much of it is decoded, not what the report stands for, so the records in dropped row groups are credited back; `rowgroup_records_kept` is what was actually read.
 - `manifest_*` lines (e.g. `total_allocated_bytes`) come from `crawl_manifest.txt` and still describe the whole crawl, not the subtree.
+
+Sunburst view:
+
+- On by default: every run writes `sunburst.html` (a self-contained, dependency-free chart page — click a wedge to zoom, click the center to go back, toggle bytes/files) and `sunburst.json` (the same tree for other tools) next to `index.html`, which links to it. `--no-sunburst` skips both; `--sunburst-depth N` (1–32, default 6) sets how many levels below the displayed root are broken out.
+- Zero extra input I/O: parse workers credit each matched record's accounted bytes / file count to the record's `parent_dir_id` column (no path strings are read for this), and after the scan one pass over the already-loaded shard catalogs rolls those into per-directory subtree totals and merges them by path. The chart therefore reflects exactly the records the report counted — uid filter, `--subtree`, and `--path-rewrite` all apply — and its grand total matches `du -sb` of the crawled tree (hardlinks deduped).
+- The displayed root is the deepest directory that still holds all the content on its own (the single-child ancestor chain above the crawl root is collapsed, and its directory records are credited to the root). If the bins hold content under more than one top-level directory — multiple crawl roots, or strays outside one — the root is `/`. A directory's own record is credited to its parent, matching the catalog's `subtree_*` convention, so a non-root node's total is `du -sb` of that directory minus the directory's own apparent size.
+- Trimming keeps the chart readable at any scale: per node, the top 12 children by bytes or by files (ties on one metric break by the other) survive if they are at least 0.1% of their parent in that metric; everything else folds into an `(other)` leaf (its `path` is the parent's plus `/(other)`, so flat id conversions never see duplicate ids). At the depth limit a node is emitted as a leaf carrying its whole subtree total. Bytes/files sitting directly in a directory (not in any child) render as a gray `(self)` wedge added by the page.
+- `sunburst.json` schema: one root node, recursively `{ "name", "path", "bytes", "files", "children"? }`. Internal nodes carry *self* values (records directly in that directory); leaves carry *subtree totals* (a depth-folded leaf includes everything below it). So a node's total is its own `bytes`/`files` plus the sum over its children, and the plain sum of every `bytes` value in the document is the grand total. Names are JSON-escaped (`<`, `>`, `&` included, so the same JSON is safe to embed in HTML); numbers are unsigned 64-bit — JavaScript treats them exactly only below 2^53.
+- Conversion recipe for flat-table tools (Plotly `px.sunburst`, etc.):
+
+  ```python
+  import json, plotly.express as px
+  def tot(n):  # subtree total: self bytes + children's subtree totals
+      return n["bytes"] + sum(tot(c) for c in n.get("children", []))
+  def rows(n, parent=""):
+      yield n["path"], parent, tot(n)
+      for c in n.get("children", []):
+          yield from rows(c, n["path"])
+  ids, parents, values = zip(*rows(json.load(open("sunburst.json"))))
+  px.sunburst(ids=ids, parents=parents, values=values,
+              branchvalues="total").write_html("plotly.html")
+  ```
+
+- Deferred by design (v2): a client-side age slider and a per-user split inside an all-users sunburst — both multiply the JSON size (per-node per-bucket arrays), and per-user runs already produce their own sunburst.
 
 Runtime behavior:
 

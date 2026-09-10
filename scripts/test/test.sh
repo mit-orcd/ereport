@@ -1158,6 +1158,154 @@ run_ecrawl_progress_tests() {
 # Duplicate catalog dir_ids reconstructing to the same path: --subtree must union
 # every DFS range. A clean crawl cannot produce this; the helper writes a synthetic
 # shard with two /dup roots, each holding one file.
+run_sunburst_tests() {
+    local td=$1
+    local tree="${td}/sb_tree" out="${td}/sb_crawl" log="${td}/sb.crawl.log"
+
+    section_int "[integration] ereport sunburst view"
+
+    # Nested dirs + a hardlink pair + an empty dir, and a 20-wide fanout to
+    # exercise top-N trimming and the (other) fold.
+    mkdir -p "${tree}/a/a1" "${tree}/b" "${tree}/c"
+    head -c 1000 /dev/zero >"${tree}/a/f1"
+    head -c 2000 /dev/zero >"${tree}/a/a1/f2"
+    head -c 4000 /dev/zero >"${tree}/c/f3"
+    ln "${tree}/c/f3" "${tree}/c/f3link"
+    head -c 500 /dev/zero >"${tree}/top"
+    local i
+    for i in $(seq 1 20); do
+        mkdir -p "${tree}/w/d$i"
+        head -c $((i * 100)) /dev/zero >"${tree}/w/d$i/f"
+    done
+    # A 2 MB file at the root dominates the grand total, so deep/x/y (~4 KB) is far
+    # below 0.1% of the root — but y holds ~25% of its parent, so a parent-relative
+    # min-fraction keeps it (regression: root-relative trimming folded every small
+    # deep directory into (other), leaving nothing to drill into).
+    mkdir -p "${tree}/deep/x/y"
+    head -c 3000 /dev/zero >"${tree}/deep/x/f_deep"
+    head -c 1000 /dev/zero >"${tree}/deep/x/y/f_leaf"
+    head -c 2000000 /dev/zero >"${tree}/big"
+
+    local tree_abs
+    tree_abs=$(cd "$tree" && pwd -P)
+
+    ECRAWL_CRAWL_THREADS=2 "$ECRAWL" "$tree_abs" "$out" >"$log" 2>&1 || {
+        tail -n 40 "$log" >&2 || true
+        die "ecrawl failed on the sunburst fixture"
+    }
+
+    local rep="${td}/sb_report"
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "$rep" mtime "$out" >"${td}/sb.au.out" 2>"${td}/sb.au.err" || {
+        tail -n 40 "${td}/sb.au.err" >&2 || true
+        die "ereport (all users) failed on the sunburst fixture"
+    }
+
+    local sdir="${rep}/all_users" sjson="${rep}/all_users/sunburst.json"
+    [[ -f "$sjson" && -f "${sdir}/sunburst.html" ]] ||
+        die "sunburst.json/sunburst.html missing in ${sdir}"
+    grep -q 'href="sunburst.html"' "${sdir}/index.html" ||
+        die "index.html does not link the sunburst page"
+    grep -q 'const SUNBURST = {"name"' "${sdir}/sunburst.html" ||
+        die "sunburst.html does not embed the JSON"
+
+    # The JSON is compact: internal nodes carry self values and leaves carry folded
+    # subtree totals, so every byte is attributed exactly once and the plain sum of
+    # every "bytes" value is the grand total. Same for "files".
+    local sb_bytes sb_files erep_bytes
+    sb_bytes=$(grep -o '"bytes":[0-9]*' "$sjson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')
+    sb_files=$(grep -o '"files":[0-9]*' "$sjson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')
+    erep_bytes=$(( $(kv_last total_capacity_in_files "${td}/sb.au.out") +
+                   $(kv_last total_capacity_in_non_files "${td}/sb.au.out") +
+                   $(kv_last total_capacity_in_others "${td}/sb.au.out") ))
+    expect_eq "sunburst: grand-total bytes vs ereport capacity" "$erep_bytes" "$sb_bytes" \
+        "sunburst accounts every matched record exactly once"
+    expect_eq "sunburst: grand-total bytes vs apparent-size sum" "$(tree_apparent_bytes "$tree_abs")" \
+        "$sb_bytes" "sunburst bytes match du -sb semantics (hardlinks deduped)"
+    expect_eq "sunburst: grand-total files vs ereport files" "$(kv_last files "${td}/sb.au.out")" \
+        "$sb_files" "sunburst file count matches the report"
+
+    # Collapse: the displayed root is the crawl root, not the ancestor chain above it.
+    local root_prefix
+    root_prefix=$(printf '{"name":"%s","path":"%s"' "${tree_abs##*/}" "$tree_abs")
+    [[ "$(head -c "${#root_prefix}" "$sjson")" == "$root_prefix" ]] ||
+        die "sunburst root is not the collapsed crawl root: $(head -c 200 "$sjson")"
+
+    # Trimming: the 20-wide fanout under w/ keeps the top 12 (one file per directory
+    # ties on files and breaks by bytes, so the union is exactly 12) and folds the
+    # rest into a single (other) leaf.
+    local w_real w_other
+    w_real=$(grep -o '"name":"d[0-9]*"' "$sjson" | wc -l)
+    w_other=$(grep -o '"name":"(other)"' "$sjson" | wc -l)
+    expect_eq "sunburst: wide directory trimmed to top 12" "12" "$w_real" \
+        "top-N trim keeps 12 of 20 children"
+    expect_eq "sunburst: trimmed children fold into (other)" "1" "$w_other" \
+        "the 8 trimmed children are represented by one (other) leaf"
+
+    # Min-fraction is parent-relative: deep/x/y is below 0.1% of the grand total
+    # (the 2 MB root file dominates) but y is ~25% of its parent, so it survives
+    # as a real node instead of folding into (other).
+    expect_eq "sunburst: min-fraction is parent-relative" "1" \
+        "$(grep -o '"name":"y"' "$sjson" | wc -l)" \
+        "a child significant within its parent survives at any depth"
+
+    # Depth fold: with --sunburst-depth 1 only the root keeps children; the grand
+    # total is unchanged because folded leaves carry their subtree totals.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_d1" --sunburst-depth 1 mtime "$out" \
+        >"${td}/sb.d1.out" 2>"${td}/sb.d1.err" || die "ereport --sunburst-depth 1 failed"
+    local d1json="${rep}_d1/all_users/sunburst.json"
+    expect_eq "sunburst --sunburst-depth 1: only the root has children" "1" \
+        "$(grep -o '"children"' "$d1json" | wc -l)" \
+        "children arrays appear at the root only"
+    expect_eq "sunburst --sunburst-depth 1: folded leaves keep the grand total" "$sb_bytes" \
+        "$(grep -o '"bytes":[0-9]*' "$d1json" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
+        "folding changes granularity, not totals"
+
+    # Opt-out: --no-sunburst writes neither file and no link.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_off" --no-sunburst mtime "$out" \
+        >"${td}/sb.off.out" 2>"${td}/sb.off.err" || die "ereport --no-sunburst failed"
+    [[ ! -e "${rep}_off/all_users/sunburst.json" && ! -e "${rep}_off/all_users/sunburst.html" ]] ||
+        die "--no-sunburst still wrote sunburst files"
+    grep -q 'sunburst.html' "${rep}_off/all_users/index.html" &&
+        die "--no-sunburst still links the sunburst page"
+
+    # --subtree: the displayed root is the subtree root itself (it has a direct file,
+    # so the single-child collapse stops there), and totals scope to the subtree.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_sub" --subtree "${tree_abs}/a" mtime "$out" \
+        >"${td}/sb.sub.out" 2>"${td}/sb.sub.err" || die "ereport --subtree failed"
+    local subjson="${rep}_sub/all_users/sunburst.json"
+    root_prefix=$(printf '{"name":"%s","path":"%s"' "a" "${tree_abs}/a")
+    [[ "$(head -c "${#root_prefix}" "$subjson")" == "$root_prefix" ]] ||
+        die "sunburst --subtree root is not the subtree root: $(head -c 200 "$subjson")"
+    expect_eq "sunburst --subtree: grand-total bytes vs subtree apparent size" \
+        "$(tree_apparent_bytes "${tree_abs}/a")" \
+        "$(grep -o '"bytes":[0-9]*' "$subjson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
+        "subtree sunburst totals scope to the subtree"
+
+    # --path-rewrite applies to the reconstructed sunburst paths as well.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_rw" --path-rewrite "${tree_abs}=/rewritten" \
+        mtime "$out" >"${td}/sb.rw.out" 2>"${td}/sb.rw.err" || die "ereport --path-rewrite failed"
+    root_prefix=$(printf '{"name":"%s","path":"%s"' "rewritten" "/rewritten")
+    [[ "$(head -c "${#root_prefix}" "${rep}_rw/all_users/sunburst.json")" == "$root_prefix" ]] ||
+        die "sunburst --path-rewrite root is not rewritten: $(head -c 200 "${rep}_rw/all_users/sunburst.json")"
+
+    # Per-user run vs ecrawl_query's own subtree aggregate for the same uid.
+    local u rep_u="${rep}_user" ujson q="${td}/sb.query"
+    u=$(id -u)
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "$rep_u" "$(id -un)" mtime "$out" \
+        >"${td}/sb.su.out" 2>"${td}/sb.su.err" || die "ereport (single user) failed on the sunburst fixture"
+    ujson=$(ls "${rep_u}"/*/sunburst.json 2>/dev/null) || die "per-user sunburst.json missing"
+    ECRAWL_QUERY_THREADS=1 "$ECRAWL_QUERY" --uid "$u" --subtree "$tree_abs" "$out" >"$q" 2>&1 ||
+        die "ecrawl_query --uid --subtree failed"
+    expect_eq "sunburst per-user bytes vs ecrawl_query --uid --subtree" "$(kv_last bytes "$q")" \
+        "$(grep -o '"bytes":[0-9]*' "$ujson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
+        "per-user sunburst and the query engine agree on the same uid's subtree bytes"
+    expect_eq "sunburst per-user files vs ecrawl_query --uid --subtree" "$(kv_last files "$q")" \
+        "$(grep -o '"files":[0-9]*' "$ujson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
+        "per-user sunburst and the query engine agree on the same uid's subtree file count"
+
+    summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out"
+}
+
 run_subtree_dup_tests() {
     local td=$1
     local out="${td}/dup_catalog"
@@ -2487,6 +2635,8 @@ run_integration() {
     summary_add PASS "ecrawl_query block skipping" "parity+strict-boundary+all-skip+accounting"
 
     run_v8_rollup_tests "$td"
+
+    run_sunburst_tests "$td"
 
     run_subtree_dup_tests "$td"
 

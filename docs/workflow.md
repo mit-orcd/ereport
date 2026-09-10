@@ -24,6 +24,8 @@ All-users report under `./all_users/`:
 all_users/index.html
 all_users/bucket_a0_s0.html
 ...
+all_users/sunburst.html    # clickable "where the bytes live" chart, linked from index.html
+all_users/sunburst.json    # the same tree as data (schema: docs/tools.md#ereport)
 ```
 
 ### 3. Build the search index (optional)

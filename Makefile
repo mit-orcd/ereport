@@ -163,6 +163,10 @@ crawl_bin_block.o: crawl_bin_block.c crawl_bin_block.h crawl_bin_codec.h crawl_b
 trigram_extract.o: trigram_extract.c trigram_extract.h
 	$(CC) $(CFLAGS) -c trigram_extract.c -o trigram_extract.o
 
+# Sunburst aggregation + JSON/HTML emitters for ereport.
+ereport_sunburst.o: ereport_sunburst.c ereport_sunburst.h crawl_bin_catalog.h
+	$(CC) $(CFLAGS) -c ereport_sunburst.c -o ereport_sunburst.o
+
 test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
 	$(CC) $(CFLAGS) -o $@ test_crawl_codec.c crawl_bin_codec.o
 
@@ -184,8 +188,8 @@ edelete: edelete.c path_canon.h path_utils.h path_utils.o
 ecrawl_query: ecrawl_query.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl_query.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
-ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
+ereport: ereport.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o crawl_sidecar.h crawl_sidecar.o ereport_sunburst.h ereport_sunburst.o
+	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport.c path_utils.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o crawl_sidecar.o ereport_sunburst.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
 
 ereport_index: ereport_index.c alloc_tuning.h crawl_ckpt.h path_canon.h crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.h crawl_fpcache.o trigram_extract.h trigram_extract.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ereport_index.c crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_fpcache.o trigram_extract.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)

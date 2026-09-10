@@ -14,14 +14,16 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
  *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
  *     --index-dir DIR (optional): dirs.idx / rowgroups.idx from `ereport_index --make`. Only --subtree uses them,
  *     and only as a shortcut to the same answer; anything unusable about them falls back silently.
+ *     --no-sunburst (optional): skip the sunburst view (sunburst.json / sunburst.html next to index.html).
+ *     --sunburst-depth N (optional): levels below the sunburst root (1…32, default 6).
  *     --verbose (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
  *     no I/O counter atomics on hot paths). While verbose, stderr prints ecrawl-style `key=value` progress
  *     about every 30s (idle counters omitted). Thread count remains EREPORT_THREADS.
@@ -75,6 +77,7 @@
 #include "crawl_ckpt.h"
 #include "crawl_fpcache.h"
 #include "crawl_sidecar.h"
+#include "ereport_sunburst.h"
 #include "path_canon.h"
 #include "path_utils.h"
 
@@ -600,11 +603,14 @@ typedef struct {
     uint64_t inode;
 } inode_key_t;
 
-#define INODE_SET_SHARDS 64
+#define INODE_SET_SHARDS 256
 
 typedef struct {
+    /* Open addressing over a single keys array; keys[i].inode == 0 marks an empty
+     * slot (inode 0 is never inserted). Keeping the occupancy bit inside the key
+     * halves probe traffic versus a separate used[] bitmap: one cache line per
+     * probe instead of two, which matters at tens of millions of entries. */
     inode_key_t *keys;
-    unsigned char *used;
     size_t cap;
     size_t count;
     pthread_mutex_t mutex;
@@ -613,6 +619,7 @@ typedef struct {
 typedef struct {
     inode_set_shard_t shard[INODE_SET_SHARDS];
 } inode_set_t;
+
 
 typedef struct {
     uint64_t *keys;
@@ -984,6 +991,15 @@ static uint32_t g_input_uid_shards = 0;
 /* Set once from resolved login name via set_bucket_output_dir(); see main(). Not "." / not "tmp" unless fallback. */
 static char g_bucket_output_dir[PATH_MAX];
 
+/* Sunburst view (ereport_sunburst.c): per-shard accumulators are indexed by file_index and
+ * sized from the shard catalog; the merged tree is built after the workers join (catalogs
+ * still attached) and written once the report output directory exists. */
+static int g_sunburst_enabled = 1;
+static unsigned g_sunburst_depth = 6;
+static ereport_sunburst_accum_t *g_sunburst_acc = NULL; /* [path_count] */
+static ereport_sunburst_tree_t *g_sunburst_tree = NULL;
+static int g_sunburst_written = 0;
+
 typedef struct {
     char *path;
     uint64_t hash; /* cached full-path FNV-1a; reused by rehash + map merge so paths aren't re-hashed */
@@ -1035,29 +1051,21 @@ static uint64_t inode_key_hash(uint32_t dev_major, uint32_t dev_minor, uint64_t 
 
 static int inode_shard_rehash_locked(inode_set_shard_t *sh, size_t new_cap) {
     inode_key_t *new_keys = (inode_key_t *)calloc(new_cap, sizeof(*new_keys));
-    unsigned char *new_used = (unsigned char *)calloc(new_cap, sizeof(*new_used));
     size_t i;
 
-    if (!new_keys || !new_used) {
-        free(new_keys);
-        free(new_used);
-        return -1;
-    }
+    if (!new_keys) return -1;
 
     for (i = 0; i < sh->cap; i++) {
-        if (sh->used[i]) {
+        if (sh->keys[i].inode != 0) {
             inode_key_t key = sh->keys[i];
             size_t idx = (size_t)(inode_key_hash(key.dev_major, key.dev_minor, key.inode) & (new_cap - 1));
-            while (new_used[idx]) idx = (idx + 1) & (new_cap - 1);
+            while (new_keys[idx].inode != 0) idx = (idx + 1) & (new_cap - 1);
             new_keys[idx] = key;
-            new_used[idx] = 1;
         }
     }
 
     free(sh->keys);
-    free(sh->used);
     sh->keys = new_keys;
-    sh->used = new_used;
     sh->cap = new_cap;
     return 0;
 }
@@ -1077,20 +1085,15 @@ static int inode_set_init(inode_set_t *s, size_t initial_cap) {
         inode_set_shard_t *sh = &s->shard[si];
 
         sh->keys = (inode_key_t *)calloc(cap, sizeof(*sh->keys));
-        sh->used = (unsigned char *)calloc(cap, sizeof(*sh->used));
-        if (!sh->keys || !sh->used) {
+        if (!sh->keys) {
             int j;
             for (j = 0; j < si; j++) {
                 free(s->shard[j].keys);
-                free(s->shard[j].used);
                 s->shard[j].keys = NULL;
-                s->shard[j].used = NULL;
                 s->shard[j].cap = 0;
                 s->shard[j].count = 0;
                 pthread_mutex_destroy(&s->shard[j].mutex);
             }
-            free(sh->keys);
-            free(sh->used);
             return -1;
         }
         sh->cap = cap;
@@ -1108,9 +1111,7 @@ static void inode_set_destroy(inode_set_t *s) {
         inode_set_shard_t *sh = &s->shard[si];
 
         free(sh->keys);
-        free(sh->used);
         sh->keys = NULL;
-        sh->used = NULL;
         sh->cap = 0;
         sh->count = 0;
         pthread_mutex_destroy(&sh->mutex);
@@ -1139,7 +1140,7 @@ static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t 
     }
 
     idx = (size_t)(hh & (sh->cap - 1));
-    while (sh->used[idx]) {
+    while (sh->keys[idx].inode != 0) {
         inode_key_t *k = &sh->keys[idx];
         if (k->dev_major == dev_major && k->dev_minor == dev_minor && k->inode == inode) {
             pthread_mutex_unlock(&sh->mutex);
@@ -1148,7 +1149,6 @@ static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t 
         idx = (idx + 1) & (sh->cap - 1);
     }
 
-    sh->used[idx] = 1;
     sh->keys[idx].dev_major = dev_major;
     sh->keys[idx].dev_minor = dev_minor;
     sh->keys[idx].inode = inode;
@@ -3376,7 +3376,7 @@ static void ereport_print_memstats(const worker_arg_t *args, int nthreads, const
         int s;
         for (s = 0; s < INODE_SET_SHARDS; s++) {
             inode_cnt += inodes->shard[s].count;
-            inode_bytes += inodes->shard[s].cap * (sizeof(inode_key_t) + 1);
+            inode_bytes += inodes->shard[s].cap * sizeof(inode_key_t);
         }
     }
     catalog_bytes = ereport_catalog_bytes(file_states, path_count);
@@ -8525,6 +8525,18 @@ static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t pa
     return 0;
 }
 
+/* Sunburst accumulation. Records arrive in contiguous same-directory runs, so the worker
+ * buffers the current run locally and flushes one relaxed atomic add per directory change
+ * instead of one per record. */
+static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t bytes, uint64_t files) {
+    ereport_sunburst_accum_t *a;
+    if (!g_sunburst_acc || file_index == UINT64_MAX || dir_id == 0ULL || (bytes | files) == 0) return;
+    a = &g_sunburst_acc[file_index];
+    if (!a->bytes || dir_id > a->max_dir_id) return;
+    if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
+    if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
+}
+
 static int read_one_chunk(const file_chunk_t *chunk,
                           file_state_t *file_states,
                           uid_t target_uid,
@@ -8591,10 +8603,29 @@ static int read_one_chunk(const file_chunk_t *chunk,
             if (progress) progress->bad_input_files++;
             goto out;
         }
-        /* Age buckets, capacity totals and the hardlink dedup between them touch
-         * every column except gid and mode, which nothing in the report reads. */
-        (void)crawl_bin_block_reader_set_projection(
-            &br, CRAWL_PROJECTION_ALL & ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE)));
+        /* Decode only the columns this run actually reads. gid/mode are never used.
+         * Names are only needed when paths are retained (--bucket-details) or the
+         * --subtree filter needs them (the sidecar-less prefix test, and the
+         * subtree root's own record compare); on the default fast path no path
+         * string is built at all. atime/ctime feed only pick_time under those
+         * bases and the bucket-details ctime-led badge (which reads all three);
+         * mtime always stays because atime/ctime chunks can be REF_MTIME-encoded
+         * and need the mtime column decoded to reconstruct. Unwanted columns are
+         * seek-skipped per row group, so each one dropped here is decode + zstd
+         * time saved outright. */
+        {
+            uint32_t proj = CRAWL_PROJECTION_ALL &
+                            ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE));
+            if (bucket_detail_levels == 0 && !g_subtree_prefix)
+                proj &= ~(CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
+            if (bucket_detail_levels == 0) {
+                if (basis != TIME_ATIME && basis != TIME_EFFECTIVE)
+                    proj &= ~CRAWL_COL_BIT(CRAWL_COL_ATIME);
+                if (basis != TIME_CTIME && basis != TIME_EFFECTIVE)
+                    proj &= ~CRAWL_COL_BIT(CRAWL_COL_CTIME);
+            }
+            (void)crawl_bin_block_reader_set_projection(&br, proj);
+        }
         /* inode and dev are read only under `if (r.nlink > 1)` below, so row groups whose NLINK zone
          * map tops out at 1 -- most of them on a tree without hardlinks -- can skip all three. */
         (void)crawl_bin_block_reader_set_hardlink_columns(&br, CRAWL_COL_BIT(CRAWL_COL_INODE) |
@@ -8608,6 +8639,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
     dir_cache.id = 0;
     dir_cache.len = 0;
 
+    /* Sunburst run buffer: the (file_index, parent_dir_id) run currently being
+     * accumulated locally; flushed on change and at chunk end. */
+    uint64_t sb_fi = UINT64_MAX;
+    uint64_t sb_dir = 0;
+    uint64_t sb_bytes = 0;
+    uint64_t sb_files = 0;
     /* Record-level parent cache: the three shape/fanout accumulators all need the
      * parent dir string and its dense hash. Derive both once per distinct parent_id
      * here and share them, instead of each accumulator recomputing on its own miss. */
@@ -8661,7 +8698,6 @@ static int read_one_chunk(const file_chunk_t *chunk,
             if (progress) progress->bad_input_files++;
             break;
         }
-
         sum->scanned_records++;
         if (progress) {
             progress->scanned_records++;
@@ -8892,6 +8928,22 @@ static int read_one_chunk(const file_chunk_t *chunk,
             accounted_size = r.size;
         }
 
+        /* Sunburst: credit the record to its parent directory. Every filter has already
+         * run (uid, subtree), so this matches the report totals; accounted_size carries
+         * the hardlink dedup, and no path string is needed. */
+        if (g_sunburst_acc) {
+            if ((uint64_t)chunk->file_index == sb_fi && r.parent_dir_id == sb_dir) {
+                sb_bytes += accounted_size;
+                sb_files += (r.type == 'f');
+            } else {
+                sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files);
+                sb_fi = (uint64_t)chunk->file_index;
+                sb_dir = r.parent_dir_id;
+                sb_bytes = accounted_size;
+                sb_files = (r.type == 'f');
+            }
+        }
+
         if (!skip_paths) {
             int mrc = share_paths
                 ? matched_records_append_ptr(matched_records, stored_parent, stored_leaf, r.type, accounted_size)
@@ -8911,6 +8963,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
                                               r.type, rec_time, sum, shp, shp_h);
         }
     }
+    sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files);
 #undef PARENT_KEY
 
 out:
@@ -9937,6 +9990,12 @@ static int emit_html(const char *report_path,
                 BUCKET_DETAIL_LEVELS_MAX);
     }
 
+    /* Sunburst: written before finalize begins, so the link is emitted exactly when
+     * the page exists. */
+    if (g_sunburst_written)
+        fprintf(out, "<p class=\"report-nav\"><a href=\"sunburst.html\">Sunburst view</a> &mdash; "
+                     "where the bytes live, as a clickable chart.</p>\n");
+
     /* The search box is opt-in: it only works when the report is served alongside a
      * trigram index, which is not always built. Hidden unless the URL carries
      * ?search (the inline script below unhides it), so index-less deployments never
@@ -10823,11 +10882,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--verbose] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10850,6 +10909,10 @@ int main(int argc, char **argv) {
                 "instead of a rebuilt path. The report is identical either way; a sidecar that is absent, stale, or "
                 "does not name every shard is ignored.\n");
         fprintf(stderr,
+                "Optional --no-sunburst: skip the sunburst view. Default on: aggregates per-directory totals "
+                "during the scan (no extra input I/O) and writes sunburst.json + sunburst.html next to "
+                "index.html; --sunburst-depth N sets the levels below the sunburst root (1…32, default 6).\n");
+        fprintf(stderr,
                 "Optional --verbose: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics); stderr prints ecrawl-style `key=value` progress about "
                 "every 30s (idle counters omitted).\n");
@@ -10864,6 +10927,7 @@ int main(int argc, char **argv) {
     {
         int ac = argc;
         char **av = argv;
+        int sunburst_depth_seen = 0;
 
         for (;;) {
             if (ac > 1 && strcmp(av[1], "--bucket-details") == 0) {
@@ -10928,6 +10992,42 @@ int main(int argc, char **argv) {
                 g_ereport_verbose = 1;
                 memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
                 ac -= 1;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--no-sunburst") == 0) {
+                if (!g_sunburst_enabled) {
+                    fprintf(stderr, "ereport: duplicate --no-sunburst\n");
+                    return 2;
+                }
+                g_sunburst_enabled = 0;
+                memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                ac -= 1;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--sunburst-depth") == 0) {
+                char *end;
+                long lv;
+
+                if (sunburst_depth_seen) {
+                    fprintf(stderr, "ereport: duplicate --sunburst-depth\n");
+                    return 2;
+                }
+                if (ac < 3) {
+                    fprintf(stderr, "ereport: --sunburst-depth requires a number\n");
+                    return 2;
+                }
+                errno = 0;
+                lv = strtol(av[2], &end, 10);
+                if (errno || end == av[2] || *end || lv < 1 || lv > 32) {
+                    fprintf(stderr, "ereport: --sunburst-depth must be between 1 and 32\n");
+                    return 2;
+                }
+                g_sunburst_depth = (unsigned)lv;
+                sunburst_depth_seen = 1;
+                memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
+                ac -= 2;
                 argc = ac;
                 continue;
             }
@@ -11659,6 +11759,29 @@ chunks_ready:
         }
     }
 
+    /* Sunburst accumulators: 16 bytes per catalog directory per shard, allocated only for
+     * shards that will actually be read (catalog attached). A failed allocation turns the
+     * feature off rather than failing the report. */
+    if (g_sunburst_enabled) {
+        size_t fi;
+
+        g_sunburst_acc = calloc(path_count, sizeof(*g_sunburst_acc));
+        if (g_sunburst_acc) {
+            for (fi = 0; fi < path_count; fi++) {
+                if (!file_states[fi].catalog) continue;
+                if (ereport_sunburst_accum_init(&g_sunburst_acc[fi],
+                                                file_states[fi].catalog->max_dir_id) != 0) {
+                    while (fi-- > 0) ereport_sunburst_accum_free(&g_sunburst_acc[fi]);
+                    free(g_sunburst_acc);
+                    g_sunburst_acc = NULL;
+                    break;
+                }
+            }
+        }
+        if (!g_sunburst_acc)
+            fprintf(stderr, "warn: sunburst accumulator allocation failed; sunburst view disabled\n");
+    }
+
     /*
      * --index-dir: close the subtree over each shard's parent pointers, once, so the scan can
      * answer "is this record's parent inside?" with a bit test.
@@ -11861,6 +11984,27 @@ chunks_ready:
         if (getenv("EREPORT_MEMSTATS")) {
             clear_status_line();
             ereport_print_memstats(args, threads_used, &seen_inodes, file_states, path_count);
+        }
+
+        /* Sunburst: roll the per-shard accumulators up the catalog trees and merge into one
+         * path-keyed tree. Must run here: the workers have joined (accumulators complete) and
+         * the catalogs are still attached (the rollup and path reconstruction need them). The
+         * merged tree is small -- bounded to g_sunburst_depth levels below the collapsed root --
+         * and is written once the report output directory exists. */
+        if (g_sunburst_acc) {
+            crawl_bin_catalog_t **cats = malloc(path_count * sizeof(*cats));
+            if (cats) {
+                for (i = 0; (size_t)i < path_count; i++) cats[i] = file_states[i].catalog;
+                g_sunburst_tree = ereport_sunburst_build(cats, g_sunburst_acc, path_count,
+                                                         g_sunburst_depth, threads_used,
+                                                         g_rewrite_from, g_rewrite_to);
+                free(cats);
+                if (!g_sunburst_tree)
+                    fprintf(stderr, "warn: sunburst tree build failed; sunburst view disabled\n");
+            }
+            for (i = 0; (size_t)i < path_count; i++) ereport_sunburst_accum_free(&g_sunburst_acc[i]);
+            free(g_sunburst_acc);
+            g_sunburst_acc = NULL;
         }
 
         /* The shard catalogs back path reconstruction during the read phase only; nothing in
@@ -12125,6 +12269,19 @@ chunks_ready:
         return 1;
     }
     (void)path_try_resolve_inplace(g_bucket_output_dir, sizeof(g_bucket_output_dir));
+
+    if (g_sunburst_tree) {
+        if (ereport_sunburst_write(g_sunburst_tree, g_bucket_output_dir, display_name) == 0) {
+            g_sunburst_written = 1;
+            if (g_ereport_verbose)
+                fprintf(stderr, "sunburst: %zu nodes materialized, wrote %s/sunburst.{json,html}\n",
+                        ereport_sunburst_tree_nodes(g_sunburst_tree), g_bucket_output_dir);
+        } else {
+            fprintf(stderr, "warn: failed to write sunburst files in %s\n", g_bucket_output_dir);
+        }
+        ereport_sunburst_tree_free(g_sunburst_tree);
+        g_sunburst_tree = NULL;
+    }
 
     if (emit_all_bucket_detail_pages(display_name, all_users_mode, distinct_uid_count, basis_str,
                                      bucket_detail_levels,
