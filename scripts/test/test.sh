@@ -1318,6 +1318,26 @@ run_sunburst_tests() {
         die "--sunburst-buckets: filter chips missing in sunburst.html"
     grep -q 'id="colorby"' "${rep}_b/all_users/sunburst.html" ||
         die "--sunburst-buckets: color-by selector missing in sunburst.html"
+    # Regression: the synthetic (self) wedge carries no bucket matrix; kidsOf
+    # must bail on childless nodes before calling selfSum, otherwise every
+    # render throws (filter bar visible, chart blank, all controls inert).
+    python3 - "$bjson" "${rep}_b/all_users/sunburst.html" <<'PYEOF' || die "--sunburst-buckets: kidsOf self-wedge guard missing"
+import json, sys
+with open(sys.argv[1]) as f:
+    root = json.load(f)
+def walk(n):
+    yield n
+    for c in n.get("children", []):
+        for m in walk(c):
+            yield m
+assert any(n.get("children") and n["bytes"] > 0 for n in walk(root)), \
+    "fixture no longer exercises the (self) wedge path"
+html = open(sys.argv[2]).read()
+body = html[html.index("function kidsOf"):][:700]
+assert "if (!n.children) return kids;" in body, "kidsOf lost the childless-node guard"
+assert body.index("if (!n.children) return kids;") < body.index("selfSum("), \
+    "kidsOf calls selfSum before the childless-node guard"
+PYEOF
     python3 - "$bjson" <<'PYEOF' || die "--sunburst-buckets: matrix sums disagree with node totals"
 import json, sys
 with open(sys.argv[1]) as f:
