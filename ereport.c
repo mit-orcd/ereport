@@ -9197,6 +9197,15 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     _Atomic uint64_t *bb = ereport_sunburst_bucket_bytes(arg->tree);
     _Atomic uint64_t *bf = ereport_sunburst_bucket_files(arg->tree);
 
+    /* Records are directory-clustered, so memoize the last parent_dir_id's
+     * node: the map lookup is a random access into a per-shard array that can
+     * be hundreds of MiB, and repeating it per record roughly doubles the
+     * pass's wall time. Same idea as pass 1's sunburst run buffer.
+     * UINT64_MAX never appears as a real parent_dir_id (0 breaks above, real
+     * ids are <= max_dir_id), so the first record always misses. */
+    uint64_t last_dir = UINT64_MAX;
+    uint32_t last_node = 0;
+
     uint32_t recno = 0;
     for (;;) {
         bin_record_hdr_t r;
@@ -9257,8 +9266,12 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
                 continue;
         }
 
-        if (r.parent_dir_id > max_dir) continue; /* corrupt; pass 1's catalog walk rejected it too */
-        const uint32_t node = dir_node[r.parent_dir_id];
+        if (r.parent_dir_id != last_dir) {
+            if (r.parent_dir_id > max_dir) continue; /* corrupt; pass 1's catalog walk rejected it too */
+            last_node = dir_node[r.parent_dir_id];
+            last_dir = r.parent_dir_id;
+        }
+        const uint32_t node = last_node;
 
         const int sb = size_bucket_for(r.size);
         const int ab = age_bucket_for(pick_time(&r, arg->basis), arg->now);
