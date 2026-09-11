@@ -82,6 +82,16 @@ struct ereport_sunburst_tree {
      * displayed root at emit time so the grand total stays exact. */
     uint64_t root_boost_bytes;
     uint64_t root_boost_files;
+    /* --sunburst-buckets: per-node 6x6 (age x size, row-major) matrices, filled
+     * by the second pass in ereport.c; plus, per shard, a dense dir_id -> node
+     * map resolving every directory to its deepest materialized ancestor
+     * (trimmed/depth-folded subtrees resolve to their fold node, so every
+     * record lands on exactly one node and each node's matrix sums to the
+     * "bytes"/"files" the JSON emits for it). NULL/0 when buckets are off. */
+    _Atomic uint64_t *bucket_bytes; /* n * 36 */
+    _Atomic uint64_t *bucket_files; /* n * 36 */
+    uint32_t **dir_node;            /* [dir_node_n == cats length] per-shard maps, NULL per skipped shard */
+    size_t dir_node_n;
 };
 
 /* One shard's catalog plus the post-rollup accumulator and a child index
@@ -94,6 +104,7 @@ typedef struct {
     ereport_sunburst_accum_t *acc;
     uint32_t *first_child;
     uint32_t *next_sibling;
+    uint32_t fi; /* index in the caller's cats[] array (ereport's file_index) */
 } sb_shard_t;
 
 typedef struct {
@@ -122,6 +133,41 @@ typedef struct {
     int32_t *buckets;        /* FNV(name) chains; 0 = empty, else entry index + 1 */
     size_t bcap;
 } sb_cmap_t;
+
+/* Materialization recorder: while the top-down merge walks, every shard-local
+ * dir_id behind each interned node (and each "(other)" fold) is appended here.
+ * After the walk, the dense per-shard dir_id -> node maps are derived from
+ * these anchors with one forward pass per shard (dir_ids are handed out
+ * parent-first, so an unmapped directory inherits its parent's node). */
+typedef struct {
+    uint32_t shard; /* compacted shard index */
+    uint32_t lid;   /* shard-local dir_id */
+    int32_t node;
+} sb_mapent_t;
+
+typedef struct {
+    sb_mapent_t *v;
+    size_t n, cap;
+} sb_maprec_t;
+
+static int sb_maprec_add(sb_maprec_t *mr, uint32_t shard, uint64_t lid, int32_t node) {
+    if (mr->n == mr->cap) {
+        size_t nc = mr->cap ? mr->cap * 2 : 1024;
+        sb_mapent_t *nv = realloc(mr->v, nc * sizeof(*nv));
+        if (!nv) return -1;
+        mr->v = nv;
+        mr->cap = nc;
+    }
+    mr->v[mr->n++] = (sb_mapent_t){ shard, (uint32_t)lid, node };
+    return 0;
+}
+
+static int sb_maprec_add_entry(sb_maprec_t *mr, const sb_cagg_t *e, int32_t node) {
+    if (sb_maprec_add(mr, e->first_shard, e->first_lid, node) != 0) return -1;
+    for (size_t i = 0; i < e->n_more; i++)
+        if (sb_maprec_add(mr, e->more[i].shard, e->more[i].lid, node) != 0) return -1;
+    return 0;
+}
 
 static void sb_cmap_init(sb_cmap_t *cm) { memset(cm, 0, sizeof(*cm)); }
 
@@ -348,11 +394,13 @@ static int sb_enum_entry(const sb_shard_t *sh, const sb_cagg_t *e, sb_cmap_t *cm
  * totals, so a node's self stays total - sum(children) exactly. */
 static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
                          int32_t ni, const char *orig, sb_cmap_t *cm,
-                         const char *rewrite_from, const char *rewrite_to) {
+                         const char *rewrite_from, const char *rewrite_to, sb_maprec_t *mr) {
     unsigned depth = t->nodes[ni].depth;
     const char *parent_path = t->nodes[ni].path; /* stable: the nodes array may move, strings don't */
     uint64_t min_b, min_f, other_b = 0, other_f = 0;
     int32_t *ord = NULL;
+    int32_t *trimmed = NULL; /* entry indexes folded into "(other)", in trim order */
+    size_t n_trimmed = 0;
     char *keep = NULL;
     int rc = -1;
 
@@ -360,7 +408,8 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
 
     ord = malloc(cm->n * sizeof(*ord));
     keep = calloc(cm->n, 1);
-    if (!ord || !keep) goto out;
+    trimmed = malloc(cm->n * sizeof(*trimmed));
+    if (!ord || !keep || !trimmed) goto out;
     for (size_t i = 0; i < cm->n; i++) ord[i] = (int32_t)i;
 
     g_sb_cagg = cm->ents;
@@ -385,6 +434,7 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
         if (!keep[ord[i]] || !above || t->n >= t->budget) {
             other_b += e->bytes;
             other_f += e->files;
+            trimmed[n_trimmed++] = ord[i];
             continue;
         }
         if (sb_path_join(corig, sizeof(corig), orig, e->name, e->name_len) != 0) goto out;
@@ -397,9 +447,10 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
         if (!display) goto out;
         ci = sb_node_add(t, display, ni, depth + 1, e->bytes, e->files); /* takes display */
         if (ci < 0) goto out;
+        if (mr && sb_maprec_add_entry(mr, e, ci) != 0) goto out;
         sb_cmap_init(&c2);
         if (sb_enum_entry(sh, e, &c2) == 0)
-            rc = sb_expand_map(t, sh, ci, corig, &c2, rewrite_from, rewrite_to);
+            rc = sb_expand_map(t, sh, ci, corig, &c2, rewrite_from, rewrite_to, mr);
         sb_cmap_free(&c2);
         if (rc != 0) goto out;
     }
@@ -413,11 +464,17 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
         oi = sb_node_add(t, strdup(opath), ni, depth + 1, other_b, other_f);
         if (oi < 0) goto out;
         t->nodes[oi].name = "(other)";
+        /* The fold, not the parent, owns the trimmed children's records. */
+        if (mr) {
+            for (size_t i = 0; i < n_trimmed; i++)
+                if (sb_maprec_add_entry(mr, &cm->ents[trimmed[i]], oi) != 0) goto out;
+        }
     }
     rc = 0;
 out:
     free(ord);
     free(keep);
+    free(trimmed);
     return rc;
 }
 
@@ -471,19 +528,76 @@ static void *sb_prep_worker(void *arg) {
     }
 }
 
+/* Derive one shard's dense dir_id -> node map from the materialization anchors.
+ * dir_ids are handed out parent-first, so after seeding the anchors a single
+ * forward pass resolves every remaining directory to its parent's node; dir_id 1
+ * (the shard top) and anything above the displayed root fold into the root. */
+static int sb_build_dir_node_map(const sb_shard_t *s, uint32_t shard_idx, const sb_mapent_t *ents,
+                                 size_t n_ents, int32_t root, uint32_t **out) {
+    const crawl_bin_catalog_t *cat = s->cat;
+    uint64_t nd = cat->max_dir_id, d;
+    uint32_t *m = malloc(((size_t)nd + 1) * sizeof(*m));
+    size_t i;
+
+    if (!m) return -1;
+    memset(m, 0xFF, ((size_t)nd + 1) * sizeof(*m));
+    m[1] = (uint32_t)root;
+    for (i = 0; i < n_ents; i++)
+        if (ents[i].shard == shard_idx) m[ents[i].lid] = (uint32_t)ents[i].node;
+    for (d = 2; d <= nd; d++) {
+        uint64_t p;
+        if (m[d] != UINT32_MAX) continue;
+        p = cat->parent_dir_id[d];
+        m[d] = (p >= 1 && p <= nd) ? m[p] : (uint32_t)root;
+    }
+    *out = m;
+    return 0;
+}
+
+typedef struct {
+    sb_shard_t *sh;
+    size_t n;
+    const sb_mapent_t *ents;
+    size_t n_ents;
+    int32_t root;
+    uint32_t **out; /* [n] compacted shard order */
+    _Atomic size_t next;
+    _Atomic int err;
+} sb_map_pool_t;
+
+static void *sb_map_worker(void *arg) {
+    sb_map_pool_t *p = arg;
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        if (i >= p->n) return NULL;
+        if (sb_build_dir_node_map(&p->sh[i], (uint32_t)i, p->ents, p->n_ents, p->root, &p->out[i]) != 0) {
+            atomic_store_explicit(&p->err, 1, memory_order_relaxed);
+            return NULL;
+        }
+    }
+}
+
 ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
                                                 ereport_sunburst_accum_t *accs, size_t n,
                                                 unsigned depth_max, unsigned threads,
-                                                const char *rewrite_from, const char *rewrite_to) {
+                                                const char *rewrite_from, const char *rewrite_to,
+                                                int want_buckets) {
     ereport_sunburst_tree_t *t = calloc(1, sizeof(*t));
     sb_shard_t *sh = NULL;
     size_t ns = 0;
     sb_lid_t *cur_lids = NULL;
     size_t ncur = 0;
+    sb_lid_t *chain = NULL; /* every lid behind the collapse chain, for root mapping */
+    size_t nchain = 0, capchain = 0;
+    sb_maprec_t mr;
+    sb_maprec_t *mrp = NULL;
     uint64_t cur_b = 0, cur_f = 0, grand_b = 0, grand_f = 0;
     char cur_orig[PATH_MAX];
     char *display = NULL;
     int32_t ri;
+
+    memset(&mr, 0, sizeof(mr));
+    if (want_buckets) mrp = &mr;
 
     if (!t) return NULL;
     t->depth_max = depth_max ? depth_max : 6;
@@ -508,6 +622,7 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
         if (nd > UINT32_MAX) goto fail; /* child index is uint32; no realistic shard is near this */
         sh[ns].cat = cat;
         sh[ns].acc = a;
+        sh[ns].fi = (uint32_t)s;
         ns++;
     }
 
@@ -555,6 +670,25 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
     cur_b = grand_b;
     cur_f = grand_f;
 
+/* Every lid set the collapse chain passes through belongs to the displayed
+ * root; collect them (cheap: one entry per shard per collapsed level). */
+#define SB_CHAIN_APPEND(list, cnt)                                                                     \
+    do {                                                                                               \
+        if (mrp) {                                                                                     \
+            if (nchain + (cnt) > capchain) {                                                           \
+                size_t nc = capchain ? capchain * 2 : 64;                                              \
+                sb_lid_t *nl_;                                                                         \
+                while (nc < nchain + (cnt)) nc *= 2;                                                   \
+                nl_ = realloc(chain, nc * sizeof(*nl_));                                               \
+                if (!nl_) goto fail;                                                                   \
+                chain = nl_;                                                                           \
+                capchain = nc;                                                                         \
+            }                                                                                          \
+            memcpy(chain + nchain, (list), (cnt) * sizeof(*chain));                                    \
+            nchain += (cnt);                                                                           \
+        }                                                                                              \
+    } while (0)
+
     /* Collapse the single-child chain from the top: the displayed root is the
      * deepest directory that still holds all the content on its own. Stop at
      * the first node with a sibling fork or with files of its own (a --subtree
@@ -586,6 +720,7 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
             if (!nl) { sb_cmap_free(&cm); goto fail; }
             nl[0] = (sb_lid_t){ e->first_shard, e->first_lid };
             memcpy(nl + 1, e->more, e->n_more * sizeof(*nl));
+            SB_CHAIN_APPEND(cur_lids, ncur); /* the level being collapsed through */
             free(cur_lids);
             cur_lids = nl;
             ncur = e->n_more + 1;
@@ -615,6 +750,13 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
     t->root_boost_bytes = grand_b - cur_b;
     t->root_boost_files = grand_f - cur_f;
 
+    if (mrp) {
+        size_t i;
+        SB_CHAIN_APPEND(cur_lids, ncur); /* the displayed root's own lids */
+        for (i = 0; i < nchain; i++)
+            if (sb_maprec_add(mrp, chain[i].shard, chain[i].lid, ri) != 0) goto fail;
+    }
+
     {
         sb_cmap_t cm;
         int rc;
@@ -623,20 +765,83 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
             sb_cmap_free(&cm);
             goto fail;
         }
-        rc = sb_expand_map(t, sh, ri, cur_orig, &cm, rewrite_from, rewrite_to);
+        rc = sb_expand_map(t, sh, ri, cur_orig, &cm, rewrite_from, rewrite_to, mrp);
         sb_cmap_free(&cm);
         if (rc != 0) goto fail;
     }
 
+    if (mrp) {
+        /* Bucket matrices, one 36-cell row per node, zeroed for the second
+         * pass; plus the per-shard dir_id -> node maps derived from the
+         * materialization anchors. maps[] holds the compacted results until
+         * they land at dir_node[fi]. */
+        size_t i;
+        uint32_t **maps = calloc(ns ? ns : 1, sizeof(*maps));
+        int ok = 0;
+
+        t->bucket_bytes = calloc(t->n * 36, sizeof(*t->bucket_bytes));
+        t->bucket_files = calloc(t->n * 36, sizeof(*t->bucket_files));
+        t->dir_node = calloc(n ? n : 1, sizeof(*t->dir_node));
+        if (!t->bucket_bytes || !t->bucket_files || !t->dir_node || !maps) {
+            free(maps);
+            goto fail;
+        }
+        t->dir_node_n = n;
+
+        if (ns > 1 && threads > 1) {
+            sb_map_pool_t pool;
+            pthread_t th[64];
+            size_t nth = threads, started = 0;
+            if (nth > ns) nth = ns;
+            if (nth > sizeof(th) / sizeof(*th)) nth = sizeof(th) / sizeof(*th);
+            pool.sh = sh;
+            pool.n = ns;
+            pool.ents = mrp->v;
+            pool.n_ents = mrp->n;
+            pool.root = ri;
+            pool.out = maps;
+            atomic_init(&pool.next, 0);
+            atomic_init(&pool.err, 0);
+            for (; started < nth; started++)
+                if (pthread_create(&th[started], NULL, sb_map_worker, &pool) != 0) break;
+            if (started == 0) {
+                for (i = 0; i < ns; i++)
+                    if (sb_build_dir_node_map(&sh[i], (uint32_t)i, mrp->v, mrp->n, ri, &maps[i]) != 0)
+                        break;
+                ok = (i == ns);
+            } else {
+                for (i = 0; i < started; i++) pthread_join(th[i], NULL);
+                ok = !atomic_load_explicit(&pool.err, memory_order_relaxed);
+            }
+        } else {
+            for (i = 0; i < ns; i++)
+                if (sb_build_dir_node_map(&sh[i], (uint32_t)i, mrp->v, mrp->n, ri, &maps[i]) != 0)
+                    break;
+            ok = (i == ns);
+        }
+        if (!ok) {
+            for (i = 0; i < ns; i++) free(maps[i]);
+            free(maps);
+            goto fail;
+        }
+        for (i = 0; i < ns; i++) t->dir_node[sh[i].fi] = maps[i];
+        free(maps);
+    }
+
+    free(chain);
+    free(mr.v);
     free(cur_lids);
     for (size_t i = 0; i < ns; i++) {
         free(sh[i].first_child);
         free(sh[i].next_sibling);
     }
     free(sh);
+#undef SB_CHAIN_APPEND
     return t;
 
 fail:
+    free(chain);
+    free(mr.v);
     free(cur_lids);
     if (sh) {
         for (size_t i = 0; i < ns; i++) {
@@ -653,10 +858,43 @@ size_t ereport_sunburst_tree_nodes(const ereport_sunburst_tree_t *t) {
     return t ? t->n : 0;
 }
 
+_Atomic uint64_t *ereport_sunburst_bucket_bytes(ereport_sunburst_tree_t *t) {
+    return t ? t->bucket_bytes : NULL;
+}
+
+_Atomic uint64_t *ereport_sunburst_bucket_files(ereport_sunburst_tree_t *t) {
+    return t ? t->bucket_files : NULL;
+}
+
+const uint32_t *ereport_sunburst_dir_node_map(const ereport_sunburst_tree_t *t, uint64_t file_index) {
+    if (!t || !t->dir_node || file_index >= t->dir_node_n) return NULL;
+    return t->dir_node[file_index];
+}
+
+void ereport_sunburst_dir_node_maps_clear(ereport_sunburst_tree_t *t) {
+    if (!t || !t->dir_node) return;
+    for (size_t i = 0; i < t->dir_node_n; i++) free(t->dir_node[i]);
+    free(t->dir_node);
+    t->dir_node = NULL;
+    t->dir_node_n = 0;
+}
+
+void ereport_sunburst_buckets_clear(ereport_sunburst_tree_t *t) {
+    if (!t) return;
+    free(t->bucket_bytes);
+    free(t->bucket_files);
+    t->bucket_bytes = NULL;
+    t->bucket_files = NULL;
+    ereport_sunburst_dir_node_maps_clear(t);
+}
+
 void ereport_sunburst_tree_free(ereport_sunburst_tree_t *t) {
     if (!t) return;
     for (size_t i = 0; i < t->n; i++) free(t->nodes[i].path);
     free(t->nodes);
+    free(t->bucket_bytes);
+    free(t->bucket_files);
+    ereport_sunburst_dir_node_maps_clear(t);
     free(t);
 }
 
@@ -697,6 +935,14 @@ static int sb_cmp_bytes_desc(const void *pa, const void *pb) {
     if (a->total_bytes != b->total_bytes) return (a->total_bytes < b->total_bytes) ? 1 : -1;
     if (a->total_files != b->total_files) return (a->total_files < b->total_files) ? 1 : -1;
     return (ia > ib) - (ia < ib);
+}
+
+/* One node's 36-cell bucket matrix row as a JSON array (no brackets). */
+static void sb_json_emit_matrix(FILE *out, const _Atomic uint64_t *row) {
+    int i;
+    for (i = 0; i < 36; i++)
+        fprintf(out, "%s%" PRIu64, i ? "," : "",
+                atomic_load_explicit(&row[i], memory_order_relaxed));
 }
 
 /* Emit one node. The build already applied the top-N + min-fraction trim and
@@ -746,9 +992,17 @@ static int sb_json_emit_node(sb_emit_ctx_t *ctx, int32_t idx, unsigned depth_fro
         sb_json_escape(out, n->name);
         fprintf(out, "\",\"path\":\"");
         sb_json_escape(out, n->path);
-        fprintf(out, "\",\"bytes\":%" PRIu64 ",\"files\":%" PRIu64 "}",
+        fprintf(out, "\",\"bytes\":%" PRIu64 ",\"files\":%" PRIu64,
                 is_root ? n->total_bytes + ctx->self_boost_bytes : n->total_bytes,
                 is_root ? n->total_files + ctx->self_boost_files : n->total_files);
+        if (t->bucket_bytes) {
+            fputs(",\"bucket_bytes\":[", out);
+            sb_json_emit_matrix(out, &t->bucket_bytes[(size_t)idx * 36]);
+            fputs("],\"bucket_files\":[", out);
+            sb_json_emit_matrix(out, &t->bucket_files[(size_t)idx * 36]);
+            fputc(']', out);
+        }
+        fputc('}', out);
         ctx->emitted++;
         free(kids);
         return 0;
@@ -758,7 +1012,15 @@ static int sb_json_emit_node(sb_emit_ctx_t *ctx, int32_t idx, unsigned depth_fro
     sb_json_escape(out, n->name);
     fprintf(out, "\",\"path\":\"");
     sb_json_escape(out, n->path);
-    fprintf(out, "\",\"bytes\":%" PRIu64 ",\"files\":%" PRIu64 ",\"children\":[", self_b, self_f);
+    fprintf(out, "\",\"bytes\":%" PRIu64 ",\"files\":%" PRIu64, self_b, self_f);
+    if (t->bucket_bytes) {
+        fputs(",\"bucket_bytes\":[", out);
+        sb_json_emit_matrix(out, &t->bucket_bytes[(size_t)idx * 36]);
+        fputs("],\"bucket_files\":[", out);
+        sb_json_emit_matrix(out, &t->bucket_files[(size_t)idx * 36]);
+        fputc(']', out);
+    }
+    fputs(",\"children\":[", out);
     ctx->emitted++;
 
     g_sb_sort_nodes = t->nodes;
@@ -833,6 +1095,14 @@ static void sb_html_prefix(FILE *out, const char *subject) {
           "z-index:10}\n"
           "#tip .dim{color:#98a2b3}\n"
           ".hint{padding:0 22px 14px;font-size:12px;color:#667085}\n"
+          ".filters{padding:10px 22px;border-bottom:1px solid #e4e7ec;display:flex;flex-direction:column;gap:8px}\n"
+          ".frow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}\n"
+          ".flabel{color:#667085;min-width:38px;font-weight:600}\n"
+          ".chip{border:1px solid #d0d5dd;border-radius:999px;background:#fff;padding:3px 10px;"
+          "font-size:12px;cursor:pointer;color:#344054;user-select:none}\n"
+          ".chip.on{background:#eff4ff;border-color:#84adff;color:#175cd3;font-weight:600}\n"
+          ".fnote{color:#98a2b3}\n"
+          ".frow select{font-size:12px;padding:2px 6px;color:#344054}\n"
           "</style>\n</head>\n<body>\n", out);
     fputs("<div class=\"topbar\">\n<h1>Sunburst", out);
     if (subject) {
@@ -843,6 +1113,15 @@ static void sb_html_prefix(FILE *out, const char *subject) {
           "<div class=\"toggle\"><button id=\"btn-bytes\" class=\"on\" type=\"button\">Bytes</button>"
           "<button id=\"btn-files\" type=\"button\">Files</button></div>\n"
           "<a href=\"index.html\">&larr; report</a>\n</div>\n"
+          "<div class=\"filters\" id=\"filters\" hidden>\n"
+          "<div class=\"frow\"><span class=\"flabel\">Age</span><span id=\"chips-age\"></span></div>\n"
+          "<div class=\"frow\"><span class=\"flabel\">Size</span><span id=\"chips-size\"></span>\n"
+          "<span class=\"fnote\">bucket filters re-slice every wedge; per-node sums stay exact</span></div>\n"
+          "<div class=\"frow\"><span class=\"flabel\">Color</span>"
+          "<select id=\"colorby\"><option value=\"dir\">directory</option>"
+          "<option value=\"age\">dominant age bucket</option>"
+          "<option value=\"size\">dominant size bucket</option></select></div>\n"
+          "</div>\n"
           "<div id=\"chartwrap\"><svg id=\"chart\" viewBox=\"0 0 1000 1000\" role=\"img\" "
           "aria-label=\"Sunburst chart\"></svg></div>\n"
           "<div class=\"hint\">Click a wedge to zoom in; click the center to go back up. "
@@ -857,12 +1136,40 @@ static void sb_html_suffix(FILE *out) {
         "let mode = 'bytes';\n"
         "let cur = SUNBURST;\n"
         "\n"
-        "/* Totals: internal nodes carry self values, leaves carry subtree totals. */\n"
-        "(function annotate(n, parent) {\n"
+        "/* Bucket axes -- keep in sync with age_bucket_names/size_bucket_names in ereport.c\n"
+        "   and the [age][size] row-major layout of each node's 36-cell matrix. */\n"
+        "const AGE_NAMES = ['< 30 days', '30\\u201390 days', '90\\u2013180 days', '180 days \\u2013 1 yr', '1\\u20133 years', '3+ years'];\n"
+        "const SIZE_NAMES = ['< 4K', '4K \\u2013 1M', '1M \\u2013 100M', '100M \\u2013 1G', '1G \\u2013 10G', '10G+'];\n"
+        "const HAS_BUCKETS = !!SUNBURST.bucket_bytes;\n"
+        "const ageSel = [1, 1, 1, 1, 1, 1], sizeSel = [1, 1, 1, 1, 1, 1];\n"
+        "let colorBy = 'dir';\n"
+        "\n"
+        "/* Sum of one node's own matrix over the selected cells. Node matrices mirror\n"
+        "   the bytes/files semantics: self values for internal nodes, subtree totals\n"
+        "   for leaves, so filtered totals annotate exactly like unfiltered ones. */\n"
+        "function selfSum(n, key) {\n"
+        "  const m = n[key];\n"
+        "  let s = 0;\n"
+        "  for (let a = 0; a < 6; a++) {\n"
+        "    if (!ageSel[a]) continue;\n"
+        "    for (let z = 0; z < 6; z++) if (sizeSel[z]) s += m[a * 6 + z];\n"
+        "  }\n"
+        "  return s;\n"
+        "}\n"
+        "\n"
+        "/* Totals: internal nodes carry self values, leaves carry subtree totals.\n"
+        "   Re-run after every bucket filter change. */\n"
+        "function annotate(n, parent) {\n"
         "  n._p = parent || null;\n"
-        "  n._b = n.bytes; n._f = n.files;\n"
+        "  if (HAS_BUCKETS) {\n"
+        "    n._b = selfSum(n, 'bucket_bytes');\n"
+        "    n._f = selfSum(n, 'bucket_files');\n"
+        "  } else {\n"
+        "    n._b = n.bytes; n._f = n.files;\n"
+        "  }\n"
         "  if (n.children) for (const c of n.children) { annotate(c, n); n._b += c._b; n._f += c._f; }\n"
-        "})(SUNBURST, null);\n"
+        "}\n"
+        "annotate(SUNBURST, null);\n"
         "\n"
         "/* Color anchor: index of each node's ancestor among the root's children. */\n"
         "(function paint() {\n"
@@ -875,13 +1182,16 @@ static void sb_html_suffix(FILE *out) {
         "\n"
         "function val(n) { return mode === 'bytes' ? n._b : n._f; }\n"
         "\n"
-        "/* Children plus a synthetic wedge for bytes/files sitting directly in n. */\n"
+        "/* Children plus a synthetic wedge for bytes/files sitting directly in n.\n"
+        "   With buckets on, the wedge shows the filtered self value. */\n"
         "function kidsOf(n) {\n"
         "  const kids = (n.children || []).slice();\n"
-        "  const self = mode === 'bytes' ? n.bytes : n.files;\n"
+        "  const sb = HAS_BUCKETS ? selfSum(n, 'bucket_bytes') : n.bytes;\n"
+        "  const sf = HAS_BUCKETS ? selfSum(n, 'bucket_files') : n.files;\n"
+        "  const self = mode === 'bytes' ? sb : sf;\n"
         "  if (n.children && self > 0)\n"
-        "    kids.unshift({ name: '(self)', path: n.path, bytes: n.bytes, files: n.files,\n"
-        "                   _b: n.bytes, _f: n.files, self: true });\n"
+        "    kids.unshift({ name: '(self)', path: n.path, bytes: sb, files: sf,\n"
+        "                   _b: sb, _f: sf, self: true });\n"
         "  return kids;\n"
         "}\n"
         "\n"
@@ -924,6 +1234,25 @@ static void sb_html_suffix(FILE *out) {
         "\n"
         "function color(n) {\n"
         "  if (n.self || n.name === '(other)') return '#d0d5dd';\n"
+        "  if (HAS_BUCKETS && colorBy !== 'dir') {\n"
+        "    /* Dominant selected cell, following the bytes/files mode. Age runs\n"
+        "       green (fresh) to red (old); size runs blue (small) to magenta (large). */\n"
+        "    const m = mode === 'bytes' ? n.bucket_bytes : n.bucket_files;\n"
+        "    if (m) {\n"
+        "      let best = 0, bi = -1;\n"
+        "      for (let a = 0; a < 6; a++) {\n"
+        "        if (!ageSel[a]) continue;\n"
+        "        for (let z = 0; z < 6; z++) {\n"
+        "          if (!sizeSel[z]) continue;\n"
+        "          const v = m[a * 6 + z];\n"
+        "          if (v > best) { best = v; bi = colorBy === 'age' ? a : z; }\n"
+        "        }\n"
+        "      }\n"
+        "      if (bi < 0) return '#e4e7ec';\n"
+        "      const hue = colorBy === 'age' ? 140 - bi * 28 : 210 + bi * 18;\n"
+        "      return 'hsl(' + hue + ' 62% 52%)';\n"
+        "    }\n"
+        "  }\n"
         "  const hue = ((n._ci || 0) * 137.508) % 360;\n"
         "  let d = 0, a = n;\n"
         "  while (a._p && a._p !== SUNBURST) { d++; a = a._p; }\n"
@@ -1047,6 +1376,33 @@ static void sb_html_suffix(FILE *out) {
         "  document.getElementById('btn-bytes').classList.remove('on');\n"
         "  render();\n"
         "});\n"
+        "\n"
+        "/* Bucket filter chips: toggle a bucket in/out of every wedge's total. */\n"
+        "if (HAS_BUCKETS) {\n"
+        "  document.getElementById('filters').hidden = false;\n"
+        "  const buildChips = function (elId, names, sel) {\n"
+        "    const el = document.getElementById(elId);\n"
+        "    names.forEach(function (nm, i) {\n"
+        "      const b = document.createElement('button');\n"
+        "      b.type = 'button';\n"
+        "      b.className = 'chip on';\n"
+        "      b.textContent = nm;\n"
+        "      b.addEventListener('click', function () {\n"
+        "        sel[i] = sel[i] ? 0 : 1;\n"
+        "        b.classList.toggle('on', !!sel[i]);\n"
+        "        annotate(SUNBURST, null);\n"
+        "        render();\n"
+        "      });\n"
+        "      el.appendChild(b);\n"
+        "    });\n"
+        "  };\n"
+        "  buildChips('chips-age', AGE_NAMES, ageSel);\n"
+        "  buildChips('chips-size', SIZE_NAMES, sizeSel);\n"
+        "  document.getElementById('colorby').addEventListener('change', function () {\n"
+        "    colorBy = this.value;\n"
+        "    render();\n"
+        "  });\n"
+        "}\n"
         "\n"
         "render();\n"
         "</script>\n</body>\n</html>\n", out);

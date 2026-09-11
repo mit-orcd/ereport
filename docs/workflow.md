@@ -28,6 +28,11 @@ all_users/sunburst.html    # clickable "where the bytes live" chart, linked from
 all_users/sunburst.json    # the same tree as data (schema: docs/tools.md#ereport)
 ```
 
+Add `--sunburst-buckets` to the `ereport` command and the sunburst page gains
+age-range and size-range filter chips (the report's 6×6 bucket axes) plus a
+color-by-dominant-bucket selector, backed by an exact per-node bucket matrix in
+`sunburst.json`.
+
 ### 3. Build the search index (optional)
 
 ```bash

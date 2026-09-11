@@ -31,7 +31,7 @@ Variations: per-user report (`./ereport alice mtime crawl-out`, index with `./er
 | Tool | Role |
 |------|------|
 | [`ecrawl`](docs/tools.md#ecrawl) | Parallel filesystem crawler; writes compact, uid-sharded binary metadata records. |
-| [`ereport`](docs/tools.md#ereport) | Turns crawl output into `index.html`, an age×size heat map with bucket drill-down pages, a sunburst chart, and a path-search box. |
+| [`ereport`](docs/tools.md#ereport) | Turns crawl output into `index.html`, an age×size heat map with bucket drill-down pages, a sunburst chart (optionally filterable by age/size buckets), and a path-search box. |
 | [`ereport_index`](docs/tools.md#ereport_index) | Builds and searches the trigram index behind path-substring search. |
 | [`eserve.py`](docs/tools.md#eservepy) | HTTP server for the static reports plus server-side path search. |
 | [`ecrawl_query`](docs/tools.md#ecrawl_query) | Read-only directory-shape stats (parent, path-depth, and top-parent histograms). |

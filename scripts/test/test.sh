@@ -1303,11 +1303,85 @@ run_sunburst_tests() {
         "$(grep -o '"files":[0-9]*' "$ujson" | LC_ALL=C awk -F: '{s+=$2} END{printf "%.0f", s}')" \
         "per-user sunburst and the query engine agree on the same uid's subtree file count"
 
+    # --sunburst-buckets: every node carries a 6x6 age x size matrix whose cells
+    # sum exactly to the node's bytes/files (the fixture's hardlink pair f3/f3link
+    # is counted once, which the per-node equality covers). The whole fixture is
+    # freshly created, so all bytes sit in age row 0; only the 2 MB root file is
+    # above 1M, so size bucket 2 holds exactly 2000000 bytes across all nodes.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_b" --sunburst-buckets mtime "$out" \
+        >"${td}/sb.b.out" 2>"${td}/sb.b.err" || die "ereport --sunburst-buckets failed"
+    local bjson="${rep}_b/all_users/sunburst.json"
+    [[ -f "$bjson" && -f "${rep}_b/all_users/sunburst.html" ]] ||
+        die "sunburst files missing for --sunburst-buckets"
+    grep -q '"bucket_bytes":\[' "$bjson" || die "--sunburst-buckets: bucket_bytes missing in JSON"
+    grep -q 'id="chips-age"' "${rep}_b/all_users/sunburst.html" ||
+        die "--sunburst-buckets: filter chips missing in sunburst.html"
+    grep -q 'id="colorby"' "${rep}_b/all_users/sunburst.html" ||
+        die "--sunburst-buckets: color-by selector missing in sunburst.html"
+    python3 - "$bjson" <<'PYEOF' || die "--sunburst-buckets: matrix sums disagree with node totals"
+import json, sys
+with open(sys.argv[1]) as f:
+    root = json.load(f)
+nodes = []
+def walk(n):
+    nodes.append(n)
+    for c in n.get("children", []):
+        walk(c)
+walk(root)
+assert len(nodes) > 1, "expected more than one node"
+for n in nodes:
+    bb, bf = n.get("bucket_bytes"), n.get("bucket_files")
+    assert bb is not None and bf is not None, "node %r lacks bucket arrays" % n.get("path")
+    assert len(bb) == 36 and len(bf) == 36, "node %r: matrix not 36 cells" % n.get("path")
+    assert sum(bb) == n["bytes"], "node %r: sum(bucket_bytes)=%d != bytes=%d" % (n.get("path"), sum(bb), n["bytes"])
+    assert sum(bf) == n["files"], "node %r: sum(bucket_files)=%d != files=%d" % (n.get("path"), sum(bf), n["files"])
+tot = [0] * 36
+for n in nodes:
+    for i in range(36):
+        tot[i] += n["bucket_bytes"][i]
+for a in range(1, 6):
+    assert sum(tot[a*6:(a+1)*6]) == 0, "fresh fixture has bytes in age row %d" % a
+assert tot[2] == 2000000, "size bucket 2 holds only the 2 MB file, got %d" % tot[2]
+PYEOF
+
+    # Buckets + --subtree: matrices scope to the subtree and still sum exactly.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_subb" --sunburst-buckets \
+        --subtree "${tree_abs}/a" mtime "$out" >"${td}/sb.subb.out" 2>"${td}/sb.subb.err" ||
+        die "ereport --sunburst-buckets --subtree failed"
+    python3 - "${rep}_subb/all_users/sunburst.json" "$(tree_apparent_bytes "${tree_abs}/a")" <<'PYEOF' || die "--sunburst-buckets --subtree: matrix sums disagree"
+import json, sys
+with open(sys.argv[1]) as f:
+    root = json.load(f)
+want = int(sys.argv[2])
+nodes = []
+def walk(n):
+    nodes.append(n)
+    for c in n.get("children", []):
+        walk(c)
+walk(root)
+for n in nodes:
+    assert sum(n["bucket_bytes"]) == n["bytes"], "node %r matrix/bytes mismatch" % n.get("path")
+    assert sum(n["bucket_files"]) == n["files"], "node %r matrix/files mismatch" % n.get("path")
+got = sum(sum(n["bucket_bytes"]) for n in nodes)
+assert got == want, "subtree bucket grand total %d != apparent %d" % (got, want)
+PYEOF
+
+    # Flag off: no bucket keys anywhere (the filter bar markup is always emitted
+    # but stays hidden; the embedded JSON is what carries the data); combined
+    # with --no-sunburst: no files at all.
+    grep -q '"bucket_bytes"' "$sjson" && die "bucket keys present without --sunburst-buckets"
+    grep -q '"bucket_bytes"' "${sdir}/sunburst.html" &&
+        die "bucket data embedded without --sunburst-buckets"
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_offb" --no-sunburst --sunburst-buckets mtime "$out" \
+        >"${td}/sb.offb.out" 2>"${td}/sb.offb.err" || die "ereport --no-sunburst --sunburst-buckets failed"
+    [[ ! -e "${rep}_offb/all_users/sunburst.json" && ! -e "${rep}_offb/all_users/sunburst.html" ]] ||
+        die "--no-sunburst --sunburst-buckets still wrote sunburst files"
+
     # Snapshot the main report for --keep-html; sunburst.html embeds the JSON
     # (const SUNBURST = ...), so the *.html copy alone stays fully browsable.
     keep_html sunburst "$rep"
 
-    summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out"
+    summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out+buckets"
 }
 
 run_subtree_dup_tests() {

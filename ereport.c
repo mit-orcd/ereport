@@ -14,8 +14,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
@@ -611,6 +611,10 @@ typedef struct {
      * halves probe traffic versus a separate used[] bitmap: one cache line per
      * probe instead of two, which matters at tens of millions of entries. */
     inode_key_t *keys;
+    /* Parallel to keys when winner recording is on (NULL otherwise): the record
+     * id that won each inode's byte attribution, so the --sunburst-buckets second
+     * pass can replay the dedup decision exactly instead of racing again. */
+    uint64_t *winner;
     size_t cap;
     size_t count;
     pthread_mutex_t mutex;
@@ -996,6 +1000,11 @@ static char g_bucket_output_dir[PATH_MAX];
  * still attached) and written once the report output directory exists. */
 static int g_sunburst_enabled = 1;
 static unsigned g_sunburst_depth = 6;
+/* --sunburst-buckets: after the tree is built, re-scan the bins with a narrow
+ * projection to attach a per-node 6x6 age x size bucket matrix (the sunburst
+ * page's filter chips). Opt-in: it costs a second read pass when on, nothing
+ * when off. */
+static int g_sunburst_buckets = 0;
 static ereport_sunburst_accum_t *g_sunburst_acc = NULL; /* [path_count] */
 static ereport_sunburst_tree_t *g_sunburst_tree = NULL;
 static int g_sunburst_written = 0;
@@ -1051,9 +1060,14 @@ static uint64_t inode_key_hash(uint32_t dev_major, uint32_t dev_minor, uint64_t 
 
 static int inode_shard_rehash_locked(inode_set_shard_t *sh, size_t new_cap) {
     inode_key_t *new_keys = (inode_key_t *)calloc(new_cap, sizeof(*new_keys));
+    uint64_t *new_winner = sh->winner ? (uint64_t *)calloc(new_cap, sizeof(*new_winner)) : NULL;
     size_t i;
 
-    if (!new_keys) return -1;
+    if (!new_keys || (sh->winner && !new_winner)) {
+        free(new_keys);
+        free(new_winner);
+        return -1;
+    }
 
     for (i = 0; i < sh->cap; i++) {
         if (sh->keys[i].inode != 0) {
@@ -1061,16 +1075,19 @@ static int inode_shard_rehash_locked(inode_set_shard_t *sh, size_t new_cap) {
             size_t idx = (size_t)(inode_key_hash(key.dev_major, key.dev_minor, key.inode) & (new_cap - 1));
             while (new_keys[idx].inode != 0) idx = (idx + 1) & (new_cap - 1);
             new_keys[idx] = key;
+            if (new_winner) new_winner[idx] = sh->winner[i];
         }
     }
 
     free(sh->keys);
+    free(sh->winner);
     sh->keys = new_keys;
+    sh->winner = new_winner;
     sh->cap = new_cap;
     return 0;
 }
 
-static int inode_set_init(inode_set_t *s, size_t initial_cap) {
+static int inode_set_init_ex(inode_set_t *s, size_t initial_cap, int record_winners) {
     size_t per_shard_target;
     size_t cap;
     int si;
@@ -1085,11 +1102,16 @@ static int inode_set_init(inode_set_t *s, size_t initial_cap) {
         inode_set_shard_t *sh = &s->shard[si];
 
         sh->keys = (inode_key_t *)calloc(cap, sizeof(*sh->keys));
-        if (!sh->keys) {
+        sh->winner = record_winners ? (uint64_t *)calloc(cap, sizeof(*sh->winner)) : NULL;
+        if (!sh->keys || (record_winners && !sh->winner)) {
             int j;
+            free(sh->keys);
+            free(sh->winner);
             for (j = 0; j < si; j++) {
                 free(s->shard[j].keys);
+                free(s->shard[j].winner);
                 s->shard[j].keys = NULL;
+                s->shard[j].winner = NULL;
                 s->shard[j].cap = 0;
                 s->shard[j].count = 0;
                 pthread_mutex_destroy(&s->shard[j].mutex);
@@ -1111,14 +1133,17 @@ static void inode_set_destroy(inode_set_t *s) {
         inode_set_shard_t *sh = &s->shard[si];
 
         free(sh->keys);
+        free(sh->winner);
         sh->keys = NULL;
+        sh->winner = NULL;
         sh->cap = 0;
         sh->count = 0;
         pthread_mutex_destroy(&sh->mutex);
     }
 }
 
-static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t dev_minor, uint64_t inode) {
+static int inode_set_insert_winner(inode_set_t *s, uint32_t dev_major, uint32_t dev_minor, uint64_t inode,
+                                   uint64_t winner_id) {
     uint64_t hh;
     size_t si;
     inode_set_shard_t *sh;
@@ -1152,10 +1177,34 @@ static int inode_set_insert_if_new(inode_set_t *s, uint32_t dev_major, uint32_t 
     sh->keys[idx].dev_major = dev_major;
     sh->keys[idx].dev_minor = dev_minor;
     sh->keys[idx].inode = inode;
+    if (sh->winner) sh->winner[idx] = winner_id;
     sh->count++;
 
     pthread_mutex_unlock(&sh->mutex);
     return 1;
+}
+
+/* Read-only winner lookup for the --sunburst-buckets replay pass. Runs after the
+ * scan workers have joined, so the set is quiescent and needs no mutex. Returns
+ * the winning record id, or UINT64_MAX when the inode was never inserted. */
+static uint64_t inode_set_lookup_winner(const inode_set_t *s, uint32_t dev_major, uint32_t dev_minor,
+                                        uint64_t inode) {
+    uint64_t hh;
+    const inode_set_shard_t *sh;
+    size_t idx;
+
+    if (!s || inode == 0) return UINT64_MAX;
+    hh = inode_key_hash(dev_major, dev_minor, inode);
+    sh = &s->shard[hh & ((uint64_t)INODE_SET_SHARDS - 1U)];
+    if (!sh->keys || sh->cap == 0) return UINT64_MAX;
+    idx = (size_t)(hh & (sh->cap - 1));
+    while (sh->keys[idx].inode != 0) {
+        const inode_key_t *k = &sh->keys[idx];
+        if (k->dev_major == dev_major && k->dev_minor == dev_minor && k->inode == inode)
+            return sh->winner ? sh->winner[idx] : UINT64_MAX;
+        idx = (idx + 1) & (sh->cap - 1);
+    }
+    return UINT64_MAX;
 }
 
 static uint64_t uid_hash64(uint64_t uid) {
@@ -3376,7 +3425,8 @@ static void ereport_print_memstats(const worker_arg_t *args, int nthreads, const
         int s;
         for (s = 0; s < INODE_SET_SHARDS; s++) {
             inode_cnt += inodes->shard[s].count;
-            inode_bytes += inodes->shard[s].cap * sizeof(inode_key_t);
+            inode_bytes += inodes->shard[s].cap *
+                           (sizeof(inode_key_t) + (inodes->shard[s].winner ? sizeof(uint64_t) : 0));
         }
     }
     catalog_bytes = ereport_catalog_bytes(file_states, path_count);
@@ -8538,6 +8588,7 @@ static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t by
 }
 
 static int read_one_chunk(const file_chunk_t *chunk,
+                          size_t chunk_idx,
                           file_state_t *file_states,
                           uid_t target_uid,
                           int all_users,
@@ -8679,11 +8730,19 @@ static int read_one_chunk(const file_chunk_t *chunk,
     const uint64_t parent_key_salt = (uint64_t)chunk->file_index << 40;
 #define PARENT_KEY(pid) (parent_key_salt | ((pid) & ((1ULL << 40) - 1ULL)))
 
+    /* Record ordinal within this chunk, counted over every record the reader
+     * yields (before any filter continue). Combined with the chunk index it
+     * forms the stable record id the hardlink winner replay relies on; the
+     * --sunburst-buckets second pass iterates the same chunk list with the same
+     * reader ranges, so its ids line up one to one. */
+    uint32_t recno = 0;
+
     for (;;) {
         bin_record_hdr_t r;
         const unsigned char *rec_name = NULL;
         char *pathbuf = NULL;
         uint64_t accounted_size = 0;
+        uint32_t rec_no;
         int record_match;
         int skip_paths;
         int got = crawl_bin_block_reader_next(&br, &r, &rec_name);
@@ -8698,6 +8757,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
             if (progress) progress->bad_input_files++;
             break;
         }
+        rec_no = recno++;
         sum->scanned_records++;
         if (progress) {
             progress->scanned_records++;
@@ -8865,7 +8925,10 @@ static int read_one_chunk(const file_chunk_t *chunk,
             int ctime_led = (bucket_detail_levels > 0) ? record_ctime_led(&r) : 0;
 
             if (r.nlink > 1) {
-                int ins = inode_set_insert_if_new(seen_inodes, r.dev_major, r.dev_minor, r.inode);
+                /* The winner id is stored only when --sunburst-buckets armed the
+                 * set for it; otherwise the call is exactly insert_if_new. */
+                int ins = inode_set_insert_winner(seen_inodes, r.dev_major, r.dev_minor, r.inode,
+                                                  ((uint64_t)chunk_idx << 32) | rec_no);
                 if (ins < 0) {
                     fprintf(stderr, "warn: inode dedup set error in %s\n", chunk->path);
                     sum->bad_input_files++;
@@ -8994,6 +9057,7 @@ static void *worker_main(void *arg_void) {
         if (!chunk) break;
 
         read_one_chunk(chunk,
+                       (size_t)(chunk - arg->queue->chunks),
                        arg->file_states,
                        arg->target_uid,
                        arg->all_users,
@@ -9018,6 +9082,224 @@ static void *worker_main(void *arg_void) {
     pintern_free(&dense_pintern);
     progress_flush_local(&progress, arg->run_stats);
 
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* --sunburst-buckets second pass                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    work_queue_t *queue;
+    file_state_t *file_states;
+    uid_t target_uid;
+    int all_users;
+    int bucket_detail_levels;       /* pass 1 builds paths (and can break on failure) when > 0 */
+    time_basis_t basis;
+    time_t now;
+    inode_set_t *seen_inodes;       /* quiescent; winner replay is read-only */
+    ereport_sunburst_tree_t *tree;  /* matrices + dir->node maps to credit */
+    unsigned long bad_reads;        /* per-worker error tallies, summed after join */
+    unsigned long missing_winners;  /* replay lookups that found no winner (should stay 0) */
+} bucket_worker_arg_t;
+
+/* Lean re-scan of one chunk crediting the tree's per-node 6x6 age x size
+ * matrices. Must replicate read_one_chunk's record iteration and filter
+ * decisions exactly: the record id (chunk_idx << 32 | recno) only lines up
+ * with the winner ids stored in pass 1 when both passes yield and count the
+ * same records in the same order, and a record the report did not count must
+ * not land in a matrix either. What is skipped here is everything the first
+ * pass does beyond matching + dedup + the sunburst credit: no path retention,
+ * no shape/fanout accumulators, no per-record progress. */
+static void read_one_chunk_buckets(const file_chunk_t *chunk,
+                                   size_t chunk_idx,
+                                   bucket_worker_arg_t *arg) {
+    /* Shards the sunburst build skipped have no map; their records credited
+     * nothing in pass 1 either, so the whole chunk is out. */
+    const uint32_t *dir_node = ereport_sunburst_dir_node_map(arg->tree, chunk->file_index);
+    if (!dir_node) return;
+
+    file_state_t *fs = &arg->file_states[chunk->file_index];
+    crawl_bin_catalog_t *cat = fs->catalog;
+    if (!cat) {
+        /* Pass 1 warned and counted the shard bad; nothing was credited. */
+        arg->bad_reads++;
+        return;
+    }
+    const uint64_t max_dir = cat->max_dir_id;
+
+    FILE *fp = counted_fopen(chunk->path, "rb");
+    if (!fp) {
+        arg->bad_reads++;
+        return;
+    }
+
+    crawl_bin_block_reader_t br;
+    memset(&br, 0, sizeof(br));
+    {
+        crawl_bin_chunk_stdio_t bio;
+        bio.fopen = NULL;
+        bio.fread = counted_fread_unlocked;
+        bio.fclose = NULL;
+        if (crawl_bin_block_reader_init(&br, &bio, fp, chunk->start_offset, chunk->end_offset) != 0) {
+            arg->bad_reads++;
+            counted_fclose(fp);
+            return;
+        }
+    }
+
+    /* Projection: identical to pass 1's rule, so the reader yields the same
+     * field values (name_len included) and every data-dependent branch takes
+     * the same turn in both passes. */
+    {
+        uint32_t proj = CRAWL_PROJECTION_ALL &
+                        ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE));
+        if (arg->bucket_detail_levels == 0 && !g_subtree_prefix)
+            proj &= ~(CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
+        if (arg->bucket_detail_levels == 0) {
+            if (arg->basis != TIME_ATIME && arg->basis != TIME_EFFECTIVE)
+                proj &= ~CRAWL_COL_BIT(CRAWL_COL_ATIME);
+            if (arg->basis != TIME_CTIME && arg->basis != TIME_EFFECTIVE)
+                proj &= ~CRAWL_COL_BIT(CRAWL_COL_CTIME);
+        }
+        (void)crawl_bin_block_reader_set_projection(&br, proj);
+        (void)crawl_bin_block_reader_set_hardlink_columns(&br, CRAWL_COL_BIT(CRAWL_COL_INODE) |
+                                                                 CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
+                                                                 CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR));
+    }
+
+    const unsigned char *sub_bits = fs->subtree_bits;
+    const uint64_t sub_root_parent = fs->subtree_root_parent;
+    const uint64_t *sub_root_parents = fs->subtree_root_parents;
+    const size_t n_sub_root_parents = fs->n_subtree_root_parents;
+    const uint64_t sub_max_dir_id = cat->max_dir_id;
+
+    /* Pass 1 builds the record path (and breaks the chunk on a reconstruction
+     * failure) whenever --bucket-details is on, or when the sidecar-less
+     * --subtree route needs the prefix compare. Replicate that exactly: a
+     * record past such a break was never accounted in pass 1 and must not
+     * reach a matrix here. */
+    const int need_path = (arg->bucket_detail_levels > 0) || (g_subtree_prefix && !sub_bits);
+    char *pathbuf_store = NULL;
+    catalog_dir_cache_t dir_cache;
+    dir_cache.id = 0;
+    dir_cache.len = 0;
+    if (need_path) {
+        pathbuf_store = (char *)malloc(PATH_MAX);
+        if (!pathbuf_store) {
+            arg->bad_reads++;
+            crawl_bin_block_reader_free(&br);
+            counted_fclose(fp);
+            return;
+        }
+    }
+
+    _Atomic uint64_t *bb = ereport_sunburst_bucket_bytes(arg->tree);
+    _Atomic uint64_t *bf = ereport_sunburst_bucket_files(arg->tree);
+
+    uint32_t recno = 0;
+    for (;;) {
+        bin_record_hdr_t r;
+        const unsigned char *rec_name = NULL;
+        int got = crawl_bin_block_reader_next(&br, &r, &rec_name);
+
+        if (got == 0) break;
+        if (got < 0) {
+            arg->bad_reads++;
+            break;
+        }
+        /* Same position as pass 1's rec_no assignment: before every filter. */
+        const uint64_t rec_id = ((uint64_t)chunk_idx << 32) | recno++;
+
+        if (!arg->all_users && (uid_t)r.uid != arg->target_uid) continue;
+
+        if (r.parent_dir_id == 0ULL) {
+            /* Pass 1 warned, counted the chunk bad and stopped reading it. */
+            arg->bad_reads++;
+            break;
+        }
+
+        if (sub_bits) {
+            uint64_t p = r.parent_dir_id;
+            int in_scope = (p <= sub_max_dir_id) && ((sub_bits[p >> 3] >> (p & 7U)) & 1U);
+
+            if (!in_scope && rec_name && (size_t)r.name_len == g_subtree_base_len &&
+                memcmp(rec_name, g_subtree_base, (size_t)r.name_len) == 0) {
+                if (p == sub_root_parent && sub_root_parent != 0ULL)
+                    in_scope = 1;
+                else if (sub_root_parents) {
+                    size_t pi;
+
+                    for (pi = 0; pi < n_sub_root_parents; pi++) {
+                        if (p == sub_root_parents[pi]) {
+                            in_scope = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!in_scope) continue;
+        }
+
+        if (need_path) {
+            const unsigned char *name_bytes = (r.name_len > 0) ? rec_name : NULL;
+
+            if (catalog_entry_path_cached(cat, r.parent_dir_id,
+                                          (char *)name_bytes, r.name_len, pathbuf_store, PATH_MAX,
+                                          &dir_cache) != 0) {
+                arg->bad_reads++;
+                break;
+            }
+            if (g_rewrite_from)
+                (void)rewrite_path_prefix(pathbuf_store, PATH_MAX);
+            if (g_subtree_prefix && !sub_bits &&
+                !starts_with_dir_prefix(pathbuf_store, g_subtree_prefix))
+                continue;
+        }
+
+        if (r.parent_dir_id > max_dir) continue; /* corrupt; pass 1's catalog walk rejected it too */
+        const uint32_t node = dir_node[r.parent_dir_id];
+
+        const int sb = size_bucket_for(r.size);
+        const int ab = age_bucket_for(pick_time(&r, arg->basis), arg->now);
+        uint64_t bytes = r.size; /* dirs/links/others always count their size, as in pass 1 */
+        uint64_t files = 0;
+
+        if (r.type == 'f') {
+            files = 1;
+            if (r.nlink > 1) {
+                /* Exact replay of the pass-1 dedup: only the record that won
+                 * the insert counts its bytes. A lookup miss means the two
+                 * passes disagree about the record stream; count nothing and
+                 * let the post-join warning say by how much. */
+                uint64_t w = inode_set_lookup_winner(arg->seen_inodes, r.dev_major, r.dev_minor, r.inode);
+                if (w != rec_id) {
+                    bytes = 0;
+                    if (w == UINT64_MAX) arg->missing_winners++;
+                }
+            }
+        }
+
+        {
+            const size_t cell = (size_t)node * 36 + (size_t)ab * SIZE_BUCKETS + (size_t)sb;
+            atomic_fetch_add_explicit(&bb[cell], bytes, memory_order_relaxed);
+            if (files) atomic_fetch_add_explicit(&bf[cell], files, memory_order_relaxed);
+        }
+    }
+
+    crawl_bin_block_reader_free(&br);
+    free(pathbuf_store);
+    counted_fclose(fp);
+}
+
+static void *bucket_worker_main(void *arg_void) {
+    bucket_worker_arg_t *arg = (bucket_worker_arg_t *)arg_void;
+
+    for (;;) {
+        file_chunk_t *chunk = queue_pop(arg->queue);
+        if (!chunk) break;
+        read_one_chunk_buckets(chunk, (size_t)(chunk - arg->queue->chunks), arg);
+    }
     return NULL;
 }
 
@@ -10882,11 +11164,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--verbose] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -10912,6 +11194,10 @@ int main(int argc, char **argv) {
                 "Optional --no-sunburst: skip the sunburst view. Default on: aggregates per-directory totals "
                 "during the scan (no extra input I/O) and writes sunburst.json + sunburst.html next to "
                 "index.html; --sunburst-depth N sets the levels below the sunburst root (1…32, default 6).\n");
+        fprintf(stderr,
+                "Optional --sunburst-buckets: attach a per-node 6x6 age x size bucket matrix to the sunburst "
+                "(filter chips in sunburst.html). Costs a second, narrow-projection read pass over the bins; "
+                "hardlink byte attribution is replayed exactly from the first pass's recorded decisions.\n");
         fprintf(stderr,
                 "Optional --verbose: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics); stderr prints ecrawl-style `key=value` progress about "
@@ -11001,6 +11287,17 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 g_sunburst_enabled = 0;
+                memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                ac -= 1;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--sunburst-buckets") == 0) {
+                if (g_sunburst_buckets) {
+                    fprintf(stderr, "ereport: duplicate --sunburst-buckets\n");
+                    return 2;
+                }
+                g_sunburst_buckets = 1;
                 memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
                 ac -= 1;
                 argc = ac;
@@ -11850,7 +12147,9 @@ chunks_ready:
     queue.next_index = 0;
     pthread_mutex_init(&queue.mutex, NULL);
 
-    if (inode_set_init(&seen_inodes, 65536) != 0) {
+    /* Winner recording arms only when the bucket second pass will replay the
+     * dedup decisions (--sunburst-buckets with the sunburst actually on). */
+    if (inode_set_init_ex(&seen_inodes, 65536, g_sunburst_buckets && g_sunburst_enabled) != 0) {
         size_t k;
         fprintf(stderr, "allocation failed\n");
         for (k = 0; k < chunk_count; k++) free(chunks[k].path);
@@ -11997,7 +12296,8 @@ chunks_ready:
                 for (i = 0; (size_t)i < path_count; i++) cats[i] = file_states[i].catalog;
                 g_sunburst_tree = ereport_sunburst_build(cats, g_sunburst_acc, path_count,
                                                          g_sunburst_depth, threads_used,
-                                                         g_rewrite_from, g_rewrite_to);
+                                                         g_rewrite_from, g_rewrite_to,
+                                                         g_sunburst_buckets);
                 free(cats);
                 if (!g_sunburst_tree)
                     fprintf(stderr, "warn: sunburst tree build failed; sunburst view disabled\n");
@@ -12005,6 +12305,65 @@ chunks_ready:
             for (i = 0; (size_t)i < path_count; i++) ereport_sunburst_accum_free(&g_sunburst_acc[i]);
             free(g_sunburst_acc);
             g_sunburst_acc = NULL;
+        }
+
+        /* --sunburst-buckets second pass: re-scan the bins with the same
+         * projection and filters and credit each matched record to its tree
+         * node's 6x6 age x size matrix, replaying the hardlink dedup from the
+         * winner ids stored in pass 1. Must run here: the tree and its
+         * dir->node maps exist, the inode set is complete and quiescent, and
+         * the catalogs the subtree path filter needs are still attached. */
+        if (g_sunburst_tree && ereport_sunburst_bucket_bytes(g_sunburst_tree)) {
+            bucket_worker_arg_t *bargs = (bucket_worker_arg_t *)calloc((size_t)threads_used, sizeof(*bargs));
+            pthread_t *btids = (pthread_t *)calloc((size_t)threads_used, sizeof(*btids));
+            if (!bargs || !btids) {
+                fprintf(stderr, "warn: bucket pass allocation failed; bucket filters disabled\n");
+                ereport_sunburst_buckets_clear(g_sunburst_tree);
+            } else {
+                double vt_b0 = (g_ereport_verbose) ? now_sec() : 0.0;
+                int bstarted = 0;
+                unsigned long bad = 0, missing = 0;
+
+                queue.next_index = 0; /* workers all joined; hand every chunk out again */
+                for (i = 0; i < threads_used; i++) {
+                    bargs[i].queue = &queue;
+                    bargs[i].file_states = file_states;
+                    bargs[i].target_uid = target_uid;
+                    bargs[i].all_users = all_users_mode;
+                    bargs[i].bucket_detail_levels = bucket_detail_levels;
+                    bargs[i].basis = basis;
+                    bargs[i].now = now;
+                    bargs[i].seen_inodes = &seen_inodes;
+                    bargs[i].tree = g_sunburst_tree;
+                    if (pthread_create(&btids[i], NULL, bucket_worker_main, &bargs[i]) != 0) {
+                        fprintf(stderr, "warn: failed to create bucket pass thread %d\n", i);
+                        break;
+                    }
+                    bstarted++;
+                }
+                for (i = 0; i < bstarted; i++) pthread_join(btids[i], NULL);
+                for (i = 0; i < bstarted; i++) {
+                    bad += bargs[i].bad_reads;
+                    missing += bargs[i].missing_winners;
+                }
+                if (bstarted == 0) {
+                    ereport_sunburst_buckets_clear(g_sunburst_tree);
+                } else {
+                    if (missing)
+                        fprintf(stderr, "warn: %lu hardlink records had no pass-1 winner; "
+                                        "bucket byte totals undercount by their sizes\n", missing);
+                    if (bad)
+                        fprintf(stderr, "warn: %lu chunk read errors in the bucket pass; "
+                                        "bucket totals may be incomplete\n", bad);
+                }
+                if (g_ereport_verbose && vt_b0 > 0.0)
+                    run_stats.vt_parse_workers_sec += now_sec() - vt_b0;
+                /* The maps were the second pass's only need for them; drop
+                 * them before the finalize merges allocate. */
+                ereport_sunburst_dir_node_maps_clear(g_sunburst_tree);
+            }
+            free(bargs);
+            free(btids);
         }
 
         /* The shard catalogs back path reconstruction during the read phase only; nothing in

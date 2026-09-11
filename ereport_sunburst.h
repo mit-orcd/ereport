@@ -47,11 +47,34 @@ typedef struct ereport_sunburst_tree ereport_sunburst_tree_t;
  * accumulators are mutated in place (the rollup turns self totals into subtree
  * totals) but not freed. threads parallelizes the per-shard rollup/index prep
  * (0 or 1 = serial).
+ *
+ * When want_buckets is set, the build additionally records, per shard, a dense
+ * dir_id -> node-index map resolving every directory to its deepest
+ * materialized ancestor (4 B per catalog entry per shard), and allocates two
+ * n_nodes x 36 cell matrices. The --sunburst-buckets second pass in ereport.c
+ * fills the matrices through the accessors below; the maps stay valid until
+ * ereport_sunburst_tree_free.
  */
 ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
                                                 ereport_sunburst_accum_t *accs, size_t n,
                                                 unsigned depth_max, unsigned threads,
-                                                const char *rewrite_from, const char *rewrite_to);
+                                                const char *rewrite_from, const char *rewrite_to,
+                                                int want_buckets);
+
+/* Bucket-matrix access for the second pass. Cells are [age_bucket][size_bucket]
+ * flattened to 36; both arrays have n_nodes * 36 entries when buckets were
+ * requested, else NULL. The dir-node map for a shard (indexed by the cats[]
+ * array position) resolves parent_dir_id to the node to credit; NULL for
+ * shards the build skipped. */
+_Atomic uint64_t *ereport_sunburst_bucket_bytes(ereport_sunburst_tree_t *t);
+_Atomic uint64_t *ereport_sunburst_bucket_files(ereport_sunburst_tree_t *t);
+const uint32_t *ereport_sunburst_dir_node_map(const ereport_sunburst_tree_t *t, uint64_t file_index);
+/* Drop the bucket matrices and dir->node maps (e.g. when the second pass
+ * cannot run); the JSON writer then omits the bucket keys. */
+void ereport_sunburst_buckets_clear(ereport_sunburst_tree_t *tree);
+/* Drop only the dir->node maps (after the second pass has run); the matrices
+ * stay for the JSON writer. */
+void ereport_sunburst_dir_node_maps_clear(ereport_sunburst_tree_t *tree);
 
 /*
  * Write <out_dir>/sunburst.json (the tool-agnostic data source) and
@@ -59,7 +82,10 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
  * Returns 0 on success. JSON schema: one root node
  * {"name","path","bytes","files","children":[...]}; internal nodes carry self
  * values, leaves carry subtree totals (a depth-folded leaf includes everything
- * below it), trimmed siblings fold into an "(other)" leaf.
+ * below it), trimmed siblings fold into an "(other)" leaf. With
+ * --sunburst-buckets each node also carries "bucket_bytes"/"bucket_files": 36
+ * values each, [age_bucket][size_bucket] row-major over the report's bucket
+ * axes, summing exactly to the node's "bytes"/"files".
  */
 int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject);
 
