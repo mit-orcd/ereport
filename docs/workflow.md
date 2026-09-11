@@ -26,12 +26,16 @@ all_users/bucket_a0_s0.html
 ...
 all_users/sunburst.html    # clickable "where the bytes live" chart, linked from index.html
 all_users/sunburst.json    # the same tree as data (schema: docs/tools.md#ereport)
+all_users/users/<name>.html  # per-user sunburst pages, reachable from the
+all_users/users/<name>.json  #   User picker on the aggregate sunburst page
 ```
 
 Add `--sunburst-buckets` to the `ereport` command and the sunburst page gains
 age-range and size-range filter chips (the report's 6×6 bucket axes) plus a
 color-by-dominant-bucket selector, backed by an exact per-node bucket matrix in
-`sunburst.json`.
+`sunburst.json`. The per-user pages carry their own matrices too. Every
+sunburst page has a collapsible legend below the chart explaining the color
+schemes; `--no-sunburst-users` suppresses the per-user pages and picker.
 
 ### 3. Build the search index (optional)
 

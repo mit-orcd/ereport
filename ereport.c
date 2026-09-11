@@ -14,8 +14,8 @@
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
  * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
+ *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
  *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
  *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
  *     bucket pages are brief summaries only.
@@ -1007,6 +1007,22 @@ static unsigned g_sunburst_depth = 6;
 static int g_sunburst_buckets = 0;
 static ereport_sunburst_accum_t *g_sunburst_acc = NULL; /* [path_count] */
 static ereport_sunburst_tree_t *g_sunburst_tree = NULL;
+/* Aggregate reports also materialize one sunburst tree per seen uid (the
+ * sunburst page's user picker navigates to the per-user pages);
+ * --no-sunburst-users opts out. */
+static int g_sunburst_users = 1;
+
+/* One built per-user sunburst tree, for the picker emission and the bucket
+ * second pass's per-uid matrix credit. */
+typedef struct {
+    uint32_t uid;
+    uint64_t shard;                 /* file_index of the shard holding the uid's records */
+    ereport_sunburst_tree_t *tree;
+} sb_user_tree_t;
+
+static sb_user_tree_t *g_sb_user_trees = NULL;  /* shard-sorted after the builds */
+static size_t g_sb_user_trees_n = 0;
+static size_t *g_sb_ut_off = NULL;              /* [path_count+1] shard offsets, pass 2 only */
 static int g_sunburst_written = 0;
 
 typedef struct {
@@ -3582,6 +3598,199 @@ static void html_escape_segment(FILE *out, const char *s, size_t len) {
 
 static void emit_heat_badge_tip_shell_css(FILE *out);
 static void emit_heat_badge_tip_install_js(FILE *out);
+
+/* ------------------------------------------------------------------ */
+/* Per-user sunburst pages (aggregate mode)                           */
+/* ------------------------------------------------------------------ */
+
+/* qsort comparators for the per-user tree list: by shard for the bucket
+ * second pass's uid->tree lookup, by displayed-root bytes (desc) for the
+ * picker emission. */
+static int sb_user_tree_by_shard(const void *a, const void *b) {
+    const sb_user_tree_t *x = a, *y = b;
+    if (x->shard != y->shard) return x->shard < y->shard ? -1 : 1;
+    return (x->uid > y->uid) - (x->uid < y->uid);
+}
+
+static int sb_user_tree_by_bytes(const void *a, const void *b) {
+    const sb_user_tree_t *x = a, *y = b;
+    uint64_t xb = ereport_sunburst_tree_total_bytes(x->tree);
+    uint64_t yb = ereport_sunburst_tree_total_bytes(y->tree);
+    if (xb != yb) return xb < yb ? 1 : -1;
+    return (x->uid > y->uid) - (x->uid < y->uid);
+}
+
+/* Sanitize a user name into a file/URL-safe base: [A-Za-z0-9._-], else '_'.
+ * Falls back to uid<N> when nothing usable remains. */
+static void sb_user_base_sanitize(char *out, size_t sz, const char *name, uint32_t uid) {
+    size_t i = 0;
+
+    /* Reserve 12 bytes so the "-<uid>" dedup suffix always fits untruncated. */
+    for (; *name && i + 12 < sz; name++) {
+        unsigned char c = (unsigned char)*name;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '_' || c == '-')
+            out[i++] = (char)c;
+        else
+            out[i++] = '_';
+    }
+    out[i] = '\0';
+    if (i == 0 || strcmp(out, ".") == 0 || strcmp(out, "..") == 0)
+        snprintf(out, sz, "uid%u", (unsigned)uid);
+}
+
+/* Build the picker link lists shared by the aggregate sunburst page and the
+ * per-user pages under <out_dir>/users/. Entry 0 is the aggregate page
+ * itself; users follow in the current g_sb_user_trees order (byte-sorted by
+ * the caller). Link k+1 describes g_sb_user_trees[k]. On success returns the
+ * entry count and sets the four outputs; 0 (all NULL) when there is nothing
+ * to link or allocation fails. Labels and hrefs are owned per list entry. */
+static size_t sunburst_user_links_build(ereport_sunburst_link_t **agg_out,
+                                        ereport_sunburst_link_t **usr_out,
+                                        char ***names_out, char ***bases_out) {
+    size_t n = g_sb_user_trees_n;
+    size_t k;
+    ereport_sunburst_link_t *agg = NULL, *usr = NULL;
+    char **names = NULL, **bases = NULL;
+
+    *agg_out = NULL;
+    *usr_out = NULL;
+    *names_out = NULL;
+    *bases_out = NULL;
+    if (n == 0) return 0;
+
+    agg = calloc(n + 1, sizeof(*agg));
+    usr = calloc(n + 1, sizeof(*usr));
+    names = calloc(n, sizeof(*names));
+    bases = calloc(n, sizeof(*bases));
+    if (!agg || !usr || !names || !bases) goto fail;
+
+    agg[0].label = strdup("all users");
+    agg[0].href = strdup("sunburst.html");
+    usr[0].label = strdup("all users");
+    usr[0].href = strdup("../sunburst.html");
+    if (!agg[0].label || !agg[0].href || !usr[0].label || !usr[0].href) goto fail;
+
+    for (k = 0; k < n; k++) {
+        uint32_t uid = g_sb_user_trees[k].uid;
+        struct passwd *pw = getpwuid((uid_t)uid);
+        const char *nm = (pw && pw->pw_name && pw->pw_name[0]) ? pw->pw_name : NULL;
+        char fb[24], hb[24], base[80];
+        size_t j, bl;
+        int dup;
+
+        if (!nm) {
+            snprintf(fb, sizeof(fb), "%u", (unsigned)uid);
+            nm = fb;
+        }
+        names[k] = strdup(nm);
+        if (!names[k]) goto fail;
+
+        /* File base: sanitized, then made unique among the pages already
+         * assigned (two uids can share a name, e.g. UNKNOWN). */
+        sb_user_base_sanitize(base, sizeof(base), nm, uid);
+        dup = 0;
+        for (j = 0; j < k; j++) {
+            if (bases[j] && strcmp(bases[j], base) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            bl = strlen(base);
+            snprintf(base + bl, sizeof(base) - bl, "-%u", (unsigned)uid);
+        }
+        bases[k] = strdup(base);
+        if (!bases[k]) goto fail;
+
+        human_bytes(ereport_sunburst_tree_total_bytes(g_sb_user_trees[k].tree), hb, sizeof(hb));
+        {
+            /* " — " is 5 bytes in UTF-8 (space + U+2014 + space), plus NUL. */
+            size_t need = strlen(nm) + strlen(hb) + 6;
+            char *lbl1 = malloc(need);
+            char *lbl2 = malloc(need);
+            char *h1 = malloc(strlen(base) + 12);
+            char *h2 = malloc(strlen(base) + 7);
+            if (!lbl1 || !lbl2 || !h1 || !h2) {
+                free(lbl1);
+                free(lbl2);
+                free(h1);
+                free(h2);
+                goto fail;
+            }
+            snprintf(lbl1, need, "%s — %s", nm, hb);
+            snprintf(lbl2, need, "%s — %s", nm, hb);
+            snprintf(h1, strlen(base) + 12, "users/%s.html", base);
+            snprintf(h2, strlen(base) + 7, "%s.html", base);
+            agg[k + 1].label = lbl1;
+            agg[k + 1].href = h1;
+            usr[k + 1].label = lbl2;
+            usr[k + 1].href = h2;
+        }
+    }
+
+    *agg_out = agg;
+    *usr_out = usr;
+    *names_out = names;
+    *bases_out = bases;
+    return n + 1;
+
+fail:
+    fprintf(stderr, "warn: per-user sunburst link allocation failed; user picker disabled\n");
+    if (agg) {
+        for (k = 0; k <= n; k++) {
+            if (!agg[k].label && !agg[k].href) break;
+            free((void *)agg[k].label);
+            free((void *)agg[k].href);
+        }
+        free(agg);
+    }
+    if (usr) {
+        for (k = 0; k <= n; k++) {
+            if (!usr[k].label && !usr[k].href) break;
+            free((void *)usr[k].label);
+            free((void *)usr[k].href);
+        }
+        free(usr);
+    }
+    if (names) {
+        for (k = 0; k < n; k++) free(names[k]);
+        free(names);
+    }
+    if (bases) {
+        for (k = 0; k < n; k++) free(bases[k]);
+        free(bases);
+    }
+    return 0;
+}
+
+static void sunburst_user_links_free(ereport_sunburst_link_t *agg, ereport_sunburst_link_t *usr,
+                                     char **names, char **bases, size_t n_links) {
+    size_t k;
+
+    if (agg) {
+        for (k = 0; k < n_links; k++) {
+            free((void *)agg[k].label);
+            free((void *)agg[k].href);
+        }
+        free(agg);
+    }
+    if (usr) {
+        for (k = 0; k < n_links; k++) {
+            free((void *)usr[k].label);
+            free((void *)usr[k].href);
+        }
+        free(usr);
+    }
+    if (names) {
+        for (k = 0; k + 1 < n_links; k++) free(names[k]);
+        free(names);
+    }
+    if (bases) {
+        for (k = 0; k + 1 < n_links; k++) free(bases[k]);
+        free(bases);
+    }
+}
 
 #define PATH_HASH_FNV_OFFSET 1469598103934665603ULL
 #define PATH_HASH_FNV_PRIME 1099511628211ULL
@@ -8575,16 +8784,93 @@ static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t pa
     return 0;
 }
 
+/* Per-uid sunburst accumulation (aggregate mode). A uid's records all live in
+ * one shard (shard = uid & (nshards-1)), so the per-uid accumulators hang off
+ * the shard and per-shard uid lists stay tiny. Slots are registered lazily on
+ * a uid's first credited record; the per-shard lock serializes registration
+ * and the credit itself, which is cheap because flushes are per directory
+ * run, not per record. */
+typedef struct {
+    uint32_t uid;
+    ereport_sunburst_accum_t acc;
+} sb_uid_slot_t;
+
+typedef struct {
+    sb_uid_slot_t *v;
+    size_t n, cap;
+    pthread_mutex_t lock;
+} sb_uid_set_t;
+
+static sb_uid_set_t *g_sunburst_uid_acc = NULL; /* [path_count] */
+static uint64_t g_sunburst_uid_alloc = 0;       /* bytes in per-uid accum arrays */
+static int g_sunburst_uid_capped = 0;           /* warn-once latch for the cap */
+/* Registration stops past this footprint (the uid's bytes still land in the
+ * aggregate tree, it just gets no picker page). */
+#define SUNBURST_UID_ACCUM_CAP (4ULL << 30)
+
+static void sunburst_uid_credit(uint64_t file_index, uint32_t uid, uint64_t dir_id,
+                                uint64_t bytes, uint64_t files) {
+    sb_uid_set_t *s = &g_sunburst_uid_acc[file_index];
+    ereport_sunburst_accum_t *a;
+    size_t i;
+
+    pthread_mutex_lock(&s->lock);
+    for (i = 0; i < s->n; i++) {
+        if (s->v[i].uid == uid) break;
+    }
+    if (i == s->n) {
+        uint64_t maxd = g_sunburst_acc[file_index].max_dir_id;
+        uint64_t need = 2 * (maxd + 1) * sizeof(uint64_t);
+        if (g_sunburst_uid_alloc + need > SUNBURST_UID_ACCUM_CAP) {
+            if (!g_sunburst_uid_capped) {
+                g_sunburst_uid_capped = 1;
+                fprintf(stderr, "warn: per-user sunburst accumulator cap (%llu GiB) reached; "
+                                "remaining users get no picker page\n",
+                        (unsigned long long)(SUNBURST_UID_ACCUM_CAP >> 30));
+            }
+            pthread_mutex_unlock(&s->lock);
+            return;
+        }
+        if (s->n == s->cap) {
+            size_t nc = s->cap ? s->cap * 2 : 4;
+            sb_uid_slot_t *nv = realloc(s->v, nc * sizeof(*nv));
+            if (!nv) {
+                pthread_mutex_unlock(&s->lock);
+                return;
+            }
+            s->v = nv;
+            s->cap = nc;
+        }
+        if (ereport_sunburst_accum_init(&s->v[s->n].acc, maxd) != 0) {
+            pthread_mutex_unlock(&s->lock);
+            return;
+        }
+        s->v[s->n].uid = uid;
+        s->n++;
+        g_sunburst_uid_alloc += need;
+    }
+    a = &s->v[i].acc;
+    if (a->bytes && dir_id <= a->max_dir_id) {
+        if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
+        if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&s->lock);
+}
+
 /* Sunburst accumulation. Records arrive in contiguous same-directory runs, so the worker
  * buffers the current run locally and flushes one relaxed atomic add per directory change
  * instead of one per record. */
-static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t bytes, uint64_t files) {
+static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t bytes, uint64_t files,
+                               uint32_t uid) {
     ereport_sunburst_accum_t *a;
     if (!g_sunburst_acc || file_index == UINT64_MAX || dir_id == 0ULL || (bytes | files) == 0) return;
     a = &g_sunburst_acc[file_index];
-    if (!a->bytes || dir_id > a->max_dir_id) return;
-    if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
-    if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
+    if (a->bytes && dir_id <= a->max_dir_id) {
+        if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
+        if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
+    }
+    if (g_sunburst_uid_acc)
+        sunburst_uid_credit(file_index, uid, dir_id, bytes, files);
 }
 
 static int read_one_chunk(const file_chunk_t *chunk,
@@ -8691,11 +8977,14 @@ static int read_one_chunk(const file_chunk_t *chunk,
     dir_cache.len = 0;
 
     /* Sunburst run buffer: the (file_index, parent_dir_id) run currently being
-     * accumulated locally; flushed on change and at chunk end. */
+     * accumulated locally; flushed on change and at chunk end. The uid joins
+     * the run key only when per-user trees are on, so runs then break a
+     * little more often but the aggregate-only path is unchanged. */
     uint64_t sb_fi = UINT64_MAX;
     uint64_t sb_dir = 0;
     uint64_t sb_bytes = 0;
     uint64_t sb_files = 0;
+    uint32_t sb_uid = 0;
     /* Record-level parent cache: the three shape/fanout accumulators all need the
      * parent dir string and its dense hash. Derive both once per distinct parent_id
      * here and share them, instead of each accumulator recomputing on its own miss. */
@@ -8995,15 +9284,18 @@ static int read_one_chunk(const file_chunk_t *chunk,
          * run (uid, subtree), so this matches the report totals; accounted_size carries
          * the hardlink dedup, and no path string is needed. */
         if (g_sunburst_acc) {
-            if ((uint64_t)chunk->file_index == sb_fi && r.parent_dir_id == sb_dir) {
+            const uint32_t sb_ruid = g_sunburst_uid_acc ? (uint32_t)r.uid : 0U;
+            if ((uint64_t)chunk->file_index == sb_fi && r.parent_dir_id == sb_dir &&
+                sb_ruid == sb_uid) {
                 sb_bytes += accounted_size;
                 sb_files += (r.type == 'f');
             } else {
-                sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files);
+                sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid);
                 sb_fi = (uint64_t)chunk->file_index;
                 sb_dir = r.parent_dir_id;
                 sb_bytes = accounted_size;
                 sb_files = (r.type == 'f');
+                sb_uid = sb_ruid;
             }
         }
 
@@ -9026,7 +9318,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
                                               r.type, rec_time, sum, shp, shp_h);
         }
     }
-    sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files);
+    sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid);
 #undef PARENT_KEY
 
 out:
@@ -9099,6 +9391,13 @@ typedef struct {
     time_t now;
     inode_set_t *seen_inodes;       /* quiescent; winner replay is read-only */
     ereport_sunburst_tree_t *tree;  /* matrices + dir->node maps to credit */
+    /* Per-user trees, shard-sorted, with [path_count+1] shard offsets: each
+     * matched record also lands in its owner's tree matrix. NULL when
+     * per-user pages or buckets are off. Per-uid matrices use shared atomics
+     * directly: with one tree per uid, hot-cell contention is spread across
+     * users instead of concentrated on one aggregate root. */
+    const sb_user_tree_t *utrees;
+    const size_t *ut_off;
     /* Per-worker matrix replicas (n_nodes*36 each), merged into the tree after
      * the join: the shared-cell atomic adds were ~93% of the pass's samples
      * (lock xadd contention on hot cells like the root and top directories).
@@ -9212,6 +9511,23 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     uint64_t last_dir = UINT64_MAX;
     uint32_t last_node = 0;
 
+    /* Per-user credit: this shard's slice of the user-tree list plus the same
+     * two memos (uid -> tree, then parent_dir_id -> node within that tree).
+     * Within a directory run the uid barely changes, so both hit nearly
+     * always. */
+    const sb_user_tree_t *ut = NULL;
+    size_t ut_n = 0;
+    uint32_t u_last_uid = UINT32_MAX;
+    const uint32_t *u_map = NULL;
+    _Atomic uint64_t *u_bb = NULL, *u_bf = NULL;
+    uint64_t u_last_dir = UINT64_MAX;
+    uint32_t u_last_node = 0;
+    if (arg->utrees && arg->ut_off) {
+        uint64_t s = chunk->file_index;
+        ut = arg->utrees + arg->ut_off[s];
+        ut_n = arg->ut_off[s + 1] - arg->ut_off[s];
+    }
+
     uint32_t recno = 0;
     for (;;) {
         bin_record_hdr_t r;
@@ -9307,6 +9623,39 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
             } else {
                 atomic_fetch_add_explicit(&bb[cell], bytes, memory_order_relaxed);
                 if (files) atomic_fetch_add_explicit(&bf[cell], files, memory_order_relaxed);
+            }
+        }
+
+        /* Per-user tree: same record, same cell, owner's matrix. The map is
+         * sized by the same shard catalog, so the parent_dir_id bound checked
+         * for the aggregate map covers this lookup too. */
+        if (ut_n) {
+            if ((uint32_t)r.uid != u_last_uid) {
+                size_t k;
+
+                u_last_uid = (uint32_t)r.uid;
+                u_map = NULL;
+                for (k = 0; k < ut_n; k++) {
+                    if (ut[k].uid == u_last_uid) {
+                        u_map = ereport_sunburst_dir_node_map(ut[k].tree, 0);
+                        u_bb = ereport_sunburst_bucket_bytes(ut[k].tree);
+                        u_bf = ereport_sunburst_bucket_files(ut[k].tree);
+                        break;
+                    }
+                }
+                u_last_dir = UINT64_MAX;
+            }
+            if (u_map && u_bb) {
+                if (r.parent_dir_id != u_last_dir) {
+                    u_last_dir = r.parent_dir_id;
+                    u_last_node = u_map[r.parent_dir_id];
+                }
+                {
+                    const size_t ucell = (size_t)u_last_node * 36 + (size_t)ab * SIZE_BUCKETS +
+                                         (size_t)sb;
+                    atomic_fetch_add_explicit(&u_bb[ucell], bytes, memory_order_relaxed);
+                    if (files) atomic_fetch_add_explicit(&u_bf[ucell], files, memory_order_relaxed);
+                }
             }
         }
     }
@@ -11188,11 +11537,11 @@ int main(int argc, char **argv) {
 
     if (argc < 2) {
         fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] "
+                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] "
                 "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
                 argv[0]);
         fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--verbose] "
+                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] "
                 "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
                 argv[0]);
         fprintf(stderr,
@@ -11222,6 +11571,10 @@ int main(int argc, char **argv) {
                 "Optional --sunburst-buckets: attach a per-node 6x6 age x size bucket matrix to the sunburst "
                 "(filter chips in sunburst.html). Costs a second, narrow-projection read pass over the bins; "
                 "hardlink byte attribution is replayed exactly from the first pass's recorded decisions.\n");
+        fprintf(stderr,
+                "Aggregate reports also build one sunburst tree per seen uid: sunburst.html gets a User "
+                "picker navigating to per-user pages under all_users/users/ (bucket matrices included when "
+                "--sunburst-buckets is on). Optional --no-sunburst-users turns that off.\n");
         fprintf(stderr,
                 "Optional --verbose: I/O counters + rolling throughput stats (default quiet: sparse "
                 "progress, no per-read I/O atomics); stderr prints ecrawl-style `key=value` progress about "
@@ -11311,6 +11664,17 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 g_sunburst_enabled = 0;
+                memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                ac -= 1;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--no-sunburst-users") == 0) {
+                if (!g_sunburst_users) {
+                    fprintf(stderr, "ereport: duplicate --no-sunburst-users\n");
+                    return 2;
+                }
+                g_sunburst_users = 0;
                 memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
                 ac -= 1;
                 argc = ac;
@@ -12103,6 +12467,20 @@ chunks_ready:
             fprintf(stderr, "warn: sunburst accumulator allocation failed; sunburst view disabled\n");
     }
 
+    /* Per-user sunburst: one uid set per shard, slots registered lazily as the
+     * scan credits records. Aggregate mode only. */
+    if (g_sunburst_acc && all_users_mode && g_sunburst_users) {
+        size_t fi;
+
+        g_sunburst_uid_acc = calloc(path_count, sizeof(*g_sunburst_uid_acc));
+        if (g_sunburst_uid_acc) {
+            for (fi = 0; fi < path_count; fi++)
+                pthread_mutex_init(&g_sunburst_uid_acc[fi].lock, NULL);
+        } else {
+            fprintf(stderr, "warn: per-user sunburst allocation failed; user picker disabled\n");
+        }
+    }
+
     /*
      * --index-dir: close the subtree over each shard's parent pointers, once, so the scan can
      * answer "is this record's parent inside?" with a bit test.
@@ -12331,6 +12709,85 @@ chunks_ready:
             g_sunburst_acc = NULL;
         }
 
+        /* Per-user sunburst trees: each uid's records live in exactly one
+         * shard, so each tree builds from that shard's catalog and the uid's
+         * own accumulator (n=1: no cross-shard merge). Runs here for the same
+         * reason as the aggregate build: workers have joined and the catalogs
+         * are still attached. The build's rollup mutates only the uid's own
+         * accumulator. */
+        if (g_sunburst_uid_acc) {
+            double vt_u0 = g_ereport_verbose ? now_sec() : 0.0;
+            size_t fi, ui, ucap = 0;
+
+            for (fi = 0; fi < path_count; fi++) {
+                sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
+                crawl_bin_catalog_t *cat = file_states[fi].catalog;
+                for (ui = 0; ui < s->n; ui++) {
+                    ereport_sunburst_tree_t *ut = NULL;
+                    if (cat) {
+                        crawl_bin_catalog_t *cats1[1];
+
+                        cats1[0] = cat;
+                        ut = ereport_sunburst_build(cats1, &s->v[ui].acc, 1, g_sunburst_depth, 1,
+                                                    g_rewrite_from, g_rewrite_to,
+                                                    g_sunburst_buckets);
+                    }
+                    if (!ut) {
+                        fprintf(stderr, "warn: per-user sunburst build failed for uid %u\n",
+                                (unsigned)s->v[ui].uid);
+                        continue;
+                    }
+                    if (ereport_sunburst_tree_total_bytes(ut) == 0 &&
+                        ereport_sunburst_tree_total_files(ut) == 0) {
+                        ereport_sunburst_tree_free(ut);
+                        continue;
+                    }
+                    if (g_sb_user_trees_n == ucap) {
+                        size_t nc = ucap ? ucap * 2 : 64;
+                        sb_user_tree_t *nt = realloc(g_sb_user_trees, nc * sizeof(*nt));
+                        if (!nt) {
+                            fprintf(stderr, "warn: per-user sunburst list allocation failed\n");
+                            ereport_sunburst_tree_free(ut);
+                            continue;
+                        }
+                        g_sb_user_trees = nt;
+                        ucap = nc;
+                    }
+                    g_sb_user_trees[g_sb_user_trees_n].uid = s->v[ui].uid;
+                    g_sb_user_trees[g_sb_user_trees_n].shard = fi;
+                    g_sb_user_trees[g_sb_user_trees_n].tree = ut;
+                    g_sb_user_trees_n++;
+                }
+                for (ui = 0; ui < s->n; ui++) ereport_sunburst_accum_free(&s->v[ui].acc);
+                free(s->v);
+                pthread_mutex_destroy(&s->lock);
+            }
+            free(g_sunburst_uid_acc);
+            g_sunburst_uid_acc = NULL;
+
+            /* Shard-sort with offsets so the bucket second pass finds a
+             * shard's users without scanning the list. */
+            if (g_sunburst_buckets && g_sb_user_trees_n > 0) {
+                if (g_sb_user_trees_n > 1)
+                    qsort(g_sb_user_trees, g_sb_user_trees_n, sizeof(*g_sb_user_trees),
+                          sb_user_tree_by_shard);
+                g_sb_ut_off = calloc(path_count + 1, sizeof(*g_sb_ut_off));
+                if (g_sb_ut_off) {
+                    size_t k;
+                    for (k = 0; k < g_sb_user_trees_n; k++)
+                        g_sb_ut_off[g_sb_user_trees[k].shard + 1]++;
+                    for (fi = 0; fi < path_count; fi++)
+                        g_sb_ut_off[fi + 1] += g_sb_ut_off[fi];
+                } else {
+                    fprintf(stderr, "warn: per-user sunburst shard index allocation failed; "
+                                    "per-user bucket filters disabled\n");
+                }
+            }
+            if (g_ereport_verbose && vt_u0 > 0.0)
+                fprintf(stderr, "sunburst: built %zu per-user trees in %.1fs\n",
+                        g_sb_user_trees_n, now_sec() - vt_u0);
+        }
+
         /* --sunburst-buckets second pass: re-scan the bins with the same
          * projection and filters and credit each matched record to its tree
          * node's 6x6 age x size matrix, replaying the hardlink dedup from the
@@ -12375,6 +12832,8 @@ chunks_ready:
                     bargs[i].now = now;
                     bargs[i].seen_inodes = &seen_inodes;
                     bargs[i].tree = g_sunburst_tree;
+                    bargs[i].utrees = g_sb_user_trees;
+                    bargs[i].ut_off = g_sb_ut_off;
                     if (rep_b) {
                         bargs[i].rep_bytes = rep_b + (size_t)i * bcells;
                         bargs[i].rep_files = rep_f + (size_t)i * bcells;
@@ -12421,6 +12880,13 @@ chunks_ready:
                 /* The maps were the second pass's only need for them; drop
                  * them before the finalize merges allocate. */
                 ereport_sunburst_dir_node_maps_clear(g_sunburst_tree);
+                {
+                    size_t ui2;
+                    for (ui2 = 0; ui2 < g_sb_user_trees_n; ui2++)
+                        ereport_sunburst_dir_node_maps_clear(g_sb_user_trees[ui2].tree);
+                }
+                free(g_sb_ut_off);
+                g_sb_ut_off = NULL;
             }
             free(bargs);
             free(btids);
@@ -12690,7 +13156,20 @@ chunks_ready:
     (void)path_try_resolve_inplace(g_bucket_output_dir, sizeof(g_bucket_output_dir));
 
     if (g_sunburst_tree) {
-        if (ereport_sunburst_write(g_sunburst_tree, g_bucket_output_dir, display_name) == 0) {
+        ereport_sunburst_link_t *agg_links = NULL, *usr_links = NULL;
+        char **user_names = NULL, **user_bases = NULL;
+        size_t n_links = 0, ui3;
+
+        /* The picker lists users by bytes desc; the bucket pass's shard order
+         * is no longer needed once its maps are dropped. */
+        if (g_sb_user_trees_n > 1)
+            qsort(g_sb_user_trees, g_sb_user_trees_n, sizeof(*g_sb_user_trees),
+                  sb_user_tree_by_bytes);
+        n_links = sunburst_user_links_build(&agg_links, &usr_links, &user_names, &user_bases);
+
+        if (ereport_sunburst_write_ex(g_sunburst_tree, g_bucket_output_dir, "sunburst",
+                                      display_name, "index.html",
+                                      agg_links, n_links, 0) == 0) {
             g_sunburst_written = 1;
             if (g_ereport_verbose)
                 fprintf(stderr, "sunburst: %zu nodes materialized, wrote %s/sunburst.{json,html}\n",
@@ -12698,6 +13177,45 @@ chunks_ready:
         } else {
             fprintf(stderr, "warn: failed to write sunburst files in %s\n", g_bucket_output_dir);
         }
+
+        /* Per-user pages: <out>/users/<base>.{json,html}, each with the same
+         * picker (hrefs relative to the users/ dir). */
+        if (n_links > 1) {
+            char udir[PATH_MAX];
+            int un = snprintf(udir, sizeof(udir), "%s/users", g_bucket_output_dir);
+
+            if (un < 0 || (size_t)un >= sizeof(udir)) {
+                fprintf(stderr, "warn: per-user sunburst dir path too long\n");
+            } else if (mkdir(udir, 0755) != 0 && errno != EEXIST) {
+                fprintf(stderr, "warn: cannot create %s: %s\n", udir, strerror(errno));
+            } else {
+                size_t wrote = 0;
+                for (ui3 = 0; ui3 < n_links - 1; ui3++) {
+                    if (ereport_sunburst_write_ex(g_sb_user_trees[ui3].tree, udir,
+                                                  user_bases[ui3], user_names[ui3],
+                                                  "../index.html",
+                                                  usr_links, n_links,
+                                                  (long)(ui3 + 1)) == 0) {
+                        wrote++;
+                    } else {
+                        fprintf(stderr, "warn: failed to write per-user sunburst for %s\n",
+                                user_names[ui3]);
+                    }
+                }
+                if (g_ereport_verbose)
+                    fprintf(stderr, "sunburst: wrote %zu per-user pages under %s\n", wrote, udir);
+            }
+        }
+
+        sunburst_user_links_free(agg_links, usr_links, user_names, user_bases, n_links);
+        for (ui3 = 0; ui3 < g_sb_user_trees_n; ui3++)
+            ereport_sunburst_tree_free(g_sb_user_trees[ui3].tree);
+        free(g_sb_user_trees);
+        g_sb_user_trees = NULL;
+        g_sb_user_trees_n = 0;
+        free(g_sb_ut_off);
+        g_sb_ut_off = NULL;
+
         ereport_sunburst_tree_free(g_sunburst_tree);
         g_sunburst_tree = NULL;
     }

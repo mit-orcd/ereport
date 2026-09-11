@@ -1065,7 +1065,8 @@ static void sb_html_escape(FILE *out, const char *s) {
     }
 }
 
-static void sb_html_prefix(FILE *out, const char *subject) {
+static void sb_html_prefix(FILE *out, const char *subject, const char *base_name,
+                           const char *report_href) {
     fputs("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
           "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Sunburst", out);
     if (subject) {
@@ -1095,6 +1096,11 @@ static void sb_html_prefix(FILE *out, const char *subject) {
           "z-index:10}\n"
           "#tip .dim{color:#98a2b3}\n"
           ".hint{padding:0 22px 14px;font-size:12px;color:#667085}\n"
+          /* Author display rules beat the UA [hidden] rule, so without this
+           * guard the filters bar and user picker would show even when their
+           * JS never unhides them (and the colorby select would sit there
+           * with no listener attached). */
+          "[hidden]{display:none!important}\n"
           ".filters{padding:10px 22px;border-bottom:1px solid #e4e7ec;display:flex;flex-direction:column;gap:8px}\n"
           ".frow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px}\n"
           ".flabel{color:#667085;min-width:38px;font-weight:600}\n"
@@ -1103,6 +1109,16 @@ static void sb_html_prefix(FILE *out, const char *subject) {
           ".chip.on{background:#eff4ff;border-color:#84adff;color:#175cd3;font-weight:600}\n"
           ".fnote{color:#98a2b3}\n"
           ".frow select{font-size:12px;padding:2px 6px;color:#344054}\n"
+          ".userpick{font-size:13px;color:#344054;display:flex;align-items:center;gap:6px}\n"
+          ".userpick select{font-size:13px;padding:3px 6px;color:#344054;max-width:min(420px,60vw)}\n"
+          ".legend{margin:0 auto 14px;max-width:min(92vmin,860px);font-size:12px;color:#344054;"
+          "border:1px solid #e4e7ec;border-radius:8px;padding:8px 12px}\n"
+          ".legend summary{cursor:pointer;font-weight:600;color:#475467;user-select:none}\n"
+          ".legend-body{padding-top:8px;display:flex;flex-direction:column;gap:6px}\n"
+          ".lrow{display:flex;flex-wrap:wrap;align-items:center;gap:4px 14px;line-height:1.5}\n"
+          ".ltitle{font-weight:600;color:#475467;min-width:70px}\n"
+          ".switem{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}\n"
+          ".sw{display:inline-block;width:12px;height:12px;border-radius:3px}\n"
           "</style>\n</head>\n<body>\n", out);
     fputs("<div class=\"topbar\">\n<h1>Sunburst", out);
     if (subject) {
@@ -1110,9 +1126,13 @@ static void sb_html_prefix(FILE *out, const char *subject) {
         sb_html_escape(out, subject);
     }
     fputs("</h1>\n<div class=\"crumbs\" id=\"crumbs\"></div>\n"
+          "<label class=\"userpick\" id=\"userpick-wrap\" hidden>User "
+          "<select id=\"userpick\"></select></label>\n"
           "<div class=\"toggle\"><button id=\"btn-bytes\" class=\"on\" type=\"button\">Bytes</button>"
-          "<button id=\"btn-files\" type=\"button\">Files</button></div>\n"
-          "<a href=\"index.html\">&larr; report</a>\n</div>\n"
+          "<button id=\"btn-files\" type=\"button\">Files</button></div>\n", out);
+    fputs("<a href=\"", out);
+    sb_html_escape(out, report_href);
+    fputs("\">&larr; report</a>\n</div>\n"
           "<div class=\"filters\" id=\"filters\" hidden>\n"
           "<div class=\"frow\"><span class=\"flabel\">Age</span><span id=\"chips-age\"></span></div>\n"
           "<div class=\"frow\"><span class=\"flabel\">Size</span><span id=\"chips-size\"></span>\n"
@@ -1124,14 +1144,19 @@ static void sb_html_prefix(FILE *out, const char *subject) {
           "</div>\n"
           "<div id=\"chartwrap\"><svg id=\"chart\" viewBox=\"0 0 1000 1000\" role=\"img\" "
           "aria-label=\"Sunburst chart\"></svg></div>\n"
+          "<details class=\"legend\" id=\"legend\"><summary>Legend</summary>"
+          "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n"
           "<div class=\"hint\">Click a wedge to zoom in; click the center to go back up. "
-          "Data: <a href=\"sunburst.json\">sunburst.json</a>.</div>\n"
+          "Data: <a href=\"", out);
+    sb_html_escape(out, base_name);
+    fputs(".json\">", out);
+    sb_html_escape(out, base_name);
+    fputs(".json</a>.</div>\n"
           "<div id=\"tip\" hidden></div>\n"
           "<script>\nconst SUNBURST = ", out);
 }
 
 static void sb_html_suffix(FILE *out) {
-    fputs(";\n", out);
     fputs(
         "let mode = 'bytes';\n"
         "let cur = SUNBURST;\n"
@@ -1407,18 +1432,99 @@ static void sb_html_suffix(FILE *out) {
         "  });\n"
         "}\n"
         "\n"
+        "/* User picker (aggregate reports that materialized per-user pages):\n"
+        "   navigate to the selected user's sunburst. */\n"
+        "if (USERS.length > 0) {\n"
+        "  const pick = document.getElementById('userpick');\n"
+        "  USERS.forEach(function (u, i) {\n"
+        "    const o = document.createElement('option');\n"
+        "    o.value = u[1];\n"
+        "    o.textContent = u[0];\n"
+        "    if (i === USER_CUR) o.selected = true;\n"
+        "    pick.appendChild(o);\n"
+        "  });\n"
+        "  pick.addEventListener('change', function () {\n"
+        "    if (this.value) window.location.href = this.value;\n"
+        "  });\n"
+        "  document.getElementById('userpick-wrap').hidden = false;\n"
+        "}\n"
+        "\n"
+        "/* Collapsible legend below the chart: the directory scheme always\n"
+        "   applies; the bucket scales only when this page carries bucket data. */\n"
+        "(function buildLegend() {\n"
+        "  const body = document.getElementById('legend-body');\n"
+        "  function row(title) {\n"
+        "    const d = document.createElement('div');\n"
+        "    d.className = 'lrow';\n"
+        "    if (title) {\n"
+        "      const t = document.createElement('span');\n"
+        "      t.className = 'ltitle';\n"
+        "      t.textContent = title;\n"
+        "      d.appendChild(t);\n"
+        "    }\n"
+        "    body.appendChild(d);\n"
+        "    return d;\n"
+        "  }\n"
+        "  function sw(d, color, label) {\n"
+        "    const item = document.createElement('span');\n"
+        "    item.className = 'switem';\n"
+        "    const box = document.createElement('span');\n"
+        "    box.className = 'sw';\n"
+        "    box.style.background = color;\n"
+        "    item.appendChild(box);\n"
+        "    item.appendChild(document.createTextNode(label));\n"
+        "    d.appendChild(item);\n"
+        "  }\n"
+        "  const d0 = row('Directory');\n"
+        "  d0.appendChild(document.createTextNode('each top-level directory gets its own hue, '\n"
+        "    + 'deeper levels are lighter shades. Grey wedges: (self) = files directly in that '\n"
+        "    + 'directory, (other) = smaller siblings folded together.'));\n"
+        "  if (HAS_BUCKETS) {\n"
+        "    const d1 = row('Age');\n"
+        "    for (let i = 0; i < 6; i++) sw(d1, 'hsl(' + (140 - i * 28) + ' 62% 52%)', AGE_NAMES[i]);\n"
+        "    const d2 = row('Size');\n"
+        "    for (let i = 0; i < 6; i++) sw(d2, 'hsl(' + (210 + i * 18) + ' 62% 52%)', SIZE_NAMES[i]);\n"
+        "    const d3 = row('');\n"
+        "    d3.appendChild(document.createTextNode('In a bucket color mode each wedge takes the hue '\n"
+        "      + 'of the bucket holding most of its selected bytes (or files).'));\n"
+        "  }\n"
+        "})();\n"
+        "\n"
         "render();\n"
         "</script>\n</body>\n</html>\n", out);
 }
 
-int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject) {
+/* The user picker data: a JS array of [label, href] pairs plus the selected
+ * index. Emitted between the tree JSON and the static suffix so every page
+ * defines USERS/USER_CUR, picker or not. */
+static void sb_users_js(FILE *out, const ereport_sunburst_link_t *users, size_t n_users,
+                        long current_user) {
+    size_t i;
+
+    fputs("const USERS = [", out);
+    for (i = 0; i < n_users; i++) {
+        fprintf(out, "%s[\"", i ? "," : "");
+        sb_json_escape(out, users[i].label);
+        fputs("\",\"", out);
+        sb_json_escape(out, users[i].href);
+        fputs("\"]", out);
+    }
+    fprintf(out, "];\nconst USER_CUR = %ld;\n", current_user);
+}
+
+int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_dir,
+                              const char *base_name, const char *subject,
+                              const char *report_href,
+                              const ereport_sunburst_link_t *users, size_t n_users,
+                              long current_user) {
     char path[PATH_MAX];
     FILE *out;
     int n;
 
-    if (!t || !out_dir || !out_dir[0]) return -1;
+    if (!t || !out_dir || !out_dir[0] || !base_name || !base_name[0] ||
+        !report_href || !report_href[0]) return -1;
 
-    n = snprintf(path, sizeof(path), "%s/sunburst.json", out_dir);
+    n = snprintf(path, sizeof(path), "%s/%s.json", out_dir, base_name);
     if (n < 0 || (size_t)n >= sizeof(path)) return -1;
     out = fopen(path, "w");
     if (!out) return -1;
@@ -1428,16 +1534,32 @@ int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir
     }
     if (fclose(out) != 0) return -1;
 
-    n = snprintf(path, sizeof(path), "%s/sunburst.html", out_dir);
+    n = snprintf(path, sizeof(path), "%s/%s.html", out_dir, base_name);
     if (n < 0 || (size_t)n >= sizeof(path)) return -1;
     out = fopen(path, "w");
     if (!out) return -1;
-    sb_html_prefix(out, subject);
+    sb_html_prefix(out, subject, base_name, report_href);
     if (sb_json_write(t, out) != 0) {
         fclose(out);
         return -1;
     }
+    fputs(";\n", out);
+    sb_users_js(out, users, n_users, current_user);
     sb_html_suffix(out);
     if (fclose(out) != 0) return -1;
     return 0;
+}
+
+int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject) {
+    return ereport_sunburst_write_ex(t, out_dir, "sunburst", subject, "index.html", NULL, 0, -1);
+}
+
+uint64_t ereport_sunburst_tree_total_bytes(const ereport_sunburst_tree_t *t) {
+    if (!t || t->root < 0) return 0;
+    return t->nodes[t->root].total_bytes + t->root_boost_bytes;
+}
+
+uint64_t ereport_sunburst_tree_total_files(const ereport_sunburst_tree_t *t) {
+    if (!t || t->root < 0) return 0;
+    return t->nodes[t->root].total_files + t->root_boost_files;
 }

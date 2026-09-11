@@ -1397,11 +1397,74 @@ PYEOF
     [[ ! -e "${rep}_offb/all_users/sunburst.json" && ! -e "${rep}_offb/all_users/sunburst.html" ]] ||
         die "--no-sunburst --sunburst-buckets still wrote sunburst files"
 
+    # User picker: the aggregate run materializes one sunburst tree per seen uid
+    # under all_users/users/ and every sunburst page gets the picker (the USERS
+    # array is what arms it; the picker markup itself is always emitted but
+    # stays hidden without it). The fixture is single-uid, so exactly one user
+    # page, whose totals equal the aggregate's.
+    [[ -d "${sdir}/users" ]] || die "sunburst users/ dir missing in the aggregate report"
+    grep -q 'const USERS = \[\["all users","sunburst.html"\],' "${sdir}/sunburst.html" ||
+        die "aggregate sunburst USERS list does not start with the all-users entry"
+    local uhtml ujson
+    uhtml=$(ls "${sdir}"/users/*.html 2>/dev/null) || die "no per-user sunburst page written"
+    ujson=$(ls "${sdir}"/users/*.json 2>/dev/null) || die "no per-user sunburst JSON written"
+    [[ "$(ls "${sdir}"/users/*.html | wc -l)" == "1" ]] ||
+        die "single-uid fixture should produce exactly one per-user page"
+    grep -q 'id="userpick"' "$uhtml" || die "user picker markup missing on the per-user page"
+    grep -q '\.\./sunburst\.html' "$uhtml" ||
+        die "per-user page picker does not link back to the aggregate page"
+    python3 - "$sjson" "$ujson" <<'PYEOF' || die "per-user sunburst totals disagree with the aggregate"
+import json, sys
+def flat(n):
+    b, f = n["bytes"], n["files"]
+    for c in n.get("children", []):
+        cb, cf = flat(c)
+        b += cb; f += cf
+    return b, f
+agg = flat(json.load(open(sys.argv[1])))
+usr = flat(json.load(open(sys.argv[2])))
+assert usr == agg, "single-user fixture: user tree totals %r != aggregate %r" % (usr, agg)
+PYEOF
+
+    # Per-user pages carry the bucket matrices too when --sunburst-buckets is on.
+    local ubjson
+    ubjson=$(ls "${rep}_b/all_users"/users/*.json 2>/dev/null) ||
+        die "per-user sunburst missing for --sunburst-buckets"
+    python3 - "$ubjson" <<'PYEOF' || die "per-user bucket matrices disagree with node totals"
+import json, sys
+root = json.load(open(sys.argv[1]))
+def walk(n):
+    yield n
+    for c in n.get("children", []):
+        for m in walk(c):
+            yield m
+nodes = list(walk(root))
+assert nodes, "empty per-user tree"
+for n in nodes:
+    assert sum(n["bucket_bytes"]) == n["bytes"], "node %r matrix/bytes mismatch" % n.get("path")
+    assert sum(n["bucket_files"]) == n["files"], "node %r matrix/files mismatch" % n.get("path")
+PYEOF
+
+    # Opt-out: --no-sunburst-users writes no users/ dir and an empty USERS
+    # array; a per-user (single username) run never gets the picker.
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_nu" --no-sunburst-users mtime "$out" \
+        >"${td}/sb.nu.out" 2>"${td}/sb.nu.err" || die "ereport --no-sunburst-users failed"
+    [[ ! -e "${rep}_nu/all_users/users" ]] ||
+        die "--no-sunburst-users still wrote the users/ dir"
+    grep -q 'const USERS = \[\];' "${rep}_nu/all_users/sunburst.html" ||
+        die "--no-sunburst-users still embeds a USERS list"
+    grep -q 'const USERS = \[\];' "${rep}_user"/*/sunburst.html ||
+        die "per-user run should not get the user picker"
+
+    # Collapsible legend below the chart on every sunburst page.
+    grep -q 'id="legend"' "${sdir}/sunburst.html" || die "legend missing on the sunburst page"
+    grep -q 'buildLegend' "${sdir}/sunburst.html" || die "legend builder missing on the sunburst page"
+
     # Snapshot the main report for --keep-html; sunburst.html embeds the JSON
     # (const SUNBURST = ...), so the *.html copy alone stays fully browsable.
     keep_html sunburst "$rep"
 
-    summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out+buckets"
+    summary_add PASS "ereport sunburst" "totals(three-way)+collapse+trim+depth-fold+subtree+per-user+opt-out+buckets+users+legend"
 }
 
 run_subtree_dup_tests() {

@@ -77,8 +77,18 @@ void ereport_sunburst_buckets_clear(ereport_sunburst_tree_t *tree);
 void ereport_sunburst_dir_node_maps_clear(ereport_sunburst_tree_t *tree);
 
 /*
- * Write <out_dir>/sunburst.json (the tool-agnostic data source) and
- * <out_dir>/sunburst.html (the self-contained chart page, JSON embedded).
+ * One entry in the user picker shown on sunburst pages when the aggregate
+ * (all_users) report also materialized per-user trees: the option label plus
+ * the relative href of that entry's page.
+ */
+typedef struct {
+    const char *label;
+    const char *href;
+} ereport_sunburst_link_t;
+
+/*
+ * Write <out_dir>/<base_name>.json (the tool-agnostic data source) and
+ * <out_dir>/<base_name>.html (the self-contained chart page, JSON embedded).
  * Returns 0 on success. JSON schema: one root node
  * {"name","path","bytes","files","children":[...]}; internal nodes carry self
  * values, leaves carry subtree totals (a depth-folded leaf includes everything
@@ -86,8 +96,26 @@ void ereport_sunburst_dir_node_maps_clear(ereport_sunburst_tree_t *tree);
  * --sunburst-buckets each node also carries "bucket_bytes"/"bucket_files": 36
  * values each, [age_bucket][size_bucket] row-major over the report's bucket
  * axes, summing exactly to the node's "bytes"/"files".
+ *
+ * report_href is the relative link back to the report's index.html.
+ * users/n_users/current_user describe the user picker: n_users == 0 hides it,
+ * otherwise current_user is the selected option (the caller includes an
+ * "all users" entry for the aggregate page).
  */
+int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_dir,
+                              const char *base_name, const char *subject,
+                              const char *report_href,
+                              const ereport_sunburst_link_t *users, size_t n_users,
+                              long current_user);
+
+/* Same as ereport_sunburst_write_ex with base "sunburst", report link
+ * "index.html" and no user picker. */
 int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject);
+
+/* Grand totals of the displayed root (subtree totals plus the collapsed
+ * ancestors' boost), for picker labels and empty-tree detection. */
+uint64_t ereport_sunburst_tree_total_bytes(const ereport_sunburst_tree_t *t);
+uint64_t ereport_sunburst_tree_total_files(const ereport_sunburst_tree_t *t);
 
 /* Node count and grand-total accessors for run stats. */
 size_t ereport_sunburst_tree_nodes(const ereport_sunburst_tree_t *t);
