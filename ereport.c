@@ -9393,11 +9393,21 @@ typedef struct {
     ereport_sunburst_tree_t *tree;  /* matrices + dir->node maps to credit */
     /* Per-user trees, shard-sorted, with [path_count+1] shard offsets: each
      * matched record also lands in its owner's tree matrix. NULL when
-     * per-user pages or buckets are off. Per-uid matrices use shared atomics
-     * directly: with one tree per uid, hot-cell contention is spread across
-     * users instead of concentrated on one aggregate root. */
+     * per-user pages or buckets are off. */
     const sb_user_tree_t *utrees;
     const size_t *ut_off;
+    /* Per-worker replica of the CURRENT uid's matrix, kept all-zero except
+     * the cells of the nodes on the u_dirty stack, which merge into the
+     * uid's shared matrix (locked adds) on uid switch and at chunk end.
+     * Same rationale as the aggregate replicas below: a shard's chunks
+     * spread across threads and a shard holds ~one uid, so direct shared
+     * stores bounce the same matrix lines between cores — measured on n2:
+     * 5x CPU / 3.5x wall for the pass, gone at 1 thread or with the stores
+     * removed. NULL -> fall back to shared atomics (allocation cap). */
+    uint64_t *u_rep_b;              /* [u_cap*36] */
+    uint64_t *u_rep_f;              /* [u_cap*36] */
+    uint32_t *u_dirty;              /* [u_cap] dirty-node stack */
+    unsigned char *u_dirty_flag;    /* [u_cap] per-node on-stack flags */
     /* Per-worker matrix replicas (n_nodes*36 each), merged into the tree after
      * the join: the shared-cell atomic adds were ~93% of the pass's samples
      * (lock xadd contention on hot cells like the root and top directories).
@@ -9407,6 +9417,35 @@ typedef struct {
     unsigned long bad_reads;        /* per-worker error tallies, summed after join */
     unsigned long missing_winners;  /* replay lookups that found no winner (should stay 0) */
 } bucket_worker_arg_t;
+
+/* Merge a worker's per-uid matrix replica into the tree's shared matrix and
+ * re-zero the dirty cells, leaving the replica all-zero for the next uid. */
+static void sb_uid_replica_flush(uint64_t *rb, uint64_t *rf, ereport_sunburst_tree_t *tree,
+                                 uint32_t *dirty, unsigned char *flag, size_t ndirty) {
+    _Atomic uint64_t *bb = ereport_sunburst_bucket_bytes(tree);
+    _Atomic uint64_t *bf = ereport_sunburst_bucket_files(tree);
+    size_t i;
+    int c;
+
+    for (i = 0; i < ndirty; i++) {
+        const uint32_t n = dirty[i];
+        uint64_t *lrb = rb + (size_t)n * 36;
+        uint64_t *lrf = rf + (size_t)n * 36;
+        _Atomic uint64_t *sbb = bb + (size_t)n * 36;
+        _Atomic uint64_t *sbf = bf + (size_t)n * 36;
+        for (c = 0; c < 36; c++) {
+            if (lrb[c]) {
+                atomic_fetch_add_explicit(&sbb[c], lrb[c], memory_order_relaxed);
+                lrb[c] = 0;
+            }
+            if (lrf[c]) {
+                atomic_fetch_add_explicit(&sbf[c], lrf[c], memory_order_relaxed);
+                lrf[c] = 0;
+            }
+        }
+        flag[n] = 0;
+    }
+}
 
 /* Lean re-scan of one chunk crediting the tree's per-node 6x6 age x size
  * matrices. Must replicate read_one_chunk's record iteration and filter
@@ -9514,12 +9553,15 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     /* Per-user credit: this shard's slice of the user-tree list plus the same
      * two memos (uid -> tree, then parent_dir_id -> node within that tree).
      * Within a directory run the uid barely changes, so both hit nearly
-     * always. */
+     * always. Stores go to the worker's private replica of the current uid's
+     * matrix (u_tree), never to the shared matrix directly. */
     const sb_user_tree_t *ut = NULL;
     size_t ut_n = 0;
     uint32_t u_last_uid = UINT32_MAX;
     const uint32_t *u_map = NULL;
-    _Atomic uint64_t *u_bb = NULL, *u_bf = NULL;
+    ereport_sunburst_tree_t *u_tree = NULL;
+    _Atomic uint64_t *u_bb = NULL, *u_bf = NULL; /* fallback path only */
+    size_t u_ndirty = 0;
     uint64_t u_last_dir = UINT64_MAX;
     uint32_t u_last_node = 0;
     if (arg->utrees && arg->ut_off) {
@@ -9631,21 +9673,32 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
          * for the aggregate map covers this lookup too. */
         if (ut_n) {
             if ((uint32_t)r.uid != u_last_uid) {
+                const sb_user_tree_t *cand = NULL;
                 size_t k;
 
                 u_last_uid = (uint32_t)r.uid;
-                u_map = NULL;
                 for (k = 0; k < ut_n; k++) {
                     if (ut[k].uid == u_last_uid) {
-                        u_map = ereport_sunburst_dir_node_map(ut[k].tree, 0);
-                        u_bb = ereport_sunburst_bucket_bytes(ut[k].tree);
-                        u_bf = ereport_sunburst_bucket_files(ut[k].tree);
+                        cand = &ut[k];
                         break;
                     }
                 }
+                if (u_tree != (cand ? cand->tree : NULL)) {
+                    /* uid switch: merge the previous uid's dirty cells into
+                     * its shared matrix, then rebind the replica. */
+                    if (u_tree && u_ndirty && arg->u_rep_b) {
+                        sb_uid_replica_flush(arg->u_rep_b, arg->u_rep_f, u_tree,
+                                             arg->u_dirty, arg->u_dirty_flag, u_ndirty);
+                        u_ndirty = 0;
+                    }
+                    u_tree = cand ? cand->tree : NULL;
+                    u_map = u_tree ? ereport_sunburst_dir_node_map(u_tree, 0) : NULL;
+                    u_bb = u_tree ? ereport_sunburst_bucket_bytes(u_tree) : NULL;
+                    u_bf = u_tree ? ereport_sunburst_bucket_files(u_tree) : NULL;
+                }
                 u_last_dir = UINT64_MAX;
             }
-            if (u_map && u_bb) {
+            if (u_tree && u_map) {
                 if (r.parent_dir_id != u_last_dir) {
                     u_last_dir = r.parent_dir_id;
                     u_last_node = u_map[r.parent_dir_id];
@@ -9653,12 +9706,25 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
                 {
                     const size_t ucell = (size_t)u_last_node * 36 + (size_t)ab * SIZE_BUCKETS +
                                          (size_t)sb;
-                    atomic_fetch_add_explicit(&u_bb[ucell], bytes, memory_order_relaxed);
-                    if (files) atomic_fetch_add_explicit(&u_bf[ucell], files, memory_order_relaxed);
+                    if (arg->u_rep_b) {
+                        if (!arg->u_dirty_flag[u_last_node]) {
+                            arg->u_dirty_flag[u_last_node] = 1;
+                            arg->u_dirty[u_ndirty++] = u_last_node;
+                        }
+                        arg->u_rep_b[ucell] += bytes;
+                        if (files) arg->u_rep_f[ucell] += files;
+                    } else {
+                        atomic_fetch_add_explicit(&u_bb[ucell], bytes, memory_order_relaxed);
+                        if (files) atomic_fetch_add_explicit(&u_bf[ucell], files, memory_order_relaxed);
+                    }
                 }
             }
         }
     }
+
+    if (u_tree && u_ndirty && arg->u_rep_b)
+        sb_uid_replica_flush(arg->u_rep_b, arg->u_rep_f, u_tree,
+                             arg->u_dirty, arg->u_dirty_flag, u_ndirty);
 
     crawl_bin_block_reader_free(&br);
     free(pathbuf_store);
@@ -12821,6 +12887,41 @@ chunks_ready:
                     }
                 }
 
+                /* Per-worker replicas for the per-uid matrices: one current
+                 * uid's matrix per worker, sized by the largest user tree,
+                 * plus the dirty-node stack/flags (one byte each). Same
+                 * 256 MiB cap as the aggregate replicas; past it the workers
+                 * credit the shared per-uid matrices directly. */
+                size_t ucells_max = 0, unodes_max = 0;
+                uint64_t *u_rep_b = NULL, *u_rep_f = NULL;
+                uint32_t *u_dirty = NULL;
+                unsigned char *u_dflag = NULL;
+                if (g_sb_user_trees_n) {
+                    size_t ui3;
+                    for (ui3 = 0; ui3 < g_sb_user_trees_n; ui3++) {
+                        size_t nn = ereport_sunburst_tree_nodes(g_sb_user_trees[ui3].tree);
+                        if (nn > unodes_max) unodes_max = nn;
+                    }
+                    ucells_max = unodes_max * 36;
+                }
+                if (ucells_max > 0 &&
+                    (uint64_t)threads_used * (ucells_max * 2 * sizeof(uint64_t) +
+                     unodes_max * (sizeof(uint32_t) + 1)) <= (256ULL << 20)) {
+                    u_rep_b = (uint64_t *)calloc((size_t)threads_used * ucells_max, sizeof(*u_rep_b));
+                    u_rep_f = (uint64_t *)calloc((size_t)threads_used * ucells_max, sizeof(*u_rep_f));
+                    u_dirty = (uint32_t *)malloc((size_t)threads_used * unodes_max * sizeof(*u_dirty));
+                    u_dflag = (unsigned char *)calloc((size_t)threads_used * unodes_max, 1);
+                    if (!u_rep_b || !u_rep_f || !u_dirty || !u_dflag) {
+                        free(u_rep_b);
+                        free(u_rep_f);
+                        free(u_dirty);
+                        free(u_dflag);
+                        u_rep_b = u_rep_f = NULL;
+                        u_dirty = NULL;
+                        u_dflag = NULL;
+                    }
+                }
+
                 queue.next_index = 0; /* workers all joined; hand every chunk out again */
                 for (i = 0; i < threads_used; i++) {
                     bargs[i].queue = &queue;
@@ -12837,6 +12938,12 @@ chunks_ready:
                     if (rep_b) {
                         bargs[i].rep_bytes = rep_b + (size_t)i * bcells;
                         bargs[i].rep_files = rep_f + (size_t)i * bcells;
+                    }
+                    if (u_rep_b) {
+                        bargs[i].u_rep_b = u_rep_b + (size_t)i * ucells_max;
+                        bargs[i].u_rep_f = u_rep_f + (size_t)i * ucells_max;
+                        bargs[i].u_dirty = u_dirty + (size_t)i * unodes_max;
+                        bargs[i].u_dirty_flag = u_dflag + (size_t)i * unodes_max;
                     }
                     if (pthread_create(&btids[i], NULL, bucket_worker_main, &bargs[i]) != 0) {
                         fprintf(stderr, "warn: failed to create bucket pass thread %d\n", i);
@@ -12865,6 +12972,10 @@ chunks_ready:
                 }
                 free(rep_b);
                 free(rep_f);
+                free(u_rep_b);
+                free(u_rep_f);
+                free(u_dirty);
+                free(u_dflag);
                 if (bstarted == 0) {
                     ereport_sunburst_buckets_clear(g_sunburst_tree);
                 } else {
