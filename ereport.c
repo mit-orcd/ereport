@@ -9099,6 +9099,12 @@ typedef struct {
     time_t now;
     inode_set_t *seen_inodes;       /* quiescent; winner replay is read-only */
     ereport_sunburst_tree_t *tree;  /* matrices + dir->node maps to credit */
+    /* Per-worker matrix replicas (n_nodes*36 each), merged into the tree after
+     * the join: the shared-cell atomic adds were ~93% of the pass's samples
+     * (lock xadd contention on hot cells like the root and top directories).
+     * NULL -> fall back to the shared atomics (huge trees, see main). */
+    uint64_t *rep_bytes;
+    uint64_t *rep_files;
     unsigned long bad_reads;        /* per-worker error tallies, summed after join */
     unsigned long missing_winners;  /* replay lookups that found no winner (should stay 0) */
 } bucket_worker_arg_t;
@@ -9295,8 +9301,13 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
 
         {
             const size_t cell = (size_t)node * 36 + (size_t)ab * SIZE_BUCKETS + (size_t)sb;
-            atomic_fetch_add_explicit(&bb[cell], bytes, memory_order_relaxed);
-            if (files) atomic_fetch_add_explicit(&bf[cell], files, memory_order_relaxed);
+            if (arg->rep_bytes) {
+                arg->rep_bytes[cell] += bytes;
+                if (files) arg->rep_files[cell] += files;
+            } else {
+                atomic_fetch_add_explicit(&bb[cell], bytes, memory_order_relaxed);
+                if (files) atomic_fetch_add_explicit(&bf[cell], files, memory_order_relaxed);
+            }
         }
     }
 
@@ -12336,6 +12347,22 @@ chunks_ready:
                 double vt_b0 = (g_ereport_verbose) ? now_sec() : 0.0;
                 int bstarted = 0;
                 unsigned long bad = 0, missing = 0;
+                /* Per-worker matrix replicas: threads * nodes * 36 cells * 2
+                 * arrays. Capped at 256 MiB; beyond that (trees near the 64K
+                 * node budget with many threads) the workers share the tree's
+                 * atomic cells directly. */
+                const size_t bcells = ereport_sunburst_tree_nodes(g_sunburst_tree) * 36;
+                uint64_t *rep_b = NULL, *rep_f = NULL;
+                if (bcells > 0 &&
+                    (uint64_t)threads_used * bcells * 2 * sizeof(uint64_t) <= (256ULL << 20)) {
+                    rep_b = (uint64_t *)calloc((size_t)threads_used * bcells, sizeof(*rep_b));
+                    rep_f = (uint64_t *)calloc((size_t)threads_used * bcells, sizeof(*rep_f));
+                    if (!rep_b || !rep_f) {
+                        free(rep_b);
+                        free(rep_f);
+                        rep_b = rep_f = NULL;
+                    }
+                }
 
                 queue.next_index = 0; /* workers all joined; hand every chunk out again */
                 for (i = 0; i < threads_used; i++) {
@@ -12348,6 +12375,10 @@ chunks_ready:
                     bargs[i].now = now;
                     bargs[i].seen_inodes = &seen_inodes;
                     bargs[i].tree = g_sunburst_tree;
+                    if (rep_b) {
+                        bargs[i].rep_bytes = rep_b + (size_t)i * bcells;
+                        bargs[i].rep_files = rep_f + (size_t)i * bcells;
+                    }
                     if (pthread_create(&btids[i], NULL, bucket_worker_main, &bargs[i]) != 0) {
                         fprintf(stderr, "warn: failed to create bucket pass thread %d\n", i);
                         break;
@@ -12359,6 +12390,22 @@ chunks_ready:
                     bad += bargs[i].bad_reads;
                     missing += bargs[i].missing_winners;
                 }
+                if (rep_b && bstarted > 0) {
+                    /* Merge the replicas into the tree's matrices. */
+                    _Atomic uint64_t *mbb = ereport_sunburst_bucket_bytes(g_sunburst_tree);
+                    _Atomic uint64_t *mbf = ereport_sunburst_bucket_files(g_sunburst_tree);
+                    size_t c;
+                    for (i = 0; i < bstarted; i++) {
+                        const uint64_t *rb = rep_b + (size_t)i * bcells;
+                        const uint64_t *rf = rep_f + (size_t)i * bcells;
+                        for (c = 0; c < bcells; c++) {
+                            if (rb[c]) atomic_fetch_add_explicit(&mbb[c], rb[c], memory_order_relaxed);
+                            if (rf[c]) atomic_fetch_add_explicit(&mbf[c], rf[c], memory_order_relaxed);
+                        }
+                    }
+                }
+                free(rep_b);
+                free(rep_f);
                 if (bstarted == 0) {
                     ereport_sunburst_buckets_clear(g_sunburst_tree);
                 } else {
