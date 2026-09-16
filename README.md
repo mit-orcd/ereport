@@ -37,6 +37,7 @@ Variations: per-user report (`./ereport alice mtime crawl-out`, index with `./er
 | [`ecrawl_query`](docs/tools.md#ecrawl_query) | Read-only directory-shape stats (parent, path-depth, and top-parent histograms). |
 | [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Mounts a crawl as a read-only FUSE filesystem, so `find`/`ls`/`du` work on it without the source tree. Linux only. |
 | [`edelete`](docs/tools.md#edelete) | Parallel deleter for non-directory paths, optionally filtered by age and owner. Dry-run by default. |
+| [`edump`](docs/tools.md#edump) | Recreates a crawl as a new tree with scrambled names and repeating seed-derived file contents. |
 
 Full flags, examples, and per-tool behavior: [docs/tools.md](docs/tools.md).
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Verification harness: ecrawl + ereport integration, smoke tests for ecrawl_query /
-# edelete / ereport_index, optional live-tree correlation with find/fd.
+# edelete / edump / ereport_index, optional live-tree correlation with find/fd.
 #
 # Usage:
 #   ./scripts/test/test.sh                      # integration + tool smoke tests (temp tree + built binaries)
@@ -9,7 +9,7 @@
 #   ./scripts/test/test.sh /path/to/tree        # above + filesystem correlation for that root
 #   SKIP_FS=1 ./scripts/test/test.sh /path      # integration only (ignore arg for fs checks)
 #   ECRAWL=/abs/ecrawl EREPORT=/abs/ereport ./scripts/test/test.sh
-#   ECRAWL_QUERY EDELETE EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
+#   ECRAWL_QUERY EDELETE EDUMP EREPORT_INDEX ECRAWL_MOUNT override those binaries (repo root by default).
 #   SKIP_FUSE=1 ./scripts/test/test.sh          # skip the ecrawl_mount live-mount comparison (index check still runs)
 #
 # Requires: bash, coreutils, the Makefile tools built (default: the repo root, two
@@ -38,6 +38,7 @@ ECRAWL="${ECRAWL:-$REPO_ROOT/ecrawl}"
 EREPORT="${EREPORT:-$REPO_ROOT/ereport}"
 ECRAWL_QUERY="${ECRAWL_QUERY:-$REPO_ROOT/ecrawl_query}"
 EDELETE="${EDELETE:-$REPO_ROOT/edelete}"
+EDUMP="${EDUMP:-$REPO_ROOT/edump}"
 EREPORT_INDEX="${EREPORT_INDEX:-$REPO_ROOT/ereport_index}"
 QUERY_SUBTREE_DUPS="${QUERY_SUBTREE_DUPS:-$REPO_ROOT/test_query_subtree_dups}"
 # Optional target: only built when FUSE headers were available (see 'make fuse-headers').
@@ -2641,6 +2642,178 @@ run_ecrawl_mount_tests() {
     summary_add PASS "ecrawl_mount live mount" "namespace+stat+du+read+symlink+ro"
 }
 
+dump_tree_sig() {
+    # Type + relative path. Skip st_size: directory sizes depend on mkdir order.
+    (cd "$1" && find . -mindepth 1 -printf '%y %P\n' | LC_ALL=C sort)
+}
+
+dump_cmp_regular() {
+    local a=$1 b=$2 rel
+    while IFS= read -r rel; do
+        cmp -s "$a/$rel" "$b/$rel" || return 1
+    done < <(cd "$a" && find . -type f -printf '%P\n')
+}
+
+run_edump_tests() {
+    local td tree crawl d1 d2 d3 dseed
+    local n1 n2
+
+    log "edump test suite (synthetic tree)"
+    td=$(mktemp -d "${TMPDIR:-/tmp}/ereport_edump.XXXXXX")
+    EDUMP_TD=$td
+    cleanup_edump() {
+        [[ -n "${EDUMP_TD:-}" ]] && rm -rf "$EDUMP_TD"
+    }
+    trap cleanup_edump EXIT
+
+    tree="${td}/tree"
+    crawl="${td}/crawl"
+    mkdir -p "${tree}/nested/sub" "${tree}/empty"
+    printf 'abc' >"${tree}/small.txt"
+    head -c 100 /dev/zero >"${tree}/mid.bin"
+    head -c 5000 /dev/zero >"${tree}/odd.bin"
+    head -c 1000 /dev/zero >"${tree}/nested/sub/file.dat"
+    printf 'hello' >"${tree}/a.txt"
+    ln "${tree}/a.txt" "${tree}/a_hard"
+    ln -s a.txt "${tree}/link_a"
+    mkfifo "${tree}/pipe.fifo"
+    truncate -s 1234567 "${tree}/sparse.bin"
+
+    section_int "[edump] name self-test"
+    "$EDUMP" --name-self-test >"${td}/self.out" 2>"${td}/self.err" || {
+        tail -n 40 "${td}/self.err" >&2 || true
+        die "edump --name-self-test failed"
+    }
+    n1=$(awk '/^id=1000000000 /{sub(/^.*name=/,""); print}' "${td}/self.out")
+    n2=$(awk '/^id=1000000001 /{sub(/^.*name=/,""); print}' "${td}/self.out")
+    [[ "$n1" =~ ^[0-9a-z]{4}-[0-9a-z]{4}$ ]] || die "edump self-test name 1000000000 is '$n1'"
+    [[ "$n2" =~ ^[0-9a-z]{4}-[0-9a-z]{4}$ ]] || die "edump self-test name 1000000001 is '$n2'"
+    [[ "$n1" != "$n2" ]] || die "edump self-test sequential ids produced '$n1'"
+    expect_eq "edump self-test injective sample" "4096" "$(kv_last injective "${td}/self.out")"
+    summary_add PASS "edump --name-self-test" "$n1 vs $n2"
+
+    section_int "[edump] crawl + dump"
+    local tree_abs
+    tree_abs=$(cd "$tree" && pwd -P)
+    ECRAWL_CRAWL_THREADS=2 "$ECRAWL" "$tree_abs" "$crawl" >"${td}/crawl.out" 2>"${td}/crawl.err" || {
+        tail -n 40 "${td}/crawl.err" >&2 || true
+        die "ecrawl failed for edump fixture"
+    }
+
+    d1="${td}/dump1"
+    "$EDUMP" --seed 7 --writers 1 --block-size 4096 "$crawl" "$d1" >"${td}/d1.out" 2>"${td}/d1.err" || {
+        tail -n 40 "${td}/d1.err" >&2 || true
+        die "edump --writers 1 failed"
+    }
+    d2="${td}/dump2"
+    "$EDUMP" --seed 7 --writers 4 --block-size 4096 "$crawl" "$d2" >"${td}/d2.out" 2>"${td}/d2.err" || {
+        tail -n 40 "${td}/d2.err" >&2 || true
+        die "edump --writers 4 failed"
+    }
+    dump_tree_sig "$d1" >"${td}/d1.sig"
+    dump_tree_sig "$d2" >"${td}/d2.sig"
+    expect_eq "edump --writers 1 vs 4 listing" "$(cat "${td}/d1.sig")" "$(cat "${td}/d2.sig")"
+    dump_cmp_regular "$d1" "$d2" || die "edump --writers 1 vs 4 regular file bytes differ"
+    summary_add PASS "edump writers 1 vs 4" "identical tree"
+
+    d3="${td}/dump1b"
+    "$EDUMP" --seed 7 --writers 1 --block-size 4096 "$crawl" "$d3" >"${td}/d1b.out" 2>"${td}/d1b.err" ||
+        die "edump second same-seed run failed"
+    dump_tree_sig "$d3" >"${td}/d3.sig"
+    expect_eq "edump same seed listing" "$(cat "${td}/d1.sig")" "$(cat "${td}/d3.sig")"
+    dump_cmp_regular "$d1" "$d3" || die "edump same seed file bytes differ"
+    summary_add PASS "edump same seed" "reproducible"
+
+    local dbuf
+    dbuf="${td}/dump_buf"
+    "$EDUMP" --seed 7 --writers 1 --block-size 4000 "$crawl" "$dbuf" >"${td}/dbuf.out" 2>"${td}/dbuf.err" || {
+        tail -n 40 "${td}/dbuf.err" >&2 || true
+        die "edump --block-size 4000 (buffered fallback) failed"
+    }
+    dump_tree_sig "$dbuf" >"${td}/dbuf.sig"
+    expect_eq "edump buffered fallback vs direct listing" "$(cat "${td}/d1.sig")" "$(cat "${td}/dbuf.sig")"
+    (cd "$d1" && find . -type f -printf '%s %P\n' | LC_ALL=C sort) >"${td}/d1.sizes"
+    (cd "$dbuf" && find . -type f -printf '%s %P\n' | LC_ALL=C sort) >"${td}/dbuf.sizes"
+    expect_eq "edump buffered fallback vs direct sizes" "$(cat "${td}/d1.sizes")" "$(cat "${td}/dbuf.sizes")"
+    summary_add PASS "edump buffered fallback (block-size 4000)" "identical names and sizes"
+
+    section_int "[edump] direct-I/O pattern periodicity"
+    local odd_dump sparse_dump
+    odd_dump=$(find "$d1" -type f -size 5000c -print)
+    sparse_dump=$(find "$d1" -type f -size 1234567c -print)
+    [[ -n "$odd_dump" && -n "$sparse_dump" ]] || die "edump missing odd/sparse dumped files"
+    cmp -n 904 <(tail -c +4097 "$odd_dump") <(head -c 904 "$odd_dump") ||
+        die "edump 5000-byte file: direct tail breaks the repeating block pattern"
+    cmp -n 4096 <(tail -c +4097 "$sparse_dump") <(head -c 4096 "$sparse_dump") ||
+        die "edump sparse file: second block differs from first"
+    cmp -n 1671 <(tail -c 1671 "$sparse_dump") <(head -c 1671 "$sparse_dump") ||
+        die "edump sparse file: direct tail breaks the repeating block pattern"
+    summary_add PASS "edump direct-I/O pattern" "tails continue the repeating block"
+
+    dseed="${td}/dump_seed2"
+    "$EDUMP" --seed 8 --writers 1 --block-size 4096 "$crawl" "$dseed" >"${td}/dseed.out" 2>"${td}/dseed.err" ||
+        die "edump different seed failed"
+    dump_tree_sig "$dseed" >"${td}/dseed.sig"
+    if cmp -s "${td}/d1.sig" "${td}/dseed.sig"; then
+        die "edump different seed produced an identical tree listing"
+    fi
+    summary_add PASS "edump different seed" "names and/or contents changed"
+
+    local names bad
+    names=$(find "$d1" -mindepth 1 -printf '%f\n' | LC_ALL=C sort)
+    bad=$(printf '%s\n' "$names" | grep -vE '^[0-9a-z]{4}-[0-9a-z]{4}$' || true)
+    [[ -z "$bad" ]] || die "edump dumped a basename that is not xxxx-xxxx: $bad"
+    summary_add PASS "edump name shape" "all basenames xxxx-xxxx"
+
+    expect_eq "edump files (first inode)" "6" "$(kv_last files "${td}/d1.out")"
+    expect_eq "edump hardlinks" "1" "$(kv_last hardlinks "${td}/d1.out")"
+    expect_eq "edump symlinks" "1" "$(kv_last symlinks "${td}/d1.out")"
+    expect_eq "edump fifos" "1" "$(kv_last fifos "${td}/d1.out")"
+    expect_eq "edump dirs" "3" "$(kv_last dirs "${td}/d1.out")"
+    expect_eq "edump bytes_written" "1240675" "$(kv_last bytes_written "${td}/d1.out")"
+    expect_eq "edump collisions" "0" "$(kv_last collisions "${td}/d1.out")"
+
+    local nlink_pair
+    nlink_pair=$(find "$d1" -type f -links +1 | wc -l | awk '{print $1}')
+    expect_eq "edump hardlink pair visible" "2" "$nlink_pair"
+
+    local sparse_path sparse_bytes sparse_blocks
+    sparse_path=$(find "$d1" -type f -size 1234567c -print)
+    [[ -n "$sparse_path" ]] || die "edump missing materialized sparse file"
+    sparse_bytes=$(stat -c %s "$sparse_path")
+    sparse_blocks=$(stat -c %b "$sparse_path")
+    expect_eq "edump sparse logical size" "1234567" "$sparse_bytes"
+    if [[ "$sparse_blocks" -lt 2000 ]]; then
+        die "edump sparse file still looks hole-y (st_blocks=$sparse_blocks)"
+    fi
+    summary_add PASS "edump sparse materialized" "st_size=1234567 st_blocks=$sparse_blocks"
+
+    local slen
+    slen=$(find "$d1" -type l -printf '%s\n')
+    expect_eq "edump symlink dummy length" "5" "$slen"
+
+    local fifo_n
+    fifo_n=$(find "$d1" -type p | wc -l | awk '{print $1}')
+    expect_eq "edump fifo exists" "1" "$fifo_n"
+
+    section_int "[edump] refuse bad args"
+    local rc
+    rc=0
+    "$EDUMP" /no/such/crawl "${td}/out_missing" >/dev/null 2>"${td}/missing.err" || rc=$?
+    expect_eq "edump missing crawl-dir exit" "2" "$rc"
+    mkdir -p "${td}/out_full"
+    echo x >"${td}/out_full/keep"
+    rc=0
+    "$EDUMP" "$crawl" "${td}/out_full" >/dev/null 2>"${td}/full.err" || rc=$?
+    expect_eq "edump non-empty out-dir exit" "2" "$rc"
+    grep -q 'not empty' "${td}/full.err" || die "edump non-empty out-dir did not say so"
+    summary_add PASS "edump arg errors" "missing crawl / non-empty out"
+
+    trap - EXIT
+    cleanup_edump
+    pass "edump"
+}
+
 run_integration() {
     log "integration test (synthetic tree)"
 
@@ -2989,6 +3162,7 @@ fi
 need_exe "$ECRAWL"
 need_exe "$EREPORT"
 need_exe "$EDELETE"
+need_exe "$EDUMP"
 need_exe "$EREPORT_INDEX"
 need_exe "$ECRAWL_QUERY"
 # Not a `make all` target. Rebuild when using the in-tree default so `make &&
@@ -3000,6 +3174,7 @@ fi
 need_exe "$QUERY_SUBTREE_DUPS"
 
 run_phase run_integration
+run_phase run_edump_tests
 
 if [[ -n "${SKIP_FS:-}" ]] || [[ -z "${ROOT}" ]] || [[ ! -d "${ROOT}" ]]; then
     if [[ -n "${ROOT}" ]] && [[ ! -d "${ROOT}" ]]; then

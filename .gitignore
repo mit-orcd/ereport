@@ -18,4 +18,5 @@ __pycache__/
 /test_query_subtree_dups
 /edelete
 /ecrawl_mount
+/edump
 .codex

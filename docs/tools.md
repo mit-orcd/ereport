@@ -4,7 +4,7 @@ Full usage, flags, examples, and per-tool behavior for every binary and `eserve.
 
 How to read this page: each tool section leads with what it does, basic usage, and examples — enough for common use. Every binary prints a compact flag list when run with no arguments (or `--help` where supported). Tuning knobs, diagnostics counters, and format/build internals are grouped under clearly marked subsections at the end of each section; stop reading once the common commands do what you need.
 
-Contents: [`ecrawl`](#ecrawl) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
+Contents: [`ecrawl`](#ecrawl) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`edump`](#edump) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
 
 ## `ecrawl`
 
@@ -356,6 +356,22 @@ done
 edelete does **not** auto-detect this contention or adjust concurrency on its own; lowering `EDELETE_MAX_UNLINK_INFLIGHT` is a deliberate manual knob.
 
 Final stdout summary includes `delete_all` (`1` when the one-argument form was used), `basis` / `age_days` when the age filter is used, `force` (`1` if `--force` was passed), `mode`, scan counts, `deleted_files`, `removed_empty_dirs`, `would_delete`, `errors`, throughput metrics, and donation counters.
+
+## `edump`
+
+`edump` reads a crawl output directory and recreates the same tree under a new root, with scrambled basenames and invented file contents. Names are a deterministic mix of a unique integer into eight characters from `[0-9a-z]` (written as `xxxx-xxxx`). File bytes are a repeating A–Z block from the same `--seed` (ewrite-style). Regular files of at least 4096 bytes are written with `O_DIRECT` when the filesystem allows it (a sub-4096-byte tail stays buffered); smaller files are fully buffered, and a `--block-size` that is not a multiple of 4096 disables Direct I/O entirely. On large dumps to fast striped arrays this avoids the page-cache writeback throttle (`balance_dirty_pages`) that otherwise caps create-heavy dumps far below the device rate. Hardlinks are recreated with `link(2)`; symlink targets are dummy strings of the recorded length.
+
+Work is split on row-group boundaries so `--writers` can run in parallel on a single shard. Directories are created once from the catalog before writers start.
+
+Sparse files cannot be identified per record (`st_size` is stored, `st_blocks` is not). They are materialized at logical size. If `crawl_manifest.txt` has `files_sparse_heuristic > 0`, `edump` warns and still dumps.
+
+```bash
+./edump [--seed N] [--writers N] [--block-size N] <crawl-dir> <output-dir>
+```
+
+Run `./edump --help` for the flag list. `<output-dir>` is created if missing and must be empty. `--writers` overrides `EDUMP_WRITERS` (default 8; on fast NVMe arrays 32 writers is a good value). `--seed` defaults to 1; the same seed and crawl always produce the same dump, including across writer counts and with or without Direct I/O. `--name-self-test` checks that the id→name map is injective on a sample and prints two mixed names for ids `1000000000` and `1000000001`.
+
+The stored crawl root (`record_root` else `start_path`) is stripped so `<output-dir>` is the new tree root. Directory names are keyed by original relative path (so the same directory in several uid shards keeps one dump name). File names use a disjoint dense id range.
 
 ## `ereport`
 
@@ -770,6 +786,7 @@ python3 eserve.py --index-dir /data/report_index /path/to/serve
 
 ## Source layout
 
+- `edump.c` — recreate a crawl tree with mixed 8-character names and repeating seed-derived contents; links `crawl_result.o` plus the bin readers.
 - `edelete.c` — standalone parallel walker / deletion utility (`path_canon.h` only).
 - `ecrawl_query.c` — read-only `uid_shard_*.bin` analyzer (parent and depth histograms, plus the record query form); links `crawl_bin_chunks.o` for shared chunk parsing.
 - `crawl_bin_format.h` — magic, format version, `bin_file_header_t`, the columnar `bin_rowgroup_hdr_t` / `bin_colchunk_hdr_t`, `bin_record_hdr_t`, `bin_dir_catalog_entry_t` (immediate-child aggregates plus the v8 DFS ordering and subtree rollups).
