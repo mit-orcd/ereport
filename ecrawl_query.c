@@ -5,21 +5,8 @@
  *
  * Build: gcc -O2 -Wall -Wextra -pthread -o ecrawl_query ecrawl_query.c crawl_bin_chunks.o
  *
- * Usage: ecrawl_query [--verbose] [--top N] <crawl-output-dir>
- *
- * Scans shards in parallel using checkpoint segment boundaries from each .ckpt when valid;
- * otherwise falls back to one job per shard [header, EOF). Prints parent-directory histograms,
- * depth (slash-count) histograms, and top parents by regular-file count on stdout. Live progress
- * on stderr when stderr is a TTY.
- *
- * Parallelism: ECRAWL_QUERY_THREADS (default 16, minimum 1, maximum 4096). Work is split
- * by chunk, not by shard, so a single huge single-UID shard still scales across cores;
- * each shard's catalog is loaded once and shared read-only by all of its chunks.
- * Checkpoint segments are 32 MiB apart, which is coarser than the thread budget on a
- * small capture, so segments are subdivided at block boundaries (see
- * parse_split_target_bytes) — without that a capture under 32 MiB ran on one core.
- * The parent-directory map is shared by all workers (CAS-published inserts, atomic
- * per-parent counters) rather than built per worker and merged; see parent_map_t.
+ * Usage: run with --help (or no arguments) for the flag list.
+ * Parallelism: ECRAWL_QUERY_THREADS (default 16).
  */
 
 #define _FILE_OFFSET_BITS 64
@@ -717,57 +704,31 @@ static int query_set_subtree(const char *arg, const char *prog) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--verbose] [--top[,dim...] N] <crawl-output-dir>\n"
-            "       %s [--subtree DIR] [--size-gt N] [--type f|d|l|c|b|p|s|o] [--gid N] [--uid N]\n"
-            "          [--perm MODE] [--list] [--level N] [--sum] [--index-dir DIR] <crawl-output-dir>\n"
-            "  Read-only parallel scan of uid_shard_*.bin shards; directory-shape stats on stdout.\n"
-            "  Uses .ckpt segment boundaries when sidecars are valid; else one range per shard.\n"
-            "  Parallel threads: ECRAWL_QUERY_THREADS (default %u).\n"
-            "  Live bytes/chunks/records + ETA on stderr when stderr is a terminal.\n"
-            "  --top N: list top N parents by regular-file count (default %u). Same as --top,dense N.\n"
-            "  --top,DIM[,DIM] N: choose one or more top lists (order-independent):\n"
-            "      dense = top N parents by regular-file count\n"
-            "      deep  = top N deepest parent directories (by path slash count)\n"
-            "    e.g. --top,deep N (deepest only) or --top,dense,deep N (both lists).\n"
+            "Usage: %s [options] <crawl-output-dir>\n"
             "\n"
-            "  Query form (any of --subtree/--size-gt/--type/--gid/--uid/--perm/--list): selects records\n"
-            "  instead of reporting directory shape. Filters combine with AND.\n"
-            "    --subtree DIR  only records at or under DIR (DIR itself included, as du counts it)\n"
-            "    --size-gt N    only records larger than N bytes (find -size +Nc)\n"
-            "    --type C       only records of that type: f d l c b p s o (find -type)\n"
-            "    --gid N        only records owned by numeric group N\n"
-            "    --uid N        only records owned by numeric user N; opens that uid shard only\n"
-            "    --perm MODE    permission bits, octal, in the three find -perm forms:\n"
-            "                     0644  exactly these bits    e.g. --perm 0777\n"
-            "                     -MODE all of these bits     e.g. --perm -0002 (world-writable)\n"
-            "                     /MODE any of these bits     e.g. --perm /0022 (group- or world-writable)\n"
-            "    --list         print each matching path on stdout; the totals move to stderr\n"
-            "    --level N      with --list: unique prefixes at relative depth N (N>=1).\n"
-            "                   Level 1 is each matching path that has no matching ancestor.\n"
-            "    --sum          with --list: each row is files,dirs,symlinks,other,bytes,path over\n"
-            "                   the matching records at or under path (du semantics: a directory\n"
-            "                   counts itself; a multiply-linked inode's bytes go to its first path\n"
-            "                   in sorted order). With --level N the rows are the collapsed prefixes;\n"
-            "                   without it every match prints, a dir's row after its children.\n"
-            "    --exact        never answer from catalog rollups; always scan the records\n"
-            "    --index-dir DIR  use the dirs.idx / rowgroups.idx sidecars `ereport_index --make` writes\n"
-            "                   there: a --subtree rollup becomes a hash lookup and a few reads instead of a\n"
-            "                   full catalog pass, and a --subtree scan reads only the row groups whose DFS\n"
-            "                   sketch can reach the subtree. Every sidecar hit is confirmed by rebuilding the\n"
-            "                   directory's path and comparing it, and a sidecar that is absent or no longer\n"
-            "                   matches its shards is ignored silently, so this only ever changes speed.\n"
-            "  A bare --subtree DIR aggregate is answered from the per-directory rollups the crawl\n"
-            "  already computed, reading no records at all, so its cost is O(directories) rather than\n"
-            "  O(files). That shortcut is taken only when it provably equals the scan: it is skipped\n"
-            "  when any record in the subtree has nlink > 1, since crawl-time hardlink credit is\n"
-            "  attributed to the first link seen anywhere in the tree while a scan dedups within the\n"
-            "  subtree. --exact forces the scan; answered_from= in the output says which ran.\n"
-            "  Row groups whose column zone maps cannot match the size/type/gid/uid filters are skipped\n"
-            "  without decompressing; set ECRAWL_QUERY_BLOCK_SKIP=0 to decode every row group.\n"
-            "  Totals are key=value lines: entries, files, dirs, symlinks, other, bytes,\n"
-            "  hardlink_dupes, records_scanned, block skip diagnostics, answered_from, elapsed_sec.\n"
-            "  bytes is apparent size with each multiply-linked inode counted once, so it matches du -sb.\n",
-            prog, prog, DEFAULT_ANALYZE_THREADS, g_top_n);
+            "  Two forms: directory-shape stats (default), or record query (any filter below).\n"
+            "  Query filters AND together.  Totals are key=value (bytes match du -sb).\n"
+            "\n"
+            "Options:\n"
+            "  --verbose, -v             per-chunk lines on stderr\n"
+            "  --top[,dim...] N          top lists: dense (file count), deep (slash depth); default dense, N=%u\n"
+            "  --subtree DIR             records at or under DIR (DIR included)\n"
+            "  --size-gt N              larger than N bytes\n"
+            "  --type C                  f d l c b p s o\n"
+            "  --gid N / --uid N         numeric owner; --uid opens that uid shard only\n"
+            "  --perm MODE               find -perm: 0644 exact, -MODE all bits, /MODE any bits\n"
+            "  --list                    print matching paths; totals move to stderr\n"
+            "  --level N                with --list: unique prefixes at relative depth N\n"
+            "  --sum                     with --list: files,dirs,symlinks,other,bytes,path\n"
+            "  --exact                   never answer from catalog rollups\n"
+            "  --index-dir DIR           from ereport_index --make; speeds --subtree\n"
+            "\n"
+            "Environment:\n"
+            "  ECRAWL_QUERY_THREADS       workers (default %u)\n"
+            "  ECRAWL_QUERY_BLOCK_SKIP   0 = decode every row group (default: skip by zone maps)\n"
+            "\n"
+            "Details: docs/tools.md.\n",
+            prog, g_top_n, DEFAULT_ANALYZE_THREADS);
 }
 
 /*

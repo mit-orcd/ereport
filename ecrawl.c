@@ -31,16 +31,9 @@
  * Build:
  *   gcc -O2 -Wall -Wextra -pthread -o ecrawl ecrawl.c
  *
- * Usage:
- *   ./ecrawl [--no-write] [--progress] [--verbose] <start-path> [output-dir]
- *   --progress: cheap live files=/entries= (dirent cadence, across directories).
- *   --verbose: full metrics to stdout at exit.
- * Threading / shard layout (optional env): ECRAWL_CRAWL_THREADS,
- * ECRAWL_WRITER_THREADS, ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS
- *
- * Diagnostics (optional env, require --verbose):
- * ECRAWL_STALL_HINT_SECONDS=N (default 5; 0 disables): after the rolling window is warm, emit one stderr line if
- * window_entries stays at 0 for N consecutive seconds (throttled until the window goes non-zero again).
+ * Usage: run with --help (or no arguments) for the flag list.
+ * Threading / shard layout: ECRAWL_CRAWL_THREADS, ECRAWL_WRITER_THREADS,
+ * ECRAWL_WRITER_QUEUE_BATCHES, ECRAWL_UID_SHARDS; see docs/environment-variables.md.
  */
 
 #define _GNU_SOURCE /* statx() declaration in <sys/stat.h> (glibc >= 2.28) */
@@ -2366,68 +2359,43 @@ static int write_bin_header(FILE *fp) {
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] "
-            "[--statx] [--iouring] [--progress] "
-            "[--verbose] <start-path> [output-dir]\n",
-            prog);
-    fprintf(stderr, "Example: %s /data1\n", prog);
-    fprintf(stderr, "Example: %s /data1 /scratch/crawl_out\n", prog);
-    fprintf(stderr, "Benchmark: %s --no-write /data1\n", prog);
-    fprintf(stderr, "Count: %s --no-stat --count /data1\n", prog);
-    fprintf(stderr, "Search: %s --no-stat --contains slurm- /data1\n", prog);
-    fprintf(stderr,
-            "--no-stat: walk names only (no inode reads) and stream paths to stdout; no capture is written.\n"
-            "--count: with --no-stat, only count files/dirs/etc from d_type; do not print paths.\n"
-            "--contains: keep paths whose full path contains <text>, case-insensitive "
-            "(same rule as ereport_index --search). Requires --no-stat.\n"
-            "--print0: NUL-separate the --no-stat stream for paths containing newlines.\n"
-            "--progress: cheap live files=/entries= (donate-entry cadence, counted across directories); "
-            "stderr, or stdout with --count. Not implied by --verbose.\n"
-            "--statx: read inodes with statx(2) asking only for the fields this mode consumes "
-            "(--no-write: type/size/blocks/nlink/ino; capture: BASIC_STATS).\n"
-            "--iouring: batch each directory's inode reads through a per-worker io_uring "
-            "(ECRAWL_IOURING_DEPTH, default 256, range 16..4096; ECRAWL_IOURING_MIN_BATCH, "
-            "default 8: smaller collected batches are statx'd inline). The kernel opcode is "
-            "STATX; the mask is the same as --statx.\n");
-    fprintf(stderr,
-            "Optional env: ECRAWL_CRAWL_THREADS (crawl threads, default %d, minimum 1), "
-            "ECRAWL_WRITER_THREADS (default %d), ECRAWL_WRITER_QUEUE_BATCHES (per writer, default %u), "
-            "ECRAWL_UID_SHARDS (power of 2, default %u), "
-            "ECRAWL_MAX_OPEN_SHARDS (per writer, default %u, auto-capped by RLIMIT_NOFILE), "
-            "ECRAWL_ID_RESOLVE_THREADS (uid/gid name lookups at finalize, default %d; 1=serial), "
-            "ECRAWL_GETDENTS_BUF (raw getdents64 read-buffer bytes per crawl thread, default %u, "
-            "range %u..%u; 0=use libc opendir/readdir).\n"
-            "Donation (reduce task-queue mutex traffic): ECRAWL_DONATE_CHECK_EVERY (default %u: donate check every N "
-            "DT_DIR pushes during readdir), ECRAWL_DONATE_ENTRY_CHECK_EVERY (default %u: also check every N dirents, "
-            "which is what lets a deep narrow chain shed work; 0 disables), "
-            "ECRAWL_DONATE_CHUNK_FORCE_MAX (default %u: max dirs per queue push when "
-            "stack exceeds force threshold), ECRAWL_FORCE_DONATE_AT (default %u: spill stack to global queue above "
-            "this depth), ECRAWL_DONATE_ALL_BUSY_MIN_STACK (default %u: when all crawl threads hold a task, still "
-            "donate if local stack is at least this deep and queue is below started*MULT), "
-            "ECRAWL_DONATE_ALL_BUSY_MAX_QDEPTH_MULT (default %u: MULT in that cap), "
-            "ECRAWL_DISCOVERED_DIR_ENQUEUE_BATCH (default %u: coalesce discovered subdir enqueues into one queue push "
-            "per batch).\n",
+            "Usage: %s [options] <start-path> [output-dir]\n"
+            "\n"
+            "  start-path   tree to crawl.\n"
+            "  output-dir   default: hostname_<date>_<time> in cwd.\n"
+            "\n"
+            "Options:\n"
+            "  --no-write              walk and print stats; no shards\n"
+            "  --progress              live files=/entries= (stderr, or stdout with --count)\n"
+            "  --verbose               full metrics on stdout at exit\n"
+            "  --statx                 statx(2) instead of fstatat\n"
+            "  --iouring               batch inode reads through per-worker io_uring\n"
+            "  --no-stat               names-only walk to stdout; no capture\n"
+            "    --count               counts only, no paths\n"
+            "    --contains TEXT        keep paths containing TEXT (case-insensitive)\n"
+            "    --print0              NUL-separate the stream\n"
+            "\n"
+            "Environment:\n"
+            "  ECRAWL_CRAWL_THREADS           crawl workers (default %d)\n"
+            "  ECRAWL_WRITER_THREADS          shard writers (default %d)\n"
+            "  ECRAWL_UID_SHARDS             power of 2 (default %u)\n"
+            "  ECRAWL_WRITER_QUEUE_BATCHES    per writer (default %u)\n"
+            "  ECRAWL_MAX_OPEN_SHARDS        per writer (default %u, capped by RLIMIT_NOFILE)\n"
+            "  ECRAWL_ID_RESOLVE_THREADS     uid/gid name lookups at finalize (default %d; 1=serial)\n"
+            "  ECRAWL_GETDENTS_BUF           getdents64 buffer (default %u MiB; 0=libc readdir)\n"
+            "  ECRAWL_STALL_HINT_SECONDS     with --verbose: warn after N idle seconds (default 5; 0=off)\n"
+            "\n"
+            "Donation knobs: docs/environment-variables.md.  io_uring: ECRAWL_IOURING_DEPTH / _MIN_BATCH.\n"
+            "Examples: %s /data1    %s --no-write /data1    %s --no-stat --count /data1\n",
+            prog,
             DEFAULT_CRAWL_THREADS,
             DEFAULT_WRITER_THREADS,
-            (unsigned)DEFAULT_WRITER_QUEUE_BATCHES,
             (unsigned)DEFAULT_UID_SHARDS,
+            (unsigned)DEFAULT_WRITER_QUEUE_BATCHES,
             DEFAULT_MAX_OPEN_SHARDS,
             DEFAULT_ID_RESOLVE_THREADS,
-            (unsigned)DEFAULT_GETDENTS_BUF,
-            (unsigned)MIN_GETDENTS_BUF,
-            (unsigned)MAX_GETDENTS_BUF,
-            (unsigned)DEFAULT_DONATE_CHECK_EVERY,
-            (unsigned)DEFAULT_DONATE_ENTRY_CHECK_EVERY,
-            (unsigned)DONATE_CHUNK_FORCE_MAX,
-            (unsigned)LOCAL_STACK_FORCE_DONATE_COUNT,
-            (unsigned)DEFAULT_DONATE_ALL_BUSY_MIN_STACK,
-            (unsigned)DEFAULT_DONATE_ALL_BUSY_MAX_QDEPTH_MULT,
-            (unsigned)DEFAULT_DISCOVERED_DIR_ENQUEUE_BATCH);
-    fprintf(stderr,
-            "Diagnostics (with --verbose): ECRAWL_STALL_HINT_SECONDS=N warns on stderr after N consecutive "
-            "seconds with zero rolling-window entries once the window is warm (default 5; 0=off).\n");
-    fprintf(stderr,
-            "Default output is a concise summary. --verbose prints full metrics to stdout at exit.\n");
+            (unsigned)(DEFAULT_GETDENTS_BUF / (1024U * 1024U)),
+            prog, prog, prog);
 }
 
 static int ensure_output_dir_exists(const char *path) {

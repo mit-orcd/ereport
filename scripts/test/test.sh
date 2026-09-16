@@ -1392,10 +1392,22 @@ PYEOF
     grep -q '"bucket_bytes"' "$sjson" && die "bucket keys present without --sunburst-buckets"
     grep -q '"bucket_bytes"' "${sdir}/sunburst.html" &&
         die "bucket data embedded without --sunburst-buckets"
-    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_offb" --no-sunburst --sunburst-buckets mtime "$out" \
-        >"${td}/sb.offb.out" 2>"${td}/sb.offb.err" || die "ereport --no-sunburst --sunburst-buckets failed"
-    [[ ! -e "${rep}_offb/all_users/sunburst.json" && ! -e "${rep}_offb/all_users/sunburst.html" ]] ||
-        die "--no-sunburst --sunburst-buckets still wrote sunburst files"
+    # --no-sunburst turns the feature off; the other sunburst flags have nothing
+    # to attach to, so combining them is an error (order-independent).
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_offb" --no-sunburst --sunburst-buckets mtime "$out" \
+        >"${td}/sb.offb.out" 2>"${td}/sb.offb.err"; then
+        die "--no-sunburst --sunburst-buckets should have been rejected"
+    fi
+    grep -q -- '--no-sunburst cannot be combined' "${td}/sb.offb.err" ||
+        die "--no-sunburst --sunburst-buckets did not name the conflict"
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_offd" --sunburst-depth 2 --no-sunburst mtime "$out" \
+        >"${td}/sb.offd.out" 2>"${td}/sb.offd.err"; then
+        die "--sunburst-depth --no-sunburst should have been rejected"
+    fi
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep}_offu" --no-sunburst --no-sunburst-users mtime "$out" \
+        >"${td}/sb.offu.out" 2>"${td}/sb.offu.err"; then
+        die "--no-sunburst --no-sunburst-users should have been rejected"
+    fi
 
     # User picker: the aggregate run materializes one sunburst tree per seen uid
     # under all_users/users/ and every sunburst page gets the picker (the USERS

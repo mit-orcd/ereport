@@ -13,20 +13,10 @@
  * the crawl finishes it removes directories that became empty (rmdir only),
  * deepest first, without ascending above the start path or removing "/".
  *
- * Usage:
- *   ./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>
- *   ./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>
+ * Usage: run with --help (or no arguments) for the flag list.
+ * Thread count: EDELETE_THREADS (default 16).
  *
- * Optional --uid / --gid restrict deletion to entries whose st_uid / st_gid match (both apply when set).
- * Default is dry-run (counts would_delete, no unlink). Pass --delete to be prompted (type YES), then unlink,
- * unless --force is also given (--delete --force skips the prompt).
- *
- * Thread count: EDELETE_THREADS (default 16, minimum 1).
- * Delete mode: EDELETE_MAX_UNLINK_INFLIGHT caps concurrent unlink(2) calls across all threads
- * (default 256; set to 0 for unlimited).
- *
- * Build:
- *   gcc -O2 -Wall -Wextra -pthread -o edelete edelete.c
+ * Build: gcc -O2 -Wall -Wextra -pthread -o edelete edelete.c
  */
 
 #define _XOPEN_SOURCE 700
@@ -1390,22 +1380,27 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>\n"
-            "       %s [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>\n"
-            "  First form: every non-directory under <path> is eligible (still dry-run unless --delete).\n"
-            "  Second form: only entries whose chosen timestamp is at least <days> full days old.\n"
-            "  --uid / --gid: optional ownership filters; both apply when set.\n"
-            "  Walks in parallel without following symlinks; by default dry-run (counts would_delete, no unlink).\n"
-            "  Pass <path> itself; shell globs like parent/* skip hidden names (e.g. .om2) unless matched explicitly.\n"
-            "  --delete: prompt (type YES), then unlink matching non-directory entries, then rmdir empty dirs\n"
-            "            (including the start directory if empty; never removes `/`).\n"
-            "  --force:  with --delete only, skip the YES prompt (non-interactive / scripting).\n"
-            "  Thread count: EDELETE_THREADS (default %d).\n"
-            "  Max concurrent unlinks (all threads): EDELETE_MAX_UNLINK_INFLIGHT (default %d; 0 = unlimited).\n"
-            "  Fan-out: files >= EDELETE_FANOUT_MIN_BYTES (default %llu; 0 = off) are queued so their\n"
-            "    (potentially slow) unlink runs across threads instead of serially in one worker.\n",
+            "Usage: %s [options] <path>\n"
+            "       %s [options] <atime|mtime|ctime> <days> <path>\n"
+            "\n"
+            "  First form:  every non-directory under <path>.\n"
+            "  Second form: chosen timestamp at least <days> full days old.\n"
+            "  Default is dry-run.  --delete unlinks.  Does not follow symlinks.\n"
+            "  Pass <path> itself; globs like parent/* skip hidden names.\n"
+            "\n"
+            "Options:\n"
+            "  --delete                prompt (type YES), then unlink matches and rmdir empty dirs\n"
+            "  --force                 with --delete: skip the YES prompt\n"
+            "  --uid UID               only this owner\n"
+            "  --gid GID               only this group (both apply when set)\n"
+            "  --verbose               parsed; currently a no-op\n"
+            "\n"
+            "Environment:\n"
+            "  EDELETE_THREADS                crawl workers (default %d)\n"
+            "  EDELETE_MAX_UNLINK_INFLIGHT    concurrent unlinks (default %d; 0=unlimited)\n"
+            "  EDELETE_FANOUT_MIN_BYTES      queue files this large for parallel unlink (default %llu MiB; 0=off)\n",
             prog, prog, DEFAULT_THREADS, DEFAULT_MAX_UNLINK_INFLIGHT,
-            (unsigned long long)DEFAULT_FANOUT_MIN_BYTES);
+            (unsigned long long)(DEFAULT_FANOUT_MIN_BYTES >> 20));
 }
 
 int main(int argc, char **argv) {

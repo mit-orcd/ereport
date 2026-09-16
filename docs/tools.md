@@ -2,7 +2,7 @@
 
 Full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`. For a brief overview and quick start, see the [README](../README.md). Tuning knobs are collected in [environment-variables.md](environment-variables.md); design rationale is in [performance.md](performance.md).
 
-How to read this page: each tool section leads with what it does, basic usage, and examples — enough for common use. Tuning knobs, diagnostics counters, and format/build internals are grouped under clearly marked subsections at the end of each section; stop reading once the common commands do what you need.
+How to read this page: each tool section leads with what it does, basic usage, and examples — enough for common use. Every binary prints a compact flag list when run with no arguments (or `--help` where supported). Tuning knobs, diagnostics counters, and format/build internals are grouped under clearly marked subsections at the end of each section; stop reading once the common commands do what you need.
 
 Contents: [`ecrawl`](#ecrawl) · [`ecrawl_query`](#ecrawl_query) · [`edelete`](#edelete) · [`ereport`](#ereport) · [`ereport_index`](#ereport_index) · [`eserve.py`](#eservepy) · [Source layout](#source-layout)
 
@@ -31,10 +31,10 @@ hostname_apr-17-2026_15-03-01
 Basic usage:
 
 ```bash
-./ecrawl [--no-write] [--no-stat [--count] [--contains <text>] [--print0]] [--progress] [--verbose] <start-path> [output-dir]
+./ecrawl [options] <start-path> [output-dir]
 ```
 
-Positional arguments are only `start-path` (required) and optionally `output-dir`. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
+Run `./ecrawl --help` for the flag list. `start-path` must exist; it is canonicalized with `realpath(3)` (relative or absolute). After the output directory is created, it is canonicalized the same way. If `output-dir` is omitted, a timestamped directory name is created in the current working directory.
 
 ### Directory scanning
 
@@ -134,9 +134,10 @@ Stdout summary (stable `key=value` / section headers) includes: shard and chunk 
 Usage:
 
 ```bash
-./ecrawl_query [--verbose] [--top[,dim...] N] <crawl-output-dir>
-./ecrawl_query [--subtree DIR] [--size-gt N] [--type C] [--gid N] [--uid N] [--perm MODE] [--list] [--level N] [--sum] [--exact] [--index-dir DIR] <crawl-output-dir>
+./ecrawl_query [options] <crawl-output-dir>
 ```
+
+Run `./ecrawl_query --help` for the flag list. Directory-shape stats by default; any of `--subtree` / `--size-gt` / `--type` / `--gid` / `--uid` / `--perm` / `--list` switches to record query.
 
 Examples:
 
@@ -253,6 +254,8 @@ ecrawl_mount -o path=<crawl-dir> [options] <mountpoint>
 ecrawl_mount --dry-run [options] <crawl-dir>
 ```
 
+Run `./ecrawl_mount --help` for the flag list.
+
 - `-o path=DIR` — crawl directory, as an option instead of a positional argument.
 - `-o subtree=PATH` / `--subtree PATH` — mount only this subtree and index only its records.
 - `-o gid=N` — `st_gid` to report (default `0`).
@@ -308,9 +311,11 @@ The extracted version is pinned to the distro's `libfuse.so.2` so the ABI matche
 Usage:
 
 ```bash
-./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <path>
-./edelete [--delete] [--force] [--verbose] [--uid <uid>] [--gid <gid>] <atime|mtime|ctime> <days> <path>
+./edelete [options] <path>
+./edelete [options] <atime|mtime|ctime> <days> <path>
 ```
+
+Run `./edelete --help` for the flag list.
 
 Optional `--uid` and/or `--gid` restrict eligibility to entries whose `st_uid` / `st_gid` match; when both are set, both must match.
 
@@ -383,9 +388,10 @@ Heat map (`index.html`):
 Usage:
 
 ```bash
-./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
-./ereport [--bucket-details N] [--subtree PATH] [--index-dir DIR] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [<atime|mtime|ctime|effective>] [bin_dir ...]   # all users → ./all_users/
+./ereport [options] [user] [time] [bin_dir ...]
 ```
+
+Run `./ereport` with no arguments for the flag list. Omit `user` for an all-users report under `./all_users/`.
 
 If you omit every `bin_dir`, `ereport` reads crawl `.bin` files from the current working directory (`./`).
 
@@ -433,7 +439,7 @@ Subtree scoping:
 
 Sunburst view:
 
-- On by default: every run writes `sunburst.html` (a self-contained, dependency-free chart page — click a wedge to zoom, click the center to go back, toggle bytes/files) and `sunburst.json` (the same tree for other tools) next to `index.html`, which links to it. `--no-sunburst` skips both; `--sunburst-depth N` (1–32, default 6) sets how many levels below the displayed root are broken out.
+- On by default: every run writes `sunburst.html` (a self-contained, dependency-free chart page — click a wedge to zoom, click the center to go back, toggle bytes/files) and `sunburst.json` (the same tree for other tools) next to `index.html`, which links to it. `--no-sunburst` skips both and cannot be combined with `--sunburst-depth`, `--sunburst-buckets`, or `--no-sunburst-users`. `--sunburst-depth N` (1–32, default 6) sets how many levels below the displayed root are broken out.
 - Zero extra input I/O: parse workers credit each matched record's accounted bytes / file count to the record's `parent_dir_id` column (no path strings are read for this), and after the scan one pass over the already-loaded shard catalogs rolls those into per-directory subtree totals and merges them by path. The chart therefore reflects exactly the records the report counted — uid filter, `--subtree`, and `--path-rewrite` all apply — and its grand total matches `du -sb` of the crawled tree (hardlinks deduped).
 - The displayed root is the deepest directory that still holds all the content on its own (the single-child ancestor chain above the crawl root is collapsed, and its directory records are credited to the root). If the bins hold content under more than one top-level directory — multiple crawl roots, or strays outside one — the root is `/`. A directory's own record is credited to its parent, matching the catalog's `subtree_*` convention, so a non-root node's total is `du -sb` of that directory minus the directory's own apparent size.
 - Trimming keeps the chart readable at any scale: per node, the top 12 children by bytes or by files (ties on one metric break by the other) survive if they are at least 0.1% of their parent in that metric; everything else folds into an `(other)` leaf (its `path` is the parent's plus `/(other)`, so flat id conversions never see duplicate ids). At the depth limit a node is emitted as a leaf carrying its whole subtree total. Bytes/files sitting directly in a directory (not in any child) render as a gray `(self)` wedge added by the page.
@@ -507,10 +513,12 @@ Queries must be at least three characters (trigram filtering).
 Usage:
 
 ```bash
-./ereport_index --make [--index-dir <path>] [--subtree <abs-path>] [--no-dir-index] [username|uid] [bin_dir ...]
-./ereport_index --resume-merge --index-dir <path>
-./ereport_index --search [--index-dir <path>] <term> [--json] [--skip N] [--limit M]
+./ereport_index --make          [options] [user] [bin_dir ...]
+./ereport_index --search        [options] <term>
+./ereport_index --resume-merge --index-dir DIR
 ```
+
+Run `./ereport_index` with no arguments for the flag list.
 
 `--make` user vs all-users: If the first argument after optional `--index-dir` is a valid login name or numeric uid on this system, it names the report user and any further arguments are crawl directories (default `./`). If that first token is not a known user (for example it is a crawl output directory name), every argument—including the first—is treated as a `bin_dir`, and the index is built for all UIDs under `./all_users/index/` unless `--index-dir` overrides the location (same merge semantics as `ereport` aggregate output). `./ereport_index --make` with nothing after `--make` indexes `./` for all users.
 
@@ -687,6 +695,12 @@ During merge, transient `tmp_trigrams_*.bin` files are removed as buckets are pr
 ## `eserve.py`
 
 HTTP server for generated HTML/CSS and bucket pages. It also implements `GET …/search`, which runs `ereport_index --search` against the configured trigram index (default: next to the report; see Search index location below).
+
+```bash
+./eserve.py [options] [DIR]
+```
+
+Run `./eserve.py --help` for the flag list.
 
 Requirements
 

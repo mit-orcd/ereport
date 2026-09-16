@@ -13,34 +13,8 @@
  * Build:
  *   gcc -O2 -Wall -Wextra -pthread -o ereport ereport.c
  *
- * Usage:
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] <username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   ./ereport [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] [<atime|mtime|ctime|effective>] [bin_dir ...]
- *   When the time argument is omitted (single-user form), age buckets use effective time: max(atime,mtime,ctime).
- *     --bucket-details N (optional): emit N levels of per-bucket directory tables (1…32); if omitted,
- *     bucket pages are brief summaries only.
- *     --report-dir DIR (optional): write reports under DIR/(sanitized user or all_users)/ instead of cwd.
- *     --index-dir DIR (optional): dirs.idx / rowgroups.idx from `ereport_index --make`. Only --subtree uses them,
- *     and only as a shortcut to the same answer; anything unusable about them falls back silently.
- *     --no-sunburst (optional): skip the sunburst view (sunburst.json / sunburst.html next to index.html).
- *     --sunburst-depth N (optional): levels below the sunburst root (1…32, default 6).
- *     --verbose (optional): per-call I/O counters and rolling throughput samples (default: quiet progress,
- *     no I/O counter atomics on hot paths). While verbose, stderr prints ecrawl-style `key=value` progress
- *     about every 30s (idle counters omitted). Thread count remains EREPORT_THREADS.
- *     Purple C-led heat-map badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).
- *     Flags must appear first (in any order), before username/time basis.
- *     (omit username: aggregate report for all UIDs in the crawl; output under ./all_users/)
- * Parallel thread count: EREPORT_THREADS (default 32); see worker_main / stats_thread / bucket HTML emit.
- * EREPORT_BUCKET_CELL_CONCURRENCY (optional 1..1024): how many bucket cells emit at once in the
- *   bucket-HTML phase. Each cell aggregates with its own inner thread pool, so with a large
- *   EREPORT_THREADS, running all 36 cells at once oversubscribes early and starves the slow-cell
- *   tail. Default: ~EREPORT_THREADS/16 (min 4) when EREPORT_THREADS>=64, else unchanged. Lower it
- *   (e.g. 4 or 8) to give the heaviest cells more inner threads; raise it for many small cells.
- * Multiple bin_dir values merge shard files from each crawl output directory (one user’s shards,
- * or every shard when aggregating all users).
- *
- * Writes outputs under ./<resolved_username>/ or ./all_users/ for aggregate mode (cwd).
- * Falls back to ./tmp/ only if the directory name is empty or unusably long after sanitization.
+ * Usage: run with no arguments for the flag list.
+ * Writes under ./<user>/ or ./all_users/; falls back to ./tmp/ if the name is unusable.
  */
 
 #define _GNU_SOURCE /* qsort_r for thread-safe index sorts (parallel path-order merge sort). */
@@ -11517,6 +11491,35 @@ static void emit_run_stats(const char *username,
     }
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "Usage: %s [options] [user] [time] [bin_dir ...]\n"
+            "\n"
+            "  user   username or numeric uid.  Omit for an all-users report (./all_users/).\n"
+            "  time   atime | mtime | ctime | effective.  Default: effective (max of the three).\n"
+            "  bins   crawl directories; default: cwd.  Must share layout and uid_shards count.\n"
+            "\n"
+            "Options:\n"
+            "  --report-dir DIR            write under DIR/<user|all_users>/  (default: cwd)\n"
+            "  --subtree PATH              absolute dir; paths kept, totals scoped\n"
+            "  --path-rewrite OLD=NEW      relabel prefix (bins unchanged; before --subtree)\n"
+            "  --index-dir DIR            from ereport_index --make; speeds --subtree\n"
+            "  --bucket-details N         1-%d directory levels per bucket page (default: brief)\n"
+            "  --no-sunburst              skip sunburst.json / sunburst.html (not with the flags below)\n"
+            "  --sunburst-depth N         levels below the displayed root (1-32, default 6)\n"
+            "  --sunburst-buckets         6x6 age x size matrix + filter chips (second bin pass)\n"
+            "  --no-sunburst-users        no per-uid pages / User picker (all-users reports only)\n"
+            "  --verbose                   I/O counters and ~30s key=value progress on stderr\n"
+            "\n"
+            "Environment:\n"
+            "  EREPORT_THREADS                    parse/emit parallelism (default %d)\n"
+            "  EREPORT_HEAT_CTIME_LED_MIN_SHARE  C-led badge threshold, (0,1] (default 0.30)\n"
+            "  EREPORT_BUCKET_CELL_CONCURRENCY   bucket-page emit parallelism (1-1024)\n"
+            "\n"
+            "Flags first, any order.  Details: docs/tools.md.\n",
+            prog, BUCKET_DETAIL_LEVELS_MAX, DEFAULT_THREADS);
+}
+
 int main(int argc, char **argv) {
     const char *user_spec;
     const char *basis_str;
@@ -11602,54 +11605,7 @@ int main(int argc, char **argv) {
     }
 
     if (argc < 2) {
-        fprintf(stderr,
-                "Usage: %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] "
-                "<username|uid> [<atime|mtime|ctime|effective>] [bin_dir ...]\n",
-                argv[0]);
-        fprintf(stderr,
-                "       %s [--bucket-details N] [--report-dir DIR] [--subtree PATH] [--index-dir DIR] [--path-rewrite OLD=NEW] [--no-sunburst] [--sunburst-depth N] [--sunburst-buckets] [--no-sunburst-users] [--verbose] "
-                "[<atime|mtime|ctime|effective>] [bin_dir ...]  (all users → ./all_users/)\n",
-                argv[0]);
-        fprintf(stderr,
-                "Default when the time argument is omitted (single-user form): effective = max(atime,mtime,ctime) "
-                "for age buckets. First arg matches a time keyword only when exact.\n");
-        fprintf(stderr, "Optional --bucket-details N (1…%d): full per-bucket directory tables; omit for brief buckets.\n",
-                BUCKET_DETAIL_LEVELS_MAX);
-        fprintf(stderr,
-                "Optional --report-dir DIR: write reports under DIR/(user or all_users)/; omit for current directory.\n");
-        fprintf(stderr,
-                "Optional --subtree PATH (absolute): analyze only records at or under PATH, as if just that "
-                "directory had been crawled (full absolute paths kept; totals/heat-map/badges scoped to the subtree).\n");
-        fprintf(stderr,
-                "Optional --path-rewrite OLD=NEW (both absolute dirs): relabel the OLD path prefix as NEW in the "
-                "report/heat-map at read time (bins unchanged), e.g. /data1/group=/orcd/data. Applied before --subtree.\n");
-        fprintf(stderr,
-                "Optional --index-dir DIR: use the dirs.idx / rowgroups.idx sidecars `ereport_index --make` wrote "
-                "there to speed up --subtree — the root is resolved once per shard, row groups that cannot hold a "
-                "descendant are never read, and membership becomes a bit test on the record's parent directory "
-                "instead of a rebuilt path. The report is identical either way; a sidecar that is absent, stale, or "
-                "does not name every shard is ignored.\n");
-        fprintf(stderr,
-                "Optional --no-sunburst: skip the sunburst view. Default on: aggregates per-directory totals "
-                "during the scan (no extra input I/O) and writes sunburst.json + sunburst.html next to "
-                "index.html; --sunburst-depth N sets the levels below the sunburst root (1…32, default 6).\n");
-        fprintf(stderr,
-                "Optional --sunburst-buckets: attach a per-node 6x6 age x size bucket matrix to the sunburst "
-                "(filter chips in sunburst.html). Costs a second, narrow-projection read pass over the bins; "
-                "hardlink byte attribution is replayed exactly from the first pass's recorded decisions.\n");
-        fprintf(stderr,
-                "Aggregate reports also build one sunburst tree per seen uid: sunburst.html gets a User "
-                "picker navigating to per-user pages under all_users/users/ (bucket matrices included when "
-                "--sunburst-buckets is on). Optional --no-sunburst-users turns that off.\n");
-        fprintf(stderr,
-                "Optional --verbose: I/O counters + rolling throughput stats (default quiet: sparse "
-                "progress, no per-read I/O atomics); stderr prints ecrawl-style `key=value` progress about "
-                "every 30s (idle counters omitted).\n");
-        fprintf(stderr,
-                "C-led badge threshold: EREPORT_HEAT_CTIME_LED_MIN_SHARE (optional float in (0,1], default 0.30).\n");
-        fprintf(stderr,
-                "Flags must appear first (any order). Thread count: EREPORT_THREADS (default %d), not argv.\n",
-                DEFAULT_THREADS);
+        usage(argv[0]);
         return 2;
     }
 
@@ -11890,6 +11846,14 @@ int main(int argc, char **argv) {
                 continue;
             }
             break;
+        }
+
+        if (!g_sunburst_enabled &&
+            (g_sunburst_buckets || sunburst_depth_seen || !g_sunburst_users)) {
+            fprintf(stderr,
+                    "ereport: --no-sunburst cannot be combined with --sunburst-depth, "
+                    "--sunburst-buckets, or --no-sunburst-users\n");
+            return 2;
         }
     }
 

@@ -67,16 +67,29 @@ def search_term_ok(term: str) -> bool:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('root', nargs='?', default='.', help='Directory to serve. Defaults to the current directory.')
-    parser.add_argument('--bind', default='127.0.0.1', help='Address to bind to. Defaults to 127.0.0.1.')
-    parser.add_argument('--port', type=int, default=8000, help='Port to listen on. Defaults to 8000.')
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Serve generated HTML reports over HTTP, including the path-search box.",
+        epilog=(
+            "  GET /<report>/search?q=<term>&skip=N&limit=M\n"
+            "  GET /search?q=...          when DIR is the report directory itself\n"
+            "\n"
+            "ereport_index on PATH, next to eserve.py, or EREPORT_INDEX_BIN."
+        ),
+    )
+    parser.add_argument(
+        'root', nargs='?', default='.', metavar='DIR',
+        help='directory to serve (default: cwd)',
+    )
+    parser.add_argument('--bind', default='127.0.0.1', metavar='ADDR',
+                        help='bind address (default: 127.0.0.1)')
+    parser.add_argument('--port', type=int, default=8000, metavar='N',
+                        help='port (default: 8000)')
     parser.add_argument(
         '--index-dir',
         metavar='DIR',
         default=None,
-        help='Trigram index directory (tri_keys.bin). Overrides default …/index layout; '
-        'may be outside SERVE_ROOT. Env: EREPORT_SEARCH_INDEX_DIR.',
+        help='trigram index dir (tri_keys.bin); default: <report>/index. Env: EREPORT_SEARCH_INDEX_DIR',
     )
     return parser.parse_args()
 
