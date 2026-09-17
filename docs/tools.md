@@ -366,10 +366,12 @@ Work is split on row-group boundaries so `--writers` can run in parallel on a si
 Sparse files cannot be identified per record (`st_size` is stored, `st_blocks` is not). They are materialized at logical size. If `crawl_manifest.txt` has `files_sparse_heuristic > 0`, `edump` warns and still dumps.
 
 ```bash
-./edump [--seed N] [--writers N] [--block-size N] <crawl-dir> <output-dir>
+./edump [--seed N] [--writers N] [--block-size N] [--only PATH] <crawl-dir> <output-dir>
 ```
 
 Run `./edump --help` for the flag list. `<output-dir>` is created if missing and must be empty. `--writers` overrides `EDUMP_WRITERS` (default 8; on fast NVMe arrays 32 writers is a good value). `--seed` defaults to 1; the same seed and crawl always produce the same dump, including across writer counts and with or without Direct I/O. `--name-self-test` checks that the id→name map is injective on a sample and prints two mixed names for ids `1000000000` and `1000000001`.
+
+`--only PATH` dumps just the subtree under `PATH` (an absolute path in the crawled namespace, at or below the crawl root), with `PATH` itself becoming `<output-dir>` — the prefix is stripped. Scrambled names are identical to those the same records get in a full dump, so the result is exactly the full dump's subtree moved up to the new root. A hardlink whose other names fall outside the subtree is recreated as a standalone file. `PATH` must exist as a directory in the crawl.
 
 The stored crawl root (`record_root` else `start_path`) is stripped so `<output-dir>` is the new tree root. Directory names are keyed by original relative path (so the same directory in several uid shards keeps one dump name). File names use a disjoint dense id range.
 

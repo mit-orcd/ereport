@@ -2759,6 +2759,43 @@ run_edump_tests() {
     fi
     summary_add PASS "edump different seed" "names and/or contents changed"
 
+    section_int "[edump] --only subtree"
+    donly="${td}/donly"
+    "$EDUMP" --seed 7 --block-size 4096 --only "${tree_abs}/nested" --writers 2 "$crawl" "$donly" >"${td}/donly.out" 2>"${td}/donly.err" || {
+        tail -n 30 "${td}/donly.err" >&2 || true
+        die "edump --only failed"
+    }
+    expect_eq "edump --only files" "1" "$(kv_last files "${td}/donly.out")"
+    expect_eq "edump --only dirs created" "1" "$(find "$donly" -mindepth 1 -type d | wc -l | awk '{print $1}')"
+    expect_eq "edump --only regular files" "1" "$(find "$donly" -type f | wc -l | awk '{print $1}')"
+
+    local rel_only rel_full
+    rel_only=$(cd "$donly" && find . -type f -printf '%P\n')
+    rel_full=$(cd "$d1" && find . -type f -size 1000c -printf '%P\n')
+    [[ -n "$rel_only" && -n "$rel_full" ]] || die "edump --only: missing dumped file"
+    [[ "$rel_full" == */"$rel_only" ]] ||
+        die "edump --only names differ from full dump: full '$rel_full' only '$rel_only'"
+    cmp -s "$d1/$rel_full" "$donly/$rel_only" || die "edump --only content differs from full dump"
+    summary_add PASS "edump --only subtree" "names and bytes match the full-dump subtree"
+
+    donly2="${td}/donly2"
+    "$EDUMP" --seed 7 --block-size 4096 --only "${tree_abs}/nested" --writers 4 "$crawl" "$donly2" >/dev/null 2>&1 ||
+        die "edump --only second run failed"
+    expect_eq "edump --only reproducible" \
+        "$(cd "$donly" && find . -printf '%P %y %s\n' | LC_ALL=C sort)" \
+        "$(cd "$donly2" && find . -printf '%P %y %s\n' | LC_ALL=C sort)"
+
+    if "$EDUMP" --only "${tree_abs}/nosuch" "$crawl" "${td}/dbad" >/dev/null 2>&1; then
+        die "edump --only accepted a missing directory"
+    fi
+    if "$EDUMP" --only "relative/path" "$crawl" "${td}/dbad2" >/dev/null 2>&1; then
+        die "edump --only accepted a relative path"
+    fi
+    if "$EDUMP" --only /etc "$crawl" "${td}/dbad3" >/dev/null 2>&1; then
+        die "edump --only accepted a path outside the crawl root"
+    fi
+    summary_add PASS "edump --only rejects" "missing, relative, and outside-root prefixes fail"
+
     local names bad
     names=$(find "$d1" -mindepth 1 -printf '%f\n' | LC_ALL=C sort)
     bad=$(printf '%s\n' "$names" | grep -vE '^[0-9a-z]{4}-[0-9a-z]{4}$' || true)

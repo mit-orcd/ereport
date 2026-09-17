@@ -68,6 +68,11 @@ static size_t g_block_size = DEFAULT_BLOCK_SIZE;
 static const char *g_out_dir;
 static size_t g_out_dir_len;
 static const char *g_stored_root;
+static const char *g_only;              /* --only abs path in crawl namespace, or NULL */
+static char g_only_rel[EDUMP_PATH_MAX]; /* --only prefix relative to crawl root; "" = no filter */
+static size_t g_only_rel_len;
+static unsigned g_only_depth;           /* component count of g_only_rel */
+static int g_only_seen;                 /* prefix directory found in the catalog */
 static uint64_t g_dir_id_max; /* D: interned directories live in 1..D */
 static unsigned char *g_block;
 static crawl_bin_catalog_t *g_cats;
@@ -366,6 +371,8 @@ static void usage(const char *prog) {
             "  --seed N           name and content seed (default 1)\n"
             "  --writers N         parallel dump workers (default %d, or EDUMP_WRITERS)\n"
             "  --block-size N     repeating content block bytes (default %u)\n"
+            "  --only PATH        dump only the subtree under PATH (absolute, crawl-side);\n"
+            "                     PATH itself becomes the dump root\n"
             "  --name-self-test   check id→name injectivity on a sample and exit\n"
             "  -h, --help         this message\n"
             "\n"
@@ -495,6 +502,15 @@ static int strip_to_rel(const char *stored, const char *root, char *rel, size_t 
     return 0;
 }
 
+/*
+ * rel is a crawl-root-relative path. With --only, only paths strictly below the
+ * prefix are kept; the prefix itself maps to the dump root (strip semantics).
+ */
+static int rel_kept(const char *rel) {
+    if (!g_only_rel_len) return 1;
+    return strncmp(rel, g_only_rel, g_only_rel_len) == 0 && rel[g_only_rel_len] == '/';
+}
+
 static int dir_is_empty(const char *path) {
     DIR *d = opendir(path);
     struct dirent *de;
@@ -599,6 +615,7 @@ static int mkdir_interned_dirs(void) {
     }
     qsort(order, n, sizeof(*order), dir_mk_cmp);
     for (i = 0; i < n; i++) {
+        if (!rel_kept(order[i]->key)) continue;
         if (map_rel_to_dest(order[i]->key, 1, 0, dest, sizeof(dest)) != 0) {
             free(order);
             return -1;
@@ -643,6 +660,7 @@ static int map_rel_to_dest(const char *rel, int is_dir, uint64_t file_id, char *
     const char *p;
     char prefix[EDUMP_PATH_MAX];
     size_t plen = 0;
+    unsigned comp = 0;
 
     if (dest_sz < g_out_dir_len + 1) return -1;
     memcpy(dest, g_out_dir, g_out_dir_len);
@@ -680,7 +698,9 @@ static int map_rel_to_dest(const char *rel, int is_dir, uint64_t file_id, char *
         } else {
             id = file_id;
         }
-        if (append_name(dest, &len, dest_sz, id) != 0) return -1;
+        /* --only: the prefix's own components map to the dump root; append only below it */
+        comp++;
+        if (comp > g_only_depth && append_name(dest, &len, dest_sz, id) != 0) return -1;
         if (!slash) break;
         p = slash + 1;
     }
@@ -945,6 +965,10 @@ static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r
             return 0;
         }
         if (st == 1) return 0;
+        if (!rel_kept(rel)) {
+            atomic_fetch_add(&g_n_skipped, 1);
+            return 0;
+        }
         if (map_rel_to_dest(rel, 0, file_id, dest, sizeof(dest)) != 0) return -1;
         orig = stored;
         slash = strrchr(dest, '/');
@@ -1148,6 +1172,7 @@ static int intern_shard_dirs(const crawl_result_t *cr, size_t si) {
 
         if (g_cats[si].name_len[d] == 0 && g_cats[si].parent_dir_id[d] == 0) continue;
         if (crawl_bin_catalog_dir_path(&g_cats[si], d, stored, sizeof(stored)) != 0) continue;
+        if (g_only_rel_len && !g_only_seen && strcmp(stored, g_only) == 0) g_only_seen = 1;
         st = strip_to_rel(stored, g_stored_root, rel, sizeof(rel));
         if (st != 0) continue;
         if (intern_put(&g_intern, rel) == 0) {
@@ -1258,6 +1283,15 @@ int main(int argc, char **argv) {
             g_block_size = (size_t)v;
             continue;
         }
+        if (strcmp(argv[i], "--only") == 0) {
+            if (i + 1 >= argc) usage_exit(argv[0], 2);
+            g_only = argv[++i];
+            if (g_only[0] != '/') {
+                fprintf(stderr, PROG ": --only must be an absolute path in the crawl namespace\n");
+                return 2;
+            }
+            continue;
+        }
         if (argv[i][0] == '-') {
             fprintf(stderr, PROG ": unknown option %s (try --help)\n", argv[i]);
             usage(argv[0]);
@@ -1304,6 +1338,34 @@ int main(int argc, char **argv) {
         g_stored_root = root_copy;
     }
 
+    if (g_only) {
+        char *only_copy = strdup(g_only);
+        const char *p;
+        int st;
+
+        if (!only_copy) {
+            fprintf(stderr, PROG ": out of memory\n");
+            crawl_result_free(&cr);
+            return 2;
+        }
+        path_rstrip_slashes(only_copy);
+        st = strip_to_rel(only_copy, g_stored_root, g_only_rel, sizeof(g_only_rel));
+        if (st < 0) {
+            fprintf(stderr, PROG ": --only %s is outside the crawl root %s\n", only_copy, g_stored_root);
+            crawl_result_free(&cr);
+            return 2;
+        }
+        if (st == 1) g_only_rel[0] = '\0'; /* prefix == crawl root: no filter */
+        g_only_rel_len = strlen(g_only_rel);
+        g_only_depth = 0;
+        if (g_only_rel_len) {
+            g_only_depth = 1;
+            for (p = g_only_rel; *p; p++)
+                if (*p == '/') g_only_depth++;
+        }
+        g_only = only_copy;
+    }
+
     if (prepare_out_dir(out_dir) != 0) {
         crawl_result_free(&cr);
         return 2;
@@ -1346,6 +1408,11 @@ int main(int argc, char **argv) {
         }
     }
     g_dir_id_max = g_intern.used;
+    if (g_only_rel_len && !g_only_seen) {
+        fprintf(stderr, PROG ": --only %s: directory not found in the crawl\n", g_only);
+        crawl_result_free(&cr);
+        return 2;
+    }
     if (mkdir_interned_dirs() != 0) {
         crawl_result_free(&cr);
         return 1;
@@ -1362,6 +1429,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (g_only_rel_len)
+        fprintf(stderr, PROG ": dumping only subtree %s (rel %s)\n", g_only, g_only_rel);
     fprintf(stderr, PROG ": %zu shard(s), %zu job(s), %" PRIu64 " dirs, %" PRIu64 " records, %d writer(s)\n",
             cr.shard_count, g_jobs.chunk_count, g_dir_id_max, total_recs, g_writers);
 
