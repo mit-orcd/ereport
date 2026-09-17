@@ -73,6 +73,7 @@ static char g_only_rel[EDUMP_PATH_MAX]; /* --only prefix relative to crawl root;
 static size_t g_only_rel_len;
 static unsigned g_only_depth;           /* component count of g_only_rel */
 static int g_only_seen;                 /* prefix directory found in the catalog */
+static unsigned char **g_kept_dirs;     /* --only: per-shard kept-dir marks, indexed by dir id */
 static uint64_t g_dir_id_max; /* D: interned directories live in 1..D */
 static unsigned char *g_block;
 static crawl_bin_catalog_t *g_cats;
@@ -513,6 +514,13 @@ static int rel_kept(const char *rel) {
     return strncmp(rel, g_only_rel, g_only_rel_len) == 0 && rel[g_only_rel_len] == '/';
 }
 
+/* rel is the prefix itself or strictly below it (parent-dir form of rel_kept). */
+static int rel_kept_or_prefix(const char *rel) {
+    if (!g_only_rel_len) return 1;
+    return strncmp(rel, g_only_rel, g_only_rel_len) == 0 &&
+           (rel[g_only_rel_len] == '/' || rel[g_only_rel_len] == '\0');
+}
+
 static int dir_is_empty(const char *path) {
     DIR *d = opendir(path);
     struct dirent *de;
@@ -577,32 +585,9 @@ static int mkdir_one(const char *path) {
 
 static int map_rel_to_dest(const char *rel, int is_dir, uint64_t file_id, char *dest, size_t dest_sz);
 
-static int dir_mk_cmp(const void *a, const void *b) {
-    const intern_slot_t *x = *(const intern_slot_t *const *)a;
-    const intern_slot_t *y = *(const intern_slot_t *const *)b;
-    uint32_t dx = 0, dy = 0;
-    size_t i;
-
-    for (i = 0; i < x->len; i++) {
-        if (x->key[i] == '/') dx++;
-    }
-    for (i = 0; i < y->len; i++) {
-        if (y->key[i] == '/') dy++;
-    }
-    if (dx != dy) return (dx < dy) ? -1 : 1;
-    if (x->len != y->len) {
-        size_t n = x->len < y->len ? x->len : y->len;
-        int c = memcmp(x->key, y->key, n);
-
-        if (c != 0) return c;
-        return (x->len < y->len) ? -1 : 1;
-    }
-    return memcmp(x->key, y->key, x->len);
-}
-
 static int mkdir_interned_dirs(void) {
     intern_slot_t **order;
-    size_t i, n = 0;
+    size_t i;
     char dest[EDUMP_PATH_MAX];
 
     if (g_intern.used == 0) return 0;
@@ -611,12 +596,17 @@ static int mkdir_interned_dirs(void) {
         fprintf(stderr, PROG ": out of memory\n");
         return -1;
     }
+    /*
+     * Catalog dir ids are minted parent-before-child (shard_cat_ensure_dir
+     * ensures the parent first), and interning walks each shard's catalog in
+     * id order, so intern id order is already a valid mkdir order: parents
+     * always precede children. No O(n log n) string-compare sort needed.
+     */
     for (i = 0; i < g_intern.cap; i++) {
         if (!g_intern.slots[i].key) continue;
-        order[n++] = &g_intern.slots[i];
+        order[g_intern.slots[i].id - 1] = &g_intern.slots[i];
     }
-    qsort(order, n, sizeof(*order), dir_mk_cmp);
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < g_intern.used; i++) {
         if (!rel_kept(order[i]->key)) continue;
         if (map_rel_to_dest(order[i]->key, 1, 0, dest, sizeof(dest)) != 0) {
             free(order);
@@ -939,7 +929,7 @@ static int dump_special(const char *dest, const bin_record_hdr_t *r, const char 
 }
 
 static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r, const unsigned char *name,
-                       uint64_t file_id, dest_parent_cache_t *pc) {
+                       uint64_t file_id, dest_parent_cache_t *pc, const unsigned char *kept) {
     char dest[EDUMP_PATH_MAX];
     char stored[EDUMP_PATH_MAX];
     const char *orig = dest;
@@ -956,6 +946,16 @@ static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r
         char *slash;
         int st;
 
+        /*
+         * --only: O(1) filter on the parent dir id, skipping the O(depth)
+         * catalog path rebuild for records outside the subtree. The bitmap
+         * marks the prefix dir itself too, so records directly under it pass.
+         */
+        if (kept && r->parent_dir_id >= 1 && r->parent_dir_id <= cat->max_dir_id &&
+            !kept[r->parent_dir_id]) {
+            atomic_fetch_add(&g_n_skipped, 1);
+            return 0;
+        }
         if (crawl_bin_catalog_entry_path(cat, r->parent_dir_id, (const char *)name, (size_t)r->name_len, stored,
                                           sizeof(stored)) != 0) {
             fprintf(stderr, PROG ": cannot rebuild stored path\n");
@@ -967,10 +967,6 @@ static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r
             return 0;
         }
         if (st == 1) return 0;
-        if (!rel_kept(rel)) {
-            atomic_fetch_add(&g_n_skipped, 1);
-            return 0;
-        }
         if (map_rel_to_dest(rel, 0, file_id, dest, sizeof(dest)) != 0) return -1;
         orig = stored;
         slash = strrchr(dest, '/');
@@ -998,6 +994,7 @@ static uint32_t dump_projection(void) {
 static int process_chunk(size_t ci) {
     const crawl_bin_file_chunk_t *chunk = &g_jobs.chunks[ci];
     const crawl_bin_catalog_t *cat = &g_cats[chunk->file_index];
+    const unsigned char *kept = g_kept_dirs ? g_kept_dirs[chunk->file_index] : NULL;
     crawl_bin_block_reader_t br;
     FILE *fp;
     uint64_t rec_in = 0;
@@ -1043,7 +1040,7 @@ static int process_chunk(size_t ci) {
             rc = -1;
             break;
         }
-        if (dump_record(cat, &r, name, file_id, pc) != 0) {
+        if (dump_record(cat, &r, name, file_id, pc, kept) != 0) {
             rc = -1;
             break;
         }
@@ -1167,6 +1164,14 @@ static int intern_shard_dirs(const crawl_result_t *cr, size_t si) {
     }
     fclose(fp);
 
+    if (g_only_rel_len) {
+        g_kept_dirs[si] = (unsigned char *)calloc((size_t)g_cats[si].max_dir_id + 1, 1);
+        if (!g_kept_dirs[si]) {
+            fprintf(stderr, PROG ": out of memory\n");
+            return -1;
+        }
+    }
+
     for (d = 1; d <= g_cats[si].max_dir_id; d++) {
         char stored[EDUMP_PATH_MAX];
         char rel[EDUMP_PATH_MAX];
@@ -1174,9 +1179,12 @@ static int intern_shard_dirs(const crawl_result_t *cr, size_t si) {
 
         if (g_cats[si].name_len[d] == 0 && g_cats[si].parent_dir_id[d] == 0) continue;
         if (crawl_bin_catalog_dir_path(&g_cats[si], d, stored, sizeof(stored)) != 0) continue;
-        if (g_only_rel_len && !g_only_seen && strcmp(stored, g_only) == 0) g_only_seen = 1;
         st = strip_to_rel(stored, g_stored_root, rel, sizeof(rel));
         if (st != 0) continue;
+        if (g_only_rel_len && rel_kept_or_prefix(rel)) {
+            g_kept_dirs[si][d] = 1;
+            if (rel[g_only_rel_len] == '\0') g_only_seen = 1;
+        }
         if (intern_put(&g_intern, rel) == 0) {
             fprintf(stderr, PROG ": out of memory interning directories\n");
             return -1;
@@ -1466,8 +1474,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, PROG ": out of memory\n");
         return 2;
     }
+    if (g_only_rel_len) {
+        g_kept_dirs = (unsigned char **)calloc(g_shard_count, sizeof(*g_kept_dirs));
+        if (!g_kept_dirs) {
+            fprintf(stderr, PROG ": out of memory\n");
+            return 2;
+        }
+    }
 
     t0 = now_sec();
+    if (progress_wanted()) {
+        atomic_store(&g_progress_done, 0);
+        if (pthread_create(&pth, NULL, progress_main, NULL) == 0) prog_on = 1;
+        if (prog_on)
+            fprintf(stderr, PROG ": loading directory catalogs from %zu shard(s)...\n", cr.shard_count);
+    }
     for (si = 0; si < cr.shard_count; si++) {
         if (intern_shard_dirs(&cr, si) != 0) {
             crawl_result_free(&cr);
@@ -1475,6 +1496,9 @@ int main(int argc, char **argv) {
         }
     }
     g_dir_id_max = g_intern.used;
+    if (prog_on)
+        fprintf(stderr, PROG ": interned %" PRIu64 " directories in %.1fs\n", (uint64_t)g_intern.used,
+                now_sec() - t0);
     if (g_only_rel_len && !g_only_seen) {
         fprintf(stderr, PROG ": --only %s: directory not found in the crawl\n", g_only);
         crawl_result_free(&cr);
@@ -1507,10 +1531,6 @@ int main(int argc, char **argv) {
     if (!th) {
         fprintf(stderr, PROG ": out of memory\n");
         return 1;
-    }
-    if (progress_wanted()) {
-        atomic_store(&g_progress_done, 0);
-        if (pthread_create(&pth, NULL, progress_main, NULL) == 0) prog_on = 1;
     }
     for (w = 0; w < g_writers; w++) {
         if (pthread_create(&th[w], NULL, worker_main, NULL) != 0) {
@@ -1546,6 +1566,10 @@ int main(int argc, char **argv) {
 
     intern_free(&g_intern);
     hl_free();
+    if (g_kept_dirs) {
+        for (si = 0; si < g_shard_count; si++) free(g_kept_dirs[si]);
+        free(g_kept_dirs);
+    }
     if (g_cats) {
         for (si = 0; si < g_shard_count; si++) crawl_bin_catalog_free(&g_cats[si]);
         free(g_cats);

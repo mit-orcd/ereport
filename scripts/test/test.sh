@@ -2781,9 +2781,8 @@ run_edump_tests() {
     donly2="${td}/donly2"
     "$EDUMP" --seed 7 --block-size 4096 --only "${tree_abs}/nested" --writers 4 "$crawl" "$donly2" >/dev/null 2>&1 ||
         die "edump --only second run failed"
-    expect_eq "edump --only reproducible" \
-        "$(cd "$donly" && find . -printf '%P %y %s\n' | LC_ALL=C sort)" \
-        "$(cd "$donly2" && find . -printf '%P %y %s\n' | LC_ALL=C sort)"
+    expect_eq "edump --only reproducible" "$(dump_tree_sig "$donly")" "$(dump_tree_sig "$donly2")"
+    dump_cmp_regular "$donly" "$donly2" || die "edump --only regular file bytes differ"
 
     if "$EDUMP" --only "${tree_abs}/nosuch" "$crawl" "${td}/dbad" >/dev/null 2>&1; then
         die "edump --only accepted a missing directory"
