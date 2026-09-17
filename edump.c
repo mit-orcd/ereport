@@ -739,14 +739,15 @@ static int write_repeating_direct(int fd, uint64_t size) {
         /*
          * Unaligned tail: drop O_DIRECT and pwrite it buffered. Cheaper than a
          * padded 4 KiB direct write plus ftruncate (one less data IO and one
-         * less truncate transaction per file).
+         * less truncate transaction per file). We opened this fd and the only
+         * settable status flag it carries is O_DIRECT, so a single F_SETFL
+         * clears it — no F_GETFL round-trip.
          */
         unsigned char tail[EDUMP_IO_ALIGN];
         size_t src = (size_t)(aligned % (uint64_t)g_block_size);
         uint64_t done = 0;
-        int fl = fcntl(fd, F_GETFL);
 
-        if (fl < 0 || fcntl(fd, F_SETFL, fl & ~O_DIRECT) != 0) return -1;
+        if (fcntl(fd, F_SETFL, 0) != 0) return -1;
         if (src + rem <= g_block_size) {
             memcpy(tail, g_block + src, (size_t)rem);
         } else {
