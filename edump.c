@@ -76,6 +76,14 @@ static int g_only_seen;                 /* prefix directory found in the catalog
 static unsigned char **g_kept_dirs;     /* --only: per-shard kept-dir marks, indexed by dir id */
 static uint64_t g_dir_id_max; /* D: interned directories live in 1..D */
 static unsigned char *g_block;
+/*
+ * Per-writer private copy of g_block. Every writer pwrite()s from the block
+ * buffer; with one shared buffer the kernel pins/unpins the same pages from
+ * all threads at once (GUP folio-refcount ping-pong), which dominates CPU at
+ * high writer counts. Each worker memcpy()s its own copy at startup; readers
+ * that never hand the buffer to the kernel (dump_symlink) keep using g_block.
+ */
+static __thread unsigned char *t_block;
 static crawl_bin_catalog_t *g_cats;
 static size_t g_shard_count;
 
@@ -359,6 +367,41 @@ static void hl_publish(uint32_t maj, uint32_t min, uint64_t ino, const char *pat
     }
     pthread_mutex_unlock(&s->mu);
 }
+
+/*
+ * Write work queue. Scanning (record decode, path resolution, name mixing,
+ * hardlink claims) is cheap; writing is not. Jobs are row-group aligned, so a
+ * job's kept bytes vary wildly -- think one fully-kept row group of large
+ * files next to an all-skipped one -- and plain job claiming strands most
+ * writers on empty jobs while a few grind monster ones. Instead, scanners
+ * enqueue one item per kept object and every thread drains: a scanner that
+ * finds the queue full executes one item before retrying, and scanners whose
+ * jobs run out become pure drainers. A couple of dedicated drainers (which
+ * never scan and never block in hl_claim) guarantee progress when every
+ * scanner is parked on a hardlink claim.
+ */
+enum { WOP_WRITE, WOP_LINK, WOP_SYMLINK, WOP_SPECIAL };
+
+typedef struct {
+    uint8_t op;      /* WOP_* */
+    uint8_t rtype;   /* WOP_SPECIAL: record type */
+    int has_hl;      /* WOP_WRITE: publish dest under (maj,min,ino) when done */
+    uint32_t maj, min;
+    uint64_t ino;
+    uint64_t size;
+    char *dest;      /* malloc'd */
+    char *target;    /* malloc'd, WOP_LINK only */
+} witem_t;
+
+#define WQ_CAP 16384U
+
+static witem_t g_wq[WQ_CAP];
+static size_t g_wq_head;
+static size_t g_wq_len;
+static pthread_mutex_t g_wq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_wq_cv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_jobs_completed;
+static int g_dedicated_writers;
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -717,11 +760,12 @@ static int write_full(int fd, const unsigned char *buf, size_t n) {
 
 static int write_repeating(int fd, uint64_t size) {
     uint64_t left = size;
+    unsigned char *blk = t_block ? t_block : g_block;
 
     while (left) {
         size_t n = left > (uint64_t)g_block_size ? g_block_size : (size_t)left;
 
-        if (write_full(fd, g_block, n) != 0) return -1;
+        if (write_full(fd, blk, n) != 0) return -1;
         left -= (uint64_t)n;
     }
     return 0;
@@ -731,6 +775,7 @@ static int write_repeating_direct(int fd, uint64_t size) {
     uint64_t aligned = size & ~(uint64_t)(EDUMP_IO_ALIGN - 1);
     uint64_t rem = size - aligned;
     uint64_t off = 0;
+    unsigned char *blk = t_block ? t_block : g_block;
 
     if (size >= (uint64_t)g_block_size) {
         int frc = posix_fallocate(fd, 0, (off_t)size);
@@ -744,7 +789,7 @@ static int write_repeating_direct(int fd, uint64_t size) {
         size_t n = g_block_size;
 
         if ((uint64_t)n > aligned - off) n = (size_t)(aligned - off);
-        if (write_full(fd, g_block, n) != 0) return -1;
+        if (write_full(fd, blk, n) != 0) return -1;
         off += (uint64_t)n;
     }
     if (rem) {
@@ -761,12 +806,12 @@ static int write_repeating_direct(int fd, uint64_t size) {
 
         if (fcntl(fd, F_SETFL, 0) != 0) return -1;
         if (src + rem <= g_block_size) {
-            memcpy(tail, g_block + src, (size_t)rem);
+            memcpy(tail, blk + src, (size_t)rem);
         } else {
             size_t first = g_block_size - src;
 
-            memcpy(tail, g_block + src, first);
-            memcpy(tail + first, g_block, (size_t)rem - first);
+            memcpy(tail, blk + src, first);
+            memcpy(tail + first, blk, (size_t)rem - first);
         }
         while (done < rem) {
             ssize_t w = pwrite(fd, tail + done, (size_t)(rem - done), (off_t)(aligned + done));
@@ -791,32 +836,19 @@ static int want_direct(uint64_t size) {
 #endif
 }
 
-static int dump_regular(const char *dest, const bin_record_hdr_t *r, const char *orig) {
-    int claim = 1;
-    char *existing = NULL;
+/*
+ * Create dest and write size bytes of repeating seed content. On error any
+ * partially written file is unlinked. Hardlink claim/publish is the caller's
+ * job, so this is safe to run from a queue executor.
+ */
+static int write_file_plain(const char *dest, uint64_t size, const char *orig) {
     int fd = -1;
     int used_direct = 0;
     int wr;
     int flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC;
-    int hl = (r->nlink > 1ULL);
-
-    if (hl) {
-        claim = hl_claim(r->dev_major, r->dev_minor, r->inode, &existing);
-        if (claim < 0) return -1;
-        if (claim == 0) {
-            if (link(existing, dest) != 0) {
-                fprintf(stderr, PROG ": link %s -> %s: %s (orig %s)\n", existing, dest, strerror(errno), orig);
-                free(existing);
-                return -1;
-            }
-            free(existing);
-            atomic_fetch_add(&g_n_hardlinks, 1);
-            return 0;
-        }
-    }
 
 #ifdef O_DIRECT
-    if (want_direct(r->size)) {
+    if (want_direct(size)) {
         fd = open(dest, flags | O_DIRECT, 0644);
         if (fd >= 0) {
             used_direct = 1;
@@ -827,7 +859,6 @@ static int dump_regular(const char *dest, const bin_record_hdr_t *r, const char 
             } else {
                 fprintf(stderr, PROG ": open %s: %s (orig %s)\n", dest, strerror(errno), orig);
             }
-            if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, NULL, 0);
             return -1;
         }
     }
@@ -843,10 +874,9 @@ static int dump_regular(const char *dest, const bin_record_hdr_t *r, const char 
         } else {
             fprintf(stderr, PROG ": open %s: %s (orig %s)\n", dest, strerror(errno), orig);
         }
-        if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, NULL, 0);
         return -1;
     }
-    wr = used_direct ? write_repeating_direct(fd, r->size) : write_repeating(fd, r->size);
+    wr = used_direct ? write_repeating_direct(fd, size) : write_repeating(fd, size);
 #ifdef O_DIRECT
     if (wr != 0 && used_direct && errno == EINVAL) {
         close(fd);
@@ -854,24 +884,46 @@ static int dump_regular(const char *dest, const bin_record_hdr_t *r, const char 
         fd = open(dest, flags, 0644);
         if (fd < 0) {
             fprintf(stderr, PROG ": open %s: %s (orig %s)\n", dest, strerror(errno), orig);
-            if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, NULL, 0);
             return -1;
         }
-        wr = write_repeating(fd, r->size);
+        wr = write_repeating(fd, size);
     }
 #endif
     if (wr != 0) {
         fprintf(stderr, PROG ": write %s: %s (orig %s)\n", dest, strerror(errno), orig);
         close(fd);
         unlink(dest);
-        if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, NULL, 0);
         return -1;
     }
     close(fd);
     atomic_fetch_add(&g_n_files, 1);
-    atomic_fetch_add(&g_n_bytes, (unsigned long long)r->size);
-    if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, dest, 1);
+    atomic_fetch_add(&g_n_bytes, (unsigned long long)size);
     return 0;
+}
+
+static int dump_regular(const char *dest, const bin_record_hdr_t *r, const char *orig) {
+    int claim = 1;
+    char *existing = NULL;
+    int hl = (r->nlink > 1ULL);
+    int rc;
+
+    if (hl) {
+        claim = hl_claim(r->dev_major, r->dev_minor, r->inode, &existing);
+        if (claim < 0) return -1;
+        if (claim == 0) {
+            if (link(existing, dest) != 0) {
+                fprintf(stderr, PROG ": link %s -> %s: %s (orig %s)\n", existing, dest, strerror(errno), orig);
+                free(existing);
+                return -1;
+            }
+            free(existing);
+            atomic_fetch_add(&g_n_hardlinks, 1);
+            return 0;
+        }
+    }
+    rc = write_file_plain(dest, r->size, orig);
+    if (hl) hl_publish(r->dev_major, r->dev_minor, r->inode, rc == 0 ? dest : NULL, rc == 0);
+    return rc;
 }
 
 static int dump_symlink(const char *dest, uint64_t size, const char *orig) {
@@ -928,6 +980,120 @@ static int dump_special(const char *dest, const bin_record_hdr_t *r, const char 
     return 0;
 }
 
+static int wq_exec(const witem_t *it) {
+    int rc;
+
+    switch (it->op) {
+    case WOP_WRITE:
+        rc = write_file_plain(it->dest, it->size, it->dest);
+        if (it->has_hl) hl_publish(it->maj, it->min, it->ino, rc == 0 ? it->dest : NULL, rc == 0);
+        break;
+    case WOP_LINK:
+        rc = 0;
+        if (link(it->target, it->dest) != 0) {
+            fprintf(stderr, PROG ": link %s -> %s: %s (orig %s)\n", it->target, it->dest, strerror(errno),
+                    it->dest);
+            rc = -1;
+        } else {
+            atomic_fetch_add(&g_n_hardlinks, 1);
+        }
+        break;
+    case WOP_SYMLINK:
+        rc = dump_symlink(it->dest, it->size, it->dest);
+        break;
+    default: {
+        bin_record_hdr_t r;
+
+        memset(&r, 0, sizeof(r));
+        r.type = it->rtype;
+        r.dev_major = it->maj;
+        r.dev_minor = it->min;
+        rc = dump_special(it->dest, &r, it->dest);
+        break;
+    }
+    }
+    free(it->dest);
+    free(it->target);
+    return rc;
+}
+
+/* Pop one item and execute it. Returns 1 if executed, 0 if queue empty, -1 on error. */
+static int wq_pop1(void) {
+    witem_t it;
+
+    pthread_mutex_lock(&g_wq_mu);
+    if (g_wq_len == 0) {
+        pthread_mutex_unlock(&g_wq_mu);
+        return 0;
+    }
+    it = g_wq[g_wq_head];
+    g_wq_head = (g_wq_head + 1) % WQ_CAP;
+    g_wq_len--;
+    pthread_mutex_unlock(&g_wq_mu);
+    if (wq_exec(&it) != 0) {
+        atomic_store(&g_failed, 1);
+        return -1;
+    }
+    return 1;
+}
+
+/* Enqueue; while the queue is full, drain one item per retry (backpressure
+ * that turns scanner threads into writers exactly when writes fall behind). */
+static int wq_push(const witem_t *it) {
+    for (;;) {
+        pthread_mutex_lock(&g_wq_mu);
+        if (!atomic_load(&g_failed) && g_wq_len < WQ_CAP) {
+            g_wq[(g_wq_head + g_wq_len) % WQ_CAP] = *it;
+            g_wq_len++;
+            pthread_cond_signal(&g_wq_cv);
+            pthread_mutex_unlock(&g_wq_mu);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_wq_mu);
+        if (atomic_load(&g_failed)) return -1;
+        if (wq_pop1() < 0) return -1;
+    }
+}
+
+/*
+ * Pop items until every scan job has completed and the queue is empty. On
+ * failure, discard remaining items instead of executing them, still
+ * fail-publishing hardlink winners so scanners parked in hl_claim wake up.
+ */
+static void wq_drain(void) {
+    for (;;) {
+        witem_t it;
+
+        pthread_mutex_lock(&g_wq_mu);
+        while (g_wq_len == 0) {
+            struct timespec ts;
+
+            if (atomic_load(&g_failed) || atomic_load(&g_jobs_completed) >= g_jobs.chunk_count) {
+                pthread_mutex_unlock(&g_wq_mu);
+                return;
+            }
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 50 * 1000 * 1000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            pthread_cond_timedwait(&g_wq_cv, &g_wq_mu, &ts);
+        }
+        it = g_wq[g_wq_head];
+        g_wq_head = (g_wq_head + 1) % WQ_CAP;
+        g_wq_len--;
+        pthread_mutex_unlock(&g_wq_mu);
+        if (atomic_load(&g_failed)) {
+            if (it.has_hl) hl_publish(it.maj, it.min, it.ino, NULL, 0);
+            free(it.dest);
+            free(it.target);
+            continue;
+        }
+        if (wq_exec(&it) != 0) atomic_store(&g_failed, 1);
+    }
+}
+
 static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r, const unsigned char *name,
                        uint64_t file_id, dest_parent_cache_t *pc, const unsigned char *kept) {
     char dest[EDUMP_PATH_MAX];
@@ -979,9 +1145,66 @@ static int dump_record(const crawl_bin_catalog_t *cat, const bin_record_hdr_t *r
         }
     }
 
-    if (r->type == (uint8_t)'f') return dump_regular(dest, r, orig);
-    if (r->type == (uint8_t)'l') return dump_symlink(dest, r->size, orig);
-    return dump_special(dest, r, orig);
+    if (g_writers <= 1) {
+        if (r->type == (uint8_t)'f') return dump_regular(dest, r, orig);
+        if (r->type == (uint8_t)'l') return dump_symlink(dest, r->size, orig);
+        return dump_special(dest, r, orig);
+    }
+
+    /*
+     * Multi-writer: hand object creation to the work queue so writes balance
+     * across all threads no matter how kept records cluster into row-group
+     * jobs. Hardlink claims happen here at scan time; a loser unblocks only
+     * after the winner's write completed and published, so a queued link
+     * always finds its target. Dedicated drainers guarantee progress while
+     * scanners park on a claim.
+     */
+    {
+        witem_t it;
+
+        memset(&it, 0, sizeof(it));
+        if (r->type == (uint8_t)'f') {
+            it.op = WOP_WRITE;
+            it.size = r->size;
+            if (r->nlink > 1ULL) {
+                int claim = hl_claim(r->dev_major, r->dev_minor, r->inode, &it.target);
+
+                if (claim < 0) return -1;
+                if (claim == 0) {
+                    it.op = WOP_LINK;
+                } else {
+                    it.has_hl = 1;
+                    it.maj = r->dev_major;
+                    it.min = r->dev_minor;
+                    it.ino = r->inode;
+                }
+            }
+        } else if (r->type == (uint8_t)'l') {
+            it.op = WOP_SYMLINK;
+            it.size = r->size;
+        } else if (r->type == (uint8_t)'p' || r->type == (uint8_t)'c' || r->type == (uint8_t)'b') {
+            it.op = WOP_SPECIAL;
+            it.rtype = r->type;
+            it.maj = r->dev_major;
+            it.min = r->dev_minor;
+        } else {
+            atomic_fetch_add(&g_n_skipped, 1);
+            return 0;
+        }
+        it.dest = strdup(dest);
+        if (!it.dest) {
+            if (it.has_hl) hl_publish(it.maj, it.min, it.ino, NULL, 0);
+            free(it.target);
+            return -1;
+        }
+        if (wq_push(&it) != 0) {
+            if (it.has_hl) hl_publish(it.maj, it.min, it.ino, NULL, 0);
+            free(it.dest);
+            free(it.target);
+            return -1;
+        }
+        return 0;
+    }
 }
 
 static uint32_t dump_projection(void) {
@@ -1052,17 +1275,31 @@ static int process_chunk(size_t ci) {
 }
 
 static void *worker_main(void *arg) {
-    (void)arg;
-    for (;;) {
-        size_t ci = (size_t)atomic_fetch_add(&g_next_chunk, 1ULL);
+    long wid = (long)arg;
 
-        if (ci >= g_jobs.chunk_count) break;
-        if (atomic_load(&g_failed)) break;
-        if (process_chunk(ci) != 0) {
-            atomic_store(&g_failed, 1);
-            break;
+    if (posix_memalign((void **)&t_block, EDUMP_IO_ALIGN, g_block_size) != 0) {
+        fprintf(stderr, PROG ": cannot allocate per-writer block buffer of %zu bytes\n", g_block_size);
+        atomic_store(&g_failed, 1);
+        return NULL;
+    }
+    memcpy(t_block, g_block, g_block_size);
+    if (wid >= g_dedicated_writers) {
+        for (;;) {
+            size_t ci = (size_t)atomic_fetch_add(&g_next_chunk, 1ULL);
+
+            if (ci >= g_jobs.chunk_count) break;
+            if (atomic_load(&g_failed)) break;
+            if (process_chunk(ci) != 0) {
+                atomic_store(&g_failed, 1);
+                atomic_fetch_add(&g_jobs_completed, 1ULL);
+                break;
+            }
+            atomic_fetch_add(&g_jobs_completed, 1ULL);
         }
     }
+    wq_drain();
+    free(t_block);
+    t_block = NULL;
     return NULL;
 }
 
@@ -1527,13 +1764,15 @@ int main(int argc, char **argv) {
 
     atomic_store(&g_next_chunk, 0);
     atomic_store(&g_failed, 0);
+    atomic_store(&g_jobs_completed, 0);
+    g_dedicated_writers = g_writers >= 4 ? 2 : (g_writers >= 2 ? 1 : 0);
     th = (pthread_t *)calloc((size_t)g_writers, sizeof(*th));
     if (!th) {
         fprintf(stderr, PROG ": out of memory\n");
         return 1;
     }
     for (w = 0; w < g_writers; w++) {
-        if (pthread_create(&th[w], NULL, worker_main, NULL) != 0) {
+        if (pthread_create(&th[w], NULL, worker_main, (void *)(long)w) != 0) {
             atomic_store(&g_failed, 1);
             break;
         }
