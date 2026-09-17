@@ -2796,6 +2796,19 @@ run_edump_tests() {
     fi
     summary_add PASS "edump --only rejects" "missing, relative, and outside-root prefixes fail"
 
+    section_int "[edump] progress"
+    "$EDUMP" --seed 7 --block-size 4096 --progress --writers 2 "$crawl" "${td}/dprog" >"${td}/dprog.out" 2>"${td}/dprog.err" ||
+        die "edump --progress failed"
+    grep -qE '^edump: files=[0-9]+ dirs=[0-9]+ objects=[0-9]+ volume=[0-9.]+ (B|MiB|GiB) elapsed=[0-9]+s$' "${td}/dprog.err" ||
+        die "edump --progress emitted no counter line on stderr"
+    expect_eq "edump --progress stdout summary intact" "6" "$(kv_last files "${td}/dprog.out")"
+    "$EDUMP" --seed 7 --block-size 4096 --no-progress --writers 2 "$crawl" "${td}/dnoprog" >"${td}/dnoprog.out" 2>"${td}/dnoprog.err" ||
+        die "edump --no-progress failed"
+    if grep -q 'volume=' "${td}/dnoprog.err"; then
+        die "edump --no-progress still printed progress"
+    fi
+    summary_add PASS "edump progress" "forced line on stderr, --no-progress silent"
+
     local names bad
     names=$(find "$d1" -mindepth 1 -printf '%f\n' | LC_ALL=C sort)
     bad=$(printf '%s\n' "$names" | grep -vE '^[0-9a-z]{4}-[0-9a-z]{4}$' || true)

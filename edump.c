@@ -373,6 +373,8 @@ static void usage(const char *prog) {
             "  --block-size N     repeating content block bytes (default %u)\n"
             "  --only PATH        dump only the subtree under PATH (absolute, crawl-side);\n"
             "                     PATH itself becomes the dump root\n"
+            "  --progress         live files/dirs/objects/volume line on stderr\n"
+            "                     (default: on when stderr is a TTY; --no-progress disables)\n"
             "  --name-self-test   check id→name injectivity on a sample and exit\n"
             "  -h, --help         this message\n"
             "\n"
@@ -1193,6 +1195,7 @@ static void warn_sparse_if_needed(const char *crawl_dir) {
 
     if (snprintf(path, sizeof(path), "%s/crawl_manifest.txt", crawl_dir) >= (int)sizeof(path)) return;
     fp = fopen(path, "r");
+
     if (!fp) return;
     while (fgets(line, sizeof(line), fp)) {
         char *nl = strchr(line, '\n');
@@ -1232,12 +1235,68 @@ static void usage_exit(const char *prog, int code) {
     exit(code);
 }
 
+/*
+ * Live progress: a reporter thread reads the counters the workers already
+ * maintain and rewrites one stderr line about once a second. Workers never
+ * touch progress state, so the dump hot path is unchanged. Default is on
+ * when stderr is a TTY; --progress forces it on, --no-progress forces off.
+ */
+static int g_progress; /* 0 = auto (TTY), 1 = on, -1 = off */
+static atomic_int g_progress_done;
+
+static int progress_wanted(void) {
+    if (g_progress > 0) return 1;
+    if (g_progress < 0) return 0;
+    return isatty(STDERR_FILENO) != 0;
+}
+
+static void progress_fmt_volume(char *buf, size_t n, unsigned long long b) {
+    if (b >= (1ULL << 30))
+        snprintf(buf, n, "%.2f GiB", (double)b / 1073741824.0);
+    else if (b >= (1ULL << 20))
+        snprintf(buf, n, "%.1f MiB", (double)b / 1048576.0);
+    else
+        snprintf(buf, n, "%llu B", b);
+}
+
+static void progress_print(int tty, double t0) {
+    char vol[32];
+    unsigned long long f, d, o, b;
+
+    f = (unsigned long long)atomic_load(&g_n_files);
+    d = (unsigned long long)atomic_load(&g_n_dirs);
+    o = (unsigned long long)atomic_load(&g_n_symlinks) + (unsigned long long)atomic_load(&g_n_fifos) +
+        (unsigned long long)atomic_load(&g_n_devices) + (unsigned long long)atomic_load(&g_n_hardlinks);
+    b = (unsigned long long)atomic_load(&g_n_bytes);
+    progress_fmt_volume(vol, sizeof(vol), b);
+    if (tty) fputs("\r\033[2K\r", stderr);
+    fprintf(stderr, PROG ": files=%llu dirs=%llu objects=%llu volume=%s elapsed=%.0fs%s", f, d, o, vol,
+            now_sec() - t0, tty ? "" : "\n");
+    fflush(stderr);
+}
+
+static void *progress_main(void *arg) {
+    double t0 = now_sec();
+    int tty = isatty(STDERR_FILENO);
+
+    (void)arg;
+    while (!atomic_load_explicit(&g_progress_done, memory_order_acquire)) {
+        sleep(1);
+        if (atomic_load_explicit(&g_progress_done, memory_order_acquire)) break;
+        progress_print(tty, t0);
+    }
+    progress_print(tty, t0); /* final line with accurate counters */
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     const char *crawl_dir = NULL;
     const char *out_dir = NULL;
     int i;
     crawl_result_t cr;
     pthread_t *th = NULL;
+    pthread_t pth;
+    int prog_on = 0;
     int nstarted = 0;
     double t0;
     uint64_t total_recs = 0;
@@ -1290,6 +1349,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, PROG ": --only must be an absolute path in the crawl namespace\n");
                 return 2;
             }
+            continue;
+        }
+        if (strcmp(argv[i], "--progress") == 0) {
+            g_progress = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-progress") == 0) {
+            g_progress = -1;
             continue;
         }
         if (argv[i][0] == '-') {
@@ -1441,6 +1508,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, PROG ": out of memory\n");
         return 1;
     }
+    if (progress_wanted()) {
+        atomic_store(&g_progress_done, 0);
+        if (pthread_create(&pth, NULL, progress_main, NULL) == 0) prog_on = 1;
+    }
     for (w = 0; w < g_writers; w++) {
         if (pthread_create(&th[w], NULL, worker_main, NULL) != 0) {
             atomic_store(&g_failed, 1);
@@ -1450,6 +1521,11 @@ int main(int argc, char **argv) {
     }
     for (w = 0; w < nstarted; w++) pthread_join(th[w], NULL);
     free(th);
+    if (prog_on) {
+        atomic_store(&g_progress_done, 1);
+        pthread_join(pth, NULL);
+        if (isatty(STDERR_FILENO)) fputc('\n', stderr);
+    }
 
     {
         double elapsed = now_sec() - t0;
