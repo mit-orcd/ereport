@@ -15,6 +15,8 @@ make serve SERVE_ROOT=./all_users SERVE_PORT=8000 # 4. serve
 
 Open <http://127.0.0.1:8000/index.html?search=1>: an age × size heat map with per-cell drill-down pages, a sunburst of where the bytes live, and a path search box.
 
+The sunburst (`sunburst.html`, linked from `index.html`) is a clickable map of the tree: each wedge is a directory sized by its bytes, click to zoom in, click the center to zoom back out, and toggle between bytes and file counts. Add `--sunburst-buckets` to the `ereport` command to get age/size filter chips on it.
+
 Common variations:
 
 ```bash
