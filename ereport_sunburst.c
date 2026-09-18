@@ -1066,7 +1066,7 @@ static void sb_html_escape(FILE *out, const char *s) {
 }
 
 static void sb_html_prefix(FILE *out, const char *subject, const char *base_name,
-                           const char *report_href) {
+                           const char *report_href, int has_buckets) {
     fputs("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
           "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Sunburst", out);
     if (subject) {
@@ -1111,7 +1111,8 @@ static void sb_html_prefix(FILE *out, const char *subject, const char *base_name
           ".frow select{font-size:12px;padding:2px 6px;color:#344054}\n"
           ".userpick{font-size:13px;color:#344054;display:flex;align-items:center;gap:6px}\n"
           ".userpick select{font-size:13px;padding:3px 6px;color:#344054;max-width:min(420px,60vw)}\n"
-          ".legend{margin:0 auto 14px;max-width:min(92vmin,860px);font-size:12px;color:#344054;"
+          ".legend{font-size:12px;color:#344054}\n"
+          ".legend-below{margin:0 auto 14px;max-width:min(92vmin,860px);"
           "border:1px solid #e4e7ec;border-radius:8px;padding:8px 12px}\n"
           ".legend summary{cursor:pointer;font-weight:600;color:#475467;user-select:none}\n"
           ".legend-body{padding-top:8px;display:flex;flex-direction:column;gap:6px}\n"
@@ -1140,13 +1141,20 @@ static void sb_html_prefix(FILE *out, const char *subject, const char *base_name
           "<div class=\"frow\"><span class=\"flabel\">Color</span>"
           "<select id=\"colorby\"><option value=\"dir\">directory</option>"
           "<option value=\"age\">dominant age bucket</option>"
-          "<option value=\"size\">dominant size bucket</option></select></div>\n"
-          "</div>\n"
+          "<option value=\"size\">dominant size bucket</option></select></div>\n", out);
+    /* Bucket reports: the legend is the filter panel's last row, directly under
+       the Color dropdown. Without buckets the panel stays hidden, so the legend
+       keeps its old boxed spot below the chart. */
+    if (has_buckets)
+        fputs("<details class=\"legend\" id=\"legend\"><summary>Legend</summary>"
+              "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n", out);
+    fputs("</div>\n"
           "<div id=\"chartwrap\"><svg id=\"chart\" viewBox=\"0 0 1000 1000\" role=\"img\" "
-          "aria-label=\"Sunburst chart\"></svg></div>\n"
-          "<details class=\"legend\" id=\"legend\"><summary>Legend</summary>"
-          "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n"
-          "<div class=\"hint\">Click a wedge to zoom in; click the center to go back up. "
+          "aria-label=\"Sunburst chart\"></svg></div>\n", out);
+    if (!has_buckets)
+        fputs("<details class=\"legend legend-below\" id=\"legend\"><summary>Legend</summary>"
+              "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n", out);
+    fputs("<div class=\"hint\">Click a wedge to zoom in; click the center to go back up. "
           "Data: <a href=\"", out);
     sb_html_escape(out, base_name);
     fputs(".json\">", out);
@@ -1405,29 +1413,62 @@ static void sb_html_suffix(FILE *out) {
         "  render();\n"
         "});\n"
         "\n"
-        "/* Bucket filter chips: toggle a bucket in/out of every wedge's total. */\n"
+        "/* Bucket filter chips: toggle a bucket in/out of every wedge's total.\n"
+        "   A chip carries its bucket's hue (same scale as the legend swatches and\n"
+        "   the wedges in the matching bucket color mode): full bucket color when\n"
+        "   on, a light tint of it when off, so the toggle state stays obvious.\n"
+        "   Chips stay neutral unless their bucket type is the active color mode:\n"
+        "   directory-mode wedges use per-directory hues, and age chips would not\n"
+        "   match a size-colored chart (or vice versa). */\n"
         "if (HAS_BUCKETS) {\n"
         "  document.getElementById('filters').hidden = false;\n"
-        "  const buildChips = function (elId, names, sel) {\n"
+        "  const chipPaints = [];\n"
+        "  const buildChips = function (elId, names, sel, mode) {\n"
         "    const el = document.getElementById(elId);\n"
         "    names.forEach(function (nm, i) {\n"
         "      const b = document.createElement('button');\n"
+        "      const hue = mode === 'age' ? 140 - i * 28 : 210 + i * 18;\n"
+        "      const paint = function () {\n"
+        "        if (colorBy !== mode) {\n"
+        "          /* Neutral: fall back to the .chip / .chip.on CSS classes. */\n"
+        "          b.style.background = '';\n"
+        "          b.style.borderColor = '';\n"
+        "          b.style.color = '';\n"
+        "          b.style.fontWeight = '';\n"
+        "          return;\n"
+        "        }\n"
+        "        if (sel[i]) {\n"
+        "          b.style.background = 'hsl(' + hue + ' 62% 52%)';\n"
+        "          b.style.borderColor = 'hsl(' + hue + ' 62% 40%)';\n"
+        "          b.style.color = '#fff';\n"
+        "          b.style.fontWeight = '600';\n"
+        "        } else {\n"
+        "          b.style.background = 'hsl(' + hue + ' 62% 94%)';\n"
+        "          b.style.borderColor = 'hsl(' + hue + ' 62% 70%)';\n"
+        "          b.style.color = 'hsl(' + hue + ' 55% 32%)';\n"
+        "          b.style.fontWeight = '400';\n"
+        "        }\n"
+        "      };\n"
         "      b.type = 'button';\n"
         "      b.className = 'chip on';\n"
         "      b.textContent = nm;\n"
+        "      paint();\n"
+        "      chipPaints.push(paint);\n"
         "      b.addEventListener('click', function () {\n"
         "        sel[i] = sel[i] ? 0 : 1;\n"
         "        b.classList.toggle('on', !!sel[i]);\n"
+        "        paint();\n"
         "        annotate(SUNBURST, null);\n"
         "        render();\n"
         "      });\n"
         "      el.appendChild(b);\n"
         "    });\n"
         "  };\n"
-        "  buildChips('chips-age', AGE_NAMES, ageSel);\n"
-        "  buildChips('chips-size', SIZE_NAMES, sizeSel);\n"
+        "  buildChips('chips-age', AGE_NAMES, ageSel, 'age');\n"
+        "  buildChips('chips-size', SIZE_NAMES, sizeSel, 'size');\n"
         "  document.getElementById('colorby').addEventListener('change', function () {\n"
         "    colorBy = this.value;\n"
+        "    chipPaints.forEach(function (p) { p(); });\n"
         "    render();\n"
         "  });\n"
         "}\n"
@@ -1449,8 +1490,9 @@ static void sb_html_suffix(FILE *out) {
         "  document.getElementById('userpick-wrap').hidden = false;\n"
         "}\n"
         "\n"
-        "/* Collapsible legend below the chart: the directory scheme always\n"
-        "   applies; the bucket scales only when this page carries bucket data. */\n"
+        "/* Collapsible legend: last filter-panel row on bucket reports, below the\n"
+        "   chart otherwise. The directory scheme always applies; the bucket\n"
+        "   scales only when this page carries bucket data. */\n"
         "(function buildLegend() {\n"
         "  const body = document.getElementById('legend-body');\n"
         "  function row(title) {\n"
@@ -1538,7 +1580,7 @@ int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_
     if (n < 0 || (size_t)n >= sizeof(path)) return -1;
     out = fopen(path, "w");
     if (!out) return -1;
-    sb_html_prefix(out, subject, base_name, report_href);
+    sb_html_prefix(out, subject, base_name, report_href, t->bucket_bytes != NULL);
     if (sb_json_write(t, out) != 0) {
         fclose(out);
         return -1;
