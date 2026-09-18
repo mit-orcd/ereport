@@ -59,7 +59,7 @@
 #define HL_SHARDS 256U
 #define NAME_SELF_TEST_N 4096U
 
-static const char EDUMP_ALPHA[36] = "0123456789abcdefghijklmnopqrstuvwxyz";
+static const char EDUMP_ALPHA[] = "0123456789abcdefghijklmnopqrstuvwxyz";
 static const crawl_bin_chunk_stdio_t g_io = {fopen, fread, fclose};
 
 static uint64_t g_seed = DEFAULT_SEED;
@@ -775,6 +775,33 @@ static int write_repeating(int fd, uint64_t size) {
     return 0;
 }
 
+/*
+ * Best-effort preallocation, posix_fallocate semantics (returns an errno code,
+ * not -1/errno). macOS never adopted posix_fallocate; the Darwin equivalent is
+ * fcntl(F_PREALLOCATE), which reserves blocks without changing the file length,
+ * so an ftruncate follows to set the size. Note the direct-write path that uses
+ * this is never taken on macOS anyway (no O_DIRECT there) — this only needs to
+ * compile and stay harmless.
+ */
+static int preallocate_file(int fd, uint64_t size) {
+#if defined(__APPLE__)
+    fstore_t store;
+
+    memset(&store, 0, sizeof(store));
+    store.fst_flags = F_ALLOCATECONTIG;
+    store.fst_posmode = F_PEOFPOSMODE;
+    store.fst_length = (off_t)size;
+    if (fcntl(fd, F_PREALLOCATE, &store) != 0) {
+        store.fst_flags = F_ALLOCATEALL; /* retry without the contiguity requirement */
+        if (fcntl(fd, F_PREALLOCATE, &store) != 0) return ENOSYS;
+    }
+    if (ftruncate(fd, (off_t)size) != 0) return errno;
+    return 0;
+#else
+    return posix_fallocate(fd, 0, (off_t)size);
+#endif
+}
+
 static int write_repeating_direct(int fd, uint64_t size) {
     uint64_t aligned = size & ~(uint64_t)(EDUMP_IO_ALIGN - 1);
     uint64_t rem = size - aligned;
@@ -782,7 +809,7 @@ static int write_repeating_direct(int fd, uint64_t size) {
     unsigned char *blk = t_block ? t_block : g_block;
 
     if (size >= (uint64_t)g_block_size) {
-        int frc = posix_fallocate(fd, 0, (off_t)size);
+        int frc = preallocate_file(fd, size);
 
         if (frc != 0 && frc != EOPNOTSUPP && frc != ENOSYS && frc != EINVAL) {
             errno = frc;

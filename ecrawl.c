@@ -4859,7 +4859,10 @@ static void disk_monitor_stop_request(void) {
     helper_stop_broadcast();
 }
 
-static void *stats_thread_main(void *arg) {
+/* Kept for re-enabling a 1 Hz stats thread; currently never started (see main). The
+ * unused attribute silences both gcc -Wunused-function and clang's stricter
+ * -Wunneeded-internal-declaration, which fires even through the old sizeof() trick. */
+static __attribute__((unused)) void *stats_thread_main(void *arg) {
     static int stall_zero_secs = 0;
     static int stall_announced = 0;
     (void)arg;
@@ -5901,7 +5904,7 @@ int main(int argc, char **argv) {
     worker_arg_t *worker_args = NULL;
     pthread_t *writer_threads = NULL;
     writer_arg_t *writer_args = NULL;
-    pthread_t stats_thread;
+    pthread_t stats_thread = {0}; /* never created; joined only under stats_thread_started */
     pthread_t disk_monitor_thread;
     int disk_monitor_started = 0;
     double t0, t1;
@@ -6280,8 +6283,6 @@ int main(int argc, char **argv) {
 
     /* No 1 Hz stats thread: default is silent; --progress prints on the dirent cadence. */
     stats_thread_started = 0;
-    (void)stats_thread;
-    (void)sizeof(&stats_thread_main);
 
     workers = (pthread_t *)calloc((size_t)g_crawl_threads, sizeof(*workers));
     worker_args = (worker_arg_t *)calloc((size_t)g_crawl_threads, sizeof(*worker_args));
