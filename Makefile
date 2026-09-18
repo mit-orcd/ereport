@@ -206,7 +206,7 @@ debug: clean all
 
 # Clean
 clean:
-	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog test_query_subtree_dups *.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o crawl_result.o crawl_sidecar.o
+	rm -f $(TARGETS) ecrawl_mount test_crawl_block_filter test_crawl_codec test_crawl_catalog test_query_subtree_dups *.o
 	rm -rf __pycache__
 
 # SERVE_BIND applies here only; serve-public always uses 0.0.0.0 (see README eserve.py section).
@@ -225,6 +225,7 @@ check: $(TARGETS) test_crawl_codec test_crawl_block_filter test_crawl_catalog te
 
 # Larger fixture under ./test (see scripts/test/test_setup.sh), then same correlation as check
 check-tree: $(TARGETS)
-	./scripts/test/test_full.sh
+	./scripts/test/test_setup.sh
+	./scripts/test/test.sh "$(CURDIR)/test"
 
 .PHONY: all clean debug serve serve-public check check-tree jemalloc-note fuse-headers

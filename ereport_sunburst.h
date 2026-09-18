@@ -108,10 +108,6 @@ int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_
                               const ereport_sunburst_link_t *users, size_t n_users,
                               long current_user);
 
-/* Same as ereport_sunburst_write_ex with base "sunburst", report link
- * "index.html" and no user picker. */
-int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject);
-
 /* Grand totals of the displayed root (subtree totals plus the collapsed
  * ancestors' boost), for picker labels and empty-tree detection. */
 uint64_t ereport_sunburst_tree_total_bytes(const ereport_sunburst_tree_t *t);

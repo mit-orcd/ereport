@@ -388,18 +388,6 @@ int crawl_dirx_lookup_all(const crawl_dirx_view_t *v, const char *path, size_t p
     return 0;
 }
 
-uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
-                           uint64_t *rows_read) {
-    uint64_t *ids = NULL;
-    size_t n = 0;
-    uint64_t first = 0;
-
-    if (crawl_dirx_lookup_all(v, path, plen, w, &ids, &n, rows_read) != 0) return 0;
-    if (n) first = ids[0];
-    free(ids);
-    return first;
-}
-
 void crawl_sidecar_scope_release(crawl_sidecar_scope_t *sp) {
     if (!sp) return;
     free(sp->roots);

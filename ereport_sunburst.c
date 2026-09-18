@@ -1592,10 +1592,6 @@ int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_
     return 0;
 }
 
-int ereport_sunburst_write(const ereport_sunburst_tree_t *t, const char *out_dir, const char *subject) {
-    return ereport_sunburst_write_ex(t, out_dir, "sunburst", subject, "index.html", NULL, 0, -1);
-}
-
 uint64_t ereport_sunburst_tree_total_bytes(const ereport_sunburst_tree_t *t) {
     if (!t || t->root < 0) return 0;
     return t->nodes[t->root].total_bytes + t->root_boost_bytes;

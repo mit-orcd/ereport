@@ -177,10 +177,6 @@ int crawl_dirx_read_row(const crawl_dirx_view_t *v, crawl_dirx_walk_t *w, uint64
 int crawl_dirx_path_of(const crawl_dirx_view_t *v, uint64_t did, crawl_dirx_walk_t *w, char *out, size_t out_sz,
                        size_t *len_out, uint64_t *rows_read);
 
-/* The first dir_id in this shard whose stored path is exactly `path`, or 0. */
-uint64_t crawl_dirx_lookup(const crawl_dirx_view_t *v, const char *path, size_t plen, crawl_dirx_walk_t *w,
-                           uint64_t *rows_read);
-
 /*
  * Every dir_id whose stored path is exactly `path`. Same-path catalog duplicates
  * share a hash and sit adjacent in dirs.idx; this returns them all.

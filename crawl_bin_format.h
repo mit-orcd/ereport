@@ -156,8 +156,8 @@ enum {
  * Picking on encoded bytes therefore cannot see them at all, and the only honest
  * test is to zstd both candidates and keep the smaller. A chunk that has already
  * collapsed to a handful of run pairs cannot save more than its whole payload,
- * so below this size the second compression pass is not worth its CPU. See
- * docs/performance.md#measured-delta-encoding-and-a-post-zstd-store-if-smaller-guard.
+ * so below this size the second compression pass is not worth its CPU.
+ * (Measured; the writeup is in the git history of docs/performance.md.)
  */
 #define CRAWL_BIN_ENC_TRIAL_MIN_BYTES 4096u
 
@@ -200,8 +200,9 @@ static inline uint16_t crawl_bin_type_bit(uint8_t type) {
  * is too short for run-length and frame-of-reference to matter) while keeping
  * per-writer memory modest: the writer holds one uint64 array per numeric column.
  *
- * Raising the target to 2, 4 or 8 MiB was measured and rejected: see
- * docs/performance.md#rejected-a-larger-row-group-raw-target. Note also that a
+ * Raising the target to 2, 4 or 8 MiB was measured and rejected (larger groups
+ * coarsen the parallel unit and the granularity of a zone-map miss; writeup in
+ * the git history of docs/performance.md). Note also that a
  * record contributes only (CRAWL_COL__COUNT - 1) * 8 + name_len decoded bytes,
  * so the record cap below binds at 65536 times that -- 7 MiB for nameless
  * records, 7.5 to 7.7 MiB on the trees measured there -- and a target past that

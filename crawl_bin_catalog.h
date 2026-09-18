@@ -175,20 +175,6 @@ int crawl_bin_catalog_read_row(int fd, const crawl_bin_catalog_map_t *m, crawl_b
                                const unsigned char **name, size_t *name_len_out, int *decoded_out);
 
 /*
- * True when dir_id `d` is at or under `root` -- a range test on the DFS
- * permutation, so it is O(1) per call with no per-shard bitmap. Requires
- * CRAWL_CAT_SUBTREE; returns 0 if the catalog was loaded without it.
- */
-static inline int crawl_bin_catalog_in_subtree(const crawl_bin_catalog_t *c, uint64_t root, uint64_t d) {
-    uint64_t lo;
-
-    if (!c->dfs_index || !c->dfs_subtree_dirs) return 0;
-    if (root == 0ULL || root > c->max_dir_id || d == 0ULL || d > c->max_dir_id) return 0;
-    lo = c->dfs_index[root];
-    return c->dfs_index[d] >= lo && c->dfs_index[d] < lo + c->dfs_subtree_dirs[root];
-}
-
-/*
  * Components crawl_bin_catalog_dir_path_len will walk before it stops.
  *
  * A directory deeper than this comes back with its leading components missing rather than as an

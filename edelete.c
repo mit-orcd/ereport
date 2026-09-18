@@ -165,7 +165,6 @@ static atomic_ullong g_live_unlinked = 0;
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
-static int g_verbose = 0;
 static int g_force = 0;
 static int g_dry_run = 1;
 static int g_threads = DEFAULT_THREADS;
@@ -1355,13 +1354,11 @@ static int confirm_delete_prompt(const char *root_path, int delete_all, const ch
             "  Threads:             %d  (EDELETE_THREADS)\n"
             "  Max unlink inflight: %d  (EDELETE_MAX_UNLINK_INFLIGHT; 0 = unlimited)\n"
             "  Fan-out min bytes:   %llu  (EDELETE_FANOUT_MIN_BYTES; 0 = off)\n"
-            "  Verbose:             %s\n"
             "\n"
             "Type YES to proceed, anything else cancels: ",
             g_threads,
             g_max_unlink_inflight,
-            g_fanout_min_bytes,
-            g_verbose ? "yes" : "no");
+            g_fanout_min_bytes);
     fflush(stderr);
 
     if (!fgets(line, sizeof(line), stdin)) {
@@ -1393,7 +1390,6 @@ static void usage(const char *prog) {
             "  --force                 with --delete: skip the YES prompt\n"
             "  --uid UID               only this owner\n"
             "  --gid GID               only this group (both apply when set)\n"
-            "  --verbose               parsed; currently a no-op\n"
             "\n"
             "Environment:\n"
             "  EDELETE_THREADS                crawl workers (default %d)\n"
@@ -1421,11 +1417,6 @@ int main(int argc, char **argv) {
     while (ai < argc && argv[ai][0] == '-') {
         if (strcmp(argv[ai], "--delete") == 0) {
             g_dry_run = 0;
-            ai++;
-            continue;
-        }
-        if (strcmp(argv[ai], "--verbose") == 0) {
-            g_verbose = 1;
             ai++;
             continue;
         }

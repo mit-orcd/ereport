@@ -107,13 +107,12 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
    plain index it warns, prints 0 and still exits 0. So the plain series has no Q4 row — skipped with
    `rollup_required`, which the charts label *needs the rolled-up index* to keep it distinct from a
    query GUFI simply cannot express.
-6. **Docs:** Fixed — `docs/binary-format.md` and `docs/performance.md` now describe **ERCBIN08**.
-7. **fd baseline:** `fd` has no `du` equivalent, so Q4 is skipped for it. It also needs `--hidden --no-ignore` or it silently omits dotfiles and ignore-file matches; `test.sh` uses `find` for directory counts because `fd -t d` omits the walk root.
-8. **du / dua / dut baselines:** all three answer Q4 only — no name, type or size predicates, so Q1–Q3 and Q5 are skipped rather than emulated with `-a | wc -l` style hacks. `dua --stats` reports *entries traversed* (files plus directories), which is not Q5's regular-file count, and `dut -f` counts files and directories together with no type predicate, so it is skipped for the same reason. `dut -b -s` gets the unit right by itself — apparent bytes with hard links deduplicated, matching `du -sb` to the byte on the seeded fixture — so its Q4 needs no annotation, but every invocation carries `-d 0 -n 1`: it takes its row count from the terminal height and with stdout on a pipe would otherwise print every entry in the tree. Only its walk row adds `-x`, where it stands in for `find -xdev`; its Q4 leaves it off so it covers the same tree as the `du -sb` it is compared against, and `env.txt` records the two vectors separately. `dua` exits 0 even when it could not read part of the tree, so unlike `find`/`du` a partial walk shows up only in its captured stderr, never as `partial_exit=1`.
-9. **Thread budget:** `THREADS` (default 16) is the *total* worker count each tool is given, since default fan-outs vary wildly — ecrawl ships 16 crawl + 8 stat + 8 writer threads, `fd` and `dua` take every logical processor, Robinhood scans with 2. Tools that run several pools at once split the budget: ecrawl keeps its stock 2:1:1 crawl/writer/stat shape, `ereport_index --make` halves it between parse workers and trigram writers, and Robinhood splits it between `nb_threads_scan` and `EntryProcessor`. GUFI (`-n`), XDU (`-j`), `fd`, `dua` and `dut` (`-t`, whose default is 4 threads or one per logical processor, whichever is larger) take it whole. `find` and `du` are single-threaded by design — an inherent property, not a handicap the harness imposes. `SUMMARY_TABLE.txt` prints the resolved split, and any tool that could not be pinned says so in its notes.
+6. **fd baseline:** `fd` has no `du` equivalent, so Q4 is skipped for it. It also needs `--hidden --no-ignore` or it silently omits dotfiles and ignore-file matches; `test.sh` uses `find` for directory counts because `fd -t d` omits the walk root.
+7. **du / dua / dut baselines:** all three answer Q4 only — no name, type or size predicates, so Q1–Q3 and Q5 are skipped rather than emulated with `-a | wc -l` style hacks. `dua --stats` reports *entries traversed* (files plus directories), which is not Q5's regular-file count, and `dut -f` counts files and directories together with no type predicate, so it is skipped for the same reason. `dut -b -s` gets the unit right by itself — apparent bytes with hard links deduplicated, matching `du -sb` to the byte on the seeded fixture — so its Q4 needs no annotation, but every invocation carries `-d 0 -n 1`: it takes its row count from the terminal height and with stdout on a pipe would otherwise print every entry in the tree. Only its walk row adds `-x`, where it stands in for `find -xdev`; its Q4 leaves it off so it covers the same tree as the `du -sb` it is compared against, and `env.txt` records the two vectors separately. `dua` exits 0 even when it could not read part of the tree, so unlike `find`/`du` a partial walk shows up only in its captured stderr, never as `partial_exit=1`.
+8. **Thread budget:** `THREADS` (default 16) is the *total* worker count each tool is given, since default fan-outs vary wildly — ecrawl ships 16 crawl + 8 stat + 8 writer threads, `fd` and `dua` take every logical processor, Robinhood scans with 2. Tools that run several pools at once split the budget: ecrawl keeps its stock 2:1:1 crawl/writer/stat shape, `ereport_index --make` halves it between parse workers and trigram writers, and Robinhood splits it between `nb_threads_scan` and `EntryProcessor`. GUFI (`-n`), XDU (`-j`), `fd`, `dua` and `dut` (`-t`, whose default is 4 threads or one per logical processor, whichever is larger) take it whole. `find` and `du` are single-threaded by design — an inherent property, not a handicap the harness imposes. `SUMMARY_TABLE.txt` prints the resolved split, and any tool that could not be pinned says so in its notes.
 
    Two caveats. GUFI's query wrappers are pinned only if the installed build advertises a thread flag in `--help`, since the spelling has moved between releases and passing an unknown flag would fail the row outright. And Robinhood's counts are baked into the config at `mariadb.sh setup` time, so changing `THREADS` afterwards needs a rerun of setup; `run_index.sh` compares the two and flags a mismatch.
-10. **Units are not comparable by default, so the harness pins each one.** Every Q3 threshold and Q4
+9. **Units are not comparable by default, so the harness pins each one.** Every Q3 threshold and Q4
     total in this comparison is *apparent* bytes, matching `find -size +Nc` and `du -sb`, and reaching
     that means overriding three different defaults. `gufi_du` reports rounded blocks unless given
     `--apparent-size --block-size 1`. `xdu` indexes `st_blocks`, so without `--apparent-size` at index
@@ -138,7 +137,7 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
     over the Q3 threshold, two Robinhood rows. Its size column is `st_size` regardless: it matched
     every seeded sparse fixture at all three thresholds, which an index of `st_blocks` could not.
     `SUMMARY_TABLE.txt`, `FAILURES.txt` and Figure 6 each name the reason beside the row.
-11. **A refused predicate is reported once, not once per repetition.** Before the timed loop, each
+10. **A refused predicate is reported once, not once per repetition.** Before the timed loop, each
     external tool is asked the shape of every query against the small seeded subtree — a name match, a
     size filter, a type filter, an aggregate. Anything it rejects becomes a `skipped` row carrying the
     tool's own error message, and the real query is never run. This is why `rbh-find -size +Nc` and a
@@ -147,7 +146,7 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
     genuinely broke, from questions a tool cannot express at all, and from tools that were not
     installed or configured — and, first of all, from tools that answered with a straight face and
     got it wrong, which no exit code reports.
-12. **Robinhood is never measured unindexed, and the indexes are not free.** A relational index is a
+11. **Robinhood is never measured unindexed, and the indexes are not free.** A relational index is a
     thing you build, and nobody queries a database without one, so the harness splits the difference
     rather than choosing: the scan is timed filling index-free tables, then `name_index` on
     `NAMES(name)` and `size_index` / `type_index` on `ENTRIES` are timed as a phase of their own, and
@@ -157,7 +156,7 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
     adds them, the same way it adds `ecrawl` + `ereport_index` and GUFI + rollup. Note what the indexes
     do *not* buy: Q6's unanchored `%token%` cannot seek into a B-tree on names, so `name_index` is there
     and the optimiser still reads every row.
-13. **Q6 is not from the paper and says so.** It is labelled *extra* in the charts and the summary. It
+12. **Q6 is not from the paper and says so.** It is labelled *extra* in the charts and the summary. It
     exists because the paper's five queries never ask for a token with nothing anchored at either end,
     which is the one shape that separates a trigram index from a B-tree: `*token*.dat` forces a full
     scan out of Robinhood despite `name_index`, while `ereport_index` takes the token as its most
@@ -165,10 +164,10 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
     shape with one anchor's difference, so the pair is the measurement, not either row alone. The seeds
     plant a directory carrying the token and a file with the wrong extension, so a tool that indexes
     directories or matches the whole path over-reports and the correctness check catches it.
-14. **Cold and hot are separate measurements, not a range.** Each tool finishes all of its cold reps
+13. **Cold and hot are separate measurements, not a range.** Each tool finishes all of its cold reps
     (one drop, then the whole pipeline) before any hot rep, so the last cold run is what warms the
     hot series. The `cache` column keeps them apart in the CSVs, the tables and the figures. A cold
     pass on a host where the harness could not drop anything records itself as `warm`, because a claim
     the run cannot support should not be in the data. Crawl and index are one unit, so a hot
     `ereport_index` reads the shards the hot `ecrawl` in that same unit just wrote.
-15. **Open files:** every tool here wants far more than the stock 1024 — `ereport_index` keeps trigram writers × LRU shards open, GUFI opens a database per directory. `benchmark.sh` raises `RLIMIT_NOFILE` to 128k (`NOFILE_TARGET`) for the whole run, and the step-by-step scripts do the same for themselves. Non-root runs are capped by the hard limit, which the summary records.
+14. **Open files:** every tool here wants far more than the stock 1024 — `ereport_index` keeps trigram writers × LRU shards open, GUFI opens a database per directory. `benchmark.sh` raises `RLIMIT_NOFILE` to 128k (`NOFILE_TARGET`) for the whole run, and the step-by-step scripts do the same for themselves. Non-root runs are capped by the hard limit, which the summary records.

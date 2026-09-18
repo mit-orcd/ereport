@@ -1,56 +1,62 @@
 # ereport
 
-Small C tools for crawling filesystem metadata into compact binary records and turning that data into static HTML reports with fast path search.
-
-## Why ereport?
-
-`du` and `find` re-walk the whole tree on every run — hours on a large filesystem. ereport splits the job:
-
-- **Crawl once.** `ecrawl` walks the tree in parallel and keeps the result as compact binary records — much faster than a serial `du`, and reusable.
-- **Report without re-walking.** `ereport` turns a crawl into a static HTML report: an age × size heat map with drill-down pages, all-users or per-user.
-- **Find any path fast.** `ereport_index` answers case-insensitive substring searches over every crawled path — even billions — from a search box in the report.
-- **Serve anywhere.** The report is static HTML; `eserve.py` serves it and routes the search box.
+C tools that crawl filesystem metadata once into compact binary records, then answer questions from the records — HTML reports, path search, subtree totals, `find`-style queries — without walking the tree again.
 
 ## Quick start
 
 ```bash
-make                                            # build everything
+make                                              # builds every binary (needs libzstd; jemalloc and FUSE are optional)
 
-./ecrawl /path/to/tree crawl-out                # 1. crawl      → shards in ./crawl-out/
-./ereport mtime crawl-out                       # 2. report     → ./all_users/
-./ereport_index --make crawl-out                # 3. (optional) search index → ./all_users/index/
-make serve SERVE_ROOT=./all_users SERVE_PORT=8000   # 4. serve
+./ecrawl /path/to/tree crawl-out                  # 1. crawl      → crawl-out/uid_shard_*.bin
+./ereport mtime crawl-out                         # 2. report     → ./all_users/index.html
+./ereport_index --make crawl-out                  # 3. search index (optional) → ./all_users/index/
+make serve SERVE_ROOT=./all_users SERVE_PORT=8000 # 4. serve
 ```
 
-Open <http://127.0.0.1:8000/index.html> — heat map plus a path-search box.
+Open <http://127.0.0.1:8000/index.html?search=1>: an age × size heat map with per-cell drill-down pages, a sunburst of where the bytes live, and a path search box.
 
-Variations: per-user report (`./ereport alice mtime crawl-out`, index with `./ereport_index --make alice crawl-out`), or merge several servers' crawls by passing every crawl directory to one command. Details: [docs/workflow.md](docs/workflow.md).
+Common variations:
+
+```bash
+./ereport alice mtime crawl-out                              # one user → ./alice/
+./ereport_index --make alice crawl-out                       # ... and their index → ./alice/index/
+./ereport mtime crawl_srv01 crawl_srv02 crawl_srv03          # merge several servers' crawls into one report
+./ereport --subtree /path/to/tree/lab/jones mtime crawl-out  # report on one directory of an existing crawl
+./ereport --bucket-details 3 mtime crawl-out                 # directory rollup tables on every bucket page
+./ecrawl_query --subtree /path/to/tree/lab/jones crawl-out   # du -sb of a subtree, from the crawl
+./ecrawl_query --size-gt 1073741824 --type f --list crawl-out   # find -size +1G, from the crawl
+```
+
+Serving one user's report: `make serve SERVE_ROOT=./alice` puts `index.html` at the site root; `make serve SERVE_ROOT=.` serves every user under `/<user>/index.html`. `make serve-public` binds `0.0.0.0`.
 
 ## Tools
 
 | Tool | Role |
 |------|------|
-| [`ecrawl`](docs/tools.md#ecrawl) | Parallel filesystem crawler; writes compact, uid-sharded binary metadata records. |
-| [`ereport`](docs/tools.md#ereport) | Turns crawl output into `index.html`, an age×size heat map with bucket drill-down pages, a sunburst chart (optionally filterable by age/size buckets, with per-user pages on all-user runs), and a path-search box. |
-| [`ereport_index`](docs/tools.md#ereport_index) | Builds and searches the trigram index behind path-substring search. |
-| [`eserve.py`](docs/tools.md#eservepy) | HTTP server for the static reports plus server-side path search. |
-| [`ecrawl_query`](docs/tools.md#ecrawl_query) | Read-only directory-shape stats (parent, path-depth, and top-parent histograms). |
-| [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Mounts a crawl as a read-only FUSE filesystem, so `find`/`ls`/`du` work on it without the source tree. Linux only. |
-| [`edelete`](docs/tools.md#edelete) | Parallel deleter for non-directory paths, optionally filtered by age and owner. Dry-run by default. |
-| [`edump`](docs/tools.md#edump) | Recreates a crawl as a new tree with scrambled names and repeating seed-derived file contents. |
+| [`ecrawl`](docs/tools.md#ecrawl) | Parallel crawler; writes uid-sharded binary records. `--no-stat` is a fast names-only `find`. |
+| [`ereport`](docs/tools.md#ereport) | Static HTML report: heat map, bucket pages, sunburst, search box. |
+| [`ereport_index`](docs/tools.md#ereport_index) | Trigram index for case-insensitive path-substring search over billions of paths. |
+| [`eserve.py`](docs/tools.md#eservepy) | Serves the report and answers the search box. |
+| [`ecrawl_query`](docs/tools.md#ecrawl_query) | `du` / `find`-style queries over a crawl: subtree totals, size/type/owner/perm filters, path lists. |
+| [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Read-only FUSE mount of a crawl so `find`, `ls`, `du` work without the source tree. Linux only. |
+| [`edelete`](docs/tools.md#edelete) | Parallel deleter with age and owner filters. Dry-run by default. |
+| [`edump`](docs/tools.md#edump) | Recreates a crawl as a real tree with scrambled names and synthetic contents. |
 
-Full flags, examples, and per-tool behavior: [docs/tools.md](docs/tools.md).
+## How the totals are defined
+
+- `ecrawl` `total_bytes`: unique regular-file `st_size` — each hardlinked inode counted once, like `du -sb`. `total_allocated_bytes` is the same over `st_blocks × 512`; `files_sparse_heuristic` counts files where allocated < logical. Directory, symlink and other apparent bytes are listed separately; `apparent_bytes_total` sums them all.
+- `ereport` heat-map bytes use the same hardlink-aware accounting over the records it matched (`total_capacity_in_files`; other types in `total_capacity_in_others`).
+- `ecrawl_query --subtree` `bytes` equals `du -sb` of that directory.
 
 ## Documentation
 
-- [Tool reference](docs/tools.md) — full usage, flags, examples, and per-tool behavior for every binary and `eserve.py`, plus the source layout.
-- [Typical workflow & output semantics](docs/workflow.md) — multi-server crawls, merged reports, and how byte/capacity totals are computed.
-- [Environment variables & thread defaults](docs/environment-variables.md) — every tuning knob and the per-binary default thread counts.
-- [Crawl shard binary format](docs/binary-format.md) — `ERCBIN09` header, columnar zstd-compressed row groups with per-column zone maps, an equally columnar catalog tail with DFS ordering and subtree rollups, and `.ckpt` sidecars.
-- [Performance & profiling](docs/performance.md) — why it is fast, adversarial-tree generation, and the profiling harness.
-- [Testing](docs/testing.md) — `scripts/test/test.sh` / `make check` and validation helpers.
-- [Build & deploy](docs/build-and-deploy.md) — jemalloc linking and the systemd daily-crawl units.
+- [Tool reference](docs/tools.md) — usage, examples and flags for every binary.
+- [Environment variables](docs/environment-variables.md) — thread counts and tuning knobs.
+- [Build & deploy](docs/build-and-deploy.md) — zstd/jemalloc/FUSE, and the systemd daily-crawl units.
+- [Testing](docs/testing.md) — `make check`, the correlation harness, the indexer comparison.
+- [Binary format](docs/binary-format.md) — shard, catalog, sidecar and index layouts.
+- [Performance](docs/performance.md) — why it is fast, adversarial trees, profiling.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE). Copyright is held by Michel Erb (2026).
+MIT — see [LICENSE](LICENSE). Copyright Michel Erb (2026).

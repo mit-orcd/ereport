@@ -24,9 +24,9 @@ bin_colchunk_hdr_t[column_count]        the column directory
 
 with the payloads in directory order, so a reader that wants two columns reads the header plus directory and then seeks straight to those two payloads. Row groups are self-describing and contiguous — `crawl_bin_rowgroup_total_bytes()` gives the stride to the next group from the header alone — so a reader walks them with header reads and no side index, and every chunk boundary handed to a parallel worker is a group boundary. `ecrawl` flushes a group at about 1 MiB of uncompressed records or 65536 records, whichever comes first (`CRAWL_BIN_ROWGROUP_RAW_TARGET`, `CRAWL_BIN_ROWGROUP_MAX_RECORDS`). The 1 MiB target is what gives the codecs enough runway to pay off: a few thousand records per group is too short for run-length and frame-of-reference encoding to matter.
 
-**Record order inside a group is current writer behaviour, not part of the format.** Just before encoding, `ecrawl` sorts the buffered group by `parent_dir_id`, then by name bytes (`memcmp` over the common prefix, shorter name first), then by arrival position, because the codecs are order-sensitive and one run per directory is worth several MiB on a capture with more than a couple of records per directory — see [performance.md](performance.md#measured-sorting-each-row-group-by-parent_dir_id-name). The order is deterministic given the group's contents, and nothing in the tree depends on it: `.ckpt` offsets are physical, the sidecars are built from what a group actually holds, and `ecrawl_query` and `ecrawl_mount` impose their own order on output. Readers should keep it that way. Sorting is per group and never moves a record between groups, so one directory's children can still straddle a boundary and arrive in either order, and a later writer is free to order a group differently or not at all.
+**Record order inside a group is current writer behaviour, not part of the format.** Just before encoding, `ecrawl` sorts the buffered group by `parent_dir_id`, then by name bytes (`memcmp` over the common prefix, shorter name first), then by arrival position, because the codecs are order-sensitive and one run per directory is worth several MiB on a capture with more than a couple of records per directory. The order is deterministic given the group's contents, and nothing in the tree depends on it: `.ckpt` offsets are physical, the sidecars are built from what a group actually holds, and `ecrawl_query` and `ecrawl_mount` impose their own order on output. Readers should keep it that way. Sorting is per group and never moves a record between groups, so one directory's children can still straddle a boundary and arrive in either order, and a later writer is free to order a group differently or not at all.
 
-That layout is intentionally heavier at **write** time than the older single-zstd block frames (v6/v7): each flush runs a codec pass and a `ZSTD_compress` per column. `--no-write` never enters this path, so a compare-indexers figure where `fd` / `find` / `du` / `ecrawl --no-write` stay flat while solid `ecrawl` (write) slows is the expected signature of a producer-format change, not a colder walk. See [performance.md](performance.md#ercbin08-capture-write-cost).
+That layout is intentionally heavier at **write** time than the older single-zstd block frames (v6/v7): each flush runs a codec pass and a `ZSTD_compress` per column. `--no-write` never enters this path, so a compare-indexers figure where `fd` / `find` / `du` / `ecrawl --no-write` stay flat while solid `ecrawl` (write) slows is the expected signature of a producer-format change, not a colder walk.
 
 `bin_rowgroup_hdr_t` (32 bytes): `record_count` `uint32_t`, `column_count` `uint32_t`, `comp_bytes` `uint64_t` (payload bytes after the directory), `raw_bytes` `uint64_t`, `type_mask` `uint16_t` (OR of `crawl_bin_type_bit()` over the group), then reserved.
 
@@ -171,3 +171,22 @@ Both sketches are stored because `dir_id` follows crawl arrival order and correl
 - Shards are assigned by `uid & (uid_shards - 1)`, so one directory's children scatter across many shard files whenever its entries have different owners.
 - For per-user runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. All-users runs load every shard file, as do merged full-cluster crawls.
 - `ECRAWL_UID_SHARDS` for a crawl run should match across every output directory you later pass together to `ereport` / `ereport_index --make`; merged reports assume a consistent shard layout.
+
+## Trigram index (`ereport_index`)
+
+Written under `<index-dir>` by `ereport_index --make`; read by `--search` and `eserve.py`.
+
+| File | Contents |
+|------|----------|
+| `meta.txt` | key/value: `ereport_index_version=5`, `trigrams=basename`, `paths_order=lex`, `indexed_paths=`, `dir_index=` … |
+| `paths.bin` | `EPATH002`: 40-byte header, path bytes in independently zstd-compressed chunks of ≤ 256 KiB cut on path boundaries, then a chunk table (logical start, file offset, stored and raw length). Rewritten in lexicographic order after the parse phase so a directory hit expands by scanning one contiguous `prefix/` run. |
+| `path_offsets.bin` | start of each `path_id` in the uncompressed stream; remapped when `paths.bin` is lex-sorted so `path_id`s never change |
+| `path_isdir.bin` | one bit per `path_id`: directory or not |
+| `tri_keys.bin` | 24-byte records, one per distinct lowercased basename trigram, binary-searched at query time; the `reserved` field says whether the postings list is bare or chunked |
+| `tri_postings.bin` | delta-varint `path_id` lists; lists ≤ 512 bytes are bare, larger ones are chunks of ≤ 128 KiB each prefixed `[u32 raw_len][u32 stored_len][u8 is_zstd]` |
+| `dirs.idx`, `rowgroups.idx` | the directory-index sidecars above; unrelated to search, written here because the build has every shard open. Omitted with `--no-dir-index`. |
+| `ereport_index.log` | one line every 8 s during `--make` / `--resume-merge` with queue and merge-memory estimates |
+
+Trigrams are taken from each path's basename only ("segment-once"); parent names are not re-trigrammed onto every child. `--search` intersects basename postings, verifies candidates, and if a hit is a directory prefix-scans its descendants in the lex-sorted `paths.bin`. `EREPORT_INDEX_ZSTD_LEVEL` (default 3) sets the level for `paths.bin` and `tri_postings.bin`. Temporary `tmp_trigrams_*.bin` files (`EITG0002` frames of delta-varints, no zstd) and `merge_seg_*` halves exist only during a build; `--resume-merge` removes orphans left by a crash.
+
+Version history: v2 added the chunked compression; v3 switched to basename trigrams and added `path_isdir.bin`; v4 added a children CSR (`path_kids.bin`) that v5 replaced with the lex-sorted `paths.bin`. There is no dual-read path — `--search` requires version 5 and `paths_order=lex`; older indexes must be rebuilt.

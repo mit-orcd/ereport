@@ -3,94 +3,41 @@
 ## Build
 
 ```bash
-make
-```
-
-Build individual binaries:
-
-```bash
-make ecrawl
-make ereport
-make ereport_index
-make ecrawl_query
-make edelete
-make ecrawl_mount      # optional; needs FUSE headers (see below)
-```
-
-Clean:
-
-```bash
+make                    # every binary; prints one line each for jemalloc and FUSE detection
+make ecrawl ereport     # individual targets
 make clean
 ```
 
+Required: gcc, pthreads, libzstd (`zstd-devel` / `libzstd-dev`; Homebrew `zstd` on macOS). Optional: jemalloc and FUSE 2, both auto-detected with `pkg-config`.
+
+### Optional: jemalloc
+
+With `jemalloc-devel` (RHEL/Fedora, EPEL) or `libjemalloc-dev` (Debian/Ubuntu) installed, every native binary links `-ljemalloc`; without it the build is a byte-identical glibc-malloc build. Force with `make JEMALLOC_LIBS=-ljemalloc` or disable with `make JEMALLOC_LIBS=`. On a 14.9M-path crawl it made `ereport_index --make` ~27% faster; `ecrawl` gains nothing. Deployment hosts then need `libjemalloc.so.2` at runtime.
+
 ### Optional: FUSE for `ecrawl_mount`
 
-`ecrawl_mount` is Linux-only; the Makefile skips it on macOS (macFUSE mounts of this filesystem can wedge the VFS). Elsewhere it is built only when FUSE 2.x headers are present, so a host without them produces a link line identical to a vanilla build. `make` reports which way it resolved:
-
-```
-build: fuse enabled (-l:libfuse.so.2)
-build: fuse not found; ecrawl_mount will not be built (try: make fuse-headers)
-```
-
-Detection prefers `pkg-config --libs fuse` from `fuse-devel`:
+Linux only (skipped on macOS). Built when FUSE 2.x headers are found:
 
 ```bash
-sudo dnf install fuse-devel     # RHEL / Fedora / EL8+
-sudo apt install libfuse-dev    # Debian / Ubuntu
+sudo dnf install fuse-devel      # or: sudo apt install libfuse-dev
+make ecrawl_mount
 ```
 
-Without root, `make fuse-headers` unpacks only the headers from the matching distro RPM into `$(FUSE_PREFIX)` (default `~/.local/fuse-devel`) using `curl` + `rpm2cpio` + `cpio`, then links against the system `libfuse.so.2` — which is already present as part of the base `fuse-libs` package:
+Without root on RHEL/Rocky, where `libfuse.so.2` is in the base `fuse-libs` package but the headers are not:
 
 ```bash
-make fuse-headers && make ecrawl_mount
+make fuse-headers && make ecrawl_mount    # unpacks only the headers of the matching RPM into ~/.local/fuse-devel
 ```
 
-The header version is pinned to the distro's `libfuse.so.2` so the ABI matches exactly; override `FUSE_DEVEL_URL` / `FUSE_DEVEL_RPM` on another distro, or `FUSE_PREFIX` to unpack elsewhere. At runtime the host needs `/dev/fuse` and the setuid `fusermount` helper from the `fuse` package; no root is needed to mount. See [tools.md#ecrawl_mount](tools.md#ecrawl_mount).
+Override `FUSE_DEVEL_URL` / `FUSE_DEVEL_RPM` for another distro, `FUSE_PREFIX` for another location. Mounting needs `/dev/fuse` and the setuid `fusermount` helper; no root.
 
-### Optional: link native binaries against jemalloc
+## systemd: daily crawl + sync
 
-The Makefile auto-detects jemalloc via `pkg-config` and, when `jemalloc-devel` / `libjemalloc-dev` is installed, links all native targets built by `make all` — `ereport`, `ereport_index`, `ecrawl`, `edelete`, `ecrawl_query`, and `ecrawl_mount` — against `-ljemalloc`. Install the dev package so `pkg-config` can find it:
+`contrib/systemd/` runs `ecrawl` daily on the paths in `/etc/ereport/ecrawl-daily.conf`, `rsync`s each output directory to `RSYNC_DEST`, and deletes the local copy after a successful sync.
 
 ```bash
-sudo dnf install jemalloc-devel    # RHEL / Fedora / EL8+ (EPEL)
-sudo apt install libjemalloc-dev   # Debian / Ubuntu
-make clean && make
-ldd ./ereport_index | grep jemalloc   # verify libjemalloc.so.2 is linked
+sudo contrib/systemd/install.sh --enable     # units + wrapper + example config, then enable the timer
+sudo systemctl edit ecrawl-daily.service     # drop-ins for User=, Environment=, ... (survive reinstalls)
 ```
 
-A single `build: jemalloc …` line prints once when you run `make` / `make all`. No source `#include` is required — linking `-ljemalloc` transparently interposes `malloc` / `calloc` / `realloc` / `free`. Without the dev package the link line is byte-for-byte identical to a vanilla build, so the change is a no-op on hosts that lack jemalloc. Override the auto-detect by passing `JEMALLOC_LIBS=` (empty) on the make command line to force-disable, or `JEMALLOC_LIBS=-ljemalloc` to force-enable.
-
-On a 14.9M-path crawl with `EREPORT_INDEX_THREADS=64`, linking against jemalloc made `ereport_index --make` ~27% faster end-to-end (index phase ~31% faster, merge phase unchanged); `ecrawl` showed no measurable benefit on adversarial trees. When enabled, the deployment host needs `libjemalloc.so.2` at runtime (the RHEL `jemalloc` package suffices; the dev package is only needed at build time).
-
-## systemd: daily `ecrawl` and binary sync
-
-Optional units under `contrib/systemd/` run `ecrawl` on paths listed in `/etc/ereport/ecrawl-daily.conf`, then `rsync` each job’s `output_dir` (crawl shard data) under `RSYNC_DEST` (typically `RSYNC_DEST/<basename(output_dir)>/`, or directly into `RSYNC_DEST` when its last path component already matches that basename); after each successful sync the script deletes matching crawl artifact files locally (see `contrib/systemd/ecrawl-daily.conf.example`).
-
-Install (from the repo root; idempotent — an existing `/etc/ereport/ecrawl-daily.conf` is never overwritten):
-
-```bash
-sudo contrib/systemd/install.sh            # units + wrapper + example config
-# edit /etc/ereport/ecrawl-daily.conf
-sudo systemctl enable --now ecrawl-daily.timer
-# or in one step: sudo contrib/systemd/install.sh --enable
-```
-
-Or install manually (adjust paths if you install elsewhere):
-
-```bash
-sudo install -d /etc/ereport /usr/local/lib/ereport
-sudo install -m0644 contrib/systemd/ecrawl-daily.conf.example /etc/ereport/ecrawl-daily.conf
-# edit /etc/ereport/ecrawl-daily.conf
-sudo install -m0755 contrib/systemd/ecrawl-daily.sh /usr/local/lib/ereport/ecrawl-daily.sh
-sudo install -m0644 contrib/systemd/ecrawl-daily.service /etc/systemd/system/
-sudo install -m0644 contrib/systemd/ecrawl-daily.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ecrawl-daily.timer
-```
-
-Customizing:
-
-- The unit sets `LimitNOFILE=65536` so the default 1024 soft fd limit for services cannot force shard LRU churn on mixed-UID trees.
-- Prefer drop-ins over editing the shipped unit (drop-ins survive reinstalls): `sudo systemctl edit ecrawl-daily.service` — e.g. `User=` / `Group=` if the job must not run as root, or `Environment=` lines.
-- `ecrawl` tuning env vars can also be set directly in `ecrawl-daily.conf`: any `ECRAWL_*` directive other than `ECRAWL_BIN` is exported into the crawl environment (see `docs/environment-variables.md`), e.g. `ECRAWL_CRAWL_THREADS=16`.
-- The service has no `[Install]` section on purpose: it is started by `ecrawl-daily.timer` only, never enabled on its own.
+`install.sh` never overwrites an existing config. Any `ECRAWL_*` line in the config (other than `ECRAWL_BIN`) is exported into the crawl's environment, so `ECRAWL_CRAWL_THREADS=16` works there. The unit sets `LimitNOFILE=65536` and has no `[Install]` section: it runs from `ecrawl-daily.timer` only. See `contrib/systemd/ecrawl-daily.conf.example` for the config keys.

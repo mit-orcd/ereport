@@ -122,26 +122,6 @@ export EREPORT_THREADS=${EREPORT_THREADS:-$THREADS}
 export ECRAWL_QUERY_THREADS=${ECRAWL_QUERY_THREADS:-$THREADS}
 unset _t_crawl _t_writer _t_half _t_trigram
 
-# gufi_dir2index and gufi_rollup take a thread count on the command line, but
-# the spelling has moved between releases, so probe --help rather than assume.
-# Anchored on whitespace: a bare substring match would find "-n" in prose and
-# pass a flag the tool rejects, turning a thread-pinning nicety into a failed
-# row. Prints one argument per line, or nothing when the tool cannot be pinned.
-# The Python wrappers (gufi_find, gufi_du) have no such flag; their thread count
-# comes from the config written by gufi_write_config.
-gufi_thread_args() {
-  local bin=${1:-}
-  [[ -n "$bin" ]] || return 0
-  command -v "$bin" >/dev/null 2>&1 || return 0
-  local help
-  help=$("$bin" --help 2>&1 || true)
-  if printf '%s' "$help" | grep -qE -- '(^|[[:space:]])--threads([[:space:],=]|$)'; then
-    printf -- '--threads\n%s\n' "$THREADS"
-  elif printf '%s' "$help" | grep -qE -- '(^|[[:space:]])-n[[:space:],]'; then
-    printf -- '-n\n%s\n' "$THREADS"
-  fi
-}
-
 # Where gufi_find and gufi_du look for their configuration. The path is compiled
 # into them, so ask the installed gufi_config module instead of guessing; the
 # fallbacks are the harness's own build and upstream's default.
@@ -1032,18 +1012,6 @@ tool_reps() {
   var=$(reps_var_name "$1")
   value=${!var:-}
   printf '%s' "${value:-$REPS}"
-}
-
-# The outer loop bound: tools are still visited rep-major so that the cache
-# state each one sees is the same as it was before per-tool counts existed.
-max_tool_reps() {
-  local t n max=0
-  for t in "$@"; do
-    n=$(tool_reps "$t")
-    ((n > max)) && max=$n
-  done
-  ((max > 0)) || max=$REPS
-  printf '%s' "$max"
 }
 
 # "3" when every tool agrees, otherwise "3 (gufi 1, robinhood 1)". Used for the
