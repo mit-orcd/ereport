@@ -754,6 +754,10 @@ static int write_full(int fd, const unsigned char *buf, size_t n) {
             return -1;
         }
         off += (size_t)w;
+        /* count bytes as written, not at file close: with giant files the
+         * volume counter would otherwise sit frozen for minutes while the
+         * device is busy (one relaxed atomic per write syscall, no hot path) */
+        atomic_fetch_add_explicit(&g_n_bytes, (unsigned long long)w, memory_order_relaxed);
     }
     return 0;
 }
@@ -822,6 +826,7 @@ static int write_repeating_direct(int fd, uint64_t size) {
                 return -1;
             }
             done += (uint64_t)w;
+            atomic_fetch_add_explicit(&g_n_bytes, (unsigned long long)w, memory_order_relaxed);
         }
     }
     return 0;
@@ -897,7 +902,6 @@ static int write_file_plain(const char *dest, uint64_t size, const char *orig) {
     }
     close(fd);
     atomic_fetch_add(&g_n_files, 1);
-    atomic_fetch_add(&g_n_bytes, (unsigned long long)size);
     return 0;
 }
 
@@ -1515,7 +1519,7 @@ static void progress_print(int tty, double t0) {
     b = (unsigned long long)atomic_load(&g_n_bytes);
     progress_fmt_volume(vol, sizeof(vol), b);
     if (tty) fputs("\r\033[2K\r", stderr);
-    fprintf(stderr, PROG ": files=%llu dirs=%llu objects=%llu volume=%s elapsed=%.0fs%s", f, d, o, vol,
+    fprintf(stderr, PROG ": files=%llu dirs=%llu other=%llu volume=%s elapsed=%.0fs%s", f, d, o, vol,
             now_sec() - t0, tty ? "" : "\n");
     fflush(stderr);
 }
