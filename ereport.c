@@ -8818,10 +8818,19 @@ static sb_uid_cell_t *sb_uid_slot_cell(sb_uid_slot_t *u, uint32_t dir_id) {
 
     if (u->n * 10 >= u->cap * 7) { /* grow at 70% load */
         size_t nc = u->cap ? u->cap * 2 : 16;
-        sb_uid_cell_t *nv = calloc(nc, sizeof(*nv));
+        sb_uid_cell_t *nv = malloc(nc * sizeof(*nv));
         size_t i, nmask = nc - 1;
 
         if (!nv) return NULL;
+        /* Write-touch every page now instead of calloc's lazy zero mapping:
+         * the probe below reads a slot before the insert writes it, and a read
+         * fault on an untouched mmap'd page maps the shared zero page, so the
+         * following write is a copy-on-write that IPIs every CPU running one
+         * of the 32 scan threads to flush its TLB. perf put that
+         * (wp_page_copy -> flush_tlb_mm_range -> smp_call_function_many_cond)
+         * at ~5% of all cycles, charged largely to the interrupted workers.
+         * A write-first touch allocates the private page directly. */
+        memset(nv, 0, nc * sizeof(*nv));
         for (i = 0; i < u->cap; i++) {
             sb_uid_cell_t *c = &u->cells[i];
             size_t j;
