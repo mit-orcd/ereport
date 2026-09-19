@@ -8833,8 +8833,9 @@ static int sb_uid_slot_reserve(sb_uid_slot_t *u, size_t want) {
      * flush its TLB. perf put that (wp_page_copy -> flush_tlb_mm_range ->
      * smp_call_function_many_cond) at ~5% of all cycles, charged largely to
      * the interrupted workers. Note that malloc + memset(0) is NOT a fix:
-     * gcc -O2 folds the pair straight back into calloc. */
-    alloc_prefault(nv, nc * sizeof(*nv));
+     * gcc -O2 folds the pair straight back into calloc. The _zeroed variant
+     * has no size floor: the doublings under 1 MiB were half the storm. */
+    alloc_prefault_zeroed(nv, nc * sizeof(*nv));
     for (i = 0; i < u->cap; i++) {
         sb_uid_cell_t *c = &u->cells[i];
         size_t j;

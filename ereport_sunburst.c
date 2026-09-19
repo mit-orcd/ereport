@@ -14,7 +14,7 @@
                        writes are safe to run concurrently (per-user trees) */
 #include "ereport_sunburst.h"
 #define EREPORT_NO_MALLOC_CONF /* ereport.c owns the jemalloc malloc_conf definition */
-#include "alloc_tuning.h"      /* alloc_prefault */
+#include "alloc_tuning.h"      /* alloc_prefault_zeroed */
 #include "compat_qsort_r.h"
 
 #include <inttypes.h>
@@ -51,8 +51,8 @@ int ereport_sunburst_accum_init(ereport_sunburst_accum_t *a, uint64_t max_dir_id
     /* Populate the pages up front (see sb_child_index_build): the rollup reads
      * every slot before adding into parents, which on calloc's lazily mapped
      * pages would turn each first write into a copy-on-write TLB-flush broadcast. */
-    alloc_prefault(a->bytes, ((size_t)max_dir_id + 1) * sizeof(*a->bytes));
-    alloc_prefault(a->files, ((size_t)max_dir_id + 1) * sizeof(*a->files));
+    alloc_prefault_zeroed(a->bytes, ((size_t)max_dir_id + 1) * sizeof(*a->bytes));
+    alloc_prefault_zeroed(a->files, ((size_t)max_dir_id + 1) * sizeof(*a->files));
     a->max_dir_id = max_dir_id;
     return 0;
 }
@@ -525,8 +525,8 @@ static int sb_child_index_build(const crawl_bin_catalog_t *cat, uint32_t **first
      * shared zero page, making the write a copy-on-write with a TLB-flush IPI
      * to every CPU of the process. (malloc + memset(0) does not help: gcc -O2
      * folds the pair straight back into calloc.) */
-    alloc_prefault(fc, ((size_t)nd + 1) * sizeof(*fc));
-    alloc_prefault(ns, ((size_t)nd + 1) * sizeof(*ns));
+    alloc_prefault_zeroed(fc, ((size_t)nd + 1) * sizeof(*fc));
+    alloc_prefault_zeroed(ns, ((size_t)nd + 1) * sizeof(*ns));
     for (d = 2; d <= nd; d++) {
         uint64_t p = cat->parent_dir_id[d];
         if (p < 1 || p > nd) continue;

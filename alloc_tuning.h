@@ -156,4 +156,49 @@ static inline void alloc_prefault(void *p, size_t bytes) {
 #endif
 }
 
+/*
+ * Same as alloc_prefault for memory that is known to be all zero (fresh calloc), with two
+ * differences that matter for small tables:
+ *
+ *  - no ALLOC_PREFAULT_MIN_BYTES floor: anything spanning at least one whole page is populated.
+ *    A hash table that doubles from 16 slots up to a megabyte passes through eight sizes under
+ *    the floor, and every one of them is fresh top-of-heap memory that glibc's calloc trusts
+ *    to be zero and does not touch. Reading a slot of such a page before writing it maps the
+ *    shared zero page, and the write is then a copy-on-write whose TLB flush IPIs every CPU
+ *    running the process. Multiply by thousands of tables and it was 3% of ereport's cycles
+ *    after the big tables had already been fixed.
+ *  - the no-madvise fallback stores 0 rather than storing back what it read: the read is what
+ *    maps the zero page in the first place, so the read-modify-write in alloc_prefault cannot
+ *    avoid the copy. A plain store can, and 0 is what the buffer holds.
+ */
+static inline void alloc_prefault_zeroed(void *p, size_t bytes) {
+#if defined(__linux__)
+    long pagesz;
+    uintptr_t start = (uintptr_t)p;
+    uintptr_t aligned, end;
+
+    if (!p) return;
+    pagesz = sysconf(_SC_PAGESIZE);
+    if (pagesz <= 0) pagesz = 4096;
+    aligned = (start + (uintptr_t)pagesz - 1u) & ~((uintptr_t)pagesz - 1u);
+    end = (start + bytes) & ~((uintptr_t)pagesz - 1u);
+    if (end <= aligned) return;
+
+#ifdef ALLOC_HAVE_MADVISE
+    if (madvise((void *)aligned, (size_t)(end - aligned), MADV_POPULATE_WRITE) == 0) return;
+#endif
+
+    {
+        volatile unsigned char *q = (volatile unsigned char *)aligned;
+        size_t span = (size_t)(end - aligned);
+        size_t off;
+
+        for (off = 0; off < span; off += (size_t)pagesz) q[off] = 0;
+    }
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
 #endif /* ALLOC_TUNING_H */
