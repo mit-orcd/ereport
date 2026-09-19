@@ -887,6 +887,9 @@ typedef struct {
     /* Crawl-wide: immediate children per parent dir (all matched types with paths). */
     dense_cell_map_t parent_fanout;
     fanout_parent_stat_map_t parent_fanout_stats;
+    /* Per-user sunburst maps owned by this worker, [path_count]; merged into
+     * g_sunburst_uid_acc after the join. NULL when per-user pages are off. */
+    struct sb_uid_set *sb_uid_local;
 } worker_arg_t;
 
 static atomic_ullong g_io_opendir_calls = 0;
@@ -8761,81 +8764,217 @@ static int catalog_entry_path_cached(const crawl_bin_catalog_t *cat, uint64_t pa
 /* Per-uid sunburst accumulation (aggregate mode). A uid's records all live in
  * one shard (shard = uid & (nshards-1)), so the per-uid accumulators hang off
  * the shard and per-shard uid lists stay tiny. Slots are registered lazily on
- * a uid's first credited record; the per-shard lock serializes registration
- * and the credit itself, which is cheap because flushes are per directory
- * run, not per record. */
+ * a uid's first credited record.
+ *
+ * Unlike the aggregate accumulator (one dense dir_id-indexed array per shard),
+ * each uid keeps a sparse open-addressing map of only the directories it has
+ * files in. Dense per-uid arrays cost 16 B x every directory in the shard for
+ * every uid regardless of whether the user owns three files or the whole
+ * volume, which forced a global cap and dropped picker pages past it. Summed
+ * over all users the sparse maps are on the order of the aggregate array
+ * itself, since a directory usually has one or two owners. The maps are
+ * expanded one uid at a time into a reusable dense scratch accumulator at
+ * build time (sunburst_uid_densify), so ereport_sunburst_build() is unchanged.
+ *
+ * Threading: every worker owns a private [path_count] array of these sets and
+ * credits into it with no locking; the arrays are merged into the global
+ * g_sunburst_uid_acc after the workers join (sunburst_uid_merge_into). The
+ * earlier design shared one set per shard behind a mutex taken once per
+ * directory run. The queue hands out consecutive chunks of the same shard to
+ * all workers at once, so that mutex was contended on nearly every take:
+ * perf showed 75% of all cycles in the kernel's futex spinlock
+ * (native_queued_spin_lock_slowpath under futex_wait/futex_wake from this
+ * lock), 5,400 s of system time on a 9-crawl report, 73 M context switches.
+ * Per-worker maps duplicate a (uid, dir) cell only where a directory run
+ * straddles a chunk boundary, so the merge is cheap and memory is unchanged. */
+typedef struct {
+    uint32_t dir_id; /* 0 = empty slot; catalog dir_ids fit 32 bits (see ereport_sunburst.c) */
+    uint32_t pad;
+    uint64_t bytes;
+    uint64_t files;
+} sb_uid_cell_t;
+
 typedef struct {
     uint32_t uid;
-    ereport_sunburst_accum_t acc;
+    sb_uid_cell_t *cells; /* power-of-two open addressing, linear probe */
+    size_t n, cap;
 } sb_uid_slot_t;
 
-typedef struct {
+typedef struct sb_uid_set {
     sb_uid_slot_t *v;
     size_t n, cap;
-    pthread_mutex_t lock;
 } sb_uid_set_t;
 
-static sb_uid_set_t *g_sunburst_uid_acc = NULL; /* [path_count] */
-static uint64_t g_sunburst_uid_alloc = 0;       /* bytes in per-uid accum arrays */
-static int g_sunburst_uid_capped = 0;           /* warn-once latch for the cap */
-/* Registration stops past this footprint (the uid's bytes still land in the
- * aggregate tree, it just gets no picker page). */
-#define SUNBURST_UID_ACCUM_CAP (4ULL << 30)
+static sb_uid_set_t *g_sunburst_uid_acc = NULL; /* [path_count], merged after the join */
 
-static void sunburst_uid_credit(uint64_t file_index, uint32_t uid, uint64_t dir_id,
-                                uint64_t bytes, uint64_t files) {
-    sb_uid_set_t *s = &g_sunburst_uid_acc[file_index];
-    ereport_sunburst_accum_t *a;
+static inline size_t sb_uid_hash(uint32_t dir_id, size_t mask) {
+    return (size_t)(((uint64_t)dir_id * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+}
+
+/* Find-or-insert the cell for dir_id. Returns NULL only on allocation failure
+ * (the credit is then dropped for this uid, matching the old behavior). */
+static sb_uid_cell_t *sb_uid_slot_cell(sb_uid_slot_t *u, uint32_t dir_id) {
+    size_t mask, h;
+
+    if (u->n * 10 >= u->cap * 7) { /* grow at 70% load */
+        size_t nc = u->cap ? u->cap * 2 : 16;
+        sb_uid_cell_t *nv = calloc(nc, sizeof(*nv));
+        size_t i, nmask = nc - 1;
+
+        if (!nv) return NULL;
+        for (i = 0; i < u->cap; i++) {
+            sb_uid_cell_t *c = &u->cells[i];
+            size_t j;
+
+            if (!c->dir_id) continue;
+            j = sb_uid_hash(c->dir_id, nmask);
+            while (nv[j].dir_id) j = (j + 1) & nmask;
+            nv[j] = *c;
+        }
+        free(u->cells);
+        u->cells = nv;
+        u->cap = nc;
+    }
+    mask = u->cap - 1;
+    h = sb_uid_hash(dir_id, mask);
+    for (;;) {
+        sb_uid_cell_t *c = &u->cells[h];
+
+        if (c->dir_id == dir_id) return c;
+        if (!c->dir_id) {
+            c->dir_id = dir_id;
+            u->n++;
+            return c;
+        }
+        h = (h + 1) & mask;
+    }
+}
+
+/* Find-or-register the slot for uid in a set. NULL on allocation failure. */
+static sb_uid_slot_t *sb_uid_set_slot(sb_uid_set_t *s, uint32_t uid) {
     size_t i;
 
-    pthread_mutex_lock(&s->lock);
     for (i = 0; i < s->n; i++) {
-        if (s->v[i].uid == uid) break;
+        if (s->v[i].uid == uid) return &s->v[i];
     }
-    if (i == s->n) {
-        uint64_t maxd = g_sunburst_acc[file_index].max_dir_id;
-        uint64_t need = 2 * (maxd + 1) * sizeof(uint64_t);
-        if (g_sunburst_uid_alloc + need > SUNBURST_UID_ACCUM_CAP) {
-            if (!g_sunburst_uid_capped) {
-                g_sunburst_uid_capped = 1;
-                fprintf(stderr, "warn: per-user sunburst accumulator cap (%llu GiB) reached; "
-                                "remaining users get no picker page\n",
-                        (unsigned long long)(SUNBURST_UID_ACCUM_CAP >> 30));
+    if (s->n == s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 4;
+        sb_uid_slot_t *nv = realloc(s->v, nc * sizeof(*nv));
+        if (!nv) return NULL;
+        s->v = nv;
+        s->cap = nc;
+    }
+    memset(&s->v[s->n], 0, sizeof(s->v[s->n]));
+    s->v[s->n].uid = uid;
+    return &s->v[s->n++];
+}
+
+/* Credit one directory run into the calling worker's private map. No locking:
+ * `sets` is the worker's own [path_count] array. */
+static void sunburst_uid_credit(sb_uid_set_t *sets, uint64_t file_index, uint32_t uid,
+                                uint64_t dir_id, uint64_t bytes, uint64_t files) {
+    sb_uid_slot_t *u;
+    sb_uid_cell_t *c;
+
+    if (dir_id > g_sunburst_acc[file_index].max_dir_id || dir_id > UINT32_MAX) return;
+    u = sb_uid_set_slot(&sets[file_index], uid);
+    if (!u) return;
+    c = sb_uid_slot_cell(u, (uint32_t)dir_id);
+    if (c) {
+        c->bytes += bytes;
+        c->files += files;
+    }
+}
+
+/* Merge one worker's set for a shard into the global set and release it. A
+ * uid the global set has not seen yet takes the worker's map wholesale (the
+ * common case: a uid's chunks mostly land on one worker); otherwise cells are
+ * summed in. Runs after the workers join, single-threaded. */
+static void sunburst_uid_merge_into(sb_uid_set_t *dst, sb_uid_set_t *src) {
+    size_t i, j;
+
+    for (i = 0; i < src->n; i++) {
+        sb_uid_slot_t *su = &src->v[i];
+        sb_uid_slot_t *du;
+
+        for (j = 0; j < dst->n; j++) {
+            if (dst->v[j].uid == su->uid) break;
+        }
+        if (j == dst->n) {
+            du = sb_uid_set_slot(dst, su->uid);
+            if (du) {
+                du->cells = su->cells;
+                du->n = su->n;
+                du->cap = su->cap;
+                su->cells = NULL;
+                continue;
             }
-            pthread_mutex_unlock(&s->lock);
-            return;
-        }
-        if (s->n == s->cap) {
-            size_t nc = s->cap ? s->cap * 2 : 4;
-            sb_uid_slot_t *nv = realloc(s->v, nc * sizeof(*nv));
-            if (!nv) {
-                pthread_mutex_unlock(&s->lock);
-                return;
+            /* registration failed: fall through and drop this uid's cells */
+        } else {
+            du = &dst->v[j];
+            for (size_t k = 0; k < su->cap; k++) {
+                const sb_uid_cell_t *sc = &su->cells[k];
+                sb_uid_cell_t *dc;
+
+                if (!sc->dir_id) continue;
+                dc = sb_uid_slot_cell(du, sc->dir_id);
+                if (!dc) break;
+                dc->bytes += sc->bytes;
+                dc->files += sc->files;
             }
-            s->v = nv;
-            s->cap = nc;
         }
-        if (ereport_sunburst_accum_init(&s->v[s->n].acc, maxd) != 0) {
-            pthread_mutex_unlock(&s->lock);
-            return;
+        free(su->cells);
+        su->cells = NULL;
+    }
+    free(src->v);
+    src->v = NULL;
+    src->n = src->cap = 0;
+}
+
+/* Expand one uid's sparse map into the dense scratch accumulator (which must be
+ * all-zero on entry). */
+static void sunburst_uid_densify(const sb_uid_slot_t *u, ereport_sunburst_accum_t *a) {
+    size_t i;
+
+    for (i = 0; i < u->cap; i++) {
+        const sb_uid_cell_t *c = &u->cells[i];
+
+        if (!c->dir_id || c->dir_id > a->max_dir_id) continue;
+        atomic_store_explicit(&a->bytes[c->dir_id], c->bytes, memory_order_relaxed);
+        atomic_store_explicit(&a->files[c->dir_id], c->files, memory_order_relaxed);
+    }
+}
+
+/* Return the scratch accumulator to all-zero after a build. The build's rollup
+ * (sb_prep_shard) adds each directory's totals into its parent, so the only
+ * non-zero slots afterwards are the uid's directories and their ancestors:
+ * walking each cell's parent chain clears exactly those, at O(touched x depth),
+ * instead of memset over the whole 16 B x dirs array per user. */
+static void sunburst_uid_scratch_clear(const sb_uid_slot_t *u, const crawl_bin_catalog_t *cat,
+                                       ereport_sunburst_accum_t *a) {
+    size_t i;
+
+    for (i = 0; i < u->cap; i++) {
+        uint64_t d = u->cells[i].dir_id;
+
+        while (d >= 1 && d <= a->max_dir_id) {
+            uint64_t p;
+
+            atomic_store_explicit(&a->bytes[d], 0, memory_order_relaxed);
+            atomic_store_explicit(&a->files[d], 0, memory_order_relaxed);
+            if (d == 1) break;
+            p = cat->parent_dir_id[d];
+            if (p == d) break; /* self-parent: shard top or corrupt link */
+            d = p;
         }
-        s->v[s->n].uid = uid;
-        s->n++;
-        g_sunburst_uid_alloc += need;
     }
-    a = &s->v[i].acc;
-    if (a->bytes && dir_id <= a->max_dir_id) {
-        if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
-        if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
-    }
-    pthread_mutex_unlock(&s->lock);
 }
 
 /* Sunburst accumulation. Records arrive in contiguous same-directory runs, so the worker
  * buffers the current run locally and flushes one relaxed atomic add per directory change
  * instead of one per record. */
 static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t bytes, uint64_t files,
-                               uint32_t uid) {
+                               uint32_t uid, sb_uid_set_t *uid_local) {
     ereport_sunburst_accum_t *a;
     if (!g_sunburst_acc || file_index == UINT64_MAX || dir_id == 0ULL || (bytes | files) == 0) return;
     a = &g_sunburst_acc[file_index];
@@ -8843,8 +8982,8 @@ static void sunburst_run_flush(uint64_t file_index, uint64_t dir_id, uint64_t by
         if (bytes) atomic_fetch_add_explicit(&a->bytes[dir_id], bytes, memory_order_relaxed);
         if (files) atomic_fetch_add_explicit(&a->files[dir_id], files, memory_order_relaxed);
     }
-    if (g_sunburst_uid_acc)
-        sunburst_uid_credit(file_index, uid, dir_id, bytes, files);
+    if (uid_local)
+        sunburst_uid_credit(uid_local, file_index, uid, dir_id, bytes, files);
 }
 
 static int read_one_chunk(const file_chunk_t *chunk,
@@ -8866,7 +9005,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
                           fanout_parent_stat_map_t *parent_fanout_stats,
                           parent_intern_t *pintern,
                           parent_intern_t *dense_pintern,
-                          ereport_run_stats_t *run_stats) {
+                          ereport_run_stats_t *run_stats,
+                          sb_uid_set_t *sb_uid_local) {
     FILE *fp = NULL;
     int rc = -1;
     /* Reused across every record in this chunk to avoid per-record malloc/free
@@ -9264,7 +9404,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
                 sb_bytes += accounted_size;
                 sb_files += (r.type == 'f');
             } else {
-                sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid);
+                sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid, sb_uid_local);
                 sb_fi = (uint64_t)chunk->file_index;
                 sb_dir = r.parent_dir_id;
                 sb_bytes = accounted_size;
@@ -9292,7 +9432,7 @@ static int read_one_chunk(const file_chunk_t *chunk,
                                               r.type, rec_time, sum, shp, shp_h);
         }
     }
-    sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid);
+    sunburst_run_flush(sb_fi, sb_dir, sb_bytes, sb_files, sb_uid, sb_uid_local);
 #undef PARENT_KEY
 
 out:
@@ -9341,7 +9481,8 @@ static void *worker_main(void *arg_void) {
                        &arg->parent_fanout_stats,
                        &pintern,
                        &dense_pintern,
-                       arg->run_stats);
+                       arg->run_stats,
+                       arg->sb_uid_local);
     }
 
     pintern_free(&pintern);
@@ -9703,6 +9844,44 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     crawl_bin_block_reader_free(&br);
     free(pathbuf_store);
     counted_fclose(fp);
+}
+
+/* Memory budget for the bucket pass's per-thread matrix replicas. The replicas
+ * exist because the shared-cell atomics were ~93% of the pass (lock-add lines
+ * bouncing between cores), so falling back to them is a large slowdown, not a
+ * graceful degradation: with 32 threads a fixed 256 MiB cap disabled the
+ * replicas past ~14.5K tree nodes -- any --sunburst-depth 8 report -- and the
+ * pass then cost 10x the whole first scan (perf: 84% of user cycles, the hot
+ * block sitting on a lock addq). Their real need is bounded anyway: the node
+ * budget is 64K, so 36 cells x 2 x 8 B x 64K = 37 MiB per thread. Budget a
+ * quarter of MemAvailable, floor 256 MiB (the old cap), ceiling 64 GiB. */
+static uint64_t sb_replica_budget_bytes(void) {
+    const uint64_t floor_b = 256ULL << 20, ceil_b = 64ULL << 30;
+    uint64_t avail = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+
+    if (f) {
+        char line[256];
+        unsigned long long kb;
+
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+                avail = (uint64_t)kb << 10;
+                break;
+            }
+        }
+        fclose(f);
+    }
+    if (!avail) { /* no /proc (macOS): half of physical memory as the stand-in */
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+
+        if (pages > 0 && psz > 0) avail = (uint64_t)pages * (uint64_t)psz / 2;
+    }
+    if (!avail) return floor_b;
+    avail /= 4;
+    if (avail < floor_b) return floor_b;
+    if (avail > ceil_b) return ceil_b;
+    return avail;
 }
 
 static void *bucket_worker_main(void *arg_void) {
@@ -12497,18 +12676,13 @@ chunks_ready:
             fprintf(stderr, "warn: sunburst accumulator allocation failed; sunburst view disabled\n");
     }
 
-    /* Per-user sunburst: one uid set per shard, slots registered lazily as the
-     * scan credits records. Aggregate mode only. */
+    /* Per-user sunburst: one uid set per shard, filled by merging the workers'
+     * private sets after the join (the per-worker arrays are allocated with
+     * the worker args below). Aggregate mode only. */
     if (g_sunburst_acc && all_users_mode && g_sunburst_users) {
-        size_t fi;
-
         g_sunburst_uid_acc = calloc(path_count, sizeof(*g_sunburst_uid_acc));
-        if (g_sunburst_uid_acc) {
-            for (fi = 0; fi < path_count; fi++)
-                pthread_mutex_init(&g_sunburst_uid_acc[fi].lock, NULL);
-        } else {
+        if (!g_sunburst_uid_acc)
             fprintf(stderr, "warn: per-user sunburst allocation failed; user picker disabled\n");
-        }
     }
 
     /*
@@ -12616,10 +12790,24 @@ chunks_ready:
         return 1;
     }
 
+    /* Per-worker per-user sunburst maps: one [path_count] set array per
+     * worker in a single block (threads x shards x 24 B, empty sets). Losing
+     * this allocation only costs the picker pages. */
+    sb_uid_set_t *sb_uid_locals = NULL;
+    if (g_sunburst_uid_acc) {
+        sb_uid_locals = calloc((size_t)threads * path_count, sizeof(*sb_uid_locals));
+        if (!sb_uid_locals) {
+            fprintf(stderr, "warn: per-user sunburst worker maps allocation failed; user picker disabled\n");
+            free(g_sunburst_uid_acc);
+            g_sunburst_uid_acc = NULL;
+        }
+    }
+
     for (i = 0; i < threads; i++) {
         memset(&args[i], 0, sizeof(args[i]));
         args[i].queue = &queue;
         args[i].file_states = file_states;
+        if (sb_uid_locals) args[i].sb_uid_local = sb_uid_locals + (size_t)i * path_count;
         args[i].target_uid = target_uid;
         args[i].all_users = all_users_mode;
         args[i].bucket_detail_levels = bucket_detail_levels;
@@ -12712,6 +12900,28 @@ chunks_ready:
         for (i = 0; i < threads_used; i++) pthread_join(tids[i], NULL);
         if (g_ereport_verbose && vt_parse0 > 0.0) run_stats.vt_parse_workers_sec += now_sec() - vt_parse0;
 
+        /* Per-user sunburst: fold the workers' private maps into the global
+         * sets. Mostly pointer steals (a uid's chunks land on few workers);
+         * cells are summed only where a directory run crossed a chunk boundary. */
+        if (sb_uid_locals) {
+            double vt_m0 = g_ereport_verbose ? now_sec() : 0.0;
+            size_t fi;
+
+            for (i = 0; i < threads_used; i++) {
+                sb_uid_set_t *mine = sb_uid_locals + (size_t)i * path_count;
+
+                for (fi = 0; fi < path_count; fi++) {
+                    if (mine[fi].n) sunburst_uid_merge_into(&g_sunburst_uid_acc[fi], &mine[fi]);
+                }
+            }
+            /* threads that never started still hold empty sets; nothing to free per set */
+            free(sb_uid_locals);
+            sb_uid_locals = NULL;
+            for (i = 0; i < threads; i++) args[i].sb_uid_local = NULL;
+            if (g_ereport_verbose && vt_m0 > 0.0)
+                fprintf(stderr, "ereport: per-user sunburst map merge %.2fs\n", now_sec() - vt_m0);
+        }
+
         if (getenv("EREPORT_MEMSTATS")) {
             clear_status_line();
             ereport_print_memstats(args, threads_used, &seen_inodes, file_states, path_count);
@@ -12743,8 +12953,9 @@ chunks_ready:
          * shard, so each tree builds from that shard's catalog and the uid's
          * own accumulator (n=1: no cross-shard merge). Runs here for the same
          * reason as the aggregate build: workers have joined and the catalogs
-         * are still attached. The build's rollup mutates only the uid's own
-         * accumulator. */
+         * are still attached. Each uid's sparse map is expanded into one dense
+         * scratch accumulator per shard (the build's rollup mutates it in
+         * place), which is cleared again before the next uid. */
         if (g_sunburst_uid_acc) {
             double vt_u0 = g_ereport_verbose ? now_sec() : 0.0;
             size_t fi, ui, ucap = 0;
@@ -12752,16 +12963,26 @@ chunks_ready:
             for (fi = 0; fi < path_count; fi++) {
                 sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
                 crawl_bin_catalog_t *cat = file_states[fi].catalog;
-                for (ui = 0; ui < s->n; ui++) {
-                    ereport_sunburst_tree_t *ut = NULL;
-                    if (cat) {
-                        crawl_bin_catalog_t *cats1[1];
+                ereport_sunburst_accum_t scratch;
+                int have_scratch = 0;
 
-                        cats1[0] = cat;
-                        ut = ereport_sunburst_build(cats1, &s->v[ui].acc, 1, g_sunburst_depth, 1,
-                                                    g_rewrite_from, g_rewrite_to,
-                                                    g_sunburst_buckets);
-                    }
+                if (cat && s->n > 0) {
+                    if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
+                        have_scratch = 1;
+                    else
+                        fprintf(stderr, "warn: per-user sunburst scratch allocation failed for shard %zu; "
+                                        "its users get no picker page\n", fi);
+                }
+                for (ui = 0; have_scratch && ui < s->n; ui++) {
+                    ereport_sunburst_tree_t *ut;
+                    crawl_bin_catalog_t *cats1[1];
+
+                    cats1[0] = cat;
+                    sunburst_uid_densify(&s->v[ui], &scratch);
+                    ut = ereport_sunburst_build(cats1, &scratch, 1, g_sunburst_depth, 1,
+                                                g_rewrite_from, g_rewrite_to,
+                                                g_sunburst_buckets);
+                    sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
                     if (!ut) {
                         fprintf(stderr, "warn: per-user sunburst build failed for uid %u\n",
                                 (unsigned)s->v[ui].uid);
@@ -12788,9 +13009,9 @@ chunks_ready:
                     g_sb_user_trees[g_sb_user_trees_n].tree = ut;
                     g_sb_user_trees_n++;
                 }
-                for (ui = 0; ui < s->n; ui++) ereport_sunburst_accum_free(&s->v[ui].acc);
+                if (have_scratch) ereport_sunburst_accum_free(&scratch);
+                for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
                 free(s->v);
-                pthread_mutex_destroy(&s->lock);
             }
             free(g_sunburst_uid_acc);
             g_sunburst_uid_acc = NULL;
@@ -12835,13 +13056,18 @@ chunks_ready:
                 int bstarted = 0;
                 unsigned long bad = 0, missing = 0;
                 /* Per-worker matrix replicas: threads * nodes * 36 cells * 2
-                 * arrays. Capped at 256 MiB; beyond that (trees near the 64K
-                 * node budget with many threads) the workers share the tree's
-                 * atomic cells directly. */
+                 * arrays, within sb_replica_budget_bytes(). The aggregate
+                 * replicas are allocated first (every record credits that
+                 * matrix, so it always contends); the per-uid replicas get
+                 * the remainder. Past the budget the workers share the
+                 * tree's atomic cells directly, which is much slower -- say
+                 * so, since nothing else makes that visible. */
+                const uint64_t rep_budget = sb_replica_budget_bytes();
+                uint64_t rep_used = 0;
                 const size_t bcells = ereport_sunburst_tree_nodes(g_sunburst_tree) * 36;
+                const uint64_t rep_need = (uint64_t)threads_used * bcells * 2 * sizeof(uint64_t);
                 uint64_t *rep_b = NULL, *rep_f = NULL;
-                if (bcells > 0 &&
-                    (uint64_t)threads_used * bcells * 2 * sizeof(uint64_t) <= (256ULL << 20)) {
+                if (bcells > 0 && rep_need <= rep_budget) {
                     rep_b = (uint64_t *)calloc((size_t)threads_used * bcells, sizeof(*rep_b));
                     rep_f = (uint64_t *)calloc((size_t)threads_used * bcells, sizeof(*rep_f));
                     if (!rep_b || !rep_f) {
@@ -12850,13 +13076,18 @@ chunks_ready:
                         rep_b = rep_f = NULL;
                     }
                 }
+                if (bcells > 0 && !rep_b)
+                    fprintf(stderr, "warn: bucket pass: aggregate matrix replicas need %llu MiB "
+                                    "(budget %llu MiB); using shared atomics, pass will be slow\n",
+                            (unsigned long long)(rep_need >> 20), (unsigned long long)(rep_budget >> 20));
+                else if (rep_b)
+                    rep_used = rep_need;
 
                 /* Per-worker replicas for the per-uid matrices: one current
                  * uid's matrix per worker, sized by the largest user tree,
-                 * plus the dirty-node stack/flags (one byte each). Same
-                 * 256 MiB cap as the aggregate replicas; past it the workers
-                 * credit the shared per-uid matrices directly. */
+                 * plus the dirty-node stack/flags (one byte each). */
                 size_t ucells_max = 0, unodes_max = 0;
+                uint64_t u_rep_need = 0;
                 uint64_t *u_rep_b = NULL, *u_rep_f = NULL;
                 uint32_t *u_dirty = NULL;
                 unsigned char *u_dflag = NULL;
@@ -12867,10 +13098,10 @@ chunks_ready:
                         if (nn > unodes_max) unodes_max = nn;
                     }
                     ucells_max = unodes_max * 36;
+                    u_rep_need = (uint64_t)threads_used * (ucells_max * 2 * sizeof(uint64_t) +
+                                                           unodes_max * (sizeof(uint32_t) + 1));
                 }
-                if (ucells_max > 0 &&
-                    (uint64_t)threads_used * (ucells_max * 2 * sizeof(uint64_t) +
-                     unodes_max * (sizeof(uint32_t) + 1)) <= (256ULL << 20)) {
+                if (ucells_max > 0 && rep_used + u_rep_need <= rep_budget) {
                     u_rep_b = (uint64_t *)calloc((size_t)threads_used * ucells_max, sizeof(*u_rep_b));
                     u_rep_f = (uint64_t *)calloc((size_t)threads_used * ucells_max, sizeof(*u_rep_f));
                     u_dirty = (uint32_t *)malloc((size_t)threads_used * unodes_max * sizeof(*u_dirty));
@@ -12885,6 +13116,11 @@ chunks_ready:
                         u_dflag = NULL;
                     }
                 }
+                if (ucells_max > 0 && !u_rep_b)
+                    fprintf(stderr, "warn: bucket pass: per-user matrix replicas need %llu MiB "
+                                    "(budget %llu MiB, %llu MiB used); using shared atomics, pass will be slow\n",
+                            (unsigned long long)(u_rep_need >> 20), (unsigned long long)(rep_budget >> 20),
+                            (unsigned long long)(rep_used >> 20));
 
                 queue.next_index = 0; /* workers all joined; hand every chunk out again */
                 for (i = 0; i < threads_used; i++) {
