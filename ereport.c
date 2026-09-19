@@ -8811,39 +8811,51 @@ static inline size_t sb_uid_hash(uint32_t dir_id, size_t mask) {
     return (size_t)(((uint64_t)dir_id * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
 }
 
+/* Grow the table until it can hold `want` cells under 70% load. Returns -1 on
+ * allocation failure with the table unchanged. Called per insert by
+ * sb_uid_slot_cell (doubling) and once up front by the merge, which knows how
+ * many cells it is about to add and would otherwise rehash through every
+ * doubling on the way there. */
+static int sb_uid_slot_reserve(sb_uid_slot_t *u, size_t want) {
+    size_t nc, i, nmask;
+    sb_uid_cell_t *nv;
+
+    if (want * 10 < u->cap * 7) return 0;
+    nc = u->cap ? u->cap : 16;
+    while (want * 10 >= nc * 7) nc *= 2;
+    nv = calloc(nc, sizeof(*nv));
+    nmask = nc - 1;
+    if (!nv) return -1;
+    /* Populate the table's pages now (MADV_POPULATE_WRITE) instead of letting
+     * them fault in as the probe reads them: a read fault on an untouched
+     * mmap'd page maps the shared zero page, so the insert's write becomes a
+     * copy-on-write that IPIs every CPU running one of the 32 scan threads to
+     * flush its TLB. perf put that (wp_page_copy -> flush_tlb_mm_range ->
+     * smp_call_function_many_cond) at ~5% of all cycles, charged largely to
+     * the interrupted workers. Note that malloc + memset(0) is NOT a fix:
+     * gcc -O2 folds the pair straight back into calloc. */
+    alloc_prefault(nv, nc * sizeof(*nv));
+    for (i = 0; i < u->cap; i++) {
+        sb_uid_cell_t *c = &u->cells[i];
+        size_t j;
+
+        if (!c->dir_id) continue;
+        j = sb_uid_hash(c->dir_id, nmask);
+        while (nv[j].dir_id) j = (j + 1) & nmask;
+        nv[j] = *c;
+    }
+    free(u->cells);
+    u->cells = nv;
+    u->cap = nc;
+    return 0;
+}
+
 /* Find-or-insert the cell for dir_id. Returns NULL only on allocation failure
  * (the credit is then dropped for this uid, matching the old behavior). */
 static sb_uid_cell_t *sb_uid_slot_cell(sb_uid_slot_t *u, uint32_t dir_id) {
     size_t mask, h;
 
-    if (u->n * 10 >= u->cap * 7) { /* grow at 70% load */
-        size_t nc = u->cap ? u->cap * 2 : 16;
-        sb_uid_cell_t *nv = malloc(nc * sizeof(*nv));
-        size_t i, nmask = nc - 1;
-
-        if (!nv) return NULL;
-        /* Write-touch every page now instead of calloc's lazy zero mapping:
-         * the probe below reads a slot before the insert writes it, and a read
-         * fault on an untouched mmap'd page maps the shared zero page, so the
-         * following write is a copy-on-write that IPIs every CPU running one
-         * of the 32 scan threads to flush its TLB. perf put that
-         * (wp_page_copy -> flush_tlb_mm_range -> smp_call_function_many_cond)
-         * at ~5% of all cycles, charged largely to the interrupted workers.
-         * A write-first touch allocates the private page directly. */
-        memset(nv, 0, nc * sizeof(*nv));
-        for (i = 0; i < u->cap; i++) {
-            sb_uid_cell_t *c = &u->cells[i];
-            size_t j;
-
-            if (!c->dir_id) continue;
-            j = sb_uid_hash(c->dir_id, nmask);
-            while (nv[j].dir_id) j = (j + 1) & nmask;
-            nv[j] = *c;
-        }
-        free(u->cells);
-        u->cells = nv;
-        u->cap = nc;
-    }
+    if (sb_uid_slot_reserve(u, u->n + 1) != 0) return NULL;
     mask = u->cap - 1;
     h = sb_uid_hash(dir_id, mask);
     for (;;) {
@@ -8895,10 +8907,36 @@ static void sunburst_uid_credit(sb_uid_set_t *sets, uint64_t file_index, uint32_
     }
 }
 
+/* Add every cell of `src` (a table being retired) into `du`. Sized once up
+ * front so the inserts never rehash. Stops early (dropping the remainder, as
+ * the scan-time path does) only on allocation failure. */
+static void sb_uid_slot_absorb(sb_uid_slot_t *du, const sb_uid_slot_t *src) {
+    size_t k;
+
+    if (sb_uid_slot_reserve(du, du->n + src->n) != 0) return;
+    for (k = 0; k < src->cap; k++) {
+        const sb_uid_cell_t *sc = &src->cells[k];
+        sb_uid_cell_t *dc;
+
+        if (!sc->dir_id) continue;
+        dc = sb_uid_slot_cell(du, sc->dir_id);
+        if (!dc) return;
+        dc->bytes += sc->bytes;
+        dc->files += sc->files;
+    }
+}
+
 /* Merge one worker's set for a shard into the global set and release it. A
- * uid the global set has not seen yet takes the worker's map wholesale (the
- * common case: a uid's chunks mostly land on one worker); otherwise cells are
- * summed in. Runs after the workers join, single-threaded. */
+ * uid the global set has not seen yet takes the worker's map wholesale; when
+ * both have one, the larger table stays and the smaller is re-inserted into
+ * it (swapping first if the worker's is larger), so the cells that move are
+ * always the minority.
+ *
+ * The steal is not the common case on the shards that matter: chunks are
+ * handed to whichever worker is free next, so a big user's runs land on all
+ * 32 workers and 31 tables get summed. Serial on the main thread that was
+ * 17 s of a 73 s wall (before: every re-insert also rehashed through each
+ * doubling). Now it runs per shard from sunburst_uid_merge_worker. */
 static void sunburst_uid_merge_into(sb_uid_set_t *dst, sb_uid_set_t *src) {
     size_t i, j;
 
@@ -8921,16 +8959,17 @@ static void sunburst_uid_merge_into(sb_uid_set_t *dst, sb_uid_set_t *src) {
             /* registration failed: fall through and drop this uid's cells */
         } else {
             du = &dst->v[j];
-            for (size_t k = 0; k < su->cap; k++) {
-                const sb_uid_cell_t *sc = &su->cells[k];
-                sb_uid_cell_t *dc;
+            if (su->n > du->n) { /* keep the bigger table, re-insert the smaller */
+                sb_uid_slot_t tmp = *du;
 
-                if (!sc->dir_id) continue;
-                dc = sb_uid_slot_cell(du, sc->dir_id);
-                if (!dc) break;
-                dc->bytes += sc->bytes;
-                dc->files += sc->files;
+                du->cells = su->cells;
+                du->n = su->n;
+                du->cap = su->cap;
+                su->cells = tmp.cells;
+                su->n = tmp.n;
+                su->cap = tmp.cap;
             }
+            sb_uid_slot_absorb(du, su);
         }
         free(su->cells);
         su->cells = NULL;
@@ -8938,6 +8977,34 @@ static void sunburst_uid_merge_into(sb_uid_set_t *dst, sb_uid_set_t *src) {
     free(src->v);
     src->v = NULL;
     src->n = src->cap = 0;
+}
+
+/* Merge pool: work unit = one shard. Shard fi's merge touches only
+ * g_sunburst_uid_acc[fi] and every worker's locals[w][fi], so shards are
+ * independent and need no locking. */
+typedef struct {
+    sb_uid_set_t *dst;    /* g_sunburst_uid_acc, [path_count] */
+    sb_uid_set_t *locals; /* [nworkers][path_count] */
+    size_t nworkers;
+    size_t path_count;
+    _Atomic size_t next;
+} sb_uid_merge_pool_t;
+
+static void *sunburst_uid_merge_worker(void *arg) {
+    sb_uid_merge_pool_t *p = (sb_uid_merge_pool_t *)arg;
+
+    for (;;) {
+        size_t fi = atomic_fetch_add(&p->next, 1);
+        size_t w;
+
+        if (fi >= p->path_count) break;
+        for (w = 0; w < p->nworkers; w++) {
+            sb_uid_set_t *mine = &p->locals[w * p->path_count + fi];
+
+            if (mine->n) sunburst_uid_merge_into(&p->dst[fi], mine);
+        }
+    }
+    return NULL;
 }
 
 /* Per-user tree build pool. Work unit = one shard: the thread that claims it
@@ -13024,25 +13091,32 @@ chunks_ready:
         if (g_ereport_verbose && vt_parse0 > 0.0) run_stats.vt_parse_workers_sec += now_sec() - vt_parse0;
 
         /* Per-user sunburst: fold the workers' private maps into the global
-         * sets. Mostly pointer steals (a uid's chunks land on few workers);
-         * cells are summed only where a directory run crossed a chunk boundary. */
+         * sets, one shard per work unit across the scan threads' worth of
+         * merge threads (see sunburst_uid_merge_worker). */
         if (sb_uid_locals) {
             double vt_m0 = g_ereport_verbose ? now_sec() : 0.0;
-            size_t fi;
+            sb_uid_merge_pool_t mp;
+            size_t nm = (size_t)threads_used < path_count ? (size_t)threads_used : path_count;
+            size_t started = 0, k;
 
-            for (i = 0; i < threads_used; i++) {
-                sb_uid_set_t *mine = sb_uid_locals + (size_t)i * path_count;
-
-                for (fi = 0; fi < path_count; fi++) {
-                    if (mine[fi].n) sunburst_uid_merge_into(&g_sunburst_uid_acc[fi], &mine[fi]);
-                }
+            mp.dst = g_sunburst_uid_acc;
+            mp.locals = sb_uid_locals;
+            mp.nworkers = (size_t)threads_used;
+            mp.path_count = path_count;
+            atomic_init(&mp.next, 0);
+            for (k = 1; k < nm; k++) { /* the main thread is merge thread 0 */
+                if (pthread_create(&tids[k], NULL, sunburst_uid_merge_worker, &mp) != 0) break;
+                started++;
             }
+            sunburst_uid_merge_worker(&mp);
+            for (k = 1; k <= started; k++) pthread_join(tids[k], NULL);
             /* threads that never started still hold empty sets; nothing to free per set */
             free(sb_uid_locals);
             sb_uid_locals = NULL;
             for (i = 0; i < threads; i++) args[i].sb_uid_local = NULL;
             if (g_ereport_verbose && vt_m0 > 0.0)
-                fprintf(stderr, "ereport: per-user sunburst map merge %.2fs\n", now_sec() - vt_m0);
+                fprintf(stderr, "ereport: per-user sunburst map merge %.2fs (%zu thread(s))\n",
+                        now_sec() - vt_m0, started + 1);
         }
 
         if (getenv("EREPORT_MEMSTATS")) {

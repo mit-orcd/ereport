@@ -164,7 +164,7 @@ trigram_extract.o: trigram_extract.c trigram_extract.h
 	$(CC) $(CFLAGS) -c trigram_extract.c -o trigram_extract.o
 
 # Sunburst aggregation + JSON/HTML emitters for ereport.
-ereport_sunburst.o: ereport_sunburst.c ereport_sunburst.h crawl_bin_catalog.h
+ereport_sunburst.o: ereport_sunburst.c ereport_sunburst.h alloc_tuning.h crawl_bin_catalog.h
 	$(CC) $(CFLAGS) -c ereport_sunburst.c -o ereport_sunburst.o
 
 test_crawl_codec: test_crawl_codec.c crawl_bin_codec.o
