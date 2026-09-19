@@ -8664,6 +8664,42 @@ fail:
     return -1;
 }
 
+/* Catalog attach pool: work unit = one shard (attach its catalog, then init
+ * its sunburst accumulator when `acc` is set). Shards touch disjoint state. */
+typedef struct {
+    file_state_t *file_states;
+    char **paths;
+    size_t path_count;
+    ereport_sunburst_accum_t *acc; /* [path_count] or NULL */
+    _Atomic size_t next;
+    _Atomic size_t attach_failed; /* count */
+    _Atomic size_t acc_failed;    /* count */
+    _Atomic size_t first_failed;  /* lowest-seen failing shard index, for the message */
+} shard_attach_pool_t;
+
+static void *shard_attach_worker(void *arg) {
+    shard_attach_pool_t *p = arg;
+
+    for (;;) {
+        size_t fi = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        file_state_t *fs;
+
+        if (fi >= p->path_count) return NULL;
+        fs = &p->file_states[fi];
+        if (atomic_load(&fs->remaining_chunks) == 0U) continue;
+        if (ereport_attach_shard_catalog(fs, p->paths[fi]) != 0) {
+            size_t cur = atomic_load(&p->first_failed);
+
+            while (fi < cur && !atomic_compare_exchange_weak(&p->first_failed, &cur, fi)) {
+            }
+            atomic_fetch_add(&p->attach_failed, 1);
+            continue;
+        }
+        if (p->acc && ereport_sunburst_accum_init(&p->acc[fi], fs->catalog->max_dir_id) != 0)
+            atomic_fetch_add(&p->acc_failed, 1);
+    }
+}
+
 /*
  * One bit per dir_id, set when that directory is at or under any of `roots`.
  *
@@ -9008,23 +9044,48 @@ static void *sunburst_uid_merge_worker(void *arg) {
     return NULL;
 }
 
-/* Per-user tree build pool. Work unit = one shard: the thread that claims it
- * sets up the shard's workspace (child index, shared by every build on that
- * catalog) and one dense scratch accumulator, builds each of the shard's
- * uids, and writes the trees into the shard's slice of `out` (slices are laid
- * out by the prefix sums in `off`, so no two threads write the same range and
- * the final list order -- shard, then uid registration -- is the same as the
- * old sequential loop's). Earlier this loop ran on the main thread alone with
- * a fresh child index + dir-node map allocated and freed per uid: on a
- * 7,660-user report that was ~140 s of a 166 s wall, most of it page faults
- * and TLB shootdowns from the churn, while 31 cores sat idle. */
+/* Per-user tree build pool. Work unit = (shard, range of that shard's uids).
+ *
+ * A whole shard was the unit at first: the thread that claimed it built the
+ * shard's workspace (child index) and one dense scratch accumulator and ran
+ * every uid through them. That fixed the serial version (~140 s of a 166 s
+ * wall on a 7,660-user report, page faults and TLB shootdowns from a fresh
+ * index per uid), but left a tail: every build costs an O(catalog dirs)
+ * rollup, so one shard with a 10M-directory catalog and a hundred users ran
+ * alone for ~8 s while 31 threads idled (timeline: 20 CPUs busy falling to 1).
+ *
+ * Now sb_user_build_plan() splits each shard's uids into parts in proportion
+ * to its cost (uids x dirs), biggest shards first, capped by the thread count
+ * and by how many 16-byte-per-dir scratches fit the memory budget. Units of a
+ * shard share one read-only workspace: the first thread to arrive builds it
+ * (ws_state 0 -> 1 -> 2, or 3 if the allocation failed and builds go without),
+ * later arrivals spin-wait the few tens of ms that takes. Each unit owns its
+ * scratch. The last unit to finish (units_left hits 0) frees the workspace and
+ * the shard's sparse maps.
+ *
+ * Output: one slot per registered uid at out[off[fi] + ui], tree NULL where
+ * the uid produced nothing; main compacts, keeping shard order then uid
+ * registration order (the sequential loop's order). */
+typedef struct {
+    size_t fi;
+    size_t ui_begin, ui_end;
+} sb_user_build_unit_t;
+
+typedef struct {
+    ereport_sunburst_ws_t ws;
+    _Atomic int ws_state;      /* 0 unbuilt, 1 building, 2 ready, 3 unavailable */
+    _Atomic size_t units_left; /* units of this shard not yet finished */
+} sb_user_build_shard_t;
+
 typedef struct {
     sb_uid_set_t *sets; /* g_sunburst_uid_acc, consumed (cells freed) as shards complete */
     file_state_t *file_states;
     size_t path_count;
-    sb_user_tree_t *out;    /* [sum of sets[fi].n] */
+    sb_user_tree_t *out;    /* [sum of sets[fi].n] slot per uid */
     const size_t *off;      /* [path_count + 1] slice starts */
-    size_t *n_out;          /* [path_count] trees produced per shard */
+    sb_user_build_unit_t *units;
+    size_t n_units;
+    sb_user_build_shard_t *shards; /* [path_count] */
     _Atomic size_t next;
     _Atomic unsigned long build_failed;
     _Atomic unsigned long scratch_failed;
@@ -9033,33 +9094,137 @@ typedef struct {
 static void sunburst_uid_densify(const sb_uid_slot_t *u, ereport_sunburst_accum_t *a);
 static void sunburst_uid_scratch_clear(const sb_uid_slot_t *u, const crawl_bin_catalog_t *cat,
                                        ereport_sunburst_accum_t *a);
+static uint64_t sb_replica_budget_bytes(void);
+
+typedef struct {
+    size_t fi;
+    uint64_t cost;
+} sb_shard_cost_t;
+
+static int sb_shard_cost_desc(const void *a, const void *b) {
+    const sb_shard_cost_t *x = a, *y = b;
+
+    if (x->cost != y->cost) return x->cost > y->cost ? -1 : 1;
+    return x->fi < y->fi ? -1 : (x->fi > y->fi);
+}
+
+/* Lay out the work units. Returns the unit count (0 = nothing to build), or
+ * (size_t)-1 on allocation failure. *units_out is malloc'd. */
+static size_t sb_user_build_plan(const sb_uid_set_t *sets, const file_state_t *file_states,
+                                 size_t path_count, int nthreads, sb_user_build_unit_t **units_out) {
+    sb_shard_cost_t *costs;
+    sb_user_build_unit_t *units;
+    size_t fi, n_costs = 0, n_units = 0, cap_units = 0;
+    uint64_t total = 0, target;
+    uint64_t budget = sb_replica_budget_bytes();
+
+    *units_out = NULL;
+    if (nthreads < 1) nthreads = 1;
+    costs = malloc((path_count ? path_count : 1) * sizeof(*costs));
+    if (!costs) return (size_t)-1;
+    for (fi = 0; fi < path_count; fi++) {
+        const crawl_bin_catalog_t *cat = file_states[fi].catalog;
+
+        if (!cat || sets[fi].n == 0) continue;
+        costs[n_costs].fi = fi;
+        costs[n_costs].cost = (uint64_t)sets[fi].n * ((uint64_t)cat->max_dir_id + 1u);
+        total += costs[n_costs].cost;
+        n_costs++;
+    }
+    if (n_costs == 0) {
+        free(costs);
+        return 0;
+    }
+    qsort(costs, n_costs, sizeof(*costs), sb_shard_cost_desc);
+    /* ~4 units per thread overall keeps the tail short without making the
+     * per-unit scratch setup (a populated 16 B x dirs calloc) significant. */
+    target = total / ((uint64_t)nthreads * 4u);
+    if (target == 0) target = 1;
+
+    for (fi = 0; fi < n_costs; fi++) {
+        const sb_uid_set_t *s = &sets[costs[fi].fi];
+        uint64_t nd = (uint64_t)file_states[costs[fi].fi].catalog->max_dir_id + 1u;
+        uint64_t parts = (costs[fi].cost + target - 1) / target;
+        uint64_t mem_parts = budget / (nd * 16u);
+        size_t per, k;
+
+        if (mem_parts < 1) mem_parts = 1;
+        if (parts > (uint64_t)nthreads) parts = (uint64_t)nthreads;
+        if (parts > mem_parts) parts = mem_parts;
+        if (parts > s->n) parts = s->n;
+        if (parts < 1) parts = 1;
+        per = (s->n + (size_t)parts - 1) / (size_t)parts;
+        for (k = 0; k < s->n; k += per) {
+            if (n_units == cap_units) {
+                size_t nc = cap_units ? cap_units * 2 : 64;
+                sb_user_build_unit_t *nu = realloc(*units_out, nc * sizeof(*nu));
+
+                if (!nu) {
+                    free(*units_out);
+                    *units_out = NULL;
+                    free(costs);
+                    return (size_t)-1;
+                }
+                *units_out = nu;
+                cap_units = nc;
+            }
+            units = *units_out;
+            units[n_units].fi = costs[fi].fi;
+            units[n_units].ui_begin = k;
+            units[n_units].ui_end = k + per < s->n ? k + per : s->n;
+            n_units++;
+        }
+    }
+    free(costs);
+    return n_units;
+}
 
 static void *sb_user_build_worker(void *arg) {
     sb_user_build_pool_t *p = arg;
 
     for (;;) {
-        size_t fi = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        size_t u = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        const sb_user_build_unit_t *unit;
         sb_uid_set_t *s;
+        sb_user_build_shard_t *sh;
         crawl_bin_catalog_t *cat;
         ereport_sunburst_accum_t scratch;
-        ereport_sunburst_ws_t ws;
         const ereport_sunburst_ws_t *wsp = NULL;
-        int have_scratch = 0;
-        size_t ui;
+        int have_scratch = 0, st;
+        size_t fi, ui;
 
-        if (fi >= p->path_count) return NULL;
+        if (u >= p->n_units) return NULL;
+        unit = &p->units[u];
+        fi = unit->fi;
         s = &p->sets[fi];
+        sh = &p->shards[fi];
         cat = p->file_states[fi].catalog;
-        if (cat && s->n > 0) {
-            if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
-                have_scratch = 1;
-            else
-                atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
-            /* A workspace failure only costs speed: the build allocates its own index. */
-            if (have_scratch && ereport_sunburst_ws_init(&ws, cat) == 0) wsp = &ws;
+
+        if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
+            have_scratch = 1;
+        else
+            atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
+
+        /* Shared workspace: first arrival builds it, the rest wait for it. A
+         * workspace failure only costs speed: the build allocates its own index. */
+        if (have_scratch) {
+            st = 0;
+            if (atomic_compare_exchange_strong(&sh->ws_state, &st, 1)) {
+                st = ereport_sunburst_ws_init(&sh->ws, cat) == 0 ? 2 : 3;
+                atomic_store(&sh->ws_state, st);
+            } else {
+                while ((st = atomic_load(&sh->ws_state)) < 2) {
+                    struct timespec ts = {0, 200000}; /* 200 us */
+
+                    nanosleep(&ts, NULL);
+                }
+            }
+            if (st == 2) wsp = &sh->ws;
         }
-        for (ui = 0; have_scratch && ui < s->n; ui++) {
+
+        for (ui = unit->ui_begin; have_scratch && ui < unit->ui_end; ui++) {
             ereport_sunburst_tree_t *ut;
+            sb_user_tree_t *slot = &p->out[p->off[fi] + ui];
 
             sunburst_uid_densify(&s->v[ui], &scratch);
             ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth,
@@ -9073,20 +9238,20 @@ static void *sb_user_build_worker(void *arg) {
                 ereport_sunburst_tree_free(ut);
                 continue;
             }
-            {
-                sb_user_tree_t *slot = &p->out[p->off[fi] + p->n_out[fi]++];
-
-                slot->uid = s->v[ui].uid;
-                slot->shard = fi;
-                slot->tree = ut;
-            }
+            slot->uid = s->v[ui].uid;
+            slot->shard = fi;
+            slot->tree = ut;
         }
-        if (wsp) ereport_sunburst_ws_free(&ws);
         if (have_scratch) ereport_sunburst_accum_free(&scratch);
-        for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
-        free(s->v);
-        s->v = NULL;
-        s->n = s->cap = 0;
+
+        /* Last unit of the shard out releases what the units shared. */
+        if (atomic_fetch_sub(&sh->units_left, 1) == 1) {
+            if (atomic_load(&sh->ws_state) == 2) ereport_sunburst_ws_free(&sh->ws);
+            for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+            free(s->v);
+            s->v = NULL;
+            s->n = s->cap = 0;
+        }
     }
 }
 
@@ -12824,15 +12989,61 @@ chunks_ready:
         return 1;
     }
 
-    for (i = 0; (size_t)i < path_count; i++) {
-        if (atomic_load(&file_states[i].remaining_chunks) == 0U) continue;
-        if (ereport_attach_shard_catalog(&file_states[i], paths[i]) != 0) {
-            fprintf(stderr, "ereport: cannot load directory catalog from %s\n", paths[i]);
+    /* Attach every shard's directory catalog, and when the sunburst is on, its
+     * accumulator (16 bytes per catalog directory, only for shards that will be
+     * read). Shards are independent, so this fans out over the scan thread
+     * count: serially it was 8 s of a 57 s wall on a 2,133-shard capture
+     * (8.5 GiB of catalogs decoded by one thread while 31 cores idled), and it
+     * is paid by every ereport run, sunburst or not. A failed catalog fails
+     * the report as before; a failed accumulator only turns the sunburst off. */
+    if (g_sunburst_enabled) {
+        g_sunburst_acc = calloc(path_count, sizeof(*g_sunburst_acc));
+        if (!g_sunburst_acc)
+            fprintf(stderr, "warn: sunburst accumulator allocation failed; sunburst view disabled\n");
+    }
+    {
+        shard_attach_pool_t ap;
+        pthread_t *at = NULL;
+        size_t na = (size_t)threads < path_count ? (size_t)threads : path_count;
+        size_t started = 0, k;
+        double vt_a0 = g_ereport_verbose ? now_sec() : 0.0;
+
+        ap.file_states = file_states;
+        ap.paths = paths;
+        ap.path_count = path_count;
+        ap.acc = g_sunburst_acc;
+        atomic_init(&ap.next, 0);
+        atomic_init(&ap.attach_failed, 0);
+        atomic_init(&ap.acc_failed, 0);
+        atomic_init(&ap.first_failed, path_count);
+        if (na > 1) at = calloc(na, sizeof(*at));
+        if (at) {
+            for (k = 1; k < na; k++) { /* the main thread is loader 0 */
+                if (pthread_create(&at[k], NULL, shard_attach_worker, &ap) != 0) break;
+                started++;
+            }
+        }
+        shard_attach_worker(&ap);
+        for (k = 1; k <= started; k++) pthread_join(at[k], NULL);
+        free(at);
+
+        if (atomic_load(&ap.attach_failed)) {
+            size_t bad = atomic_load(&ap.first_failed);
+
+            fprintf(stderr, "ereport: cannot load directory catalog from %s\n",
+                    bad < path_count ? paths[bad] : "(unknown shard)");
             if (stats_thread_started) {
                 ereport_stats_stop_request(&run_stats);
                 pthread_join(stats_thread, NULL);
                 clear_status_line();
                 stats_thread_started = 0;
+            }
+            if (g_sunburst_acc) {
+                size_t fi;
+
+                for (fi = 0; fi < path_count; fi++) ereport_sunburst_accum_free(&g_sunburst_acc[fi]);
+                free(g_sunburst_acc);
+                g_sunburst_acc = NULL;
             }
             for (i = 0; (size_t)i < chunk_count; i++) free(chunks[i].path);
             free(chunks);
@@ -12842,29 +13053,17 @@ chunks_ready:
             ereport_free_file_states(file_states, path_count);
             return 1;
         }
-    }
+        if (g_sunburst_acc && atomic_load(&ap.acc_failed)) {
+            size_t fi;
 
-    /* Sunburst accumulators: 16 bytes per catalog directory per shard, allocated only for
-     * shards that will actually be read (catalog attached). A failed allocation turns the
-     * feature off rather than failing the report. */
-    if (g_sunburst_enabled) {
-        size_t fi;
-
-        g_sunburst_acc = calloc(path_count, sizeof(*g_sunburst_acc));
-        if (g_sunburst_acc) {
-            for (fi = 0; fi < path_count; fi++) {
-                if (!file_states[fi].catalog) continue;
-                if (ereport_sunburst_accum_init(&g_sunburst_acc[fi],
-                                                file_states[fi].catalog->max_dir_id) != 0) {
-                    while (fi-- > 0) ereport_sunburst_accum_free(&g_sunburst_acc[fi]);
-                    free(g_sunburst_acc);
-                    g_sunburst_acc = NULL;
-                    break;
-                }
-            }
-        }
-        if (!g_sunburst_acc)
+            for (fi = 0; fi < path_count; fi++) ereport_sunburst_accum_free(&g_sunburst_acc[fi]);
+            free(g_sunburst_acc);
+            g_sunburst_acc = NULL;
             fprintf(stderr, "warn: sunburst accumulator allocation failed; sunburst view disabled\n");
+        }
+        if (g_ereport_verbose && vt_a0 > 0.0)
+            fprintf(stderr, "ereport: attached %zu shard catalog(s) in %.2fs (%zu thread(s))\n",
+                    path_count, now_sec() - vt_a0, started + 1);
     }
 
     /* Per-user sunburst: one uid set per shard, filled by merging the workers'
@@ -13151,9 +13350,10 @@ chunks_ready:
          * shard, so each tree builds from that shard's catalog and the uid's
          * own accumulator (n=1: no cross-shard merge). Runs here for the same
          * reason as the aggregate build: workers have joined and the catalogs
-         * are still attached. Shards are handed to a pool of threads
-         * (sb_user_build_worker); each expands its uids one at a time into a
-         * dense scratch accumulator against a per-shard workspace. */
+         * are still attached. sb_user_build_plan splits the work into
+         * (shard, uid range) units for a pool of threads (sb_user_build_worker);
+         * each expands its uids one at a time into a dense scratch accumulator
+         * against the shard's shared workspace. */
         if (g_sunburst_uid_acc) {
             double vt_u0 = g_ereport_verbose ? now_sec() : 0.0;
             size_t fi, total_uids = 0;
@@ -13177,45 +13377,72 @@ chunks_ready:
                 }
             } else if (total_uids) {
                 sb_user_build_pool_t pool;
+                sb_user_build_unit_t *units = NULL;
+                sb_user_build_shard_t *shards = calloc(path_count, sizeof(*shards));
                 pthread_t *bt = calloc((size_t)threads_used, sizeof(*bt));
                 int nb = threads_used, started = 0;
-                size_t k, w = 0;
+                size_t k, w = 0, n_units;
 
-                if ((size_t)nb > path_count) nb = (int)path_count;
                 if (nb < 1) nb = 1;
+                n_units = sb_user_build_plan(g_sunburst_uid_acc, file_states, path_count, nb, &units);
+                if (n_units == (size_t)-1 || !shards) {
+                    fprintf(stderr, "warn: per-user sunburst plan allocation failed; user picker disabled\n");
+                    for (fi = 0; fi < path_count; fi++) {
+                        sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
+                        size_t ui;
+                        for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+                        free(s->v);
+                    }
+                    n_units = 0;
+                } else {
+                    /* slice lengths for the compaction; unit counts for the release */
+                    for (fi = 0; fi < path_count; fi++) n_out[fi] = g_sunburst_uid_acc[fi].n;
+                    for (k = 0; k < n_units; k++) atomic_fetch_add(&shards[units[k].fi].units_left, 1);
+                    if ((size_t)nb > n_units) nb = (int)n_units;
+                }
                 pool.sets = g_sunburst_uid_acc;
                 pool.file_states = file_states;
                 pool.path_count = path_count;
                 pool.out = out;
                 pool.off = uoff;
-                pool.n_out = n_out;
+                pool.units = units;
+                pool.n_units = n_units;
+                pool.shards = shards;
                 atomic_init(&pool.next, 0);
                 atomic_init(&pool.build_failed, 0);
                 atomic_init(&pool.scratch_failed, 0);
-                if (bt) {
-                    for (; started < nb; started++)
-                        if (pthread_create(&bt[started], NULL, sb_user_build_worker, &pool) != 0) break;
-                }
-                if (started == 0) {
-                    (void)sb_user_build_worker(&pool); /* no threads: run inline */
-                } else {
-                    for (i = 0; i < started; i++) pthread_join(bt[i], NULL);
+                if (n_units) {
+                    if (bt) {
+                        for (; started < nb; started++)
+                            if (pthread_create(&bt[started], NULL, sb_user_build_worker, &pool) != 0) break;
+                    }
+                    if (started == 0) {
+                        (void)sb_user_build_worker(&pool); /* no threads: run inline */
+                    } else {
+                        for (i = 0; i < started; i++) pthread_join(bt[i], NULL);
+                    }
                 }
                 free(bt);
+                free(units);
+                free(shards);
                 if (atomic_load(&pool.scratch_failed))
-                    fprintf(stderr, "warn: per-user sunburst scratch allocation failed for %lu shard(s); "
+                    fprintf(stderr, "warn: per-user sunburst scratch allocation failed for %lu work unit(s); "
                                     "their users get no picker page\n", atomic_load(&pool.scratch_failed));
                 if (atomic_load(&pool.build_failed))
                     fprintf(stderr, "warn: per-user sunburst build failed for %lu uid(s)\n",
                             atomic_load(&pool.build_failed));
 
-                /* Compact the per-shard slices into one list, shard order then
+                /* Compact the per-uid slots into one list, shard order then
                  * registration order (the sequential loop's order). */
                 for (fi = 0; fi < path_count; fi++)
-                    for (k = 0; k < n_out[fi]; k++) out[w++] = out[uoff[fi] + k];
+                    for (k = 0; k < n_out[fi]; k++)
+                        if (out[uoff[fi] + k].tree) out[w++] = out[uoff[fi] + k];
                 g_sb_user_trees = out;
                 g_sb_user_trees_n = w;
                 out = NULL;
+                if (g_ereport_verbose)
+                    fprintf(stderr, "sunburst: per-user build ran %zu work unit(s) on %d thread(s)\n",
+                            n_units, started ? started : 1);
             }
             free(out);
             free(uoff);
