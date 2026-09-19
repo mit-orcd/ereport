@@ -61,6 +61,29 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
                                                 const char *rewrite_from, const char *rewrite_to,
                                                 int want_buckets);
 
+/*
+ * Single-shard builds that repeat on one catalog (the per-user trees: every uid
+ * of a shard builds against that shard's catalog) can share a workspace: the
+ * child index the build needs (8 B per directory) depends on the catalog alone,
+ * so it is built once here instead of allocated, filled and freed per build.
+ * A workspace is read-only during builds, so concurrent builds on different
+ * threads may share one. Builds and writes are thread-safe.
+ */
+typedef struct {
+    const crawl_bin_catalog_t *cat;
+    uint32_t *first_child;
+    uint32_t *next_sibling;
+} ereport_sunburst_ws_t;
+
+int ereport_sunburst_ws_init(ereport_sunburst_ws_t *ws, const crawl_bin_catalog_t *cat);
+void ereport_sunburst_ws_free(ereport_sunburst_ws_t *ws);
+
+/* ereport_sunburst_build() for n = 1 with a workspace for cat (may be NULL). */
+ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *acc,
+                                                   const ereport_sunburst_ws_t *ws, unsigned depth_max,
+                                                   const char *rewrite_from, const char *rewrite_to,
+                                                   int want_buckets);
+
 /* Bucket-matrix access for the second pass. Cells are [age_bucket][size_bucket]
  * flattened to 36; both arrays have n_nodes * 36 entries when buckets were
  * requested, else NULL. The dir-node map for a shard (indexed by the cats[]

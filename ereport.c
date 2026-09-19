@@ -8931,6 +8931,120 @@ static void sunburst_uid_merge_into(sb_uid_set_t *dst, sb_uid_set_t *src) {
     src->n = src->cap = 0;
 }
 
+/* Per-user tree build pool. Work unit = one shard: the thread that claims it
+ * sets up the shard's workspace (child index, shared by every build on that
+ * catalog) and one dense scratch accumulator, builds each of the shard's
+ * uids, and writes the trees into the shard's slice of `out` (slices are laid
+ * out by the prefix sums in `off`, so no two threads write the same range and
+ * the final list order -- shard, then uid registration -- is the same as the
+ * old sequential loop's). Earlier this loop ran on the main thread alone with
+ * a fresh child index + dir-node map allocated and freed per uid: on a
+ * 7,660-user report that was ~140 s of a 166 s wall, most of it page faults
+ * and TLB shootdowns from the churn, while 31 cores sat idle. */
+typedef struct {
+    sb_uid_set_t *sets; /* g_sunburst_uid_acc, consumed (cells freed) as shards complete */
+    file_state_t *file_states;
+    size_t path_count;
+    sb_user_tree_t *out;    /* [sum of sets[fi].n] */
+    const size_t *off;      /* [path_count + 1] slice starts */
+    size_t *n_out;          /* [path_count] trees produced per shard */
+    _Atomic size_t next;
+    _Atomic unsigned long build_failed;
+    _Atomic unsigned long scratch_failed;
+} sb_user_build_pool_t;
+
+static void sunburst_uid_densify(const sb_uid_slot_t *u, ereport_sunburst_accum_t *a);
+static void sunburst_uid_scratch_clear(const sb_uid_slot_t *u, const crawl_bin_catalog_t *cat,
+                                       ereport_sunburst_accum_t *a);
+
+static void *sb_user_build_worker(void *arg) {
+    sb_user_build_pool_t *p = arg;
+
+    for (;;) {
+        size_t fi = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        sb_uid_set_t *s;
+        crawl_bin_catalog_t *cat;
+        ereport_sunburst_accum_t scratch;
+        ereport_sunburst_ws_t ws;
+        const ereport_sunburst_ws_t *wsp = NULL;
+        int have_scratch = 0;
+        size_t ui;
+
+        if (fi >= p->path_count) return NULL;
+        s = &p->sets[fi];
+        cat = p->file_states[fi].catalog;
+        if (cat && s->n > 0) {
+            if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
+                have_scratch = 1;
+            else
+                atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
+            /* A workspace failure only costs speed: the build allocates its own index. */
+            if (have_scratch && ereport_sunburst_ws_init(&ws, cat) == 0) wsp = &ws;
+        }
+        for (ui = 0; have_scratch && ui < s->n; ui++) {
+            ereport_sunburst_tree_t *ut;
+
+            sunburst_uid_densify(&s->v[ui], &scratch);
+            ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth,
+                                           g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
+            sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
+            if (!ut) {
+                atomic_fetch_add_explicit(&p->build_failed, 1, memory_order_relaxed);
+                continue;
+            }
+            if (ereport_sunburst_tree_total_bytes(ut) == 0 && ereport_sunburst_tree_total_files(ut) == 0) {
+                ereport_sunburst_tree_free(ut);
+                continue;
+            }
+            {
+                sb_user_tree_t *slot = &p->out[p->off[fi] + p->n_out[fi]++];
+
+                slot->uid = s->v[ui].uid;
+                slot->shard = fi;
+                slot->tree = ut;
+            }
+        }
+        if (wsp) ereport_sunburst_ws_free(&ws);
+        if (have_scratch) ereport_sunburst_accum_free(&scratch);
+        for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+        free(s->v);
+        s->v = NULL;
+        s->n = s->cap = 0;
+    }
+}
+
+/* Per-user page write pool: one <base>.json + <base>.html per user tree, all
+ * independent files. ereport_sunburst_write_ex is re-entrant (no shared
+ * state), so the writes fan out over the same thread count as the build. On
+ * the 7,660-user report this was ~3.5 GB of HTML written serially from the
+ * main thread. */
+typedef struct {
+    const sb_user_tree_t *trees;
+    const char *udir;
+    char *const *user_bases;
+    char *const *user_names;
+    const ereport_sunburst_link_t *links;
+    size_t n_links;
+    size_t n;            /* pages to write = n_links - 1 */
+    _Atomic size_t next;
+    _Atomic size_t wrote;
+} sb_user_write_pool_t;
+
+static void *sb_user_write_worker(void *arg) {
+    sb_user_write_pool_t *p = arg;
+
+    for (;;) {
+        size_t i = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+
+        if (i >= p->n) return NULL;
+        if (ereport_sunburst_write_ex(p->trees[i].tree, p->udir, p->user_bases[i], p->user_names[i],
+                                      "../index.html", p->links, p->n_links, (long)(i + 1)) == 0)
+            atomic_fetch_add_explicit(&p->wrote, 1, memory_order_relaxed);
+        else
+            fprintf(stderr, "warn: failed to write per-user sunburst for %s\n", p->user_names[i]);
+    }
+}
+
 /* Expand one uid's sparse map into the dense scratch accumulator (which must be
  * all-zero on entry). */
 static void sunburst_uid_densify(const sb_uid_slot_t *u, ereport_sunburst_accum_t *a) {
@@ -12953,66 +13067,75 @@ chunks_ready:
          * shard, so each tree builds from that shard's catalog and the uid's
          * own accumulator (n=1: no cross-shard merge). Runs here for the same
          * reason as the aggregate build: workers have joined and the catalogs
-         * are still attached. Each uid's sparse map is expanded into one dense
-         * scratch accumulator per shard (the build's rollup mutates it in
-         * place), which is cleared again before the next uid. */
+         * are still attached. Shards are handed to a pool of threads
+         * (sb_user_build_worker); each expands its uids one at a time into a
+         * dense scratch accumulator against a per-shard workspace. */
         if (g_sunburst_uid_acc) {
             double vt_u0 = g_ereport_verbose ? now_sec() : 0.0;
-            size_t fi, ui, ucap = 0;
+            size_t fi, total_uids = 0;
+            size_t *uoff = calloc(path_count + 1, sizeof(*uoff));
+            size_t *n_out = calloc(path_count ? path_count : 1, sizeof(*n_out));
+            sb_user_tree_t *out = NULL;
 
             for (fi = 0; fi < path_count; fi++) {
-                sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
-                crawl_bin_catalog_t *cat = file_states[fi].catalog;
-                ereport_sunburst_accum_t scratch;
-                int have_scratch = 0;
-
-                if (cat && s->n > 0) {
-                    if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
-                        have_scratch = 1;
-                    else
-                        fprintf(stderr, "warn: per-user sunburst scratch allocation failed for shard %zu; "
-                                        "its users get no picker page\n", fi);
-                }
-                for (ui = 0; have_scratch && ui < s->n; ui++) {
-                    ereport_sunburst_tree_t *ut;
-                    crawl_bin_catalog_t *cats1[1];
-
-                    cats1[0] = cat;
-                    sunburst_uid_densify(&s->v[ui], &scratch);
-                    ut = ereport_sunburst_build(cats1, &scratch, 1, g_sunburst_depth, 1,
-                                                g_rewrite_from, g_rewrite_to,
-                                                g_sunburst_buckets);
-                    sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
-                    if (!ut) {
-                        fprintf(stderr, "warn: per-user sunburst build failed for uid %u\n",
-                                (unsigned)s->v[ui].uid);
-                        continue;
-                    }
-                    if (ereport_sunburst_tree_total_bytes(ut) == 0 &&
-                        ereport_sunburst_tree_total_files(ut) == 0) {
-                        ereport_sunburst_tree_free(ut);
-                        continue;
-                    }
-                    if (g_sb_user_trees_n == ucap) {
-                        size_t nc = ucap ? ucap * 2 : 64;
-                        sb_user_tree_t *nt = realloc(g_sb_user_trees, nc * sizeof(*nt));
-                        if (!nt) {
-                            fprintf(stderr, "warn: per-user sunburst list allocation failed\n");
-                            ereport_sunburst_tree_free(ut);
-                            continue;
-                        }
-                        g_sb_user_trees = nt;
-                        ucap = nc;
-                    }
-                    g_sb_user_trees[g_sb_user_trees_n].uid = s->v[ui].uid;
-                    g_sb_user_trees[g_sb_user_trees_n].shard = fi;
-                    g_sb_user_trees[g_sb_user_trees_n].tree = ut;
-                    g_sb_user_trees_n++;
-                }
-                if (have_scratch) ereport_sunburst_accum_free(&scratch);
-                for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
-                free(s->v);
+                if (uoff) uoff[fi] = total_uids;
+                total_uids += g_sunburst_uid_acc[fi].n;
             }
+            if (uoff) uoff[path_count] = total_uids;
+            if (total_uids) out = calloc(total_uids, sizeof(*out));
+            if (!uoff || !n_out || (total_uids && !out)) {
+                fprintf(stderr, "warn: per-user sunburst list allocation failed; user picker disabled\n");
+                for (fi = 0; fi < path_count; fi++) {
+                    sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
+                    size_t ui;
+                    for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+                    free(s->v);
+                }
+            } else if (total_uids) {
+                sb_user_build_pool_t pool;
+                pthread_t *bt = calloc((size_t)threads_used, sizeof(*bt));
+                int nb = threads_used, started = 0;
+                size_t k, w = 0;
+
+                if ((size_t)nb > path_count) nb = (int)path_count;
+                if (nb < 1) nb = 1;
+                pool.sets = g_sunburst_uid_acc;
+                pool.file_states = file_states;
+                pool.path_count = path_count;
+                pool.out = out;
+                pool.off = uoff;
+                pool.n_out = n_out;
+                atomic_init(&pool.next, 0);
+                atomic_init(&pool.build_failed, 0);
+                atomic_init(&pool.scratch_failed, 0);
+                if (bt) {
+                    for (; started < nb; started++)
+                        if (pthread_create(&bt[started], NULL, sb_user_build_worker, &pool) != 0) break;
+                }
+                if (started == 0) {
+                    (void)sb_user_build_worker(&pool); /* no threads: run inline */
+                } else {
+                    for (i = 0; i < started; i++) pthread_join(bt[i], NULL);
+                }
+                free(bt);
+                if (atomic_load(&pool.scratch_failed))
+                    fprintf(stderr, "warn: per-user sunburst scratch allocation failed for %lu shard(s); "
+                                    "their users get no picker page\n", atomic_load(&pool.scratch_failed));
+                if (atomic_load(&pool.build_failed))
+                    fprintf(stderr, "warn: per-user sunburst build failed for %lu uid(s)\n",
+                            atomic_load(&pool.build_failed));
+
+                /* Compact the per-shard slices into one list, shard order then
+                 * registration order (the sequential loop's order). */
+                for (fi = 0; fi < path_count; fi++)
+                    for (k = 0; k < n_out[fi]; k++) out[w++] = out[uoff[fi] + k];
+                g_sb_user_trees = out;
+                g_sb_user_trees_n = w;
+                out = NULL;
+            }
+            free(out);
+            free(uoff);
+            free(n_out);
             free(g_sunburst_uid_acc);
             g_sunburst_uid_acc = NULL;
 
@@ -13500,21 +13623,35 @@ chunks_ready:
             } else if (mkdir(udir, 0755) != 0 && errno != EEXIST) {
                 fprintf(stderr, "warn: cannot create %s: %s\n", udir, strerror(errno));
             } else {
-                size_t wrote = 0;
-                for (ui3 = 0; ui3 < n_links - 1; ui3++) {
-                    if (ereport_sunburst_write_ex(g_sb_user_trees[ui3].tree, udir,
-                                                  user_bases[ui3], user_names[ui3],
-                                                  "../index.html",
-                                                  usr_links, n_links,
-                                                  (long)(ui3 + 1)) == 0) {
-                        wrote++;
-                    } else {
-                        fprintf(stderr, "warn: failed to write per-user sunburst for %s\n",
-                                user_names[ui3]);
-                    }
+                sb_user_write_pool_t wp;
+                pthread_t *wt = NULL;
+                int nw = threads, started = 0;
+                double vt_w0 = g_ereport_verbose ? now_sec() : 0.0;
+
+                wp.trees = g_sb_user_trees;
+                wp.udir = udir;
+                wp.user_bases = user_bases;
+                wp.user_names = user_names;
+                wp.links = usr_links;
+                wp.n_links = n_links;
+                wp.n = n_links - 1;
+                atomic_init(&wp.next, 0);
+                atomic_init(&wp.wrote, 0);
+                if ((size_t)nw > wp.n) nw = (int)wp.n;
+                if (nw > 1) wt = calloc((size_t)nw, sizeof(*wt));
+                if (wt) {
+                    for (; started < nw; started++)
+                        if (pthread_create(&wt[started], NULL, sb_user_write_worker, &wp) != 0) break;
                 }
+                if (started == 0) {
+                    (void)sb_user_write_worker(&wp); /* no threads: write inline */
+                } else {
+                    for (i = 0; i < started; i++) pthread_join(wt[i], NULL);
+                }
+                free(wt);
                 if (g_ereport_verbose)
-                    fprintf(stderr, "sunburst: wrote %zu per-user pages under %s\n", wrote, udir);
+                    fprintf(stderr, "sunburst: wrote %zu per-user pages under %s in %.1fs (%d thread(s))\n",
+                            (size_t)atomic_load(&wp.wrote), udir, now_sec() - vt_w0, started ? started : 1);
             }
         }
 

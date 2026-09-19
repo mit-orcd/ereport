@@ -10,7 +10,10 @@
  * memory tracks the emitted chart (bounded by SUNBURST_NODE_BUDGET), not the
  * number of directories within depth_max of the root.
  */
+#define _GNU_SOURCE /* qsort_r: comparators take their table as context, so builds and
+                       writes are safe to run concurrently (per-user trees) */
 #include "ereport_sunburst.h"
+#include "compat_qsort_r.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -105,6 +108,7 @@ typedef struct {
     uint32_t *first_child;
     uint32_t *next_sibling;
     uint32_t fi; /* index in the caller's cats[] array (ereport's file_index) */
+    int borrowed_index; /* first_child/next_sibling belong to a caller workspace: do not free */
 } sb_shard_t;
 
 typedef struct {
@@ -288,12 +292,12 @@ static int sb_enum_children(const sb_shard_t *sh,
 }
 
 /* Selection sort order: primary metric desc, the other metric as tie-break,
- * name bytes last for full determinism (siblings routinely tie on files). */
-static const sb_cagg_t *g_sb_cagg;
-
-static int sb_cagg_cmp_bytes_desc(const void *pa, const void *pb) {
-    const sb_cagg_t *a = &g_sb_cagg[*(const int32_t *)pa];
-    const sb_cagg_t *b = &g_sb_cagg[*(const int32_t *)pb];
+ * name bytes last for full determinism (siblings routinely tie on files).
+ * The entry table arrives as qsort_r context, never via a global. */
+static int sb_cagg_cmp_bytes_desc(const void *pa, const void *pb, void *ctx) {
+    const sb_cagg_t *ents = ctx;
+    const sb_cagg_t *a = &ents[*(const int32_t *)pa];
+    const sb_cagg_t *b = &ents[*(const int32_t *)pb];
     int c;
     if (a->bytes != b->bytes) return (a->bytes < b->bytes) ? 1 : -1;
     if (a->files != b->files) return (a->files < b->files) ? 1 : -1;
@@ -301,9 +305,10 @@ static int sb_cagg_cmp_bytes_desc(const void *pa, const void *pb) {
     if (c) return c;
     return (a->name_len > b->name_len) - (a->name_len < b->name_len);
 }
-static int sb_cagg_cmp_files_desc(const void *pa, const void *pb) {
-    const sb_cagg_t *a = &g_sb_cagg[*(const int32_t *)pa];
-    const sb_cagg_t *b = &g_sb_cagg[*(const int32_t *)pb];
+static int sb_cagg_cmp_files_desc(const void *pa, const void *pb, void *ctx) {
+    const sb_cagg_t *ents = ctx;
+    const sb_cagg_t *a = &ents[*(const int32_t *)pa];
+    const sb_cagg_t *b = &ents[*(const int32_t *)pb];
     int c;
     if (a->files != b->files) return (a->files < b->files) ? 1 : -1;
     if (a->bytes != b->bytes) return (a->bytes < b->bytes) ? 1 : -1;
@@ -412,16 +417,15 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
     if (!ord || !keep || !trimmed) goto out;
     for (size_t i = 0; i < cm->n; i++) ord[i] = (int32_t)i;
 
-    g_sb_cagg = cm->ents;
-    qsort(ord, cm->n, sizeof(*ord), sb_cagg_cmp_bytes_desc);
+    ereport_qsort_r(ord, cm->n, sizeof(*ord), sb_cagg_cmp_bytes_desc, cm->ents);
     for (size_t i = 0; i < cm->n && i < SUNBURST_TOP_N; i++) keep[ord[i]] = 1;
-    qsort(ord, cm->n, sizeof(*ord), sb_cagg_cmp_files_desc);
+    ereport_qsort_r(ord, cm->n, sizeof(*ord), sb_cagg_cmp_files_desc, cm->ents);
     for (size_t i = 0; i < cm->n && i < SUNBURST_TOP_N; i++) keep[ord[i]] = 1;
 
     min_b = (uint64_t)((long double)t->nodes[ni].total_bytes * SUNBURST_MIN_FRAC);
     min_f = (uint64_t)((long double)t->nodes[ni].total_files * SUNBURST_MIN_FRAC);
 
-    qsort(ord, cm->n, sizeof(*ord), sb_cagg_cmp_bytes_desc); /* intern in bytes order */
+    ereport_qsort_r(ord, cm->n, sizeof(*ord), sb_cagg_cmp_bytes_desc, cm->ents); /* intern in bytes order */
     for (size_t i = 0; i < cm->n; i++) {
         sb_cagg_t *e = &cm->ents[ord[i]];
         int above = (min_b > 0 && e->bytes >= min_b) || (min_f > 0 && e->files >= min_f);
@@ -482,9 +486,7 @@ out:
  * subtree totals, in place; dir_ids are handed out parent-first, so a single
  * reverse pass settles every descendant), then build the child index for
  * O(fanout) enumeration. Shards are independent, so this runs in parallel. */
-static int sb_prep_shard(sb_shard_t *s) {
-    const crawl_bin_catalog_t *cat = s->cat;
-    ereport_sunburst_accum_t *a = s->acc;
+static void sb_rollup_shard(const crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *a) {
     uint64_t nd = cat->max_dir_id, d;
 
     for (d = nd; d >= 2; d--) {
@@ -496,17 +498,52 @@ static int sb_prep_shard(sb_shard_t *s) {
         if (b) atomic_fetch_add_explicit(&a->bytes[p], b, memory_order_relaxed);
         if (f) atomic_fetch_add_explicit(&a->files[p], f, memory_order_relaxed);
     }
+}
 
-    s->first_child = calloc((size_t)nd + 1, sizeof(*s->first_child));
-    s->next_sibling = calloc((size_t)nd + 1, sizeof(*s->next_sibling));
-    if (!s->first_child || !s->next_sibling) return -1;
+/* The child index depends on the catalog alone (not on the accumulator), which
+ * is what lets a workspace share one across every per-user build on a shard. */
+static int sb_child_index_build(const crawl_bin_catalog_t *cat, uint32_t **first_child_out,
+                                uint32_t **next_sibling_out) {
+    uint64_t nd = cat->max_dir_id, d;
+    uint32_t *fc = calloc((size_t)nd + 1, sizeof(*fc));
+    uint32_t *ns = calloc((size_t)nd + 1, sizeof(*ns));
+
+    if (!fc || !ns) {
+        free(fc);
+        free(ns);
+        return -1;
+    }
     for (d = 2; d <= nd; d++) {
         uint64_t p = cat->parent_dir_id[d];
         if (p < 1 || p > nd) continue;
-        s->next_sibling[d] = s->first_child[p];
-        s->first_child[p] = (uint32_t)d;
+        ns[d] = fc[p];
+        fc[p] = (uint32_t)d;
     }
+    *first_child_out = fc;
+    *next_sibling_out = ns;
     return 0;
+}
+
+static int sb_prep_shard(sb_shard_t *s) {
+    sb_rollup_shard(s->cat, s->acc);
+    if (s->borrowed_index) return 0;
+    return sb_child_index_build(s->cat, &s->first_child, &s->next_sibling);
+}
+
+int ereport_sunburst_ws_init(ereport_sunburst_ws_t *ws, const crawl_bin_catalog_t *cat) {
+    if (!ws) return -1;
+    memset(ws, 0, sizeof(*ws));
+    if (!cat || !cat->parent_dir_id || cat->max_dir_id == 0 || cat->max_dir_id > UINT32_MAX) return -1;
+    if (sb_child_index_build(cat, &ws->first_child, &ws->next_sibling) != 0) return -1;
+    ws->cat = cat;
+    return 0;
+}
+
+void ereport_sunburst_ws_free(ereport_sunburst_ws_t *ws) {
+    if (!ws) return;
+    free(ws->first_child);
+    free(ws->next_sibling);
+    memset(ws, 0, sizeof(*ws));
 }
 
 typedef struct {
@@ -577,11 +614,11 @@ static void *sb_map_worker(void *arg) {
     }
 }
 
-ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
-                                                ereport_sunburst_accum_t *accs, size_t n,
-                                                unsigned depth_max, unsigned threads,
-                                                const char *rewrite_from, const char *rewrite_to,
-                                                int want_buckets) {
+static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
+                                              ereport_sunburst_accum_t *accs, size_t n,
+                                              unsigned depth_max, unsigned threads,
+                                              const char *rewrite_from, const char *rewrite_to,
+                                              int want_buckets, const ereport_sunburst_ws_t *ws) {
     ereport_sunburst_tree_t *t = calloc(1, sizeof(*t));
     sb_shard_t *sh = NULL;
     size_t ns = 0;
@@ -623,6 +660,11 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
         sh[ns].cat = cat;
         sh[ns].acc = a;
         sh[ns].fi = (uint32_t)s;
+        if (ws && ws->cat == cat && ws->first_child && ws->next_sibling) {
+            sh[ns].first_child = ws->first_child;
+            sh[ns].next_sibling = ws->next_sibling;
+            sh[ns].borrowed_index = 1;
+        }
         ns++;
     }
 
@@ -832,6 +874,7 @@ ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats
     free(mr.v);
     free(cur_lids);
     for (size_t i = 0; i < ns; i++) {
+        if (sh[i].borrowed_index) continue;
         free(sh[i].first_child);
         free(sh[i].next_sibling);
     }
@@ -845,6 +888,7 @@ fail:
     free(cur_lids);
     if (sh) {
         for (size_t i = 0; i < ns; i++) {
+            if (sh[i].borrowed_index) continue;
             free(sh[i].first_child);
             free(sh[i].next_sibling);
         }
@@ -852,6 +896,24 @@ fail:
     }
     ereport_sunburst_tree_free(t);
     return NULL;
+}
+
+ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
+                                                ereport_sunburst_accum_t *accs, size_t n,
+                                                unsigned depth_max, unsigned threads,
+                                                const char *rewrite_from, const char *rewrite_to,
+                                                int want_buckets) {
+    return sb_build_impl(cats, accs, n, depth_max, threads, rewrite_from, rewrite_to, want_buckets, NULL);
+}
+
+ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *acc,
+                                                   const ereport_sunburst_ws_t *ws, unsigned depth_max,
+                                                   const char *rewrite_from, const char *rewrite_to,
+                                                   int want_buckets) {
+    crawl_bin_catalog_t *cats1[1];
+
+    cats1[0] = cat;
+    return sb_build_impl(cats1, acc, 1, depth_max, 1, rewrite_from, rewrite_to, want_buckets, ws);
 }
 
 size_t ereport_sunburst_tree_nodes(const ereport_sunburst_tree_t *t) {
@@ -925,13 +987,13 @@ typedef struct {
     size_t emitted;             /* node budget bookkeeping */
 } sb_emit_ctx_t;
 
-static const sb_node_t *g_sb_sort_nodes;
-
 /* Deterministic totals order: primary metric desc, the other metric as tie-break
- * (siblings routinely tie on files, e.g. one file per directory), node id last. */
-static int sb_cmp_bytes_desc(const void *pa, const void *pb) {
+ * (siblings routinely tie on files, e.g. one file per directory), node id last.
+ * The node table arrives as qsort_r context, never via a global. */
+static int sb_cmp_bytes_desc(const void *pa, const void *pb, void *ctx) {
+    const sb_node_t *nodes = ctx;
     int32_t ia = *(const int32_t *)pa, ib = *(const int32_t *)pb;
-    const sb_node_t *a = &g_sb_sort_nodes[ia], *b = &g_sb_sort_nodes[ib];
+    const sb_node_t *a = &nodes[ia], *b = &nodes[ib];
     if (a->total_bytes != b->total_bytes) return (a->total_bytes < b->total_bytes) ? 1 : -1;
     if (a->total_files != b->total_files) return (a->total_files < b->total_files) ? 1 : -1;
     return (ia > ib) - (ia < ib);
@@ -1023,8 +1085,7 @@ static int sb_json_emit_node(sb_emit_ctx_t *ctx, int32_t idx, unsigned depth_fro
     fputs(",\"children\":[", out);
     ctx->emitted++;
 
-    g_sb_sort_nodes = t->nodes;
-    qsort(kids, nkids, sizeof(*kids), sb_cmp_bytes_desc);
+    ereport_qsort_r(kids, nkids, sizeof(*kids), sb_cmp_bytes_desc, (void *)t->nodes);
     for (size_t i = 0; i < nkids; i++) {
         if (i) fputc(',', out);
         if (sb_json_emit_node(ctx, kids[i], child_depth, out) != 0) {
