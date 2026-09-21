@@ -11432,26 +11432,34 @@ static int emit_html(const char *report_path,
     fprintf(out, ".cell,.tot-cell{transition:background 0.2s ease}\n");
     fprintf(out, ".cell a.bucket-link,.tot-block.cell-split{display:block;color:inherit;text-decoration:none;position:relative;"
                 "overflow:hidden;min-height:62px;padding:0}\n");
-    fprintf(out, "td.cell,td.tot-cell{min-width:7.2em;vertical-align:middle}\n");
+    /* Wide enough for an 11-digit count with separators at the cell font. */
+    fprintf(out, "td.cell,td.tot-cell{min-width:8.6em;vertical-align:middle}\n");
     fprintf(out, ".cell-split-bg{position:absolute;inset:0;z-index:0;pointer-events:none}\n");
     fprintf(out, ".cell-split-part{position:absolute;inset:0}\n");
     fprintf(out, ".cell-split-bytes{clip-path:polygon(100%% 0,100%% 100%%,0 0)}\n");
     fprintf(out, ".cell-split-files{clip-path:polygon(0 100%%,100%% 100%%,0 0)}\n");
     fprintf(out, ".cell-split-text{position:absolute;inset:0;z-index:1;line-height:1.15;box-sizing:border-box;"
                 "pointer-events:none}\n");
-    fprintf(out, ".cell-split-text-bytes{clip-path:polygon(100%% 0,100%% 100%%,0 0);display:flex;flex-direction:column;"
-                "align-items:flex-end;justify-content:flex-start;padding:5px 5px 36%% 36%%}\n");
-    fprintf(out, ".cell-split-text-files{clip-path:polygon(0 100%%,100%% 100%%,0 0);display:flex;flex-direction:column;"
-                "align-items:flex-start;justify-content:flex-end;padding:36%% 36%% 5px 5px}\n");
-    fprintf(out, ".cell-vol-row{display:flex;align-items:baseline;justify-content:flex-end;gap:3px;flex-wrap:wrap;"
-                "max-width:100%%}\n");
-    fprintf(out, ".cell-bytes{font-size:12px;font-weight:700;letter-spacing:-0.02em}\n");
+    /* Only the backgrounds are clipped to the two triangles. The text layers
+     * span the whole cell (bytes top-right, files bottom-left, never on the
+     * same rows) and never wrap: clipping them to a triangle cut long counts
+     * at the diagonal, and break-all then wrapped the rest into the hidden
+     * half. The white halo keeps a number legible where it crosses onto the
+     * other triangle's color. */
+    fprintf(out, ".cell-split-text-bytes{display:flex;flex-direction:column;"
+                "align-items:flex-end;justify-content:flex-start;padding:5px 5px 34%% 5px}\n");
+    fprintf(out, ".cell-split-text-files{display:flex;flex-direction:column;"
+                "align-items:flex-start;justify-content:flex-end;padding:34%% 5px 5px 5px}\n");
+    fprintf(out, ".cell-vol-row{display:flex;align-items:baseline;justify-content:flex-end;gap:3px;flex-wrap:nowrap;"
+                "white-space:nowrap;max-width:100%%}\n");
+    fprintf(out, ".cell-bytes{font-size:12px;font-weight:700;letter-spacing:-0.02em;"
+                "text-shadow:0 0 4px #fff,0 0 8px rgba(255,255,255,0.92)}\n");
     fprintf(out, ".cell-pct{font-size:8px;font-weight:700;color:#163a7a;background:rgba(255,255,255,0.9);padding:1px 3px;"
                 "border-radius:999px;line-height:1;white-space:nowrap}\n");
     fprintf(out, ".cell-pct-files{color:#6b2a2a}\n");
     fprintf(out, ".cell-files-stack{display:flex;flex-direction:column;align-items:flex-start;gap:3px;max-width:100%%}\n");
     fprintf(out, ".cell-files-main{font-size:11px;font-weight:700;color:#1a1a1a;line-height:1.15;letter-spacing:-0.02em;"
-                "text-shadow:0 0 4px #fff,0 0 8px rgba(255,255,255,0.92);word-break:break-all}\n");
+                "text-shadow:0 0 4px #fff,0 0 8px rgba(255,255,255,0.92);white-space:nowrap}\n");
     fprintf(out, ".cell.active{outline:3px solid #2d6a9f;outline-offset:-3px}\n");
     fprintf(out,
             ".heat-map-badges{position:absolute;top:3px;left:4px;z-index:2;display:flex;flex-direction:column;"
