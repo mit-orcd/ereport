@@ -1152,8 +1152,35 @@ static void sb_html_escape(FILE *out, const char *s) {
     }
 }
 
+/* The highlights row: label / value / muted detail chips, wrapping. */
+static void sb_stats_html(FILE *out, const ereport_sunburst_stats_t *stats) {
+    size_t i;
+
+    fputs("<span class=\"stats\" id=\"stats\">", out);
+    for (i = 0; i < stats->n; i++) {
+        const ereport_sunburst_stat_t *it = &stats->items[i];
+
+        if (!it->label || !it->value) continue;
+        fputs("<span class=\"stat\"><span class=\"sl\">", out);
+        sb_html_escape(out, it->label);
+        fputs("</span><span class=\"sv\">", out);
+        sb_html_escape(out, it->value);
+        fputs("</span>", out);
+        if (it->detail && it->detail[0]) {
+            fputs("<span class=\"sd\">", out);
+            sb_html_escape(out, it->detail);
+            fputs("</span>", out);
+        }
+        fputs("</span>", out);
+    }
+    fputs("</span>", out);
+}
+
 static void sb_html_prefix(FILE *out, const char *subject, const char *base_name,
-                           const char *report_href, int has_buckets) {
+                           const char *report_href, int has_buckets,
+                           const ereport_sunburst_stats_t *stats) {
+    const int has_stats = stats && stats->n > 0;
+
     fputs("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
           "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Sunburst", out);
     if (subject) {
@@ -1222,6 +1249,13 @@ static void sb_html_prefix(FILE *out, const char *subject, const char *base_name
           "#userpick-list li.upmeta{cursor:default;color:#98a2b3;font-size:11px;justify-content:center;"
           "padding-top:6px;margin-top:2px;border-top:1px solid #f2f4f7;border-radius:0}\n"
           "#userpick-list li.upmeta:hover,#userpick-list li.upmeta.act{background:none}\n"
+          /* Report highlights: a chip row above the legend. */
+          ".stats{display:inline-flex;flex-wrap:wrap;align-items:baseline;gap:4px 16px;font-size:12px;color:#344054}\n"
+          ".stat{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}\n"
+          ".stat .sl{color:#667085}\n"
+          ".stat .sv{font-weight:600;color:#1d2939}\n"
+          ".stat .sd{color:#98a2b3}\n"
+          ".stats-below{display:flex;margin:0 auto 10px;max-width:min(92vmin,860px);padding:0 12px;box-sizing:border-box}\n"
           ".legend{font-size:12px;color:#344054}\n"
           ".legend-below{margin:0 auto 14px;max-width:min(92vmin,860px);"
           "border:1px solid #e4e7ec;border-radius:8px;padding:8px 12px}\n"
@@ -1263,12 +1297,22 @@ static void sb_html_prefix(FILE *out, const char *subject, const char *base_name
     /* Bucket reports: the legend is the filter panel's last row, directly under
        the Color dropdown. Without buckets the panel stays hidden, so the legend
        keeps its old boxed spot below the chart. */
+    if (has_buckets && has_stats) {
+        fputs("<div class=\"frow\"><span class=\"flabel\">Report</span>", out);
+        sb_stats_html(out, stats);
+        fputs("</div>\n", out);
+    }
     if (has_buckets)
         fputs("<details class=\"legend\" id=\"legend\"><summary>Legend</summary>"
               "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n", out);
     fputs("</div>\n"
           "<div id=\"chartwrap\"><svg id=\"chart\" viewBox=\"0 0 1000 1000\" role=\"img\" "
           "aria-label=\"Sunburst chart\"></svg></div>\n", out);
+    if (!has_buckets && has_stats) {
+        fputs("<div class=\"stats-below\">", out);
+        sb_stats_html(out, stats);
+        fputs("</div>\n", out);
+    }
     if (!has_buckets)
         fputs("<details class=\"legend legend-below\" id=\"legend\"><summary>Legend</summary>"
               "<div class=\"legend-body\" id=\"legend-body\"></div></details>\n", out);
@@ -1864,7 +1908,7 @@ int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_
                               const char *base_name, const char *subject,
                               const char *report_href,
                               const ereport_sunburst_link_t *users, size_t n_users,
-                              long current_user) {
+                              long current_user, const ereport_sunburst_stats_t *stats) {
     char path[PATH_MAX];
     FILE *out;
     int n;
@@ -1886,7 +1930,7 @@ int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_
     if (n < 0 || (size_t)n >= sizeof(path)) return -1;
     out = fopen(path, "w");
     if (!out) return -1;
-    sb_html_prefix(out, subject, base_name, report_href, t->bucket_bytes != NULL);
+    sb_html_prefix(out, subject, base_name, report_href, t->bucket_bytes != NULL, stats);
     if (sb_json_write(t, out) != 0) {
         fclose(out);
         return -1;

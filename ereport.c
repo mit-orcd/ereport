@@ -3597,6 +3597,167 @@ static void emit_heat_badge_tip_install_js(FILE *out);
 /* Per-user sunburst pages (aggregate mode)                           */
 /* ------------------------------------------------------------------ */
 
+/* Short count for chips: 146M, 1.07B, 71.8M; below 100,000 the comma form. */
+static void format_count_short(uint64_t n, char *buf, size_t sz) {
+    static const char *const sfx[] = {"", "K", "M", "B", "T", "Q"};
+    double v = (double)n;
+    size_t i = 0;
+
+    if (n < 100000ULL) {
+        format_uint_commas(n, buf, sz);
+        return;
+    }
+    while (v >= 999.5 && i + 1 < sizeof(sfx) / sizeof(*sfx)) {
+        v /= 1000.0;
+        i++;
+    }
+    if (v >= 99.95)
+        snprintf(buf, sz, "%.0f%s", v, sfx[i]);
+    else if (v >= 9.995)
+        snprintf(buf, sz, "%.1f%s", v, sfx[i]);
+    else
+        snprintf(buf, sz, "%.2f%s", v, sfx[i]);
+}
+
+/* Share of a total for chips: 45%, 2.3%, <0.1%. */
+static void format_share(uint64_t part, uint64_t total, char *buf, size_t sz) {
+    double pct = total ? 100.0 * (double)part / (double)total : 0.0;
+
+    if (total == 0)
+        snprintf(buf, sz, "n/a");
+    else if (part == 0)
+        snprintf(buf, sz, "0%%");
+    else if (pct < 0.1)
+        snprintf(buf, sz, "<0.1%%");
+    else if (pct < 10.0)
+        snprintf(buf, sz, "%.1f%%", pct);
+    else
+        snprintf(buf, sz, "%.0f%%", pct);
+}
+
+/* Highlights for the sunburst pages (the row above the legend): the
+ * index.html summary reduced to what orients a reader of the chart. The
+ * strings live in this struct, so it outlives the writers that use it. */
+#define SB_STATS_MAX 10
+typedef struct {
+    ereport_sunburst_stat_t items[SB_STATS_MAX];
+    size_t n;
+    char v[SB_STATS_MAX][96];
+    char d[SB_STATS_MAX][160];
+} sb_stats_buf_t;
+
+static void sb_stats_add(sb_stats_buf_t *b, const char *label, const char *value, const char *detail) {
+    if (b->n >= SB_STATS_MAX) return;
+    snprintf(b->v[b->n], sizeof(b->v[0]), "%s", value);
+    if (detail && detail[0]) snprintf(b->d[b->n], sizeof(b->d[0]), "%s", detail);
+    else b->d[b->n][0] = '\0';
+    b->items[b->n].label = label;
+    b->items[b->n].value = b->v[b->n];
+    b->items[b->n].detail = b->d[b->n][0] ? b->d[b->n] : NULL;
+    b->n++;
+}
+
+/* Count chip: short form, with the exact comma form as detail when they differ. */
+static void sb_stats_add_count(sb_stats_buf_t *b, const char *label, uint64_t n) {
+    char a[48], c[64];
+
+    format_count_short(n, a, sizeof(a));
+    format_uint_commas(n, c, sizeof(c));
+    sb_stats_add(b, label, a, strcmp(a, c) ? c : NULL);
+}
+
+static void sb_stats_build(sb_stats_buf_t *b, const summary_t *sum, int all_users, uint64_t distinct_uids,
+                           uid_t uid, const char *basis_str, size_t crawl_source_count,
+                           const char *sources_label, const ereport_crawl_timing_t *timing,
+                           const ereport_manifest_disk_t *disk) {
+    char a[96], d[160];
+
+    b->n = 0;
+
+    human_bytes(sum->total_bytes, a, sizeof(a));
+    d[0] = '\0';
+    if (disk && disk->valid) {
+        char od[32];
+
+        human_bytes(disk->total_allocated_bytes, od, sizeof(od));
+        snprintf(d, sizeof(d), "%s on disk", od);
+    }
+    sb_stats_add(b, "Size", a, d);
+
+    sb_stats_add_count(b, "Files", sum->total_files);
+    sb_stats_add_count(b, "Directories", sum->total_dirs);
+    if (sum->total_links) sb_stats_add_count(b, "Symlinks", sum->total_links);
+
+    if (all_users) {
+        sb_stats_add_count(b, "Users", distinct_uids);
+    } else {
+        snprintf(a, sizeof(a), "%lu", (unsigned long)uid);
+        sb_stats_add(b, "UID", a, NULL);
+    }
+
+    /* Crawl roots: the count, with the distinct (rewritten) paths when they
+     * fit -- several captures of one server layout share a root. */
+    snprintf(a, sizeof(a), "%zu location%s", crawl_source_count, crawl_source_count == 1 ? "" : "s");
+    d[0] = '\0';
+    if (sources_label && sources_label[0]) {
+        const char *p = sources_label;
+        char seen[16][PATH_MAX];
+        size_t n_seen = 0, used = 0;
+        int fits = 1;
+
+        while (*p && fits) {
+            const char *semi = strchr(p, ';');
+            size_t len = semi ? (size_t)(semi - p) : strlen(p);
+            char seg[PATH_MAX];
+
+            if (len > 0 && len < sizeof(seg)) {
+                size_t sl, k;
+                int dup = 0;
+
+                memcpy(seg, p, len);
+                seg[len] = '\0';
+                if (g_rewrite_from) (void)rewrite_path_prefix(seg, sizeof(seg));
+                for (k = 0; k < n_seen; k++)
+                    if (strcmp(seen[k], seg) == 0) dup = 1;
+                if (!dup) {
+                    if (n_seen == sizeof(seen) / sizeof(*seen)) {
+                        fits = 0;
+                        break;
+                    }
+                    snprintf(seen[n_seen++], sizeof(*seen), "%s", seg);
+                    sl = strlen(seg);
+                    if (used + sl + (used ? 2 : 0) > 72)
+                        fits = 0;
+                    else
+                        used += (size_t)snprintf(d + used, sizeof(d) - used, "%s%s", used ? ", " : "", seg);
+                }
+            }
+            if (!semi) break;
+            p = semi + 1;
+        }
+        if (!fits) d[0] = '\0';
+    }
+    sb_stats_add(b, "Sources", a, d);
+
+    if (timing && timing->valid) {
+        struct tm t0, t1;
+        char s0[32], s1[32], dur[48];
+
+        s0[0] = s1[0] = '\0';
+        if (localtime_r(&timing->wall_start, &t0)) strftime(s0, sizeof(s0), "%Y-%m-%d", &t0);
+        if (localtime_r(&timing->wall_end, &t1)) strftime(s1, sizeof(s1), "%Y-%m-%d", &t1);
+        if (s0[0] && s1[0] && strcmp(s0, s1) != 0)
+            snprintf(a, sizeof(a), "%s \xe2\x80\x93 %s", s0, s1); /* en dash */
+        else
+            snprintf(a, sizeof(a), "%s", s0[0] ? s0 : s1);
+        format_duration_approx(timing->elapsed_sec, dur, sizeof(dur));
+        snprintf(d, sizeof(d), "%s%s", dur, timing->merged ? ", merged span" : "");
+        sb_stats_add(b, "Crawled", a, d);
+    }
+
+    if (basis_str && basis_str[0]) sb_stats_add(b, "Time basis", basis_str, NULL);
+}
+
 /* qsort comparators: the pass-2 reference list by shard (then uid), the
  * per-user tree list by displayed-root bytes (desc) for the picker emission. */
 static int sb_user_ref_by_shard(const void *a, const void *b) {
@@ -9593,6 +9754,8 @@ typedef struct {
     const ereport_sunburst_link_t *links;
     size_t n_links;
     size_t n;            /* pages to write = n_links - 1 */
+    const ereport_sunburst_stats_t *report_stats; /* highlights row; the user's own share is prepended */
+    uint64_t total_bytes, total_files;            /* report totals behind that share */
     _Atomic size_t next;
     _Atomic size_t wrote;
 } sb_user_write_pool_t;
@@ -9602,10 +9765,32 @@ static void *sb_user_write_worker(void *arg) {
 
     for (;;) {
         size_t i = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
+        ereport_sunburst_stat_t items[SB_STATS_MAX + 1];
+        ereport_sunburst_stats_t st = {items, 0};
+        char v[96], d[96];
 
         if (i >= p->n) return NULL;
+        if (p->report_stats && p->report_stats->n) {
+            uint64_t ub = ereport_sunburst_tree_total_bytes(p->trees[i].tree);
+            uint64_t uf = ereport_sunburst_tree_total_files(p->trees[i].tree);
+            char hb[32], hf[32], sb[16], sf[16];
+            size_t k;
+
+            human_bytes(ub, hb, sizeof(hb));
+            format_count_short(uf, hf, sizeof(hf));
+            format_share(ub, p->total_bytes, sb, sizeof(sb));
+            format_share(uf, p->total_files, sf, sizeof(sf));
+            snprintf(v, sizeof(v), "%s \xc2\xb7 %s files", hb, hf);            /* middle dot */
+            snprintf(d, sizeof(d), "%s of bytes \xc2\xb7 %s of files", sb, sf);
+            items[0].label = "This user";
+            items[0].value = v;
+            items[0].detail = d;
+            for (k = 0; k < p->report_stats->n && k < SB_STATS_MAX; k++) items[k + 1] = p->report_stats->items[k];
+            st.n = k + 1;
+        }
         if (ereport_sunburst_write_ex(p->trees[i].tree, p->udir, p->user_bases[i], p->user_names[i],
-                                      "../index.html", p->links, p->n_links, (long)(i + 1)) == 0)
+                                      "../index.html", p->links, p->n_links, (long)(i + 1),
+                                      st.n ? &st : NULL) == 0)
             atomic_fetch_add_explicit(&p->wrote, 1, memory_order_relaxed);
         else
             fprintf(stderr, "warn: failed to write per-user sunburst for %s\n", p->user_names[i]);
@@ -14275,6 +14460,15 @@ chunks_ready:
         ereport_sunburst_link_t *agg_links = NULL, *usr_links = NULL;
         char **user_names = NULL, **user_bases = NULL;
         size_t n_links = 0;
+        sb_stats_buf_t *sbst = calloc(1, sizeof(*sbst));
+        ereport_sunburst_stats_t stats = {NULL, 0};
+
+        if (sbst) {
+            sb_stats_build(sbst, &final_sum, all_users_mode, distinct_uid_count, target_uid, basis_str,
+                           bin_dir_count, storage_base_paths_label, &crawl_timing, &manifest_disk);
+            stats.items = sbst->items;
+            stats.n = sbst->n;
+        }
 
         /* The picker lists users by bytes desc; the bucket pass's shard order
          * is no longer needed once its maps are dropped. */
@@ -14285,7 +14479,7 @@ chunks_ready:
 
         if (ereport_sunburst_write_ex(g_sunburst_tree, g_bucket_output_dir, "sunburst",
                                       display_name, "index.html",
-                                      agg_links, n_links, 0) == 0) {
+                                      agg_links, n_links, 0, stats.n ? &stats : NULL) == 0) {
             g_sunburst_written = 1;
             if (g_ereport_verbose)
                 fprintf(stderr, "sunburst: %zu nodes materialized, wrote %s/sunburst.{json,html}\n",
@@ -14317,6 +14511,9 @@ chunks_ready:
                 wp.links = usr_links;
                 wp.n_links = n_links;
                 wp.n = n_links - 1;
+                wp.report_stats = stats.n ? &stats : NULL;
+                wp.total_bytes = final_sum.total_bytes;
+                wp.total_files = final_sum.total_files;
                 atomic_init(&wp.next, 0);
                 atomic_init(&wp.wrote, 0);
                 if ((size_t)nw > wp.n) nw = (int)wp.n;
@@ -14339,6 +14536,7 @@ chunks_ready:
 
         sunburst_user_links_free(agg_links, usr_links, user_names, user_bases, n_links);
         sb_user_trees_free();
+        free(sbst);
 
         ereport_sunburst_tree_free(g_sunburst_tree);
         g_sunburst_tree = NULL;

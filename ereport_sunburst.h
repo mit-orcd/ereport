@@ -120,6 +120,22 @@ typedef struct {
 } ereport_sunburst_link_t;
 
 /*
+ * Report highlights shown on the sunburst page above the legend: a short row
+ * of label / value / muted detail chips, pre-formatted by the caller (the
+ * page shows them verbatim, HTML-escaped). NULL or n == 0 hides the row.
+ */
+typedef struct {
+    const char *label;
+    const char *value;
+    const char *detail; /* NULL = none */
+} ereport_sunburst_stat_t;
+
+typedef struct {
+    const ereport_sunburst_stat_t *items;
+    size_t n;
+} ereport_sunburst_stats_t;
+
+/*
  * Write <out_dir>/<base_name>.json (the tool-agnostic data source) and
  * <out_dir>/<base_name>.html (the self-contained chart page, JSON embedded).
  * Returns 0 on success. JSON schema: one root node
@@ -133,13 +149,14 @@ typedef struct {
  * report_href is the relative link back to the report's index.html.
  * users/n_users/current_user describe the user picker: n_users == 0 hides it,
  * otherwise current_user is the selected option (the caller includes an
- * "all users" entry for the aggregate page).
+ * "all users" entry for the aggregate page). stats (may be NULL) is the
+ * highlights row.
  */
 int ereport_sunburst_write_ex(const ereport_sunburst_tree_t *t, const char *out_dir,
                               const char *base_name, const char *subject,
                               const char *report_href,
                               const ereport_sunburst_link_t *users, size_t n_users,
-                              long current_user);
+                              long current_user, const ereport_sunburst_stats_t *stats);
 
 /* Grand totals of the displayed root (subtree totals plus the collapsed
  * ancestors' boost), for picker labels and empty-tree detection. */
