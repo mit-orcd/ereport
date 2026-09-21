@@ -83,6 +83,16 @@ ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ere
                                                    const ereport_sunburst_ws_t *ws, unsigned depth_max,
                                                    const char *rewrite_from, const char *rewrite_to,
                                                    int want_buckets);
+/* ereport_sunburst_build() (serial) with one optional workspace per cats[]
+ * position: wss may be NULL, as may any entry; an entry is used only when its
+ * cat matches. For a uid whose records span several shards of a multi-capture
+ * report: one tree merged across those shards, sharing the shards' indexes. */
+ereport_sunburst_tree_t *ereport_sunburst_build_wss(crawl_bin_catalog_t *const *cats,
+                                                    ereport_sunburst_accum_t *accs, size_t n,
+                                                    const ereport_sunburst_ws_t *const *wss,
+                                                    unsigned depth_max,
+                                                    const char *rewrite_from, const char *rewrite_to,
+                                                    int want_buckets);
 
 /* Bucket-matrix access for the second pass. Cells are [age_bucket][size_bucket]
  * flattened to 36; both arrays have n_nodes * 36 entries when buckets were

@@ -632,7 +632,8 @@ static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
                                               ereport_sunburst_accum_t *accs, size_t n,
                                               unsigned depth_max, unsigned threads,
                                               const char *rewrite_from, const char *rewrite_to,
-                                              int want_buckets, const ereport_sunburst_ws_t *ws) {
+                                              int want_buckets,
+                                              const ereport_sunburst_ws_t *const *wss) {
     ereport_sunburst_tree_t *t = calloc(1, sizeof(*t));
     sb_shard_t *sh = NULL;
     size_t ns = 0;
@@ -674,9 +675,9 @@ static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
         sh[ns].cat = cat;
         sh[ns].acc = a;
         sh[ns].fi = (uint32_t)s;
-        if (ws && ws->cat == cat && ws->first_child && ws->next_sibling) {
-            sh[ns].first_child = ws->first_child;
-            sh[ns].next_sibling = ws->next_sibling;
+        if (wss && wss[s] && wss[s]->cat == cat && wss[s]->first_child && wss[s]->next_sibling) {
+            sh[ns].first_child = wss[s]->first_child;
+            sh[ns].next_sibling = wss[s]->next_sibling;
             sh[ns].borrowed_index = 1;
         }
         ns++;
@@ -925,9 +926,20 @@ ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ere
                                                    const char *rewrite_from, const char *rewrite_to,
                                                    int want_buckets) {
     crawl_bin_catalog_t *cats1[1];
+    const ereport_sunburst_ws_t *wss1[1];
 
     cats1[0] = cat;
-    return sb_build_impl(cats1, acc, 1, depth_max, 1, rewrite_from, rewrite_to, want_buckets, ws);
+    wss1[0] = ws;
+    return sb_build_impl(cats1, acc, 1, depth_max, 1, rewrite_from, rewrite_to, want_buckets, wss1);
+}
+
+ereport_sunburst_tree_t *ereport_sunburst_build_wss(crawl_bin_catalog_t *const *cats,
+                                                    ereport_sunburst_accum_t *accs, size_t n,
+                                                    const ereport_sunburst_ws_t *const *wss,
+                                                    unsigned depth_max,
+                                                    const char *rewrite_from, const char *rewrite_to,
+                                                    int want_buckets) {
+    return sb_build_impl(cats, accs, n, depth_max, 1, rewrite_from, rewrite_to, want_buckets, wss);
 }
 
 size_t ereport_sunburst_tree_nodes(const ereport_sunburst_tree_t *t) {

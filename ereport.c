@@ -990,15 +990,32 @@ static ereport_sunburst_tree_t *g_sunburst_tree = NULL;
 static int g_sunburst_users = 1;
 
 /* One built per-user sunburst tree, for the picker emission and the bucket
- * second pass's per-uid matrix credit. */
+ * second pass's per-uid matrix credit. A uid's records live in one shard per
+ * capture, so a multi-capture report can hold the same uid in several shards;
+ * the tree is then built across all of them (like the aggregate tree) and
+ * shards[] lists them: ereport_sunburst_dir_node_map(tree, k) is shards[k]'s map. */
 typedef struct {
     uint32_t uid;
-    uint64_t shard;                 /* file_index of the shard holding the uid's records */
+    uint32_t n_shards;
+    uint64_t *shards;               /* [n_shards] file_index, ascending */
     ereport_sunburst_tree_t *tree;
 } sb_user_tree_t;
 
-static sb_user_tree_t *g_sb_user_trees = NULL;  /* shard-sorted after the builds */
+static sb_user_tree_t *g_sb_user_trees = NULL;
 static size_t g_sb_user_trees_n = 0;
+
+/* Bucket second pass lookup: one entry per (shard, user tree), shard-sorted
+ * with [path_count+1] offsets, so a chunk's worker finds the trees of its
+ * shard's uids and the map position for that shard without a scan. */
+typedef struct {
+    uint64_t shard;
+    uint32_t uid;
+    uint32_t local;                 /* position of shard in the tree's shards[] */
+    ereport_sunburst_tree_t *tree;
+} sb_user_ref_t;
+
+static sb_user_ref_t *g_sb_ut_refs = NULL;
+static size_t g_sb_ut_refs_n = 0;
 static size_t *g_sb_ut_off = NULL;              /* [path_count+1] shard offsets, pass 2 only */
 static int g_sunburst_written = 0;
 
@@ -3580,13 +3597,29 @@ static void emit_heat_badge_tip_install_js(FILE *out);
 /* Per-user sunburst pages (aggregate mode)                           */
 /* ------------------------------------------------------------------ */
 
-/* qsort comparators for the per-user tree list: by shard for the bucket
- * second pass's uid->tree lookup, by displayed-root bytes (desc) for the
- * picker emission. */
-static int sb_user_tree_by_shard(const void *a, const void *b) {
-    const sb_user_tree_t *x = a, *y = b;
+/* qsort comparators: the pass-2 reference list by shard (then uid), the
+ * per-user tree list by displayed-root bytes (desc) for the picker emission. */
+static int sb_user_ref_by_shard(const void *a, const void *b) {
+    const sb_user_ref_t *x = a, *y = b;
     if (x->shard != y->shard) return x->shard < y->shard ? -1 : 1;
     return (x->uid > y->uid) - (x->uid < y->uid);
+}
+
+static void sb_user_trees_free(void) {
+    size_t k;
+
+    for (k = 0; k < g_sb_user_trees_n; k++) {
+        ereport_sunburst_tree_free(g_sb_user_trees[k].tree);
+        free(g_sb_user_trees[k].shards);
+    }
+    free(g_sb_user_trees);
+    g_sb_user_trees = NULL;
+    g_sb_user_trees_n = 0;
+    free(g_sb_ut_refs);
+    g_sb_ut_refs = NULL;
+    g_sb_ut_refs_n = 0;
+    free(g_sb_ut_off);
+    g_sb_ut_off = NULL;
 }
 
 static int sb_user_tree_by_bytes(const void *a, const void *b) {
@@ -3664,18 +3697,24 @@ static size_t sunburst_user_links_build(ereport_sunburst_link_t **agg_out,
         if (!names[k]) goto fail;
 
         /* File base: sanitized, then made unique among the pages already
-         * assigned (two uids can share a name, e.g. UNKNOWN). */
+         * assigned (two uids can share a name, e.g. UNKNOWN): first by
+         * appending the uid, then by numbering. Re-checked after every
+         * suffix so two pages can never share a file. */
         sb_user_base_sanitize(base, sizeof(base), nm, uid);
-        dup = 0;
-        for (j = 0; j < k; j++) {
-            if (bases[j] && strcmp(bases[j], base) == 0) {
-                dup = 1;
-                break;
+        bl = strlen(base);
+        for (unsigned tries = 0; tries < 1000u; tries++) {
+            dup = 0;
+            for (j = 0; j < k; j++) {
+                if (bases[j] && strcmp(bases[j], base) == 0) {
+                    dup = 1;
+                    break;
+                }
             }
-        }
-        if (dup) {
-            bl = strlen(base);
-            snprintf(base + bl, sizeof(base) - bl, "-%u", (unsigned)uid);
+            if (!dup) break;
+            if (tries == 0)
+                snprintf(base + bl, sizeof(base) - bl, "-%u", (unsigned)uid);
+            else
+                snprintf(base + bl, sizeof(base) - bl, "-%u-%u", (unsigned)uid, tries + 1);
         }
         bases[k] = strdup(base);
         if (!bases[k]) goto fail;
@@ -9044,13 +9083,24 @@ static void *sunburst_uid_merge_worker(void *arg) {
     return NULL;
 }
 
-/* Per-user tree build pool. Work unit = (shard, range of that shard's uids).
+/* Per-user tree build pool.
  *
- * A whole shard was the unit at first: the thread that claimed it built the
- * shard's workspace (child index) and one dense scratch accumulator and ran
- * every uid through them. That fixed the serial version (~140 s of a 166 s
- * wall on a 7,660-user report, page faults and TLB shootdowns from a fresh
- * index per uid), but left a tail: every build costs an O(catalog dirs)
+ * Two kinds of work unit. A uid whose records sit in one shard (every uid of a
+ * single-capture report, most uids of a multi-capture one) is built from that
+ * shard alone, and the unit is (shard, range of that shard's uids). A uid seen
+ * in several shards -- a multi-capture report where one account has data on
+ * more than one server -- gets one tree merged across those shards, the way
+ * the aggregate tree merges every shard by path; such uids are pulled out of
+ * the per-shard ranges (plan->skip) and grouped, and a multi-shard unit is a
+ * range of groups. Before this, each (uid, shard) pair became its own tree:
+ * the picker listed the same account once per server with per-server totals,
+ * and the pages collided on one file name.
+ *
+ * A whole shard was the single-shard unit at first: the thread that claimed it
+ * built the shard's workspace (child index) and one dense scratch accumulator
+ * and ran every uid through them. That fixed the serial version (~140 s of a
+ * 166 s wall on a 7,660-user report, page faults and TLB shootdowns from a
+ * fresh index per uid), but left a tail: every build costs an O(catalog dirs)
  * rollup, so one shard with a 10M-directory catalog and a hundred users ran
  * alone for ~8 s while 31 threads idled (timeline: 20 CPUs busy falling to 1).
  *
@@ -9059,32 +9109,56 @@ static void *sunburst_uid_merge_worker(void *arg) {
  * and by how many 16-byte-per-dir scratches fit the memory budget. Units of a
  * shard share one read-only workspace: the first thread to arrive builds it
  * (ws_state 0 -> 1 -> 2, or 3 if the allocation failed and builds go without),
- * later arrivals spin-wait the few tens of ms that takes. Each unit owns its
- * scratch. The last unit to finish (units_left hits 0) frees the workspace and
- * the shard's sparse maps.
+ * later arrivals spin-wait the few tens of ms that takes. Each single-shard
+ * unit owns its scratch; a multi-shard unit keeps one scratch per shard it
+ * touches for its duration (cleared between groups, O(touched x depth)) and
+ * borrows the same shared workspaces. units_left counts one per single-shard
+ * unit and one per (group, shard) membership in multi-shard units; the
+ * release that takes it to 0 frees the workspace and the shard's sparse maps.
  *
- * Output: one slot per registered uid at out[off[fi] + ui], tree NULL where
- * the uid produced nothing; main compacts, keeping shard order then uid
- * registration order (the sequential loop's order). */
+ * Output: one slot per registered uid at out[off[fi] + ui] (NULL tree for
+ * skipped or empty uids), then one slot per group at out[multi_off + g]; main
+ * compacts the non-NULL slots. */
 typedef struct {
-    size_t fi;
-    size_t ui_begin, ui_end;
+    uint32_t uid;
+    uint32_t fi;                /* shard file_index */
+    uint32_t ui;                /* slot in sets[fi].v */
+} sb_uid_ref_t;
+
+typedef struct {
+    size_t ref_begin, ref_end;  /* members in plan->refs, fi ascending */
+} sb_user_group_t;
+
+typedef struct {
+    size_t fi;                  /* single-shard unit: the shard; SIZE_MAX marks a multi-shard unit */
+    size_t ui_begin, ui_end;    /* single: uid slot range of sets[fi] */
+    size_t g_begin, g_end;      /* multi: group range in plan->groups */
 } sb_user_build_unit_t;
+
+typedef struct {
+    sb_user_build_unit_t *units;
+    size_t n_units;
+    sb_uid_ref_t *refs;         /* multi-shard members, grouped by uid, fi ascending */
+    size_t n_refs;
+    sb_user_group_t *groups;    /* biggest (sum of member shards' dirs) first */
+    size_t n_groups;
+    unsigned char *skip;        /* [total_uids] 1 = slot off[fi] + ui belongs to a group; NULL = none */
+} sb_user_build_plan_t;
 
 typedef struct {
     ereport_sunburst_ws_t ws;
     _Atomic int ws_state;      /* 0 unbuilt, 1 building, 2 ready, 3 unavailable */
-    _Atomic size_t units_left; /* units of this shard not yet finished */
+    _Atomic size_t units_left; /* releases owed to this shard */
 } sb_user_build_shard_t;
 
 typedef struct {
     sb_uid_set_t *sets; /* g_sunburst_uid_acc, consumed (cells freed) as shards complete */
     file_state_t *file_states;
     size_t path_count;
-    sb_user_tree_t *out;    /* [sum of sets[fi].n] slot per uid */
-    const size_t *off;      /* [path_count + 1] slice starts */
-    sb_user_build_unit_t *units;
-    size_t n_units;
+    sb_user_tree_t *out;    /* [sum of sets[fi].n + n_groups] */
+    const size_t *off;      /* [path_count + 1] per-shard slice starts */
+    size_t multi_off;       /* group slots start here */
+    const sb_user_build_plan_t *plan;
     sb_user_build_shard_t *shards; /* [path_count] */
     _Atomic size_t next;
     _Atomic unsigned long build_failed;
@@ -9097,7 +9171,7 @@ static void sunburst_uid_scratch_clear(const sb_uid_slot_t *u, const crawl_bin_c
 static uint64_t sb_replica_budget_bytes(void);
 
 typedef struct {
-    size_t fi;
+    size_t fi;      /* shard index, or group index for the multi-shard sort */
     uint64_t cost;
 } sb_shard_cost_t;
 
@@ -9108,38 +9182,208 @@ static int sb_shard_cost_desc(const void *a, const void *b) {
     return x->fi < y->fi ? -1 : (x->fi > y->fi);
 }
 
-/* Lay out the work units. Returns the unit count (0 = nothing to build), or
- * (size_t)-1 on allocation failure. *units_out is malloc'd. */
-static size_t sb_user_build_plan(const sb_uid_set_t *sets, const file_state_t *file_states,
-                                 size_t path_count, int nthreads, sb_user_build_unit_t **units_out) {
-    sb_shard_cost_t *costs;
-    sb_user_build_unit_t *units;
-    size_t fi, n_costs = 0, n_units = 0, cap_units = 0;
-    uint64_t total = 0, target;
+static int sb_uid_ref_cmp(const void *a, const void *b) {
+    const sb_uid_ref_t *x = a, *y = b;
+
+    if (x->uid != y->uid) return x->uid < y->uid ? -1 : 1;
+    return x->fi < y->fi ? -1 : (x->fi > y->fi);
+}
+
+static void sb_user_build_plan_free(sb_user_build_plan_t *pl) {
+    free(pl->units);
+    free(pl->refs);
+    free(pl->groups);
+    free(pl->skip);
+    memset(pl, 0, sizeof(*pl));
+}
+
+static int sb_user_build_unit_push(sb_user_build_plan_t *pl, size_t *cap, const sb_user_build_unit_t *u) {
+    if (pl->n_units == *cap) {
+        size_t nc = *cap ? *cap * 2 : 64;
+        sb_user_build_unit_t *nu = realloc(pl->units, nc * sizeof(*nu));
+
+        if (!nu) return -1;
+        pl->units = nu;
+        *cap = nc;
+    }
+    pl->units[pl->n_units++] = *u;
+    return 0;
+}
+
+/* Find the uids present in more than one shard and group their (shard, slot)
+ * members; sets pl->refs/groups/skip. Nothing to do for one shard. */
+static int sb_user_build_group_multi(const sb_uid_set_t *sets, const file_state_t *file_states,
+                                     size_t path_count, const size_t *off, size_t total_uids,
+                                     sb_user_build_plan_t *pl) {
+    sb_uid_ref_t *all;
+    size_t fi, i, n_all = 0, n_multi = 0, n_groups = 0;
+
+    if (path_count < 2 || total_uids == 0) return 0;
+    all = malloc(total_uids * sizeof(*all));
+    if (!all) return -1;
+    for (fi = 0; fi < path_count; fi++) {
+        const sb_uid_set_t *s = &sets[fi];
+        size_t ui;
+
+        if (!file_states[fi].catalog) continue;
+        for (ui = 0; ui < s->n; ui++) {
+            all[n_all].uid = s->v[ui].uid;
+            all[n_all].fi = (uint32_t)fi;
+            all[n_all].ui = (uint32_t)ui;
+            n_all++;
+        }
+    }
+    if (n_all > 1) qsort(all, n_all, sizeof(*all), sb_uid_ref_cmp);
+    for (i = 0; i < n_all;) {
+        size_t j = i + 1;
+
+        while (j < n_all && all[j].uid == all[i].uid) j++;
+        if (j - i > 1) {
+            n_multi += j - i;
+            n_groups++;
+        }
+        i = j;
+    }
+    if (n_groups == 0) {
+        free(all);
+        return 0;
+    }
+    pl->refs = malloc(n_multi * sizeof(*pl->refs));
+    pl->groups = malloc(n_groups * sizeof(*pl->groups));
+    pl->skip = calloc(total_uids, 1);
+    if (!pl->refs || !pl->groups || !pl->skip) {
+        free(all);
+        return -1;
+    }
+    for (i = 0; i < n_all;) {
+        size_t j = i + 1;
+
+        while (j < n_all && all[j].uid == all[i].uid) j++;
+        if (j - i > 1) {
+            sb_user_group_t *g = &pl->groups[pl->n_groups++];
+            size_t k;
+
+            g->ref_begin = pl->n_refs;
+            for (k = i; k < j; k++) {
+                pl->refs[pl->n_refs++] = all[k];
+                pl->skip[off[all[k].fi] + all[k].ui] = 1;
+            }
+            g->ref_end = pl->n_refs;
+        }
+        i = j;
+    }
+    free(all);
+    return 0;
+}
+
+/* Lay out the work units. Returns 0 (pl->n_units may be 0: nothing to build)
+ * or -1 on allocation failure; pl is zeroed on entry and owned by the caller
+ * (sb_user_build_plan_free). */
+static int sb_user_build_plan(const sb_uid_set_t *sets, const file_state_t *file_states,
+                              size_t path_count, const size_t *off, size_t total_uids,
+                              int nthreads, sb_user_build_plan_t *pl) {
+    sb_shard_cost_t *costs = NULL;
+    size_t fi, n_costs = 0, cap_units = 0, g;
+    uint64_t total = 0, multi_total = 0, target;
     uint64_t budget = sb_replica_budget_bytes();
 
-    *units_out = NULL;
+    memset(pl, 0, sizeof(*pl));
     if (nthreads < 1) nthreads = 1;
+    if (sb_user_build_group_multi(sets, file_states, path_count, off, total_uids, pl) != 0) goto fail;
+
+    /* Cost of the multi-shard groups: dirs of every member shard. */
+    for (g = 0; g < pl->n_groups; g++) {
+        size_t r;
+
+        for (r = pl->groups[g].ref_begin; r < pl->groups[g].ref_end; r++)
+            multi_total += (uint64_t)file_states[pl->refs[r].fi].catalog->max_dir_id + 1u;
+    }
+    total = multi_total;
+
     costs = malloc((path_count ? path_count : 1) * sizeof(*costs));
-    if (!costs) return (size_t)-1;
+    if (!costs) goto fail;
     for (fi = 0; fi < path_count; fi++) {
         const crawl_bin_catalog_t *cat = file_states[fi].catalog;
+        size_t n_single = sets[fi].n, ui;
 
         if (!cat || sets[fi].n == 0) continue;
+        if (pl->skip)
+            for (ui = 0; ui < sets[fi].n; ui++) n_single -= pl->skip[off[fi] + ui];
+        if (n_single == 0) continue;
         costs[n_costs].fi = fi;
-        costs[n_costs].cost = (uint64_t)sets[fi].n * ((uint64_t)cat->max_dir_id + 1u);
+        costs[n_costs].cost = (uint64_t)n_single * ((uint64_t)cat->max_dir_id + 1u);
         total += costs[n_costs].cost;
         n_costs++;
     }
-    if (n_costs == 0) {
+    if (n_costs == 0 && pl->n_groups == 0) {
         free(costs);
         return 0;
     }
-    qsort(costs, n_costs, sizeof(*costs), sb_shard_cost_desc);
+    if (n_costs > 1) qsort(costs, n_costs, sizeof(*costs), sb_shard_cost_desc);
     /* ~4 units per thread overall keeps the tail short without making the
      * per-unit scratch setup (a populated 16 B x dirs calloc) significant. */
     target = total / ((uint64_t)nthreads * 4u);
     if (target == 0) target = 1;
+
+    /* Multi-shard units first: the biggest trees, so they start early. */
+    if (pl->n_groups) {
+        sb_shard_cost_t *gc = malloc(pl->n_groups * sizeof(*gc));
+        sb_user_group_t *sorted = malloc(pl->n_groups * sizeof(*sorted));
+        unsigned char *seen = calloc(path_count, 1);
+        uint64_t footprint = 0, parts, per_unit, acc = 0;
+        size_t r, ub = 0;
+
+        if (!gc || !sorted || !seen) {
+            free(gc);
+            free(sorted);
+            free(seen);
+            goto fail;
+        }
+        for (g = 0; g < pl->n_groups; g++) {
+            gc[g].fi = g;
+            gc[g].cost = 0;
+            for (r = pl->groups[g].ref_begin; r < pl->groups[g].ref_end; r++) {
+                uint32_t sfi = pl->refs[r].fi;
+                uint64_t nd = (uint64_t)file_states[sfi].catalog->max_dir_id + 1u;
+
+                gc[g].cost += nd;
+                if (!seen[sfi]) {
+                    seen[sfi] = 1;
+                    footprint += nd * 16u; /* a unit may end up holding every such shard's scratch */
+                }
+            }
+        }
+        if (pl->n_groups > 1) qsort(gc, pl->n_groups, sizeof(*gc), sb_shard_cost_desc);
+        for (g = 0; g < pl->n_groups; g++) sorted[g] = pl->groups[gc[g].fi];
+        free(pl->groups);
+        pl->groups = sorted;
+        free(seen);
+
+        parts = (multi_total + target - 1) / target;
+        if (parts > (uint64_t)nthreads) parts = (uint64_t)nthreads;
+        if (parts > pl->n_groups) parts = pl->n_groups;
+        if (footprint && parts > budget / footprint) parts = budget / footprint;
+        if (parts < 1) parts = 1;
+        per_unit = (multi_total + parts - 1) / parts;
+        for (g = 0; g < pl->n_groups; g++) {
+            acc += gc[g].cost;
+            if (acc >= per_unit || g + 1 == pl->n_groups) {
+                sb_user_build_unit_t u;
+
+                u.fi = SIZE_MAX;
+                u.ui_begin = u.ui_end = 0;
+                u.g_begin = ub;
+                u.g_end = g + 1;
+                if (sb_user_build_unit_push(pl, &cap_units, &u) != 0) {
+                    free(gc);
+                    goto fail;
+                }
+                ub = g + 1;
+                acc = 0;
+            }
+        }
+        free(gc);
+    }
 
     for (fi = 0; fi < n_costs; fi++) {
         const sb_uid_set_t *s = &sets[costs[fi].fi];
@@ -9155,28 +9399,171 @@ static size_t sb_user_build_plan(const sb_uid_set_t *sets, const file_state_t *f
         if (parts < 1) parts = 1;
         per = (s->n + (size_t)parts - 1) / (size_t)parts;
         for (k = 0; k < s->n; k += per) {
-            if (n_units == cap_units) {
-                size_t nc = cap_units ? cap_units * 2 : 64;
-                sb_user_build_unit_t *nu = realloc(*units_out, nc * sizeof(*nu));
+            sb_user_build_unit_t u;
 
-                if (!nu) {
-                    free(*units_out);
-                    *units_out = NULL;
-                    free(costs);
-                    return (size_t)-1;
-                }
-                *units_out = nu;
-                cap_units = nc;
-            }
-            units = *units_out;
-            units[n_units].fi = costs[fi].fi;
-            units[n_units].ui_begin = k;
-            units[n_units].ui_end = k + per < s->n ? k + per : s->n;
-            n_units++;
+            u.fi = costs[fi].fi;
+            u.ui_begin = k;
+            u.ui_end = k + per < s->n ? k + per : s->n;
+            u.g_begin = u.g_end = 0;
+            if (sb_user_build_unit_push(pl, &cap_units, &u) != 0) goto fail;
         }
     }
     free(costs);
-    return n_units;
+    return 0;
+
+fail:
+    free(costs);
+    sb_user_build_plan_free(pl);
+    return -1;
+}
+
+/* Shared per-shard workspace: first arrival builds it, the rest wait for it.
+ * NULL when unavailable (a failure only costs speed: the build allocates its
+ * own index). */
+static const ereport_sunburst_ws_t *sb_user_build_ws_get(sb_user_build_shard_t *sh,
+                                                         const crawl_bin_catalog_t *cat) {
+    int st = 0;
+
+    if (atomic_compare_exchange_strong(&sh->ws_state, &st, 1)) {
+        st = ereport_sunburst_ws_init(&sh->ws, cat) == 0 ? 2 : 3;
+        atomic_store(&sh->ws_state, st);
+    } else {
+        while ((st = atomic_load(&sh->ws_state)) < 2) {
+            struct timespec ts = {0, 200000}; /* 200 us */
+
+            nanosleep(&ts, NULL);
+        }
+    }
+    return st == 2 ? &sh->ws : NULL;
+}
+
+/* One release owed to the shard; the last one frees what its units shared. */
+static void sb_user_build_shard_release(sb_user_build_pool_t *p, size_t fi) {
+    sb_user_build_shard_t *sh = &p->shards[fi];
+
+    if (atomic_fetch_sub(&sh->units_left, 1) == 1) {
+        sb_uid_set_t *s = &p->sets[fi];
+        size_t ui;
+
+        if (atomic_load(&sh->ws_state) == 2) ereport_sunburst_ws_free(&sh->ws);
+        for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+        free(s->v);
+        s->v = NULL;
+        s->n = s->cap = 0;
+    }
+}
+
+/* Keep a built tree (dropping empty ones) with its shard list: refs[0..m) for
+ * a multi-shard build, else the single shard fi. */
+static void sb_user_build_store(sb_user_build_pool_t *p, sb_user_tree_t *slot, ereport_sunburst_tree_t *ut,
+                                uint32_t uid, const sb_uid_ref_t *refs, size_t m, size_t fi) {
+    size_t k;
+
+    if (!ut) {
+        atomic_fetch_add_explicit(&p->build_failed, 1, memory_order_relaxed);
+        return;
+    }
+    if (ereport_sunburst_tree_total_bytes(ut) == 0 && ereport_sunburst_tree_total_files(ut) == 0) {
+        ereport_sunburst_tree_free(ut);
+        return;
+    }
+    slot->shards = malloc(m * sizeof(*slot->shards));
+    if (!slot->shards) {
+        ereport_sunburst_tree_free(ut);
+        atomic_fetch_add_explicit(&p->build_failed, 1, memory_order_relaxed);
+        return;
+    }
+    for (k = 0; k < m; k++) slot->shards[k] = refs ? (uint64_t)refs[k].fi : (uint64_t)fi;
+    slot->n_shards = (uint32_t)m;
+    slot->uid = uid;
+    slot->tree = ut;
+}
+
+static void sb_user_build_single(sb_user_build_pool_t *p, const sb_user_build_unit_t *unit) {
+    size_t fi = unit->fi, ui;
+    sb_uid_set_t *s = &p->sets[fi];
+    crawl_bin_catalog_t *cat = p->file_states[fi].catalog;
+    const unsigned char *skip = p->plan->skip ? p->plan->skip + p->off[fi] : NULL;
+    ereport_sunburst_accum_t scratch;
+    const ereport_sunburst_ws_t *wsp = NULL;
+    int have_scratch = 0;
+
+    if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
+        have_scratch = 1;
+    else
+        atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
+    if (have_scratch) wsp = sb_user_build_ws_get(&p->shards[fi], cat);
+
+    for (ui = unit->ui_begin; have_scratch && ui < unit->ui_end; ui++) {
+        ereport_sunburst_tree_t *ut;
+
+        if (skip && skip[ui]) continue;
+        sunburst_uid_densify(&s->v[ui], &scratch);
+        ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth,
+                                       g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
+        sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
+        sb_user_build_store(p, &p->out[p->off[fi] + ui], ut, s->v[ui].uid, NULL, 1, fi);
+    }
+    if (have_scratch) ereport_sunburst_accum_free(&scratch);
+    sb_user_build_shard_release(p, fi);
+}
+
+static void sb_user_build_multi(sb_user_build_pool_t *p, const sb_user_build_unit_t *unit) {
+    const sb_user_build_plan_t *pl = p->plan;
+    size_t pc = p->path_count, g, r, fi;
+    ereport_sunburst_accum_t *sc = calloc(pc, sizeof(*sc)); /* .bytes NULL = not held */
+    crawl_bin_catalog_t **cats = malloc(pc * sizeof(*cats));
+    ereport_sunburst_accum_t *accs = malloc(pc * sizeof(*accs));
+    const ereport_sunburst_ws_t **wss = malloc(pc * sizeof(*wss));
+
+    if (sc && cats && accs && wss) {
+        for (g = unit->g_begin; g < unit->g_end; g++) {
+            const sb_user_group_t *grp = &pl->groups[g];
+            const sb_uid_ref_t *refs = pl->refs + grp->ref_begin;
+            size_t m = grp->ref_end - grp->ref_begin, k;
+            ereport_sunburst_tree_t *ut;
+            int ok = 1;
+
+            for (k = 0; k < m && ok; k++) {
+                crawl_bin_catalog_t *cat = p->file_states[refs[k].fi].catalog;
+
+                if (!sc[refs[k].fi].bytes &&
+                    (ereport_sunburst_accum_init(&sc[refs[k].fi], cat->max_dir_id) != 0 ||
+                     !sc[refs[k].fi].bytes))
+                    ok = 0;
+            }
+            if (!ok) {
+                atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
+                continue;
+            }
+            for (k = 0; k < m; k++) {
+                crawl_bin_catalog_t *cat = p->file_states[refs[k].fi].catalog;
+
+                sunburst_uid_densify(&p->sets[refs[k].fi].v[refs[k].ui], &sc[refs[k].fi]);
+                cats[k] = cat;
+                accs[k] = sc[refs[k].fi];
+                wss[k] = sb_user_build_ws_get(&p->shards[refs[k].fi], cat);
+            }
+            ut = ereport_sunburst_build_wss(cats, accs, m, wss, g_sunburst_depth,
+                                            g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
+            for (k = 0; k < m; k++)
+                sunburst_uid_scratch_clear(&p->sets[refs[k].fi].v[refs[k].ui],
+                                           p->file_states[refs[k].fi].catalog, &sc[refs[k].fi]);
+            sb_user_build_store(p, &p->out[p->multi_off + g], ut, refs[0].uid, refs, m, 0);
+        }
+        for (fi = 0; fi < pc; fi++)
+            if (sc[fi].bytes) ereport_sunburst_accum_free(&sc[fi]);
+    } else {
+        atomic_fetch_add_explicit(&p->scratch_failed, unit->g_end - unit->g_begin, memory_order_relaxed);
+    }
+    free(sc);
+    free(cats);
+    free(accs);
+    free(wss);
+    /* One release per (group, shard) membership, matching the plan's count. */
+    for (g = unit->g_begin; g < unit->g_end; g++)
+        for (r = pl->groups[g].ref_begin; r < pl->groups[g].ref_end; r++)
+            sb_user_build_shard_release(p, pl->refs[r].fi);
 }
 
 static void *sb_user_build_worker(void *arg) {
@@ -9184,74 +9571,12 @@ static void *sb_user_build_worker(void *arg) {
 
     for (;;) {
         size_t u = atomic_fetch_add_explicit(&p->next, 1, memory_order_relaxed);
-        const sb_user_build_unit_t *unit;
-        sb_uid_set_t *s;
-        sb_user_build_shard_t *sh;
-        crawl_bin_catalog_t *cat;
-        ereport_sunburst_accum_t scratch;
-        const ereport_sunburst_ws_t *wsp = NULL;
-        int have_scratch = 0, st;
-        size_t fi, ui;
 
-        if (u >= p->n_units) return NULL;
-        unit = &p->units[u];
-        fi = unit->fi;
-        s = &p->sets[fi];
-        sh = &p->shards[fi];
-        cat = p->file_states[fi].catalog;
-
-        if (ereport_sunburst_accum_init(&scratch, cat->max_dir_id) == 0 && scratch.bytes)
-            have_scratch = 1;
+        if (u >= p->plan->n_units) return NULL;
+        if (p->plan->units[u].fi == SIZE_MAX)
+            sb_user_build_multi(p, &p->plan->units[u]);
         else
-            atomic_fetch_add_explicit(&p->scratch_failed, 1, memory_order_relaxed);
-
-        /* Shared workspace: first arrival builds it, the rest wait for it. A
-         * workspace failure only costs speed: the build allocates its own index. */
-        if (have_scratch) {
-            st = 0;
-            if (atomic_compare_exchange_strong(&sh->ws_state, &st, 1)) {
-                st = ereport_sunburst_ws_init(&sh->ws, cat) == 0 ? 2 : 3;
-                atomic_store(&sh->ws_state, st);
-            } else {
-                while ((st = atomic_load(&sh->ws_state)) < 2) {
-                    struct timespec ts = {0, 200000}; /* 200 us */
-
-                    nanosleep(&ts, NULL);
-                }
-            }
-            if (st == 2) wsp = &sh->ws;
-        }
-
-        for (ui = unit->ui_begin; have_scratch && ui < unit->ui_end; ui++) {
-            ereport_sunburst_tree_t *ut;
-            sb_user_tree_t *slot = &p->out[p->off[fi] + ui];
-
-            sunburst_uid_densify(&s->v[ui], &scratch);
-            ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth,
-                                           g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
-            sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
-            if (!ut) {
-                atomic_fetch_add_explicit(&p->build_failed, 1, memory_order_relaxed);
-                continue;
-            }
-            if (ereport_sunburst_tree_total_bytes(ut) == 0 && ereport_sunburst_tree_total_files(ut) == 0) {
-                ereport_sunburst_tree_free(ut);
-                continue;
-            }
-            slot->uid = s->v[ui].uid;
-            slot->shard = fi;
-            slot->tree = ut;
-        }
-        if (have_scratch) ereport_sunburst_accum_free(&scratch);
-
-        /* Last unit of the shard out releases what the units shared. */
-        if (atomic_fetch_sub(&sh->units_left, 1) == 1) {
-            if (atomic_load(&sh->ws_state) == 2) ereport_sunburst_ws_free(&sh->ws);
-            for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
-            free(s->v);
-            s->v = NULL;
-            s->n = s->cap = 0;
-        }
+            sb_user_build_single(p, &p->plan->units[u]);
     }
 }
 
@@ -9862,10 +10187,11 @@ typedef struct {
     time_t now;
     inode_set_t *seen_inodes;       /* quiescent; winner replay is read-only */
     ereport_sunburst_tree_t *tree;  /* matrices + dir->node maps to credit */
-    /* Per-user trees, shard-sorted, with [path_count+1] shard offsets: each
-     * matched record also lands in its owner's tree matrix. NULL when
-     * per-user pages or buckets are off. */
-    const sb_user_tree_t *utrees;
+    /* Per-user tree references, shard-sorted, with [path_count+1] shard
+     * offsets: each matched record also lands in its owner's tree matrix,
+     * through that tree's map for this shard. NULL when per-user pages or
+     * buckets are off. */
+    const sb_user_ref_t *urefs;
     const size_t *ut_off;
     /* Per-worker replica of the CURRENT uid's matrix, kept all-zero except
      * the cells of the nodes on the u_dirty stack, which merge into the
@@ -10026,7 +10352,7 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
      * Within a directory run the uid barely changes, so both hit nearly
      * always. Stores go to the worker's private replica of the current uid's
      * matrix (u_tree), never to the shared matrix directly. */
-    const sb_user_tree_t *ut = NULL;
+    const sb_user_ref_t *ut = NULL;
     size_t ut_n = 0;
     uint32_t u_last_uid = UINT32_MAX;
     const uint32_t *u_map = NULL;
@@ -10035,9 +10361,9 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     size_t u_ndirty = 0;
     uint64_t u_last_dir = UINT64_MAX;
     uint32_t u_last_node = 0;
-    if (arg->utrees && arg->ut_off) {
+    if (arg->urefs && arg->ut_off) {
         uint64_t s = chunk->file_index;
-        ut = arg->utrees + arg->ut_off[s];
+        ut = arg->urefs + arg->ut_off[s];
         ut_n = arg->ut_off[s + 1] - arg->ut_off[s];
     }
 
@@ -10144,7 +10470,7 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
          * for the aggregate map covers this lookup too. */
         if (ut_n) {
             if ((uint32_t)r.uid != u_last_uid) {
-                const sb_user_tree_t *cand = NULL;
+                const sb_user_ref_t *cand = NULL;
                 size_t k;
 
                 u_last_uid = (uint32_t)r.uid;
@@ -10163,7 +10489,7 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
                         u_ndirty = 0;
                     }
                     u_tree = cand ? cand->tree : NULL;
-                    u_map = u_tree ? ereport_sunburst_dir_node_map(u_tree, 0) : NULL;
+                    u_map = u_tree ? ereport_sunburst_dir_node_map(u_tree, cand->local) : NULL;
                     u_bb = u_tree ? ereport_sunburst_bucket_bytes(u_tree) : NULL;
                     u_bf = u_tree ? ereport_sunburst_bucket_files(u_tree) : NULL;
                 }
@@ -13346,72 +13672,80 @@ chunks_ready:
             g_sunburst_acc = NULL;
         }
 
-        /* Per-user sunburst trees: each uid's records live in exactly one
-         * shard, so each tree builds from that shard's catalog and the uid's
-         * own accumulator (n=1: no cross-shard merge). Runs here for the same
-         * reason as the aggregate build: workers have joined and the catalogs
-         * are still attached. sb_user_build_plan splits the work into
-         * (shard, uid range) units for a pool of threads (sb_user_build_worker);
-         * each expands its uids one at a time into a dense scratch accumulator
-         * against the shard's shared workspace. */
+        /* Per-user sunburst trees. A uid's records live in one shard per
+         * capture, so a uid seen in one shard builds from that shard alone
+         * and a uid seen in several (multi-capture report) builds across all
+         * of them, merged by path like the aggregate tree. Runs here for the
+         * same reason as the aggregate build: workers have joined and the
+         * catalogs are still attached. sb_user_build_plan lays out the work
+         * units for a pool of threads (sb_user_build_worker); each expands
+         * its uids one at a time into dense scratch accumulators against the
+         * shards' shared workspaces. */
         if (g_sunburst_uid_acc) {
             double vt_u0 = g_ereport_verbose ? now_sec() : 0.0;
             size_t fi, total_uids = 0;
             size_t *uoff = calloc(path_count + 1, sizeof(*uoff));
-            size_t *n_out = calloc(path_count ? path_count : 1, sizeof(*n_out));
             sb_user_tree_t *out = NULL;
+            int drop_sets = 0;
 
             for (fi = 0; fi < path_count; fi++) {
                 if (uoff) uoff[fi] = total_uids;
                 total_uids += g_sunburst_uid_acc[fi].n;
             }
             if (uoff) uoff[path_count] = total_uids;
-            if (total_uids) out = calloc(total_uids, sizeof(*out));
-            if (!uoff || !n_out || (total_uids && !out)) {
+            if (!uoff) {
                 fprintf(stderr, "warn: per-user sunburst list allocation failed; user picker disabled\n");
-                for (fi = 0; fi < path_count; fi++) {
-                    sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
-                    size_t ui;
-                    for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
-                    free(s->v);
-                }
+                drop_sets = 1;
             } else if (total_uids) {
                 sb_user_build_pool_t pool;
-                sb_user_build_unit_t *units = NULL;
+                sb_user_build_plan_t plan;
                 sb_user_build_shard_t *shards = calloc(path_count, sizeof(*shards));
                 pthread_t *bt = calloc((size_t)threads_used, sizeof(*bt));
                 int nb = threads_used, started = 0;
-                size_t k, w = 0, n_units;
+                size_t k, w = 0, n_slots;
 
                 if (nb < 1) nb = 1;
-                n_units = sb_user_build_plan(g_sunburst_uid_acc, file_states, path_count, nb, &units);
-                if (n_units == (size_t)-1 || !shards) {
+                if (sb_user_build_plan(g_sunburst_uid_acc, file_states, path_count, uoff, total_uids,
+                                       nb, &plan) != 0 || !shards) {
                     fprintf(stderr, "warn: per-user sunburst plan allocation failed; user picker disabled\n");
-                    for (fi = 0; fi < path_count; fi++) {
-                        sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
-                        size_t ui;
-                        for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
-                        free(s->v);
+                    drop_sets = 1;
+                    plan.n_units = 0;
+                }
+                n_slots = total_uids + plan.n_groups;
+                if (plan.n_units && !(out = calloc(n_slots, sizeof(*out)))) {
+                    fprintf(stderr, "warn: per-user sunburst list allocation failed; user picker disabled\n");
+                    drop_sets = 1;
+                    plan.n_units = 0;
+                }
+                if (plan.n_units) {
+                    /* Releases owed per shard: one per single-shard unit, one
+                     * per (group, shard) membership of the multi-shard units. */
+                    for (k = 0; k < plan.n_units; k++) {
+                        const sb_user_build_unit_t *u = &plan.units[k];
+                        size_t g, r;
+
+                        if (u->fi != SIZE_MAX) {
+                            atomic_fetch_add(&shards[u->fi].units_left, 1);
+                            continue;
+                        }
+                        for (g = u->g_begin; g < u->g_end; g++)
+                            for (r = plan.groups[g].ref_begin; r < plan.groups[g].ref_end; r++)
+                                atomic_fetch_add(&shards[plan.refs[r].fi].units_left, 1);
                     }
-                    n_units = 0;
-                } else {
-                    /* slice lengths for the compaction; unit counts for the release */
-                    for (fi = 0; fi < path_count; fi++) n_out[fi] = g_sunburst_uid_acc[fi].n;
-                    for (k = 0; k < n_units; k++) atomic_fetch_add(&shards[units[k].fi].units_left, 1);
-                    if ((size_t)nb > n_units) nb = (int)n_units;
+                    if ((size_t)nb > plan.n_units) nb = (int)plan.n_units;
                 }
                 pool.sets = g_sunburst_uid_acc;
                 pool.file_states = file_states;
                 pool.path_count = path_count;
                 pool.out = out;
                 pool.off = uoff;
-                pool.units = units;
-                pool.n_units = n_units;
+                pool.multi_off = total_uids;
+                pool.plan = &plan;
                 pool.shards = shards;
                 atomic_init(&pool.next, 0);
                 atomic_init(&pool.build_failed, 0);
                 atomic_init(&pool.scratch_failed, 0);
-                if (n_units) {
+                if (plan.n_units) {
                     if (bt) {
                         for (; started < nb; started++)
                             if (pthread_create(&bt[started], NULL, sb_user_build_worker, &pool) != 0) break;
@@ -13423,7 +13757,6 @@ chunks_ready:
                     }
                 }
                 free(bt);
-                free(units);
                 free(shards);
                 if (atomic_load(&pool.scratch_failed))
                     fprintf(stderr, "warn: per-user sunburst scratch allocation failed for %lu work unit(s); "
@@ -13432,38 +13765,65 @@ chunks_ready:
                     fprintf(stderr, "warn: per-user sunburst build failed for %lu uid(s)\n",
                             atomic_load(&pool.build_failed));
 
-                /* Compact the per-uid slots into one list, shard order then
-                 * registration order (the sequential loop's order). */
-                for (fi = 0; fi < path_count; fi++)
-                    for (k = 0; k < n_out[fi]; k++)
-                        if (out[uoff[fi] + k].tree) out[w++] = out[uoff[fi] + k];
-                g_sb_user_trees = out;
-                g_sb_user_trees_n = w;
-                out = NULL;
-                if (g_ereport_verbose)
-                    fprintf(stderr, "sunburst: per-user build ran %zu work unit(s) on %d thread(s)\n",
-                            n_units, started ? started : 1);
+                /* Compact the built slots into one list. */
+                if (out) {
+                    for (k = 0; k < n_slots; k++)
+                        if (out[k].tree) out[w++] = out[k];
+                    g_sb_user_trees = out;
+                    g_sb_user_trees_n = w;
+                    out = NULL;
+                }
+                if (g_ereport_verbose && plan.n_units)
+                    fprintf(stderr, "sunburst: per-user build ran %zu work unit(s) on %d thread(s); "
+                                    "%zu uid(s) span several shards\n",
+                            plan.n_units, started ? started : 1, plan.n_groups);
+                sb_user_build_plan_free(&plan);
+            }
+            if (drop_sets) {
+                for (fi = 0; fi < path_count; fi++) {
+                    sb_uid_set_t *s = &g_sunburst_uid_acc[fi];
+                    size_t ui;
+                    for (ui = 0; ui < s->n; ui++) free(s->v[ui].cells);
+                    free(s->v);
+                }
             }
             free(out);
             free(uoff);
-            free(n_out);
             free(g_sunburst_uid_acc);
             g_sunburst_uid_acc = NULL;
 
-            /* Shard-sort with offsets so the bucket second pass finds a
-             * shard's users without scanning the list. */
+            /* Shard-sorted (shard, tree) references with offsets so the bucket
+             * second pass finds a shard's users, and each tree's map for that
+             * shard, without scanning the list. */
             if (g_sunburst_buckets && g_sb_user_trees_n > 0) {
-                if (g_sb_user_trees_n > 1)
-                    qsort(g_sb_user_trees, g_sb_user_trees_n, sizeof(*g_sb_user_trees),
-                          sb_user_tree_by_shard);
+                size_t k, r = 0, nref = 0;
+
+                for (k = 0; k < g_sb_user_trees_n; k++) nref += g_sb_user_trees[k].n_shards;
+                g_sb_ut_refs = malloc(nref * sizeof(*g_sb_ut_refs));
                 g_sb_ut_off = calloc(path_count + 1, sizeof(*g_sb_ut_off));
-                if (g_sb_ut_off) {
-                    size_t k;
-                    for (k = 0; k < g_sb_user_trees_n; k++)
-                        g_sb_ut_off[g_sb_user_trees[k].shard + 1]++;
+                if (g_sb_ut_refs && g_sb_ut_off) {
+                    for (k = 0; k < g_sb_user_trees_n; k++) {
+                        const sb_user_tree_t *t = &g_sb_user_trees[k];
+                        uint32_t j;
+
+                        for (j = 0; j < t->n_shards; j++) {
+                            g_sb_ut_refs[r].shard = t->shards[j];
+                            g_sb_ut_refs[r].uid = t->uid;
+                            g_sb_ut_refs[r].local = j;
+                            g_sb_ut_refs[r].tree = t->tree;
+                            r++;
+                        }
+                    }
+                    g_sb_ut_refs_n = nref;
+                    if (nref > 1) qsort(g_sb_ut_refs, nref, sizeof(*g_sb_ut_refs), sb_user_ref_by_shard);
+                    for (r = 0; r < nref; r++) g_sb_ut_off[g_sb_ut_refs[r].shard + 1]++;
                     for (fi = 0; fi < path_count; fi++)
                         g_sb_ut_off[fi + 1] += g_sb_ut_off[fi];
                 } else {
+                    free(g_sb_ut_refs);
+                    g_sb_ut_refs = NULL;
+                    free(g_sb_ut_off);
+                    g_sb_ut_off = NULL;
                     fprintf(stderr, "warn: per-user sunburst shard index allocation failed; "
                                     "per-user bucket filters disabled\n");
                 }
@@ -13567,7 +13927,7 @@ chunks_ready:
                     bargs[i].now = now;
                     bargs[i].seen_inodes = &seen_inodes;
                     bargs[i].tree = g_sunburst_tree;
-                    bargs[i].utrees = g_sb_user_trees;
+                    bargs[i].urefs = g_sb_ut_refs;
                     bargs[i].ut_off = g_sb_ut_off;
                     if (rep_b) {
                         bargs[i].rep_bytes = rep_b + (size_t)i * bcells;
@@ -13630,6 +13990,9 @@ chunks_ready:
                     for (ui2 = 0; ui2 < g_sb_user_trees_n; ui2++)
                         ereport_sunburst_dir_node_maps_clear(g_sb_user_trees[ui2].tree);
                 }
+                free(g_sb_ut_refs);
+                g_sb_ut_refs = NULL;
+                g_sb_ut_refs_n = 0;
                 free(g_sb_ut_off);
                 g_sb_ut_off = NULL;
             }
@@ -13903,7 +14266,7 @@ chunks_ready:
     if (g_sunburst_tree) {
         ereport_sunburst_link_t *agg_links = NULL, *usr_links = NULL;
         char **user_names = NULL, **user_bases = NULL;
-        size_t n_links = 0, ui3;
+        size_t n_links = 0;
 
         /* The picker lists users by bytes desc; the bucket pass's shard order
          * is no longer needed once its maps are dropped. */
@@ -13967,13 +14330,7 @@ chunks_ready:
         }
 
         sunburst_user_links_free(agg_links, usr_links, user_names, user_bases, n_links);
-        for (ui3 = 0; ui3 < g_sb_user_trees_n; ui3++)
-            ereport_sunburst_tree_free(g_sb_user_trees[ui3].tree);
-        free(g_sb_user_trees);
-        g_sb_user_trees = NULL;
-        g_sb_user_trees_n = 0;
-        free(g_sb_ut_off);
-        g_sb_ut_off = NULL;
+        sb_user_trees_free();
 
         ereport_sunburst_tree_free(g_sunburst_tree);
         g_sunburst_tree = NULL;
