@@ -52,6 +52,7 @@
 #include "crawl_fpcache.h"
 #include "crawl_sidecar.h"
 #include "ereport_sunburst.h"
+#include "path_rewrite.h"
 #include "path_canon.h"
 #include "path_utils.h"
 
@@ -552,6 +553,7 @@ typedef struct {
 typedef struct {
     atomic_uint remaining_chunks;
     crawl_bin_catalog_t *catalog;
+    uint32_t bin_idx; /* which crawl directory (bin_dirs[]) this shard came from: its --path-rewrite set */
     /*
      * --subtree via dirs.idx. subtree_bits has one bit per dir_id, set when that directory is at
      * or under any subtree root *in this shard*; the scan then tests a record's parent_dir_id
@@ -938,32 +940,25 @@ static crawl_rgix_prune_stats_t g_rgix_stats;
  * enough that every row group survives still takes this route. */
 static int g_subtree_from_index = 0;
 
-/* --path-rewrite OLD=NEW: when g_rewrite_from is non-NULL, every reconstructed path at or under OLD has its
- * OLD prefix replaced with NEW (directory-boundary match), purely at read time — the on-disk bins are never
- * modified. Lets a crawl stored under one root be reported/heat-mapped as if it lived elsewhere
- * (e.g. relabel /data1/group as /orcd/data). Applied before --subtree, so --subtree is given in NEW terms. */
-static const char *g_rewrite_from = NULL;
-static size_t g_rewrite_from_len = 0;
-static const char *g_rewrite_to = NULL;
-static size_t g_rewrite_to_len = 0;
+/*
+ * --path-rewrite OLD=NEW rule sets, one per crawl bin directory (path_rewrite.h). Rules before the
+ * positionals go to g_rewrite_global and apply to every directory; a rule right after a crawl directory
+ * binds to that one; DIR/path_rewrites.txt joins that directory's set. The sets are grafted into each
+ * shard's catalog at attach (ereport_attach_shard_catalog), so every reconstructed path -- records,
+ * --subtree, the sunburst merge -- is already in the rewritten namespace.
+ */
+static path_rewrite_set_t g_rewrite_global;
+static path_rewrite_set_t *g_bin_rewrites = NULL; /* [bin_dir_count]: global + own CLI rules + path_rewrites.txt */
+static size_t g_bin_rewrites_n = 0;
+static int g_rewrite_any = 0; /* at least one rule somewhere */
+static int g_no_rewrite_file = 0;
 
-/* If path is at/under g_rewrite_from (directory boundary), rewrite that prefix to g_rewrite_to in place.
- * Both prefixes are normalized absolute dirs without trailing '/'. Returns 0 (no-op when no rewrite is set
- * or the path doesn't match); -1 if the result would not fit in bufsz (path left unchanged). */
 static int starts_with_dir_prefix(const char *path, const char *prefix);
-static int rewrite_path_prefix(char *path, size_t bufsz) {
-    size_t plen, suffix_len, newlen;
 
-    if (!g_rewrite_from || !path) return 0;
-    if (!starts_with_dir_prefix(path, g_rewrite_from)) return 0;
-    plen = strlen(path);
-    /* g_rewrite_from has no trailing slash, so the remainder is "" (exact match) or "/...". */
-    suffix_len = plen - g_rewrite_from_len;
-    newlen = g_rewrite_to_len + suffix_len;
-    if (newlen + 1 > bufsz) return -1;
-    memmove(path + g_rewrite_to_len, path + g_rewrite_from_len, suffix_len + 1); /* include NUL */
-    memcpy(path, g_rewrite_to, g_rewrite_to_len);
-    return 0;
+/* The set for a crawl directory (index into the resolved bin_dirs), or NULL when it has no rules. */
+static const path_rewrite_set_t *rewrite_set_for_bin(size_t bin_idx) {
+    if (!g_bin_rewrites || bin_idx >= g_bin_rewrites_n) return NULL;
+    return g_bin_rewrites[bin_idx].n ? &g_bin_rewrites[bin_idx] : NULL;
 }
 
 /* Manifest-driven crawl directory layout: "uid_shards" or "unsharded" (no uid-shard manifest). */
@@ -2031,11 +2026,6 @@ static int counted_closedir(DIR *dir) {
     return closedir(dir);
 }
 
-static void die(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
-    exit(1);
-}
-
 static int has_bin_suffix(const char *name) {
     size_t n = strlen(name);
     return n > 4 && strcmp(name + n - 4, ".bin") == 0;
@@ -2151,6 +2141,54 @@ static int read_manifest_storage_display_path(const char *bin_dir, char *out, si
         return -1;
     }
     return -1;
+}
+
+/* hostname= from crawl_manifest.txt (short name of the crawling host; ecrawl writes it since the
+ * multi-server rewrites). Returns 0 with a non-empty name, else -1 and out[0] == '\0'. */
+static int read_manifest_hostname(const char *bin_dir, char *out, size_t out_sz) {
+    char manifest_path[PATH_MAX];
+    FILE *fp;
+    char line[4096];
+
+    if (!out || out_sz == 0) return -1;
+    out[0] = '\0';
+    if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", bin_dir) >= (int)sizeof(manifest_path)) return -1;
+    fp = counted_fopen(manifest_path, "r");
+    if (!fp) return -1;
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "hostname=", 9) == 0) {
+            if (snprintf(out, out_sz, "%s", line + 9) >= (int)out_sz) out[0] = '\0';
+            break;
+        }
+    }
+    counted_fclose(fp);
+    return out[0] ? 0 : -1;
+}
+
+/*
+ * Two crawl directories with the same start path on different hosts and no --path-rewrite on either
+ * will merge their identical local paths by name (one /data2/group for two servers). Say so once.
+ */
+static void rewrite_sources_warn(const char **dirs, size_t n) {
+    size_t i, j;
+    char pi[4096], pj[4096], hi[256], hj[256];
+
+    for (i = 0; i < n; i++) {
+        if (read_manifest_storage_display_path(dirs[i], pi, sizeof(pi)) != 0) continue;
+        if (read_manifest_hostname(dirs[i], hi, sizeof(hi)) != 0) continue;
+        for (j = i + 1; j < n; j++) {
+            if (read_manifest_storage_display_path(dirs[j], pj, sizeof(pj)) != 0) continue;
+            if (strcmp(pi, pj) != 0) continue;
+            if (read_manifest_hostname(dirs[j], hj, sizeof(hj)) != 0 || strcmp(hi, hj) == 0) continue;
+            if (rewrite_set_for_bin(i) || rewrite_set_for_bin(j)) continue;
+            fprintf(stderr,
+                    "warn: %s (%s) and %s (%s) both crawled %s on different hosts with no --path-rewrite; "
+                    "their identical local paths merge by name in the report\n",
+                    dirs[i], hi, dirs[j], hj, pi);
+        }
+    }
 }
 
 static int read_manifest_crawl_timing(const char *bin_dir, time_t *start_out, time_t *end_out, double *elapsed_out) {
@@ -2349,26 +2387,43 @@ static void format_duration_approx(double sec, char *buf, size_t sz) {
         snprintf(buf, sz, "%.2f days", sec / 86400.0);
 }
 
+/* One crawl directory's source label: "host:/path" when the manifest names the host, the path being
+ * the crawl root after that directory's --path-rewrite rules (so it reads like the rest of the report);
+ * the directory itself when there is no manifest. */
+static void format_storage_source_one(const char **dirs, size_t i, char *out, size_t out_sz) {
+    char path[4096];
+    char host[256];
+
+    if (read_manifest_storage_display_path(dirs[i], path, sizeof(path)) != 0) {
+        snprintf(out, out_sz, "%s", dirs[i]);
+        return;
+    }
+    (void)path_rewrite_set_apply(rewrite_set_for_bin(i), path, sizeof(path));
+    if (read_manifest_hostname(dirs[i], host, sizeof(host)) == 0)
+        snprintf(out, out_sz, "%.255s:%.4095s", host, path);
+    else
+        snprintf(out, out_sz, "%s", path);
+}
+
 static void format_storage_base_paths_label(const char **dirs, size_t n, char *buf, size_t buf_sz) {
     size_t pos = 0;
     size_t i;
-    char one[4096];
+    char one[4096 + 260];
 
     if (!buf || buf_sz == 0) return;
     buf[0] = '\0';
     if (n == 0 || !dirs) return;
 
     if (n == 1) {
-        if (read_manifest_storage_display_path(dirs[0], one, sizeof(one)) == 0)
-            snprintf(buf, buf_sz, "%s", one);
-        else
-            snprintf(buf, buf_sz, "%s", dirs[0]);
+        format_storage_source_one(dirs, 0, one, sizeof(one));
+        snprintf(buf, buf_sz, "%.4095s", one); /* buffers are PATH_MAX; the label may be a bit longer */
         return;
     }
 
     for (i = 0; i < n && pos + 1 < buf_sz; i++) {
-        const char *show = dirs[i];
-        if (read_manifest_storage_display_path(dirs[i], one, sizeof(one)) == 0) show = one;
+        const char *show;
+        format_storage_source_one(dirs, i, one, sizeof(one));
+        show = one;
         {
             int w = snprintf(buf + pos, buf_sz - pos, "%s%s", i ? ";" : "", show);
             if (w < 0 || (size_t)w >= buf_sz - pos) {
@@ -3716,7 +3771,6 @@ static void sb_stats_build(sb_stats_buf_t *b, const summary_t *sum, int all_user
 
                 memcpy(seg, p, len);
                 seg[len] = '\0';
-                if (g_rewrite_from) (void)rewrite_path_prefix(seg, sizeof(seg));
                 for (k = 0; k < n_seen; k++)
                     if (strcmp(seen[k], seg) == 0) dup = 1;
                 if (!dup) {
@@ -8855,6 +8909,16 @@ static int ereport_attach_shard_catalog(file_state_t *fs, const char *path) {
         goto fail;
     }
     counted_fclose(fp);
+
+    /* --path-rewrite for this shard's crawl directory: graft each rule into the
+     * catalog now, before anything sizes an array off max_dir_id or walks a
+     * parent chain. A rule whose OLD this shard never saw (a uid shard with no
+     * files under that export) is simply not here; the hit count tells the
+     * caller whether a rule matched nowhere at all. */
+    if (path_rewrite_graft_catalog(rewrite_set_for_bin(fs->bin_idx), cat) != 0) {
+        errno = ENOMEM;
+        goto fail;
+    }
     fs->catalog = cat;
     return 0;
 
@@ -8932,14 +8996,30 @@ static unsigned char *ereport_subtree_bits(const crawl_bin_catalog_t *cat, const
         bits[root >> 3] |= (unsigned char)(1U << (root & 7U));
     }
 
-    for (d = 2ULL; d <= n; d++) {
-        uint64_t p = cat->parent_dir_id[d];
+    /* Synthetic ancestors from grafted rewrites (crawl_bin_catalog_graft) come
+     * after every crawled id and hang off synthetic ids or the root, so they
+     * settle first; a crawled directory re-parented under one then finds it. */
+    {
+        uint64_t syn = crawl_bin_catalog_first_synthetic(cat);
 
-        if (p >= d) {
-            free(bits);
-            return NULL;
+        for (d = syn; d <= n; d++) {
+            uint64_t p = cat->parent_dir_id[d];
+
+            if (p != 0ULL && p != 1ULL && p < syn) {
+                free(bits);
+                return NULL;
+            }
+            if (p != 0ULL && ((bits[p >> 3] >> (p & 7U)) & 1U)) bits[d >> 3] |= (unsigned char)(1U << (d & 7U));
         }
-        if (p != 0ULL && ((bits[p >> 3] >> (p & 7U)) & 1U)) bits[d >> 3] |= (unsigned char)(1U << (d & 7U));
+        for (d = 2ULL; d < syn && d <= n; d++) {
+            uint64_t p = cat->parent_dir_id[d];
+
+            if (p >= d && p < syn) {
+                free(bits);
+                return NULL;
+            }
+            if (p != 0ULL && ((bits[p >> 3] >> (p & 7U)) & 1U)) bits[d >> 3] |= (unsigned char)(1U << (d & 7U));
+        }
     }
     return bits;
 }
@@ -9660,8 +9740,7 @@ static void sb_user_build_single(sb_user_build_pool_t *p, const sb_user_build_un
 
         if (skip && skip[ui]) continue;
         sunburst_uid_densify(&s->v[ui], &scratch);
-        ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth,
-                                       g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
+        ut = ereport_sunburst_build_ws(cat, &scratch, wsp, g_sunburst_depth, g_sunburst_buckets);
         sunburst_uid_scratch_clear(&s->v[ui], cat, &scratch);
         sb_user_build_store(p, &p->out[p->off[fi] + ui], ut, s->v[ui].uid, NULL, 1, fi);
     }
@@ -9705,8 +9784,7 @@ static void sb_user_build_multi(sb_user_build_pool_t *p, const sb_user_build_uni
                 accs[k] = sc[refs[k].fi];
                 wss[k] = sb_user_build_ws_get(&p->shards[refs[k].fi], cat);
             }
-            ut = ereport_sunburst_build_wss(cats, accs, m, wss, g_sunburst_depth,
-                                            g_rewrite_from, g_rewrite_to, g_sunburst_buckets);
+            ut = ereport_sunburst_build_wss(cats, accs, m, wss, g_sunburst_depth, g_sunburst_buckets);
             for (k = 0; k < m; k++)
                 sunburst_uid_scratch_clear(&p->sets[refs[k].fi].v[refs[k].ui],
                                            p->file_states[refs[k].fi].catalog, &sc[refs[k].fi]);
@@ -9933,7 +10011,12 @@ static int read_one_chunk(const file_chunk_t *chunk,
         {
             uint32_t proj = CRAWL_PROJECTION_ALL &
                             ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE));
-            if (bucket_detail_levels == 0 && !g_subtree_prefix)
+            const crawl_bin_catalog_t *pcat = file_states[chunk->file_index].catalog;
+            /* --path-rewrite: the grafted directories' own records are matched by name, so names
+             * stay projected but are decoded only in the row groups that can hold one. */
+            int watch_dirs = pcat && pcat->n_redirects > 0;
+
+            if (bucket_detail_levels == 0 && !g_subtree_prefix && !watch_dirs)
                 proj &= ~(CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
             if (bucket_detail_levels == 0) {
                 if (basis != TIME_ATIME && basis != TIME_EFFECTIVE)
@@ -9942,6 +10025,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
                     proj &= ~CRAWL_COL_BIT(CRAWL_COL_CTIME);
             }
             (void)crawl_bin_block_reader_set_projection(&br, proj);
+            if (watch_dirs && bucket_detail_levels == 0 && !g_subtree_prefix)
+                (void)crawl_bin_block_reader_watch_dir_records(&br, pcat->redirect_parents, pcat->n_redirects);
         }
         /* inode and dev are read only under `if (r.nlink > 1)` below, so row groups whose NLINK zone
          * map tops out at 1 -- most of them on a tree without hardlinks -- can skip all three. */
@@ -10055,6 +10140,16 @@ static int read_one_chunk(const file_chunk_t *chunk,
             break;
         }
 
+        /* --path-rewrite: a grafted directory's own record moves with its subtree. */
+        if (r.type == 'd') {
+            uint64_t rp = r.parent_dir_id;
+            uint16_t rl = r.name_len;
+            if (crawl_bin_catalog_graft_redirect(file_states[chunk->file_index].catalog, &rp, &rec_name, &rl)) {
+                r.parent_dir_id = rp;
+                r.name_len = rl;
+            }
+        }
+
         /* --subtree via dirs.idx: decide membership from the record's parent_dir_id, before any path
          * exists. Same set of records as the prefix compare below -- the bitmap is the descendants of
          * the directory the sidecar resolved, and the subtree's own record, which starts_with_dir_prefix
@@ -10100,11 +10195,8 @@ static int read_one_chunk(const file_chunk_t *chunk,
             }
         }
 
-        /* --path-rewrite: relabel the stored prefix before any path use, so the report, heat map, and the
-         * --subtree filter all operate in the rewritten namespace. */
-        if (g_rewrite_from && pathbuf) {
-            (void)rewrite_path_prefix(pathbuf, PATH_MAX);
-        }
+        /* --path-rewrite is already in the catalog this path came from (grafted at attach), so the
+         * report, heat map, and the --subtree filter all operate in the rewritten namespace. */
 
         /* --subtree: keep only records at or under the requested directory (full absolute path retained).
          * Filter before any accounting so totals/heat-map/distinct-uids reflect just the subtree. */
@@ -10480,7 +10572,9 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
     {
         uint32_t proj = CRAWL_PROJECTION_ALL &
                         ~(CRAWL_COL_BIT(CRAWL_COL_GID) | CRAWL_COL_BIT(CRAWL_COL_MODE));
-        if (arg->bucket_detail_levels == 0 && !g_subtree_prefix)
+        int watch_dirs = cat && cat->n_redirects > 0;
+
+        if (arg->bucket_detail_levels == 0 && !g_subtree_prefix && !watch_dirs)
             proj &= ~(CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
         if (arg->bucket_detail_levels == 0) {
             if (arg->basis != TIME_ATIME && arg->basis != TIME_EFFECTIVE)
@@ -10489,6 +10583,8 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
                 proj &= ~CRAWL_COL_BIT(CRAWL_COL_CTIME);
         }
         (void)crawl_bin_block_reader_set_projection(&br, proj);
+        if (watch_dirs && arg->bucket_detail_levels == 0 && !g_subtree_prefix)
+            (void)crawl_bin_block_reader_watch_dir_records(&br, cat->redirect_parents, cat->n_redirects);
         (void)crawl_bin_block_reader_set_hardlink_columns(&br, CRAWL_COL_BIT(CRAWL_COL_INODE) |
                                                                  CRAWL_COL_BIT(CRAWL_COL_DEV_MAJOR) |
                                                                  CRAWL_COL_BIT(CRAWL_COL_DEV_MINOR));
@@ -10574,6 +10670,16 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
             break;
         }
 
+        if (r.type == 'd') {
+            uint64_t rp = r.parent_dir_id;
+            uint16_t rl = r.name_len;
+
+            if (crawl_bin_catalog_graft_redirect(cat, &rp, &rec_name, &rl)) {
+                r.parent_dir_id = rp;
+                r.name_len = rl;
+            }
+        }
+
         if (sub_bits) {
             uint64_t p = r.parent_dir_id;
             int in_scope = (p <= sub_max_dir_id) && ((sub_bits[p >> 3] >> (p & 7U)) & 1U);
@@ -10605,8 +10711,6 @@ static void read_one_chunk_buckets(const file_chunk_t *chunk,
                 arg->bad_reads++;
                 break;
             }
-            if (g_rewrite_from)
-                (void)rewrite_path_prefix(pathbuf_store, PATH_MAX);
             if (g_subtree_prefix && !sub_bits &&
                 !starts_with_dir_prefix(pathbuf_store, g_subtree_prefix))
                 continue;
@@ -11134,10 +11238,12 @@ static int scan_dirs_collect_files(const char **dirpaths,
                                    uid_t target_uid,
                                    int all_users,
                                    char ***out_paths,
+                                   uint32_t **out_bin_idx,
                                    size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
+    uint32_t *bin_idx = NULL;
     size_t count = 0;
     size_t cap = 0;
     size_t di;
@@ -11218,14 +11324,17 @@ static int scan_dirs_collect_files(const char **dirpaths,
             if (count == cap) {
                 size_t new_cap = (cap == 0) ? 64 : cap * 2;
                 char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
-                if (!tmp) {
+                uint32_t *tmpb = tmp ? (uint32_t *)realloc(bin_idx, new_cap * sizeof(*bin_idx)) : NULL;
+                if (tmp) paths = tmp;
+                if (!tmp || !tmpb) {
                     size_t i;
                     counted_closedir(dir);
                     for (i = 0; i < count; i++) free(paths[i]);
                     free(paths);
+                    free(bin_idx);
                     return -1;
                 }
-                paths = tmp;
+                bin_idx = tmpb;
                 cap = new_cap;
             }
 
@@ -11235,9 +11344,11 @@ static int scan_dirs_collect_files(const char **dirpaths,
                 counted_closedir(dir);
                 for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
+                free(bin_idx);
                 return -1;
             }
 
+            bin_idx[count] = (uint32_t)di;
             paths[count++] = copy;
         }
 
@@ -11246,6 +11357,7 @@ static int scan_dirs_collect_files(const char **dirpaths,
     }
 
     *out_paths = paths;
+    *out_bin_idx = bin_idx;
     *out_count = count;
     return 0;
 
@@ -11254,6 +11366,7 @@ fail_partial:
         size_t i;
         for (i = 0; i < count; i++) free(paths[i]);
         free(paths);
+        free(bin_idx);
     }
     return -1;
 }
@@ -11357,19 +11470,12 @@ static void *chunk_prep_worker_main(void *arg) {
     return NULL;
 }
 
-/* Emit one ';'-separated source segment as an <li>, applying --path-rewrite so the provenance line
- * matches the rewritten paths shown elsewhere in the report. seg is not NUL-terminated; seg_len bytes. */
+/* Emit one ';'-separated source segment as an <li>. The label was built with each crawl directory's
+ * --path-rewrite rules and host applied (format_storage_base_paths_label), so it already matches the
+ * paths shown elsewhere in the report. seg is not NUL-terminated; seg_len bytes. */
 static void emit_storage_source_segment(FILE *out, const char *seg, size_t seg_len) {
     fprintf(out, "<li>");
-    if (g_rewrite_from && seg_len < PATH_MAX) {
-        char buf[PATH_MAX];
-        memcpy(buf, seg, seg_len);
-        buf[seg_len] = '\0';
-        (void)rewrite_path_prefix(buf, sizeof(buf));
-        html_escape(out, buf);
-    } else {
-        html_escape_segment(out, seg, seg_len);
-    }
+    html_escape_segment(out, seg, seg_len);
     fprintf(out, "</li>\n");
 }
 
@@ -12545,6 +12651,22 @@ static void emit_run_stats(const char *username,
     }
 }
 
+/* Crawl directories from argv[ai..] with their own --path-rewrite rules (path_rewrite_collect). Returns
+ * 0, or 2 after a message. */
+static int collect_bin_dirs(int argc, char **argv, int ai, const char ***dirs_out, size_t *count_out,
+                            path_rewrite_set_t **sets_out) {
+    return path_rewrite_collect(argc, argv, ai, "ereport", NULL, dirs_out, count_out, sets_out) == 0 ? 0 : 2;
+}
+
+/* Final per-directory rule sets for the resolved bin_dirs (path_rewrite_finish). Consumes cli_sets. */
+static int rewrite_sets_finish(const char **bin_dirs, size_t n, path_rewrite_set_t *cli_sets) {
+    if (path_rewrite_finish(&g_rewrite_global, bin_dirs, n, cli_sets, g_no_rewrite_file, "ereport", &g_bin_rewrites,
+                            &g_rewrite_any) != 0)
+        return -1;
+    g_bin_rewrites_n = n;
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [options] [user] [time] [bin_dir ...]\n"
@@ -12552,11 +12674,14 @@ static void usage(const char *prog) {
             "  user   username or numeric uid.  Omit for an all-users report (./all_users/).\n"
             "  time   atime | mtime | ctime | effective.  Default: effective (max of the three).\n"
             "  bins   crawl directories; default: cwd.  Must share layout and uid_shards count.\n"
+            "         A --path-rewrite OLD=NEW right after a crawl directory applies to that one only\n"
+            "         (repeatable); DIR/path_rewrites.txt (OLD=NEW per line) joins in too.\n"
             "\n"
             "Options:\n"
             "  --report-dir DIR            write under DIR/<user|all_users>/  (default: cwd)\n"
             "  --subtree PATH              absolute dir; paths kept, totals scoped\n"
-            "  --path-rewrite OLD=NEW      relabel prefix (bins unchanged; before --subtree)\n"
+            "  --path-rewrite OLD=NEW      relabel prefix in every crawl directory (repeatable; before --subtree)\n"
+            "  --no-rewrite-file           ignore path_rewrites.txt in the crawl directories\n"
             "  --index-dir DIR            from ereport_index --make; speeds --subtree\n"
             "  --bucket-details N         1-%d directory levels per bucket page (default: brief)\n"
             "  --no-sunburst              skip sunburst.json / sunburst.html (not with the flags below)\n"
@@ -12579,12 +12704,14 @@ int main(int argc, char **argv) {
     const char *basis_str;
     const char **bin_dirs = NULL;
     size_t bin_dir_count = 0;
+    path_rewrite_set_t *bin_cli_rewrites = NULL; /* per crawl directory, from the CLI; folded into g_bin_rewrites */
     char input_dirs_label[4096];
     char storage_base_paths_label[4096];
     time_basis_t basis;
     uid_t target_uid;
     char display_name[256];
     char **paths = NULL;
+    uint32_t *path_bin_idx = NULL; /* [path_count] crawl directory index per shard file */
     size_t path_count = 0;
     file_chunk_t *chunks = NULL;
     size_t chunk_count = 0;
@@ -12608,8 +12735,6 @@ int main(int argc, char **argv) {
     int bucket_detail_levels = 0;
     char report_dir_opt[PATH_MAX];
     static char subtree_buf[PATH_MAX]; /* backs g_subtree_prefix; static so it outlives main()'s frame for worker threads */
-    static char rewrite_from_buf[PATH_MAX]; /* backs g_rewrite_from; static for the same reason */
-    static char rewrite_to_buf[PATH_MAX];   /* backs g_rewrite_to */
     uint64_t distinct_uid_count = 0;
     uint64_t catalog_dirs_total = 0;
     size_t expect_parents_per_worker = 0;
@@ -12854,48 +12979,23 @@ int main(int argc, char **argv) {
                 continue;
             }
             if (ac > 1 && strcmp(av[1], "--path-rewrite") == 0) {
-                const char *eq;
-                size_t fl, tl;
-
-                if (g_rewrite_from != NULL) {
-                    fprintf(stderr, "ereport: duplicate --path-rewrite\n");
-                    return 2;
-                }
+                /* Before the positionals: applies to every crawl directory. After a crawl directory it
+                 * binds to that one (collect_bin_dirs). */
                 if (ac < 3) {
                     fprintf(stderr, "ereport: --path-rewrite requires OLD=NEW (two absolute directory paths)\n");
                     return 2;
                 }
-                eq = strchr(av[2], '=');
-                if (!eq || eq == av[2] || eq[1] == '\0') {
-                    fprintf(stderr, "ereport: --path-rewrite must be OLD=NEW (got '%s')\n", av[2]);
-                    return 2;
-                }
-                fl = (size_t)(eq - av[2]);
-                if (av[2][0] != '/' || eq[1] != '/') {
-                    fprintf(stderr, "ereport: --path-rewrite OLD and NEW must both be absolute\n");
-                    return 2;
-                }
-                if (fl >= sizeof(rewrite_from_buf) ||
-                    snprintf(rewrite_to_buf, sizeof(rewrite_to_buf), "%s", eq + 1) >= (int)sizeof(rewrite_to_buf)) {
-                    fprintf(stderr, "ereport: --path-rewrite path too long\n");
-                    return 2;
-                }
-                memcpy(rewrite_from_buf, av[2], fl);
-                rewrite_from_buf[fl] = '\0';
-                /* Normalize: strip trailing '/'. Both sides must name a directory below root (not a bare "/"). */
-                while (fl > 1 && rewrite_from_buf[fl - 1] == '/') rewrite_from_buf[--fl] = '\0';
-                tl = strlen(rewrite_to_buf);
-                while (tl > 1 && rewrite_to_buf[tl - 1] == '/') rewrite_to_buf[--tl] = '\0';
-                if (fl < 2 || tl < 2) {
-                    fprintf(stderr, "ereport: --path-rewrite OLD and NEW must name a directory below root (not '/')\n");
-                    return 2;
-                }
-                g_rewrite_from = rewrite_from_buf;
-                g_rewrite_from_len = fl;
-                g_rewrite_to = rewrite_to_buf;
-                g_rewrite_to_len = tl;
+                if (path_rewrite_set_add_arg(&g_rewrite_global, av[2], "ereport", "") != 0) return 2;
+                g_rewrite_any = 1;
                 memmove(av + 1, av + 3, (size_t)(ac - 2) * sizeof(char *));
                 ac -= 2;
+                argc = ac;
+                continue;
+            }
+            if (ac > 1 && strcmp(av[1], "--no-rewrite-file") == 0) {
+                g_no_rewrite_file = 1;
+                memmove(av + 1, av + 2, (size_t)(ac - 1) * sizeof(char *));
+                ac -= 1;
                 argc = ac;
                 continue;
             }
@@ -12936,30 +13036,7 @@ int main(int argc, char **argv) {
             return 2;
         }
 
-        {
-            int ai = 2;
-            bin_dirs = (const char **)calloc((size_t)(argc > 2 ? (size_t)(argc - 2) : 1), sizeof(char *));
-            if (!bin_dirs) die("allocation failed");
-            while (ai < argc) {
-                if (argv[ai][0] == '-') {
-                    fprintf(stderr,
-                            "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
-                            "EREPORT_THREADS)\n",
-                            argv[ai]);
-                    free((void *)bin_dirs);
-                    return 2;
-                }
-                bin_dirs[bin_dir_count++] = argv[ai];
-                ai++;
-            }
-            if (bin_dir_count == 0) {
-                free((void *)bin_dirs);
-                bin_dirs = (const char **)malloc(sizeof(char *));
-                if (!bin_dirs) die("allocation failed");
-                bin_dirs[0] = ".";
-                bin_dir_count = 1;
-            }
-        }
+        if (collect_bin_dirs(argc, argv, 2, &bin_dirs, &bin_dir_count, &bin_cli_rewrites) != 0) return 2;
     } else {
         user_spec = argv[1];
 
@@ -12970,59 +13047,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "unknown user or uid: %s\n", user_spec);
                 return 1;
             }
-            {
-                int ai = 3;
-                bin_dirs = (const char **)calloc((size_t)(argc > 3 ? (size_t)(argc - 3) : 1), sizeof(char *));
-                if (!bin_dirs) die("allocation failed");
-                while (ai < argc) {
-                    if (argv[ai][0] == '-') {
-                        fprintf(stderr,
-                            "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
-                            "EREPORT_THREADS)\n",
-                            argv[ai]);
-                        free((void *)bin_dirs);
-                        return 2;
-                    }
-                    bin_dirs[bin_dir_count++] = argv[ai];
-                    ai++;
-                }
-                if (bin_dir_count == 0) {
-                    free((void *)bin_dirs);
-                    bin_dirs = (const char **)malloc(sizeof(char *));
-                    if (!bin_dirs) die("allocation failed");
-                    bin_dirs[0] = ".";
-                    bin_dir_count = 1;
-                }
-            }
+            if (collect_bin_dirs(argc, argv, 3, &bin_dirs, &bin_dir_count, &bin_cli_rewrites) != 0) return 2;
         } else {
             if (resolve_target_user(user_spec, &target_uid, display_name, sizeof(display_name)) == 0) {
                 all_users_mode = 0;
                 basis = TIME_EFFECTIVE;
                 basis_str = "effective";
-                {
-                    int ai = 2;
-                    bin_dirs = (const char **)calloc((size_t)(argc > 2 ? (size_t)(argc - 2) : 1), sizeof(char *));
-                    if (!bin_dirs) die("allocation failed");
-                    while (ai < argc) {
-                        if (argv[ai][0] == '-') {
-                            fprintf(stderr,
-                                    "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
-                                    "EREPORT_THREADS)\n",
-                                    argv[ai]);
-                            free((void *)bin_dirs);
-                            return 2;
-                        }
-                        bin_dirs[bin_dir_count++] = argv[ai];
-                        ai++;
-                    }
-                    if (bin_dir_count == 0) {
-                        free((void *)bin_dirs);
-                        bin_dirs = (const char **)malloc(sizeof(char *));
-                        if (!bin_dirs) die("allocation failed");
-                        bin_dirs[0] = ".";
-                        bin_dir_count = 1;
-                    }
-                }
+                if (collect_bin_dirs(argc, argv, 2, &bin_dirs, &bin_dir_count, &bin_cli_rewrites) != 0) return 2;
             } else {
                 all_users_mode = 1;
                 basis = TIME_EFFECTIVE;
@@ -13032,30 +13063,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "ereport: output name too long\n");
                     return 2;
                 }
-                {
-                    int ai = 1;
-                    bin_dirs = (const char **)calloc((size_t)(argc > 1 ? (size_t)(argc - 1) : 1), sizeof(char *));
-                    if (!bin_dirs) die("allocation failed");
-                    while (ai < argc) {
-                        if (argv[ai][0] == '-') {
-                            fprintf(stderr,
-                                    "ereport: unknown option %s (use --verbose for diagnostics; thread count: "
-                                    "EREPORT_THREADS)\n",
-                                    argv[ai]);
-                            free((void *)bin_dirs);
-                            return 2;
-                        }
-                        bin_dirs[bin_dir_count++] = argv[ai];
-                        ai++;
-                    }
-                    if (bin_dir_count == 0) {
-                        free((void *)bin_dirs);
-                        bin_dirs = (const char **)malloc(sizeof(char *));
-                        if (!bin_dirs) die("allocation failed");
-                        bin_dirs[0] = ".";
-                        bin_dir_count = 1;
-                    }
-                }
+                if (collect_bin_dirs(argc, argv, 1, &bin_dirs, &bin_dir_count, &bin_cli_rewrites) != 0) return 2;
             }
         }
     }
@@ -13091,6 +13099,10 @@ int main(int argc, char **argv) {
         bin_dirs = (const char **)resolved;
     }
 
+    if (rewrite_sets_finish(bin_dirs, bin_dir_count, bin_cli_rewrites) != 0) return 2;
+    bin_cli_rewrites = NULL;
+    rewrite_sources_warn(bin_dirs, bin_dir_count);
+
     format_input_dirs_label(bin_dirs, bin_dir_count, input_dirs_label, sizeof(input_dirs_label));
     format_storage_base_paths_label(bin_dirs, bin_dir_count, storage_base_paths_label, sizeof(storage_base_paths_label));
 
@@ -13118,7 +13130,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, all_users_mode, &paths, &path_count) != 0) {
+    if (scan_dirs_collect_files(bin_dirs, bin_dir_count, target_uid, all_users_mode, &paths, &path_bin_idx,
+                                &path_count) != 0) {
         ereport_free_bin_dirs_list(bin_dirs, bin_dir_count);
         return 1;
     }
@@ -13146,11 +13159,11 @@ int main(int argc, char **argv) {
      *
      * Declined outright for --subtree / (every absolute path matches, so there is nothing to
      * narrow) and under --path-rewrite (the filter then runs in the rewritten namespace, which the
-     * catalogs and therefore the sidecar know nothing about). Anything the sidecar cannot account
+     * sidecar -- built from the stored, ungrafted catalogs -- knows nothing about). Anything the sidecar cannot account
      * for -- a shard it does not name, an identity that has moved, a subtree it cannot place in any
      * shard -- leaves sidecar_scope NULL and the run takes the path-prefix route unchanged.
      */
-    if (g_index_dir && g_subtree_prefix && !g_subtree_is_root && !g_rewrite_from) {
+    if (g_index_dir && g_subtree_prefix && !g_subtree_is_root && !g_rewrite_any) {
         uint64_t rows_read = 0;
 
         if (crawl_sidecar_open(g_index_dir, (const char *const *)paths, path_count, &sidecar) == 0) {
@@ -13188,7 +13201,14 @@ int main(int argc, char **argv) {
         crawl_sidecar_close(&sidecar);
         for (k = 0; k < path_count; k++) free(paths[k]);
         free(paths);
+        free(path_bin_idx);
         return 1;
+    }
+    {
+        size_t k;
+        for (k = 0; k < path_count; k++) file_states[k].bin_idx = path_bin_idx[k];
+        free(path_bin_idx);
+        path_bin_idx = NULL;
     }
 
     {
@@ -13583,6 +13603,8 @@ chunks_ready:
         if (g_ereport_verbose && vt_a0 > 0.0)
             fprintf(stderr, "ereport: attached %zu shard catalog(s) in %.2fs (%zu thread(s))\n",
                     path_count, now_sec() - vt_a0, started + 1);
+
+        path_rewrite_warn_unmatched(g_bin_rewrites, g_bin_rewrites_n);
     }
 
     /* Per-user sunburst: one uid set per shard, filled by merging the workers'
@@ -13854,7 +13876,6 @@ chunks_ready:
                 for (i = 0; (size_t)i < path_count; i++) cats[i] = file_states[i].catalog;
                 g_sunburst_tree = ereport_sunburst_build(cats, g_sunburst_acc, path_count,
                                                          g_sunburst_depth, threads_used,
-                                                         g_rewrite_from, g_rewrite_to,
                                                          g_sunburst_buckets);
                 free(cats);
                 if (!g_sunburst_tree)

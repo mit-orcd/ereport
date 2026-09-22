@@ -167,7 +167,7 @@ Both sketches are stored because `dir_id` follows crawl arrival order and correl
 ## Operational notes
 
 - The code assumes local filesystem crawl data in `ERCBIN09` / format version 9 (nonzero `catalog_offset` and a trailing catalog). Interrupted crawls leave shards without a catalog tail; re-crawl rather than patching sidecars.
-- `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`.
+- `uid_shard_*.bin` layout is preferred and automatically detected via `crawl_manifest.txt`. The manifest is `key=value` per line; readers ignore keys they do not know. Besides the layout (`uid_shards`, `uid_shard_digits`), it records `start_path`, `hostname` (short name of the crawling host, so a report merging several servers can tell identical local paths apart and label its sources `host:/path`), the byte-accounting fields (`st_blocks_bytes_unit`, `total_allocated_bytes`, `files_sparse_heuristic`) and the wall-clock span (`crawl_started_epoch`, `crawl_finished_epoch`, `crawl_elapsed_sec`).
 - Shards are assigned by `uid & (uid_shards - 1)`, so one directory's children scatter across many shard files whenever its entries have different owners.
 - For per-user runs, `ereport` and `ereport_index --make` read only the uid-shard files relevant to that user when uid-sharded input is available. All-users runs load every shard file, as do merged full-cluster crawls.
 - `ECRAWL_UID_SHARDS` for a crawl run should match across every output directory you later pass together to `ereport` / `ereport_index --make`; merged reports assume a consistent shard layout.

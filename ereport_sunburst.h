@@ -40,8 +40,8 @@ typedef struct ereport_sunburst_tree ereport_sunburst_tree_t;
  * min-fraction bar against their parent, with the rest folded into an
  * "(other)" node, down to depth_max levels below the root. Selection happens
  * before interning, so memory tracks the emitted chart, not the directory
- * count. rewrite_from/rewrite_to apply the --path-rewrite prefix swap to the
- * displayed paths (NULL = off).
+ * count. --path-rewrite is not a concern here: ereport grafts it into the
+ * catalogs (crawl_bin_catalog_graft) before any build.
  *
  * cats/accs are parallel arrays of length n; NULL catalogs are skipped. The
  * accumulators are mutated in place (the rollup turns self totals into subtree
@@ -58,7 +58,6 @@ typedef struct ereport_sunburst_tree ereport_sunburst_tree_t;
 ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
                                                 ereport_sunburst_accum_t *accs, size_t n,
                                                 unsigned depth_max, unsigned threads,
-                                                const char *rewrite_from, const char *rewrite_to,
                                                 int want_buckets);
 
 /*
@@ -81,7 +80,6 @@ void ereport_sunburst_ws_free(ereport_sunburst_ws_t *ws);
 /* ereport_sunburst_build() for n = 1 with a workspace for cat (may be NULL). */
 ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *acc,
                                                    const ereport_sunburst_ws_t *ws, unsigned depth_max,
-                                                   const char *rewrite_from, const char *rewrite_to,
                                                    int want_buckets);
 /* ereport_sunburst_build() (serial) with one optional workspace per cats[]
  * position: wss may be NULL, as may any entry; an entry is used only when its
@@ -91,7 +89,6 @@ ereport_sunburst_tree_t *ereport_sunburst_build_wss(crawl_bin_catalog_t *const *
                                                     ereport_sunburst_accum_t *accs, size_t n,
                                                     const ereport_sunburst_ws_t *const *wss,
                                                     unsigned depth_max,
-                                                    const char *rewrite_from, const char *rewrite_to,
                                                     int want_buckets);
 
 /* Bucket-matrix access for the second pass. Cells are [age_bucket][size_bucket]

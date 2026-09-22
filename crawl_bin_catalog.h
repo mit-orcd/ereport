@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "crawl_bin_format.h"
 
@@ -69,10 +70,97 @@ typedef struct crawl_bin_catalog {
     uint64_t *subtree_symlinks;
     uint64_t *self_bytes;
     unsigned char *self_present; /* CRAWL_DIR_FLAG_SELF_RECORD, unpacked */
+
+    /*
+     * Path rewrites grafted after loading (crawl_bin_catalog_graft). dir_ids at
+     * or above synthetic_from are synthetic ancestors: they own no records, were
+     * appended after every crawled directory, and their parent is either another
+     * synthetic directory or the root (dir_id 1). 0 when nothing was grafted.
+     *
+     * A crawled directory re-parented under one of them breaks the usual
+     * "parent id < child id" order, so a pass that relies on it must handle the
+     * synthetic range separately: forward passes resolve synthetic_from..max_dir_id
+     * first, reverse rollups settle them last. crawl_bin_catalog_first_synthetic()
+     * gives the boundary whether or not anything was grafted.
+     */
+    uint64_t synthetic_from;
+    char **graft_names; /* owned name bytes handed to name_comp by grafts */
+    size_t n_graft_names;
+    /* Directory records name their parent, so the record of a grafted directory
+     * still points at the old parent (and carries the old name). Readers pass
+     * type 'd' records through crawl_bin_catalog_graft_redirect() to move them
+     * with the subtree; otherwise the abandoned chain keeps a few bytes and shows
+     * up as an empty sibling of the grafted tree. The entry exists even when this
+     * shard's catalog lacks the grafted directory itself and only holds its
+     * parent: that is the shard the directory's own record lives in. */
+    struct crawl_bin_catalog_redirect {
+        uint64_t old_parent;
+        uint64_t new_parent;
+        const char *old_name; /* arena or graft_names owned */
+        const char *new_name; /* graft_names owned */
+        uint16_t old_name_len;
+        uint16_t new_name_len;
+    } *redirects;
+    uint64_t *redirect_parents; /* redirects[i].old_parent, for crawl_bin_block_reader_watch_dir_records */
+    size_t n_redirects;
 } crawl_bin_catalog_t;
+
+/* First synthetic dir_id, or max_dir_id + 1 when the catalog has none: dir_ids
+ * 1 .. first_synthetic - 1 are the crawled directories. */
+static inline uint64_t crawl_bin_catalog_first_synthetic(const crawl_bin_catalog_t *c) {
+    return c->synthetic_from ? c->synthetic_from : c->max_dir_id + 1ULL;
+}
 
 void crawl_bin_catalog_init_empty(crawl_bin_catalog_t *c);
 void crawl_bin_catalog_free(crawl_bin_catalog_t *c);
+
+/*
+ * Relabel the directory whose stored path is `from` (absolute, no trailing '/',
+ * not "/") so that it and everything below it reconstruct under `to` instead:
+ * synthetic directories are appended for the components of `to` above its last
+ * one, the matching directory (every one, when the catalog holds duplicates of
+ * the path) is re-parented onto that chain and takes the last component of `to`
+ * as its name. Its old ancestors keep their own paths. Path reconstruction,
+ * per-directory rollups and merges by name then all see the rewritten tree
+ * without a per-path string swap.
+ *
+ * Returns 0 when something was grafted (including the case where only the
+ * parent of `from` is present and a record redirect was registered), 1 when
+ * `from` is not under this catalog (nothing changed), -1 on allocation failure
+ * or a malformed argument.
+ */
+int crawl_bin_catalog_graft(crawl_bin_catalog_t *c, const char *from, const char *to);
+
+/*
+ * Move a directory record along with its grafted directory: when the record
+ * (parent_dir_id, name) names a directory that a graft re-parented, *parent,
+ * *name and *name_len are replaced with the new parent and name and 1 is
+ * returned; otherwise nothing changes and 0 is returned. Call it for type 'd'
+ * records only; n_redirects is 0 on catalogs without grafts so the check is
+ * one load.
+ */
+static inline int crawl_bin_catalog_graft_redirect(const crawl_bin_catalog_t *c, uint64_t *parent,
+                                                   const unsigned char **name, uint16_t *name_len) {
+    size_t i, hops = 0;
+    int moved = 0;
+
+    if (!c->n_redirects) return 0;
+    /* Follow chains (a later rule whose OLD is an earlier rule's NEW), bounded
+     * by the entry count. */
+    for (i = 0; i < c->n_redirects && hops < c->n_redirects; i++) {
+        const struct crawl_bin_catalog_redirect *r = &c->redirects[i];
+
+        if (r->old_parent != *parent || r->old_name_len != *name_len) continue;
+        if (*name_len && memcmp(r->old_name, *name, *name_len) != 0) continue;
+        *parent = r->new_parent;
+        *name = (const unsigned char *)r->new_name;
+        *name_len = r->new_name_len;
+        moved = 1;
+        hops++;
+        i = (size_t)-1; /* restart: the new key may itself be redirected */
+    }
+    return moved;
+}
 
 /*
  * Parse catalog blob starting at catalog_offset (must be <= file_sz), loading

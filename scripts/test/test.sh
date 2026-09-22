@@ -1288,6 +1288,106 @@ run_sunburst_tests() {
     root_prefix=$(printf '{"name":"%s","path":"%s"' "rewritten" "/rewritten")
     [[ "$(head -c "${#root_prefix}" "${rep}_rw/all_users/sunburst.json")" == "$root_prefix" ]] ||
         die "sunburst --path-rewrite root is not rewritten: $(head -c 200 "${rep}_rw/all_users/sunburst.json")"
+    # The rewrite is grafted into the catalogs, so bucket pages and the heat map see the same
+    # names; the Sources line carries host:path with the crawl root rewritten.
+    grep -rl "/rewritten/" "${rep}_rw/all_users" --include='*.html' >/dev/null ||
+        die "--path-rewrite: no bucket page mentions the rewritten prefix"
+    if grep -rq -- "${tree_abs}/" "${rep}_rw/all_users" --include='*.html'; then
+        die "--path-rewrite: a report page still shows the stored prefix ${tree_abs}"
+    fi
+    grep -q '^hostname=' "$out/crawl_manifest.txt" || die "crawl_manifest.txt has no hostname= line"
+    expect_eq "crawl_manifest.txt hostname= is the short host name" "$(hostname | cut -d. -f1)" \
+        "$(kv_last hostname "$out/crawl_manifest.txt")" "ecrawl records the crawling host"
+    grep -q "$(kv_last hostname "$out/crawl_manifest.txt"):/rewritten" "${rep}_rw/all_users/index.html" ||
+        die "--path-rewrite: Crawl sources does not show host:/rewritten"
+
+    # Per-crawl-directory rules: the same tree crawled twice stands in for two servers that
+    # share a local layout. A rule after a directory binds to that directory only, so the two
+    # captures land under different names and merge only at their common parent -- rather than
+    # by identical local path, which is what a single global rule (or none) would do. A rule
+    # given before the positionals still applies to every directory.
+    local out2="${td}/sb_crawl2" rep2="${rep}_perbin" rep3="${rep}_file" mjson
+    ECRAWL_CRAWL_THREADS=2 "$ECRAWL" "$tree_abs" "$out2" >"${td}/sb2.crawl.log" 2>&1 ||
+        die "ecrawl failed on the second sunburst capture"
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "$rep2" mtime \
+        "$out" --path-rewrite "${tree_abs}=/multi/srvA" \
+        "$out2" --path-rewrite "${tree_abs}=/multi/srvB" \
+        >"${td}/sb.pb.out" 2>"${td}/sb.pb.err" || {
+        tail -n 20 "${td}/sb.pb.err" >&2 || true
+        die "ereport with per-directory --path-rewrite failed"
+    }
+    mjson="${rep2}/all_users/sunburst.json"
+    # Hardlink dedup is keyed on (dev, inode) across every input, so the fixture's f3/f3link pair
+    # (4000 bytes, nlink 2) is credited to whichever capture the scan reaches first: one child
+    # carries the full apparent size, the other that size less 4000. The crawl root's own
+    # directory record is credited to its parent, as always -- after the graft that parent is
+    # /multi, so each capture's subtree is the apparent size less the root directory's st_size
+    # and /multi itself carries one such record per capture.
+    python3 - "$mjson" "$(tree_apparent_bytes "$tree_abs")" "$(stat -c %s "$tree_abs")" <<'PYEOF' || die "per-directory --path-rewrite: sunburst tree is not two captures under /multi"
+import json, sys
+t = json.load(open(sys.argv[1])); want = int(sys.argv[2]) - int(sys.argv[3]); rootrec = int(sys.argv[3])
+def total(n): return n["bytes"] + sum(total(c) for c in n.get("children", []))
+assert t["path"] == "/multi", "root %r" % t["path"]
+kids = {c["path"]: c for c in t.get("children", [])}
+assert set(kids) == {"/multi/srvA", "/multi/srvB"}, sorted(kids)
+got = sorted(total(c) for c in kids.values())
+assert got in ([want, want], [want - 4000, want]), "per-capture totals %r, apparent %d" % (got, want)
+assert t["bytes"] == 2 * rootrec, "/multi self %d != two root records %d" % (t["bytes"], 2 * rootrec)
+assert total(t) == sum(got) + 2 * rootrec, "grand total %d != %d" % (total(t), sum(got) + 2 * rootrec)
+PYEOF
+    # A rule that names nothing in its directory is reported (typo / other server's rule).
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep2}_miss" mtime "$out" --path-rewrite "/no/such/dir=/x" \
+        >"${td}/sb.pbm.out" 2>"${td}/sb.pbm.err" || die "ereport with an unmatched --path-rewrite failed"
+    grep -q 'matched no directory' "${td}/sb.pbm.err" || die "unmatched --path-rewrite rule not reported"
+    # Nested OLDs in one directory's set are refused (the graft moves a directory once).
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep2}_ovl" mtime "$out" \
+        --path-rewrite "${tree_abs}=/x" --path-rewrite "${tree_abs}/a=/y" >"${td}/sb.ovl.out" 2>"${td}/sb.ovl.err"; then
+        die "overlapping --path-rewrite OLDs should have been rejected"
+    fi
+    grep -q 'overlap' "${td}/sb.ovl.err" || die "overlapping --path-rewrite OLDs: no message"
+    # A --path-rewrite before any crawl directory is an error in the positional part.
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep2}_pos" mtime --path-rewrite "${tree_abs}=/x" "$out" \
+        >"${td}/sb.pos.out" 2>"${td}/sb.pos.err"; then
+        die "--path-rewrite before the first crawl directory should have been rejected"
+    fi
+
+    # path_rewrites.txt inside a crawl directory (what scripts/ecrawl-zfs-autofs-map.sh --write
+    # produces) is picked up for that directory; --no-rewrite-file ignores it.
+    printf '# written by the test\n\n%s=/fromfile/srvA\n' "$tree_abs" >"$out/path_rewrites.txt"
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "$rep3" mtime "$out" "$out2" --path-rewrite "${tree_abs}=/fromfile/srvB" \
+        >"${td}/sb.pf.out" 2>"${td}/sb.pf.err" || die "ereport with path_rewrites.txt failed"
+    python3 - "${rep3}/all_users/sunburst.json" <<'PYEOF' || die "path_rewrites.txt was not applied to its crawl directory"
+import json, sys
+t = json.load(open(sys.argv[1]))
+assert t["path"] == "/fromfile", t["path"]
+assert sorted(c["path"] for c in t["children"]) == ["/fromfile/srvA", "/fromfile/srvB"], [c["path"] for c in t["children"]]
+PYEOF
+    EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep3}_off" --no-rewrite-file mtime "$out" \
+        >"${td}/sb.pfo.out" 2>"${td}/sb.pfo.err" || die "ereport --no-rewrite-file failed"
+    root_prefix=$(printf '{"name":"%s","path":"%s"' "$(basename "$tree_abs")" "$tree_abs")
+    [[ "$(head -c "${#root_prefix}" "${rep3}_off/all_users/sunburst.json")" == "$root_prefix" ]] ||
+        die "--no-rewrite-file still applied path_rewrites.txt: $(head -c 200 "${rep3}_off/all_users/sunburst.json")"
+    printf 'not a rule\n' >"$out/path_rewrites.txt"
+    if EREPORT_THREADS=4 "$EREPORT" --report-dir "${rep3}_bad" mtime "$out" >"${td}/sb.pfb.out" 2>"${td}/sb.pfb.err"; then
+        die "a malformed path_rewrites.txt should have been rejected"
+    fi
+    grep -q 'path_rewrites.txt:1:' "${td}/sb.pfb.err" || die "malformed path_rewrites.txt: line not named"
+    rm -f "$out/path_rewrites.txt"
+
+    # ereport_index --make with a per-directory rule: the trigram index stores the rewritten paths.
+    local idx_pb="${td}/sb_idx_perbin"
+    EREPORT_INDEX_THREADS=2 "$EREPORT_INDEX" --make --index-dir "$idx_pb" \
+        "$out" --path-rewrite "${tree_abs}=/multi/srvA" "$out2" --path-rewrite "${tree_abs}=/multi/srvB" \
+        >"${td}/sb.ipb.out" 2>"${td}/sb.ipb.err" || {
+        tail -n 20 "${td}/sb.ipb.err" >&2 || true
+        die "ereport_index --make with per-directory --path-rewrite failed"
+    }
+    "$EREPORT_INDEX" --search --index-dir "$idx_pb" f_leaf >"${td}/sb.ipb.hits" 2>/dev/null || true
+    expect_eq "ereport_index per-directory --path-rewrite: f_leaf under both rewritten roots" \
+        "/multi/srvA/deep/x/y/f_leaf /multi/srvB/deep/x/y/f_leaf" \
+        "$(sort "${td}/sb.ipb.hits" | tr '\n' ' ' | sed 's/ $//')" \
+        "each capture is indexed under its own NEW"
+    rm -rf "$out2" "$idx_pb"
 
     # Per-user run vs ecrawl_query's own subtree aggregate for the same uid.
     local u rep_u="${rep}_user" ujson q="${td}/sb.query"

@@ -39,6 +39,7 @@
 #include "crawl_ckpt.h"
 #include "crawl_fpcache.h"
 #include "path_canon.h"
+#include "path_rewrite.h"
 #include "trigram_extract.h"
 
 #ifndef PATH_MAX
@@ -143,70 +144,27 @@ static int set_subtree_prefix(const char *arg) {
     return 0;
 }
 
-/* --path-rewrite OLD=NEW: when set, every reconstructed path at or under OLD has its OLD prefix replaced
- * with NEW (directory boundary) at read time, so the index stores the rewritten paths (bins untouched).
- * Applied before the --subtree filter, so --subtree is given in NEW terms. Mirrors ereport's --path-rewrite. */
-static char g_rewrite_from_buf[PATH_MAX];
-static char g_rewrite_to_buf[PATH_MAX];
-static const char *g_rewrite_from = NULL;
-static size_t g_rewrite_from_len = 0;
-static const char *g_rewrite_to = NULL;
-static size_t g_rewrite_to_len = 0;
+/*
+ * --path-rewrite OLD=NEW rule sets, one per crawl bin directory (path_rewrite.h), grafted into each
+ * shard's catalog at attach so the index stores the rewritten paths (bins untouched) and --subtree is
+ * given in NEW terms. Mirrors ereport: a rule before the positionals applies to every directory, one
+ * right after a crawl directory only to that one, and DIR/path_rewrites.txt joins that directory's set.
+ * The dirs.idx / rowgroups.idx sidecars are built from separately loaded, ungrafted catalogs and keep
+ * the stored spelling.
+ */
+static path_rewrite_set_t g_rewrite_global;
+static path_rewrite_set_t *g_bin_rewrites = NULL; /* [dirpath_count] */
+static size_t g_bin_rewrites_n = 0;
+static int g_no_rewrite_file = 0;
 
-/* In-place prefix rewrite. Returns 0 (no-op when unset or no match), -1 if the result would not fit. */
-static int rewrite_path_prefix(char *path, size_t bufsz) {
-    size_t plen, suffix_len, newlen;
-
-    if (!g_rewrite_from || !path) return 0;
-    if (strncmp(path, g_rewrite_from, g_rewrite_from_len) != 0) return 0;
-    if (path[g_rewrite_from_len] != '\0' && path[g_rewrite_from_len] != '/') return 0;
-    plen = strlen(path);
-    suffix_len = plen - g_rewrite_from_len; /* "" or "/..." (g_rewrite_from has no trailing slash) */
-    newlen = g_rewrite_to_len + suffix_len;
-    if (newlen + 1 > bufsz) return -1;
-    memmove(path + g_rewrite_to_len, path + g_rewrite_from_len, suffix_len + 1); /* include NUL */
-    memcpy(path, g_rewrite_to, g_rewrite_to_len);
-    return 0;
+/* Validate + normalize a global "--path-rewrite OLD=NEW" argument. Returns 0 on success, non-zero on error. */
+static int set_path_rewrite(const char *arg) {
+    return path_rewrite_set_add_arg(&g_rewrite_global, arg, "ereport_index", "");
 }
 
-/* Validate + normalize a "--path-rewrite OLD=NEW" argument. Returns 0 on success, non-zero on error. */
-static int set_path_rewrite(const char *arg) {
-    const char *eq;
-    size_t fl, tl;
-
-    if (g_rewrite_from != NULL) {
-        fprintf(stderr, "ereport_index: duplicate --path-rewrite\n");
-        return -1;
-    }
-    eq = arg ? strchr(arg, '=') : NULL;
-    if (!arg || !eq || eq == arg || eq[1] == '\0') {
-        fprintf(stderr, "ereport_index: --path-rewrite must be OLD=NEW (got '%s')\n", arg ? arg : "");
-        return -1;
-    }
-    fl = (size_t)(eq - arg);
-    if (arg[0] != '/' || eq[1] != '/') {
-        fprintf(stderr, "ereport_index: --path-rewrite OLD and NEW must both be absolute\n");
-        return -1;
-    }
-    if (fl >= sizeof(g_rewrite_from_buf) ||
-        snprintf(g_rewrite_to_buf, sizeof(g_rewrite_to_buf), "%s", eq + 1) >= (int)sizeof(g_rewrite_to_buf)) {
-        fprintf(stderr, "ereport_index: --path-rewrite path too long\n");
-        return -1;
-    }
-    memcpy(g_rewrite_from_buf, arg, fl);
-    g_rewrite_from_buf[fl] = '\0';
-    while (fl > 1 && g_rewrite_from_buf[fl - 1] == '/') g_rewrite_from_buf[--fl] = '\0';
-    tl = strlen(g_rewrite_to_buf);
-    while (tl > 1 && g_rewrite_to_buf[tl - 1] == '/') g_rewrite_to_buf[--tl] = '\0';
-    if (fl < 2 || tl < 2) {
-        fprintf(stderr, "ereport_index: --path-rewrite OLD and NEW must name a directory below root (not '/')\n");
-        return -1;
-    }
-    g_rewrite_from = g_rewrite_from_buf;
-    g_rewrite_from_len = fl;
-    g_rewrite_to = g_rewrite_to_buf;
-    g_rewrite_to_len = tl;
-    return 0;
+static const path_rewrite_set_t *rewrite_set_for_bin(size_t bin_idx) {
+    if (!g_bin_rewrites || bin_idx >= g_bin_rewrites_n) return NULL;
+    return g_bin_rewrites[bin_idx].n ? &g_bin_rewrites[bin_idx] : NULL;
 }
 #define MEMLOG_INTERVAL_SEC 8
 #define MERGE_IO_BUFSIZE (1U << 20)
@@ -397,6 +355,7 @@ typedef struct {
 typedef struct {
     atomic_uint remaining_chunks;
     crawl_bin_catalog_t *catalog;
+    uint32_t bin_idx; /* which crawl directory this shard came from: its --path-rewrite set */
 } file_state_t;
 
 /*
@@ -2077,7 +2036,9 @@ static void die_usage(const char *argv0) {
             "                           --make default: ./<user|all_users>/index/\n"
             "                           --search default: ./index\n"
             "  --subtree PATH          --make: index only this absolute directory\n"
-            "  --path-rewrite OLD=NEW  --make: relabel prefix (bins unchanged; before --subtree)\n"
+            "  --path-rewrite OLD=NEW  --make: relabel prefix (bins unchanged; before --subtree); before the\n"
+            "                           crawl directories: all of them, after one: that one only (repeatable)\n"
+            "  --no-rewrite-file       --make: ignore path_rewrites.txt in the crawl directories\n"
             "  --no-dir-index          --make: skip dirs.idx / rowgroups.idx\n"
             "  --json                  --search: JSON object instead of paths\n"
             "  --skip N                --search: skip first N hits\n"
@@ -2277,10 +2238,12 @@ static int scan_dirs_collect_files(const char **dirpaths,
                                    uid_t target_uid,
                                    int all_users,
                                    char ***out_paths,
+                                   uint32_t **out_bin_idx,
                                    size_t *out_count) {
     DIR *dir = NULL;
     struct dirent *de;
     char **paths = NULL;
+    uint32_t *bin_idx = NULL;
     size_t count = 0;
     size_t cap = 0;
     size_t di;
@@ -2361,14 +2324,17 @@ static int scan_dirs_collect_files(const char **dirpaths,
             if (count == cap) {
                 size_t new_cap = (cap == 0) ? 64 : cap * 2;
                 char **tmp = (char **)realloc(paths, new_cap * sizeof(*paths));
-                if (!tmp) {
+                uint32_t *tmpb = tmp ? (uint32_t *)realloc(bin_idx, new_cap * sizeof(*bin_idx)) : NULL;
+                if (tmp) paths = tmp;
+                if (!tmp || !tmpb) {
                     size_t i;
                     closedir(dir);
                     for (i = 0; i < count; i++) free(paths[i]);
                     free(paths);
+                    free(bin_idx);
                     return -1;
                 }
-                paths = tmp;
+                bin_idx = tmpb;
                 cap = new_cap;
             }
 
@@ -2378,9 +2344,11 @@ static int scan_dirs_collect_files(const char **dirpaths,
                 closedir(dir);
                 for (i = 0; i < count; i++) free(paths[i]);
                 free(paths);
+                free(bin_idx);
                 return -1;
             }
 
+            bin_idx[count] = (uint32_t)di;
             paths[count++] = copy;
         }
 
@@ -2389,6 +2357,7 @@ static int scan_dirs_collect_files(const char **dirpaths,
     }
 
     *out_paths = paths;
+    *out_bin_idx = bin_idx;
     *out_count = count;
     return 0;
 
@@ -2397,6 +2366,7 @@ fail_partial:
         size_t i;
         for (i = 0; i < count; i++) free(paths[i]);
         free(paths);
+        free(bin_idx);
     }
     return -1;
 }
@@ -3896,6 +3866,11 @@ static int index_attach_shard_catalog(file_state_t *fs, const char *path) {
         goto fail;
     }
     ei_shard_fclose(fp);
+    /* --path-rewrite for this shard's crawl directory, grafted before any path is reconstructed. */
+    if (path_rewrite_graft_catalog(rewrite_set_for_bin(fs->bin_idx), cat) != 0) {
+        errno = ENOMEM;
+        goto fail;
+    }
     fs->catalog = cat;
     return 0;
 
@@ -4060,6 +4035,17 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             break;
         }
 
+        /* --path-rewrite: a grafted directory's own record moves with its subtree. */
+        if (r.type == 'd') {
+            uint64_t rp = r.parent_dir_id;
+            uint16_t rl = r.name_len;
+
+            if (crawl_bin_catalog_graft_redirect(file_states[chunk->file_index].catalog, &rp, &rec_name, &rl)) {
+                r.parent_dir_id = rp;
+                r.name_len = rl;
+            }
+        }
+
         /* Reconstruct into the worker's own buffer; write_batch_append copies the
          * bytes that survive the filters into the batch arena. */
         if (trigram_ensure_buf(&worker->path_buf, &worker->path_cap, PATH_MAX) != 0) {
@@ -4079,13 +4065,8 @@ static int process_chunk_make(worker_arg_t *worker, const file_chunk_t *chunk) {
             }
         }
 
-        /* --path-rewrite: relabel the stored prefix before indexing, so the index (and the --subtree filter)
-         * use the rewritten namespace. */
-        if (g_rewrite_from) {
-            (void)rewrite_path_prefix(pathbuf, PATH_MAX);
-            /* Rewrite mutates pathbuf, so the next sibling cannot reuse the prefix. */
-            dir_cache.live_out = NULL;
-        }
+        /* --path-rewrite is already in the catalog this path came from (grafted at attach), so the index
+         * and the --subtree filter use the rewritten namespace. */
 
         /* --subtree: only index records at or under the requested directory (full absolute path kept). */
         if (g_subtree_prefix && !subtree_path_under_prefix(pathbuf)) continue;
@@ -6154,6 +6135,7 @@ static int build_index_dir(const char *user_spec,
     char dirs_label[4096];
     char paths_path[PATH_MAX], offsets_path[PATH_MAX];
     char **paths = NULL;
+    uint32_t *path_bin_idx = NULL; /* [path_count] crawl directory index per shard file */
     size_t path_count = 0;
     file_chunk_t *chunks = NULL;
     size_t chunk_count = 0;
@@ -6239,7 +6221,8 @@ static int build_index_dir(const char *user_spec,
     run_stats.run_start_sec = t0;
     ctx.run_stats = &run_stats;
 
-    if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, all_users_mode, &paths, &path_count) != 0)
+    if (scan_dirs_collect_files(dirpaths, dirpath_count, target_uid, all_users_mode, &paths, &path_bin_idx,
+                                &path_count) != 0)
         return 1;
 
     dirs_label[0] = '\0';
@@ -6260,6 +6243,7 @@ static int build_index_dir(const char *user_spec,
     if (path_count == 0) {
         fprintf(stderr, "no matching input .bin files under %s\n", dirs_label);
         free(paths);
+        free(path_bin_idx);
         return 1;
     }
 
@@ -6268,8 +6252,12 @@ static int build_index_dir(const char *user_spec,
         fprintf(stderr, "allocation failed\n");
         for (i = 0; i < path_count; i++) free(paths[i]);
         free(paths);
+        free(path_bin_idx);
         return 1;
     }
+    for (i = 0; i < path_count; i++) file_states[i].bin_idx = path_bin_idx[i];
+    free(path_bin_idx);
+    path_bin_idx = NULL;
 
     if (getrusage(RUSAGE_SELF, &ru_make_start) == 0) ru_have_start = 1;
     make_io_reset();
@@ -6491,6 +6479,7 @@ static int build_index_dir(const char *user_spec,
             return 1;
         }
     }
+    path_rewrite_warn_unmatched(g_bin_rewrites, g_bin_rewrites_n);
 
     if ((!index_dir_override || index_dir_override[0] == '\0') && ensure_dir_recursive(sanitized_name) != 0) {
         fprintf(stderr, "failed to create %s: %s\n", sanitized_name, strerror(errno));
@@ -9160,7 +9149,8 @@ static int run_build_index_dir_resolved(const char *user_spec,
                                         const char **dirpaths_in,
                                         size_t dirpath_count,
                                         int all_users_mode,
-                                        const char *index_dir_override) {
+                                        const char *index_dir_override,
+                                        path_rewrite_set_t *cli_sets) {
     char *dir_blob = NULL;
     const char **dir_heap = NULL;
     char index_override_canon[PATH_MAX];
@@ -9213,6 +9203,15 @@ static int run_build_index_dir_resolved(const char *user_spec,
         dirpaths_in = dir_heap;
     }
 
+    /* Per-directory --path-rewrite sets: global rules + the directory's own + its path_rewrites.txt. */
+    if (path_rewrite_finish(&g_rewrite_global, dirpaths_in, dirpath_count, cli_sets, g_no_rewrite_file,
+                            "ereport_index", &g_bin_rewrites, NULL) != 0) {
+        free(dir_blob);
+        free(dir_heap);
+        return 2;
+    }
+    g_bin_rewrites_n = dirpath_count;
+
     rc = build_index_dir(user_spec, dirpaths_in, dirpath_count, all_users_mode, index_pass);
     free(dir_blob);
     free(dir_heap);
@@ -9246,6 +9245,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[cmd0], "--make") == 0) {
         const char **dirpaths;
         size_t dirpath_count;
+        path_rewrite_set_t *cli_sets = NULL; /* per crawl directory, from the CLI */
         int all_users_mode;
         const char *user_spec = NULL;
         const char *index_dir_override = NULL;
@@ -9291,36 +9291,33 @@ int main(int argc, char **argv) {
                 ai++;
                 continue;
             }
+            if (strcmp(argv[ai], "--no-rewrite-file") == 0) {
+                g_no_rewrite_file = 1;
+                ai++;
+                continue;
+            }
             break;
         }
 
         if (argc == ai) {
-            static const char *dot = ".";
             all_users_mode = 1;
-            dirpaths = &dot;
-            dirpath_count = 1;
-            return run_build_index_dir_resolved(NULL, dirpaths, dirpath_count, all_users_mode, index_dir_override);
-        }
-
-        if (resolve_target_user(argv[ai], &probe_uid, probe_disp, sizeof(probe_disp)) == 0) {
+        } else if (resolve_target_user(argv[ai], &probe_uid, probe_disp, sizeof(probe_disp)) == 0) {
             user_spec = argv[ai];
             all_users_mode = 0;
             ai++;
-            if (argc == ai) {
-                static const char *dot = ".";
-                dirpaths = &dot;
-                dirpath_count = 1;
-            } else {
-                dirpaths = (const char **)(argv + ai);
-                dirpath_count = (size_t)(argc - ai);
-            }
         } else {
             all_users_mode = 1;
-            dirpaths = (const char **)(argv + ai);
-            dirpath_count = (size_t)(argc - ai);
         }
-        while (dirpath_count > 0 && arg_is_verbose(dirpaths[dirpath_count - 1])) dirpath_count--;
-        return run_build_index_dir_resolved(user_spec, dirpaths, dirpath_count, all_users_mode, index_dir_override);
+        /* Crawl directories, each with the --path-rewrite rules that follow it (none -> "."). */
+        if (path_rewrite_collect(argc, argv, ai, "ereport_index", arg_is_verbose, &dirpaths, &dirpath_count,
+                                 &cli_sets) != 0)
+            return 2;
+        {
+            int rc = run_build_index_dir_resolved(user_spec, dirpaths, dirpath_count, all_users_mode,
+                                                  index_dir_override, cli_sets);
+            free((void *)dirpaths);
+            return rc;
+        }
     }
 
     if (strcmp(argv[cmd0], "--search") == 0) {

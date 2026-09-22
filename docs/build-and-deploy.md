@@ -40,4 +40,4 @@ sudo contrib/systemd/install.sh --enable     # units + wrapper + example config,
 sudo systemctl edit ecrawl-daily.service     # drop-ins for User=, Environment=, ... (survive reinstalls)
 ```
 
-`install.sh` never overwrites an existing config. Any `ECRAWL_*` line in the config (other than `ECRAWL_BIN`) is exported into the crawl's environment, so `ECRAWL_CRAWL_THREADS=16` works there. The unit sets `LimitNOFILE=65536` and has no `[Install]` section: it runs from `ecrawl-daily.timer` only. See `contrib/systemd/ecrawl-daily.conf.example` for the config keys.
+`install.sh` never overwrites an existing config. Any `ECRAWL_*` line in the config (other than `ECRAWL_BIN`) is exported into the crawl's environment, so `ECRAWL_CRAWL_THREADS=16` works there. On a ZFS/NFS server, `PATH_REWRITE_MAP=/usr/local/lib/ereport/ecrawl-zfs-autofs-map.sh` makes each crawl leave a `path_rewrites.txt` (dataset mountpoint → LDAP autofs path) next to its bins, which `ereport` applies on its own. The unit sets `LimitNOFILE=65536` and has no `[Install]` section: it runs from `ecrawl-daily.timer` only. See `contrib/systemd/ecrawl-daily.conf.example` for the config keys.

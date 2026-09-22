@@ -8,11 +8,17 @@
 # (avoids DEST/foo/foo when both names match).
 #
 # On any non-zero exit, ecrawl artifact files under each touched output_dir are also deleted (by name:
-# uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt). Cleanup only runs
-# when the directory resolves with readlink -f to a real path that is not /, ., or ...
+# uid_shard_*.bin, uid_shard_*.bin.ckpt, crawl_manifest.txt, uid.txt, gid.txt, path_rewrites.txt).
+# Cleanup only runs when the directory resolves with readlink -f to a real path that is not /, ., or ...
 #
-# Config directives: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE. Any other ECRAWL_*
-# directive is exported into ecrawl's environment (see docs/environment-variables.md), e.g.
+# PATH_REWRITE_MAP (optional): path to scripts/ecrawl-zfs-autofs-map.sh. After each successful crawl
+# with an output_dir it is run as `PATH_REWRITE_MAP --write output_dir --allow-missing`, which writes
+# output_dir/path_rewrites.txt (this host's ZFS dataset mountpoints -> their LDAP autofs paths) so
+# ereport applies the rules when it reads the directory; the file travels with the rsync. A failure
+# there is logged and does not fail the job.
+#
+# Config directives: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE, PATH_REWRITE_MAP. Any other
+# ECRAWL_* directive is exported into ecrawl's environment (see docs/environment-variables.md), e.g.
 # ECRAWL_CRAWL_THREADS=16.
 #
 # Usage:
@@ -28,6 +34,7 @@ ECRAWL_BIN=${ECRAWL_BIN:-}
 RSYNC_DEST=${RSYNC_DEST:-}
 RSYNC_RSH=${RSYNC_RSH:-}
 RSYNC_DELETE=${RSYNC_DELETE:-0}
+PATH_REWRITE_MAP=${PATH_REWRITE_MAP:-}
 
 ECRAWL_DAILY_CLEANUP_OUTPUT_DIRS=()
 CRAWL_RSYNC_OUTPUT_DIRS=()
@@ -87,7 +94,8 @@ remove_ecrawl_artifact_files_in_dir() {
 		-name 'uid_shard_*.bin.ckpt' -o \
 		-name 'crawl_manifest.txt' -o \
 		-name 'uid.txt' -o \
-		-name 'gid.txt' \
+		-name 'gid.txt' -o \
+		-name 'path_rewrites.txt' \
 		\) -delete 2>/dev/null || true
 }
 
@@ -110,6 +118,7 @@ set_directive() {
 	RSYNC_DEST) RSYNC_DEST=$v ;;
 	RSYNC_RSH) RSYNC_RSH=$v ;;
 	RSYNC_DELETE) RSYNC_DELETE=$v ;;
+	PATH_REWRITE_MAP) PATH_REWRITE_MAP=$v ;;
 	ECRAWL_DAILY_*)
 		echo "ecrawl-daily: ignoring internal directive '$k'" >&2
 		;;
@@ -119,7 +128,7 @@ set_directive() {
 		export "$k=$v"
 		;;
 	*)
-		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE, or ECRAWL_* passthrough)" >&2
+		echo "ecrawl-daily: ignoring unknown directive '$k' (allowed: ECRAWL_BIN, RSYNC_DEST, RSYNC_RSH, RSYNC_DELETE, PATH_REWRITE_MAP, or ECRAWL_* passthrough)" >&2
 		;;
 	esac
 }
@@ -218,6 +227,20 @@ sync_crawl_outputs() {
 	done
 }
 
+# output_dir/path_rewrites.txt from the LDAP autofs maps and zfs list (PATH_REWRITE_MAP). Best effort.
+write_path_rewrites() {
+	local output_dir=$1
+	[[ -n "$PATH_REWRITE_MAP" && -n "$output_dir" ]] || return 0
+	if [[ ! -x "$PATH_REWRITE_MAP" ]]; then
+		echo "ecrawl-daily: PATH_REWRITE_MAP not executable: $PATH_REWRITE_MAP (skipping path_rewrites.txt)" >&2
+		return 0
+	fi
+	echo "ecrawl-daily: $PATH_REWRITE_MAP --write $output_dir --allow-missing"
+	if ! "$PATH_REWRITE_MAP" --write "$output_dir" --allow-missing; then
+		echo "ecrawl-daily: path rewrite map failed for $output_dir (report will use stored paths)" >&2
+	fi
+}
+
 main() {
 	local jobs_fail=0 start_path output_dir record_root line section=directives key val
 	# record_root: third job column from the old config format; ecrawl no longer
@@ -290,7 +313,7 @@ main() {
 
 		echo "ecrawl-daily: ${ecrawl_cmd[*]}"
 		if "${ecrawl_cmd[@]}"; then
-			:
+			write_path_rewrites "$output_dir"
 		else
 			local ec=$?
 			echo "ecrawl-daily: ecrawl failed for start_path=$start_path (exit $ec)" >&2

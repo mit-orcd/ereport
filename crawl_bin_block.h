@@ -137,6 +137,11 @@ typedef struct {
     unsigned range_count;
     uint16_t type_bit;
 
+    /* Name columns wanted only in row groups that may hold a directory record
+     * whose parent is one of dir_watch[]; see crawl_bin_block_reader_watch_dir_records. */
+    const uint64_t *dir_watch;
+    size_t dir_watch_n;
+
     uint64_t blocks_decompressed; /* row groups decoded */
     uint64_t blocks_skipped;      /* row groups proven unable to match */
     uint64_t records_skipped;     /* records inside skipped row groups */
@@ -200,6 +205,19 @@ int crawl_bin_block_reader_set_filter(crawl_bin_block_reader_t *r, int have_size
  * no NLINK chunk the columns are decoded as usual. Must be re-applied after each reinit.
  */
 int crawl_bin_block_reader_set_hardlink_columns(crawl_bin_block_reader_t *r, uint32_t mask);
+
+/*
+ * Decode the name columns only in row groups that can hold a directory record
+ * under one of the `n` parent dir_ids in `ids` (the array must outlive the
+ * reader's use of it). A group is ruled out by its type_mask (no 'd' record) or
+ * by the PARENT_DIR_ID zone map (no watched id in [min, max]); a group without
+ * that evidence decodes names as usual. Meant for --path-rewrite, which needs
+ * the name of one directory record per grafted directory to move it along, and
+ * nothing else from the name columns on the default scan. Only takes effect when
+ * the name columns are projected: callers add them to the projection and then
+ * call this. n == 0 clears the watch. Must be re-applied after each reinit.
+ */
+int crawl_bin_block_reader_watch_dir_records(crawl_bin_block_reader_t *r, const uint64_t *ids, size_t n);
 
 /*
  * Yield the next record, reconstructing a row from the decoded columns. Fields

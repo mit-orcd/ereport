@@ -53,6 +53,10 @@ else
 fi
 
 install -m0755 "$SRC/ecrawl-daily.sh" "$LIBDIR/ecrawl-daily.sh"
+# The ZFS/LDAP path map (PATH_REWRITE_MAP in the config); optional, only when the tree has it.
+if [[ -f "$SRC/../../scripts/ecrawl-zfs-autofs-map.sh" ]]; then
+	install -m0755 "$SRC/../../scripts/ecrawl-zfs-autofs-map.sh" "$LIBDIR/ecrawl-zfs-autofs-map.sh"
+fi
 install -m0644 "$SRC/ecrawl-daily.service" "$UNITDIR/ecrawl-daily.service"
 install -m0644 "$SRC/ecrawl-daily.timer" "$UNITDIR/ecrawl-daily.timer"
 

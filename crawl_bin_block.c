@@ -601,6 +601,8 @@ int crawl_bin_block_reader_reinit(crawl_bin_block_reader_t *r, const crawl_bin_c
     r->names_len = 0;
     r->range_count = 0;
     r->type_bit = 0;
+    r->dir_watch = NULL;
+    r->dir_watch_n = 0;
     r->blocks_decompressed = 0;
     r->blocks_skipped = 0;
     r->records_skipped = 0;
@@ -636,6 +638,13 @@ int crawl_bin_block_reader_set_hardlink_columns(crawl_bin_block_reader_t *r, uin
     mask &= ~(CRAWL_COL_BIT(CRAWL_COL_NLINK) | CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) |
               CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES) | CRAWL_COL_BIT(CRAWL_COL_MTIME));
     r->hardlink_only = mask & r->projection;
+    return 0;
+}
+
+int crawl_bin_block_reader_watch_dir_records(crawl_bin_block_reader_t *r, const uint64_t *ids, size_t n) {
+    if (!r) return -1;
+    r->dir_watch = n ? ids : NULL;
+    r->dir_watch_n = n;
     return 0;
 }
 
@@ -774,6 +783,30 @@ static int reader_load_group(crawl_bin_block_reader_t *r) {
             if (dir[ci].max_value <= 1ULL) want &= ~r->hardlink_only;
             break;
         }
+    }
+    if (r->dir_watch_n && (want & (CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES)))) {
+        /* Names are wanted for one directory record per watched parent. Drop
+         * them when the group provably holds none: no 'd' record at all, or the
+         * PARENT_DIR_ID zone map misses every watched id. Damaged summaries
+         * (zero type_mask) and a missing PARENT chunk keep the names. */
+        int keep = 1;
+        int summary_ok = rg.record_count != 0U && rg.type_mask != 0U;
+
+        if (summary_ok && !(rg.type_mask & crawl_bin_type_bit((uint8_t)'d'))) keep = 0;
+        for (ci = 0; summary_ok && keep && ci < rg.column_count; ci++) {
+            size_t k;
+
+            if (dir[ci].column_id != (uint8_t)CRAWL_COL_PARENT_DIR_ID) continue;
+            if (dir[ci].max_value == 0ULL) break; /* no zone map: no evidence */
+            keep = 0;
+            for (k = 0; k < r->dir_watch_n; k++)
+                if (r->dir_watch[k] >= dir[ci].min_value && r->dir_watch[k] <= dir[ci].max_value) {
+                    keep = 1;
+                    break;
+                }
+            break;
+        }
+        if (!keep) want &= ~(CRAWL_COL_BIT(CRAWL_COL_NAME_LEN) | CRAWL_COL_BIT(CRAWL_COL_NAME_BYTES));
     }
 
     for (ci = 0; ci < rg.column_count; ci++) {

@@ -115,6 +115,13 @@ void crawl_bin_catalog_free(crawl_bin_catalog_t *c) {
     free(c->subtree_symlinks);
     free(c->self_bytes);
     free(c->self_present);
+    if (c->graft_names) {
+        size_t i;
+        for (i = 0; i < c->n_graft_names; i++) free(c->graft_names[i]);
+        free(c->graft_names);
+    }
+    free(c->redirects);
+    free(c->redirect_parents);
     crawl_bin_catalog_init_empty(c);
 }
 
@@ -993,6 +1000,262 @@ int crawl_bin_catalog_read_row(int fd, const crawl_bin_catalog_map_t *m, crawl_b
     }
     if (name_len_out) *name_len_out = nlen;
     return 0;
+}
+
+/* ---- grafted rewrites ---------------------------------------------------- */
+
+#define GRAFT_MAX_PARTS 64
+
+/* Split an absolute path into its non-empty components (pointers into `path`). */
+static int graft_split(const char *path, const char **parts, size_t *lens, size_t *n_out) {
+    size_t n = 0;
+    const char *p;
+
+    if (!path || path[0] != '/') return -1;
+    p = path;
+    while (*p) {
+        const char *s;
+
+        while (*p == '/') p++;
+        if (!*p) break;
+        s = p;
+        while (*p && *p != '/') p++;
+        if (n == GRAFT_MAX_PARTS || (size_t)(p - s) > UINT16_MAX) return -1;
+        parts[n] = s;
+        lens[n] = (size_t)(p - s);
+        n++;
+    }
+    if (n == 0) return -1; /* "/" itself cannot be relabelled */
+    *n_out = n;
+    return 0;
+}
+
+/* Take ownership of a component name so name_comp can point at it for the
+ * catalog's lifetime (the loader's name bytes are borrowed or arena-owned and
+ * cannot grow). */
+static char *graft_own_name(crawl_bin_catalog_t *c, const char *s, size_t len) {
+    char **tmp;
+    char *copy;
+
+    copy = (char *)malloc(len ? len : 1U);
+    if (!copy) return NULL;
+    memcpy(copy, s, len);
+    tmp = (char **)realloc(c->graft_names, (c->n_graft_names + 1U) * sizeof(char *));
+    if (!tmp) {
+        free(copy);
+        return NULL;
+    }
+    c->graft_names = tmp;
+    c->graft_names[c->n_graft_names++] = copy;
+    return copy;
+}
+
+/* Append one synthetic directory under `parent`; returns its dir_id or 0. */
+static uint64_t graft_append_dir(crawl_bin_catalog_t *c, uint64_t parent, const char *name, size_t len) {
+    uint64_t id = c->max_dir_id + 1ULL;
+    char *own;
+
+    if (id > c->cap && catalog_reserve(c, id) != 0) return 0ULL;
+    own = graft_own_name(c, name, len);
+    if (!own) return 0ULL;
+    c->parent_dir_id[id] = parent;
+    c->depth[id] = c->depth[parent] + 1U;
+    c->name_len[id] = (uint16_t)len;
+    c->name_comp[id] = own;
+    /* Optional rollups, when this catalog carries them: a synthetic directory
+     * holds no records of its own. */
+    if (c->imm_child_bytes) c->imm_child_bytes[id] = 0ULL;
+    if (c->imm_child_count) c->imm_child_count[id] = 0ULL;
+    if (c->imm_child_ctime_led_count) c->imm_child_ctime_led_count[id] = 0ULL;
+    if (c->imm_child_min_eff_time) c->imm_child_min_eff_time[id] = UINT64_MAX;
+    if (c->imm_child_max_eff_time) c->imm_child_max_eff_time[id] = 0ULL;
+    if (c->dfs_index) c->dfs_index[id] = 0ULL;
+    if (c->dfs_subtree_dirs) c->dfs_subtree_dirs[id] = 0ULL;
+    if (c->subtree_bytes) c->subtree_bytes[id] = 0ULL;
+    if (c->subtree_count) c->subtree_count[id] = 0ULL;
+    if (c->subtree_nlink_gt1_count) c->subtree_nlink_gt1_count[id] = 0ULL;
+    if (c->subtree_files) c->subtree_files[id] = 0ULL;
+    if (c->subtree_dirs) c->subtree_dirs[id] = 0ULL;
+    if (c->subtree_symlinks) c->subtree_symlinks[id] = 0ULL;
+    if (c->self_bytes) c->self_bytes[id] = 0ULL;
+    if (c->self_present) c->self_present[id] = 0U;
+    c->max_dir_id = id;
+    if (!c->synthetic_from) c->synthetic_from = id;
+    return id;
+}
+
+static int graft_name_eq(const crawl_bin_catalog_t *c, uint64_t d, const char *name, size_t len) {
+    return (size_t)c->name_len[d] == len && (len == 0 || memcmp(c->name_comp[d], name, len) == 0);
+}
+
+int crawl_bin_catalog_graft(crawl_bin_catalog_t *c, const char *from, const char *to) {
+    const char *fparts[GRAFT_MAX_PARTS], *tparts[GRAFT_MAX_PARTS];
+    size_t flens[GRAFT_MAX_PARTS], tlens[GRAFT_MAX_PARTS];
+    size_t nf = 0, nt = 0, k, i;
+    uint64_t *cur = NULL, *nxt = NULL;
+    size_t ncur, nnxt, cap_ids = 8;
+    uint64_t chain = 1ULL, first_syn;
+    char *leaf_name;
+    uint64_t d;
+    int rc = -1;
+    int leaf_missing = 0;
+
+    if (!c || !c->parent_dir_id || !c->name_len || !c->name_comp || c->max_dir_id < 1ULL) return -1;
+    if (graft_split(from, fparts, flens, &nf) != 0 || graft_split(to, tparts, tlens, &nt) != 0) return -1;
+
+    /*
+     * Resolve `from` one level at a time. The catalog may hold the same path
+     * more than once (duplicate interning across crawl segments), so each level
+     * carries every directory that spells the prefix so far, and all of them are
+     * re-parented below. A level scans the whole id range: parent-first order
+     * cannot be relied on once earlier grafts have re-parented directories, and
+     * eight bytes per directory is a cheap sequential read next to the load.
+     */
+    cur = (uint64_t *)malloc(cap_ids * sizeof(uint64_t));
+    nxt = (uint64_t *)malloc(cap_ids * sizeof(uint64_t));
+    if (!cur || !nxt) goto out;
+    cur[0] = 1ULL;
+    ncur = 1;
+    for (k = 0; k < nf; k++) {
+        nnxt = 0;
+        for (d = 2ULL; d <= c->max_dir_id; d++) {
+            uint64_t p = c->parent_dir_id[d];
+            int hit = 0;
+
+            for (i = 0; i < ncur; i++)
+                if (cur[i] == p) {
+                    hit = 1;
+                    break;
+                }
+            if (!hit || !graft_name_eq(c, d, fparts[k], flens[k])) continue;
+            if (nnxt == cap_ids) {
+                uint64_t *t1 = (uint64_t *)realloc(nxt, cap_ids * 2U * sizeof(uint64_t));
+                uint64_t *t2;
+
+                if (!t1) goto out;
+                nxt = t1;
+                t2 = (uint64_t *)realloc(cur, cap_ids * 2U * sizeof(uint64_t));
+                if (!t2) goto out;
+                cur = t2;
+                cap_ids *= 2U;
+            }
+            nxt[nnxt++] = d;
+        }
+        if (nnxt == 0) {
+            /* The last component may be absent while its parent is present: a
+             * shard that holds only the directory's own record (which names
+             * the parent) interns the parent, not the directory. Nothing is
+             * re-parented then, but that record still has to move, so the
+             * synthetic chain is built and a redirect is registered per parent. */
+            if (k + 1 == nf && nf > 0) {
+                leaf_missing = 1;
+                break;
+            }
+            rc = 1; /* not a directory of this catalog */
+            goto out;
+        }
+        {
+            uint64_t *t = cur;
+            cur = nxt;
+            nxt = t;
+            ncur = nnxt;
+        }
+    }
+
+    /*
+     * Synthetic chain for the components of `to` above its last one. Components
+     * are shared with earlier grafts on this catalog (/orcd/data for every
+     * dataset of a server) but never with a crawled directory of the same name:
+     * a synthetic directory's parent must be synthetic or the root so the
+     * two-range rollup order stays exact. A same-named crawled sibling merges
+     * with it by name in the report, which is the intended reading.
+     */
+    first_syn = crawl_bin_catalog_first_synthetic(c);
+    for (k = 0; k + 1 < nt; k++) {
+        uint64_t found = 0ULL;
+
+        for (d = first_syn; d <= c->max_dir_id; d++)
+            if (c->parent_dir_id[d] == chain && graft_name_eq(c, d, tparts[k], tlens[k])) {
+                found = d;
+                break;
+            }
+        if (!found) {
+            found = graft_append_dir(c, chain, tparts[k], tlens[k]);
+            if (!found) goto out;
+            first_syn = crawl_bin_catalog_first_synthetic(c);
+        }
+        chain = found;
+    }
+
+    leaf_name = graft_own_name(c, tparts[nt - 1], tlens[nt - 1]);
+    if (!leaf_name) goto out;
+    {
+        struct crawl_bin_catalog_redirect *rd = (struct crawl_bin_catalog_redirect *)realloc(
+            c->redirects, (c->n_redirects + ncur) * sizeof(*rd));
+        uint64_t *rp;
+
+        if (!rd) goto out;
+        c->redirects = rd;
+        rp = (uint64_t *)realloc(c->redirect_parents, (c->n_redirects + ncur) * sizeof(uint64_t));
+        if (!rp) goto out;
+        c->redirect_parents = rp;
+    }
+    if (leaf_missing) {
+        /* cur[] holds the parents of the absent directory; its record hangs
+         * off one of them under the old name. */
+        char *old_leaf = graft_own_name(c, fparts[nf - 1], flens[nf - 1]);
+
+        if (!old_leaf) goto out;
+        for (i = 0; i < ncur; i++) {
+            struct crawl_bin_catalog_redirect *rd = &c->redirects[c->n_redirects];
+
+            c->redirect_parents[c->n_redirects++] = cur[i];
+            rd->old_parent = cur[i];
+            rd->old_name = old_leaf;
+            rd->old_name_len = (uint16_t)flens[nf - 1];
+            rd->new_parent = chain;
+            rd->new_name = leaf_name;
+            rd->new_name_len = (uint16_t)tlens[nt - 1];
+        }
+    } else {
+        for (i = 0; i < ncur; i++) {
+            struct crawl_bin_catalog_redirect *rd = &c->redirects[c->n_redirects];
+
+            d = cur[i];
+            c->redirect_parents[c->n_redirects++] = c->parent_dir_id[d];
+            rd->old_parent = c->parent_dir_id[d];
+            rd->old_name = c->name_comp[d]; /* stays valid: arena or graft_names owned */
+            rd->old_name_len = c->name_len[d];
+            rd->new_parent = chain;
+            rd->new_name = leaf_name;
+            rd->new_name_len = (uint16_t)tlens[nt - 1];
+            c->parent_dir_id[d] = chain;
+            c->name_len[d] = (uint16_t)tlens[nt - 1];
+            c->name_comp[d] = leaf_name;
+        }
+    }
+    /* The graft may not have needed a synthetic directory (`to` has one
+     * component); the re-parented directories still hang off the root then and
+     * the id order is intact, so synthetic_from stays 0. */
+
+    /* Depths: the moved subtree may sit at a different level now. Synthetic
+     * ids first (their parents are synthetic or the root), then the crawled
+     * range in id order, whose parents are all settled by then. */
+    if (c->depth) {
+        first_syn = crawl_bin_catalog_first_synthetic(c);
+        c->depth[1] = 0U;
+        for (d = first_syn; d <= c->max_dir_id; d++) c->depth[d] = c->depth[c->parent_dir_id[d]] + 1U;
+        for (d = 2ULL; d < first_syn; d++) {
+            uint64_t p = c->parent_dir_id[d];
+            c->depth[d] = (p >= 1ULL && p <= c->max_dir_id) ? c->depth[p] + 1U : 1U;
+        }
+    }
+    rc = 0;
+
+out:
+    free(cur);
+    free(nxt);
+    return rc;
 }
 
 /* ---- path reconstruction ------------------------------------------------- */

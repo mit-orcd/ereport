@@ -5703,16 +5703,29 @@ static int write_crawl_manifest(const char *start_path, int worker_count_started
                                 const shared_state_t *totals) {
     FILE *fp;
     char manifest_path[PATH_MAX];
+    char hostname_buf[256];
     time_t end_wall = time(NULL);
 
     if (snprintf(manifest_path, sizeof(manifest_path), "%s/crawl_manifest.txt", g_output_dir) >= (int)sizeof(manifest_path)) return -1;
     fp = ecrawl_io_fopen(manifest_path, "w");
     if (!fp) return -1;
 
+    /* Short host name (same spelling as the default output-dir prefix), so a
+     * report merging crawls of several servers can tell identical local paths
+     * apart. Empty when the kernel will not say. */
+    memset(hostname_buf, 0, sizeof(hostname_buf));
+    if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) != 0) hostname_buf[0] = '\0';
+    hostname_buf[sizeof(hostname_buf) - 1] = '\0';
+    {
+        char *dot = strchr(hostname_buf, '.');
+        if (dot) *dot = '\0';
+    }
+
     fprintf(fp, "format_version=%u\n", FORMAT_VERSION);
     fprintf(fp, "layout=uid_shards\n");
     fprintf(fp, "seed_mode=root_only\n");
     fprintf(fp, "start_path=%s\n", start_path);
+    fprintf(fp, "hostname=%s\n", hostname_buf);
     fprintf(fp, "split_depth=%d\n", g_split_depth);
     fprintf(fp, "byte_accounting=unique_regular_files\n");
     fprintf(fp, "st_blocks_bytes_unit=%u\n", (unsigned)ST_BLOCKS_BYTES_UNIT);

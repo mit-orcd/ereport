@@ -35,7 +35,7 @@ ECRAWL_CRAWL_THREADS=8 ./ecrawl /data/lab crawl-out
 | `--print0` | with `--no-stat`: NUL-separated output |
 | `--statx`, `--iouring` | alternative stat paths; usually no faster, `--iouring` regresses badly on NFS — leave off |
 
-Byte accounting: `total_bytes` is unique regular-file `st_size` (each hardlinked inode counted once, like `du`); `total_allocated_bytes` is the same over `st_blocks`; directory, symlink and other apparent bytes are reported separately. Paths are stored canonical (`realpath`); relabel at report time with `--path-rewrite OLD=NEW` on `ereport` / `ereport_index`.
+Byte accounting: `total_bytes` is unique regular-file `st_size` (each hardlinked inode counted once, like `du`); `total_allocated_bytes` is the same over `st_blocks`; directory, symlink and other apparent bytes are reported separately. Paths are stored canonical (`realpath`); relabel at report time with `--path-rewrite OLD=NEW` on `ereport` / `ereport_index`. `crawl_manifest.txt` records `hostname=` (short name of the crawling host) so a merged report can tell identical local paths on different servers apart.
 
 If `fstatat` finds a directory where `d_type` said otherwise (bad `d_type` or a rename race), `ecrawl` does not descend, counts it in `stat_batch_unexpected_dir_total` and prints a `WARN` block on stderr with example paths — totals may be incomplete when that appears.
 
@@ -182,6 +182,10 @@ Builds a static HTML report from one or more crawls: an age × size heat map wit
 ./ereport alice mtime crawl-out                        # one user (login or uid) → ./alice/
 ./ereport alice crawl-out                              # single user, effective time (max of atime/mtime/ctime)
 ./ereport mtime crawl_srv01 crawl_srv02 crawl_srv03    # merge several servers' crawls into one report
+./ereport mtime crawl_hstor004 --path-rewrite /data2/group/dandi/002=/orcd/data/dandi/002 \
+                               --path-rewrite /data2/group/orcd/007=/orcd/data/orcd/007 \
+               crawl_hstor003 --path-rewrite /data2/group/ki/001=/orcd/data/ki/001
+                                                       # each server's exports under its cluster path
 ./ereport --bucket-details 3 mtime crawl-out           # per-bucket directory rollup tables, 3 levels deep
 ./ereport --subtree /data/lab/jones mtime crawl-out    # report on one directory of an existing crawl
 ./ereport --sunburst-buckets mtime crawl-out           # sunburst with age/size filter chips
@@ -195,13 +199,16 @@ Output (`./<user>/` or `./all_users/`): `index.html` (heat map + statistics), `b
 | `--bucket-details N` | read paths and add `N` (1…32) levels of directory rollup tables plus Dense/Deep/Skew drill-downs to each bucket page; slower and more memory |
 | `--subtree PATH` | restrict everything to records at or under `PATH` (directory boundary); paths stay absolute |
 | `--index-dir DIR` | with `--subtree`: use the `dirs.idx` / `rowgroups.idx` sidecars to skip row groups outside the subtree; output is byte-identical |
-| `--path-rewrite OLD=NEW` | relabel a path prefix in the report (e.g. one root per storage server) |
+| `--path-rewrite OLD=NEW` | relabel a path prefix in the report; before the crawl directories: every directory, right after one: that directory only (repeatable, see below) |
+| `--no-rewrite-file` | ignore `path_rewrites.txt` found in the crawl directories |
 | `--no-sunburst` | skip `sunburst.html` / `sunburst.json` |
 | `--sunburst-depth N` | levels broken out below the displayed root (default 6) |
 | `--sunburst-buckets` | per-node age × size matrices, enabling the filter chips and bucket coloring; one extra pass over the bins |
 | `--no-sunburst-users` | all-users runs: skip the per-user sunburst pages |
 
 Options go before `user` / time basis. A first token that is not a time keyword and does not resolve as a user is taken as the first crawl directory (all-users, effective time). With no crawl directory, `./` is read. When merging directories they must share the same `uid_shards` layout.
+
+Path rewrites: storage servers export ZFS datasets under local paths (`/data2/group/dandi/002` on `hstor004`) that the cluster mounts elsewhere (`/orcd/data/dandi/002`), and two servers usually share the local layout, so merging their crawls unrewritten folds `/data2/group` of both into one directory. `--path-rewrite OLD=NEW` relabels everything at or under `OLD`. A rule given before the positionals applies to every crawl directory; one given right after a crawl directory binds to that directory only, and several may follow it. A `path_rewrites.txt` inside a crawl directory (one `OLD=NEW` per line, `#` comments) joins that directory's rules — `scripts/ecrawl-zfs-autofs-map.sh --write CRAWL_DIR`, run on the storage server, writes it from the LDAP autofs maps and `zfs list`, so the rules travel with the bins. Within one directory the `OLD`s must not nest. The rules are grafted into each shard's directory catalog when it is loaded, so bucket pages, the heat map, the sunburst (which merges directories by name across inputs) and `--subtree` all work in the rewritten namespace; `--subtree` is given in `NEW` terms. The grafted directory's own record (which names its old parent) moves with it; on the default scan this costs decoding the name columns only in the row groups whose zone maps admit such a record. A rule that matches no directory of its crawl directory is reported on stderr. The report's "Crawl sources" and the sunburst "Sources" line show each input as `host:/path` using the manifest's `hostname=`; two inputs that crawled the same path on different hosts with no rule get a warning, because their paths will merge by name.
 
 Sunburst: click a wedge to zoom, the center to go back, toggle bytes/files. The root is the deepest directory that still holds all content; a node's total is `du -sb` of the directory minus its own record. Per node the top 12 children by bytes or files survive (≥ 0.1% of the parent), the rest fold into `(other)`. `sunburst.json` is `{name, path, bytes, files, children?}` recursively — internal nodes carry *self* values, leaves carry subtree totals, so summing every `bytes` gives the grand total; with `--sunburst-buckets` each node adds `bucket_bytes` / `bucket_files` (36 values, `[age][size]` row-major). To feed Plotly: `px.sunburst(ids=paths, parents=parent_paths, values=subtree_totals, branchvalues="total")`.
 
@@ -214,7 +221,7 @@ Search box: shown only when the URL has `?search` (e.g. `index.html?search=1`); 
 Builds and searches a trigram index over crawled paths. Search is a case-insensitive substring match within one path segment (never across `/`): `doc` matches `/x/acme-docs`, `/x/doc`, and everything under a matching directory. Minimum 3 characters.
 
 ```bash
-./ereport_index --make   [--index-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--no-dir-index] [user] [crawl-dir ...]
+./ereport_index --make   [--index-dir DIR] [--subtree PATH] [--path-rewrite OLD=NEW] [--no-rewrite-file] [--no-dir-index] [user] [crawl-dir [--path-rewrite OLD=NEW ...] ...]
 ./ereport_index --search [--index-dir DIR] [--json] [--skip N] [--limit N] <term>
 ./ereport_index --resume-merge --index-dir DIR
 ```
@@ -234,7 +241,8 @@ ulimit -n 65535; ulimit -f unlimited                            # before large -
 |------|--------|
 | `--index-dir DIR` | where to write / read the index (default `./<user>/index` or `./all_users/index`; `--search` defaults to `./index`) |
 | `--subtree PATH` | index only records at or under `PATH`; stored paths stay absolute |
-| `--path-rewrite OLD=NEW` | relabel a path prefix in the stored paths (does not touch the sidecars) |
+| `--path-rewrite OLD=NEW` | relabel a path prefix in the stored paths; same per-crawl-directory grouping and `path_rewrites.txt` as `ereport` (does not touch the sidecars, which keep the stored spelling) |
+| `--no-rewrite-file` | ignore `path_rewrites.txt` found in the crawl directories |
 | `--no-dir-index` | skip writing `dirs.idx` / `rowgroups.idx` |
 | `--json` | one JSON object: `total`, `skip`, `limit`, `search_ms`, `index_keys`, `indexed_paths`, `paths[]`; `--limit` defaults to 50 |
 

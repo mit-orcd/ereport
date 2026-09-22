@@ -71,7 +71,7 @@ void ereport_sunburst_accum_free(ereport_sunburst_accum_t *a) {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char *path;              /* full display path (after --path-rewrite); owned */
+    char *path;              /* full display path; owned */
     const char *name;        /* last path component: points into path, or the static "(other)" */
     uint64_t total_bytes;    /* subtree totals, summed across shards */
     uint64_t total_files;
@@ -356,24 +356,6 @@ static int32_t sb_node_add(ereport_sunburst_tree_t *t, char *path_owned, int32_t
     return idx;
 }
 
-/* --path-rewrite prefix swap, malloc'd result. Directory boundary only. */
-static char *sb_rewrite_apply(const char *from, const char *to, const char *orig) {
-    size_t fl, tl, rest;
-    char *out;
-
-    if (!from || !to || !*from) return strdup(orig);
-    fl = strlen(from);
-    if (strncmp(orig, from, fl) != 0) return strdup(orig);
-    if (orig[fl] != '\0' && orig[fl] != '/') return strdup(orig);
-    rest = strlen(orig + fl);
-    tl = strlen(to);
-    out = malloc(tl + rest + 1);
-    if (!out) return NULL;
-    memcpy(out, to, tl);
-    memcpy(out + tl, orig + fl, rest + 1);
-    return out;
-}
-
 /* Join parent path + name into out (NUL-terminated). The synthetic root has
  * the empty path; its children are absolute top-level components, so they
  * gain the leading slash here. */
@@ -401,12 +383,11 @@ static int sb_enum_entry(const sb_shard_t *sh, const sb_cagg_t *e, sb_cmap_t *cm
 /* Expand node ni from its enumerated children cm: keep the union of the top-N
  * by bytes and by files that also clear the parent-relative min-fraction bar,
  * fold the rest into an "(other)" child, and recurse into the kept children.
- * orig is ni's pre-rewrite path. DFS: recursion depth is bounded by depth_max.
+ * orig is ni's catalog path. DFS: recursion depth is bounded by depth_max.
  * Folding never loses totals: "(other)" carries the trimmed children's subtree
  * totals, so a node's self stays total - sum(children) exactly. */
 static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
-                         int32_t ni, const char *orig, sb_cmap_t *cm,
-                         const char *rewrite_from, const char *rewrite_to, sb_maprec_t *mr) {
+                         int32_t ni, const char *orig, sb_cmap_t *cm, sb_maprec_t *mr) {
     unsigned depth = t->nodes[ni].depth;
     const char *parent_path = t->nodes[ni].path; /* stable: the nodes array may move, strings don't */
     uint64_t min_b, min_f, other_b = 0, other_f = 0;
@@ -449,19 +430,15 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
             continue;
         }
         if (sb_path_join(corig, sizeof(corig), orig, e->name, e->name_len) != 0) goto out;
-        if (rewrite_from && strcmp(corig, rewrite_from) == 0) {
-            display = strdup(rewrite_to);
-        } else {
-            if (sb_path_join(dbuf, sizeof(dbuf), parent_path, e->name, e->name_len) != 0) goto out;
-            display = strdup(dbuf);
-        }
+        if (sb_path_join(dbuf, sizeof(dbuf), parent_path, e->name, e->name_len) != 0) goto out;
+        display = strdup(dbuf);
         if (!display) goto out;
         ci = sb_node_add(t, display, ni, depth + 1, e->bytes, e->files); /* takes display */
         if (ci < 0) goto out;
         if (mr && sb_maprec_add_entry(mr, e, ci) != 0) goto out;
         sb_cmap_init(&c2);
         if (sb_enum_entry(sh, e, &c2) == 0)
-            rc = sb_expand_map(t, sh, ci, corig, &c2, rewrite_from, rewrite_to, mr);
+            rc = sb_expand_map(t, sh, ci, corig, &c2, mr);
         sb_cmap_free(&c2);
         if (rc != 0) goto out;
     }
@@ -489,22 +466,31 @@ out:
     return rc;
 }
 
+static inline void sb_rollup_one(const crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *a, uint64_t d) {
+    uint64_t p = cat->parent_dir_id[d];
+    uint64_t b, f;
+    if (p < 1 || p > cat->max_dir_id) return;
+    b = atomic_load_explicit(&a->bytes[d], memory_order_relaxed);
+    f = atomic_load_explicit(&a->files[d], memory_order_relaxed);
+    if (b) atomic_fetch_add_explicit(&a->bytes[p], b, memory_order_relaxed);
+    if (f) atomic_fetch_add_explicit(&a->files[p], f, memory_order_relaxed);
+}
+
 /* Per-shard prep: roll the scan-time accumulator up the catalog tree (self ->
  * subtree totals, in place; dir_ids are handed out parent-first, so a single
  * reverse pass settles every descendant), then build the child index for
- * O(fanout) enumeration. Shards are independent, so this runs in parallel. */
+ * O(fanout) enumeration. Shards are independent, so this runs in parallel.
+ *
+ * Grafted rewrites (crawl_bin_catalog_graft) append synthetic ancestors above
+ * every crawled id, and a crawled directory may now hang off one of them. The
+ * crawled range settles first -- a re-parented directory adds into its
+ * synthetic parent, which nothing has read yet -- and the synthetic range, whose
+ * parents are synthetic or the root, settles after. */
 static void sb_rollup_shard(const crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *a) {
-    uint64_t nd = cat->max_dir_id, d;
+    uint64_t nd = cat->max_dir_id, syn = crawl_bin_catalog_first_synthetic(cat), d;
 
-    for (d = nd; d >= 2; d--) {
-        uint64_t p = cat->parent_dir_id[d];
-        uint64_t b, f;
-        if (p < 1 || p > nd) continue;
-        b = atomic_load_explicit(&a->bytes[d], memory_order_relaxed);
-        f = atomic_load_explicit(&a->files[d], memory_order_relaxed);
-        if (b) atomic_fetch_add_explicit(&a->bytes[p], b, memory_order_relaxed);
-        if (f) atomic_fetch_add_explicit(&a->files[p], f, memory_order_relaxed);
-    }
+    for (d = syn - 1; d >= 2; d--) sb_rollup_one(cat, a, d);
+    for (d = nd; d >= syn && d >= 2; d--) sb_rollup_one(cat, a, d);
 }
 
 /* The child index depends on the catalog alone (not on the accumulator), which
@@ -582,11 +568,20 @@ static void *sb_prep_worker(void *arg) {
 /* Derive one shard's dense dir_id -> node map from the materialization anchors.
  * dir_ids are handed out parent-first, so after seeding the anchors a single
  * forward pass resolves every remaining directory to its parent's node; dir_id 1
- * (the shard top) and anything above the displayed root fold into the root. */
+ * (the shard top) and anything above the displayed root fold into the root.
+ * Synthetic ancestors from grafted rewrites sit above every crawled id and are
+ * resolved first, so a crawled directory re-parented under one finds it settled. */
+static inline void sb_map_one(const crawl_bin_catalog_t *cat, uint32_t *m, int32_t root, uint64_t d) {
+    uint64_t p;
+    if (m[d] != UINT32_MAX) return;
+    p = cat->parent_dir_id[d];
+    m[d] = (p >= 1 && p <= cat->max_dir_id) ? m[p] : (uint32_t)root;
+}
+
 static int sb_build_dir_node_map(const sb_shard_t *s, uint32_t shard_idx, const sb_mapent_t *ents,
                                  size_t n_ents, int32_t root, uint32_t **out) {
     const crawl_bin_catalog_t *cat = s->cat;
-    uint64_t nd = cat->max_dir_id, d;
+    uint64_t nd = cat->max_dir_id, syn = crawl_bin_catalog_first_synthetic(cat), d;
     uint32_t *m = malloc(((size_t)nd + 1) * sizeof(*m));
     size_t i;
 
@@ -595,12 +590,8 @@ static int sb_build_dir_node_map(const sb_shard_t *s, uint32_t shard_idx, const 
     m[1] = (uint32_t)root;
     for (i = 0; i < n_ents; i++)
         if (ents[i].shard == shard_idx) m[ents[i].lid] = (uint32_t)ents[i].node;
-    for (d = 2; d <= nd; d++) {
-        uint64_t p;
-        if (m[d] != UINT32_MAX) continue;
-        p = cat->parent_dir_id[d];
-        m[d] = (p >= 1 && p <= nd) ? m[p] : (uint32_t)root;
-    }
+    for (d = syn; d <= nd; d++) sb_map_one(cat, m, root, d);
+    for (d = 2; d < syn && d <= nd; d++) sb_map_one(cat, m, root, d);
     *out = m;
     return 0;
 }
@@ -631,7 +622,6 @@ static void *sb_map_worker(void *arg) {
 static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
                                               ereport_sunburst_accum_t *accs, size_t n,
                                               unsigned depth_max, unsigned threads,
-                                              const char *rewrite_from, const char *rewrite_to,
                                               int want_buckets,
                                               const ereport_sunburst_ws_t *const *wss) {
     ereport_sunburst_tree_t *t = calloc(1, sizeof(*t));
@@ -796,9 +786,10 @@ static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
         cur_orig[1] = '\0';
     }
 
-    /* --path-rewrite swaps the displayed root's prefix; children inherit it
-     * (a rewrite landing below the root is applied when that node is interned). */
-    display = sb_rewrite_apply(rewrite_from, rewrite_to, cur_orig);
+    /* --path-rewrite is grafted into the catalogs before the build
+     * (crawl_bin_catalog_graft), so the reconstructed names are already the
+     * displayed ones. */
+    display = strdup(cur_orig);
     if (!display) goto fail;
     ri = sb_node_add(t, display, -1, 0, cur_b, cur_f); /* takes display */
     if (ri < 0) goto fail;
@@ -822,7 +813,7 @@ static ereport_sunburst_tree_t *sb_build_impl(crawl_bin_catalog_t *const *cats,
             sb_cmap_free(&cm);
             goto fail;
         }
-        rc = sb_expand_map(t, sh, ri, cur_orig, &cm, rewrite_from, rewrite_to, mrp);
+        rc = sb_expand_map(t, sh, ri, cur_orig, &cm, mrp);
         sb_cmap_free(&cm);
         if (rc != 0) goto fail;
     }
@@ -916,30 +907,27 @@ fail:
 ereport_sunburst_tree_t *ereport_sunburst_build(crawl_bin_catalog_t *const *cats,
                                                 ereport_sunburst_accum_t *accs, size_t n,
                                                 unsigned depth_max, unsigned threads,
-                                                const char *rewrite_from, const char *rewrite_to,
                                                 int want_buckets) {
-    return sb_build_impl(cats, accs, n, depth_max, threads, rewrite_from, rewrite_to, want_buckets, NULL);
+    return sb_build_impl(cats, accs, n, depth_max, threads, want_buckets, NULL);
 }
 
 ereport_sunburst_tree_t *ereport_sunburst_build_ws(crawl_bin_catalog_t *cat, ereport_sunburst_accum_t *acc,
                                                    const ereport_sunburst_ws_t *ws, unsigned depth_max,
-                                                   const char *rewrite_from, const char *rewrite_to,
                                                    int want_buckets) {
     crawl_bin_catalog_t *cats1[1];
     const ereport_sunburst_ws_t *wss1[1];
 
     cats1[0] = cat;
     wss1[0] = ws;
-    return sb_build_impl(cats1, acc, 1, depth_max, 1, rewrite_from, rewrite_to, want_buckets, wss1);
+    return sb_build_impl(cats1, acc, 1, depth_max, 1, want_buckets, wss1);
 }
 
 ereport_sunburst_tree_t *ereport_sunburst_build_wss(crawl_bin_catalog_t *const *cats,
                                                     ereport_sunburst_accum_t *accs, size_t n,
                                                     const ereport_sunburst_ws_t *const *wss,
                                                     unsigned depth_max,
-                                                    const char *rewrite_from, const char *rewrite_to,
                                                     int want_buckets) {
-    return sb_build_impl(cats, accs, n, depth_max, 1, rewrite_from, rewrite_to, want_buckets, wss);
+    return sb_build_impl(cats, accs, n, depth_max, 1, want_buckets, wss);
 }
 
 size_t ereport_sunburst_tree_nodes(const ereport_sunburst_tree_t *t) {

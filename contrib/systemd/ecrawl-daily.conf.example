@@ -27,6 +27,11 @@ RSYNC_DEST=backup.example.com:/var/lib/ereport-crawl/
 # RSYNC_RSH=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new
 # RSYNC_DELETE=1
 
+# Optional (ZFS/NFS servers): after each crawl, write output_dir/path_rewrites.txt mapping this
+# host's dataset mountpoints to their LDAP autofs paths, so ereport relabels them automatically
+# (install.sh copies the script next to ecrawl-daily.sh).
+# PATH_REWRITE_MAP=/usr/local/lib/ereport/ecrawl-zfs-autofs-map.sh
+
 # Optional: any other ECRAWL_* directive is exported into ecrawl's environment
 # (see docs/environment-variables.md), e.g.:
 # ECRAWL_CRAWL_THREADS=16
