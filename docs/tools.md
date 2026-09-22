@@ -112,37 +112,7 @@ The whole namespace is built in memory at mount time (~90 bytes per record: ~9 G
 
 ## `edelete`
 
-Parallel deleter for non-directory entries. Dry-run by default; never follows symlinks; removes directories only when they become empty (`--delete`, deepest first, never above the start path).
-
-```bash
-./edelete [options] <path>                          # everything under path
-./edelete [options] <atime|mtime|ctime> <days> <path>   # only entries older than N days
-```
-
-```bash
-./edelete /scratch/staging                          # dry run: prints would_delete=
-./edelete mtime 90 /scratch/job123                  # dry run, age-filtered
-./edelete --delete mtime 90 /scratch/job123         # asks you to type YES
-./edelete --delete --force ctime 14 /cache/tmp      # no prompt (scripting)
-./edelete --uid 1234 --delete /scratch/shared       # only that owner's entries
-```
-
-| Flag | Effect |
-|------|--------|
-| `--delete` | actually unlink (prompts for `YES` on stdin) |
-| `--force` | with `--delete`: skip the prompt |
-| `--uid N`, `--gid N` | restrict to entries with that owner / group (both must match when both set) |
-
-Summary keys: `mode`, `would_delete`, `deleted_files`, `removed_empty_dirs`, `errors`, `elapsed_sec`, throughput.
-
-Quota'd XFS: every `unlink` of one owner's files serializes on that owner's dquot mutex, so more threads make it *slower* (kernel time in `osq_lock` / `mutex_spin_on_owner`). Cap `EDELETE_MAX_UNLINK_INFLIGHT` (2–4 is often best when deleting one user's tree); traversal parallelism (`EDELETE_THREADS`) can stay high. Find the knee with:
-
-```bash
-for n in 1 2 4 8 16; do
-  EDELETE_THREADS=$n EDELETE_MAX_UNLINK_INFLIGHT=$n ./edelete --delete --force <path> 2>/dev/null \
-  | awk -F= -v n=$n '/^deleted_files=/{d=$2} /^elapsed_sec=/{e=$2} END{printf "inflight=%s rate=%.0f/s\n", n, e>0?d/e:0}'
-done
-```
+Moved to [mit-orcd/ecopy](https://github.com/mit-orcd/ecopy) (`edelete.c` is standalone: `path_canon.h`, `path_utils`). Build it there with `make edelete`; see that repo's README for usage. ereport scripts that used it (`benchmark.sh --undo`, `profiling.sh`) clone and build it on first use via `scripts/ensure-edelete.sh`, take `EDELETE_BIN` as an override, or fall back to `rm -rf`.
 
 ## `edump`
 
@@ -278,7 +248,6 @@ API: `GET /search?q=…&skip=0&limit=50` when `SERVE_ROOT` is the report directo
 | `ecrawl.c` | crawler; parallel walk with work donation, uid-sharded columnar writer |
 | `ecrawl_query.c` | read-only queries over shards (shape stats, filters, `--list`, sidecar routes) |
 | `ecrawl_mount.c` | FUSE 2 read-only view; in-memory namespace index |
-| `edelete.c` | parallel deleter (standalone: `path_canon.h`, `path_utils`) |
 | `edump.c` | tree recreation from a crawl |
 | `ereport.c`, `ereport_sunburst.[ch]` | HTML report; sunburst aggregation and emitters |
 | `ereport_index.c`, `trigram_extract.[ch]` | trigram index build/search; basename trigram extraction |

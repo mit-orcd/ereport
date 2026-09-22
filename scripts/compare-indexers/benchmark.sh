@@ -74,11 +74,13 @@
 # Both actions are re-runnable: --do skips work that is already done, so it
 # doubles as the way to resume an interrupted setup.
 #
-# --undo deletes the benchmark tree and the scratch with this repo's edelete
-# ('--delete --force', EDELETE_THREADS threads) when it is built and runnable,
-# because rm -rf takes hours on a tree of tens of millions of files. It falls
-# back to rm -rf, and always uses rm -rf for the small paths. EDELETE_BIN
-# overrides the binary.
+# --undo deletes the benchmark tree and the scratch with edelete
+# ('--delete --force', EDELETE_THREADS threads) when it is runnable, because
+# rm -rf takes hours on a tree of tens of millions of files. edelete lives in
+# the ecopy repo now (https://github.com/mit-orcd/ecopy); on first use
+# scripts/ensure-edelete.sh clones and builds it into ereport's own cache
+# ($ECOPY_DIR), and EDELETE_BIN overrides that. Without it the teardown falls
+# back to rm -rf, and always uses rm -rf for the small paths.
 #
 # Env (all optional, passed through to the underlying scripts):
 #   PREFIX, SRC_ROOT, JOBS, TOOLS, PKG_ARGS, INSTALL_PACKAGES, SETUP_CHARTS,
@@ -202,9 +204,9 @@ SMALL=0
 SMOKE=0
 QUICK=0
 # The suite under test. Built by --small so a cycle always measures the working
-# tree rather than whatever was compiled last; edelete is included because
-# --undo uses it.
-SUITE_TARGETS="ecrawl ereport ereport_index ecrawl_query edelete"
+# tree rather than whatever was compiled last. edelete (used by --undo) is no
+# longer built here — it comes from the ecopy repo; see EDELETE_BIN.
+SUITE_TARGETS="ecrawl ereport ereport_index ecrawl_query"
 
 log() { printf '\n=== %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -293,15 +295,21 @@ check_removable() {
 }
 
 # The trees this builds are tens of millions of entries, which single-threaded
-# rm -rf unlinks for hours. edelete is the parallel walker from this repo and
-# ends the same way: files unlinked, then empty directories removed bottom-up,
-# including the start directory.
-EDELETE_BIN=${EDELETE_BIN:-"$SCRIPT_DIR/../../edelete"}
+# rm -rf unlinks for hours. edelete is a parallel walker that ends the same
+# way: files unlinked, then empty directories removed bottom-up, including the
+# start directory. It moved to the ecopy repo; an empty EDELETE_BIN means
+# "resolve on first use", which scripts/ensure-edelete.sh does by cloning and
+# building https://github.com/mit-orcd/ecopy into ereport's own cache.
+# Resolution is lazy so an offline host never pays a git timeout at startup.
+EDELETE_BIN=${EDELETE_BIN:-}
 EDELETE_OK=""
 edelete_usable() {
   if [[ -z "$EDELETE_OK" ]]; then
     EDELETE_OK=0
-    if [[ -x "$EDELETE_BIN" ]]; then
+    if [[ -z "$EDELETE_BIN" ]]; then
+      EDELETE_BIN=$("$SCRIPT_DIR/../ensure-edelete.sh" 2>/dev/null) || EDELETE_BIN=""
+    fi
+    if [[ -n "$EDELETE_BIN" && -x "$EDELETE_BIN" ]]; then
       # Linked against jemalloc it can be present and still fail to start, and
       # a teardown is the wrong place to find that out. A bare invocation is a
       # usage error (2) and touches nothing; 126/127 is the loader failing.
@@ -966,8 +974,8 @@ undo_run() {
   if edelete_usable; then
     info "the tree and the scratch go through 'edelete --delete --force' (${EDELETE_THREADS:-$THREADS} threads); the rest through rm -rf"
   else
-    info "edelete is not runnable ($EDELETE_BIN), so everything goes through rm -rf"
-    info "  build it with 'make edelete' first to delete a large tree in parallel"
+    info "edelete is not runnable${EDELETE_BIN:+ ($EDELETE_BIN)}, so everything goes through rm -rf"
+    info "  scripts/ensure-edelete.sh clones+builds it from github.com/mit-orcd/ecopy — check this host's network, or set EDELETE_BIN"
   fi
 
   confirm "Proceed?" || die "aborted; nothing was removed"

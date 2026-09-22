@@ -26,9 +26,6 @@ Common to every binary: compact binary I/O, parallelism along natural boundaries
 `ecrawl_query`
 - Row groups are skipped on zone maps, only named columns are decoded, per-thread `FILE*` caches avoid glibc's global stream-list lock on thousand-shard captures, and `--list --level/--sum` sort per task and k-way merge.
 
-`edelete`
-- Same walk as `ecrawl`; concurrent `unlink` is capped separately because quota'd XFS serializes unlinks of one owner on that owner's dquot mutex — see [tools.md#edelete](tools.md#edelete).
-
 ## Synthetic adversarial trees
 
 `scripts/fixtures/generate-ecrawl-adversarial-tree.sh <root>` builds stress layouts: a flat megadir, a deep chain, wide fan-out, optional `ecrawl_query` depth slices and `ereport` badge fixtures. Pick the scale with `SYNTH_PROFILE` (unset = quick smoke, `medium`, `heavy`, `extreme`).

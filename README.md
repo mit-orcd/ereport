@@ -41,8 +41,9 @@ Serving one user's report: `make serve SERVE_ROOT=./alice` puts `index.html` at 
 | [`eserve.py`](docs/tools.md#eservepy) | Serves the report and answers the search box. |
 | [`ecrawl_query`](docs/tools.md#ecrawl_query) | `du` / `find`-style queries over a crawl: subtree totals, size/type/owner/perm filters, path lists. |
 | [`ecrawl_mount`](docs/tools.md#ecrawl_mount) | Read-only FUSE mount of a crawl so `find`, `ls`, `du` work without the source tree. Linux only. |
-| [`edelete`](docs/tools.md#edelete) | Parallel deleter with age and owner filters. Dry-run by default. |
 | [`edump`](docs/tools.md#edump) | Recreates a crawl as a real tree with scrambled names and synthetic contents. |
+
+`edelete` (the parallel deleter with age and owner filters) moved to [mit-orcd/ecopy](https://github.com/mit-orcd/ecopy) — build it there with `make edelete`; ereport scripts clone it automatically via `scripts/ensure-edelete.sh`.
 
 ## How the totals are defined
 

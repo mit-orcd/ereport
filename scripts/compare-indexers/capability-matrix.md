@@ -66,7 +66,7 @@ Each query has **three argument sets**. The measured series is set 1: all cold r
 | Incremental / resume | policy / changelogs (FS-dependent) | re-index / rollup | partition re-index | **no** cross-run resume; scrub output dir |
 | Rollup | ACCT_STAT (user/group); weak dir rollup | optional `gufi_rollup` (cutoff) | partition pruning | heat-map + `ecrawl_query` shapes |
 | Typical footprint / 1M files | modest GiB-class DB | large with rollup | smallest (Parquet) | bins + optional trigram index (richer → larger than XDU) |
-| Workflow fit here | general RDB | secure multi-tenant find/du | tiny index + analytics | ORCD report HTML, `edelete`, path rewrite/subtree |
+| Workflow fit here | general RDB | secure multi-tenant find/du | tiny index + analytics | ORCD report HTML, path rewrite/subtree |
 
 ## Known parity gaps (do not over-claim)
 

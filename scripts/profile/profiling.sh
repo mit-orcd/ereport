@@ -46,8 +46,14 @@ export ECRAWL_QUERY_BIN="$bin_root/ecrawl_query"
 export EREPORT_BIN="$bin_root/ereport"
 export EREPORT_INDEX_BIN="$bin_root/ereport_index"
 
+# edelete moved to the ecopy repo (https://github.com/mit-orcd/ecopy); it is
+# only used for teardown, so it is optional — EDELETE_BIN overrides it, and an
+# empty value is resolved lazily in step1 by scripts/ensure-edelete.sh, which
+# clones and builds ecopy into ereport's own cache on first use.
+EDELETE_BIN="${EDELETE_BIN:-}"
+
 # Fail once, up front, instead of once per profiler deep into the run.
-for f in "$bin_root"/{edelete,ecrawl,ecrawl_query,ereport,ereport_index}; do
+for f in "$bin_root"/{ecrawl,ecrawl_query,ereport,ereport_index}; do
   [[ -f "$f" && -x "$f" ]] || { echo "ERROR: not an executable: $f (set EREPORT_BIN_DIR)" >&2; exit 2; }
 done
 for d in "$scripts_root"/{fixtures,profile}; do
@@ -55,8 +61,15 @@ for d in "$scripts_root"/{fixtures,profile}; do
 done
 
 function step1() {
-  EDELETE_THREADS=96 "$bin_root/edelete" --delete --force "$data_dir"
-  EDELETE_THREADS=96 "$bin_root/edelete" --delete --force "$report_dir"
+  if [[ -z "$EDELETE_BIN" ]]; then
+    EDELETE_BIN=$("$scripts_root/ensure-edelete.sh" 2>/dev/null || true)
+  fi
+  if [[ -n "$EDELETE_BIN" && -x "$EDELETE_BIN" ]]; then
+    EDELETE_THREADS=96 "$EDELETE_BIN" --delete --force "$data_dir"
+    EDELETE_THREADS=96 "$EDELETE_BIN" --delete --force "$report_dir"
+  else
+    rm -rf "$data_dir" "$report_dir"
+  fi
   mkdir -p "$data_dir"
   mkdir -p "$report_dir"
 

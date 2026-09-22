@@ -16,7 +16,7 @@ SERVE_BIND ?= 127.0.0.1
 SERVE_INDEX_DIR ?=
 
 # Targets
-TARGETS = ereport ereport_index ecrawl ecrawl_query edelete edump
+TARGETS = ereport ereport_index ecrawl ecrawl_query edump
 
 UNAME_S := $(shell uname -s)
 
@@ -181,9 +181,6 @@ test_query_subtree_dups: test_query_subtree_dups.c crawl_bin_catalog.o crawl_bin
 
 ecrawl: ecrawl.c alloc_tuning.h crawl_ckpt.h path_canon.h path_utils.h path_utils.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o ecrawl_wire.h
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ ecrawl.c path_utils.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)
-
-edelete: edelete.c path_canon.h path_utils.h path_utils.o
-	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) -o $@ edelete.c path_utils.o $(JEMALLOC_LIBS)
 
 edump: edump.c alloc_tuning.h crawl_result.h crawl_result.o crawl_bin_chunks.h crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.h crawl_bin_block.o crawl_bin_codec.o path_utils.h path_utils.o
 	$(CC) $(CFLAGS) $(JEMALLOC_CFLAGS) $(ZSTD_CFLAGS) -o $@ edump.c crawl_result.o crawl_bin_chunks.o crawl_bin_catalog.o crawl_bin_block.o crawl_bin_codec.o path_utils.o $(ZSTD_LIBS) $(JEMALLOC_LIBS)

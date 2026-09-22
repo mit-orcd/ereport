@@ -79,14 +79,3 @@ int path_join_alloc(const char *base, size_t base_len, const char *name, size_t 
     *out_len = need - 1U;
     return 0;
 }
-
-int path_is_under_root(const char *path, const char *root) {
-    size_t lr;
-
-    if (!path || !root) return 0;
-    if (strcmp(root, "/") == 0) return strcmp(path, "/") != 0;
-    lr = strlen(root);
-    if (strcmp(path, root) == 0) return 1;
-    if (strncmp(path, root, lr) != 0) return 0;
-    return path[lr] == '/';
-}

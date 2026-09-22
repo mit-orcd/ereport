@@ -21,7 +21,7 @@ Missing external tools are skipped (`status=skipped`), never fatal.
 ## Quick start
 
 ```bash
-make -C ../.. ecrawl ereport ereport_index ecrawl_query edelete
+make -C ../.. ecrawl ereport ereport_index ecrawl_query
 
 # 1. Under a minute: does the suite still answer Q1–Q6 correctly? (find/du only; no external tools)
 scripts/compare-indexers/benchmark.sh --do /tmp/small --small
@@ -68,7 +68,7 @@ Any env var set explicitly (`REPS=`, `TOOLS=`, `SYNTH_PROFILE=`, `DROP_CACHES=`,
 | `--adopt TREE` | record a tree built by the step-by-step flow so `--undo` will accept it |
 | `--keep-tools`, `--purge-results` | with `--undo` |
 
-`--do` is re-runnable and resumes: a tree with a matching `FIXTURE_MANIFEST.txt` is not regenerated (a different `SYNTH_PROFILE` against the same root is an error; `FORCE=1` rebuilds). `--undo` refuses paths without the `.indexer-compare-run` marker and any top-level path, and deletes the two big trees with this repo's `edelete` rather than `rm -rf`. Step 0 prints the filesystem each of the three paths resolved to — check that `--work` is real scratch, since GUFI writes one SQLite database per directory.
+`--do` is re-runnable and resumes: a tree with a matching `FIXTURE_MANIFEST.txt` is not regenerated (a different `SYNTH_PROFILE` against the same root is an error; `FORCE=1` rebuilds). `--undo` refuses paths without the `.indexer-compare-run` marker and any top-level path, and deletes the two big trees with `edelete` (from [mit-orcd/ecopy](https://github.com/mit-orcd/ecopy), cloned and built on first use by `scripts/ensure-edelete.sh`; `EDELETE_BIN` overrides) when it is runnable, `rm -rf` otherwise. Step 0 prints the filesystem each of the three paths resolved to — check that `--work` is real scratch, since GUFI writes one SQLite database per directory.
 
 ## On a cluster
 

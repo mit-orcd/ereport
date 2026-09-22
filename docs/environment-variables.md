@@ -11,8 +11,6 @@ Every tuning knob, in one place. Each binary reads its own variables; there is n
 | `ecrawl` | `ECRAWL_ID_RESOLVE_THREADS` | 16 | uid/gid name lookups at the end of the run (1 = serial) |
 | `ecrawl_query` | `ECRAWL_QUERY_THREADS` | 16 | shard scan (maximum 4096) |
 | `ecrawl_mount` | `ECRAWL_MOUNT_THREADS` | 32 | in-memory index build at mount time; `-o threads=N` overrides (1…4096) |
-| `edelete` | `EDELETE_THREADS` | 16 | directory walk |
-| `edelete` | `EDELETE_MAX_UNLINK_INFLIGHT` | 256 | concurrent `unlink` calls in `--delete` (`0` = unlimited) |
 | `edump` | `EDUMP_WRITERS` | 8 | file recreation; `--writers N` overrides (1…4096) |
 | `ereport` | `EREPORT_THREADS` | 32 | `.bin` parsing and `bucket_*.html` emission |
 | `ereport_index` | `EREPORT_INDEX_THREADS` | 32 | `--make` parse workers; `--search` postings load |
@@ -20,7 +18,7 @@ Every tuning knob, in one place. Each binary reads its own variables; there is n
 | `ereport_index` | `EREPORT_INDEX_MERGE_WORKERS` | 16 | concurrent merge workers; RAM admission may run fewer |
 | `ereport_index` | `EREPORT_INDEX_MERGE_SORT_THREADS` | 1 | threads per within-bucket sort; only helps when the merge is CPU-bound |
 
-Rough floors for the defaults on an idle host: 4 CPUs / 4 GiB for `ecrawl`, `ecrawl_query`, `edelete`, `edump`; 8 CPUs / 8 GiB for `ereport` and `ecrawl_mount`; 16 CPUs / 16 GiB for `ereport_index`. Large `ereport_index --make` merges can need tens to hundreds of GiB; the merge budget tracks `MemAvailable`.
+Rough floors for the defaults on an idle host: 4 CPUs / 4 GiB for `ecrawl`, `ecrawl_query`, `edump`; 8 CPUs / 8 GiB for `ereport` and `ecrawl_mount`; 16 CPUs / 16 GiB for `ereport_index`. Large `ereport_index --make` merges can need tens to hundreds of GiB; the merge budget tracks `MemAvailable`.
 
 ## `ecrawl`
 
@@ -53,9 +51,7 @@ The `DONATE`/`ENQUEUE` knobs are for pathological trees (one huge directory, a v
 
 ## `edelete`
 
-| Variable | Default | Role |
-|----------|---------|------|
-| `EDELETE_FANOUT_MIN_BYTES` | 64 MiB | files at least this large are unlinked via the work queue instead of inline (`0` = off) |
+Moved to [mit-orcd/ecopy](https://github.com/mit-orcd/ecopy) — see that repo's README for `EDELETE_THREADS`, `EDELETE_MAX_UNLINK_INFLIGHT`, and `EDELETE_FANOUT_MIN_BYTES`. ereport scripts resolve the binary via `EDELETE_BIN` or `scripts/ensure-edelete.sh` (which honors `ECOPY_DIR`/`ECOPY_REPO`/`ECOPY_REF`).
 
 ## `ereport`
 

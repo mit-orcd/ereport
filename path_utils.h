@@ -1,5 +1,5 @@
 /*
- * Shared path helpers (join, strip trailing separators, prefix containment).
+ * Shared path helpers (join, strip trailing separators).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -23,11 +23,5 @@ int path_join_fast(const char *base, size_t base_len, const char *name, size_t n
 /* malloc path; sets *out_len to strlen(path). */
 int path_join_alloc(const char *base, size_t base_len, const char *name, size_t name_len, char **out_path,
                     size_t *out_len);
-
-/*
- * True if path equals root or is strictly under root as a path prefix
- * (root "/" matches any path except "/").
- */
-int path_is_under_root(const char *path, const char *root);
 
 #endif /* PATH_UTILS_H */
