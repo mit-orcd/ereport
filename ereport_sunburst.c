@@ -30,8 +30,10 @@
 
 /* Children kept per node: in the top N by bytes or by files (union), and above
  * SUNBURST_MIN_FRAC of their parent in at least one metric; the rest fold into
- * an "(other)" leaf. SUNBURST_NODE_BUDGET is the hard backstop against
- * multiplicative blowup on trees that are wide at every level. */
+ * an "(other)" leaf. The fraction bar is waived when it would leave the kept
+ * children a minority of the parent (flat fan-outs), see sb_expand_map.
+ * SUNBURST_NODE_BUDGET is the hard backstop against multiplicative blowup on
+ * trees that are wide at every level. */
 #define SUNBURST_TOP_N 12
 #define SUNBURST_MIN_FRAC 0.001
 #define SUNBURST_NODE_BUDGET 65536
@@ -413,10 +415,31 @@ static int sb_expand_map(ereport_sunburst_tree_t *t, const sb_shard_t *sh,
     min_b = (uint64_t)((long double)t->nodes[ni].total_bytes * SUNBURST_MIN_FRAC);
     min_f = (uint64_t)((long double)t->nodes[ni].total_files * SUNBURST_MIN_FRAC);
 
+    /* The min-fraction bar prunes slivers that would be invisible next to big
+     * siblings. On a flat fan-out (thousands of similar home directories) it
+     * prunes everything instead, leaving a ring that is one "(other)" wedge
+     * with nothing to click. So the bar is waived when the children it keeps
+     * would hold less than half of the parent in either metric: the top-N then
+     * show regardless of share. */
+    {
+        uint64_t kept_b = 0, kept_f = 0;
+        const uint64_t tot_b = t->nodes[ni].total_bytes, tot_f = t->nodes[ni].total_files;
+
+        for (size_t i = 0; i < cm->n; i++) {
+            const sb_cagg_t *e = &cm->ents[i];
+            if (!keep[i]) continue;
+            if ((min_b > 0 && e->bytes >= min_b) || (min_f > 0 && e->files >= min_f)) {
+                kept_b += e->bytes;
+                kept_f += e->files;
+            }
+        }
+        if ((tot_b && kept_b < tot_b - kept_b) || (tot_f && kept_f < tot_f - kept_f)) min_b = min_f = 0;
+    }
+
     ereport_qsort_r(ord, cm->n, sizeof(*ord), sb_cagg_cmp_bytes_desc, cm->ents); /* intern in bytes order */
     for (size_t i = 0; i < cm->n; i++) {
         sb_cagg_t *e = &cm->ents[ord[i]];
-        int above = (min_b > 0 && e->bytes >= min_b) || (min_f > 0 && e->files >= min_f);
+        int above = (min_b == 0 && min_f == 0) || (min_b > 0 && e->bytes >= min_b) || (min_f > 0 && e->files >= min_f);
         char corig[PATH_MAX];
         char dbuf[PATH_MAX];
         char *display;
@@ -1381,23 +1404,53 @@ static void sb_html_suffix(FILE *out) {
         "  return kids;\n"
         "}\n"
         "\n"
+        "/* Minimum wedge width as a share of the parent's span (2% = 7.2 degrees on\n"
+        "   a full ring, ~15px of arc on the innermost ring). On a flat fan-out\n"
+        "   (thousands of similar home directories) the kept children are hairlines\n"
+        "   next to a 99% \"(other)\": too thin to click or label. Directory wedges\n"
+        "   below the minimum are widened and the difference is taken from that\n"
+        "   ring's \"(other)\" fold, which is the only synthetic wedge and keeps at\n"
+        "   least the minimum itself; the \"(self)\" wedge is left alone. Nothing else\n"
+        "   moves: rings whose \"(other)\" is small or absent stay to scale, tooltips\n"
+        "   and totals always show the true values, and the chart says so when it\n"
+        "   happened. */\n"
+        "const MIN_WEDGE_FRAC = 0.02;\n"
+        "let notToScale = false;\n"
+        "\n"
         "function layout(root) {\n"
         "  const nodes = [];\n"
         "  root.x0 = 0; root.x1 = Math.PI * 2; root.y = 0;\n"
+        "  notToScale = false;\n"
         "  const stack = [root];\n"
         "  while (stack.length) {\n"
         "    const n = stack.pop();\n"
         "    nodes.push(n);\n"
         "    const total = val(n);\n"
         "    if (!(total > 0)) continue;\n"
-        "    let x = n.x0;\n"
-        "    for (const c of kidsOf(n)) {\n"
-        "      const cv = val(c);\n"
-        "      const w = (n.x1 - n.x0) * (cv / total);\n"
-        "      c.x0 = x; c.x1 = x + w; c.y = n.y + 1;\n"
-        "      x = c.x1;\n"
-        "      if (cv > 0) stack.push(c);\n"
+        "    const span = n.x1 - n.x0;\n"
+        "    const kids = kidsOf(n);\n"
+        "    const ws = kids.map(function (c) { return span * (val(c) / total); });\n"
+        "    const minW = span * MIN_WEDGE_FRAC;\n"
+        "    let oi = -1, deficit = 0;\n"
+        "    kids.forEach(function (c, i) {\n"
+        "      if (c.name === '(other)' && !c.self) oi = i;\n"
+        "      else if (!c.self && val(c) > 0 && ws[i] < minW) deficit += minW - ws[i];\n"
+        "    });\n"
+        "    if (oi >= 0 && deficit > 0 && ws[oi] > minW) {\n"
+        "      const give = Math.min(deficit, ws[oi] - minW);\n"
+        "      const scale = give / deficit; /* < 1 when (other) cannot cover it all */\n"
+        "      kids.forEach(function (c, i) {\n"
+        "        if (i !== oi && !c.self && val(c) > 0 && ws[i] < minW) ws[i] += (minW - ws[i]) * scale;\n"
+        "      });\n"
+        "      ws[oi] -= give;\n"
+        "      notToScale = true;\n"
         "    }\n"
+        "    let x = n.x0;\n"
+        "    kids.forEach(function (c, i) {\n"
+        "      c.x0 = x; c.x1 = x + ws[i]; c.y = n.y + 1;\n"
+        "      x = c.x1;\n"
+        "      if (val(c) > 0) stack.push(c);\n"
+        "    });\n"
         "  }\n"
         "  return nodes;\n"
         "}\n"
@@ -1599,6 +1652,15 @@ static void sb_html_suffix(FILE *out) {
         "  t2.style.fontSize = '12px'; t2.style.fill = '#667085';\n"
         "  t2.textContent = fmtV(cur);\n"
         "  svg.appendChild(t1); svg.appendChild(t2);\n"
+        "\n"
+        "  if (notToScale) {\n"
+        "    const t3 = document.createElementNS(NS, 'text');\n"
+        "    t3.setAttribute('x', CX); t3.setAttribute('y', 994);\n"
+        "    t3.setAttribute('text-anchor', 'middle');\n"
+        "    t3.style.fontSize = '11px'; t3.style.fill = '#667085';\n"
+        "    t3.textContent = 'Not to scale: thin wedges widened to stay clickable, taken from \"(other)\". Hover for true shares.';\n"
+        "    svg.appendChild(t3);\n"
+        "  }\n"
         "}\n"
         "\n"
         "document.getElementById('btn-bytes').addEventListener('click', function () {\n"
