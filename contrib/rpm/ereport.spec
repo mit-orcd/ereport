@@ -10,12 +10,20 @@
 #   ereport-systemd  the ecrawl-daily timer + wrapper + noreplace config
 #   ereport-docs     upstream docs/ tree
 #
-# Upstream has no release tags yet, so this packages a pinned git snapshot;
-# to track a new commit, bump %{commit}/%{gitdate} and the changelog.
+# Upstream has no release tags yet, so this packages a git snapshot using
+# FPG snapshot naming: Version: 0^<yyyymmdd>git<7-char sha> (the caret sorts
+# snapshots above a bare "0" and below "0.1", so a future first release
+# upgrades cleanly). The pinned values below are only the fallback for hand
+# builds; CI (.github/workflows/rpm.yml) overrides them with the commit
+# actually being built, so every published RPM carries that commit's
+# shorthash:
+#   rpmbuild --define "ereport_commit <full sha>" \
+#            --define "ereport_gitdate <commit date, yyyymmdd>"
 #
 # Build options:
-#   --without fuse    skip ecrawl_mount (needs FUSE 2.x headers: EL8/EL9
-#                     fuse-devel; use on distros shipping fuse3 only)
+#   --without fuse    skip ecrawl_mount (needs FUSE 2.x headers: fuse-devel,
+#                     BaseOS on EL8, CRB on EL9/EL10; use on distros that
+#                     really do ship fuse3 only)
 #   --with jemalloc   link native tools against jemalloc. Off by default:
 #                     upstream documents that without it builds are
 #                     byte-identical glibc-malloc builds, and a build host
@@ -27,9 +35,20 @@
 %bcond_with    jemalloc
 %bcond_without check
 
-%global commit       7308ed67c352ec3157e1ee3a8672a35cb45dbf25
-%global shortcommit  7308ed6
-%global gitdate      20260930
+# Snapshot pin. Hand builds use the fallback values; CI
+# (.github/workflows/rpm.yml) overrides them with the commit actually being
+# built so every published RPM's NVR carries that commit's shorthash:
+#   rpmbuild --define "ereport_commit <full sha>" \
+#            --define "ereport_gitdate <yyyymmdd>"
+# Hand-building from a git checkout (what CI does):
+#   sha=$(git rev-parse HEAD)
+#   git archive --prefix="ereport-$sha/" -o SOURCES/ereport-$sha.tar.gz HEAD
+#   rpmbuild --define "ereport_commit $sha" \
+#            --define "ereport_gitdate $(git show -s --format=%cd --date=format:%Y%m%d HEAD)" \
+#            .../ereport.spec
+%global commit       %{?ereport_commit}%{!?ereport_commit:7308ed67c352ec3157e1ee3a8672a35cb45dbf25}
+%global shortcommit  %(c="%{commit}"; echo "$c" | cut -c1-7)
+%global gitdate      %{?ereport_gitdate}%{!?ereport_gitdate:20260930}
 
 # Fallback for build hosts whose rpm does not define %_unitdir (RHEL/Fedora
 # get it from redhat-rpm-config; plain rpm installs may not).
@@ -39,8 +58,14 @@
 %endif
 
 Name:           ereport
-Version:        0
-Release:        0.1.%{gitdate}git%{shortcommit}%{?dist}
+# FPG snapshot naming (Fedora packaging guidelines, "Snapshots"): upstream
+# has never chosen a version, so Version is 0, and the snapshot field
+# ^<yyyymmdd>git<7-char sha> rides in the Version tag after a caret. The
+# caret makes post-release snapshots sort higher than the bare version and
+# lower than 0.1, so a future first real release (Version: 0.1) upgrades
+# cleanly over any snapshot.
+Version:        0^%{gitdate}git%{shortcommit}
+Release:        1%{?dist}
 Summary:        Filesystem crawl and reporting tools (ecrawl, ereport and friends)
 
 License:        MIT
@@ -248,9 +273,12 @@ EOF
 %{_docdir}/%{name}
 
 %changelog
-* Wed Oct 07 2026 Lincoln Bryant <lincolnb@mit.edu> - 0-0.1.20260930git7308ed6
+* Wed Oct 07 2026 Lincoln Bryant <lincolnb@mit.edu> - 0^20260930git7308ed6-1
 - Initial package of git snapshot 7308ed6 (2026-09-30): ecrawl, ereport,
   ereport_index, ecrawl_query, edump and eserve.py
+- FPG snapshot naming: Version 0^<yyyymmdd>git<shortsha>, Release 1
 - ereport-systemd subpackage: ecrawl-daily.{service,timer}, wrapper and
   noreplace config, paths rewritten from upstream's /usr/local/lib/ereport
 - ereport-docs subpackage carrying upstream docs/
+- CI (.github/workflows/rpm.yml) overrides ereport_commit/ereport_gitdate so
+  each published RPM's NVR carries the commit actually built

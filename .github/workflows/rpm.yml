@@ -3,10 +3,11 @@ name: rpm
 # Build the RPMs from contrib/rpm/ereport.spec on every push to main (or on
 # demand) and publish them as workflow artifacts. The spec's snapshot macros
 # are overridden with the commit actually being built, so every RPM's NVR
-# carries that commit's shorthash, e.g.
-#   ereport-0-0.1.20261007gitd711c09.el8
-# The binary RPMs land in the "rpms-<shortsha>" artifact together with the
-# SRPM. %check runs the full upstream test suite as part of the build.
+# carries that commit's shorthash (FPG snapshot naming), e.g.
+#   ereport-0^20261007gitd711c09-1.el8 / ...el9 / ...el10
+# Each distro lands in its own artifact ("rpms-rocky8-<shortsha>",
+# "rpms-rocky9-<shortsha>", ...) together with the SRPM. %check runs the full
+# upstream test suite as part of the build.
 
 on:
   push:
@@ -17,11 +18,15 @@ permissions:
   contents: read
 
 jobs:
-  rocky8:
-    name: RPM (Rocky Linux 8)
+  rpms:
+    name: RPM (Rocky Linux ${{ matrix.release }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["8", "9", "10"]
     container:
-      image: rockylinux:8
+      image: rockylinux:${{ matrix.release }}
     steps:
       - name: Install build dependencies
         # git must be present before checkout: actions/checkout falls back to
@@ -30,9 +35,18 @@ jobs:
         # annobin when gcc is present). systemd-rpm-macros carries the
         # %systemd_* scriptlet macros: a real package on EL9+, a virtual
         # provide of systemd on EL8 (dnf installs systemd, which owns
-        # /usr/lib/rpm/macros.d/macros.systemd there).
+        # /usr/lib/rpm/macros.d/macros.systemd there). python3 is a real
+        # package on EL9 and a virtual provide of python36 on EL8, where
+        # /usr/bin/python3 comes from the alternatives system either way.
+        # On EL9+ fuse-devel (FUSE 2.9 headers, needed for ecrawl_mount)
+        # lives in CRB, which the rockylinux images ship disabled:
+        # --enablerepo is a built-in dnf option, no plugin needed.
         run: |
-          dnf -y install gcc make rpm-build redhat-rpm-config \
+          set -euo pipefail
+          crb=""
+          if [ "${{ matrix.release }}" != "8" ]; then crb="--enablerepo=crb"; fi
+          # shellcheck disable=SC2086
+          dnf -y $crb install gcc make rpm-build redhat-rpm-config \
                          systemd-rpm-macros \
                          libzstd-devel fuse-devel python3 git
 
@@ -50,7 +64,7 @@ jobs:
             echo "short=$short"
             echo "gitdate=$gitdate"
           } >> "$GITHUB_ENV"
-          echo "building ereport-0-0.1.${gitdate}git${short}"
+          echo "building ereport-0^${gitdate}git${short}-1"
 
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           # Same top-level directory name as the Source0 GitHub tarball
@@ -85,7 +99,7 @@ jobs:
       - name: Upload RPMs
         uses: actions/upload-artifact@v4
         with:
-          name: rpms-rocky8-${{ env.short }}
+          name: rpms-rocky${{ matrix.release }}-${{ env.short }}
           path: |
             rpmbuild/RPMS/*/*.rpm
             rpmbuild/SRPMS/*.rpm
