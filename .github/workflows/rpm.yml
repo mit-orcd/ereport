@@ -1,0 +1,92 @@
+name: rpm
+
+# Build the RPMs from contrib/rpm/ereport.spec on every push to main (or on
+# demand) and publish them as workflow artifacts. The spec's snapshot macros
+# are overridden with the commit actually being built, so every RPM's NVR
+# carries that commit's shorthash, e.g.
+#   ereport-0-0.1.20261007gitd711c09.el8
+# The binary RPMs land in the "rpms-<shortsha>" artifact together with the
+# SRPM. %check runs the full upstream test suite as part of the build.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rocky8:
+    name: RPM (Rocky Linux 8)
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:8
+    steps:
+      - name: Install build dependencies
+        # git must be present before checkout: actions/checkout falls back to
+        # an API tarball download without it, and we need a real clone for
+        # `git archive`. redhat-rpm-config provides %optflags (and pulls
+        # annobin when gcc is present). systemd-rpm-macros carries the
+        # %systemd_* scriptlet macros: a real package on EL9+, a virtual
+        # provide of systemd on EL8 (dnf installs systemd, which owns
+        # /usr/lib/rpm/macros.d/macros.systemd there).
+        run: |
+          dnf -y install gcc make rpm-build redhat-rpm-config \
+                         systemd-rpm-macros \
+                         libzstd-devel fuse-devel python3 git
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build source tarball from this commit
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short="${sha:0:7}"
+          gitdate="$(git show -s --format=%cd --date=format:%Y%m%d HEAD)"
+          {
+            echo "commit=$sha"
+            echo "short=$short"
+            echo "gitdate=$gitdate"
+          } >> "$GITHUB_ENV"
+          echo "building ereport-0-0.1.${gitdate}git${short}"
+
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Same top-level directory name as the Source0 GitHub tarball
+          # (ereport-<full sha>/), which %setup -n expects.
+          git archive --prefix="ereport-${sha}/" \
+                      -o "rpmbuild/SOURCES/ereport-${sha}.tar.gz" HEAD
+          cp contrib/rpm/ereport.spec rpmbuild/SPECS/
+
+      - name: rpmbuild
+        run: |
+          set -euo pipefail
+          rpmbuild -ba \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "ereport_commit $commit" \
+            --define "ereport_gitdate $gitdate" \
+            rpmbuild/SPECS/ereport.spec
+
+      - name: Verify NVR carries this commit
+        run: |
+          set -euo pipefail
+          rc=0
+          for r in rpmbuild/RPMS/*/*.rpm rpmbuild/SRPMS/*.rpm; do
+            nvr="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' "$r")"
+            echo "$r -> $nvr"
+            case "$nvr" in
+              *git"$short"*) ;;
+              *) echo "FAIL: $nvr does not carry short sha $short" >&2; rc=1 ;;
+            esac
+          done
+          exit $rc
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-rocky8-${{ env.short }}
+          path: |
+            rpmbuild/RPMS/*/*.rpm
+            rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
