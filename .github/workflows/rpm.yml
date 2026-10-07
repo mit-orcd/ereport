@@ -1,0 +1,106 @@
+name: rpm
+
+# Build the RPMs from contrib/rpm/ereport.spec on every push to main (or on
+# demand) and publish them as workflow artifacts. The spec's snapshot macros
+# are overridden with the commit actually being built, so every RPM's NVR
+# carries that commit's shorthash (FPG snapshot naming), e.g.
+#   ereport-0^20261007gitd711c09-1.el8 / ...el9 / ...el10
+# Each distro lands in its own artifact ("rpms-rocky8-<shortsha>",
+# "rpms-rocky9-<shortsha>", ...) together with the SRPM. %check runs the full
+# upstream test suite as part of the build.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rpms:
+    name: RPM (Rocky Linux ${{ matrix.release }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["8", "9", "10"]
+    container:
+      image: rockylinux:${{ matrix.release }}
+    steps:
+      - name: Install build dependencies
+        # git must be present before checkout: actions/checkout falls back to
+        # an API tarball download without it, and we need a real clone for
+        # `git archive`. redhat-rpm-config provides %optflags (and pulls
+        # annobin when gcc is present). systemd-rpm-macros carries the
+        # %systemd_* scriptlet macros: a real package on EL9+, a virtual
+        # provide of systemd on EL8 (dnf installs systemd, which owns
+        # /usr/lib/rpm/macros.d/macros.systemd there). python3 is a real
+        # package on EL9 and a virtual provide of python36 on EL8, where
+        # /usr/bin/python3 comes from the alternatives system either way.
+        # On EL9+ fuse-devel (FUSE 2.9 headers, needed for ecrawl_mount)
+        # lives in CRB, which the rockylinux images ship disabled:
+        # --enablerepo is a built-in dnf option, no plugin needed.
+        run: |
+          set -euo pipefail
+          crb=""
+          if [ "${{ matrix.release }}" != "8" ]; then crb="--enablerepo=crb"; fi
+          # shellcheck disable=SC2086
+          dnf -y $crb install gcc make rpm-build redhat-rpm-config \
+                         systemd-rpm-macros \
+                         libzstd-devel fuse-devel python3 git
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build source tarball from this commit
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          short="${sha:0:7}"
+          gitdate="$(git show -s --format=%cd --date=format:%Y%m%d HEAD)"
+          {
+            echo "commit=$sha"
+            echo "short=$short"
+            echo "gitdate=$gitdate"
+          } >> "$GITHUB_ENV"
+          echo "building ereport-0^${gitdate}git${short}-1"
+
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Same top-level directory name as the Source0 GitHub tarball
+          # (ereport-<full sha>/), which %setup -n expects.
+          git archive --prefix="ereport-${sha}/" \
+                      -o "rpmbuild/SOURCES/ereport-${sha}.tar.gz" HEAD
+          cp contrib/rpm/ereport.spec rpmbuild/SPECS/
+
+      - name: rpmbuild
+        run: |
+          set -euo pipefail
+          rpmbuild -ba \
+            --define "_topdir $PWD/rpmbuild" \
+            --define "ereport_commit $commit" \
+            --define "ereport_gitdate $gitdate" \
+            rpmbuild/SPECS/ereport.spec
+
+      - name: Verify NVR carries this commit
+        run: |
+          set -euo pipefail
+          rc=0
+          for r in rpmbuild/RPMS/*/*.rpm rpmbuild/SRPMS/*.rpm; do
+            nvr="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' "$r")"
+            echo "$r -> $nvr"
+            case "$nvr" in
+              *git"$short"*) ;;
+              *) echo "FAIL: $nvr does not carry short sha $short" >&2; rc=1 ;;
+            esac
+          done
+          exit $rc
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms-rocky${{ matrix.release }}-${{ env.short }}
+          path: |
+            rpmbuild/RPMS/*/*.rpm
+            rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
