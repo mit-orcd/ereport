@@ -18,4 +18,6 @@ __pycache__/
 /test_query_subtree_dups
 /ecrawl_mount
 /edump
+# rpmbuild output
+/rpmbuild/
 .codex

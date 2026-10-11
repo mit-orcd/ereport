@@ -4,9 +4,10 @@
 # then answer questions from the records (HTML reports, path search,
 # find/du-style queries) without walking the tree again.
 #
-# One spec, three packages:
-#   ereport          ecrawl, ereport, ereport_index, ecrawl_query, edump,
-#                    (ecrawl_mount when built with FUSE) and eserve.py
+# One spec, packages:
+#   ereport          report stack: ereport, ereport_index, eserve.py
+#   ecrawl           crawl tools: ecrawl, ecrawl_query, edump
+#                    (ecrawl_mount when built with FUSE)
 #   ereport-systemd  the ecrawl-daily timer + wrapper + noreplace config
 #   ereport-docs     upstream docs/ tree
 #
@@ -96,14 +97,24 @@ binary records, then answer questions from those records without walking the
 tree again: static HTML reports with an age x size heat map and sunburst,
 trigram path search over billions of paths, and du/find-style queries.
 
-This package provides the ecrawl, ereport, ereport_index, ecrawl_query and
-edump binaries (ecrawl_mount too when built with FUSE support), plus
-eserve.py, the web server for the generated reports.
+This package provides the report stack: ereport, ereport_index and
+eserve.py. The crawl tools (ecrawl, ecrawl_query, edump, ecrawl_mount)
+are in the ecrawl package.
+
+%package -n ecrawl
+Summary:        Parallel filesystem crawler and crawl tools (ecrawl family)
+# /usr/bin/ecrawl came from the monolithic ereport package
+Conflicts:      %{name} < %{version}-%{release}
+
+%description -n ecrawl
+Parallel filesystem crawler and crawl tools: ecrawl, ecrawl_query, edump,
+and (with FUSE 2) ecrawl_mount.
 
 %package systemd
 Summary:        Daily ecrawl timer for ereport
 BuildArch:      noarch
-Requires:       %{name} = %{?epoch:%{epoch}:}%{version}-%{release}
+# crawls don't need the report generator
+Requires:       ecrawl = %{?epoch:%{epoch}:}%{version}-%{release}
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -200,15 +211,17 @@ cat > %{buildroot}%{_docdir}/%{name}/README.RPM <<'EOF'
 ereport RPM layout
 ==================
 
-Binaries (package: ereport)
+Binaries (package: ecrawl)
   %{_bindir}/ecrawl           parallel crawler; writes uid-sharded records
-  %{_bindir}/ereport          static HTML report generator
-  %{_bindir}/ereport_index    trigram path-search index (make/query)
   %{_bindir}/ecrawl_query    du/find-style queries over a crawl
   %{_bindir}/edump            recreate a crawl as a synthetic tree
-  %{_bindir}/eserve.py        HTTP server for reports + the search box
   (when built with FUSE: %{_bindir}/ecrawl_mount, a read-only FUSE view of
    a crawl; Linux only)
+
+Binaries (package: ereport)
+  %{_bindir}/ereport          static HTML report generator
+  %{_bindir}/ereport_index    trigram path-search index (make/query)
+  %{_bindir}/eserve.py        HTTP server for reports + the search box
 
 Quick start
   ecrawl /path/to/tree crawl-out
@@ -250,15 +263,18 @@ EOF
 
 %files
 %license LICENSE
-%{_bindir}/ecrawl
 %{_bindir}/ereport
 %{_bindir}/ereport_index
+%{_bindir}/eserve.py
+
+%files -n ecrawl
+%license LICENSE
+%{_bindir}/ecrawl
 %{_bindir}/ecrawl_query
 %{_bindir}/edump
 %if %{with fuse}
 %{_bindir}/ecrawl_mount
 %endif
-%{_bindir}/eserve.py
 
 %files systemd
 %dir %{_libexecdir}/ereport
@@ -273,6 +289,14 @@ EOF
 %{_docdir}/%{name}
 
 %changelog
+* Sun Oct 11 2026 George Tsouloupas <george.tsouloupas@quantori.com> - 0^20260930git7308ed6-1
+- Split the crawl tools into a standalone ecrawl package: ecrawl,
+  ecrawl_query, edump and (with FUSE) ecrawl_mount; the ereport package
+  keeps the report stack (ereport, ereport_index, eserve.py)
+- ereport-systemd now Requires ecrawl instead of ereport: a crawl node
+  needs the crawler and the timer, not the report generator
+- ecrawl Conflicts with pre-split ereport; upgrade the ecrawl and ereport
+  packages together in one transaction to move off the monolithic install
 * Wed Oct 07 2026 Lincoln Bryant <lincolnb@mit.edu> - 0^20260930git7308ed6-1
 - Initial package of git snapshot 7308ed6 (2026-09-30): ecrawl, ereport,
   ereport_index, ecrawl_query, edump and eserve.py
