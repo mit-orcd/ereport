@@ -14,10 +14,13 @@
 # Upstream has no release tags yet, so this packages a git snapshot using
 # FPG snapshot naming: Version: 0^<yyyymmdd>git<7-char sha> (the caret sorts
 # snapshots above a bare "0" and below "0.1", so a future first release
-# upgrades cleanly). The pinned values below are only the fallback for hand
-# builds; CI (.github/workflows/rpm.yml) overrides them with the commit
+# upgrades cleanly). The snapshot macros are overridden with the commit
 # actually being built, so every published RPM carries that commit's
-# shorthash:
+# shorthash. Builds are driven by Makefile targets that run one recipe,
+# contrib/rpm/rpm_build.sh, inside an EL container:
+#   make rpms            locally: podman/docker, releases 8/9/10
+#   make rpm RELEASE=9   in a container: what CI's rpm.yml calls per matrix job
+# Hand runs override the same macros:
 #   rpmbuild --define "ereport_commit <full sha>" \
 #            --define "ereport_gitdate <commit date, yyyymmdd>"
 #
@@ -36,17 +39,12 @@
 %bcond_with    jemalloc
 %bcond_without check
 
-# Snapshot pin. Hand builds use the fallback values; CI
-# (.github/workflows/rpm.yml) overrides them with the commit actually being
-# built so every published RPM's NVR carries that commit's shorthash:
+# Snapshot pin. Hand builds use the fallback values below; both builders
+# (make rpms locally, CI via make rpm) pass the commit being built so every
+# published RPM's NVR carries its shorthash — see contrib/rpm/rpm_build.sh,
+# which does exactly this for them:
 #   rpmbuild --define "ereport_commit <full sha>" \
 #            --define "ereport_gitdate <yyyymmdd>"
-# Hand-building from a git checkout (what CI does):
-#   sha=$(git rev-parse HEAD)
-#   git archive --prefix="ereport-$sha/" -o SOURCES/ereport-$sha.tar.gz HEAD
-#   rpmbuild --define "ereport_commit $sha" \
-#            --define "ereport_gitdate $(git show -s --format=%cd --date=format:%Y%m%d HEAD)" \
-#            .../ereport.spec
 %global commit       %{?ereport_commit}%{!?ereport_commit:7308ed67c352ec3157e1ee3a8672a35cb45dbf25}
 %global shortcommit  %(c="%{commit}"; echo "$c" | cut -c1-7)
 %global gitdate      %{?ereport_gitdate}%{!?ereport_gitdate:20260930}
