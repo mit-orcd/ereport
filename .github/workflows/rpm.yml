@@ -1,17 +1,9 @@
 name: rpm
 
-# Build the RPMs from contrib/rpm/ereport.spec on every push to main (or on
-# demand) and publish them as workflow artifacts. The build recipe lives in
-# contrib/rpm/rpm_build.sh, invoked here via `make rpm RELEASE=<rel>` — the
-# same entry point local builds use (`make rpms` loops releases in containers;
-# the GitHub job container replaces that here). The spec's snapshot macros are
-# overridden with the commit actually being built, so every RPM's NVR carries
-# that commit's shorthash (FPG snapshot naming), e.g.
-#   ereport-0^20261007gitd711c09-1.el8 / ...el9 / ...el10
-# Each distro lands in its own artifact ("rpms-rocky8-<shortsha>") together
-# with the SRPM, collected by the recipe into rpmbuild/artifacts/<release>/
-# after its NVR check passes. %check runs the full upstream test suite as
-# part of the build.
+# Build RPMs on every push to main (or on demand) via the Makefile recipe
+# (`make rpm RELEASE=<rel>` — engine/image/container handling lives in the
+# Makefile); each distro's RPMs + SRPM land in its artifact
+# "rpms-rocky<rel>-<shortsha>".
 
 on:
   push:
@@ -29,27 +21,13 @@ jobs:
       fail-fast: false
       matrix:
         release: ["8", "9", "10"]
-    container:
-      image: rockylinux:${{ matrix.release }}
-    env:
-      # rpm_build.sh requires an opt-in marker outside its detection rules
-      EREPORT_IN_BUILD_CONTAINER: 1
     steps:
-      - name: Install make and git
-        # git must exist before checkout: actions/checkout falls back to an
-        # API tarball download without it, and the recipe needs a real clone
-        # for `git archive`. The full dependency list lives in
-        # contrib/rpm/rpm_build.sh, which installs it in the next step.
-        run: dnf -y install git make
-
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Record short sha (artifact naming only)
-        run: echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
 
       - name: Build RPMs
-        run: make rpm RELEASE=${{ matrix.release }}
+        run: |
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+          make rpm RELEASE=${{ matrix.release }}
 
       - name: Upload RPMs
         uses: actions/upload-artifact@v4

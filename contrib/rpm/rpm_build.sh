@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # rpm_build.sh — build the ereport RPMs for ONE EL release, in-container.
 #
-# The single source of truth for the rpmbuild recipe. Shared by:
-#   make rpms                  host driver: podman/docker, one container per release
-#   make rpm RELEASE=9         in-container shim (validation + call into here)
-#   .github/workflows/rpm.yml  CI: job container per release, calls `make rpm`
+# The single source of truth for the rpmbuild recipe, called by:
+#   make rpm RELEASE=9         one build; outside a container make wraps itself
+#                              into an EL container, inside one calls into here
+#   make rpms                  same, looped over $(RELEASES)
+#   .github/workflows/rpm.yml  CI: per-release matrix, each leg `make rpm`
 #
 # Must run inside a Rocky/EL container: it installs build dependencies with
 # dnf, and doing so on a real build host would mutate it. Detection covers:
 # podman marks /run/.containerenv, docker marks /.dockerenv, systemd-nspawn
 # marks /run/systemd/container; anything else needs an explicit opt-in
-# (EREPORT_IN_BUILD_CONTAINER=1), which make rpms sets inside its containers
-# and CI's job sets for itself.
+# (EREPORT_IN_BUILD_CONTAINER=1), which make sets inside the container it
+# spawns from the host.
 set -euo pipefail
 
 rel="${1:?usage: rpm_build.sh <8|9|10>}"
