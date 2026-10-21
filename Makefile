@@ -225,4 +225,45 @@ check-tree: $(TARGETS)
 	./scripts/test/test_setup.sh
 	./scripts/test/test.sh "$(CURDIR)/test"
 
-.PHONY: all clean debug serve serve-public check check-tree jemalloc-note fuse-headers
+# ─── RPM packaging (contrib/rpm) ───────────────────────────────────────
+# One recipe, shared by local builds and CI (.github/workflows/rpm.yml):
+#   make rpm RELEASE=9  one EL build: outside a container it wraps itself into
+#                       $(EL_IMG):<rel> (podman/docker); inside one it runs
+#                       contrib/rpm/rpm_build.sh
+#   make rpms           same, looped over $(RELEASES)
+#   make rpm-clean      drop rpmbuild/ (tarball cache, outputs, stamps)
+# The dnf/rpmbuild recipe itself lives in rpm_build.sh: bash owns the
+# sequential steps; make only ships the script into the right container.
+# The GIT_CONFIG_* env stanza marks the bind-mounted repo as a git
+# safe.directory: a user-owned repo seen by the container's root would
+# otherwise trip git's dubious-ownership check.
+# Old per-sha tarballs accumulate in rpmbuild/SOURCES until rpm-clean.
+
+RELEASES ?= 8 9 10
+EL_IMG ?= quay.io/rockylinux/rockylinux
+
+rpms:
+	@set -e; for rel in $(RELEASES); do $(MAKE) --no-print-directory rpm RELEASE=$$rel; done
+
+rpm:
+	@test -n "$(RELEASE)" || { echo "usage: make rpm RELEASE=8|9|10" >&2; exit 2; }
+	@if [ "$${EREPORT_IN_BUILD_CONTAINER:-}" = 1 ] || [ -e /.dockerenv ] \
+	    || [ -e /run/.containerenv ] || [ -e /run/systemd/container ]; then \
+	  echo "== RPM: el$(RELEASE) (in-container) =="; \
+	  contrib/rpm/rpm_build.sh $(RELEASE); \
+	else \
+	  eng="$$(command -v podman || command -v docker)"; \
+	  test -n "$$eng" || { echo "need podman or docker on PATH" >&2; exit 1; }; \
+	  echo "== RPM: el$(RELEASE) in $$(basename $$eng) =="; \
+	  $$eng run --rm -e EREPORT_IN_BUILD_CONTAINER=1 \
+	    -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory \
+	    -e GIT_CONFIG_VALUE_0=/repo \
+	    -v "$(CURDIR)":/repo -w /repo "$(EL_IMG):$(RELEASE)" \
+	    bash -c "dnf -y install git make && make rpm RELEASE=$(RELEASE)"; \
+	fi
+
+rpm-clean:
+	rm -rf rpmbuild
+
+.PHONY: all clean debug serve serve-public check check-tree jemalloc-note fuse-headers \
+	rpms rpm rpm-clean
