@@ -70,6 +70,13 @@ facts via `probe.sh` snapshots.
   matching source; `##exportfile` corroborates only.
 - Pool wildcard shares end in `&`; they resolve to the parent dataset
   (`/pool/00N/&` → `/data1/pool/008`).
+- `leaf` is about shares, not zfs: 1 when no other share's local path
+  (`local_fs`, or `share` when that path is the local mountpoint) sits
+  beneath it, 0 when one does.  A filer's `/` under per-directory shares
+  is 0 (16 xfs rows today, plus fstor001's `/software/community/001`);
+  pool wildcards stay 1 because nothing else covers their children, so
+  dropping every `leaf = 0` row never loses a byte.  Re-exports and
+  unresolved rows are NULL — they have no local path to compare.
 - The `##marker` lines in probe.sh output are the parse contract between
   collection and parsing — change them on both sides together.
 - The first `uv` run bootstraps into `~/.local/bin`; the project

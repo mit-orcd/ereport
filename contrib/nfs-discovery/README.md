@@ -77,10 +77,22 @@ from the inventory and any `probe/<host>` file no inventory host names.
     pool        zfs pool of the fs carrying the share: first segment of
                 the dataset's name from the ##zfs list (data1/amins ->
                 data1); NULL for xfs filers and unattested paths
+    leaf        1 when no other share's local path sits beneath this one,
+                so walking it never revisits another row's data (the local
+                path is local_fs, or the share when that path is the local
+                mountpoint); 0 when a share does sit beneath it, e.g. a
+                whole-filesystem '/' share above the per-directory shares;
+                NULL when the share has no local path (re-export,
+                unresolved)
 
 Facts trace to probe/<host> snapshot evidence only: exact mountpoint rows,
 framed re-roots, mounted-children-attested paths, device-mated mount
 rows, identified re-exports.  Unattested paths stay NULL instead of
 borrowing foreign facts, and a fresh snapshot that cannot resolve a share
-clears its stored facts.  Unreachable filers stay NULL — rerun or
-`--limit` the ones that are up.
+clears its stored facts.  `leaf` marks shares whose local path has no
+other share beneath it, so a walk that follows the flag visits every byte
+once: fstor004's `/` is 0 because `/data1/compute/orcd/004` is shared
+below it, while a pool wildcard (`/data1/pool/014/&`) is 1 because nothing
+else covers its children.  Re-exports and unresolved rows have no local
+path and stay NULL.
+Unreachable filers stay NULL — rerun or `--limit` the ones that are up.

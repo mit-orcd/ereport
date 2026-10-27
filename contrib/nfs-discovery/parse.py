@@ -20,6 +20,10 @@ Column rules (never guessed, never defaulted):
                of the dataset's name in the ##zfs table (data1/amins ->
                data1); NULL whenever that fs is not zfs or no ##zfs row
                names its mountpoint
+    leaf       1 when no other share's local path sits beneath this one,
+               so walking it never revisits another row's data; 0 when one
+               does; NULL when the share has no local path (re-export or
+               unresolved)
 
 Decision rules above the stages:
     A bare 'host:/' automount rides the filer's single fsid=0 pseudo-root
@@ -206,6 +210,15 @@ def pool_of(zfsm, mountpoint, fstype):
     return None
 
 
+def is_leaf(path, carriers):
+    """1 when no other share's local path sits strictly beneath path, so
+    walking this share never revisits another row's data; 0 when one does.
+
+    The carrier is the server-side path (local_fs, or the share when that
+    path is the local mountpoint) - never the client-side export alias."""
+    return int(not any(inside(path, other) for other in carriers))
+
+
 def wildcard_base(share):
     """The path a '&' share stands for: pool wildcard shares end in the
     automount's child-dir wildcard - server-side they mean the parent
@@ -347,18 +360,20 @@ def update_db(con, host, resolutions):
     letting stale values pose as current."""
     updated = cleared = 0
     clear = ("UPDATE shares SET backing = NULL, usage = NULL,"
-             " local_fs = NULL, size = NULL, nfiles = NULL, pool = NULL"
+             " local_fs = NULL, size = NULL, nfiles = NULL, pool = NULL,"
+             " leaf = NULL"
              " WHERE host = ? AND share = ? AND (backing IS NOT NULL"
              " OR usage IS NOT NULL OR local_fs IS NOT NULL"
              " OR size IS NOT NULL OR nfiles IS NOT NULL"
-             " OR pool IS NOT NULL)")
-    for share, backing, usage, local_fs, size, nfiles, pool in resolutions:
+             " OR pool IS NOT NULL OR leaf IS NOT NULL)")
+    for (share, backing, usage, local_fs, size, nfiles, pool,
+         leaf) in resolutions:
         if backing is not None:
             changed = con.execute(
                 "UPDATE shares SET backing = ?, usage = ?, local_fs = ?,"
-                " size = ?, nfiles = ?, pool = ?"
+                " size = ?, nfiles = ?, pool = ?, leaf = ?"
                 " WHERE host = ? AND share = ?",
-                (backing, usage, local_fs, size, nfiles, pool,
+                (backing, usage, local_fs, size, nfiles, pool, leaf,
                  host, share)).rowcount
             updated += 1 if changed else 0
             continue
@@ -394,9 +409,18 @@ def parse_snapshot(path, shares):
     zfsm = zfs_map(snap.get("zfs", ""))
     mounts = snap.get("mounts", "").splitlines()
     fsid0 = fsid0_roots(snap.get("exportfile", ""))
-    return [(share, *resolve_share(share, df, root, zfsm, inodes, mounts,
-                                   fsid0))
-            for share in shares]
+    facts = [(share, *resolve_share(share, df, root, zfsm, inodes, mounts,
+                                    fsid0))
+             for share in shares]
+    # carrier: the filer-local path carrying the share - local_fs when the
+    # share is an export alias, the share itself when that path is the local
+    # mountpoint.  Re-exports name another server's tree, so they are out.
+    carriers = {share: norm(wildcard_base(local_fs or share))
+                for share, backing, _usage, local_fs, _size, _n, _pool in facts
+                if backing in ("zfs", "xfs")}
+    return [(*row, is_leaf(carriers[row[0]], carriers.values())
+             if row[0] in carriers else None)
+            for row in facts]
 
 
 def main():
@@ -453,9 +477,12 @@ def main():
             "SELECT COALESCE(SUM(size IS NOT NULL), 0),"
             " COALESCE(SUM(nfiles IS NOT NULL), 0) FROM shares"
             " WHERE backing IS NOT NULL").fetchone()
+        parent_count = con.execute(
+            "SELECT COUNT(*) FROM shares WHERE leaf = 0").fetchone()[0]
         print(f"DB: {share_count} shares carry backing facts across"
               f" {host_count} hosts; size on {size_count},"
-              f" nfiles on {nfiles_count}"
+              f" nfiles on {nfiles_count},"
+              f" leaf = 0 on {parent_count}"
               f" ({len(pending)} hosts lack a usable snapshot)")
         print(f"inventory: {len(hosts)} hosts,"
               f" {len(unclassified)} unclassified"
