@@ -1,0 +1,498 @@
+##host
+hstor001-mgmt
+##df
+Filesystem                  Type        1K-blocks         Used    Available Use% Mounted on
+/dev/mapper/xcatvg-root     xfs        1868563012     29893896   1838669116   2% /
+/dev/sdg1                   xfs           1038336       481300       557036  47% /boot
+data1                       zfs      213090947968          512 213090947456   1% /data1
+data1/systems_backup        zfs       42949672960  35247534208   7702138752  83% /data1/backup/systems/002
+data1/arupclab              zfs       10737418240          512  10737417728   1% /data1/group/arupclab/001
+data1/aselab                zfs       32212254720          512  32212254208   1% /data1/group/aselab/001
+data1/camcat                zfs       42949672960  40118742144   2830930816  94% /data1/group/camcat/001
+data1/cburge                zfs      214748364800 168266671104  46481693696  79% /data1/group/cburge/001
+data1/cordero               zfs       21474836480   6862999808  14611836672  32% /data1/group/cordero/002
+data1/econ                  zfs       21474836480  10220995584  11253840896  48% /data1/group/econ/001
+data1/fraenkel_002          zfs       21474836480  10097107456  11377729024  48% /data1/group/fraenkel/002
+data1/fraenkel_003          zfs       21474836480   7432448256  14042388224  35% /data1/group/fraenkel/003
+data1/orcd                  zfs       21474836480   3355636224  18119200256  16% /data1/group/orcd/005
+data1/picower               zfs       64424509440  54381532672  10042976768  85% /data1/group/picower/003
+data1/polzlab               zfs       12884901888          512  12884901376   1% /data1/group/polzlab/002
+data1/rafagb                zfs       42949672960  35694243712   7255429248  84% /data1/group/rafagb/001
+data1/rutledge              zfs       42949672960  40224809856   2724863104  94% /data1/group/rutledge/001
+data1/tah                   zfs       21474836480  10379440768  11095395712  49% /data1/group/tah/001
+data1/wvanreeslab           zfs       34359738368          512  34359737856   1% /data1/group/wvanreeslab/001
+data2                       zfs      159081238528          640 159081237888   1% /data2
+data2/systems_backup        zfs       32212254720  22466304896   9745949824  70% /data2/backup/systems/001
+data2/abodner               zfs      107374182400  58457955456  48916226944  55% /data2/group/abodner/001
+data2/ashansen              zfs       21474836480          256  21474836224   1% /data2/group/ashansen/001
+data2/chisholm              zfs       42949672960  20826775168  22122897792  49% /data2/group/chisholm/001
+data2/cnh                   zfs       10737418240          768  10737417472   1% /data2/group/cnh/001
+data2/dhousman              zfs       21474836480          256  21474836224   1% /data2/group/dhousman/001
+data2/faez                  zfs       85899345920  66379884928  19519460992  78% /data2/group/faez/001
+data2/fraenkel_001          zfs       42949672960  42570600448    379072512 100% /data2/group/fraenkel/001
+data2/kpate                 zfs       42949672960          256  42949672704   1% /data2/group/kpate/001
+data2/mick                  zfs      373829602688  97256374528 276573228160  27% /data2/group/mick/006
+data2/mvogelsb              zfs      171798691840 171431654272    367037568 100% /data2/group/mvogelsb/004
+data2/orcd                  zfs       21474836480   1744452480  19730384000   9% /data2/group/orcd/002
+data2/pog                   zfs       21474836480  19914000000   1560836480  93% /data2/group/pog/001
+data2/psfc                  zfs       21474836480   1132393856  20342442624   6% /data2/group/psfc/001
+data2/reimer                zfs      107374182400  98096024832   9278157568  92% /data2/group/reimer/001
+data2/shaohao               zfs       10737418240         4352  10737413888   1% /data2/group/shaohao/001
+data2/talia_tb              zfs       64424509440  56212837248   8211672192  88% /data2/group/talia_tb/001
+data2/tami                  zfs       21474836480  12826324480   8648512000  60% /data2/group/tami/002
+data2/tsmidt                zfs       21474836480    882304000  20592532480   5% /data2/group/tsmidt/001
+data2/vfish                 zfs       21474836480       127360  21474709120   1% /data2/group/vfish/001
+devtmpfs                    devtmpfs    197056688            0    197056688   0% /dev
+tmpfs                       tmpfs       197081832            0    197081832   0% /dev/shm
+nfs001.lb:/                 nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home             nfs4     432503206784 323470650496 109032556288  75% /net/nfs001.lb/home
+data2/caitlinm              zfs       85899345920  65169517312  20729828608  76% /orcd/data/caitlinm/001
+fstor001:/software/core/001 nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+tmpfs                       tmpfs        78832736        46660     78786076   1% /run
+tmpfs                       tmpfs        39416364            4     39416360   1% /run/user/0
+##mounts
+/dev/mapper/xcatvg-root / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdg1 /boot xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+data1 /data1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/systems_backup /data1/backup/systems/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/arupclab /data1/group/arupclab/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/aselab /data1/group/aselab/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/camcat /data1/group/camcat/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/cburge /data1/group/cburge/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/cordero /data1/group/cordero/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/econ /data1/group/econ/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/fraenkel_002 /data1/group/fraenkel/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/fraenkel_003 /data1/group/fraenkel/003 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/orcd /data1/group/orcd/005 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/picower /data1/group/picower/003 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/polzlab /data1/group/polzlab/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/rafagb /data1/group/rafagb/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/rutledge /data1/group/rutledge/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/tah /data1/group/tah/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/wvanreeslab /data1/group/wvanreeslab/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2 /data2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/systems_backup /data2/backup/systems/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/abodner /data2/group/abodner/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/ashansen /data2/group/ashansen/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/caitlinm /data2/group/caitlinm/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/chisholm /data2/group/chisholm/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/cnh /data2/group/cnh/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/dhousman /data2/group/dhousman/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/faez /data2/group/faez/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/fraenkel_001 /data2/group/fraenkel/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/kpate /data2/group/kpate/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/mick /data2/group/mick/006 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/mvogelsb /data2/group/mvogelsb/004 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/orcd /data2/group/orcd/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pog /data2/group/pog/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/psfc /data2/group/psfc/001 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/reimer /data2/group/reimer/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/shaohao /data2/group/shaohao/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/talia_tb /data2/group/talia_tb/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/tami /data2/group/tami/002 zfs ro,relatime,xattr,posixacl,casesensitive 0 0
+data2/tsmidt /data2/group/tsmidt/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/vfish /data2/group/vfish/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=197056688k,nr_inodes=49264172,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=22788,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=388972 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=22788,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=301842 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.121,local_lock=none,addr=10.1.223.3 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=22788,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=301842 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.121,local_lock=none,addr=10.1.223.3 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=331754 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=413733 0 0
+ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster /orcd/data autofs rw,relatime,fd=23,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31480784 0 0
+ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster /orcd/data/caitlinm autofs rw,relatime,fd=26,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31524210 0 0
+data2/caitlinm /orcd/data/caitlinm/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster /orcd/software autofs rw,relatime,fd=30,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31683027 0 0
+ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster /orcd/software/core autofs rw,relatime,fd=33,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31683036 0 0
+fstor001:/software/core/001 /orcd/software/core/001 nfs4 rw,noatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.3.121,local_lock=none,addr=172.16.4.121 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=271237 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=22788,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=413750 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=78832736k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=39416364k,nr_inodes=9854091,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data1/backup/systems/002              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/backup/systems/002/provision001 10.1.225.103,172.16.225.103
+/data1/group/arupclab/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/aselab/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/camcat/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/econ/001                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/fraenkel/002              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/orcd/005                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/polzlab/002               10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/rafagb/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/tah/001                   10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data1/group/wvanreeslab/001           10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/backup/systems/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/abodner/001               10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/ashansen/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/caitlinm/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/chisholm/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/cnh/001                   10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/dhousman/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/faez/001                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/fraenkel/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/kpate/001                 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/mick/006                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/mvogelsb/004              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/orcd/002                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/pog/001                   10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/psfc/001                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/reimer/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/shaohao/001               10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/talia_tb/001              10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/tami/002                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/tsmidt/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data2/group/vfish/001                 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+data1	/data1	667568190229504	218205130304800
+data1/arupclab	/data1/group/arupclab/001	403200	10995115874560
+data1/aselab	/data1/group/aselab/001	403200	32985348430080
+data1/camcat	/data1/group/camcat/001	41081591869920	2898873241120
+data1/cburge	/data1/group/cburge/001	172305071114400	47597254440800
+data1/cordero	/data1/group/cordero/002	7027711729920	14962520825600
+data1/econ	/data1/group/econ/001	10466299448640	11523933106880
+data1/fraenkel_002	/data1/group/fraenkel/002	10339437921120	11650794634400
+data1/fraenkel_003	/data1/group/fraenkel/003	7610826888000	14379405667520
+data1/orcd	/data1/group/orcd/005	3436171441920	18554061113600
+data1/picower	/data1/group/picower/003	55686689352000	10284008314560
+data1/polzlab	/data1/group/polzlab/002	403200	13194139130112
+data1/rafagb	/data1/group/rafagb/001	36550905451200	7429559659840
+data1/rutledge	/data1/group/rutledge/001	41190205180320	2790259930720
+data1/systems_backup	/data1/backup/systems/002	36093474930240	7886990180800
+data1/tah	/data1/group/tah/001	10628547229440	11361685326080
+data1/wvanreeslab	/data1/group/wvanreeslab/001	403200	35184371685632
+data2	/data2	1058030937575520	162899187639104
+data2/abodner	/data2/group/abodner/001	59860946285280	50090216492320
+data2/ashansen	/data2/group/ashansen/001	241920	21990232313600
+data2/caitlinm	/data2/group/caitlinm/001	66733585672320	21227344549760
+data2/chisholm	/data2/group/chisholm/001	21326617670400	22653847440640
+data2/cnh	/data2/group/cnh/001	675360	10995115602400
+data2/dhousman	/data2/group/dhousman/001	241920	21990232313600
+data2/faez	/data2/group/faez/001	67973002060320	19987928161760
+data2/fraenkel_001	/data2/group/fraenkel/001	43592294753280	388170357760
+data2/kpate	/data2/group/kpate/001	241920	43980464869120
+data2/mick	/data2/group/mick/006	99590527451520	283210985742784
+data2/mvogelsb	/data2/group/mvogelsb/004	175546013922720	375846521440
+data2/orcd	/data2/group/orcd/002	1786319287200	20203913268320
+data2/pog	/data2/group/pog/001	20391935941440	1598296614080
+data2/psfc	/data2/group/psfc/001	1159571286720	20830661268800
+data2/reimer	/data2/group/reimer/001	100450329325920	9500833451680
+data2/shaohao	/data2/group/shaohao/001	4364640	10995111913120
+data2/systems_backup	/data2/backup/systems/001	23005496142720	9979852690560
+data2/talia_tb	/data2/group/talia_tb/001	57561945275520	8408752391040
+data2/tami	/data2/group/tami/002	13134156184800	8856076370720
+data2/tsmidt	/data2/group/tsmidt/001	903479250240	21086753305280
+data2/vfish	/data2/group/vfish/001	130415040	21990102140480
+##inodes
+Filesystem                        Inodes      IUsed        IFree IUse% Mounted on
+/dev/mapper/xcatvg-root        186947584     268702    186678882    1% /
+/dev/sdg1                         524288        384       523904    1% /boot
+data1                       426181895167         41 426181895126    1% /data1
+data1/systems_backup         15417114982   12837286  15404277696    1% /data1/backup/systems/002
+data1/arupclab               21474835698          6  21474835692    1% /data1/group/arupclab/001
+data1/aselab                 64424508658          6  64424508652    1% /data1/group/aselab/001
+data1/camcat                  5661919857      58058   5661861799    1% /data1/group/camcat/001
+data1/cburge                 93119062566  155674987  92963387579    1% /data1/group/cburge/001
+data1/cordero                29225024318    1350831  29223673487    1% /data1/group/cordero/002
+data1/econ                   22509238052    1556203  22507681849    1% /data1/group/econ/001
+data1/fraenkel_002           22756021734     563464  22755458270    1% /data1/group/fraenkel/002
+data1/fraenkel_003           28101753755   16977061  28084776694    1% /data1/group/fraenkel/003
+data1/orcd                   36238400650         38  36238400612    1% /data1/group/orcd/005
+data1/picower                20088659069    2705330  20085953739    1% /data1/group/picower/003
+data1/polzlab                25769802994          6  25769802988    1% /data1/group/polzlab/002
+data1/rafagb                 14588259942   77401232  14510858710    1% /data1/group/rafagb/001
+data1/rutledge                5517983509   68257082   5449726427    2% /data1/group/rutledge/001
+data1/tah                    22203964340   13172688  22190791652    1% /data1/group/tah/001
+data1/wvanreeslab            68719475954          6  68719475948    1% /data1/group/wvanreeslab/001
+data2                       318162475913         56 318162475857    1% /data2
+data2/systems_backup         19515877854   23978068  19491899786    1% /data2/backup/systems/001
+data2/abodner                97832513507      59421  97832454086    1% /data2/group/abodner/001
+data2/ashansen               42949672493          6  42949672487    1% /data2/group/ashansen/001
+data2/chisholm               44250714775    4918993  44245795782    1% /data2/group/chisholm/001
+data2/cnh                    21474835195         35  21474835160    1% /data2/group/cnh/001
+data2/dhousman               42949672493          6  42949672487    1% /data2/group/dhousman/001
+data2/faez                   39202480261  163558071  39038922190    1% /data2/group/faez/001
+data2/fraenkel_001             762785931    4640701    758145230    1% /data2/group/fraenkel/001
+data2/kpate                  85899345453          6  85899345447    1% /data2/group/kpate/001
+data2/mick                  553148898609    2442081 553146456528    1% /data2/group/mick/006
+data2/mvogelsb                 737993678    3918441    734075237    1% /data2/group/mvogelsb/004
+data2/orcd                   39461333431     565329  39460768102    1% /data2/group/orcd/002
+data2/pog                     3139352911   17679837   3121673074    1% /data2/group/pog/001
+data2/psfc                   40688585525    3700235  40684885290    1% /data2/group/psfc/001
+data2/reimer                 18574580890   18265555  18556315335    1% /data2/group/reimer/001
+data2/shaohao                21474828341        386  21474827955    1% /data2/group/shaohao/001
+data2/talia_tb               16423946705     602192  16423344513    1% /data2/group/talia_tb/001
+data2/tami                   17297220850     196689  17297024161    1% /data2/group/tami/002
+data2/tsmidt                 41239816386   54751337  41185065049    1% /data2/group/tsmidt/001
+data2/vfish                  42949418283         40  42949418243    1% /data2/group/vfish/001
+devtmpfs                        49264172       5960     49258212    1% /dev
+tmpfs                           49270458          1     49270457    1% /dev/shm
+nfs001.lb:/                        31122        103        31019    1% /net/nfs001.lb
+nfs001.lb:/home              13852490493 1439698596  12412791897   11% /net/nfs001.lb/home
+data2/caitlinm               41466364143    6706820  41459657323    1% /orcd/data/caitlinm/001
+fstor001:/software/core/001   2228666733   34454953   2194211780    2% /orcd/software/core/001
+tmpfs                             819200      10515       808685    2% /run
+tmpfs                            9854091         21      9854070    1% /run/user/0
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+# may not need this. -larry
+# allow backup servers to mount rw for TSM, need no_root_squash or TSM can't cache properly
+#/data1/group 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+#/data2/group 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+ 
+# allow cluster to mount orcd lab 005
+/data1/group/orcd/005 172.16.0.0/16(rw,async)
+/data1/group/orcd/005 172.19.0.0/16(rw,async)
+/data1/group/orcd/005 10.1.0.0/16(rw,async)
+/data1/group/orcd/005 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# allow cluster to mount wvanreeslab lab 001
+/data1/group/wvanreeslab/001 172.16.0.0/16(rw,async)
+/data1/group/wvanreeslab/001 172.19.0.0/16(rw,async)
+/data1/group/wvanreeslab/001 10.1.0.0/16(rw,async)
+/data1/group/wvanreeslab/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# allow cluster to mount polzlab lab 002
+/data1/group/polzlab/002 172.16.0.0/16(rw,async)
+/data1/group/polzlab/002 172.19.0.0/16(rw,async)
+/data1/group/polzlab/002 10.1.0.0/16(rw,async)
+/data1/group/polzlab/002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# allow cluster to mount aselab lab 001
+/data1/group/aselab/001 172.16.0.0/16(rw,async)
+/data1/group/aselab/001 172.19.0.0/16(rw,async)
+/data1/group/aselab/001 10.1.0.0/16(rw,async)
+/data1/group/aselab/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# allow cluster to mount arupclab lab 001
+/data1/group/arupclab/001 172.16.0.0/16(rw,async)
+/data1/group/arupclab/001 172.19.0.0/16(rw,async)
+/data1/group/arupclab/001 10.1.0.0/16(rw,async)
+/data1/group/arupclab/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# allow cluster to mount camcat lab 001
+/data1/group/camcat/001 172.16.0.0/16(rw,async)
+/data1/group/camcat/001 172.19.0.0/16(rw,async)
+/data1/group/camcat/001 10.1.0.0/16(rw,async)
+/data1/group/camcat/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount reimer lab 001
+/data2/group/reimer/001 172.16.0.0/16(rw,async)
+/data2/group/reimer/001 172.19.0.0/16(rw,async)
+/data2/group/reimer/001 10.1.0.0/16(rw,async)
+/data2/group/reimer/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount vfish lab 001
+/data2/group/vfish/001 172.16.0.0/16(rw,async)
+/data2/group/vfish/001 172.19.0.0/16(rw,async)
+/data2/group/vfish/001 10.1.0.0/16(rw,async)
+/data2/group/vfish/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount tsmidt lab 001
+/data2/group/tsmidt/001 172.16.0.0/16(rw,async)
+/data2/group/tsmidt/001 172.19.0.0/16(rw,async)
+/data2/group/tsmidt/001 10.1.0.0/16(rw,async)
+/data2/group/tsmidt/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount ashansen lab 001
+/data2/group/ashansen/001 172.16.0.0/16(rw,async)
+/data2/group/ashansen/001 172.19.0.0/16(rw,async)
+/data2/group/ashansen/001 10.1.0.0/16(rw,async)
+/data2/group/ashansen/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount kpate lab 001
+/data2/group/kpate/001 172.16.0.0/16(rw,async)
+/data2/group/kpate/001 172.19.0.0/16(rw,async)
+/data2/group/kpate/001 10.1.0.0/16(rw,async)
+/data2/group/kpate/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# unused, removed on Jan 14 2026 {db}
+#allow cluster to mount lzfan lab 001
+#/data2/group/lzfan/001 172.16.0.0/16(rw,async)
+#/data2/group/lzfan/001 172.19.0.0/16(rw,async)
+#/data2/group/lzfan/001 10.1.0.0/16(rw,async)
+#/data2/group/lzfan/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount cnh lab 001
+/data2/group/cnh/001 172.16.0.0/16(rw,async)
+/data2/group/cnh/001 172.19.0.0/16(rw,async)
+/data2/group/cnh/001 10.1.0.0/16(rw,async)
+/data2/group/cnh/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount shaohao lab 001
+/data2/group/shaohao/001 172.16.0.0/16(rw,async)
+/data2/group/shaohao/001 172.19.0.0/16(rw,async)
+/data2/group/shaohao/001 10.1.0.0/16(rw,async)
+/data2/group/shaohao/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount orcd lab 002
+/data2/group/orcd/002 172.16.0.0/16(rw,async)
+/data2/group/orcd/002 172.19.0.0/16(rw,async)
+/data2/group/orcd/002 10.1.0.0/16(rw,async)
+/data2/group/orcd/002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+/data2/group/orcd/002 172.16.222.12(rw,async,no_root_squash) 172.16.224.23(rw,async,no_root_squash) 172.16.224.24(rw,async,no_root_squash)
+
+#allow cluster to mount mvogelsb lab 004
+/data2/group/mvogelsb/004 172.16.0.0/16(rw,async)
+/data2/group/mvogelsb/004 172.19.0.0/16(rw,async)
+/data2/group/mvogelsb/004 10.1.0.0/16(rw,async)
+/data2/group/mvogelsb/004 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount stephdut lab 001
+# ME: Sept 17, setting to read-only as this export moved to hstor002-n2
+# ME: Dec 19th, 2024 deleted
+#/data2/group/stephdut/001 172.16.0.0/16(ro,async)
+#/data2/group/stephdut/001 172.19.0.0/16(ro,async)
+#/data2/group/stephdut/001 10.1.0.0/16(ro,async)
+#/data2/group/stephdut/001 172.16.3.123(ro,async,no_root_squash)
+#/data2/group/stephdut/001 172.16.6.221(ro,async,no_root_squash) 172.16.6.222(ro,async,no_root_squash) 172.16.6.223(ro,async,no_root_squash) 172.16.6.224(ro,async,no_root_squash)
+
+#allow cluster to mount caitlinm lab 001
+/data2/group/caitlinm/001 172.16.0.0/16(rw,async)
+/data2/group/caitlinm/001 172.19.0.0/16(rw,async)
+/data2/group/caitlinm/001 10.1.0.0/16(rw,async)
+/data2/group/caitlinm/001 172.16.7.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash) 
+/data2/group/caitlinm/001 172.16.3.139(rw,async,no_root_squash)
+
+#allow cluster to mount dhousman lab 001
+/data2/group/dhousman/001 172.16.0.0/16(rw,async)
+/data2/group/dhousman/001 172.19.0.0/16(rw,async)
+/data2/group/dhousman/001 10.1.0.0/16(rw,async)
+/data2/group/dhousman/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount psfc lab 001
+/data2/group/psfc/001 172.16.0.0/16(rw,async)
+/data2/group/psfc/001 172.19.0.0/16(rw,async)
+/data2/group/psfc/001 10.1.0.0/16(rw,async)
+/data2/group/psfc/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount talia_tb lab 001
+/data2/group/talia_tb/001 172.16.0.0/16(rw,async)
+/data2/group/talia_tb/001 172.19.0.0/16(rw,async)
+/data2/group/talia_tb/001 10.1.0.0/16(rw,async)
+/data2/group/talia_tb/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount chisholm lab 001
+/data2/group/chisholm/001 172.16.0.0/16(rw,async)
+/data2/group/chisholm/001 172.19.0.0/16(rw,async)
+/data2/group/chisholm/001 10.1.0.0/16(rw,async)
+/data2/group/chisholm/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount tah lab 001
+/data1/group/tah/001 172.16.0.0/16(rw,async)
+/data1/group/tah/001 172.19.0.0/16(rw,async)
+/data1/group/tah/001 10.1.0.0/16(rw,async)
+/data1/group/tah/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount fraenkel lab 001
+/data2/group/fraenkel/001 172.16.0.0/16(rw,async)
+/data2/group/fraenkel/001 172.19.0.0/16(rw,async)
+/data2/group/fraenkel/001 10.1.0.0/16(rw,async)
+/data2/group/fraenkel/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount fraenkel lab 002
+/data1/group/fraenkel/002 172.16.0.0/16(rw,async)
+/data1/group/fraenkel/002 172.19.0.0/16(rw,async)
+/data1/group/fraenkel/002 10.1.0.0/16(rw,async)
+/data1/group/fraenkel/002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount econ lab 001
+/data1/group/econ/001 172.16.0.0/16(rw,async)
+/data1/group/econ/001 172.19.0.0/16(rw,async)
+/data1/group/econ/001 10.1.0.0/16(rw,async)
+/data1/group/econ/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount rafagb 001
+/data1/group/rafagb/001 172.16.0.0/16(rw,async)
+/data1/group/rafagb/001 172.19.0.0/16(rw,async)
+/data1/group/rafagb/001 10.1.0.0/16(rw,async)
+/data1/group/rafagb/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount pog lab 001
+/data2/group/pog/001 172.16.0.0/16(rw,async)
+/data2/group/pog/001 172.19.0.0/16(rw,async)
+/data2/group/pog/001 10.1.0.0/16(rw,async)
+/data2/group/pog/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount abodner lab 001
+/data2/group/abodner/001 172.16.0.0/16(rw,async)
+/data2/group/abodner/001 172.19.0.0/16(rw,async)
+/data2/group/abodner/001 10.1.0.0/16(rw,async)
+/data2/group/abodner/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount tami lab 002
+/data2/group/tami/002 172.16.0.0/16(rw,async)
+/data2/group/tami/002 172.19.0.0/16(rw,async)
+/data2/group/tami/002 10.1.0.0/16(rw,async)
+/data2/group/tami/002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount mick lab 006
+/data2/group/mick/006 172.16.0.0/16(rw,async)
+/data2/group/mick/006 172.19.0.0/16(rw,async)
+/data2/group/mick/006 10.1.0.0/16(rw,async)
+/data2/group/mick/006 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount faez lab 001
+/data2/group/faez/001 172.16.0.0/16(rw,async)
+/data2/group/faez/001 172.19.0.0/16(rw,async)
+/data2/group/faez/001 10.1.0.0/16(rw,async)
+/data2/group/faez/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+#allow cluster to mount backup for systems 001
+/data2/backup/systems/001 172.16.0.0/16(rw,async)
+/data2/backup/systems/001 172.19.0.0/16(rw,async)
+/data2/backup/systems/001 10.1.0.0/16(rw,async)
+/data2/backup/systems/001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+/data2/backup/systems/001 172.16.222.1(rw,async,no_root_squash) 172.16.222.2(rw,async,no_root_squash) 172.16.222.3(rw,async,no_root_squash) 172.16.222.4(rw,async,no_root_squash) 172.16.222.5(rw,async,no_root_squash) 172.16.222.6(rw,async,no_root_squash) 172.16.222.7(rw,async,no_root_squash) 172.16.222.8(rw,async,no_root_squash) 172.16.222.22(rw,async,no_root_squash) 172.16.222.21(rw,async,no_root_squash)
+/data2/backup/systems/001 172.16.4.130(rw,async,no_root_squash)
+/data2/backup/systems/001 172.16.6.225(rw,async,no_root_squash)
+
+#allow cluster to mount backup for systems 002
+/data1/backup/systems/002 172.16.0.0/16(rw,async)
+/data1/backup/systems/002 172.19.0.0/16(rw,async)
+/data1/backup/systems/002 10.1.0.0/16(rw,async)
+/data1/backup/systems/002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+/data1/backup/systems/002 172.16.222.1(rw,async,no_root_squash) 172.16.222.2(rw,async,no_root_squash) 172.16.222.3(rw,async,no_root_squash) 172.16.222.4(rw,async,no_root_squash) 172.16.222.5(rw,async,no_root_squash) 172.16.222.6(rw,async,no_root_squash) 172.16.222.7(rw,async,no_root_squash) 172.16.222.8(rw,async,no_root_squash) 172.16.222.22(rw,async,no_root_squash) 172.16.222.21(rw,async,no_root_squash)
+/data1/backup/systems/002 172.16.4.130(rw,async,no_root_squash)
+/data1/backup/systems/002 172.16.6.225(rw,async,no_root_squash)
+
+# mgmt001
+/data1/backup/systems/002 172.16.222.12(rw,async,no_root_squash) 10.1.222.12(rw,async,no_root_squash) 172.16.222.16(rw,async,no_root_squash) 10.1.222.16(rw,async,no_root_squash)
+/data2/group/mvogelsb/004 172.16.222.12(rw,async,no_root_squash)
+
+#provision001 (testing xcat backup process)
+/data1/backup/systems/002/provision001 172.16.225.103(rw,async,no_root_squash) 10.1.225.103(rw,async,no_root_squash) 
+

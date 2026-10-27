@@ -1,0 +1,313 @@
+##host
+hstor014-mgmt
+##df
+Filesystem                  Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md0                    xfs         904143524     18131984    886011540   3% /
+/dev/sda1                   vfat           204560         7808       196752   4% /boot/efi
+data1                       zfs      275788233344          512 275788232832   1% /data1
+data1/dvaron                zfs      257698037760  13951671040 243746366720   6% /data1/group/dvaron/002
+data1/flavell               zfs      515396075520         1024 515396074496   1% /data1/group/flavell/003
+data1/fraenkel              zfs       21474836480   7303224320  14171612160  35% /data1/group/fraenkel/005
+data1/mheiman               zfs       21474836480    862364800  20612471680   5% /data1/group/mheiman/001
+data1/orcd                  zfs      107374182400     64004096 107310178304   1% /data1/group/orcd/025
+data1/pool                  zfs      214598531200         1280 214598529920   1% /data1/pool/014
+data1/pool/ajkb             zfs        1073741824          256   1073741568   1% /data1/pool/014/ajkb
+data1/pool/akuzee17         zfs        1073741824          256   1073741568   1% /data1/pool/014/akuzee17
+data1/pool/alexsc           zfs        1073741824    120939392    952802432  12% /data1/pool/014/alexsc
+data1/pool/alishali         zfs        1073741824          256   1073741568   1% /data1/pool/014/alishali
+data1/pool/arprasad         zfs        1073741824          256   1073741568   1% /data1/pool/014/arprasad
+data1/pool/br0              zfs        1073741824          256   1073741568   1% /data1/pool/014/br0
+data1/pool/conchell         zfs        1073741824     28889088   1044852736   3% /data1/pool/014/conchell
+data1/pool/dimond           zfs        1073741824          256   1073741568   1% /data1/pool/014/dimond
+data1/pool/domenicn         zfs        1073741824          256   1073741568   1% /data1/pool/014/domenicn
+data1/pool/fraenkel_shared  zfs        5368709120          256   5368708864   1% /data1/pool/014/fraenkel_shared
+data1/pool/fwk              zfs        1073741824          256   1073741568   1% /data1/pool/014/fwk
+data1/pool/gkharris         zfs        1073741824          256   1073741568   1% /data1/pool/014/gkharris
+data1/pool/gurses           zfs        1073741824          256   1073741568   1% /data1/pool/014/gurses
+data1/pool/katecar          zfs        1073741824          256   1073741568   1% /data1/pool/014/katecar
+data1/pool/kemingz          zfs        1073741824          256   1073741568   1% /data1/pool/014/kemingz
+data1/pool/kiryangk         zfs        1073741824          256   1073741568   1% /data1/pool/014/kiryangk
+data1/pool/klik             zfs        1073741824          256   1073741568   1% /data1/pool/014/klik
+data1/pool/kswu             zfs        1073741824          256   1073741568   1% /data1/pool/014/kswu
+data1/pool/leiwu042         zfs        1073741824          256   1073741568   1% /data1/pool/014/leiwu042
+data1/pool/lgardner         zfs        1073741824          256   1073741568   1% /data1/pool/014/lgardner
+data1/pool/margarh          zfs        1073741824          256   1073741568   1% /data1/pool/014/margarh
+data1/pool/matalex          zfs        1073741824          256   1073741568   1% /data1/pool/014/matalex
+data1/pool/micha202         zfs        1073741824          256   1073741568   1% /data1/pool/014/micha202
+data1/pool/nklee            zfs        1073741824          256   1073741568   1% /data1/pool/014/nklee
+data1/pool/odunton          zfs        1073741824          256   1073741568   1% /data1/pool/014/odunton
+data1/pool/psanti_shared    zfs        5368709120          256   5368708864   1% /data1/pool/014/psanti_shared
+data1/pool/sherry29         zfs        1073741824          256   1073741568   1% /data1/pool/014/sherry29
+data1/pool/sraavyas         zfs        1073741824          256   1073741568   1% /data1/pool/014/sraavyas
+data1/pool/vilanova         zfs        1073741824          256   1073741568   1% /data1/pool/014/vilanova
+data2                       zfs      812947164032          640 812947163392   1% /data2
+data2/amins                 zfs       21474836480  11166585984  10308250496  52% /data2/group/amins/002
+data2/fakhri                zfs       42949672960   1346459648  41603213312   4% /data2/group/fakhri/001
+data2/lboyer                zfs       21474836480          256  21474836224   1% /data2/group/lboyer/001
+data2/lhtsai                zfs      236223201280 175002736640  61220464640  75% /data2/group/lhtsai/002
+data2/mhowland              zfs       42949672960  28506656512  14443016448  67% /data2/group/mhowland/002
+data2/modclim               zfs       64424509440   5923590400  58500919040  10% /data2/group/modclim/001
+data2/ngk                   zfs       64424509440     43768704  64380740736   1% /data2/group/ngk/002
+data2/orcd                  zfs      107374182400     64004096 107310178304   1% /data2/group/orcd/026
+devtmpfs                    devtmpfs    131542600            0    131542600   0% /dev
+tmpfs                       tmpfs       131567996            0    131567996   0% /dev/shm
+core009.ib:/mhowland/001    nfs4      42947581952  33014764544   9932817408  77% /mnt/mhowland
+nfs001.lb:/                 nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home             nfs4     432503206784 323470871936 109032334848  75% /net/nfs001.lb/home
+fstor001:/software/core/001 nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+tmpfs                       tmpfs        52627200       106744     52520456   1% /run
+tmpfs                       tmpfs        26313596            4     26313592   1% /run/user/0
+efivarfs                    efivarfs          512          155          353  31% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sda1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+data1 /data1 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/dvaron /data1/group/dvaron/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/flavell /data1/group/flavell/003 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/fraenkel /data1/group/fraenkel/005 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/mheiman /data1/group/mheiman/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/orcd /data1/group/orcd/025 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool /data1/pool/014 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/ajkb /data1/pool/014/ajkb zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/akuzee17 /data1/pool/014/akuzee17 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/alexsc /data1/pool/014/alexsc zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/alishali /data1/pool/014/alishali zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/arprasad /data1/pool/014/arprasad zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/br0 /data1/pool/014/br0 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/conchell /data1/pool/014/conchell zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/dimond /data1/pool/014/dimond zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/domenicn /data1/pool/014/domenicn zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/fraenkel_shared /data1/pool/014/fraenkel_shared zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/fwk /data1/pool/014/fwk zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/gkharris /data1/pool/014/gkharris zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/gurses /data1/pool/014/gurses zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/katecar /data1/pool/014/katecar zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kemingz /data1/pool/014/kemingz zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kiryangk /data1/pool/014/kiryangk zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/klik /data1/pool/014/klik zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kswu /data1/pool/014/kswu zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/leiwu042 /data1/pool/014/leiwu042 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/lgardner /data1/pool/014/lgardner zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/margarh /data1/pool/014/margarh zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/matalex /data1/pool/014/matalex zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/micha202 /data1/pool/014/micha202 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/nklee /data1/pool/014/nklee zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/odunton /data1/pool/014/odunton zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/psanti_shared /data1/pool/014/psanti_shared zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/sherry29 /data1/pool/014/sherry29 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/sraavyas /data1/pool/014/sraavyas zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/vilanova /data1/pool/014/vilanova zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2 /data2 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/amins /data2/group/amins/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/fakhri /data2/group/fakhri/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/lboyer /data2/group/lboyer/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/lhtsai /data2/group/lhtsai/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/mhowland /data2/group/mhowland/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/modclim /data2/group/modclim/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/ngk /data2/group/ngk/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/orcd /data2/group/orcd/026 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=131542600k,nr_inodes=32885650,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/dev/md0 /export/data1 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+data1 /export/data1 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/dvaron /export/data1/group/dvaron/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/flavell /export/data1/group/flavell/003 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/fraenkel /export/data1/group/fraenkel/005 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/mheiman /export/data1/group/mheiman/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/orcd /export/data1/group/orcd/025 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool /export/data1/pool/014 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/ajkb /export/data1/pool/014/ajkb zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/akuzee17 /export/data1/pool/014/akuzee17 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/alexsc /export/data1/pool/014/alexsc zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/alishali /export/data1/pool/014/alishali zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/arprasad /export/data1/pool/014/arprasad zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/br0 /export/data1/pool/014/br0 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/conchell /export/data1/pool/014/conchell zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/dimond /export/data1/pool/014/dimond zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/domenicn /export/data1/pool/014/domenicn zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/fraenkel_shared /export/data1/pool/014/fraenkel_shared zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/fwk /export/data1/pool/014/fwk zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/gkharris /export/data1/pool/014/gkharris zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/gurses /export/data1/pool/014/gurses zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/katecar /export/data1/pool/014/katecar zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kemingz /export/data1/pool/014/kemingz zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kiryangk /export/data1/pool/014/kiryangk zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/klik /export/data1/pool/014/klik zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/kswu /export/data1/pool/014/kswu zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/leiwu042 /export/data1/pool/014/leiwu042 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/lgardner /export/data1/pool/014/lgardner zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/margarh /export/data1/pool/014/margarh zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/matalex /export/data1/pool/014/matalex zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/micha202 /export/data1/pool/014/micha202 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/nklee /export/data1/pool/014/nklee zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/odunton /export/data1/pool/014/odunton zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/psanti_shared /export/data1/pool/014/psanti_shared zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/sherry29 /export/data1/pool/014/sherry29 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/sraavyas /export/data1/pool/014/sraavyas zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data1/pool/vilanova /export/data1/pool/014/vilanova zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+/dev/md0 /export/data2 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+data2 /export/data2 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/amins /export/data2/group/amins/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/fakhri /export/data2/group/fakhri/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/lboyer /export/data2/group/lboyer/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/lhtsai /export/data2/group/lhtsai/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/mhowland /export/data2/group/mhowland/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/modclim /export/data2/group/modclim/001 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/ngk /export/data2/group/ngk/002 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+data2/orcd /export/data2/group/orcd/026 zfs rw,noatime,xattr,posixacl,casesensitive 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=33986,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=1074394 0 0
+core009.ib:/mhowland/001 /mnt/mhowland nfs4 rw,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.3.142,local_lock=none,addr=172.16.222.9 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=33986,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=944422 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.142,local_lock=none,addr=10.1.223.3 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=33986,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=944422 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.142,local_lock=none,addr=10.1.223.4 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=15,pgrp=33986,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=947882 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=12,pgrp=33986,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=1051272 0 0
+ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster /orcd/software autofs rw,relatime,fd=24,pgrp=33986,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=9351214 0 0
+ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster /orcd/software/core autofs rw,relatime,fd=27,pgrp=33986,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=9184693 0 0
+fstor001:/software/core/001 /orcd/software/core/001 nfs4 rw,noatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.3.142,local_lock=none,addr=172.16.4.121 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=915636 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=33986,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=617858 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=52627200k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26313596k,nr_inodes=6578399,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/export       10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/export/data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/export/data2 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+data1	/data1	1077521547624448	282407150426240
+data1/dvaron	/data1/group/dvaron/002	14286511028864	249596279637376
+data1/flavell	/data1/group/flavell/003	196608	527765581135872
+data1/fraenkel	/data1/group/fraenkel/005	7478500773888	14511731781632
+data1/mheiman	/data1/group/mheiman/001	883061516288	21107171039232
+data1/orcd	/data1/group/orcd/025	65540055040	109885622722560
+data1/pool	/data1/pool/014	153430793088	219748894762112
+data1/pool/ajkb	/data1/pool/014/ajkb	196608	1099511431168
+data1/pool/akuzee17	/data1/pool/014/akuzee17	196608	1099511431168
+data1/pool/alexsc	/data1/pool/014/alexsc	123841847680	975669780096
+data1/pool/alishali	/data1/pool/014/alishali	196608	1099511431168
+data1/pool/arprasad	/data1/pool/014/arprasad	196608	1099511431168
+data1/pool/br0	/data1/pool/014/br0	196608	1099511431168
+data1/pool/conchell	/data1/pool/014/conchell	29582400000	1069929227776
+data1/pool/dimond	/data1/pool/014/dimond	196608	1099511431168
+data1/pool/domenicn	/data1/pool/014/domenicn	196608	1099511431168
+data1/pool/fraenkel_shared	/data1/pool/014/fraenkel_shared	204800	5497557934080
+data1/pool/fwk	/data1/pool/014/fwk	196608	1099511431168
+data1/pool/gkharris	/data1/pool/014/gkharris	196608	1099511431168
+data1/pool/gurses	/data1/pool/014/gurses	196608	1099511431168
+data1/pool/katecar	/data1/pool/014/katecar	196608	1099511431168
+data1/pool/kemingz	/data1/pool/014/kemingz	196608	1099511431168
+data1/pool/kiryangk	/data1/pool/014/kiryangk	196608	1099511431168
+data1/pool/klik	/data1/pool/014/klik	196608	1099511431168
+data1/pool/kswu	/data1/pool/014/kswu	196608	1099511431168
+data1/pool/leiwu042	/data1/pool/014/leiwu042	196608	1099511431168
+data1/pool/lgardner	/data1/pool/014/lgardner	196608	1099511431168
+data1/pool/margarh	/data1/pool/014/margarh	196608	1099511431168
+data1/pool/matalex	/data1/pool/014/matalex	196608	1099511431168
+data1/pool/micha202	/data1/pool/014/micha202	196608	1099511431168
+data1/pool/nklee	/data1/pool/014/nklee	196608	1099511431168
+data1/pool/odunton	/data1/pool/014/odunton	196608	1099511431168
+data1/pool/psanti_shared	/data1/pool/014/psanti_shared	204800	5497557934080
+data1/pool/sherry29	/data1/pool/014/sherry29	196608	1099511431168
+data1/pool/sraavyas	/data1/pool/014/sraavyas	196608	1099511431168
+data1/pool/vilanova	/data1/pool/014/vilanova	196608	1099511431168
+data2	/data2	527766338572288	832457895343872
+data2/amins	/data2/group/amins/002	11434584013952	10555648541568
+data2/fakhri	/data2/group/fakhri/001	1378774569472	42601690541568
+data2/lboyer	/data2/group/lboyer/001	245760	21990232309760
+data2/lhtsai	/data2/group/lhtsai/002	179202802242048	62689755868672
+data2/mhowland	/data2/group/mhowland/002	29190816265344	14789648845696
+data2/modclim	/data2/group/modclim/001	6065756558848	59904941107712
+data2/ngk	/data2/group/ngk/002	44819101056	65925878565504
+data2/orcd	/data2/group/orcd/026	65540022272	109885622755328
+##inodes
+Filesystem                         Inodes      IUsed         IFree IUse% Mounted on
+/dev/md0                        452292608     178039     452114569    1% /
+/dev/sda1                               0          0             0     - /boot/efi
+data1                        551576465696         20  551576465676    1% /data1
+data1/dvaron                 487495061531    2327865  487492733666    1% /data1/group/dvaron/002
+data1/flavell               1030792150662          6 1030792150656    1% /data1/group/flavell/003
+data1/fraenkel                28343458590     232454   28343226136    1% /data1/group/fraenkel/005
+data1/mheiman                 41225048715     105279   41224943436    1% /data1/group/mheiman/001
+data1/orcd                   214620356897         17  214620356880    1% /data1/group/orcd/025
+data1/pool                   429197060117         35  429197060082    1% /data1/pool/014
+data1/pool/ajkb                2147483270          6    2147483264    1% /data1/pool/014/ajkb
+data1/pool/akuzee17            2147483270          6    2147483264    1% /data1/pool/014/akuzee17
+data1/pool/alexsc              1905747380     142341    1905605039    1% /data1/pool/014/alexsc
+data1/pool/alishali            2147483270          6    2147483264    1% /data1/pool/014/alishali
+data1/pool/arprasad            2147483270          6    2147483264    1% /data1/pool/014/arprasad
+data1/pool/br0                 2147483270          6    2147483264    1% /data1/pool/014/br0
+data1/pool/conchell            2089752361      46838    2089705523    1% /data1/pool/014/conchell
+data1/pool/dimond              2147483270          6    2147483264    1% /data1/pool/014/dimond
+data1/pool/domenicn            2147483270          6    2147483264    1% /data1/pool/014/domenicn
+data1/pool/fraenkel_shared    10737417847          7   10737417840    1% /data1/pool/014/fraenkel_shared
+data1/pool/fwk                 2147483270          6    2147483264    1% /data1/pool/014/fwk
+data1/pool/gkharris            2147483270          6    2147483264    1% /data1/pool/014/gkharris
+data1/pool/gurses              2147483270          6    2147483264    1% /data1/pool/014/gurses
+data1/pool/katecar             2147483270          6    2147483264    1% /data1/pool/014/katecar
+data1/pool/kemingz             2147483270          6    2147483264    1% /data1/pool/014/kemingz
+data1/pool/kiryangk            2147483270          6    2147483264    1% /data1/pool/014/kiryangk
+data1/pool/klik                2147483270          6    2147483264    1% /data1/pool/014/klik
+data1/pool/kswu                2147483270          6    2147483264    1% /data1/pool/014/kswu
+data1/pool/leiwu042            2147483270          6    2147483264    1% /data1/pool/014/leiwu042
+data1/pool/lgardner            2147483270          6    2147483264    1% /data1/pool/014/lgardner
+data1/pool/margarh             2147483270          6    2147483264    1% /data1/pool/014/margarh
+data1/pool/matalex             2147483270          6    2147483264    1% /data1/pool/014/matalex
+data1/pool/micha202            2147483270          6    2147483264    1% /data1/pool/014/micha202
+data1/pool/nklee               2147483270          6    2147483264    1% /data1/pool/014/nklee
+data1/pool/odunton             2147483270          6    2147483264    1% /data1/pool/014/odunton
+data1/pool/psanti_shared      10737417847          7   10737417840    1% /data1/pool/014/psanti_shared
+data1/pool/sherry29            2147483270          6    2147483264    1% /data1/pool/014/sherry29
+data1/pool/sraavyas            2147483270          6    2147483264    1% /data1/pool/014/sraavyas
+data1/pool/vilanova            2147483270          6    2147483264    1% /data1/pool/014/vilanova
+data2                       1625894326867         24 1625894326843    1% /data2
+data2/amins                   20616544502      43445   20616501057    1% /data2/group/amins/002
+data2/fakhri                  83207062859     636020   83206426839    1% /data2/group/fakhri/001
+data2/lboyer                  42949672488          8   42949672480    1% /data2/group/lboyer/001
+data2/lhtsai                 122453318902   12389471  122440929431    1% /data2/group/lhtsai/002
+data2/mhowland                28887585718    1552817   28886032901    1% /data2/group/mhowland/002
+data2/modclim                117002085844     247743  117001838101    1% /data2/group/modclim/001
+data2/ngk                    128761508192      26619  128761481573    1% /data2/group/ngk/002
+data2/orcd                   214620356961         17  214620356944    1% /data2/group/orcd/026
+devtmpfs                         32885650       7887      32877763    1% /dev
+tmpfs                            32891999          1      32891998    1% /dev/shm
+core009.ib:/mhowland/001       4294966848    1577385    4293389463    1% /mnt/mhowland
+nfs001.lb:/                         31122        103         31019    1% /net/nfs001.lb
+nfs001.lb:/home               13852490493 1439702083   12412788410   11% /net/nfs001.lb/home
+fstor001:/software/core/001    2228666733   34454953    2194211780    2% /orcd/software/core/001
+tmpfs                              819200      13642        805558    2% /run
+tmpfs                             6578399         19       6578380    1% /run/user/0
+efivarfs                                0          0             0     - /sys/firmware/efi/efivars
+##exportfile
+# allow cluster to mount data1 & data2
+#
+# Pseudo-root (fsid=0)
+/export          172.16.0.0/16(ro,fsid=0,no_subtree_check,crossmnt) 172.19.0.0/16(ro,fsid=0,no_subtree_check,crossmnt) 10.1.0.0/16(ro,fsid=0,no_subtree_check,crossmnt) 172.16.6.225(ro,fsid=0,no_subtree_check,crossmnt) 172.16.10.213(ro,fsid=0,no_subtree_check,crossmnt) 172.16.10.210(ro,fsid=0,no_subtree_check,crossmnt) 172.16.5.214(ro,fsid=0,no_subtree_check,crossmnt)
+
+# Pool 1
+/export/data1    172.16.0.0/16(rw,async,no_subtree_check,crossmnt) 172.19.0.0/16(rw,async,no_subtree_check,crossmnt) 10.1.0.0/16(rw,async,no_subtree_check,crossmnt) 172.16.6.225(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.10.213(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.10.210(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.5.214(rw,async,no_subtree_check,crossmnt,no_root_squash)
+
+# Pool 2
+/export/data2    172.16.0.0/16(rw,async,no_subtree_check,crossmnt) 172.19.0.0/16(rw,async,no_subtree_check,crossmnt) 10.1.0.0/16(rw,async,no_subtree_check,crossmnt) 172.16.6.225(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.10.213(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.10.210(rw,async,no_subtree_check,crossmnt,no_root_squash) 172.16.5.214(rw,async,no_subtree_check,crossmnt,no_root_squash)

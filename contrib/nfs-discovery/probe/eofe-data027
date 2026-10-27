@@ -1,0 +1,95 @@
+##host
+eofe-data027-mgmt
+##df
+Filesystem                   Type        1K-blocks         Used    Available Use% Mounted on
+/dev/mapper/xcatvg-root      xfs         921768192    146087072    775681120  16% /
+/dev/sda2                    xfs          10420224       508328      9911896   5% /boot
+/dev/sda1                    vfat           261864         7572       254292   3% /boot/efi
+/dev/mapper/mbathe-mbathe001 xfs      832029108224 303741296256 528287811968  37% /data1
+devtmpfs                     devtmpfs         4096            0         4096   0% /dev
+tmpfs                        tmpfs       131511716            0    131511716   0% /dev/shm
+nfs001.lb:/                  nfs4           996160        62272       933888   7% /net/nfs001.lb
+xcat:/install                nfs4        838808576    425346048    413462528  51% /net/xcat/install
+tmpfs                        tmpfs        52604688         2144     52602544   1% /run
+tmpfs                        tmpfs        26302340            4     26302336   1% /run/user/0
+efivarfs                     efivarfs          304          165          135  56% /sys/firmware/efi/efivars
+##mounts
+/dev/mapper/xcatvg-root / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=256k,sunit=512,swidth=512,noquota 0 0
+/dev/sda2 /boot xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=256k,sunit=512,swidth=512,noquota 0 0
+/dev/sda1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+/dev/mapper/mbathe-mbathe001 /data1 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=64k,usrquota,prjquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=4096k,nr_inodes=32870795,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=3068,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=30779 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=3068,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=63975 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.227,local_lock=none,addr=10.1.223.2 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=3068,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=63975 0 0
+-hosts /net/xcat/install autofs rw,relatime,fd=9,pgrp=3068,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=63975 0 0
+xcat:/install /net/xcat/install nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.227,local_lock=none,addr=10.1.10.195 0 0
+-hosts /net/xcat/tftpboot autofs rw,relatime,fd=9,pgrp=3068,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=63975 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=3068,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=84360 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=3068,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=82483 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=73769 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=3068,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=104621 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=52604688k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26302340k,nr_inodes=6575585,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                        Inodes    IUsed       IFree IUse% Mounted on
+/dev/mapper/xcatvg-root        461109248   209692   460899556    1% /
+/dev/sda2                        5242880       37     5242843    1% /boot
+/dev/sda1                              0        0           0     - /boot/efi
+/dev/mapper/mbathe-mbathe001 16640623872 26967276 16613656596    1% /data1
+devtmpfs                        32870795      979    32869816    1% /dev
+tmpfs                           32877929        1    32877928    1% /dev/shm
+nfs001.lb:/                        31122      103       31019    1% /net/nfs001.lb
+xcat:/install                  419429824   257153   419172671    1% /net/xcat/install
+tmpfs                             819200     1519      817681    1% /run
+tmpfs                            6575585       21     6575564    1% /run/user/0
+efivarfs                               0        0           0     - /sys/firmware/efi/efivars
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+# allow cluster to mount data1
+/data1 172.16.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+/data1 172.19.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+/data1 10.1.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+
+# mgmt001 (172.16.222.12), no root squash on mgmt001
+/data1 172.16.222.12(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# mgmt002 (172.16.222.12), no root squash on mgmt002
+/data1 172.16.222.16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)

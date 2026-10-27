@@ -1,0 +1,79 @@
+##host
+eofe-data023-mgmt.inband
+##df
+Filesystem                      Type        1K-blocks         Used  Available Use% Mounted on
+/dev/sdc3                       xfs         158784768      3768724  155016044   3% /
+/dev/sdc1                       ext4          8195240       275052    7484172   4% /boot
+devtmpfs                        devtmpfs    197272412            0  197272412   0% /dev
+tmpfs                           tmpfs       197289048            0  197289048   0% /dev/shm
+/dev/mapper/vg00-mvogelsblab002 xfs      275535366144 273526933844 2008432300 100% /mvogelsblab002
+tmpfs                           tmpfs       197289048       616128  196672920   1% /run
+tmpfs                           tmpfs        39457808            0   39457808   0% /run/user/0
+tmpfs                           tmpfs       197289048            0  197289048   0% /sys/fs/cgroup
+##mounts
+/dev/sdc3 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdc1 /boot ext4 rw,relatime 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=197272412k,nr_inodes=49318103,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=5,pgrp=1747,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=17862 0 0
+/dev/mapper/vg00-mvogelsblab002 /mvogelsblab002 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+-hosts /net autofs rw,relatime,fd=11,pgrp=1747,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=26356 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=42,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=39055 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=39457808k,mode=700 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpu,cpuacct 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_cls,net_prio 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/rdma cgroup rw,nosuid,nodev,noexec,relatime,rdma 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+none /sys/kernel/tracing tracefs rw,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/mvogelsblab002 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                          Inodes   IUsed      IFree IUse% Mounted on
+/dev/sdc3                         79431168   64087   79367081    1% /
+/dev/sdc1                           525200     323     524877    1% /boot
+devtmpfs                          49318103     520   49317583    1% /dev
+tmpfs                             49322262       1   49322261    1% /dev/shm
+/dev/mapper/vg00-mvogelsblab002 4019865880 2980791 4016885089    1% /mvogelsblab002
+tmpfs                             49322262     962   49321300    1% /run
+tmpfs                             49322262       5   49322257    1% /run/user/0
+tmpfs                             49322262      17   49322245    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+
+/mvogelsblab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 
+
+

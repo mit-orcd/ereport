@@ -1,0 +1,85 @@
+##host
+eofe-data007-mgmt
+##df
+Filesystem     Type       1K-blocks        Used   Available Use% Mounted on
+/dev/md125     xfs        104806400     2188352   102618048   3% /
+/dev/md126     xfs          2088896      176652     1912244   9% /boot
+devtmpfs       devtmpfs    65857496           0    65857496   0% /dev
+tmpfs          tmpfs       65868004           0    65868004   0% /dev/shm
+tmpfs          tmpfs       65868004      189664    65678340   1% /run
+tmpfs          tmpfs       13173604           0    13173604   0% /run/user/0
+tmpfs          tmpfs       65868004           0    65868004   0% /sys/fs/cgroup
+/dev/sda1      xfs      85951840580 68715515252 17236325328  80% /twcroninlab001
+/dev/sdb1      xfs      85951840580 82430491216  3521349364  96% /twcroninlab002
+##mounts
+rootfs / rootfs rw 0 0
+/dev/md125 / xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md126 /boot xfs rw,relatime,attr2,inode64,noquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=65857496k,nr_inodes=16464374,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=7,pgrp=1665,timeout=300,minproto=5,maxproto=5,indirect 0 0
+-hosts /net autofs rw,relatime,fd=13,pgrp=1665,timeout=300,minproto=5,maxproto=5,indirect 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=26,pgrp=1,timeout=300,minproto=5,maxproto=5,direct 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=13173604k,mode=700 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+/dev/sda1 /twcroninlab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=5632,usrquota 0 0
+/dev/sdb1 /twcroninlab002 xfs rw,relatime,attr2,inode64,sunit=512,swidth=5632,usrquota 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/twcroninlab001 10.1.0.0/16,172.16.0.0/16
+/twcroninlab002 10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem         Inodes   IUsed      IFree IUse% Mounted on
+/dev/md125      104857600   71044  104786556    1% /
+/dev/md126        2099136     338    2098798    1% /boot
+devtmpfs         16464374     577   16463797    1% /dev
+tmpfs            16467001       1   16467000    1% /dev/shm
+tmpfs            16467001     800   16466201    1% /run
+tmpfs            16467001       1   16467000    1% /run/user/0
+tmpfs            16467001      16   16466985    1% /sys/fs/cgroup
+/dev/sda1      3438157056 3190210 3434966846    1% /twcroninlab001
+/dev/sdb1      3438157056 1902680 3436254376    1% /twcroninlab002
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+/twcroninlab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 
+
+/twcroninlab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 
+
+/twcroninlab001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+/twcroninlab001 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+/twcroninlab002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+/twcroninlab002 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)

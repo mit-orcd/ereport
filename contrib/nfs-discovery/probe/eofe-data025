@@ -1,0 +1,89 @@
+##host
+eofe-data025-mgmt
+##df
+Filesystem               Type        1K-blocks         Used   Available Use% Mounted on
+/dev/md1                 xfs         201225220      7670696   193554524   4% /
+/dev/sdd1                vfat           204560         7580      196980   4% /boot/efi
+devtmpfs                 devtmpfs         4096            0        4096   0% /dev
+tmpfs                    tmpfs       197142028            0   197142028   0% /dev/shm
+/dev/mapper/data-jhewitt xfs      390623922176 346519795296 44104126880  89% /jhewitt/001
+nfs001.lb:/              nfs4           996160        62272      933888   7% /net/nfs001.lb
+xcat:/install            nfs4        838808576    425346048   413462528  51% /net/xcat/install
+tmpfs                    tmpfs        78856812       147564    78709248   1% /run
+tmpfs                    tmpfs        39428404            4    39428400   1% /run/user/0
+efivarfs                 efivarfs          304          192         107  65% /sys/firmware/efi/efivars
+##mounts
+/dev/md1 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdd1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=4096k,nr_inodes=49279570,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/dev/mapper/data-jhewitt /jhewitt/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=256k,sunit=512,swidth=2048,usrquota,prjquota,grpquota 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=2069,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=57394 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=2069,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=35114 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.225,local_lock=none,addr=10.1.223.1 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=2069,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=35114 0 0
+-hosts /net/xcat/install autofs rw,relatime,fd=9,pgrp=2069,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=35114 0 0
+xcat:/install /net/xcat/install nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.225,local_lock=none,addr=10.1.10.195 0 0
+-hosts /net/xcat/tftpboot autofs rw,relatime,fd=9,pgrp=2069,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=35114 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=2069,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=18768 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=19,pgrp=2069,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=5188411 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=35928 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=15,pgrp=2069,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=18769 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=78856812k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=39428404k,nr_inodes=9857101,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/jhewitt/001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                   Inodes     IUsed      IFree IUse% Mounted on
+/dev/md1                  100661760    183261  100478499    1% /
+/dev/sdd1                         0         0          0     - /boot/efi
+devtmpfs                   49279570       651   49278919    1% /dev
+tmpfs                      49285507         1   49285506    1% /dev/shm
+/dev/mapper/data-jhewitt 7812520128 203320828 7609199300    3% /jhewitt/001
+nfs001.lb:/                   31122       103      31019    1% /net/nfs001.lb
+xcat:/install             419429824    257153  419172671    1% /net/xcat/install
+tmpfs                        819200      1217     817983    1% /run
+tmpfs                       9857101        21    9857080    1% /run/user/0
+efivarfs                          0         0          0     - /sys/firmware/efi/efivars
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+
+/jhewitt/001 172.16.0.0/16(rw,sync,no_wdelay) 10.1.0.0/16(rw,sync,no_wdelay) 172.19.0.0/16(rw,sync,no_wdelay) 172.16.5.196(rw,sync,no_wdelay,no_root_squash) 172.16.4.245(rw,sync,no_wdelay,no_root_squash) 172.16.4.246(rw,sync,no_wdelay,no_root_squash) 172.16.4.247(rw,sync,no_wdelay,no_root_squash) 172.16.4.248(rw,sync,no_wdelay,no_root_squash) 172.16.4.249(rw,sync,no_wdelay,no_root_squash) 172.16.5.190(rw,sync,no_wdelay,no_root_squash) 172.16.5.254(rw,sync,no_wdelay,no_root_squash) 10.1.1.196(rw,sync,no_wdelay,no_root_squash) 10.1.1.199(rw,sync,no_wdelay,no_root_squash) 
+
+# allow TSM to do backups
+/jhewitt/001 172.16.6.221(rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+/jhewitt/001 172.16.6.222(rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+/jhewitt/001 172.16.6.223(rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+/jhewitt/001 172.16.6.224(rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)

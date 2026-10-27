@@ -1,0 +1,164 @@
+##host
+core010
+##df
+Filesystem                                   Type         1K-blocks         Used    Available Use% Mounted on
+/dev/md0                                     xfs          904143524     13277656    890865868   2% /
+/dev/nvme0n1p1                               vfat            204580         7568       197012   4% /boot/efi
+/dev/mapper/aselab002-aselab002              xfs        75159836672  72721785140   2438051532  97% /data/aselab002
+/dev/mapper/ashansen-ashansen                xfs         5366618112     37449836   5329168276   1% /data/ashansen/001
+/dev/mapper/csim-csim                        xfs        21472745472    312411796  21160333676   2% /data/csim/001
+/dev/mapper/fan_wang-fan_wang                xfs       150321764352 122676942292  27644822060  82% /data/fan_wang/001
+/dev/mapper/fraenkel-fraenkel                xfs        10735327232   2720583676   8014743556  26% /data/fraenkel/001
+/dev/mapper/jhm001-openmind--mcdermott       xfs       429494638592 322127971140 107366667452  76% /data/jhm/001
+/dev/mapper/lhtsai001-openmind--lhtsai       xfs        32210163712   8781431212  23428732500  28% /data/lhtsai/001
+/dev/mapper/nnakatalab-nnakatalab            xfs       246958528512 153908618852  93049909660  63% /data/nnakatalab
+/dev/rbd0                                    xfs       279170786288 187445194556  91725591732  68% /data/pog/001
+/dev/mapper/psfc001-psfc--001                xfs        53685000192  39132125840  14552874352  73% /data/psfclab001
+/dev/mapper/satra001dandi-openmind--gablab   xfs        32210163712        34316  32210129396   1% /data/satra/001/dandi
+/dev/mapper/satra001sig-openmind--sig--satra xfs       324216657920 197725554260 126491103660  61% /data/satra/001/sig
+/dev/mapper/sloanlab005-sloanlab005          xfs        26841454592  10670497252  16170957340  40% /data/sloanlab005
+/dev/mapper/sloanlab007-sloanlab007          xfs      1030790060032 577864265440 452925794592  57% /data/sloanlab007
+/dev/mapper/wfrank001-wfrank001              xfs       274411972608 108779002136 165632970472  40% /data/wfranklab002
+/dev/mapper/wonghslab-wonghslab              xfs        21472745472   4524339168  16948406304  22% /data/wonghslab
+devtmpfs                                     devtmpfs     263631768            0    263631768   0% /dev
+tmpfs                                        tmpfs        263656744            0    263656744   0% /dev/shm
+nfs001.lb:/                                  nfs4            996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home                              nfs4      432503206784 323470871936 109032334848  75% /net/nfs001.lb/home
+eofe-data004:/sloanlab003                    nfs       107372095488  93893292032  13478803456  88% /nfs/sloanlab003
+core021.ib:/data/sloan/008                   nfs4     1030790064128 208586244096 822203820032  21% /nfs/sloanlab008
+core010.ib:/satra/001                        nfs4         904143872     13277184    890866688   2% /orcd/archive/satra/001
+fstor001:/software/core/001                  nfs4        4294967296   3197861504   1097105792  75% /orcd/software/core/001
+tmpfs                                        tmpfs        105462700       122368    105340332   1% /run
+tmpfs                                        tmpfs         52731348            0     52731348   0% /run/user/0
+tmpfs                                        tmpfs         52731348            4     52731344   1% /run/user/176182
+efivarfs                                     efivarfs           304          128          172  43% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+/dev/mapper/aselab002-aselab002 /data/aselab002 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/ashansen-ashansen /data/ashansen/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/csim-csim /data/csim/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/fan_wang-fan_wang /data/fan_wang/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/fraenkel-fraenkel /data/fraenkel/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/jhm001-openmind--mcdermott /data/jhm/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/lhtsai001-openmind--lhtsai /data/lhtsai/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/nnakatalab-nnakatalab /data/nnakatalab xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/rbd0 /data/pog/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/psfc001-psfc--001 /data/psfclab001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/satra001dandi-openmind--gablab /data/satra/001/dandi xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/satra001sig-openmind--sig--satra /data/satra/001/sig xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/sloanlab005-sloanlab005 /data/sloanlab005 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/sloanlab007-sloanlab007 /data/sloanlab007 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/wfrank001-wfrank001 /data/wfranklab002 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/mapper/wonghslab-wonghslab /data/wonghslab xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=263631768k,nr_inodes=65907942,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=4192,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=26838 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=4192,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=27937 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.10,local_lock=none,addr=10.1.223.2 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=4192,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=27937 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.10,local_lock=none,addr=10.1.223.4 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31261 0 0
+eofe-data004:/sloanlab003 /nfs/sloanlab003 nfs rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.5.214,mountvers=3,mountport=20048,mountproto=udp,local_lock=none,addr=172.16.5.214 0 0
+core021.ib:/data/sloan/008 /nfs/sloanlab008 nfs4 rw,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.10,local_lock=none,addr=172.16.222.47 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=16,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=25785 0 0
+ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster /orcd/archive autofs rw,relatime,fd=32,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=88995112 0 0
+ou=auto.orcd.archive.satra,ou=automount,dc=cm,dc=cluster /orcd/archive/satra autofs rw,relatime,fd=35,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=88904139 0 0
+core010.ib:/satra/001 /orcd/archive/satra/001 nfs4 rw,relatime,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.10,local_lock=none,addr=172.16.222.10 0 0
+ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster /orcd/software autofs rw,relatime,fd=23,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=574988 0 0
+ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster /orcd/software/core autofs rw,relatime,fd=25,pgrp=4192,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=518972 0 0
+fstor001:/software/core/001 /orcd/software/core/001 nfs4 rw,noatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.10,local_lock=none,addr=172.16.4.121 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=85016 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=27,pgrp=4192,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=68834792 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=105462700k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=52731348k,nr_inodes=13182837,mode=700,inode64 0 0
+tmpfs /run/user/176182 tmpfs rw,nosuid,nodev,relatime,size=52731348k,nr_inodes=13182837,mode=700,uid=176182,gid=176182,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data             10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+/data/sloanlab005 172.16.222.16
+/data/sloanlab007 172.16.222.10,172.16.222.42,172.16.222.41,172.16.10.208,172.16.6.224,172.16.6.223,172.16.6.222,172.16.6.221
+##zfs
+##inodes
+Filesystem                                        Inodes      IUsed       IFree IUse% Mounted on
+/dev/md0                                       452292608     202737   452089871    1% /
+/dev/nvme0n1p1                                         0          0           0     - /boot/efi
+/dev/mapper/aselab002-aselab002               1503238464    3334274  1499904190    1% /data/aselab002
+/dev/mapper/ashansen-ashansen                  536870464          6   536870458    1% /data/ashansen/001
+/dev/mapper/csim-csim                         2147483200      57092  2147426108    1% /data/csim/001
+/dev/mapper/fan_wang-fan_wang                 3006476992   33297322  2973179670    2% /data/fan_wang/001
+/dev/mapper/fraenkel-fraenkel                 1073741376     198705  1073542671    1% /data/fraenkel/001
+/dev/mapper/jhm001-openmind--mcdermott        8589934464  157479347  8432455117    2% /data/jhm/001
+/dev/mapper/lhtsai001-openmind--lhtsai        3221225024     820972  3220404052    1% /data/lhtsai/001
+/dev/mapper/nnakatalab-nnakatalab             4939212288   11314585  4927897703    1% /data/nnakatalab
+/dev/rbd0                                     5583457408   10037393  5573420015    1% /data/pog/001
+/dev/mapper/psfc001-psfc--001                 5368708672   17117212  5351591460    1% /data/psfclab001
+/dev/mapper/satra001dandi-openmind--gablab    3221225024         11  3221225013    1% /data/satra/001/dandi
+/dev/mapper/satra001sig-openmind--sig--satra 32421874432   82232162 32339642270    1% /data/satra/001/sig
+/dev/mapper/sloanlab005-sloanlab005           2684354112   21385523  2662968589    1% /data/sloanlab005
+/dev/mapper/sloanlab007-sloanlab007          20615842880  565820168 20050022712    3% /data/sloanlab007
+/dev/mapper/wfrank001-wfrank001              27441405952   22398780 27419007172    1% /data/wfranklab002
+/dev/mapper/wonghslab-wonghslab               2147483200      29030  2147454170    1% /data/wonghslab
+devtmpfs                                        65907942       1237    65906705    1% /dev
+tmpfs                                           65914186          1    65914185    1% /dev/shm
+nfs001.lb:/                                        31122        103       31019    1% /net/nfs001.lb
+nfs001.lb:/home                              13852490493 1439702083 12412788410   11% /net/nfs001.lb/home
+eofe-data004:/sloanlab003                     2147483648  104394911  2043088737    5% /nfs/sloanlab003
+core021.ib:/data/sloan/008                   20615843008  128318640 20487524368    1% /nfs/sloanlab008
+core010.ib:/satra/001                          452292608     202737   452089871    1% /orcd/archive/satra/001
+fstor001:/software/core/001                   2228666733   34454953  2194211780    2% /orcd/software/core/001
+tmpfs                                             819200       1856      817344    1% /run
+tmpfs                                           13182837         15    13182822    1% /run/user/0
+tmpfs                                           13182837         18    13182819    1% /run/user/176182
+efivarfs                                               0          0           0     - /sys/firmware/efi/efivars
+##exportfile
+# allow cluster to mount data1
+/data 172.16.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data 172.19.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data 10.1.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+
+# mgmt001
+/data 172.16.222.12(rw,async,crossmnt,no_root_squash)
+
+# allow root to see sloanlab005 from mgmt0002
+/data/sloanlab005 172.16.222.16(rw,async,crossmnt,no_root_squash)
+
+#backup servers
+/data 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/data/sloanlab007 172.16.6.221(rw,async,no_root_squash) 
+/data/sloanlab007 172.16.6.222(rw,async,no_root_squash)
+/data/sloanlab007 172.16.6.223(rw,async,no_root_squash) 
+/data/sloanlab007 172.16.6.224(rw,async,no_root_squash)
+
+/data/sloanlab007 172.16.10.208(rw,async,crossmnt,no_root_squash)
+
+# allow DTN to do OM data migration
+/data/sloanlab007 172.16.222.41(rw,async,crossmnt,no_root_squash) 
+/data/sloanlab007 172.16.222.42(rw,async,crossmnt,no_root_squash)
+
+/data/sloanlab007 172.16.222.10(rw,async,crossmnt,no_root_squash)

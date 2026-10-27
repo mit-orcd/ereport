@@ -1,0 +1,137 @@
+##host
+hstor005-n2-mgmt
+##df
+Filesystem         Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md0           xfs         201225220      9279332    191945888   5% /
+/dev/sdb1          vfat           204560         7568       196992   4% /boot/efi
+data2              zfs      139800560768          640 139800560128   1% /data2
+data2/anikeeva     zfs       64424509440         1152  64424508288   1% /data2/group/anikeeva/001
+data2/ekmiller     zfs       64424509440  59928019072   4496490368  94% /data2/group/ekmiller/001
+data2/evogan       zfs       21474836480   7410627456  14064209024  35% /data2/group/evogan/001
+data2/human_esfmri zfs       10737418240   2871096832   7866321408  27% /data2/group/human_esfmri/001
+data2/ngk          zfs      316753838080 293930188416  22823649664  93% /data2/group/ngk/001
+data2/orcd         zfs       21474836480          384  21474836096   1% /data2/group/orcd/008
+data2/psinha       zfs       64424509440  25615329408  38809180032  40% /data2/group/psinha/001
+data2/rakhlin      zfs       42949672960    920404480  42029268480   3% /data2/group/rakhlin/001
+data2/rsi          zfs       21474836480     19110656  21455725824   1% /data2/group/rsi/001
+data2/saxe         zfs      128849018880 117084167680  11764851200  91% /data2/group/saxe/001
+data2/tegmark      zfs       21474836480   7830010240  13644826240  37% /data2/group/tegmark/001
+data2/zhang_f      zfs      322122547200 296106106752  26016440448  92% /data2/group/zhang_f/001
+devtmpfs           devtmpfs    395829484            0    395829484   0% /dev
+tmpfs              tmpfs       395853884            0    395853884   0% /dev/shm
+nfs001.lb:/        nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home    nfs4     432503206784 323470871936 109032334848  75% /net/nfs001.lb/home
+tmpfs              tmpfs       158341556        46008    158295548   1% /run
+tmpfs              tmpfs        79170776            4     79170772   1% /run/user/0
+efivarfs           efivarfs          128           31           93  25% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdb1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+data2 /data2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/anikeeva /data2/group/anikeeva/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/ekmiller /data2/group/ekmiller/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/evogan /data2/group/evogan/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/human_esfmri /data2/group/human_esfmri/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/ngk /data2/group/ngk/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/orcd /data2/group/orcd/008 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/psinha /data2/group/psinha/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/rakhlin /data2/group/rakhlin/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/rsi /data2/group/rsi/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/saxe /data2/group/saxe/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/tegmark /data2/group/tegmark/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/zhang_f /data2/group/zhang_f/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=395829484k,nr_inodes=98957371,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=18330,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=738543 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=18330,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=738546 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.129,local_lock=none,addr=10.1.223.4 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=18330,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=738546 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.129,local_lock=none,addr=10.1.223.1 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=18330,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=738548 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=18330,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=714101 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=596113 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=18330,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=734549 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=158341556k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=79170776k,nr_inodes=19792694,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data2 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+data2	/data2	1105077193883520	143155773587456
+data2/anikeeva	/data2/group/anikeeva/001	1071360	65970696595200
+data2/ekmiller	/data2/group/ekmiller/001	61366291520256	4604406146304
+data2/evogan	/data2/group/evogan/001	7588482425088	14401750130432
+data2/human_esfmri	/data2/group/human_esfmri/001	2940003065856	8055113211904
+data2/ngk	/data2/group/ngk/001	300984512853504	23371417340416
+data2/orcd	/data2/group/orcd/008	309504	21990232246016
+data2/psinha	/data2/group/psinha/001	26230097309184	39740600357376
+data2/rakhlin	/data2/group/rakhlin/001	942494164608	43037970946432
+data2/rsi	/data2/group/rsi/001	19569259392	21970663296128
+data2/saxe	/data2/group/saxe/001	119894187697536	12047207635584
+data2/tegmark	/data2/group/tegmark/001	8017930379136	13972302176384
+data2/zhang_f	/data2/group/zhang_f/001	303212653219584	26640835113216
+##inodes
+Filesystem               Inodes      IUsed        IFree IUse% Mounted on
+/dev/md0              100661760     208847    100452913    1% /
+/dev/sdb1                     0          0            0     - /boot/efi
+data2              279601120321         33 279601120288    1% /data2
+data2/anikeeva     128849016806         19 128849016787    1% /data2/group/anikeeva/001
+data2/ekmiller       9033785739   40804985   8992980754    1% /data2/group/ekmiller/001
+data2/evogan        28183560522   55142299  28128418223    1% /data2/group/evogan/001
+data2/human_esfmri  15733184648     541656  15732642992    1% /data2/group/human_esfmri/001
+data2/ngk           46005025014  357725521  45647299493    1% /data2/group/ngk/001
+data2/orcd          42949672362          7  42949672355    1% /data2/group/orcd/008
+data2/psinha        77641249807   22889734  77618360073    1% /data2/group/psinha/001
+data2/rakhlin       84059579808    1042804  84058537004    1% /data2/group/rakhlin/001
+data2/rsi           42911452164        414  42911451750    1% /data2/group/rsi/001
+data2/saxe          23721707741  192005328  23529702413    1% /data2/group/saxe/001
+data2/tegmark       27295388207    5735519  27289652688    1% /data2/group/tegmark/001
+data2/zhang_f       52207946532  175065452  52032881080    1% /data2/group/zhang_f/001
+devtmpfs               98957371       5659     98951712    1% /dev
+tmpfs                  98963471          1     98963470    1% /dev/shm
+nfs001.lb:/               31122        103        31019    1% /net/nfs001.lb
+nfs001.lb:/home     13852490493 1439702083  12412788410   11% /net/nfs001.lb/home
+tmpfs                    819200       9329       809871    2% /run
+tmpfs                  19792694         21     19792673    1% /run/user/0
+efivarfs                      0          0            0     - /sys/firmware/efi/efivars
+##exportfile
+# allow cluster to mount data2
+/data2 172.16.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data2 172.19.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data2 10.1.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+
+# export to backups
+/data2 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data2 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data2 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data2 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+# allow DTN to do OM data migration
+/data2 172.16.222.41(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/data2 172.16.222.42(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+# ME:Mar 05, 2026, allow Mediaflux read only access as root from node9900
+/data2 172.16.99.0(fsid=0,ro,async,crossmnt,no_root_squash,insecure)
+
+# DB:Sep 21 2026 - allow for migration of core20 server saxe data
+/data2 172.16.222.46(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)

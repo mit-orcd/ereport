@@ -1,0 +1,1835 @@
+##host
+hstor002-n2-mgmt
+##df
+Filesystem                 Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md0                   xfs         201225220      9139796    192085424   5% /
+/dev/sdg1                  vfat           204560         7568       196992   4% /boot/efi
+data2                      zfs       14864695680          512  14864695168   1% /data2
+data2/abodner              zfs      751619276800 716823740416  34795536384  96% /data2/group/abodner/003
+data2/fisherp              zfs       21474836480    360078208  21114758272   2% /data2/group/fisherp/001
+data2/orcd                 zfs      107374182400          896 107374181504   1% /data2/group/orcd/012
+data2/stephdut             zfs      107374182400  13104136832  94270045568  13% /data2/group/stephdut/001
+data2/pool                 zfs      143047912192        16256 143047895936   1% /data2/pool/003
+data2/pool/aac9            zfs        1073741824          512   1073741312   1% /data2/pool/003/aac9
+data2/pool/aaron_g         zfs        1073741824          640   1073741184   1% /data2/pool/003/aaron_g
+data2/pool/abaraban        zfs        1073741824    755435264    318306560  71% /data2/pool/003/abaraban
+data2/pool/abdnegm         zfs        1073741824          512   1073741312   1% /data2/pool/003/abdnegm
+data2/pool/abimek          zfs        1073741824          512   1073741312   1% /data2/pool/003/abimek
+data2/pool/abiyer          zfs        1073741824          512   1073741312   1% /data2/pool/003/abiyer
+data2/pool/abobu           zfs        1073741824          512   1073741312   1% /data2/pool/003/abobu
+data2/pool/abrenner        zfs        1073741824     15429760   1058312064   2% /data2/pool/003/abrenner
+data2/pool/acliang         zfs        1073741824          512   1073741312   1% /data2/pool/003/acliang
+data2/pool/acyjiang        zfs        1073741824          512   1073741312   1% /data2/pool/003/acyjiang
+data2/pool/adamsell        zfs        1073741824          512   1073741312   1% /data2/pool/003/adamsell
+data2/pool/adithyab        zfs        1073741824          512   1073741312   1% /data2/pool/003/adithyab
+data2/pool/adityaks        zfs        1073741824          512   1073741312   1% /data2/pool/003/adityaks
+data2/pool/adorfeui        zfs        1073741824          512   1073741312   1% /data2/pool/003/adorfeui
+data2/pool/advaith5        zfs        1073741824          512   1073741312   1% /data2/pool/003/advaith5
+data2/pool/advarma         zfs        1073741824          512   1073741312   1% /data2/pool/003/advarma
+data2/pool/aecohen         zfs        1073741824    158620416    915121408  15% /data2/pool/003/aecohen
+data2/pool/aewj            zfs        1073741824          512   1073741312   1% /data2/pool/003/aewj
+data2/pool/afath           zfs        1073741824          512   1073741312   1% /data2/pool/003/afath
+data2/pool/aglidden        zfs        1073741824     82358016    991383808   8% /data2/pool/003/aglidden
+data2/pool/aimoli          zfs        1073741824    225126784    848615040  21% /data2/pool/003/aimoli
+data2/pool/aipetrov        zfs        1073741824    861231488    212510336  81% /data2/pool/003/aipetrov
+data2/pool/akap            zfs        1073741824          512   1073741312   1% /data2/pool/003/akap
+data2/pool/akhilar         zfs        1073741824    464440704    609301120  44% /data2/pool/003/akhilar
+data2/pool/akht            zfs        1073741824          512   1073741312   1% /data2/pool/003/akht
+data2/pool/akiruga         zfs        1073741824          512   1073741312   1% /data2/pool/003/akiruga
+data2/pool/akshayd2        zfs        1073741824          512   1073741312   1% /data2/pool/003/akshayd2
+data2/pool/aladera         zfs        1073741824          512   1073741312   1% /data2/pool/003/aladera
+data2/pool/alegro29        zfs        1073741824          512   1073741312   1% /data2/pool/003/alegro29
+data2/pool/alexhu          zfs        1073741824          640   1073741184   1% /data2/pool/003/alexhu
+data2/pool/allikeys        zfs        1073741824          512   1073741312   1% /data2/pool/003/allikeys
+data2/pool/alphapha        zfs        1073741824          512   1073741312   1% /data2/pool/003/alphapha
+data2/pool/ament           zfs        1073741824          512   1073741312   1% /data2/pool/003/ament
+data2/pool/amgoel          zfs        1073741824          512   1073741312   1% /data2/pool/003/amgoel
+data2/pool/amitjain        zfs        1073741824    150959104    922782720  15% /data2/pool/003/amitjain
+data2/pool/amoranka        zfs        1073741824    533180544    540561280  50% /data2/pool/003/amoranka
+data2/pool/anaemeje        zfs        1073741824          512   1073741312   1% /data2/pool/003/anaemeje
+data2/pool/andraye         zfs        1073741824          512   1073741312   1% /data2/pool/003/andraye
+data2/pool/ansanto         zfs        1073741824          512   1073741312   1% /data2/pool/003/ansanto
+data2/pool/ansh2192        zfs        1073741824          512   1073741312   1% /data2/pool/003/ansh2192
+data2/pool/anusinha        zfs        1073741824          512   1073741312   1% /data2/pool/003/anusinha
+data2/pool/arbri           zfs        1073741824    226262912    847478912  22% /data2/pool/003/arbri
+data2/pool/aridavy         zfs        1073741824          512   1073741312   1% /data2/pool/003/aridavy
+data2/pool/arily           zfs        1073741824          512   1073741312   1% /data2/pool/003/arily
+data2/pool/aringel         zfs        1073741824          512   1073741312   1% /data2/pool/003/aringel
+data2/pool/arupk156        zfs        1073741824          512   1073741312   1% /data2/pool/003/arupk156
+data2/pool/aryanz          zfs        1073741824          512   1073741312   1% /data2/pool/003/aryanz
+data2/pool/ashia07_shared  zfs        5368709120    174124672   5194584448   4% /data2/pool/003/ashia07_shared
+data2/pool/asiehg          zfs        1073741824         6400   1073735424   1% /data2/pool/003/asiehg
+data2/pool/asosag01        zfs        1073741824          512   1073741312   1% /data2/pool/003/asosag01
+data2/pool/audreysa        zfs        1073741824    264035840    809705984  25% /data2/pool/003/audreysa
+data2/pool/avasqu42        zfs        1073741824          512   1073741312   1% /data2/pool/003/avasqu42
+data2/pool/avmatute        zfs        1073741824          512   1073741312   1% /data2/pool/003/avmatute
+data2/pool/axelt671        zfs        1073741824          512   1073741312   1% /data2/pool/003/axelt671
+data2/pool/ayan_k          zfs        1073741824    443085568    630656256  42% /data2/pool/003/ayan_k
+data2/pool/aymelgad        zfs        1073741824    181087232    892654592  17% /data2/pool/003/aymelgad
+data2/pool/ayuz            zfs        1073741824          512   1073741312   1% /data2/pool/003/ayuz
+data2/pool/ayz26           zfs        1073741824          512   1073741312   1% /data2/pool/003/ayz26
+data2/pool/azhang05        zfs        1073741824          512   1073741312   1% /data2/pool/003/azhang05
+data2/pool/baesuj          zfs        1073741824          512   1073741312   1% /data2/pool/003/baesuj
+data2/pool/balbasty        zfs        1073741824          512   1073741312   1% /data2/pool/003/balbasty
+data2/pool/ben25           zfs        1073741824          512   1073741312   1% /data2/pool/003/ben25
+data2/pool/bjork           zfs        1073741824          512   1073741312   1% /data2/pool/003/bjork
+data2/pool/blash           zfs        1073741824          512   1073741312   1% /data2/pool/003/blash
+data2/pool/blp_shared      zfs        5368709120          512   5368708608   1% /data2/pool/003/blp_shared
+data2/pool/boguraev        zfs        1073741824          512   1073741312   1% /data2/pool/003/boguraev
+data2/pool/boucenec        zfs        1073741824          512   1073741312   1% /data2/pool/003/boucenec
+data2/pool/bowen27         zfs        1073741824          512   1073741312   1% /data2/pool/003/bowen27
+data2/pool/bowenyu         zfs        1073741824          512   1073741312   1% /data2/pool/003/bowenyu
+data2/pool/brade           zfs        1073741824          512   1073741312   1% /data2/pool/003/brade
+data2/pool/brunm           zfs        1073741824          512   1073741312   1% /data2/pool/003/brunm
+data2/pool/bshaer          zfs        1073741824          512   1073741312   1% /data2/pool/003/bshaer
+data2/pool/camcat          zfs        1073741824    894788224    178953600  84% /data2/pool/003/camcat
+data2/pool/carlo_sg        zfs        1073741824     40707456   1033034368   4% /data2/pool/003/carlo_sg
+data2/pool/cassidyj        zfs        1073741824          512   1073741312   1% /data2/pool/003/cassidyj
+data2/pool/cdunn314        zfs        1073741824          512   1073741312   1% /data2/pool/003/cdunn314
+data2/pool/cekbote         zfs        1073741824          512   1073741312   1% /data2/pool/003/cekbote
+data2/pool/cgt20_shared    zfs        5368709120          512   5368708608   1% /data2/pool/003/cgt20_shared
+data2/pool/charliew        zfs        1073741824     36917504   1036824320   4% /data2/pool/003/charliew
+data2/pool/chcho           zfs        1073741824          512   1073741312   1% /data2/pool/003/chcho
+data2/pool/choja           zfs        1073741824          512   1073741312   1% /data2/pool/003/choja
+data2/pool/chris302        zfs        1073741824          512   1073741312   1% /data2/pool/003/chris302
+data2/pool/cjohnsto        zfs        1073741824      1267968   1072473856   1% /data2/pool/003/cjohnsto
+data2/pool/ckf             zfs        1073741824          512   1073741312   1% /data2/pool/003/ckf
+data2/pool/clarenz         zfs        1073741824          512   1073741312   1% /data2/pool/003/clarenz
+data2/pool/colb14          zfs        1073741824          512   1073741312   1% /data2/pool/003/colb14
+data2/pool/corsaro         zfs        1073741824   1058416384     15325440  99% /data2/pool/003/corsaro
+data2/pool/craabreu        zfs        1073741824          512   1073741312   1% /data2/pool/003/craabreu
+data2/pool/cthrash         zfs        1073741824          512   1073741312   1% /data2/pool/003/cthrash
+data2/pool/cysung          zfs        1073741824          512   1073741312   1% /data2/pool/003/cysung
+data2/pool/dahlt781        zfs        1073741824          512   1073741312   1% /data2/pool/003/dahlt781
+data2/pool/daisong         zfs        1073741824          512   1073741312   1% /data2/pool/003/daisong
+data2/pool/dasabir         zfs        1073741824          512   1073741312   1% /data2/pool/003/dasabir
+data2/pool/dbaek           zfs        1073741824          512   1073741312   1% /data2/pool/003/dbaek
+data2/pool/dbertsim_shared zfs        5368709120   2205222656   3163486464  42% /data2/pool/003/dbertsim_shared
+data2/pool/dbyun           zfs        1073741824          896   1073740928   1% /data2/pool/003/dbyun
+data2/pool/ddl             zfs        1073741824          512   1073741312   1% /data2/pool/003/ddl
+data2/pool/debocka         zfs        1073741824          512   1073741312   1% /data2/pool/003/debocka
+data2/pool/devar_ag        zfs        1073741824          512   1073741312   1% /data2/pool/003/devar_ag
+data2/pool/dewei           zfs        1073741824    224435072    849306752  21% /data2/pool/003/dewei
+data2/pool/dgander_shared  zfs        5368709120   1231797120   4136912000  23% /data2/pool/003/dgander_shared
+data2/pool/dikang          zfs        1073741824    922181760    151560064  86% /data2/pool/003/dikang
+data2/pool/djarecka        zfs        1073741824          512   1073741312   1% /data2/pool/003/djarecka
+data2/pool/djeff           zfs        1073741824          512   1073741312   1% /data2/pool/003/djeff
+data2/pool/dka             zfs        1073741824    532607744    541134080  50% /data2/pool/003/dka
+data2/pool/dkorsun         zfs        1073741824          512   1073741312   1% /data2/pool/003/dkorsun
+data2/pool/dliveoak        zfs        1073741824    561123328    512618496  53% /data2/pool/003/dliveoak
+data2/pool/dmin            zfs        1073741824          512   1073741312   1% /data2/pool/003/dmin
+data2/pool/dmondal         zfs        1073741824          512   1073741312   1% /data2/pool/003/dmondal
+data2/pool/donti           zfs        1073741824          512   1073741312   1% /data2/pool/003/donti
+data2/pool/drap            zfs        1073741824          512   1073741312   1% /data2/pool/003/drap
+data2/pool/duoxu           zfs        4294967296          512   4294966784   1% /data2/pool/003/duoxu
+data2/pool/dzhang17        zfs        1073741824    823886592    249855232  77% /data2/pool/003/dzhang17
+data2/pool/eflor           zfs        1073741824    391198080    682543744  37% /data2/pool/003/eflor
+data2/pool/ehmann          zfs        1073741824          512   1073741312   1% /data2/pool/003/ehmann
+data2/pool/ehz             zfs        1073741824          512   1073741312   1% /data2/pool/003/ehz
+data2/pool/eirka289        zfs        1073741824    292265088    781476736  28% /data2/pool/003/eirka289
+data2/pool/ejiang          zfs        1073741824          512   1073741312   1% /data2/pool/003/ejiang
+data2/pool/elro13          zfs        1073741824    553383936    520357888  52% /data2/pool/003/elro13
+data2/pool/emailhot        zfs        1073741824          512   1073741312   1% /data2/pool/003/emailhot
+data2/pool/emily424        zfs        1073741824          512   1073741312   1% /data2/pool/003/emily424
+data2/pool/empogue         zfs        1073741824          512   1073741312   1% /data2/pool/003/empogue
+data2/pool/enyala          zfs        1073741824          512   1073741312   1% /data2/pool/003/enyala
+data2/pool/eozen           zfs        1073741824          512   1073741312   1% /data2/pool/003/eozen
+data2/pool/equ             zfs        1073741824     40102528   1033639296   4% /data2/pool/003/equ
+data2/pool/erbmi1          zfs        1073741824          512   1073741312   1% /data2/pool/003/erbmi1
+data2/pool/esebast         zfs        1073741824    394891776    678850048  37% /data2/pool/003/esebast
+data2/pool/estebanf        zfs        1073741824          512   1073741312   1% /data2/pool/003/estebanf
+data2/pool/estockin        zfs        1073741824          512   1073741312   1% /data2/pool/003/estockin
+data2/pool/estratak        zfs        1073741824          512   1073741312   1% /data2/pool/003/estratak
+data2/pool/etienne7        zfs        1073741824          512   1073741312   1% /data2/pool/003/etienne7
+data2/pool/fidan10         zfs        1073741824          512   1073741312   1% /data2/pool/003/fidan10
+data2/pool/fisherp         zfs        1073741824    620138496    453603328  58% /data2/pool/003/fisherp
+data2/pool/floresh2        zfs        1073741824    433003776    640738048  41% /data2/pool/003/floresh2
+data2/pool/fosterb         zfs        1073741824    741229952    332511872  70% /data2/pool/003/fosterb
+data2/pool/fosterm         zfs        1073741824     15369856   1058371968   2% /data2/pool/003/fosterm
+data2/pool/froit           zfs        1073741824          512   1073741312   1% /data2/pool/003/froit
+data2/pool/fshan1          zfs        1073741824          512   1073741312   1% /data2/pool/003/fshan1
+data2/pool/ftmljfr         zfs        1073741824          512   1073741312   1% /data2/pool/003/ftmljfr
+data2/pool/gckleung        zfs        1073741824    151194240    922547584  15% /data2/pool/003/gckleung
+data2/pool/gfanson         zfs        1073741824     58577152   1015164672   6% /data2/pool/003/gfanson
+data2/pool/ggliu           zfs        1073741824          512   1073741312   1% /data2/pool/003/ggliu
+data2/pool/ghadi           zfs        1073741824          512   1073741312   1% /data2/pool/003/ghadi
+data2/pool/gilliard_shared zfs        5368709120   2102215040   3266494080  40% /data2/pool/003/gilliard_shared
+data2/pool/gleason3        zfs        1073741824          512   1073741312   1% /data2/pool/003/gleason3
+data2/pool/gokulg          zfs        1073741824     10129792   1063612032   1% /data2/pool/003/gokulg
+data2/pool/goldag          zfs        1073741824          512   1073741312   1% /data2/pool/003/goldag
+data2/pool/grantr          zfs        1073741824    389459840    684281984  37% /data2/pool/003/grantr
+data2/pool/gstine          zfs        1073741824          512   1073741312   1% /data2/pool/003/gstine
+data2/pool/gterrone        zfs        1073741824          512   1073741312   1% /data2/pool/003/gterrone
+data2/pool/guna23          zfs        1073741824    819076992    254664832  77% /data2/pool/003/guna23
+data2/pool/haleyw          zfs        1073741824          512   1073741312   1% /data2/pool/003/haleyw
+data2/pool/hannesal        zfs        1073741824          512   1073741312   1% /data2/pool/003/hannesal
+data2/pool/harm0n          zfs        1073741824          512   1073741312   1% /data2/pool/003/harm0n
+data2/pool/harryc          zfs        1073741824          512   1073741312   1% /data2/pool/003/harryc
+data2/pool/hawkx82         zfs        1073741824          512   1073741312   1% /data2/pool/003/hawkx82
+data2/pool/hayel           zfs        1073741824          512   1073741312   1% /data2/pool/003/hayel
+data2/pool/hdoosth         zfs        1073741824          512   1073741312   1% /data2/pool/003/hdoosth
+data2/pool/hengzhil        zfs        1073741824     79931904    993809920   8% /data2/pool/003/hengzhil
+data2/pool/hlei            zfs        1073741824          512   1073741312   1% /data2/pool/003/hlei
+data2/pool/hlrich          zfs        1073741824          512   1073741312   1% /data2/pool/003/hlrich
+data2/pool/hmni            zfs        1073741824          512   1073741312   1% /data2/pool/003/hmni
+data2/pool/hmughal         zfs        1073741824          512   1073741312   1% /data2/pool/003/hmughal
+data2/pool/hnaka24         zfs        1073741824    527986048    545755776  50% /data2/pool/003/hnaka24
+data2/pool/hoffmanp        zfs        1073741824    104504832    969236992  10% /data2/pool/003/hoffmanp
+data2/pool/hs421           zfs        1073741824          512   1073741312   1% /data2/pool/003/hs421
+data2/pool/hughhig         zfs        1073741824          512   1073741312   1% /data2/pool/003/hughhig
+data2/pool/hyery           zfs        1073741824          512   1073741312   1% /data2/pool/003/hyery
+data2/pool/icecream        zfs        1073741824    860263808    213478016  81% /data2/pool/003/icecream
+data2/pool/igorf222        zfs        1073741824    689487488    384254336  65% /data2/pool/003/igorf222
+data2/pool/imteek          zfs        1073741824          512   1073741312   1% /data2/pool/003/imteek
+data2/pool/ituck           zfs        1073741824          512   1073741312   1% /data2/pool/003/ituck
+data2/pool/jackking        zfs        1073741824    808152704    265589120  76% /data2/pool/003/jackking
+data2/pool/jaysonli        zfs        1073741824     34305664   1039436160   4% /data2/pool/003/jaysonli
+data2/pool/jcorream        zfs        1073741824          512   1073741312   1% /data2/pool/003/jcorream
+data2/pool/jcstark_shared  zfs        5368709120          512   5368708608   1% /data2/pool/003/jcstark_shared
+data2/pool/jelizlee        zfs        1073741824          512   1073741312   1% /data2/pool/003/jelizlee
+data2/pool/jennkim         zfs        1073741824          512   1073741312   1% /data2/pool/003/jennkim
+data2/pool/jgoot           zfs        1073741824          512   1073741312   1% /data2/pool/003/jgoot
+data2/pool/jhday           zfs        1073741824          512   1073741312   1% /data2/pool/003/jhday
+data2/pool/jichi           zfs        1073741824          512   1073741312   1% /data2/pool/003/jichi
+data2/pool/jimink          zfs        1073741824     93287552    980454272   9% /data2/pool/003/jimink
+data2/pool/jingyaow        zfs        1073741824          512   1073741312   1% /data2/pool/003/jingyaow
+data2/pool/jjsun2          zfs        1073741824          512   1073741312   1% /data2/pool/003/jjsun2
+data2/pool/jleonard        zfs        1073741824          512   1073741312   1% /data2/pool/003/jleonard
+data2/pool/jlomelin        zfs        1073741824          512   1073741312   1% /data2/pool/003/jlomelin
+data2/pool/jms3            zfs        1073741824          512   1073741312   1% /data2/pool/003/jms3
+data2/pool/joepaggi        zfs        1073741824   1004607744     69134080  94% /data2/pool/003/joepaggi
+data2/pool/jokorie         zfs        1073741824          512   1073741312   1% /data2/pool/003/jokorie
+data2/pool/jordancn        zfs        1073741824          512   1073741312   1% /data2/pool/003/jordancn
+data2/pool/jorgem13        zfs        1073741824          512   1073741312   1% /data2/pool/003/jorgem13
+data2/pool/jprice7         zfs        1073741824          512   1073741312   1% /data2/pool/003/jprice7
+data2/pool/jrein           zfs        1073741824    317632000    756109824  30% /data2/pool/003/jrein
+data2/pool/jrpeng          zfs        1073741824          512   1073741312   1% /data2/pool/003/jrpeng
+data2/pool/jsmentch        zfs        1073741824          512   1073741312   1% /data2/pool/003/jsmentch
+data2/pool/junlaw          zfs        1073741824          512   1073741312   1% /data2/pool/003/junlaw
+data2/pool/junxian         zfs        1073741824          512   1073741312   1% /data2/pool/003/junxian
+data2/pool/junxiliu        zfs        1073741824          512   1073741312   1% /data2/pool/003/junxiliu
+data2/pool/jvineet9        zfs        1073741824          512   1073741312   1% /data2/pool/003/jvineet9
+data2/pool/kaitlint        zfs        1073741824          512   1073741312   1% /data2/pool/003/kaitlint
+data2/pool/kakura          zfs        1073741824          512   1073741312   1% /data2/pool/003/kakura
+data2/pool/katiegal_shared zfs        5368709120   4778133632    590575488  89% /data2/pool/003/katiegal_shared
+data2/pool/kaygisiz        zfs        1073741824    118400768    955341056  12% /data2/pool/003/kaygisiz
+data2/pool/kcdwyer         zfs        1073741824          512   1073741312   1% /data2/pool/003/kcdwyer
+data2/pool/kchen1          zfs        1073741824          512   1073741312   1% /data2/pool/003/kchen1
+data2/pool/kchen88         zfs        1073741824          512   1073741312   1% /data2/pool/003/kchen88
+data2/pool/kellh219        zfs        1073741824          512   1073741312   1% /data2/pool/003/kellh219
+data2/pool/kevinlor        zfs        1073741824          512   1073741312   1% /data2/pool/003/kevinlor
+data2/pool/kez             zfs        1073741824          512   1073741312   1% /data2/pool/003/kez
+data2/pool/kharazmi        zfs        1073741824   1041932416     31809408  98% /data2/pool/003/kharazmi
+data2/pool/khizer          zfs        1073741824          512   1073741312   1% /data2/pool/003/khizer
+data2/pool/khoh            zfs        1073741824          512   1073741312   1% /data2/pool/003/khoh
+data2/pool/kimjd           zfs        1073741824          512   1073741312   1% /data2/pool/003/kimjd
+data2/pool/kirilb          zfs        1073741824    878919936    194821888  82% /data2/pool/003/kirilb
+data2/pool/kitzmann        zfs        1073741824          512   1073741312   1% /data2/pool/003/kitzmann
+data2/pool/kmcclenn        zfs        1073741824    674320512    399421312  63% /data2/pool/003/kmcclenn
+data2/pool/knathan         zfs        1073741824          512   1073741312   1% /data2/pool/003/knathan
+data2/pool/kodittr         zfs        1073741824          512   1073741312   1% /data2/pool/003/kodittr
+data2/pool/kokomoor        zfs        1073741824          512   1073741312   1% /data2/pool/003/kokomoor
+data2/pool/kopan           zfs        1073741824        57600   1073684224   1% /data2/pool/003/kopan
+data2/pool/krxu            zfs        1073741824          512   1073741312   1% /data2/pool/003/krxu
+data2/pool/kvira           zfs        1073741824          512   1073741312   1% /data2/pool/003/kvira
+data2/pool/kyujin22        zfs        1073741824          512   1073741312   1% /data2/pool/003/kyujin22
+data2/pool/kyzhao          zfs        1073741824          512   1073741312   1% /data2/pool/003/kyzhao
+data2/pool/lancelot        zfs        1073741824          512   1073741312   1% /data2/pool/003/lancelot
+data2/pool/laub_shared     zfs        5368709120          512   5368708608   1% /data2/pool/003/laub_shared
+data2/pool/lbreitha        zfs        1073741824          512   1073741312   1% /data2/pool/003/lbreitha
+data2/pool/lee_d           zfs        1073741824          512   1073741312   1% /data2/pool/003/lee_d
+data2/pool/leverest        zfs        1073741824    101176064    972565760  10% /data2/pool/003/leverest
+data2/pool/lgardner        zfs        1073741824          640   1073741184   1% /data2/pool/003/lgardner
+data2/pool/liangy          zfs        1073741824          512   1073741312   1% /data2/pool/003/liangy
+data2/pool/lichenz         zfs        1073741824          512   1073741312   1% /data2/pool/003/lichenz
+data2/pool/lidao           zfs        1073741824          512   1073741312   1% /data2/pool/003/lidao
+data2/pool/liuyz           zfs        1073741824     25661952   1048079872   3% /data2/pool/003/liuyz
+data2/pool/lpbrock         zfs        1073741824          512   1073741312   1% /data2/pool/003/lpbrock
+data2/pool/lpmoser         zfs        1073741824          512   1073741312   1% /data2/pool/003/lpmoser
+data2/pool/lquan           zfs        1073741824          512   1073741312   1% /data2/pool/003/lquan
+data2/pool/lraymond        zfs        1073741824    695695360    378046464  65% /data2/pool/003/lraymond
+data2/pool/lucas_b         zfs        1073741824          512   1073741312   1% /data2/pool/003/lucas_b
+data2/pool/luccote         zfs        1073741824    180427904    893313920  17% /data2/pool/003/luccote
+data2/pool/lucg            zfs        1073741824          512   1073741312   1% /data2/pool/003/lucg
+data2/pool/lur             zfs        1073741824          512   1073741312   1% /data2/pool/003/lur
+data2/pool/lyons66         zfs        1073741824    592081536    481660288  56% /data2/pool/003/lyons66
+data2/pool/manets12        zfs        1073741824          512   1073741312   1% /data2/pool/003/manets12
+data2/pool/manvitha        zfs        1073741824          512   1073741312   1% /data2/pool/003/manvitha
+data2/pool/mapleint        zfs        1073741824          512   1073741312   1% /data2/pool/003/mapleint
+data2/pool/maru            zfs        1073741824          512   1073741312   1% /data2/pool/003/maru
+data2/pool/mathis00        zfs        1073741824          512   1073741312   1% /data2/pool/003/mathis00
+data2/pool/matt5320        zfs        1073741824          512   1073741312   1% /data2/pool/003/matt5320
+data2/pool/matveyev_shared zfs        5368709120    876829696   4491879424  17% /data2/pool/003/matveyev_shared
+data2/pool/maurais         zfs        1073741824    600647040    473094784  56% /data2/pool/003/maurais
+data2/pool/mcharara        zfs        1073741824          512   1073741312   1% /data2/pool/003/mcharara
+data2/pool/mcneilly        zfs        1073741824          512   1073741312   1% /data2/pool/003/mcneilly
+data2/pool/megantj         zfs        1073741824     15524992   1058216832   2% /data2/pool/003/megantj
+data2/pool/meganwei        zfs        1073741824          512   1073741312   1% /data2/pool/003/meganwei
+data2/pool/meixuanw        zfs        1073741824          512   1073741312   1% /data2/pool/003/meixuanw
+data2/pool/meral           zfs        1073741824          512   1073741312   1% /data2/pool/003/meral
+data2/pool/mgaynor         zfs        1073741824          512   1073741312   1% /data2/pool/003/mgaynor
+data2/pool/mglasgow        zfs        1073741824          512   1073741312   1% /data2/pool/003/mglasgow
+data2/pool/michmo          zfs        1073741824          512   1073741312   1% /data2/pool/003/michmo
+data2/pool/mihok485        zfs        1073741824    257470592    816271232  24% /data2/pool/003/mihok485
+data2/pool/milessmi        zfs        1073741824          512   1073741312   1% /data2/pool/003/milessmi
+data2/pool/mingda_shared   zfs        5368709120       961664   5367747456   1% /data2/pool/003/mingda_shared
+data2/pool/miramay         zfs        1073741824    195535488    878206336  19% /data2/pool/003/miramay
+data2/pool/mlahogue        zfs        1073741824          512   1073741312   1% /data2/pool/003/mlahogue
+data2/pool/mleroy          zfs        1073741824          512   1073741312   1% /data2/pool/003/mleroy
+data2/pool/mmdesai         zfs        1073741824          512   1073741312   1% /data2/pool/003/mmdesai
+data2/pool/mnmassri        zfs        1073741824          512   1073741312   1% /data2/pool/003/mnmassri
+data2/pool/mohuadas        zfs        1073741824     48712064   1025029760   5% /data2/pool/003/mohuadas
+data2/pool/moreka          zfs        1073741824       118912   1073622912   1% /data2/pool/003/moreka
+data2/pool/mp2020          zfs        1073741824    993805312     79936512  93% /data2/pool/003/mp2020
+data2/pool/mphill          zfs        1073741824          512   1073741312   1% /data2/pool/003/mphill
+data2/pool/mrkraus         zfs        1073741824       696320   1073045504   1% /data2/pool/003/mrkraus
+data2/pool/mshaqfa         zfs        1073741824          512   1073741312   1% /data2/pool/003/mshaqfa
+data2/pool/mvera           zfs        1073741824          512   1073741312   1% /data2/pool/003/mvera
+data2/pool/mwilkin         zfs        1073741824          512   1073741312   1% /data2/pool/003/mwilkin
+data2/pool/mzwang          zfs        1073741824    105370496    968371328  10% /data2/pool/003/mzwang
+data2/pool/naj20           zfs        1073741824          512   1073741312   1% /data2/pool/003/naj20
+data2/pool/nathra          zfs        1073741824     90393728    983348096   9% /data2/pool/003/nathra
+data2/pool/ndovroli        zfs        1073741824    333360384    740381440  32% /data2/pool/003/ndovroli
+data2/pool/nemm            zfs        1073741824          512   1073741312   1% /data2/pool/003/nemm
+data2/pool/neputzi         zfs        1073741824          512   1073741312   1% /data2/pool/003/neputzi
+data2/pool/nevint          zfs        1073741824          512   1073741312   1% /data2/pool/003/nevint
+data2/pool/nfrey           zfs        1073741824    256574464    817167360  24% /data2/pool/003/nfrey
+data2/pool/ngreeley        zfs        1073741824          512   1073741312   1% /data2/pool/003/ngreeley
+data2/pool/nicwjh          zfs        1073741824          512   1073741312   1% /data2/pool/003/nicwjh
+data2/pool/nityab          zfs        1073741824          512   1073741312   1% /data2/pool/003/nityab
+data2/pool/nkk             zfs        1073741824          512   1073741312   1% /data2/pool/003/nkk
+data2/pool/nliu04          zfs        1073741824          512   1073741312   1% /data2/pool/003/nliu04
+data2/pool/nnelsen         zfs        1073741824          512   1073741312   1% /data2/pool/003/nnelsen
+data2/pool/nsomers         zfs        1073741824    762409344    311332480  72% /data2/pool/003/nsomers
+data2/pool/nye             zfs        1073741824          512   1073741312   1% /data2/pool/003/nye
+data2/pool/nyoh            zfs        1073741824          512   1073741312   1% /data2/pool/003/nyoh
+data2/pool/ojoshi          zfs        1073741824          512   1073741312   1% /data2/pool/003/ojoshi
+data2/pool/olivrw          zfs        1073741824          512   1073741312   1% /data2/pool/003/olivrw
+data2/pool/opitcho         zfs        1073741824          512   1073741312   1% /data2/pool/003/opitcho
+data2/pool/osahon          zfs        1073741824          512   1073741312   1% /data2/pool/003/osahon
+data2/pool/pablorf         zfs        1073741824    766521088    307220736  72% /data2/pool/003/pablorf
+data2/pool/pablorf_shared  zfs        5368709120   4234140800   1134568320  79% /data2/pool/003/pablorf_shared
+data2/pool/pallavib        zfs        1073741824    895742336    177999488  84% /data2/pool/003/pallavib
+data2/pool/passey01        zfs        1073741824          512   1073741312   1% /data2/pool/003/passey01
+data2/pool/patomaki        zfs        1073741824          512   1073741312   1% /data2/pool/003/patomaki
+data2/pool/peiyuxu         zfs        1073741824          512   1073741312   1% /data2/pool/003/peiyuxu
+data2/pool/pfox            zfs        1073741824          512   1073741312   1% /data2/pool/003/pfox
+data2/pool/phend13         zfs        1073741824     91637376    982104448   9% /data2/pool/003/phend13
+data2/pool/pibou149        zfs        1073741824          512   1073741312   1% /data2/pool/003/pibou149
+data2/pool/pinter          zfs        1073741824          512   1073741312   1% /data2/pool/003/pinter
+data2/pool/pisinger        zfs        1073741824          512   1073741312   1% /data2/pool/003/pisinger
+data2/pool/plopez          zfs        1073741824    923818880    149922944  87% /data2/pool/003/plopez
+data2/pool/pmtneuro        zfs        1073741824          512   1073741312   1% /data2/pool/003/pmtneuro
+data2/pool/ppapa           zfs        1073741824       351104   1073390720   1% /data2/pool/003/ppapa
+data2/pool/prav3           zfs        1073741824          512   1073741312   1% /data2/pool/003/prav3
+data2/pool/promptkp        zfs        1073741824          512   1073741312   1% /data2/pool/003/promptkp
+data2/pool/pryal           zfs        1073741824          512   1073741312   1% /data2/pool/003/pryal
+data2/pool/qianyu_z        zfs        1073741824    863416832    210324992  81% /data2/pool/003/qianyu_z
+data2/pool/qua             zfs        1073741824          512   1073741312   1% /data2/pool/003/qua
+data2/pool/raffaele        zfs        1073741824          512   1073741312   1% /data2/pool/003/raffaele
+data2/pool/rbarea          zfs        1073741824          512   1073741312   1% /data2/pool/003/rbarea
+data2/pool/reggo           zfs        1073741824     35272704   1038469120   4% /data2/pool/003/reggo
+data2/pool/reimer_shared   zfs        5368709120        70784   5368638336   1% /data2/pool/003/reimer_shared
+data2/pool/rhshen          zfs        1073741824    156693376    917048448  15% /data2/pool/003/rhshen
+data2/pool/rhurt           zfs        1073741824          512   1073741312   1% /data2/pool/003/rhurt
+data2/pool/rianc           zfs        1073741824          512   1073741312   1% /data2/pool/003/rianc
+data2/pool/rizzoj          zfs        1073741824          512   1073741312   1% /data2/pool/003/rizzoj
+data2/pool/rkuba           zfs        1073741824          512   1073741312   1% /data2/pool/003/rkuba
+data2/pool/rlwang          zfs        1073741824          512   1073741312   1% /data2/pool/003/rlwang
+data2/pool/rmcconke        zfs        1073741824          512   1073741312   1% /data2/pool/003/rmcconke
+data2/pool/rohs            zfs        1073741824   1031784192     41957632  97% /data2/pool/003/rohs
+data2/pool/rothma          zfs        1073741824          512   1073741312   1% /data2/pool/003/rothma
+data2/pool/ruixiaox        zfs        1073741824          512   1073741312   1% /data2/pool/003/ruixiaox
+data2/pool/rzhuang         zfs        1073741824          512   1073741312   1% /data2/pool/003/rzhuang
+data2/pool/sahughes        zfs        1073741824    183852032    889889792  18% /data2/pool/003/sahughes
+data2/pool/sampeng_shared  zfs        5368709120    511816832   4856892288  10% /data2/pool/003/sampeng_shared
+data2/pool/sathyae         zfs        1073741824    663696256    410045568  62% /data2/pool/003/sathyae
+data2/pool/sco             zfs        1073741824          512   1073741312   1% /data2/pool/003/sco
+data2/pool/sduggal         zfs        1073741824          512   1073741312   1% /data2/pool/003/sduggal
+data2/pool/seijieng        zfs        1181116032   1073950720    107165312  91% /data2/pool/003/seijieng
+data2/pool/setliu22        zfs        1073741824          512   1073741312   1% /data2/pool/003/setliu22
+data2/pool/sgbruce         zfs        1073741824          512   1073741312   1% /data2/pool/003/sgbruce
+data2/pool/shahineb        zfs        1073741824          512   1073741312   1% /data2/pool/003/shahineb
+data2/pool/shan2312        zfs        1073741824          512   1073741312   1% /data2/pool/003/shan2312
+data2/pool/shenwang        zfs        1073741824          512   1073741312   1% /data2/pool/003/shenwang
+data2/pool/shorterm        zfs        1073741824          512   1073741312   1% /data2/pool/003/shorterm
+data2/pool/sizheli         zfs        1073741824    805747968    267993856  76% /data2/pool/003/sizheli
+data2/pool/sjr             zfs        1073741824          512   1073741312   1% /data2/pool/003/sjr
+data2/pool/skrem           zfs        1073741824          512   1073741312   1% /data2/pool/003/skrem
+data2/pool/slhughes        zfs        1073741824          512   1073741312   1% /data2/pool/003/slhughes
+data2/pool/sloomba         zfs        1073741824          512   1073741312   1% /data2/pool/003/sloomba
+data2/pool/smish           zfs        1073741824          512   1073741312   1% /data2/pool/003/smish
+data2/pool/soonhyun        zfs        1073741824          512   1073741312   1% /data2/pool/003/soonhyun
+data2/pool/sophscag        zfs        1073741824          512   1073741312   1% /data2/pool/003/sophscag
+data2/pool/soukayna        zfs        1073741824    876086272    197655552  82% /data2/pool/003/soukayna
+data2/pool/sparsh          zfs        1073741824          512   1073741312   1% /data2/pool/003/sparsh
+data2/pool/sreejat         zfs        1073741824          512   1073741312   1% /data2/pool/003/sreejat
+data2/pool/srini01         zfs        1073741824          512   1073741312   1% /data2/pool/003/srini01
+data2/pool/sritterb        zfs        1073741824          512   1073741312   1% /data2/pool/003/sritterb
+data2/pool/srm_shared      zfs        5368709120          512   5368708608   1% /data2/pool/003/srm_shared
+data2/pool/starkman        zfs        1073741824      1213696   1072528128   1% /data2/pool/003/starkman
+data2/pool/steven30        zfs        1073741824          512   1073741312   1% /data2/pool/003/steven30
+data2/pool/stevensh        zfs        1073741824          512   1073741312   1% /data2/pool/003/stevensh
+data2/pool/stulchin        zfs        1073741824          512   1073741312   1% /data2/pool/003/stulchin
+data2/pool/sumit99         zfs        1073741824          512   1073741312   1% /data2/pool/003/sumit99
+data2/pool/sunhyoo         zfs        1073741824          512   1073741312   1% /data2/pool/003/sunhyoo
+data2/pool/sunx528         zfs        1073741824          512   1073741312   1% /data2/pool/003/sunx528
+data2/pool/sunx_shared     zfs        5368709120    281554048   5087155072   6% /data2/pool/003/sunx_shared
+data2/pool/svtaylor        zfs        1073741824          512   1073741312   1% /data2/pool/003/svtaylor
+data2/pool/swatir          zfs        1073741824          512   1073741312   1% /data2/pool/003/swatir
+data2/pool/sxp820          zfs        1073741824          512   1073741312   1% /data2/pool/003/sxp820
+data2/pool/sylziyuz        zfs        1073741824          512   1073741312   1% /data2/pool/003/sylziyuz
+data2/pool/szantou         zfs        1073741824          512   1073741312   1% /data2/pool/003/szantou
+data2/pool/szhang11        zfs        1073741824          512   1073741312   1% /data2/pool/003/szhang11
+data2/pool/ta_nikol        zfs        1073741824    907965696    165776128  85% /data2/pool/003/ta_nikol
+data2/pool/tagem           zfs        1073741824     73927680    999814144   7% /data2/pool/003/tagem
+data2/pool/tanm678         zfs        1073741824          512   1073741312   1% /data2/pool/003/tanm678
+data2/pool/tdaillak        zfs        1073741824          512   1073741312   1% /data2/pool/003/tdaillak
+data2/pool/temills         zfs        1073741824          512   1073741312   1% /data2/pool/003/temills
+data2/pool/thavishi        zfs        1073741824          512   1073741312   1% /data2/pool/003/thavishi
+data2/pool/thibsoub        zfs        1073741824     63926400   1009815424   6% /data2/pool/003/thibsoub
+data2/pool/thoma98         zfs        1073741824          512   1073741312   1% /data2/pool/003/thoma98
+data2/pool/timneum1        zfs        1073741824          512   1073741312   1% /data2/pool/003/timneum1
+data2/pool/tobioni_shared  zfs        5368709120          512   5368708608   1% /data2/pool/003/tobioni_shared
+data2/pool/tongwu97        zfs        1073741824          512   1073741312   1% /data2/pool/003/tongwu97
+data2/pool/trancik_shared  zfs        5368709120     16389120   5352320000   1% /data2/pool/003/trancik_shared
+data2/pool/trudyenc        zfs        1073741824          512   1073741312   1% /data2/pool/003/trudyenc
+data2/pool/tslatyer        zfs        1073741824          512   1073741312   1% /data2/pool/003/tslatyer
+data2/pool/tsliu           zfs        1073741824          512   1073741312   1% /data2/pool/003/tsliu
+data2/pool/twilks          zfs        1073741824          512   1073741312   1% /data2/pool/003/twilks
+data2/pool/tyoshino        zfs        1073741824          512   1073741312   1% /data2/pool/003/tyoshino
+data2/pool/tzegoh          zfs        1073741824    665909888    407831936  63% /data2/pool/003/tzegoh
+data2/pool/vaddala9        zfs        1073741824          512   1073741312   1% /data2/pool/003/vaddala9
+data2/pool/varun123        zfs        1073741824          512   1073741312   1% /data2/pool/003/varun123
+data2/pool/vaxmanf         zfs        1073741824          512   1073741312   1% /data2/pool/003/vaxmanf
+data2/pool/vicfaith        zfs        1073741824          512   1073741312   1% /data2/pool/003/vicfaith
+data2/pool/viviansg        zfs        4294967296          640   4294966656   1% /data2/pool/003/viviansg
+data2/pool/vm8             zfs        1181116032   1073755264    107360768  91% /data2/pool/003/vm8
+data2/pool/vpatel12        zfs        1073741824       779648   1072962176   1% /data2/pool/003/vpatel12
+data2/pool/vranjan         zfs        1073741824          512   1073741312   1% /data2/pool/003/vranjan
+data2/pool/wadel642        zfs        1073741824          512   1073741312   1% /data2/pool/003/wadel642
+data2/pool/whamitch        zfs        1073741824    969619200    104122624  91% /data2/pool/003/whamitch
+data2/pool/wuhg5330        zfs        1073741824    200415360    873326464  19% /data2/pool/003/wuhg5330
+data2/pool/wyf             zfs        1073741824    420886784    652855040  40% /data2/pool/003/wyf
+data2/pool/xbtmkmmm        zfs        1073741824          512   1073741312   1% /data2/pool/003/xbtmkmmm
+data2/pool/xdelabru        zfs        1073741824          512   1073741312   1% /data2/pool/003/xdelabru
+data2/pool/xgong75         zfs        1073741824          512   1073741312   1% /data2/pool/003/xgong75
+data2/pool/xumei           zfs        1073741824          512   1073741312   1% /data2/pool/003/xumei
+data2/pool/yael_cg         zfs        1073741824          512   1073741312   1% /data2/pool/003/yael_cg
+data2/pool/yanac           zfs        1073741824          512   1073741312   1% /data2/pool/003/yanac
+data2/pool/yangsj          zfs        1073741824          512   1073741312   1% /data2/pool/003/yangsj
+data2/pool/yifanyin        zfs        1073741824          512   1073741312   1% /data2/pool/003/yifanyin
+data2/pool/yilup666        zfs        1073741824          512   1073741312   1% /data2/pool/003/yilup666
+data2/pool/yishika2        zfs        1073741824     75495040    998246784   8% /data2/pool/003/yishika2
+data2/pool/yongheng        zfs        1073741824          512   1073741312   1% /data2/pool/003/yongheng
+data2/pool/yonglo          zfs        1073741824    100676736    973065088  10% /data2/pool/003/yonglo
+data2/pool/yosebiba        zfs        1073741824    499202048    574539776  47% /data2/pool/003/yosebiba
+data2/pool/ypol            zfs        1073741824          512   1073741312   1% /data2/pool/003/ypol
+data2/pool/yshen99         zfs        1073741824    582459392    491282432  55% /data2/pool/003/yshen99
+data2/pool/yu_xie          zfs        1073741824          512   1073741312   1% /data2/pool/003/yu_xie
+data2/pool/yu_zheng        zfs        1073741824    506121984    567619840  48% /data2/pool/003/yu_zheng
+data2/pool/yuanxun         zfs        1073741824          512   1073741312   1% /data2/pool/003/yuanxun
+data2/pool/yuechuan        zfs        1181116032   1074155648    106960384  91% /data2/pool/003/yuechuan
+data2/pool/yumzhang        zfs        1073741824   1016664704     57077120  95% /data2/pool/003/yumzhang
+data2/pool/zabreyko        zfs        1073741824          512   1073741312   1% /data2/pool/003/zabreyko
+data2/pool/zachw23         zfs        1073741824          512   1073741312   1% /data2/pool/003/zachw23
+data2/pool/zappi           zfs        1073741824      6747264   1066994560   1% /data2/pool/003/zappi
+data2/pool/zhh24           zfs        1073741824          512   1073741312   1% /data2/pool/003/zhh24
+data2/pool/zhiye           zfs        1073741824          512   1073741312   1% /data2/pool/003/zhiye
+data2/pool/zhuoranw        zfs        1073741824          512   1073741312   1% /data2/pool/003/zhuoranw
+data2/pool/zieglerc        zfs        1073741824    611982208    461759616  57% /data2/pool/003/zieglerc
+data2/pool/zitongc         zfs        1073741824          512   1073741312   1% /data2/pool/003/zitongc
+data2/pool/zituo           zfs        1073741824    978687104     95054720  92% /data2/pool/003/zituo
+data2/pool/zixiaowa        zfs        1073741824          512   1073741312   1% /data2/pool/003/zixiaowa
+data2/pool/zk27            zfs        1181116032   1074325376    106790656  91% /data2/pool/003/zk27
+data2/pool/zniu            zfs        1073741824    566562176    507179648  53% /data2/pool/003/zniu
+data2/pool/zwest           zfs        1073741824          512   1073741312   1% /data2/pool/003/zwest
+devtmpfs                   devtmpfs    395829504            0    395829504   0% /dev
+tmpfs                      tmpfs       395853900            0    395853900   0% /dev/shm
+nfs001.lb:/                nfs4           996160        62272       933888   7% /net/nfs001.lb
+tmpfs                      tmpfs       158341564        37812    158303752   1% /run
+tmpfs                      tmpfs        79170780            4     79170776   1% /run/user/0
+efivarfs                   efivarfs          128           41           83  33% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdg1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+data2 /data2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/abodner /data2/group/abodner/003 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/fisherp /data2/group/fisherp/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/orcd /data2/group/orcd/012 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/stephdut /data2/group/stephdut/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool /data2/pool/003 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aac9 /data2/pool/003/aac9 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aaron_g /data2/pool/003/aaron_g zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abaraban /data2/pool/003/abaraban zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abdnegm /data2/pool/003/abdnegm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abimek /data2/pool/003/abimek zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abiyer /data2/pool/003/abiyer zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abobu /data2/pool/003/abobu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/abrenner /data2/pool/003/abrenner zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/acliang /data2/pool/003/acliang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/acyjiang /data2/pool/003/acyjiang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/adamsell /data2/pool/003/adamsell zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/adithyab /data2/pool/003/adithyab zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/adityaks /data2/pool/003/adityaks zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/adorfeui /data2/pool/003/adorfeui zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/advaith5 /data2/pool/003/advaith5 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/advarma /data2/pool/003/advarma zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aecohen /data2/pool/003/aecohen zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aewj /data2/pool/003/aewj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/afath /data2/pool/003/afath zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aglidden /data2/pool/003/aglidden zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aimoli /data2/pool/003/aimoli zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aipetrov /data2/pool/003/aipetrov zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/akap /data2/pool/003/akap zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/akhilar /data2/pool/003/akhilar zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/akht /data2/pool/003/akht zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/akiruga /data2/pool/003/akiruga zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/akshayd2 /data2/pool/003/akshayd2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aladera /data2/pool/003/aladera zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/alegro29 /data2/pool/003/alegro29 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/alexhu /data2/pool/003/alexhu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/allikeys /data2/pool/003/allikeys zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/alphapha /data2/pool/003/alphapha zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ament /data2/pool/003/ament zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/amgoel /data2/pool/003/amgoel zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/amitjain /data2/pool/003/amitjain zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/amoranka /data2/pool/003/amoranka zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/anaemeje /data2/pool/003/anaemeje zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/andraye /data2/pool/003/andraye zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ansanto /data2/pool/003/ansanto zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ansh2192 /data2/pool/003/ansh2192 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/anusinha /data2/pool/003/anusinha zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/arbri /data2/pool/003/arbri zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aridavy /data2/pool/003/aridavy zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/arily /data2/pool/003/arily zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aringel /data2/pool/003/aringel zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/arupk156 /data2/pool/003/arupk156 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aryanz /data2/pool/003/aryanz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ashia07_shared /data2/pool/003/ashia07_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/asiehg /data2/pool/003/asiehg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/asosag01 /data2/pool/003/asosag01 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/audreysa /data2/pool/003/audreysa zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/avasqu42 /data2/pool/003/avasqu42 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/avmatute /data2/pool/003/avmatute zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/axelt671 /data2/pool/003/axelt671 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ayan_k /data2/pool/003/ayan_k zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/aymelgad /data2/pool/003/aymelgad zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ayuz /data2/pool/003/ayuz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ayz26 /data2/pool/003/ayz26 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/azhang05 /data2/pool/003/azhang05 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/baesuj /data2/pool/003/baesuj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/balbasty /data2/pool/003/balbasty zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ben25 /data2/pool/003/ben25 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/bjork /data2/pool/003/bjork zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/blash /data2/pool/003/blash zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/blp_shared /data2/pool/003/blp_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/boguraev /data2/pool/003/boguraev zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/boucenec /data2/pool/003/boucenec zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/bowen27 /data2/pool/003/bowen27 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/bowenyu /data2/pool/003/bowenyu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/brade /data2/pool/003/brade zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/brunm /data2/pool/003/brunm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/bshaer /data2/pool/003/bshaer zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/camcat /data2/pool/003/camcat zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/carlo_sg /data2/pool/003/carlo_sg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cassidyj /data2/pool/003/cassidyj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cdunn314 /data2/pool/003/cdunn314 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cekbote /data2/pool/003/cekbote zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cgt20_shared /data2/pool/003/cgt20_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/charliew /data2/pool/003/charliew zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/chcho /data2/pool/003/chcho zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/choja /data2/pool/003/choja zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/chris302 /data2/pool/003/chris302 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cjohnsto /data2/pool/003/cjohnsto zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ckf /data2/pool/003/ckf zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/clarenz /data2/pool/003/clarenz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/colb14 /data2/pool/003/colb14 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/corsaro /data2/pool/003/corsaro zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/craabreu /data2/pool/003/craabreu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cthrash /data2/pool/003/cthrash zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/cysung /data2/pool/003/cysung zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dahlt781 /data2/pool/003/dahlt781 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/daisong /data2/pool/003/daisong zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dasabir /data2/pool/003/dasabir zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dbaek /data2/pool/003/dbaek zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dbertsim_shared /data2/pool/003/dbertsim_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dbyun /data2/pool/003/dbyun zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ddl /data2/pool/003/ddl zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/debocka /data2/pool/003/debocka zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/devar_ag /data2/pool/003/devar_ag zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dewei /data2/pool/003/dewei zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dgander_shared /data2/pool/003/dgander_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dikang /data2/pool/003/dikang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/djarecka /data2/pool/003/djarecka zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/djeff /data2/pool/003/djeff zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dka /data2/pool/003/dka zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dkorsun /data2/pool/003/dkorsun zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dliveoak /data2/pool/003/dliveoak zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dmin /data2/pool/003/dmin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dmondal /data2/pool/003/dmondal zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/donti /data2/pool/003/donti zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/drap /data2/pool/003/drap zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/duoxu /data2/pool/003/duoxu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/dzhang17 /data2/pool/003/dzhang17 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/eflor /data2/pool/003/eflor zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ehmann /data2/pool/003/ehmann zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ehz /data2/pool/003/ehz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/eirka289 /data2/pool/003/eirka289 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ejiang /data2/pool/003/ejiang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/elro13 /data2/pool/003/elro13 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/emailhot /data2/pool/003/emailhot zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/emily424 /data2/pool/003/emily424 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/empogue /data2/pool/003/empogue zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/enyala /data2/pool/003/enyala zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/eozen /data2/pool/003/eozen zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/equ /data2/pool/003/equ zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/erbmi1 /data2/pool/003/erbmi1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/esebast /data2/pool/003/esebast zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/estebanf /data2/pool/003/estebanf zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/estockin /data2/pool/003/estockin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/estratak /data2/pool/003/estratak zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/etienne7 /data2/pool/003/etienne7 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/fidan10 /data2/pool/003/fidan10 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/fisherp /data2/pool/003/fisherp zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/floresh2 /data2/pool/003/floresh2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/fosterb /data2/pool/003/fosterb zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/fosterm /data2/pool/003/fosterm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/froit /data2/pool/003/froit zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/fshan1 /data2/pool/003/fshan1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ftmljfr /data2/pool/003/ftmljfr zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gckleung /data2/pool/003/gckleung zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gfanson /data2/pool/003/gfanson zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ggliu /data2/pool/003/ggliu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ghadi /data2/pool/003/ghadi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gilliard_shared /data2/pool/003/gilliard_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gleason3 /data2/pool/003/gleason3 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gokulg /data2/pool/003/gokulg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/goldag /data2/pool/003/goldag zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/grantr /data2/pool/003/grantr zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gstine /data2/pool/003/gstine zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/gterrone /data2/pool/003/gterrone zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/guna23 /data2/pool/003/guna23 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/haleyw /data2/pool/003/haleyw zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hannesal /data2/pool/003/hannesal zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/harm0n /data2/pool/003/harm0n zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/harryc /data2/pool/003/harryc zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hawkx82 /data2/pool/003/hawkx82 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hayel /data2/pool/003/hayel zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hdoosth /data2/pool/003/hdoosth zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hengzhil /data2/pool/003/hengzhil zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hlei /data2/pool/003/hlei zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hlrich /data2/pool/003/hlrich zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hmni /data2/pool/003/hmni zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hmughal /data2/pool/003/hmughal zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hnaka24 /data2/pool/003/hnaka24 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hoffmanp /data2/pool/003/hoffmanp zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hs421 /data2/pool/003/hs421 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hughhig /data2/pool/003/hughhig zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/hyery /data2/pool/003/hyery zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/icecream /data2/pool/003/icecream zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/igorf222 /data2/pool/003/igorf222 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/imteek /data2/pool/003/imteek zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ituck /data2/pool/003/ituck zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jackking /data2/pool/003/jackking zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jaysonli /data2/pool/003/jaysonli zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jcorream /data2/pool/003/jcorream zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jcstark_shared /data2/pool/003/jcstark_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jelizlee /data2/pool/003/jelizlee zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jennkim /data2/pool/003/jennkim zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jgoot /data2/pool/003/jgoot zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jhday /data2/pool/003/jhday zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jichi /data2/pool/003/jichi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jimink /data2/pool/003/jimink zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jingyaow /data2/pool/003/jingyaow zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jjsun2 /data2/pool/003/jjsun2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jleonard /data2/pool/003/jleonard zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jlomelin /data2/pool/003/jlomelin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jms3 /data2/pool/003/jms3 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/joepaggi /data2/pool/003/joepaggi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jokorie /data2/pool/003/jokorie zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jordancn /data2/pool/003/jordancn zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jorgem13 /data2/pool/003/jorgem13 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jprice7 /data2/pool/003/jprice7 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jrein /data2/pool/003/jrein zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jrpeng /data2/pool/003/jrpeng zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jsmentch /data2/pool/003/jsmentch zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/junlaw /data2/pool/003/junlaw zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/junxian /data2/pool/003/junxian zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/junxiliu /data2/pool/003/junxiliu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/jvineet9 /data2/pool/003/jvineet9 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kaitlint /data2/pool/003/kaitlint zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kakura /data2/pool/003/kakura zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/katiegal_shared /data2/pool/003/katiegal_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kaygisiz /data2/pool/003/kaygisiz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kcdwyer /data2/pool/003/kcdwyer zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kchen1 /data2/pool/003/kchen1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kchen88 /data2/pool/003/kchen88 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kellh219 /data2/pool/003/kellh219 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kevinlor /data2/pool/003/kevinlor zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kez /data2/pool/003/kez zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kharazmi /data2/pool/003/kharazmi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/khizer /data2/pool/003/khizer zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/khoh /data2/pool/003/khoh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kimjd /data2/pool/003/kimjd zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kirilb /data2/pool/003/kirilb zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kitzmann /data2/pool/003/kitzmann zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kmcclenn /data2/pool/003/kmcclenn zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/knathan /data2/pool/003/knathan zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kodittr /data2/pool/003/kodittr zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kokomoor /data2/pool/003/kokomoor zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kopan /data2/pool/003/kopan zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/krxu /data2/pool/003/krxu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kvira /data2/pool/003/kvira zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kyujin22 /data2/pool/003/kyujin22 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/kyzhao /data2/pool/003/kyzhao zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lancelot /data2/pool/003/lancelot zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/laub_shared /data2/pool/003/laub_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lbreitha /data2/pool/003/lbreitha zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lee_d /data2/pool/003/lee_d zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/leverest /data2/pool/003/leverest zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lgardner /data2/pool/003/lgardner zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/liangy /data2/pool/003/liangy zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lichenz /data2/pool/003/lichenz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lidao /data2/pool/003/lidao zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/liuyz /data2/pool/003/liuyz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lpbrock /data2/pool/003/lpbrock zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lpmoser /data2/pool/003/lpmoser zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lquan /data2/pool/003/lquan zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lraymond /data2/pool/003/lraymond zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lucas_b /data2/pool/003/lucas_b zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/luccote /data2/pool/003/luccote zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lucg /data2/pool/003/lucg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lur /data2/pool/003/lur zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/lyons66 /data2/pool/003/lyons66 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/manets12 /data2/pool/003/manets12 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/manvitha /data2/pool/003/manvitha zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mapleint /data2/pool/003/mapleint zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/maru /data2/pool/003/maru zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mathis00 /data2/pool/003/mathis00 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/matt5320 /data2/pool/003/matt5320 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/matveyev_shared /data2/pool/003/matveyev_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/maurais /data2/pool/003/maurais zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mcharara /data2/pool/003/mcharara zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mcneilly /data2/pool/003/mcneilly zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/megantj /data2/pool/003/megantj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/meganwei /data2/pool/003/meganwei zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/meixuanw /data2/pool/003/meixuanw zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/meral /data2/pool/003/meral zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mgaynor /data2/pool/003/mgaynor zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mglasgow /data2/pool/003/mglasgow zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/michmo /data2/pool/003/michmo zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mihok485 /data2/pool/003/mihok485 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/milessmi /data2/pool/003/milessmi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mingda_shared /data2/pool/003/mingda_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/miramay /data2/pool/003/miramay zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mlahogue /data2/pool/003/mlahogue zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mleroy /data2/pool/003/mleroy zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mmdesai /data2/pool/003/mmdesai zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mnmassri /data2/pool/003/mnmassri zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mohuadas /data2/pool/003/mohuadas zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/moreka /data2/pool/003/moreka zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mp2020 /data2/pool/003/mp2020 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mphill /data2/pool/003/mphill zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mrkraus /data2/pool/003/mrkraus zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mshaqfa /data2/pool/003/mshaqfa zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mvera /data2/pool/003/mvera zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mwilkin /data2/pool/003/mwilkin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/mzwang /data2/pool/003/mzwang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/naj20 /data2/pool/003/naj20 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nathra /data2/pool/003/nathra zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ndovroli /data2/pool/003/ndovroli zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nemm /data2/pool/003/nemm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/neputzi /data2/pool/003/neputzi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nevint /data2/pool/003/nevint zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nfrey /data2/pool/003/nfrey zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ngreeley /data2/pool/003/ngreeley zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nicwjh /data2/pool/003/nicwjh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nityab /data2/pool/003/nityab zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nkk /data2/pool/003/nkk zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nliu04 /data2/pool/003/nliu04 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nnelsen /data2/pool/003/nnelsen zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nsomers /data2/pool/003/nsomers zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nye /data2/pool/003/nye zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/nyoh /data2/pool/003/nyoh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ojoshi /data2/pool/003/ojoshi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/olivrw /data2/pool/003/olivrw zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/opitcho /data2/pool/003/opitcho zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/osahon /data2/pool/003/osahon zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pablorf /data2/pool/003/pablorf zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pablorf_shared /data2/pool/003/pablorf_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pallavib /data2/pool/003/pallavib zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/passey01 /data2/pool/003/passey01 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/patomaki /data2/pool/003/patomaki zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/peiyuxu /data2/pool/003/peiyuxu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pfox /data2/pool/003/pfox zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/phend13 /data2/pool/003/phend13 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pibou149 /data2/pool/003/pibou149 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pinter /data2/pool/003/pinter zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pisinger /data2/pool/003/pisinger zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/plopez /data2/pool/003/plopez zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pmtneuro /data2/pool/003/pmtneuro zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ppapa /data2/pool/003/ppapa zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/prav3 /data2/pool/003/prav3 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/promptkp /data2/pool/003/promptkp zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/pryal /data2/pool/003/pryal zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/qianyu_z /data2/pool/003/qianyu_z zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/qua /data2/pool/003/qua zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/raffaele /data2/pool/003/raffaele zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rbarea /data2/pool/003/rbarea zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/reggo /data2/pool/003/reggo zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/reimer_shared /data2/pool/003/reimer_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rhshen /data2/pool/003/rhshen zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rhurt /data2/pool/003/rhurt zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rianc /data2/pool/003/rianc zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rizzoj /data2/pool/003/rizzoj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rkuba /data2/pool/003/rkuba zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rlwang /data2/pool/003/rlwang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rmcconke /data2/pool/003/rmcconke zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rohs /data2/pool/003/rohs zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rothma /data2/pool/003/rothma zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ruixiaox /data2/pool/003/ruixiaox zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/rzhuang /data2/pool/003/rzhuang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sahughes /data2/pool/003/sahughes zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sampeng_shared /data2/pool/003/sampeng_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sathyae /data2/pool/003/sathyae zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sco /data2/pool/003/sco zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sduggal /data2/pool/003/sduggal zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/seijieng /data2/pool/003/seijieng zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/setliu22 /data2/pool/003/setliu22 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sgbruce /data2/pool/003/sgbruce zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/shahineb /data2/pool/003/shahineb zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/shan2312 /data2/pool/003/shan2312 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/shenwang /data2/pool/003/shenwang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/shorterm /data2/pool/003/shorterm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sizheli /data2/pool/003/sizheli zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sjr /data2/pool/003/sjr zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/skrem /data2/pool/003/skrem zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/slhughes /data2/pool/003/slhughes zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sloomba /data2/pool/003/sloomba zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/smish /data2/pool/003/smish zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/soonhyun /data2/pool/003/soonhyun zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sophscag /data2/pool/003/sophscag zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/soukayna /data2/pool/003/soukayna zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sparsh /data2/pool/003/sparsh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sreejat /data2/pool/003/sreejat zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/srini01 /data2/pool/003/srini01 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sritterb /data2/pool/003/sritterb zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/srm_shared /data2/pool/003/srm_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/starkman /data2/pool/003/starkman zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/steven30 /data2/pool/003/steven30 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/stevensh /data2/pool/003/stevensh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/stulchin /data2/pool/003/stulchin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sumit99 /data2/pool/003/sumit99 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sunhyoo /data2/pool/003/sunhyoo zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sunx528 /data2/pool/003/sunx528 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sunx_shared /data2/pool/003/sunx_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/svtaylor /data2/pool/003/svtaylor zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/swatir /data2/pool/003/swatir zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sxp820 /data2/pool/003/sxp820 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/sylziyuz /data2/pool/003/sylziyuz zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/szantou /data2/pool/003/szantou zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/szhang11 /data2/pool/003/szhang11 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ta_nikol /data2/pool/003/ta_nikol zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tagem /data2/pool/003/tagem zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tanm678 /data2/pool/003/tanm678 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tdaillak /data2/pool/003/tdaillak zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/temills /data2/pool/003/temills zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/thavishi /data2/pool/003/thavishi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/thibsoub /data2/pool/003/thibsoub zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/thoma98 /data2/pool/003/thoma98 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/timneum1 /data2/pool/003/timneum1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tobioni_shared /data2/pool/003/tobioni_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tongwu97 /data2/pool/003/tongwu97 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/trancik_shared /data2/pool/003/trancik_shared zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/trudyenc /data2/pool/003/trudyenc zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tslatyer /data2/pool/003/tslatyer zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tsliu /data2/pool/003/tsliu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/twilks /data2/pool/003/twilks zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tyoshino /data2/pool/003/tyoshino zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/tzegoh /data2/pool/003/tzegoh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vaddala9 /data2/pool/003/vaddala9 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/varun123 /data2/pool/003/varun123 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vaxmanf /data2/pool/003/vaxmanf zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vicfaith /data2/pool/003/vicfaith zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/viviansg /data2/pool/003/viviansg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vm8 /data2/pool/003/vm8 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vpatel12 /data2/pool/003/vpatel12 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/vranjan /data2/pool/003/vranjan zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/wadel642 /data2/pool/003/wadel642 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/whamitch /data2/pool/003/whamitch zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/wuhg5330 /data2/pool/003/wuhg5330 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/wyf /data2/pool/003/wyf zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/xbtmkmmm /data2/pool/003/xbtmkmmm zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/xdelabru /data2/pool/003/xdelabru zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/xgong75 /data2/pool/003/xgong75 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/xumei /data2/pool/003/xumei zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yael_cg /data2/pool/003/yael_cg zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yanac /data2/pool/003/yanac zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yangsj /data2/pool/003/yangsj zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yifanyin /data2/pool/003/yifanyin zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yilup666 /data2/pool/003/yilup666 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yishika2 /data2/pool/003/yishika2 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yongheng /data2/pool/003/yongheng zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yonglo /data2/pool/003/yonglo zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yosebiba /data2/pool/003/yosebiba zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/ypol /data2/pool/003/ypol zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yshen99 /data2/pool/003/yshen99 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yu_xie /data2/pool/003/yu_xie zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yu_zheng /data2/pool/003/yu_zheng zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yuanxun /data2/pool/003/yuanxun zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yuechuan /data2/pool/003/yuechuan zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/yumzhang /data2/pool/003/yumzhang zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zabreyko /data2/pool/003/zabreyko zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zachw23 /data2/pool/003/zachw23 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zappi /data2/pool/003/zappi zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zhh24 /data2/pool/003/zhh24 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zhiye /data2/pool/003/zhiye zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zhuoranw /data2/pool/003/zhuoranw zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zieglerc /data2/pool/003/zieglerc zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zitongc /data2/pool/003/zitongc zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zituo /data2/pool/003/zituo zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zixiaowa /data2/pool/003/zixiaowa zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zk27 /data2/pool/003/zk27 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zniu /data2/pool/003/zniu zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data2/pool/zwest /data2/pool/003/zwest zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=395829504k,nr_inodes=98957376,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=20573,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=905415 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=20573,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=905420 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.123,local_lock=none,addr=10.1.223.1 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=20573,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=905420 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=20573,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=18650 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=20573,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=18658 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=615398 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=20573,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=896134 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=158341564k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=79170780k,nr_inodes=19792695,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data2 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+data2	/data2	1231495107070336	15221447885824
+data2/abodner	/data2/group/abodner/003	734027510089728	35630629353472
+data2/fisherp	/data2/group/fisherp/001	368720043264	21621512512256
+data2/orcd	/data2/group/orcd/012	916608	109951161860992
+data2/pool	/data2/pool/003	73421280055040	146481045500160
+data2/pool/aac9	/data2/pool/003/aac9	499968	1099511127808
+data2/pool/aaron_g	/data2/pool/003/aaron_g	571392	1099511056384
+data2/pool/abaraban	/data2/pool/003/abaraban	773565631488	325945996288
+data2/pool/abdnegm	/data2/pool/003/abdnegm	499968	1099511127808
+data2/pool/abimek	/data2/pool/003/abimek	499968	1099511127808
+data2/pool/abiyer	/data2/pool/003/abiyer	499968	1099511127808
+data2/pool/abobu	/data2/pool/003/abobu	499968	1099511127808
+data2/pool/abrenner	/data2/pool/003/abrenner	15800000640	1083711627136
+data2/pool/acliang	/data2/pool/003/acliang	499968	1099511127808
+data2/pool/acyjiang	/data2/pool/003/acyjiang	499968	1099511127808
+data2/pool/adamsell	/data2/pool/003/adamsell	499968	1099511127808
+data2/pool/adithyab	/data2/pool/003/adithyab	499968	1099511127808
+data2/pool/adityaks	/data2/pool/003/adityaks	499968	1099511127808
+data2/pool/adorfeui	/data2/pool/003/adorfeui	499968	1099511127808
+data2/pool/advaith5	/data2/pool/003/advaith5	499968	1099511127808
+data2/pool/advarma	/data2/pool/003/advarma	499968	1099511127808
+data2/pool/aecohen	/data2/pool/003/aecohen	162427199232	937084428544
+data2/pool/aewj	/data2/pool/003/aewj	499968	1099511127808
+data2/pool/afath	/data2/pool/003/afath	499968	1099511127808
+data2/pool/aglidden	/data2/pool/003/aglidden	84334578432	1015177049344
+data2/pool/aimoli	/data2/pool/003/aimoli	230529733248	868981894528
+data2/pool/aipetrov	/data2/pool/003/aipetrov	881901030912	217610596864
+data2/pool/akap	/data2/pool/003/akap	499968	1099511127808
+data2/pool/akhilar	/data2/pool/003/akhilar	475587155712	623924472064
+data2/pool/akht	/data2/pool/003/akht	499968	1099511127808
+data2/pool/akiruga	/data2/pool/003/akiruga	499968	1099511127808
+data2/pool/akshayd2	/data2/pool/003/akshayd2	499968	1099511127808
+data2/pool/aladera	/data2/pool/003/aladera	499968	1099511127808
+data2/pool/alegro29	/data2/pool/003/alegro29	499968	1099511127808
+data2/pool/alexhu	/data2/pool/003/alexhu	619008	1099511008768
+data2/pool/allikeys	/data2/pool/003/allikeys	499968	1099511127808
+data2/pool/alphapha	/data2/pool/003/alphapha	499968	1099511127808
+data2/pool/ament	/data2/pool/003/ament	499968	1099511127808
+data2/pool/amgoel	/data2/pool/003/amgoel	499968	1099511127808
+data2/pool/amitjain	/data2/pool/003/amitjain	154581998976	944929628800
+data2/pool/amoranka	/data2/pool/003/amoranka	545976805248	553534822528
+data2/pool/anaemeje	/data2/pool/003/anaemeje	499968	1099511127808
+data2/pool/andraye	/data2/pool/003/andraye	499968	1099511127808
+data2/pool/ansanto	/data2/pool/003/ansanto	499968	1099511127808
+data2/pool/ansh2192	/data2/pool/003/ansh2192	499968	1099511127808
+data2/pool/anusinha	/data2/pool/003/anusinha	499968	1099511127808
+data2/pool/arbri	/data2/pool/003/arbri	231693111168	867818516608
+data2/pool/aridavy	/data2/pool/003/aridavy	499968	1099511127808
+data2/pool/arily	/data2/pool/003/arily	499968	1099511127808
+data2/pool/aringel	/data2/pool/003/aringel	499968	1099511127808
+data2/pool/arupk156	/data2/pool/003/arupk156	499968	1099511127808
+data2/pool/aryanz	/data2/pool/003/aryanz	499968	1099511127808
+data2/pool/ashia07_shared	/data2/pool/003/ashia07_shared	178303540224	5319254598656
+data2/pool/asiehg	/data2/pool/003/asiehg	6535296	1099505092480
+data2/pool/asosag01	/data2/pool/003/asosag01	499968	1099511127808
+data2/pool/audreysa	/data2/pool/003/audreysa	270372659328	829138968448
+data2/pool/avasqu42	/data2/pool/003/avasqu42	499968	1099511127808
+data2/pool/avmatute	/data2/pool/003/avmatute	499968	1099511127808
+data2/pool/axelt671	/data2/pool/003/axelt671	499968	1099511127808
+data2/pool/ayan_k	/data2/pool/003/ayan_k	453719543424	645792084352
+data2/pool/aymelgad	/data2/pool/003/aymelgad	185433214848	914078412928
+data2/pool/ayuz	/data2/pool/003/ayuz	499968	1099511127808
+data2/pool/ayz26	/data2/pool/003/ayz26	499968	1099511127808
+data2/pool/azhang05	/data2/pool/003/azhang05	499968	1099511127808
+data2/pool/baesuj	/data2/pool/003/baesuj	499968	1099511127808
+data2/pool/balbasty	/data2/pool/003/balbasty	499968	1099511127808
+data2/pool/ben25	/data2/pool/003/ben25	499968	1099511127808
+data2/pool/bjork	/data2/pool/003/bjork	499968	1099511127808
+data2/pool/blash	/data2/pool/003/blash	499968	1099511127808
+data2/pool/blp_shared	/data2/pool/003/blp_shared	499968	5497557638912
+data2/pool/boguraev	/data2/pool/003/boguraev	499968	1099511127808
+data2/pool/boucenec	/data2/pool/003/boucenec	499968	1099511127808
+data2/pool/bowen27	/data2/pool/003/bowen27	499968	1099511127808
+data2/pool/bowenyu	/data2/pool/003/bowenyu	499968	1099511127808
+data2/pool/brade	/data2/pool/003/brade	499968	1099511127808
+data2/pool/brunm	/data2/pool/003/brunm	499968	1099511127808
+data2/pool/bshaer	/data2/pool/003/bshaer	499968	1099511127808
+data2/pool/camcat	/data2/pool/003/camcat	916263081600	183248546176
+data2/pool/carlo_sg	/data2/pool/003/carlo_sg	41684367744	1057827260032
+data2/pool/cassidyj	/data2/pool/003/cassidyj	499968	1099511127808
+data2/pool/cdunn314	/data2/pool/003/cdunn314	499968	1099511127808
+data2/pool/cekbote	/data2/pool/003/cekbote	499968	1099511127808
+data2/pool/cgt20_shared	/data2/pool/003/cgt20_shared	499968	5497557638912
+data2/pool/charliew	/data2/pool/003/charliew	37803437568	1061708190208
+data2/pool/chcho	/data2/pool/003/chcho	499968	1099511127808
+data2/pool/choja	/data2/pool/003/choja	499968	1099511127808
+data2/pool/chris302	/data2/pool/003/chris302	499968	1099511127808
+data2/pool/cjohnsto	/data2/pool/003/cjohnsto	1298274048	1098213353728
+data2/pool/ckf	/data2/pool/003/ckf	499968	1099511127808
+data2/pool/clarenz	/data2/pool/003/clarenz	499968	1099511127808
+data2/pool/colb14	/data2/pool/003/colb14	499968	1099511127808
+data2/pool/corsaro	/data2/pool/003/corsaro	1083818369280	15693258496
+data2/pool/craabreu	/data2/pool/003/craabreu	499968	1099511127808
+data2/pool/cthrash	/data2/pool/003/cthrash	499968	1099511127808
+data2/pool/cysung	/data2/pool/003/cysung	499968	1099511127808
+data2/pool/dahlt781	/data2/pool/003/dahlt781	499968	1099511127808
+data2/pool/daisong	/data2/pool/003/daisong	499968	1099511127808
+data2/pool/dasabir	/data2/pool/003/dasabir	499968	1099511127808
+data2/pool/dbaek	/data2/pool/003/dbaek	499968	1099511127808
+data2/pool/dbertsim_shared	/data2/pool/003/dbertsim_shared	2258147957376	3239410181504
+data2/pool/dbyun	/data2/pool/003/dbyun	892800	1099510734976
+data2/pool/ddl	/data2/pool/003/ddl	499968	1099511127808
+data2/pool/debocka	/data2/pool/003/debocka	499968	1099511127808
+data2/pool/devar_ag	/data2/pool/003/devar_ag	499968	1099511127808
+data2/pool/dewei	/data2/pool/003/dewei	229821504768	869690123008
+data2/pool/dgander_shared	/data2/pool/003/dgander_shared	1261360136832	4236198002048
+data2/pool/dikang	/data2/pool/003/dikang	944314071936	155197555840
+data2/pool/djarecka	/data2/pool/003/djarecka	499968	1099511127808
+data2/pool/djeff	/data2/pool/003/djeff	499968	1099511127808
+data2/pool/dka	/data2/pool/003/dka	545390283264	554121344512
+data2/pool/dkorsun	/data2/pool/003/dkorsun	499968	1099511127808
+data2/pool/dliveoak	/data2/pool/003/dliveoak	574590176256	524921451520
+data2/pool/dmin	/data2/pool/003/dmin	499968	1099511127808
+data2/pool/dmondal	/data2/pool/003/dmondal	499968	1099511127808
+data2/pool/donti	/data2/pool/003/donti	499968	1099511127808
+data2/pool/drap	/data2/pool/003/drap	499968	1099511127808
+data2/pool/duoxu	/data2/pool/003/duoxu	499968	4398046011136
+data2/pool/dzhang17	/data2/pool/003/dzhang17	843659823744	255851804032
+data2/pool/eflor	/data2/pool/003/eflor	400586717952	698924909824
+data2/pool/ehmann	/data2/pool/003/ehmann	499968	1099511127808
+data2/pool/ehz	/data2/pool/003/ehz	499968	1099511127808
+data2/pool/eirka289	/data2/pool/003/eirka289	299279321088	800232306688
+data2/pool/ejiang	/data2/pool/003/ejiang	499968	1099511127808
+data2/pool/elro13	/data2/pool/003/elro13	566665076352	532846551424
+data2/pool/emailhot	/data2/pool/003/emailhot	499968	1099511127808
+data2/pool/emily424	/data2/pool/003/emily424	499968	1099511127808
+data2/pool/empogue	/data2/pool/003/empogue	499968	1099511127808
+data2/pool/enyala	/data2/pool/003/enyala	499968	1099511127808
+data2/pool/eozen	/data2/pool/003/eozen	499968	1099511127808
+data2/pool/equ	/data2/pool/003/equ	41064919296	1058446708480
+data2/pool/erbmi1	/data2/pool/003/erbmi1	499968	1099511127808
+data2/pool/esebast	/data2/pool/003/esebast	404369083008	695142544768
+data2/pool/estebanf	/data2/pool/003/estebanf	499968	1099511127808
+data2/pool/estockin	/data2/pool/003/estockin	499968	1099511127808
+data2/pool/estratak	/data2/pool/003/estratak	499968	1099511127808
+data2/pool/etienne7	/data2/pool/003/etienne7	499968	1099511127808
+data2/pool/fidan10	/data2/pool/003/fidan10	499968	1099511127808
+data2/pool/fisherp	/data2/pool/003/fisherp	635021736960	464489890816
+data2/pool/floresh2	/data2/pool/003/floresh2	443395823232	656115804544
+data2/pool/fosterb	/data2/pool/003/fosterb	759019419648	340492208128
+data2/pool/fosterm	/data2/pool/003/fosterm	15738611712	1083773016064
+data2/pool/froit	/data2/pool/003/froit	499968	1099511127808
+data2/pool/fshan1	/data2/pool/003/fshan1	499968	1099511127808
+data2/pool/ftmljfr	/data2/pool/003/ftmljfr	499968	1099511127808
+data2/pool/gckleung	/data2/pool/003/gckleung	154822828800	944688798976
+data2/pool/gfanson	/data2/pool/003/gfanson	59982922752	1039528705024
+data2/pool/ggliu	/data2/pool/003/ggliu	499968	1099511127808
+data2/pool/ghadi	/data2/pool/003/ghadi	499968	1099511127808
+data2/pool/gilliard_shared	/data2/pool/003/gilliard_shared	2152668160896	3344889977984
+data2/pool/gleason3	/data2/pool/003/gleason3	499968	1099511127808
+data2/pool/gokulg	/data2/pool/003/gokulg	10372800384	1089138827392
+data2/pool/goldag	/data2/pool/003/goldag	499968	1099511127808
+data2/pool/grantr	/data2/pool/003/grantr	398806748544	700704879232
+data2/pool/gstine	/data2/pool/003/gstine	499968	1099511127808
+data2/pool/gterrone	/data2/pool/003/gterrone	499968	1099511127808
+data2/pool/guna23	/data2/pool/003/guna23	838734793728	260776834048
+data2/pool/haleyw	/data2/pool/003/haleyw	499968	1099511127808
+data2/pool/hannesal	/data2/pool/003/hannesal	499968	1099511127808
+data2/pool/harm0n	/data2/pool/003/harm0n	499968	1099511127808
+data2/pool/harryc	/data2/pool/003/harryc	499968	1099511127808
+data2/pool/hawkx82	/data2/pool/003/hawkx82	499968	1099511127808
+data2/pool/hayel	/data2/pool/003/hayel	499968	1099511127808
+data2/pool/hdoosth	/data2/pool/003/hdoosth	499968	1099511127808
+data2/pool/hengzhil	/data2/pool/003/hengzhil	81850261248	1017661366528
+data2/pool/hlei	/data2/pool/003/hlei	499968	1099511127808
+data2/pool/hlrich	/data2/pool/003/hlrich	499968	1099511127808
+data2/pool/hmni	/data2/pool/003/hmni	499968	1099511127808
+data2/pool/hmughal	/data2/pool/003/hmughal	499968	1099511127808
+data2/pool/hnaka24	/data2/pool/003/hnaka24	540657705216	558853922560
+data2/pool/hoffmanp	/data2/pool/003/hoffmanp	107012900736	992498727040
+data2/pool/hs421	/data2/pool/003/hs421	499968	1099511127808
+data2/pool/hughhig	/data2/pool/003/hughhig	499968	1099511127808
+data2/pool/hyery	/data2/pool/003/hyery	499968	1099511127808
+data2/pool/icecream	/data2/pool/003/icecream	880910022912	218601604864
+data2/pool/igorf222	/data2/pool/003/igorf222	706035072768	393476555008
+data2/pool/imteek	/data2/pool/003/imteek	499968	1099511127808
+data2/pool/ituck	/data2/pool/003/ituck	499968	1099511127808
+data2/pool/jackking	/data2/pool/003/jackking	827548366848	271963260928
+data2/pool/jaysonli	/data2/pool/003/jaysonli	35128882560	1064382745216
+data2/pool/jcorream	/data2/pool/003/jcorream	499968	1099511127808
+data2/pool/jcstark_shared	/data2/pool/003/jcstark_shared	499968	5497557638912
+data2/pool/jelizlee	/data2/pool/003/jelizlee	499968	1099511127808
+data2/pool/jennkim	/data2/pool/003/jennkim	499968	1099511127808
+data2/pool/jgoot	/data2/pool/003/jgoot	499968	1099511127808
+data2/pool/jhday	/data2/pool/003/jhday	499968	1099511127808
+data2/pool/jichi	/data2/pool/003/jichi	499968	1099511127808
+data2/pool/jimink	/data2/pool/003/jimink	95526350208	1003985277568
+data2/pool/jingyaow	/data2/pool/003/jingyaow	499968	1099511127808
+data2/pool/jjsun2	/data2/pool/003/jjsun2	499968	1099511127808
+data2/pool/jleonard	/data2/pool/003/jleonard	499968	1099511127808
+data2/pool/jlomelin	/data2/pool/003/jlomelin	499968	1099511127808
+data2/pool/jms3	/data2/pool/003/jms3	499968	1099511127808
+data2/pool/joepaggi	/data2/pool/003/joepaggi	1028718288768	70793339008
+data2/pool/jokorie	/data2/pool/003/jokorie	499968	1099511127808
+data2/pool/jordancn	/data2/pool/003/jordancn	499968	1099511127808
+data2/pool/jorgem13	/data2/pool/003/jorgem13	499968	1099511127808
+data2/pool/jprice7	/data2/pool/003/jprice7	499968	1099511127808
+data2/pool/jrein	/data2/pool/003/jrein	325255122816	774256504960
+data2/pool/jrpeng	/data2/pool/003/jrpeng	499968	1099511127808
+data2/pool/jsmentch	/data2/pool/003/jsmentch	499968	1099511127808
+data2/pool/junlaw	/data2/pool/003/junlaw	499968	1099511127808
+data2/pool/junxian	/data2/pool/003/junxian	499968	1099511127808
+data2/pool/junxiliu	/data2/pool/003/junxiliu	499968	1099511127808
+data2/pool/jvineet9	/data2/pool/003/jvineet9	499968	1099511127808
+data2/pool/kaitlint	/data2/pool/003/kaitlint	499968	1099511127808
+data2/pool/kakura	/data2/pool/003/kakura	499968	1099511127808
+data2/pool/katiegal_shared	/data2/pool/003/katiegal_shared	4892808804480	604749334400
+data2/pool/kaygisiz	/data2/pool/003/kaygisiz	121242299520	978269328256
+data2/pool/kcdwyer	/data2/pool/003/kcdwyer	499968	1099511127808
+data2/pool/kchen1	/data2/pool/003/kchen1	499968	1099511127808
+data2/pool/kchen88	/data2/pool/003/kchen88	499968	1099511127808
+data2/pool/kellh219	/data2/pool/003/kellh219	499968	1099511127808
+data2/pool/kevinlor	/data2/pool/003/kevinlor	499968	1099511127808
+data2/pool/kez	/data2/pool/003/kez	499968	1099511127808
+data2/pool/kharazmi	/data2/pool/003/kharazmi	1066938687744	32572940032
+data2/pool/khizer	/data2/pool/003/khizer	499968	1099511127808
+data2/pool/khoh	/data2/pool/003/khoh	499968	1099511127808
+data2/pool/kimjd	/data2/pool/003/kimjd	499968	1099511127808
+data2/pool/kirilb	/data2/pool/003/kirilb	900013919232	199497708544
+data2/pool/kitzmann	/data2/pool/003/kitzmann	499968	1099511127808
+data2/pool/kmcclenn	/data2/pool/003/kmcclenn	690504150144	409007477632
+data2/pool/knathan	/data2/pool/003/knathan	499968	1099511127808
+data2/pool/kodittr	/data2/pool/003/kodittr	499968	1099511127808
+data2/pool/kokomoor	/data2/pool/003/kokomoor	499968	1099511127808
+data2/pool/kopan	/data2/pool/003/kopan	58900992	1099452726784
+data2/pool/krxu	/data2/pool/003/krxu	499968	1099511127808
+data2/pool/kvira	/data2/pool/003/kvira	499968	1099511127808
+data2/pool/kyujin22	/data2/pool/003/kyujin22	499968	1099511127808
+data2/pool/kyzhao	/data2/pool/003/kyzhao	499968	1099511127808
+data2/pool/lancelot	/data2/pool/003/lancelot	499968	1099511127808
+data2/pool/laub_shared	/data2/pool/003/laub_shared	499968	5497557638912
+data2/pool/lbreitha	/data2/pool/003/lbreitha	499968	1099511127808
+data2/pool/lee_d	/data2/pool/003/lee_d	499968	1099511127808
+data2/pool/leverest	/data2/pool/003/leverest	103604178432	995907449344
+data2/pool/lgardner	/data2/pool/003/lgardner	559488	1099511068288
+data2/pool/liangy	/data2/pool/003/liangy	499968	1099511127808
+data2/pool/lichenz	/data2/pool/003/lichenz	499968	1099511127808
+data2/pool/lidao	/data2/pool/003/lidao	499968	1099511127808
+data2/pool/liuyz	/data2/pool/003/liuyz	26277830016	1073233797760
+data2/pool/lpbrock	/data2/pool/003/lpbrock	499968	1099511127808
+data2/pool/lpmoser	/data2/pool/003/lpmoser	499968	1099511127808
+data2/pool/lquan	/data2/pool/003/lquan	499968	1099511127808
+data2/pool/lraymond	/data2/pool/003/lraymond	712392034944	387119592832
+data2/pool/lucas_b	/data2/pool/003/lucas_b	499968	1099511127808
+data2/pool/luccote	/data2/pool/003/luccote	184758067584	914753560192
+data2/pool/lucg	/data2/pool/003/lucg	499968	1099511127808
+data2/pool/lur	/data2/pool/003/lur	499968	1099511127808
+data2/pool/lyons66	/data2/pool/003/lyons66	606291432960	493220194816
+data2/pool/manets12	/data2/pool/003/manets12	499968	1099511127808
+data2/pool/manvitha	/data2/pool/003/manvitha	499968	1099511127808
+data2/pool/mapleint	/data2/pool/003/mapleint	499968	1099511127808
+data2/pool/maru	/data2/pool/003/maru	499968	1099511127808
+data2/pool/mathis00	/data2/pool/003/mathis00	499968	1099511127808
+data2/pool/matt5320	/data2/pool/003/matt5320	499968	1099511127808
+data2/pool/matveyev_shared	/data2/pool/003/matveyev_shared	897873603840	4599684535040
+data2/pool/maurais	/data2/pool/003/maurais	615062562048	484449065728
+data2/pool/mcharara	/data2/pool/003/mcharara	499968	1099511127808
+data2/pool/mcneilly	/data2/pool/003/mcneilly	499968	1099511127808
+data2/pool/megantj	/data2/pool/003/megantj	15897542016	1083614085760
+data2/pool/meganwei	/data2/pool/003/meganwei	499968	1099511127808
+data2/pool/meixuanw	/data2/pool/003/meixuanw	499968	1099511127808
+data2/pool/meral	/data2/pool/003/meral	499968	1099511127808
+data2/pool/mgaynor	/data2/pool/003/mgaynor	499968	1099511127808
+data2/pool/mglasgow	/data2/pool/003/mglasgow	499968	1099511127808
+data2/pool/michmo	/data2/pool/003/michmo	499968	1099511127808
+data2/pool/mihok485	/data2/pool/003/mihok485	263649768192	835861859584
+data2/pool/milessmi	/data2/pool/003/milessmi	499968	1099511127808
+data2/pool/mingda_shared	/data2/pool/003/mingda_shared	984615552	5496573523328
+data2/pool/miramay	/data2/pool/003/miramay	200228232192	899283395584
+data2/pool/mlahogue	/data2/pool/003/mlahogue	499968	1099511127808
+data2/pool/mleroy	/data2/pool/003/mleroy	499968	1099511127808
+data2/pool/mmdesai	/data2/pool/003/mmdesai	499968	1099511127808
+data2/pool/mnmassri	/data2/pool/003/mnmassri	499968	1099511127808
+data2/pool/mohuadas	/data2/pool/003/mohuadas	49881045504	1049630582272
+data2/pool/moreka	/data2/pool/003/moreka	121718400	1099389909376
+data2/pool/mp2020	/data2/pool/003/mp2020	1017656508672	81855119104
+data2/pool/mphill	/data2/pool/003/mphill	499968	1099511127808
+data2/pool/mrkraus	/data2/pool/003/mrkraus	712930560	1098798697216
+data2/pool/mshaqfa	/data2/pool/003/mshaqfa	499968	1099511127808
+data2/pool/mvera	/data2/pool/003/mvera	499968	1099511127808
+data2/pool/mwilkin	/data2/pool/003/mwilkin	499968	1099511127808
+data2/pool/mzwang	/data2/pool/003/mzwang	107899284480	991612343296
+data2/pool/naj20	/data2/pool/003/naj20	499968	1099511127808
+data2/pool/nathra	/data2/pool/003/nathra	92563087488	1006948540288
+data2/pool/ndovroli	/data2/pool/003/ndovroli	341360984832	758150642944
+data2/pool/nemm	/data2/pool/003/nemm	499968	1099511127808
+data2/pool/neputzi	/data2/pool/003/neputzi	499968	1099511127808
+data2/pool/nevint	/data2/pool/003/nevint	499968	1099511127808
+data2/pool/nfrey	/data2/pool/003/nfrey	262732219776	836779408000
+data2/pool/ngreeley	/data2/pool/003/ngreeley	499968	1099511127808
+data2/pool/nicwjh	/data2/pool/003/nicwjh	499968	1099511127808
+data2/pool/nityab	/data2/pool/003/nityab	499968	1099511127808
+data2/pool/nkk	/data2/pool/003/nkk	499968	1099511127808
+data2/pool/nliu04	/data2/pool/003/nliu04	499968	1099511127808
+data2/pool/nnelsen	/data2/pool/003/nnelsen	499968	1099511127808
+data2/pool/nsomers	/data2/pool/003/nsomers	780707079168	318804548608
+data2/pool/nye	/data2/pool/003/nye	499968	1099511127808
+data2/pool/nyoh	/data2/pool/003/nyoh	499968	1099511127808
+data2/pool/ojoshi	/data2/pool/003/ojoshi	499968	1099511127808
+data2/pool/olivrw	/data2/pool/003/olivrw	499968	1099511127808
+data2/pool/opitcho	/data2/pool/003/opitcho	499968	1099511127808
+data2/pool/osahon	/data2/pool/003/osahon	499968	1099511127808
+data2/pool/pablorf	/data2/pool/003/pablorf	784917488256	314594139520
+data2/pool/pablorf_shared	/data2/pool/003/pablorf_shared	4335760053120	1161798085760
+data2/pool/pallavib	/data2/pool/003/pallavib	917240078592	182271549184
+data2/pool/passey01	/data2/pool/003/passey01	499968	1099511127808
+data2/pool/patomaki	/data2/pool/003/patomaki	499968	1099511127808
+data2/pool/peiyuxu	/data2/pool/003/peiyuxu	499968	1099511127808
+data2/pool/pfox	/data2/pool/003/pfox	499968	1099511127808
+data2/pool/phend13	/data2/pool/003/phend13	93836577408	1005675050368
+data2/pool/pibou149	/data2/pool/003/pibou149	499968	1099511127808
+data2/pool/pinter	/data2/pool/003/pinter	499968	1099511127808
+data2/pool/pisinger	/data2/pool/003/pisinger	523776	1099511104000
+data2/pool/plopez	/data2/pool/003/plopez	945990440832	153521186944
+data2/pool/pmtneuro	/data2/pool/003/pmtneuro	499968	1099511127808
+data2/pool/ppapa	/data2/pool/003/ppapa	359488896	1099152138880
+data2/pool/prav3	/data2/pool/003/prav3	499968	1099511127808
+data2/pool/promptkp	/data2/pool/003/promptkp	499968	1099511127808
+data2/pool/pryal	/data2/pool/003/pryal	499968	1099511127808
+data2/pool/qianyu_z	/data2/pool/003/qianyu_z	884138816256	215372811520
+data2/pool/qua	/data2/pool/003/qua	499968	1099511127808
+data2/pool/raffaele	/data2/pool/003/raffaele	499968	1099511127808
+data2/pool/rbarea	/data2/pool/003/rbarea	499968	1099511127808
+data2/pool/reggo	/data2/pool/003/reggo	36119212032	1063392415744
+data2/pool/reimer_shared	/data2/pool/003/reimer_shared	72412032	5497485726848
+data2/pool/rhshen	/data2/pool/003/rhshen	160453932672	939057695104
+data2/pool/rhurt	/data2/pool/003/rhurt	499968	1099511127808
+data2/pool/rianc	/data2/pool/003/rianc	499968	1099511127808
+data2/pool/rizzoj	/data2/pool/003/rizzoj	499968	1099511127808
+data2/pool/rkuba	/data2/pool/003/rkuba	499968	1099511127808
+data2/pool/rlwang	/data2/pool/003/rlwang	499968	1099511127808
+data2/pool/rmcconke	/data2/pool/003/rmcconke	499968	1099511127808
+data2/pool/rohs	/data2/pool/003/rohs	1056546924288	42964703488
+data2/pool/rothma	/data2/pool/003/rothma	499968	1099511127808
+data2/pool/ruixiaox	/data2/pool/003/ruixiaox	499968	1099511127808
+data2/pool/rzhuang	/data2/pool/003/rzhuang	499968	1099511127808
+data2/pool/sahughes	/data2/pool/003/sahughes	188264366976	911247260800
+data2/pool/sampeng_shared	/data2/pool/003/sampeng_shared	524100395904	4973457742976
+data2/pool/sathyae	/data2/pool/003/sathyae	679624846464	419886781312
+data2/pool/sco	/data2/pool/003/sco	499968	1099511127808
+data2/pool/sduggal	/data2/pool/003/sduggal	499968	1099511127808
+data2/pool/seijieng	/data2/pool/003/seijieng	1099725410688	109737379865
+data2/pool/setliu22	/data2/pool/003/setliu22	499968	1099511127808
+data2/pool/sgbruce	/data2/pool/003/sgbruce	499968	1099511127808
+data2/pool/shahineb	/data2/pool/003/shahineb	499968	1099511127808
+data2/pool/shan2312	/data2/pool/003/shan2312	499968	1099511127808
+data2/pool/shenwang	/data2/pool/003/shenwang	499968	1099511127808
+data2/pool/shorterm	/data2/pool/003/shorterm	499968	1099511127808
+data2/pool/sizheli	/data2/pool/003/sizheli	825085905408	274425722368
+data2/pool/sjr	/data2/pool/003/sjr	499968	1099511127808
+data2/pool/skrem	/data2/pool/003/skrem	499968	1099511127808
+data2/pool/slhughes	/data2/pool/003/slhughes	499968	1099511127808
+data2/pool/sloomba	/data2/pool/003/sloomba	499968	1099511127808
+data2/pool/smish	/data2/pool/003/smish	499968	1099511127808
+data2/pool/soonhyun	/data2/pool/003/soonhyun	499968	1099511127808
+data2/pool/sophscag	/data2/pool/003/sophscag	499968	1099511127808
+data2/pool/soukayna	/data2/pool/003/soukayna	897112307328	202399320448
+data2/pool/sparsh	/data2/pool/003/sparsh	499968	1099511127808
+data2/pool/sreejat	/data2/pool/003/sreejat	499968	1099511127808
+data2/pool/srini01	/data2/pool/003/srini01	499968	1099511127808
+data2/pool/sritterb	/data2/pool/003/sritterb	499968	1099511127808
+data2/pool/srm_shared	/data2/pool/003/srm_shared	499968	5497557638912
+data2/pool/starkman	/data2/pool/003/starkman	1242789504	1098268838272
+data2/pool/steven30	/data2/pool/003/steven30	499968	1099511127808
+data2/pool/stevensh	/data2/pool/003/stevensh	499968	1099511127808
+data2/pool/stulchin	/data2/pool/003/stulchin	499968	1099511127808
+data2/pool/sumit99	/data2/pool/003/sumit99	499968	1099511127808
+data2/pool/sunhyoo	/data2/pool/003/sunhyoo	499968	1099511127808
+data2/pool/sunx528	/data2/pool/003/sunx528	499968	1099511127808
+data2/pool/sunx_shared	/data2/pool/003/sunx_shared	288311296896	5209246841984
+data2/pool/svtaylor	/data2/pool/003/svtaylor	499968	1099511127808
+data2/pool/swatir	/data2/pool/003/swatir	499968	1099511127808
+data2/pool/sxp820	/data2/pool/003/sxp820	499968	1099511127808
+data2/pool/sylziyuz	/data2/pool/003/sylziyuz	499968	1099511127808
+data2/pool/szantou	/data2/pool/003/szantou	499968	1099511127808
+data2/pool/szhang11	/data2/pool/003/szhang11	499968	1099511127808
+data2/pool/ta_nikol	/data2/pool/003/ta_nikol	929756860800	169754766976
+data2/pool/tagem	/data2/pool/003/tagem	75701916672	1023809711104
+data2/pool/tanm678	/data2/pool/003/tanm678	499968	1099511127808
+data2/pool/tdaillak	/data2/pool/003/tdaillak	499968	1099511127808
+data2/pool/temills	/data2/pool/003/temills	499968	1099511127808
+data2/pool/thavishi	/data2/pool/003/thavishi	499968	1099511127808
+data2/pool/thibsoub	/data2/pool/003/thibsoub	65460560256	1034051067520
+data2/pool/thoma98	/data2/pool/003/thoma98	499968	1099511127808
+data2/pool/timneum1	/data2/pool/003/timneum1	499968	1099511127808
+data2/pool/tobioni_shared	/data2/pool/003/tobioni_shared	499968	5497557638912
+data2/pool/tongwu97	/data2/pool/003/tongwu97	499968	1099511127808
+data2/pool/trancik_shared	/data2/pool/003/trancik_shared	16782366336	5480775772544
+data2/pool/trudyenc	/data2/pool/003/trudyenc	499968	1099511127808
+data2/pool/tslatyer	/data2/pool/003/tslatyer	499968	1099511127808
+data2/pool/tsliu	/data2/pool/003/tsliu	499968	1099511127808
+data2/pool/twilks	/data2/pool/003/twilks	499968	1099511127808
+data2/pool/tyoshino	/data2/pool/003/tyoshino	499968	1099511127808
+data2/pool/tzegoh	/data2/pool/003/tzegoh	681891653760	417619974016
+data2/pool/vaddala9	/data2/pool/003/vaddala9	499968	1099511127808
+data2/pool/varun123	/data2/pool/003/varun123	499968	1099511127808
+data2/pool/vaxmanf	/data2/pool/003/vaxmanf	499968	1099511127808
+data2/pool/vicfaith	/data2/pool/003/vicfaith	499968	1099511127808
+data2/pool/viviansg	/data2/pool/003/viviansg	583296	4398045927808
+data2/pool/vm8	/data2/pool/003/vm8	1099525292544	109937498009
+data2/pool/vpatel12	/data2/pool/003/vpatel12	798258432	1098713369344
+data2/pool/vranjan	/data2/pool/003/vranjan	499968	1099511127808
+data2/pool/wadel642	/data2/pool/003/wadel642	499968	1099511127808
+data2/pool/whamitch	/data2/pool/003/whamitch	992889998592	106621629184
+data2/pool/wuhg5330	/data2/pool/003/wuhg5330	205225281408	894286346368
+data2/pool/wyf	/data2/pool/003/wyf	430988022144	668523605632
+data2/pool/xbtmkmmm	/data2/pool/003/xbtmkmmm	499968	1099511127808
+data2/pool/xdelabru	/data2/pool/003/xdelabru	499968	1099511127808
+data2/pool/xgong75	/data2/pool/003/xgong75	499968	1099511127808
+data2/pool/xumei	/data2/pool/003/xumei	499968	1099511127808
+data2/pool/yael_cg	/data2/pool/003/yael_cg	499968	1099511127808
+data2/pool/yanac	/data2/pool/003/yanac	499968	1099511127808
+data2/pool/yangsj	/data2/pool/003/yangsj	499968	1099511127808
+data2/pool/yifanyin	/data2/pool/003/yifanyin	499968	1099511127808
+data2/pool/yilup666	/data2/pool/003/yilup666	499968	1099511127808
+data2/pool/yishika2	/data2/pool/003/yishika2	77306861568	1022204766208
+data2/pool/yongheng	/data2/pool/003/yongheng	499968	1099511127808
+data2/pool/yonglo	/data2/pool/003/yonglo	103092865920	996418761856
+data2/pool/yosebiba	/data2/pool/003/yosebiba	511182817920	588328809856
+data2/pool/ypol	/data2/pool/003/ypol	499968	1099511127808
+data2/pool/yshen99	/data2/pool/003/yshen99	596438361216	503073266560
+data2/pool/yu_xie	/data2/pool/003/yu_xie	499968	1099511127808
+data2/pool/yu_zheng	/data2/pool/003/yu_zheng	518268852480	581242775296
+data2/pool/yuanxun	/data2/pool/003/yuanxun	499968	1099511127808
+data2/pool/yuechuan	/data2/pool/003/yuechuan	1099935313920	109527476633
+data2/pool/yumzhang	/data2/pool/003/yumzhang	1041064617600	58447010176
+data2/pool/zabreyko	/data2/pool/003/zabreyko	499968	1099511127808
+data2/pool/zachw23	/data2/pool/003/zachw23	499968	1099511127808
+data2/pool/zappi	/data2/pool/003/zappi	6909105408	1092602522368
+data2/pool/zhh24	/data2/pool/003/zhh24	499968	1099511127808
+data2/pool/zhiye	/data2/pool/003/zhiye	499968	1099511127808
+data2/pool/zhuoranw	/data2/pool/003/zhuoranw	499968	1099511127808
+data2/pool/zieglerc	/data2/pool/003/zieglerc	626669712000	472841915776
+data2/pool/zitongc	/data2/pool/003/zitongc	499968	1099511127808
+data2/pool/zituo	/data2/pool/003/zituo	1002175487616	97336140160
+data2/pool/zixiaowa	/data2/pool/003/zixiaowa	499968	1099511127808
+data2/pool/zk27	/data2/pool/003/zk27	1100109124224	109353666329
+data2/pool/zniu	/data2/pool/003/zniu	580159581696	519352046080
+data2/pool/zwest	/data2/pool/003/zwest	499968	1099511127808
+data2/stephdut	/data2/group/stephdut/001	13418636033280	96532526744320
+##inodes
+Filesystem                       Inodes    IUsed        IFree IUse% Mounted on
+/dev/md0                      100661760   206283    100455477    1% /
+/dev/sdg1                             0        0            0     - /boot/efi
+data2                       29729390419       17  29729390402    1% /data2
+data2/abodner               69609150007 18077051  69591072956    1% /data2/group/abodner/003
+data2/fisherp               42229517736     1111  42229516625    1% /data2/group/fisherp/001
+data2/orcd                 214748363037       28 214748363009    1% /data2/group/orcd/012
+data2/stephdut             188550217955 10126658 188540091297    1% /data2/group/stephdut/001
+data2/pool                 286095792432      440 286095791992    1% /data2/pool/003
+data2/pool/aac9              2147482678        7   2147482671    1% /data2/pool/003/aac9
+data2/pool/aaron_g           2147482539        7   2147482532    1% /data2/pool/003/aaron_g
+data2/pool/abaraban           636616692     3418    636613274    1% /data2/pool/003/abaraban
+data2/pool/abdnegm           2147482678        7   2147482671    1% /data2/pool/003/abdnegm
+data2/pool/abimek            2147482678        7   2147482671    1% /data2/pool/003/abimek
+data2/pool/abiyer            2147482678        7   2147482671    1% /data2/pool/003/abiyer
+data2/pool/abobu             2147482678        7   2147482671    1% /data2/pool/003/abobu
+data2/pool/abrenner          2116625014      743   2116624271    1% /data2/pool/003/abrenner
+data2/pool/acliang           2147482678        7   2147482671    1% /data2/pool/003/acliang
+data2/pool/acyjiang          2147482678        7   2147482671    1% /data2/pool/003/acyjiang
+data2/pool/adamsell          2147482678        7   2147482671    1% /data2/pool/003/adamsell
+data2/pool/adithyab          2147482678        7   2147482671    1% /data2/pool/003/adithyab
+data2/pool/adityaks          2147482678        7   2147482671    1% /data2/pool/003/adityaks
+data2/pool/adorfeui          2147482678        7   2147482671    1% /data2/pool/003/adorfeui
+data2/pool/advaith5          2147482678        7   2147482671    1% /data2/pool/003/advaith5
+data2/pool/advarma           2147482678        7   2147482671    1% /data2/pool/003/advarma
+data2/pool/aecohen           1830292087    49063   1830243024    1% /data2/pool/003/aecohen
+data2/pool/aewj              2147482678        7   2147482671    1% /data2/pool/003/aewj
+data2/pool/afath             2147482678        7   2147482671    1% /data2/pool/003/afath
+data2/pool/aglidden          1982857668    89994   1982767674    1% /data2/pool/003/aglidden
+data2/pool/aimoli            1697524219   293957   1697230262    1% /data2/pool/003/aimoli
+data2/pool/aipetrov           425067030    46333    425020697    1% /data2/pool/003/aipetrov
+data2/pool/akap              2147482678        7   2147482671    1% /data2/pool/003/akap
+data2/pool/akhilar           1218818385   215901   1218602484    1% /data2/pool/003/akhilar
+data2/pool/akht              2147482678        7   2147482671    1% /data2/pool/003/akht
+data2/pool/akiruga           2147482678        7   2147482671    1% /data2/pool/003/akiruga
+data2/pool/akshayd2          2147482678        7   2147482671    1% /data2/pool/003/akshayd2
+data2/pool/aladera           2147482678        7   2147482671    1% /data2/pool/003/aladera
+data2/pool/alegro29          2147482678        7   2147482671    1% /data2/pool/003/alegro29
+data2/pool/alexhu            2147482449       10   2147482439    1% /data2/pool/003/alexhu
+data2/pool/allikeys          2147482678        7   2147482671    1% /data2/pool/003/allikeys
+data2/pool/alphapha          2147482678        7   2147482671    1% /data2/pool/003/alphapha
+data2/pool/ament             2147482678        7   2147482671    1% /data2/pool/003/ament
+data2/pool/amgoel            2147482678        7   2147482671    1% /data2/pool/003/amgoel
+data2/pool/amitjain          1846088161   522480   1845565681    1% /data2/pool/003/amitjain
+data2/pool/amoranka          1081135653    12953   1081122700    1% /data2/pool/003/amoranka
+data2/pool/anaemeje          2147482678        7   2147482671    1% /data2/pool/003/anaemeje
+data2/pool/andraye           2147482678        7   2147482671    1% /data2/pool/003/andraye
+data2/pool/ansanto           2147482678        7   2147482671    1% /data2/pool/003/ansanto
+data2/pool/ansh2192          2147482678        7   2147482671    1% /data2/pool/003/ansh2192
+data2/pool/anusinha          2147482678        7   2147482671    1% /data2/pool/003/anusinha
+data2/pool/arbri             1694961434     3394   1694958040    1% /data2/pool/003/arbri
+data2/pool/aridavy           2147482678        7   2147482671    1% /data2/pool/003/aridavy
+data2/pool/arily             2147482678        7   2147482671    1% /data2/pool/003/arily
+data2/pool/aringel           2147482678        7   2147482671    1% /data2/pool/003/aringel
+data2/pool/arupk156          2147482678        7   2147482671    1% /data2/pool/003/arupk156
+data2/pool/aryanz            2147482678        7   2147482671    1% /data2/pool/003/aryanz
+data2/pool/ashia07_shared   10389240813    71675  10389169138    1% /data2/pool/003/ashia07_shared
+data2/pool/asiehg            2147471035      152   2147470883    1% /data2/pool/003/asiehg
+data2/pool/asosag01          2147482678        7   2147482671    1% /data2/pool/003/asosag01
+data2/pool/audreysa          1620305725   893678   1619412047    1% /data2/pool/003/audreysa
+data2/pool/avasqu42          2147482678        7   2147482671    1% /data2/pool/003/avasqu42
+data2/pool/avmatute          2147482678        7   2147482671    1% /data2/pool/003/avmatute
+data2/pool/axelt671          2147482678        7   2147482671    1% /data2/pool/003/axelt671
+data2/pool/ayan_k            1261314343     1679   1261312664    1% /data2/pool/003/ayan_k
+data2/pool/aymelgad          1785923451   614051   1785309400    1% /data2/pool/003/aymelgad
+data2/pool/ayuz              2147482678        7   2147482671    1% /data2/pool/003/ayuz
+data2/pool/ayz26             2147482678        7   2147482671    1% /data2/pool/003/ayz26
+data2/pool/azhang05          2147482678        7   2147482671    1% /data2/pool/003/azhang05
+data2/pool/baesuj            2147482678        7   2147482671    1% /data2/pool/003/baesuj
+data2/pool/balbasty          2147482678        7   2147482671    1% /data2/pool/003/balbasty
+data2/pool/ben25             2147482678        7   2147482671    1% /data2/pool/003/ben25
+data2/pool/bjork             2147482678        7   2147482671    1% /data2/pool/003/bjork
+data2/pool/blash             2147482678        7   2147482671    1% /data2/pool/003/blash
+data2/pool/blp_shared       10737417270        7  10737417263    1% /data2/pool/003/blp_shared
+data2/pool/boguraev          2147482678        7   2147482671    1% /data2/pool/003/boguraev
+data2/pool/boucenec          2147482678        7   2147482671    1% /data2/pool/003/boucenec
+data2/pool/bowen27           2147482678        7   2147482671    1% /data2/pool/003/bowen27
+data2/pool/bowenyu           2147482678        7   2147482671    1% /data2/pool/003/bowenyu
+data2/pool/brade             2147482678        7   2147482671    1% /data2/pool/003/brade
+data2/pool/brunm             2147482678        7   2147482671    1% /data2/pool/003/brunm
+data2/pool/bshaer            2147482678        7   2147482671    1% /data2/pool/003/bshaer
+data2/pool/camcat             357912599     5283    357907316    1% /data2/pool/003/camcat
+data2/pool/carlo_sg          2066091476    22609   2066068867    1% /data2/pool/003/carlo_sg
+data2/pool/cassidyj          2147482678        7   2147482671    1% /data2/pool/003/cassidyj
+data2/pool/cdunn314          2147482678        7   2147482671    1% /data2/pool/003/cdunn314
+data2/pool/cekbote           2147482678        7   2147482671    1% /data2/pool/003/cekbote
+data2/pool/cgt20_shared     10737417270        7  10737417263    1% /data2/pool/003/cgt20_shared
+data2/pool/charliew          2073669630    20821   2073648809    1% /data2/pool/003/charliew
+data2/pool/chcho             2147482678        7   2147482671    1% /data2/pool/003/chcho
+data2/pool/choja             2147482678        7   2147482671    1% /data2/pool/003/choja
+data2/pool/chris302          2147482678        7   2147482671    1% /data2/pool/003/chris302
+data2/pool/cjohnsto          2144948456      500   2144947956    1% /data2/pool/003/cjohnsto
+data2/pool/ckf               2147482678        7   2147482671    1% /data2/pool/003/ckf
+data2/pool/clarenz           2147482678        7   2147482671    1% /data2/pool/003/clarenz
+data2/pool/colb14            2147482678        7   2147482671    1% /data2/pool/003/colb14
+data2/pool/corsaro             30771572   120677     30650895    1% /data2/pool/003/corsaro
+data2/pool/craabreu          2147482678        7   2147482671    1% /data2/pool/003/craabreu
+data2/pool/cthrash           2147482678        7   2147482671    1% /data2/pool/003/cthrash
+data2/pool/cysung            2147482678        7   2147482671    1% /data2/pool/003/cysung
+data2/pool/dahlt781          2147482678        7   2147482671    1% /data2/pool/003/dahlt781
+data2/pool/daisong           2147482678        7   2147482671    1% /data2/pool/003/daisong
+data2/pool/dasabir           2147482678        7   2147482671    1% /data2/pool/003/dasabir
+data2/pool/dbaek             2147482678        7   2147482671    1% /data2/pool/003/dbaek
+data2/pool/dbertsim_shared   6327133412   160402   6326973010    1% /data2/pool/003/dbertsim_shared
+data2/pool/dbyun             2147481918       14   2147481904    1% /data2/pool/003/dbyun
+data2/pool/ddl               2147482678        7   2147482671    1% /data2/pool/003/ddl
+data2/pool/debocka           2147482678        7   2147482671    1% /data2/pool/003/debocka
+data2/pool/devar_ag          2147482678        7   2147482671    1% /data2/pool/003/devar_ag
+data2/pool/dewei             1698633560    20039   1698613521    1% /data2/pool/003/dewei
+data2/pool/dgander_shared    8274060558   236336   8273824222    1% /data2/pool/003/dgander_shared
+data2/pool/dikang             303154107    33881    303120226    1% /data2/pool/003/dikang
+data2/pool/djarecka          2147482678        7   2147482671    1% /data2/pool/003/djarecka
+data2/pool/djeff             2147482678        7   2147482671    1% /data2/pool/003/djeff
+data2/pool/dka               1082586889   318638   1082268251    1% /data2/pool/003/dka
+data2/pool/dkorsun           2147482678        7   2147482671    1% /data2/pool/003/dkorsun
+data2/pool/dliveoak          1025842313   605103   1025237210    1% /data2/pool/003/dliveoak
+data2/pool/dmin              2147482678        7   2147482671    1% /data2/pool/003/dmin
+data2/pool/dmondal           2147482678        7   2147482671    1% /data2/pool/003/dmondal
+data2/pool/donti             2147482678        7   2147482671    1% /data2/pool/003/donti
+data2/pool/drap              2147482678        7   2147482671    1% /data2/pool/003/drap
+data2/pool/duoxu             8589933622        7   8589933615    1% /data2/pool/003/duoxu
+data2/pool/dzhang17           504868812  5158258    499710554    2% /data2/pool/003/dzhang17
+data2/pool/eflor             1365294316   206602   1365087714    1% /data2/pool/003/eflor
+data2/pool/ehmann            2147482678        7   2147482671    1% /data2/pool/003/ehmann
+data2/pool/ehz               2147482678        7   2147482671    1% /data2/pool/003/ehz
+data2/pool/eirka289          1562976228    22504   1562953724    1% /data2/pool/003/eirka289
+data2/pool/ejiang            2147482678        7   2147482671    1% /data2/pool/003/ejiang
+data2/pool/elro13            1040718794     2874   1040715920    1% /data2/pool/003/elro13
+data2/pool/emailhot          2147482678        7   2147482671    1% /data2/pool/003/emailhot
+data2/pool/emily424          2147482678        7   2147482671    1% /data2/pool/003/emily424
+data2/pool/empogue           2147482678        7   2147482671    1% /data2/pool/003/empogue
+data2/pool/enyala            2147482678        7   2147482671    1% /data2/pool/003/enyala
+data2/pool/eozen             2147482678        7   2147482671    1% /data2/pool/003/eozen
+data2/pool/equ               2068041598   762871   2067278727    1% /data2/pool/003/equ
+data2/pool/erbmi1            2147482678        7   2147482671    1% /data2/pool/003/erbmi1
+data2/pool/esebast           1357705585     5303   1357700282    1% /data2/pool/003/esebast
+data2/pool/estebanf          2147482678        7   2147482671    1% /data2/pool/003/estebanf
+data2/pool/estockin          2147482678        7   2147482671    1% /data2/pool/003/estockin
+data2/pool/estratak          2147482678        7   2147482671    1% /data2/pool/003/estratak
+data2/pool/etienne7          2147482678        7   2147482671    1% /data2/pool/003/etienne7
+data2/pool/fidan10           2147482678        7   2147482671    1% /data2/pool/003/fidan10
+data2/pool/fisherp            907224147    17329    907206818    1% /data2/pool/003/fisherp
+data2/pool/floresh2          1281630891   154711   1281476180    1% /data2/pool/003/floresh2
+data2/pool/fosterb            666887845  1864001    665023844    1% /data2/pool/003/fosterb
+data2/pool/fosterm           2116744188       16   2116744172    1% /data2/pool/003/fosterm
+data2/pool/froit             2147482678        7   2147482671    1% /data2/pool/003/froit
+data2/pool/fshan1            2147482678        7   2147482671    1% /data2/pool/003/fshan1
+data2/pool/ftmljfr           2147482678        7   2147482671    1% /data2/pool/003/ftmljfr
+data2/pool/gckleung          1845690506   595196   1845095310    1% /data2/pool/003/gckleung
+data2/pool/gfanson           2030394402    64900   2030329502    1% /data2/pool/003/gfanson
+data2/pool/ggliu             2147482678        7   2147482671    1% /data2/pool/003/ggliu
+data2/pool/ghadi             2147482678        7   2147482671    1% /data2/pool/003/ghadi
+data2/pool/gilliard_shared   6533131948   143710   6532988238    1% /data2/pool/003/gilliard_shared
+data2/pool/gleason3          2147482678        7   2147482671    1% /data2/pool/003/gleason3
+data2/pool/gokulg            2127225735     1463   2127224272    1% /data2/pool/003/gokulg
+data2/pool/goldag            2147482678        7   2147482671    1% /data2/pool/003/goldag
+data2/pool/grantr            1368623006    58789   1368564217    1% /data2/pool/003/grantr
+data2/pool/gstine            2147482678        7   2147482671    1% /data2/pool/003/gstine
+data2/pool/gterrone          2147482678        7   2147482671    1% /data2/pool/003/gterrone
+data2/pool/guna23             509431055   101301    509329754    1% /data2/pool/003/guna23
+data2/pool/haleyw            2147482678        7   2147482671    1% /data2/pool/003/haleyw
+data2/pool/hannesal          2147482678        7   2147482671    1% /data2/pool/003/hannesal
+data2/pool/harm0n            2147482678        7   2147482671    1% /data2/pool/003/harm0n
+data2/pool/harryc            2147482678        7   2147482671    1% /data2/pool/003/harryc
+data2/pool/hawkx82           2147482678        7   2147482671    1% /data2/pool/003/hawkx82
+data2/pool/hayel             2147482678        7   2147482671    1% /data2/pool/003/hayel
+data2/pool/hdoosth           2147482678        7   2147482671    1% /data2/pool/003/hdoosth
+data2/pool/hengzhil          1988127138   507282   1987619856    1% /data2/pool/003/hengzhil
+data2/pool/hlei              2147482678        7   2147482671    1% /data2/pool/003/hlei
+data2/pool/hlrich            2147482678        7   2147482671    1% /data2/pool/003/hlrich
+data2/pool/hmni              2147482678        7   2147482671    1% /data2/pool/003/hmni
+data2/pool/hmughal           2147482678        7   2147482671    1% /data2/pool/003/hmughal
+data2/pool/hnaka24           1091726466   214899   1091511567    1% /data2/pool/003/hnaka24
+data2/pool/hoffmanp          1938534957    60881   1938474076    1% /data2/pool/003/hoffmanp
+data2/pool/hs421             2147482678        7   2147482671    1% /data2/pool/003/hs421
+data2/pool/hughhig           2147482678        7   2147482671    1% /data2/pool/003/hughhig
+data2/pool/hyery             2147482678        7   2147482671    1% /data2/pool/003/hyery
+data2/pool/icecream           427086661   130402    426956259    1% /data2/pool/003/icecream
+data2/pool/igorf222           771083860  2574964    768508896    1% /data2/pool/003/igorf222
+data2/pool/imteek            2147482678        7   2147482671    1% /data2/pool/003/imteek
+data2/pool/ituck             2147482678        7   2147482671    1% /data2/pool/003/ituck
+data2/pool/jackking           531280594   102350    531178244    1% /data2/pool/003/jackking
+data2/pool/jaysonli          2078874778     2229   2078872549    1% /data2/pool/003/jaysonli
+data2/pool/jcorream          2147482678        7   2147482671    1% /data2/pool/003/jcorream
+data2/pool/jcstark_shared   10737417270        7  10737417263    1% /data2/pool/003/jcstark_shared
+data2/pool/jelizlee          2147482678        7   2147482671    1% /data2/pool/003/jelizlee
+data2/pool/jennkim           2147482678        7   2147482671    1% /data2/pool/003/jennkim
+data2/pool/jgoot             2147482678        7   2147482671    1% /data2/pool/003/jgoot
+data2/pool/jhday             2147482678        7   2147482671    1% /data2/pool/003/jhday
+data2/pool/jichi             2147482678        7   2147482671    1% /data2/pool/003/jichi
+data2/pool/jimink            1961448742   539997   1960908745    1% /data2/pool/003/jimink
+data2/pool/jingyaow          2147482678        7   2147482671    1% /data2/pool/003/jingyaow
+data2/pool/jjsun2            2147482678        7   2147482671    1% /data2/pool/003/jjsun2
+data2/pool/jleonard          2147482678        7   2147482671    1% /data2/pool/003/jleonard
+data2/pool/jlomelin          2147482678        7   2147482671    1% /data2/pool/003/jlomelin
+data2/pool/jms3              2147482678        7   2147482671    1% /data2/pool/003/jms3
+data2/pool/joepaggi           138294445    26205    138268240    1% /data2/pool/003/joepaggi
+data2/pool/jokorie           2147482678        7   2147482671    1% /data2/pool/003/jokorie
+data2/pool/jordancn          2147482678        7   2147482671    1% /data2/pool/003/jordancn
+data2/pool/jorgem13          2147482678        7   2147482671    1% /data2/pool/003/jorgem13
+data2/pool/jprice7           2147482678        7   2147482671    1% /data2/pool/003/jprice7
+data2/pool/jrein             1512221325     1589   1512219736    1% /data2/pool/003/jrein
+data2/pool/jrpeng            2147482678        7   2147482671    1% /data2/pool/003/jrpeng
+data2/pool/jsmentch          2147482678        7   2147482671    1% /data2/pool/003/jsmentch
+data2/pool/junlaw            2147482678        7   2147482671    1% /data2/pool/003/junlaw
+data2/pool/junxian           2147482678        7   2147482671    1% /data2/pool/003/junxian
+data2/pool/junxiliu          2147482678        7   2147482671    1% /data2/pool/003/junxiliu
+data2/pool/jvineet9          2147482678        7   2147482671    1% /data2/pool/003/jvineet9
+data2/pool/kaitlint          2147482678        7   2147482671    1% /data2/pool/003/kaitlint
+data2/pool/kakura            2147482678        7   2147482671    1% /data2/pool/003/kakura
+data2/pool/katiegal_shared   1182106382   955339   1181151043    1% /data2/pool/003/katiegal_shared
+data2/pool/kaygisiz          1910715472    33191   1910682281    1% /data2/pool/003/kaygisiz
+data2/pool/kcdwyer           2147482678        7   2147482671    1% /data2/pool/003/kcdwyer
+data2/pool/kchen1            2147482678        7   2147482671    1% /data2/pool/003/kchen1
+data2/pool/kchen88           2147482678        7   2147482671    1% /data2/pool/003/kchen88
+data2/pool/kellh219          2147482678        7   2147482671    1% /data2/pool/003/kellh219
+data2/pool/kevinlor          2147482678        7   2147482671    1% /data2/pool/003/kevinlor
+data2/pool/kez               2147482678        7   2147482671    1% /data2/pool/003/kez
+data2/pool/kharazmi            63645014    25991     63619023    1% /data2/pool/003/kharazmi
+data2/pool/khizer            2147482678        7   2147482671    1% /data2/pool/003/khizer
+data2/pool/khoh              2147482678        7   2147482671    1% /data2/pool/003/khoh
+data2/pool/kimjd             2147482678        7   2147482671    1% /data2/pool/003/kimjd
+data2/pool/kirilb             390214211   570249    389643962    1% /data2/pool/003/kirilb
+data2/pool/kitzmann          2147482678        7   2147482671    1% /data2/pool/003/kitzmann
+data2/pool/kmcclenn           799915663  1072934    798842729    1% /data2/pool/003/kmcclenn
+data2/pool/knathan           2147482678        7   2147482671    1% /data2/pool/003/knathan
+data2/pool/kodittr           2147482678        7   2147482671    1% /data2/pool/003/kodittr
+data2/pool/kokomoor          2147482678        7   2147482671    1% /data2/pool/003/kokomoor
+data2/pool/kopan             2147368661       54   2147368607    1% /data2/pool/003/kopan
+data2/pool/krxu              2147482678        7   2147482671    1% /data2/pool/003/krxu
+data2/pool/kvira             2147482678        7   2147482671    1% /data2/pool/003/kvira
+data2/pool/kyujin22          2147482678        7   2147482671    1% /data2/pool/003/kyujin22
+data2/pool/kyzhao            2147482678        7   2147482671    1% /data2/pool/003/kyzhao
+data2/pool/lancelot          2147482678        7   2147482671    1% /data2/pool/003/lancelot
+data2/pool/laub_shared      10737417270        7  10737417263    1% /data2/pool/003/laub_shared
+data2/pool/lbreitha          2147482678        7   2147482671    1% /data2/pool/003/lbreitha
+data2/pool/lee_d             2147482678        7   2147482671    1% /data2/pool/003/lee_d
+data2/pool/leverest          1945149451    17714   1945131737    1% /data2/pool/003/leverest
+data2/pool/lgardner          2147482565       10   2147482555    1% /data2/pool/003/lgardner
+data2/pool/liangy            2147482678        7   2147482671    1% /data2/pool/003/liangy
+data2/pool/lichenz           2147482678        7   2147482671    1% /data2/pool/003/lichenz
+data2/pool/lidao             2147482678        7   2147482671    1% /data2/pool/003/lidao
+data2/pool/liuyz             2096172558    12797   2096159761    1% /data2/pool/003/liuyz
+data2/pool/lpbrock           2147482678        7   2147482671    1% /data2/pool/003/lpbrock
+data2/pool/lpmoser           2147482678        7   2147482671    1% /data2/pool/003/lpmoser
+data2/pool/lquan             2147482678        7   2147482671    1% /data2/pool/003/lquan
+data2/pool/lraymond           756095541     2587    756092954    1% /data2/pool/003/lraymond
+data2/pool/lucas_b           2147482678        7   2147482671    1% /data2/pool/003/lucas_b
+data2/pool/luccote           1786693437    65390   1786628047    1% /data2/pool/003/luccote
+data2/pool/lucg              2147482678        7   2147482671    1% /data2/pool/003/lucg
+data2/pool/lur               2147482678        7   2147482671    1% /data2/pool/003/lur
+data2/pool/lyons66            968619075  5298382    963320693    1% /data2/pool/003/lyons66
+data2/pool/manets12          2147482678        7   2147482671    1% /data2/pool/003/manets12
+data2/pool/manvitha          2147482678        7   2147482671    1% /data2/pool/003/manvitha
+data2/pool/mapleint          2147482678        7   2147482671    1% /data2/pool/003/mapleint
+data2/pool/maru              2147482678        7   2147482671    1% /data2/pool/003/maru
+data2/pool/mathis00          2147482678        7   2147482671    1% /data2/pool/003/mathis00
+data2/pool/matt5320          2147482678        7   2147482671    1% /data2/pool/003/matt5320
+data2/pool/matveyev_shared   9008109719 24350862   8983758857    1% /data2/pool/003/matveyev_shared
+data2/pool/maurais            946199837    10256    946189581    1% /data2/pool/003/maurais
+data2/pool/mcharara          2147482678        7   2147482671    1% /data2/pool/003/mcharara
+data2/pool/mcneilly          2147482678        7   2147482671    1% /data2/pool/003/mcneilly
+data2/pool/megantj           2116433823       62   2116433761    1% /data2/pool/003/megantj
+data2/pool/meganwei          2147482678        7   2147482671    1% /data2/pool/003/meganwei
+data2/pool/meixuanw          2147482678        7   2147482671    1% /data2/pool/003/meixuanw
+data2/pool/meral             2147482678        7   2147482671    1% /data2/pool/003/meral
+data2/pool/mgaynor           2147482678        7   2147482671    1% /data2/pool/003/mgaynor
+data2/pool/mglasgow          2147482678        7   2147482671    1% /data2/pool/003/mglasgow
+data2/pool/michmo            2147482678        7   2147482671    1% /data2/pool/003/michmo
+data2/pool/mihok485          1633493891   951197   1632542694    1% /data2/pool/003/mihok485
+data2/pool/milessmi          2147482678        7   2147482671    1% /data2/pool/003/milessmi
+data2/pool/mingda_shared    10735503651     8489  10735495162    1% /data2/pool/003/mingda_shared
+data2/pool/miramay           1756412921       39   1756412882    1% /data2/pool/003/miramay
+data2/pool/mlahogue          2147482678        7   2147482671    1% /data2/pool/003/mlahogue
+data2/pool/mleroy            2147482678        7   2147482671    1% /data2/pool/003/mleroy
+data2/pool/mmdesai           2147482678        7   2147482671    1% /data2/pool/003/mmdesai
+data2/pool/mnmassri          2147482678        7   2147482671    1% /data2/pool/003/mnmassri
+data2/pool/mohuadas          2050061526     1795   2050059731    1% /data2/pool/003/mohuadas
+data2/pool/moreka            2147250990     5074   2147245916    1% /data2/pool/003/moreka
+data2/pool/mp2020             159915885    42606    159873279    1% /data2/pool/003/mp2020
+data2/pool/mphill            2147482678        7   2147482671    1% /data2/pool/003/mphill
+data2/pool/mrkraus           2146095575     4370   2146091205    1% /data2/pool/003/mrkraus
+data2/pool/mshaqfa           2147482678        7   2147482671    1% /data2/pool/003/mshaqfa
+data2/pool/mvera             2147482678        7   2147482671    1% /data2/pool/003/mvera
+data2/pool/mwilkin           2147482678        7   2147482671    1% /data2/pool/003/mwilkin
+data2/pool/mzwang            1936742968      110   1936742858    1% /data2/pool/003/mzwang
+data2/pool/naj20             2147482678        7   2147482671    1% /data2/pool/003/naj20
+data2/pool/nathra            1966915708   219341   1966696367    1% /data2/pool/003/nathra
+data2/pool/ndovroli          1480854752    91778   1480762974    1% /data2/pool/003/ndovroli
+data2/pool/nemm              2147482678        7   2147482671    1% /data2/pool/003/nemm
+data2/pool/neputzi           2147482678        7   2147482671    1% /data2/pool/003/neputzi
+data2/pool/nevint            2147482678        7   2147482671    1% /data2/pool/003/nevint
+data2/pool/nfrey             1634375502    40721   1634334781    1% /data2/pool/003/nfrey
+data2/pool/ngreeley          2147482678        7   2147482671    1% /data2/pool/003/ngreeley
+data2/pool/nicwjh            2147482678        7   2147482671    1% /data2/pool/003/nicwjh
+data2/pool/nityab            2147482678        7   2147482671    1% /data2/pool/003/nityab
+data2/pool/nkk               2147482678        7   2147482671    1% /data2/pool/003/nkk
+data2/pool/nliu04            2147482678        7   2147482671    1% /data2/pool/003/nliu04
+data2/pool/nnelsen           2147482678        7   2147482671    1% /data2/pool/003/nnelsen
+data2/pool/nsomers            623072955   407821    622665134    1% /data2/pool/003/nsomers
+data2/pool/nye               2147482678        7   2147482671    1% /data2/pool/003/nye
+data2/pool/nyoh              2147482678        7   2147482671    1% /data2/pool/003/nyoh
+data2/pool/ojoshi            2147482678        7   2147482671    1% /data2/pool/003/ojoshi
+data2/pool/olivrw            2147482678        7   2147482671    1% /data2/pool/003/olivrw
+data2/pool/opitcho           2147482678        7   2147482671    1% /data2/pool/003/opitcho
+data2/pool/osahon            2147482678        7   2147482671    1% /data2/pool/003/osahon
+data2/pool/pablorf            616856190  2414512    614441678    1% /data2/pool/003/pablorf
+data2/pool/pablorf_shared    2298780495 29643609   2269136886    2% /data2/pool/003/pablorf_shared
+data2/pool/pallavib           356009563    10444    355999119    1% /data2/pool/003/pallavib
+data2/pool/passey01          2147482678        7   2147482671    1% /data2/pool/003/passey01
+data2/pool/patomaki          2147482678        7   2147482671    1% /data2/pool/003/patomaki
+data2/pool/peiyuxu           2147482678        7   2147482671    1% /data2/pool/003/peiyuxu
+data2/pool/pfox              2147482678        7   2147482671    1% /data2/pool/003/pfox
+data2/pool/phend13           1964218197     9115   1964209082    1% /data2/pool/003/phend13
+data2/pool/pibou149          2147482678        7   2147482671    1% /data2/pool/003/pibou149
+data2/pool/pinter            2147482678        7   2147482671    1% /data2/pool/003/pinter
+data2/pool/pisinger          2147482633        8   2147482625    1% /data2/pool/003/pisinger
+data2/pool/plopez             300427717   581649    299846068    1% /data2/pool/003/plopez
+data2/pool/pmtneuro          2147482678        7   2147482671    1% /data2/pool/003/pmtneuro
+data2/pool/ppapa             2146781566       45   2146781521    1% /data2/pool/003/ppapa
+data2/pool/prav3             2147482678        7   2147482671    1% /data2/pool/003/prav3
+data2/pool/promptkp          2147482678        7   2147482671    1% /data2/pool/003/promptkp
+data2/pool/pryal             2147482678        7   2147482671    1% /data2/pool/003/pryal
+data2/pool/qianyu_z           421714800  1064778    420650022    1% /data2/pool/003/qianyu_z
+data2/pool/qua               2147482678        7   2147482671    1% /data2/pool/003/qua
+data2/pool/raffaele          2147482678        7   2147482671    1% /data2/pool/003/raffaele
+data2/pool/rbarea            2147482678        7   2147482671    1% /data2/pool/003/rbarea
+data2/pool/reggo             2076938584      272   2076938312    1% /data2/pool/003/reggo
+data2/pool/reimer_shared    10737276919      109  10737276810    1% /data2/pool/003/reimer_shared
+data2/pool/rhshen            1834138952    41892   1834097060    1% /data2/pool/003/rhshen
+data2/pool/rhurt             2147482678        7   2147482671    1% /data2/pool/003/rhurt
+data2/pool/rianc             2147482678        7   2147482671    1% /data2/pool/003/rianc
+data2/pool/rizzoj            2147482678        7   2147482671    1% /data2/pool/003/rizzoj
+data2/pool/rkuba             2147482678        7   2147482671    1% /data2/pool/003/rkuba
+data2/pool/rlwang            2147482678        7   2147482671    1% /data2/pool/003/rlwang
+data2/pool/rmcconke          2147482678        7   2147482671    1% /data2/pool/003/rmcconke
+data2/pool/rohs                84381570   466134     83915436    1% /data2/pool/003/rohs
+data2/pool/rothma            2147482678        7   2147482671    1% /data2/pool/003/rothma
+data2/pool/ruixiaox          2147482678        7   2147482671    1% /data2/pool/003/ruixiaox
+data2/pool/rzhuang           2147482678        7   2147482671    1% /data2/pool/003/rzhuang
+data2/pool/sahughes          1779857493    77687   1779779806    1% /data2/pool/003/sahughes
+data2/pool/sampeng_shared    9713807253    22599   9713784654    1% /data2/pool/003/sampeng_shared
+data2/pool/sathyae            820207618   116249    820091369    1% /data2/pool/003/sathyae
+data2/pool/sco               2147482678        7   2147482671    1% /data2/pool/003/sco
+data2/pool/sduggal           2147482678        7   2147482671    1% /data2/pool/003/sduggal
+data2/pool/seijieng           215754415  1423595    214330820    1% /data2/pool/003/seijieng
+data2/pool/setliu22          2147482678        7   2147482671    1% /data2/pool/003/setliu22
+data2/pool/sgbruce           2147482678        7   2147482671    1% /data2/pool/003/sgbruce
+data2/pool/shahineb          2147482678        7   2147482671    1% /data2/pool/003/shahineb
+data2/pool/shan2312          2147482678        7   2147482671    1% /data2/pool/003/shan2312
+data2/pool/shenwang          2147482678        7   2147482671    1% /data2/pool/003/shenwang
+data2/pool/shorterm          2147482678        7   2147482671    1% /data2/pool/003/shorterm
+data2/pool/sizheli            536364008   376269    535987739    1% /data2/pool/003/sizheli
+data2/pool/sjr               2147482678        7   2147482671    1% /data2/pool/003/sjr
+data2/pool/skrem             2147482678        7   2147482671    1% /data2/pool/003/skrem
+data2/pool/slhughes          2147482678        7   2147482671    1% /data2/pool/003/slhughes
+data2/pool/sloomba           2147482678        7   2147482671    1% /data2/pool/003/sloomba
+data2/pool/smish             2147482678        7   2147482671    1% /data2/pool/003/smish
+data2/pool/soonhyun          2147482678        7   2147482671    1% /data2/pool/003/soonhyun
+data2/pool/sophscag          2147482678        7   2147482671    1% /data2/pool/003/sophscag
+data2/pool/soukayna           395543941   232769    395311172    1% /data2/pool/003/soukayna
+data2/pool/sparsh            2147482678        7   2147482671    1% /data2/pool/003/sparsh
+data2/pool/sreejat           2147482678        7   2147482671    1% /data2/pool/003/sreejat
+data2/pool/srini01           2147482678        7   2147482671    1% /data2/pool/003/srini01
+data2/pool/sritterb          2147482678        7   2147482671    1% /data2/pool/003/sritterb
+data2/pool/srm_shared       10737417270        7  10737417263    1% /data2/pool/003/srm_shared
+data2/pool/starkman          2145080913    24589   2145056324    1% /data2/pool/003/starkman
+data2/pool/steven30          2147482678        7   2147482671    1% /data2/pool/003/steven30
+data2/pool/stevensh          2147482678        7   2147482671    1% /data2/pool/003/stevensh
+data2/pool/stulchin          2147482678        7   2147482671    1% /data2/pool/003/stulchin
+data2/pool/sumit99           2147482678        7   2147482671    1% /data2/pool/003/sumit99
+data2/pool/sunhyoo           2147482678        7   2147482671    1% /data2/pool/003/sunhyoo
+data2/pool/sunx528           2147482678        7   2147482671    1% /data2/pool/003/sunx528
+data2/pool/sunx_shared      10174885440   575202  10174310238    1% /data2/pool/003/sunx_shared
+data2/pool/svtaylor          2147482678        7   2147482671    1% /data2/pool/003/svtaylor
+data2/pool/swatir            2147482678        7   2147482671    1% /data2/pool/003/swatir
+data2/pool/sxp820            2147482678        7   2147482671    1% /data2/pool/003/sxp820
+data2/pool/sylziyuz          2147482678        7   2147482671    1% /data2/pool/003/sylziyuz
+data2/pool/szantou           2147482678        7   2147482671    1% /data2/pool/003/szantou
+data2/pool/szhang11          2147482678        7   2147482671    1% /data2/pool/003/szhang11
+data2/pool/ta_nikol           331877927   325648    331552279    1% /data2/pool/003/ta_nikol
+data2/pool/tagem             2000519024   890682   1999628342    1% /data2/pool/003/tagem
+data2/pool/tanm678           2147482678        7   2147482671    1% /data2/pool/003/tanm678
+data2/pool/tdaillak          2147482678        7   2147482671    1% /data2/pool/003/tdaillak
+data2/pool/temills           2147482678        7   2147482671    1% /data2/pool/003/temills
+data2/pool/thavishi          2147482678        7   2147482671    1% /data2/pool/003/thavishi
+data2/pool/thibsoub          2019837820   206829   2019630991    1% /data2/pool/003/thibsoub
+data2/pool/thoma98           2147482678        7   2147482671    1% /data2/pool/003/thoma98
+data2/pool/timneum1          2147482678        7   2147482671    1% /data2/pool/003/timneum1
+data2/pool/tobioni_shared   10737417270        7  10737417263    1% /data2/pool/003/tobioni_shared
+data2/pool/tongwu97          2147482678        7   2147482671    1% /data2/pool/003/tongwu97
+data2/pool/trancik_shared   10704641863     1683  10704640180    1% /data2/pool/003/trancik_shared
+data2/pool/trudyenc          2147482678        7   2147482671    1% /data2/pool/003/trudyenc
+data2/pool/tslatyer          2147482678        7   2147482671    1% /data2/pool/003/tslatyer
+data2/pool/tsliu             2147482678        7   2147482671    1% /data2/pool/003/tsliu
+data2/pool/twilks            2147482678        7   2147482671    1% /data2/pool/003/twilks
+data2/pool/tyoshino          2147482678        7   2147482671    1% /data2/pool/003/tyoshino
+data2/pool/tzegoh             818856184  3192173    815664011    1% /data2/pool/003/tzegoh
+data2/pool/vaddala9          2147482678        7   2147482671    1% /data2/pool/003/vaddala9
+data2/pool/varun123          2147482678        7   2147482671    1% /data2/pool/003/varun123
+data2/pool/vaxmanf           2147482678        7   2147482671    1% /data2/pool/003/vaxmanf
+data2/pool/vicfaith          2147482678        7   2147482671    1% /data2/pool/003/vicfaith
+data2/pool/viviansg          8589933461        9   8589933452    1% /data2/pool/003/viviansg
+data2/pool/vm8                214945410   223735    214721675    1% /data2/pool/003/vm8
+data2/pool/vpatel12          2145930872     6323   2145924549    1% /data2/pool/003/vpatel12
+data2/pool/vranjan           2147482678        7   2147482671    1% /data2/pool/003/vranjan
+data2/pool/wadel642          2147482678        7   2147482671    1% /data2/pool/003/wadel642
+data2/pool/whamitch           209259981  1014612    208245369    1% /data2/pool/003/whamitch
+data2/pool/wuhg5330          1746653470      450   1746653020    1% /data2/pool/003/wuhg5330
+data2/pool/wyf               1305711423     1256   1305710167    1% /data2/pool/003/wyf
+data2/pool/xbtmkmmm          2147482678        7   2147482671    1% /data2/pool/003/xbtmkmmm
+data2/pool/xdelabru          2147482678        7   2147482671    1% /data2/pool/003/xdelabru
+data2/pool/xgong75           2147482678        7   2147482671    1% /data2/pool/003/xgong75
+data2/pool/xumei             2147482678        7   2147482671    1% /data2/pool/003/xumei
+data2/pool/yael_cg           2147482678        7   2147482671    1% /data2/pool/003/yael_cg
+data2/pool/yanac             2147482678        7   2147482671    1% /data2/pool/003/yanac
+data2/pool/yangsj            2147482678        7   2147482671    1% /data2/pool/003/yangsj
+data2/pool/yifanyin          2147482678        7   2147482671    1% /data2/pool/003/yifanyin
+data2/pool/yilup666          2147482678        7   2147482671    1% /data2/pool/003/yilup666
+data2/pool/yishika2          1996494139      455   1996493684    1% /data2/pool/003/yishika2
+data2/pool/yongheng          2147482678        7   2147482671    1% /data2/pool/003/yongheng
+data2/pool/yonglo            1946450891   320497   1946130394    1% /data2/pool/003/yonglo
+data2/pool/yosebiba          1149462333   382627   1149079706    1% /data2/pool/003/yosebiba
+data2/pool/ypol              2147482678        7   2147482671    1% /data2/pool/003/ypol
+data2/pool/yshen99            983297965   732992    982564973    1% /data2/pool/003/yshen99
+data2/pool/yu_xie            2147482678        7   2147482671    1% /data2/pool/003/yu_xie
+data2/pool/yu_zheng          1135487454   247659   1135239795    1% /data2/pool/003/yu_zheng
+data2/pool/yuanxun           2147482678        7   2147482671    1% /data2/pool/003/yuanxun
+data2/pool/yuechuan           213926009     5157    213920852    1% /data2/pool/003/yuechuan
+data2/pool/yumzhang           114980895   826579    114154316    1% /data2/pool/003/yumzhang
+data2/pool/zabreyko          2147482678        7   2147482671    1% /data2/pool/003/zabreyko
+data2/pool/zachw23           2147482678        7   2147482671    1% /data2/pool/003/zachw23
+data2/pool/zappi             2134104370   115069   2133989301    1% /data2/pool/003/zappi
+data2/pool/zhh24             2147482678        7   2147482671    1% /data2/pool/003/zhh24
+data2/pool/zhiye             2147482678        7   2147482671    1% /data2/pool/003/zhiye
+data2/pool/zhuoranw          2147482678        7   2147482671    1% /data2/pool/003/zhuoranw
+data2/pool/zieglerc           923618293    98927    923519366    1% /data2/pool/003/zieglerc
+data2/pool/zitongc           2147482678        7   2147482671    1% /data2/pool/003/zitongc
+data2/pool/zituo              190328452   218804    190109648    1% /data2/pool/003/zituo
+data2/pool/zixiaowa          2147482678        7   2147482671    1% /data2/pool/003/zixiaowa
+data2/pool/zk27               213628945    47566    213581379    1% /data2/pool/003/zk27
+data2/pool/zniu              1017239332  2879867   1014359465    1% /data2/pool/003/zniu
+data2/pool/zwest             2147482678        7   2147482671    1% /data2/pool/003/zwest
+devtmpfs                       98957376     5659     98951717    1% /dev
+tmpfs                          98963475        1     98963474    1% /dev/shm
+nfs001.lb:/                       31122      103        31019    1% /net/nfs001.lb
+tmpfs                            819200     9329       809871    2% /run
+tmpfs                          19792695       21     19792674    1% /run/user/0
+efivarfs                              0        0            0     - /sys/firmware/efi/efivars
+##exportfile
+# allow cluster to mount data2
+/data2 172.16.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data2 172.19.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+/data2 10.1.0.0/16(fsid=0,rw,async,crossmnt,no_subtree_check)
+
+# allow TSM to do backups
+/data2 172.16.6.221(rw,async,crossmnt,no_subtree_check,no_root_squash) 172.16.6.222(rw,async,crossmnt,no_subtree_check,no_root_squash) 172.16.6.223(rw,async,crossmnt,no_subtree_check,no_root_squash) 172.16.6.224(rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+# allow mgmt001 to deal with pool storage migrations
+/data2 172.16.222.12(fsid=0,rw,async,crossmnt,no_root_squash)
+
+# ME:Mar 05, 2026, allow Mediaflux read only access as root from node9900
+/data2 172.16.99.0(fsid=0,ro,async,crossmnt,no_root_squash,insecure)

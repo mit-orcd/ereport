@@ -1,0 +1,2301 @@
+dn: ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.direct,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.master,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.home,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.system,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ki,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.scratch,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ase,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.cnh,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ere,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fee,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.foo,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jas,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jbt,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mki,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ngk,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.pog,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rsi,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.so3,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tah,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tus,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.yec,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.datasets,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.examples,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.003,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.004,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.005,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.006,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.007,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.008,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.014,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.015,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.pool.026,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.projects,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.binz,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.econ,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.faez,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.gore,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.gssc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.gwli,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.laub,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.linc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mick,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mjaz,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.msur,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ogot,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.saxe,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tami,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tess,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ypol,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.csim,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.econ,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.tami,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.amins,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.arupc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.beery,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dandi,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.darae,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.edsun,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ejalm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ekara,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fengg,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fiete,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.kpate,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.satra,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.vfish,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.yunha,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.ejalm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.las,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.ngk,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.pog,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.bcs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.mki,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.rsi,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.so3,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.bolken,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.camcat,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.cburge,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ccoley,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dvaron,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.eilers,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.evogan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fakhri,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.johanf,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.juanes,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.knouse,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.lboyer,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.lhtsai,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.lnecib,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.manoli,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mbathe,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.pattie,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.psinha,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rafagb,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rplevy,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tsmidt,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.cburge,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.scratch.bcs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.saxe,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.faez,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.gore,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.tata,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.abodner,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.andrewv,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.bdolsen,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.belcher,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.byildiz,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.cavoigt,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dicarlo,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dmcrose,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dylanhm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.flavell,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.hjkulik,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jhdavis,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jhewitt,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.kburdge,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.keating,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ldlewis,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mgjones,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mheiman,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.modclim,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.omarabu,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rakhlin,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rsimcoe,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.rteague,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.sborisk,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.shaohao,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.syslogs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tegmark,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.tpoggio,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.trancik,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.zhang_f,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.rteague,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.fiete,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.satra,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.edsun,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.anikeeva,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ashansen,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.braakman,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.cdrennan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.chisholm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.coughlin,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.desimone,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dhousman,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.dinaktbi,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.edboyden,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.ekmiller,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.enbrown1,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.evelina9,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fan_wang,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.gabrieli,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jmjacobs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.jspeedie,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.katiegal,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.lraymond,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mhowland,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mvogelsb,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.raffaele,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.sdorkenw,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.seedfund,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.shaohorn,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.sherwang,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.soljacic,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.stephdut,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.talia_tb,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.wvanrees,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.ashansen,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.caitlinm,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.fraenkel,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.mhowland,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.nese.raffaele,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.lhtsai,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.guttag,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.juanes,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.lboyer,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.pattie,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.ruonan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.tjacks,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.courtview,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.mki_aryeh,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.ldlewis,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.omarabu,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.zhang_f,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.ashia07,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.gfarina,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.gforget,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.ppliang,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.sendhil,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.songhan,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.datasets.legacy,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.edboyden,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.evelina9,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.fan_wang,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.archive.gabrieli,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.dinaktbi,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.mghassem,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.sdorkenw,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.sitzmann,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.compute.sprescot,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.scratch.seedfund,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.human_esfmri,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.data.pg_inbrain_hs,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.software.community,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.scratch.orcd.legacy,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.software.deprecated,ou=automount,dc=cm,dc=cluster
+
+dn: ou=auto.orcd.software.repository,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tah001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/tah/001
+
+dn: cn=burgelab,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data010:/data001/burgelab
+
+dn: cn=schuh001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/schuh001
+
+dn: cn=aselab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/aselab002
+
+dn: cn=camcat001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/camcat/001
+
+dn: cn=cnhlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/mnt/pool/cnhlab001
+
+dn: cn=cnhlab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data005:/cnhlab002
+
+dn: cn=cnhlab003,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data009:/cnhlab003
+
+dn: cn=erelab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data006:/erelab001
+
+dn: cn=rgmark001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/rgmark001
+
+dn: cn=wonghslab,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/wonghslab
+
+dn: cn=econlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/econ/001
+
+dn: cn=housman001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/housman001
+
+dn: cn=micklab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/micklab002
+
+dn: cn=micklab003,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/mnt/pool/micklab003
+
+dn: cn=micklab004,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data005:/micklab004
+
+dn: cn=micklab005,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data009:/micklab005
+
+dn: cn=nnakatalab,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/nnakatalab
+
+dn: cn=picower001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/mnt/pool/picower001
+
+dn: cn=picower002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data013:/picower002
+
+dn: cn=picower003,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data010:/picower003
+
+dn: cn=picower004,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/picower004
+
+dn: cn=polzlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/polzlab001
+
+dn: cn=polzlab003,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/polzlab003
+
+dn: cn=psfclab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data005:/psfclab001
+
+dn: cn=arupclab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/arupclab002
+
+dn: cn=ejalmlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/ejalmlab001
+
+dn: cn=mbuehler001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data021:/mbuehler001
+
+dn: cn=sloanlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/sloanlab001
+
+dn: cn=sloanlab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data013:/sloanlab002
+
+dn: cn=sloanlab003,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/sloanlab003
+
+dn: cn=sloanlab004,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data013:/sloanlab004
+
+dn: cn=sloanlab005,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/sloanlab005
+
+dn: cn=sloanlab007,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/sloanlab007
+
+dn: cn=sloanlab008,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/sloan/008
+
+dn: cn=software001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs fstor001:/data1/software/core/001
+
+dn: cn=ccoleylab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data001:/ccoleylab001
+
+dn: cn=rafagblab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/rafagb/001
+
+dn: cn=wfranklab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data020:/wfranklab001
+
+dn: cn=wfranklab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/wfranklab002
+
+dn: cn=corderolab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/corderolab001
+
+dn: cn=corderolab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data010:/corderolab002
+
+dn: cn=emanuellab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/emanuellab001
+
+dn: cn=chisholmlab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=3 eofe-data004:/mnt/pool/chisholmlab002
+
+dn: cn=fraenkellab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/fraenkel/002
+
+dn: cn=mvogelsblab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data022:/mvogelsblab001
+
+dn: cn=mvogelsblab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data023:/mvogelsblab002
+
+dn: cn=rutledgelab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data003:/rutledgelab001
+
+dn: cn=software001-rw,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs fstor001:/data1/software/core/001
+
+dn: cn=twcroninlab001,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data007:/twcroninlab001
+
+dn: cn=twcroninlab002,ou=auto.nfs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data007:/twcroninlab002
+
+dn: cn=data,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+
+dn: cn=home,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.home,ou=automount,dc=cm,dc=cluster
+
+dn: cn=nese,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pool,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+
+dn: cn=system,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.system,ou=automount,dc=cm,dc=cluster
+
+dn: cn=archive,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+
+dn: cn=compute,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+
+dn: cn=scratch,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.scratch,ou=automount,dc=cm,dc=cluster
+
+dn: cn=datasets,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.datasets,ou=automount,dc=cm,dc=cluster
+
+dn: cn=examples,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.examples,ou=automount,dc=cm,dc=cluster
+
+dn: cn=projects,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.projects,ou=automount,dc=cm,dc=cluster
+
+dn: cn=software,ou=auto.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+
+dn: cn=/programs,ou=auto.direct,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/software/community/001/licensed/pkg/sbgrid
+
+dn: cn=/-,ou=auto.master,ou=automount,dc=cm,dc=cluster
+automountInformation: ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster --timeout=86400
+
+dn: cn=/nfs,ou=auto.master,ou=automount,dc=cm,dc=cluster
+automountInformation: ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster --timeout=86400 --ghost
+
+dn: cn=/orcd,ou=auto.master,ou=automount,dc=cm,dc=cluster
+automountInformation: ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster --timeout=86400 --ghost
+
+dn: cn=ki,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ki,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ase,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ase,ou=automount,dc=cm,dc=cluster
+
+dn: cn=cnh,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.cnh,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ere,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ere,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fee,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fee,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jas,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jas,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jbt,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jbt,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jhm,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mki,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mki,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ngk,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ngk,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pog,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.pog,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rsi,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rsi,ou=automount,dc=cm,dc=cluster
+
+dn: cn=so3,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.so3,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tah,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tah,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tus,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tus,ou=automount,dc=cm,dc=cluster
+
+dn: cn=yec,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.yec,ou=automount,dc=cm,dc=cluster
+
+dn: cn=binz,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.binz,ou=automount,dc=cm,dc=cluster
+
+dn: cn=econ,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.econ,ou=automount,dc=cm,dc=cluster
+
+dn: cn=faez,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.faez,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gore,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.gore,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gssc,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.gssc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gwli,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.gwli,ou=automount,dc=cm,dc=cluster
+
+dn: cn=laub,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.laub,ou=automount,dc=cm,dc=cluster
+
+dn: cn=linc,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.linc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mick,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mick,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mjaz,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mjaz,ou=automount,dc=cm,dc=cluster
+
+dn: cn=msur,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.msur,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ogot,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ogot,ou=automount,dc=cm,dc=cluster
+
+dn: cn=orcd,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: cn=psfc,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=saxe,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.saxe,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tami,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tami,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tess,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tess,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ypol,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ypol,ou=automount,dc=cm,dc=cluster
+
+dn: cn=amins,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.amins,ou=automount,dc=cm,dc=cluster
+
+dn: cn=arupc,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.arupc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=beery,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.beery,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dandi,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dandi,ou=automount,dc=cm,dc=cluster
+
+dn: cn=darae,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.darae,ou=automount,dc=cm,dc=cluster
+
+dn: cn=edsun,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.edsun,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ejalm,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ejalm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ekara,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ekara,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fengg,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fengg,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fiete,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fiete,ou=automount,dc=cm,dc=cluster
+
+dn: cn=kpate,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.kpate,ou=automount,dc=cm,dc=cluster
+
+dn: cn=satra,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.satra,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sloan,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=vfish,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.vfish,ou=automount,dc=cm,dc=cluster
+
+dn: cn=yunha,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.yunha,ou=automount,dc=cm,dc=cluster
+
+dn: cn=bolken,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.bolken,ou=automount,dc=cm,dc=cluster
+
+dn: cn=camcat,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.camcat,ou=automount,dc=cm,dc=cluster
+
+dn: cn=cburge,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.cburge,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ccoley,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ccoley,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dvaron,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dvaron,ou=automount,dc=cm,dc=cluster
+
+dn: cn=eilers,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.eilers,ou=automount,dc=cm,dc=cluster
+
+dn: cn=evogan,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.evogan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fakhri,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fakhri,ou=automount,dc=cm,dc=cluster
+
+dn: cn=johanf,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.johanf,ou=automount,dc=cm,dc=cluster
+
+dn: cn=juanes,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.juanes,ou=automount,dc=cm,dc=cluster
+
+dn: cn=knouse,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.knouse,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lboyer,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.lboyer,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lhtsai,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.lhtsai,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lnecib,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.lnecib,ou=automount,dc=cm,dc=cluster
+
+dn: cn=manoli,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.manoli,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mbathe,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mbathe,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pattie,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.pattie,ou=automount,dc=cm,dc=cluster
+
+dn: cn=psinha,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.psinha,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rafagb,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rafagb,ou=automount,dc=cm,dc=cluster
+
+dn: cn=reimer,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rplevy,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rplevy,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tsmidt,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tsmidt,ou=automount,dc=cm,dc=cluster
+
+dn: cn=abodner,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.abodner,ou=automount,dc=cm,dc=cluster
+
+dn: cn=andrewv,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.andrewv,ou=automount,dc=cm,dc=cluster
+
+dn: cn=bdolsen,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.bdolsen,ou=automount,dc=cm,dc=cluster
+
+dn: cn=belcher,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.belcher,ou=automount,dc=cm,dc=cluster
+
+dn: cn=byildiz,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.byildiz,ou=automount,dc=cm,dc=cluster
+
+dn: cn=cavoigt,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.cavoigt,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dicarlo,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dicarlo,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dmcrose,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dmcrose,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dylanhm,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dylanhm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fisherp,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: cn=flavell,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.flavell,ou=automount,dc=cm,dc=cluster
+
+dn: cn=hjkulik,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.hjkulik,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jhewitt,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jhewitt,ou=automount,dc=cm,dc=cluster
+
+dn: cn=kburdge,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.kburdge,ou=automount,dc=cm,dc=cluster
+
+dn: cn=keating,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.keating,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ldlewis,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ldlewis,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mgjones,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mgjones,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mheiman,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mheiman,ou=automount,dc=cm,dc=cluster
+
+dn: cn=modclim,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.modclim,ou=automount,dc=cm,dc=cluster
+
+dn: cn=omarabu,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.omarabu,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rakhlin,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rakhlin,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rsimcoe,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rsimcoe,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rteague,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.rteague,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sborisk,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.sborisk,ou=automount,dc=cm,dc=cluster
+
+dn: cn=shaohao,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.shaohao,ou=automount,dc=cm,dc=cluster
+
+dn: cn=syslogs,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.syslogs,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tegmark,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tegmark,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tpoggio,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.tpoggio,ou=automount,dc=cm,dc=cluster
+
+dn: cn=trancik,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.trancik,ou=automount,dc=cm,dc=cluster
+
+dn: cn=zhang_f,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.zhang_f,ou=automount,dc=cm,dc=cluster
+
+dn: cn=anikeeva,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.anikeeva,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ashansen,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ashansen,ou=automount,dc=cm,dc=cluster
+
+dn: cn=braakman,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.braakman,ou=automount,dc=cm,dc=cluster
+
+dn: cn=caitlinm,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=cdrennan,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.cdrennan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=chisholm,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.chisholm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=coughlin,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.coughlin,ou=automount,dc=cm,dc=cluster
+
+dn: cn=desimone,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.desimone,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dhousman,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dhousman,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dinaktbi,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.dinaktbi,ou=automount,dc=cm,dc=cluster
+
+dn: cn=edboyden,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.edboyden,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ekmiller,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.ekmiller,ou=automount,dc=cm,dc=cluster
+
+dn: cn=enbrown1,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.enbrown1,ou=automount,dc=cm,dc=cluster
+
+dn: cn=evelina9,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.evelina9,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fan_wang,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fan_wang,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fraenkel,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gabrieli,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.gabrieli,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jmjacobs,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jmjacobs,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jspeedie,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.jspeedie,ou=automount,dc=cm,dc=cluster
+
+dn: cn=katiegal,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.katiegal,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lraymond,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.lraymond,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mhowland,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mhowland,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mvogelsb,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mvogelsb,ou=automount,dc=cm,dc=cluster
+
+dn: cn=raffaele,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.raffaele,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sdorkenw,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.sdorkenw,ou=automount,dc=cm,dc=cluster
+
+dn: cn=seedfund,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.seedfund,ou=automount,dc=cm,dc=cluster
+
+dn: cn=shaohorn,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.shaohorn,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sherwang,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.sherwang,ou=automount,dc=cm,dc=cluster
+
+dn: cn=soljacic,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.soljacic,ou=automount,dc=cm,dc=cluster
+
+dn: cn=stephdut,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.stephdut,ou=automount,dc=cm,dc=cluster
+
+dn: cn=talia_tb,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.talia_tb,ou=automount,dc=cm,dc=cluster
+
+dn: cn=wvanrees,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.wvanrees,ou=automount,dc=cm,dc=cluster
+
+dn: cn=courtview,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.courtview,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mki_aryeh,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.mki_aryeh,ou=automount,dc=cm,dc=cluster
+
+dn: cn=human_esfmri,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.human_esfmri,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pg_inbrain_hs,ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.data.pg_inbrain_hs,ou=automount,dc=cm,dc=cluster
+
+dn: cn=002,ou=auto.orcd.home,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 nfs001.lb:/home
+
+dn: cn=csim,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.csim,ou=automount,dc=cm,dc=cluster
+
+dn: cn=econ,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.econ,ou=automount,dc=cm,dc=cluster
+
+dn: cn=psfc,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tami,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.tami,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ejalm,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.ejalm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=cburge,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.cburge,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fisherp,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rteague,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.rteague,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ashansen,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.ashansen,ou=automount,dc=cm,dc=cluster
+
+dn: cn=caitlinm,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.caitlinm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fraenkel,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.fraenkel,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mhowland,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.mhowland,ou=automount,dc=cm,dc=cluster
+
+dn: cn=raffaele,ou=auto.orcd.nese,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.nese.raffaele,ou=automount,dc=cm,dc=cluster
+
+dn: cn=003,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.003,ou=automount,dc=cm,dc=cluster
+
+dn: cn=004,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.004,ou=automount,dc=cm,dc=cluster
+
+dn: cn=005,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.005,ou=automount,dc=cm,dc=cluster
+
+dn: cn=006,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.006,ou=automount,dc=cm,dc=cluster
+
+dn: cn=007,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.007,ou=automount,dc=cm,dc=cluster
+
+dn: cn=008,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.008,ou=automount,dc=cm,dc=cluster
+
+dn: cn=014,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.pool.014,ou=automount,dc=cm,dc=cluster
+
+dn: cn=015,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.pool.015,ou=automount,dc=cm,dc=cluster
+
+dn: cn=026,ou=auto.orcd.pool,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,timeout=86400 ldap:ou=auto.orcd.pool.026,ou=automount,dc=cm,dc=cluster
+
+dn: cn=001,ou=auto.orcd.system,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/system
+
+dn: cn=jhm,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=las,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.las,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ngk,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.ngk,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pog,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.pog,ou=automount,dc=cm,dc=cluster
+
+dn: cn=orcd,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: cn=psfc,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=saxe,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.saxe,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fiete,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.fiete,ou=automount,dc=cm,dc=cluster
+
+dn: cn=satra,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.satra,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sloan,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lhtsai,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.lhtsai,ou=automount,dc=cm,dc=cluster
+
+dn: cn=reimer,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fisherp,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.fisherp,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ldlewis,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.ldlewis,ou=automount,dc=cm,dc=cluster
+
+dn: cn=omarabu,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.omarabu,ou=automount,dc=cm,dc=cluster
+
+dn: cn=zhang_f,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.zhang_f,ou=automount,dc=cm,dc=cluster
+
+dn: cn=edboyden,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.edboyden,ou=automount,dc=cm,dc=cluster
+
+dn: cn=evelina9,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.evelina9,ou=automount,dc=cm,dc=cluster
+
+dn: cn=fan_wang,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.fan_wang,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gabrieli,ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.archive.gabrieli,ou=automount,dc=cm,dc=cluster
+
+dn: cn=bcs,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.bcs,ou=automount,dc=cm,dc=cluster
+
+dn: cn=jhm,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.jhm,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mki,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.mki,ou=automount,dc=cm,dc=cluster
+
+dn: cn=rsi,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.rsi,ou=automount,dc=cm,dc=cluster
+
+dn: cn=so3,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.so3,ou=automount,dc=cm,dc=cluster
+
+dn: cn=faez,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.faez,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gore,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.gore,ou=automount,dc=cm,dc=cluster
+
+dn: cn=orcd,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: cn=psfc,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.psfc,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tata,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.tata,ou=automount,dc=cm,dc=cluster
+
+dn: cn=edsun,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.edsun,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sloan,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.sloan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=guttag,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.guttag,ou=automount,dc=cm,dc=cluster
+
+dn: cn=juanes,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.juanes,ou=automount,dc=cm,dc=cluster
+
+dn: cn=lboyer,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.lboyer,ou=automount,dc=cm,dc=cluster
+
+dn: cn=pattie,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.pattie,ou=automount,dc=cm,dc=cluster
+
+dn: cn=reimer,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.reimer,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ruonan,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.ruonan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=tjacks,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.tjacks,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ashia07,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.ashia07,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gfarina,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.gfarina,ou=automount,dc=cm,dc=cluster
+
+dn: cn=gforget,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.gforget,ou=automount,dc=cm,dc=cluster
+
+dn: cn=ppliang,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.ppliang,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sendhil,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.sendhil,ou=automount,dc=cm,dc=cluster
+
+dn: cn=songhan,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.songhan,ou=automount,dc=cm,dc=cluster
+
+dn: cn=dinaktbi,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.dinaktbi,ou=automount,dc=cm,dc=cluster
+
+dn: cn=mghassem,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.mghassem,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sdorkenw,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.sdorkenw,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sitzmann,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.sitzmann,ou=automount,dc=cm,dc=cluster
+
+dn: cn=sprescot,ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.compute.sprescot,ou=automount,dc=cm,dc=cluster
+
+dn: cn=000,ou=auto.orcd.data.ki,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 eofe-data026:/group/ki/000
+
+dn: cn=001,ou=auto.orcd.data.ki,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n2:/group/ki/001
+
+dn: cn=003,ou=auto.orcd.data.ki,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n1:/group/ki/003
+
+dn: cn=bcs,ou=auto.orcd.scratch,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.scratch.bcs,ou=automount,dc=cm,dc=cluster
+
+dn: cn=orcd,ou=auto.orcd.scratch,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+
+dn: cn=seedfund,ou=auto.orcd.scratch,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.scratch.seedfund,ou=automount,dc=cm,dc=cluster
+
+dn: cn=001,ou=auto.orcd.data.ase,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/ase/001
+
+dn: cn=002,ou=auto.orcd.data.ase,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1.ib:/group/ase/002
+
+dn: cn=001,ou=auto.orcd.data.cnh,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/cnh/001
+
+dn: cn=002,ou=auto.orcd.data.ere,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/ere/002
+
+dn: cn=001,ou=auto.orcd.data.fee,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/fee/001
+
+dn: cn=001,ou=auto.orcd.data.jas,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/jas/001
+
+dn: cn=001,ou=auto.orcd.data.jbt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/jbt/001
+
+dn: cn=002,ou=auto.orcd.data.jbt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/jbt/002
+
+dn: cn=001,ou=auto.orcd.data.jhm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/jhm/001
+
+dn: cn=001,ou=auto.orcd.data.mki,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n2:/group/mki/001
+
+dn: cn=001,ou=auto.orcd.data.ngk,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/ngk/001
+
+dn: cn=002,ou=auto.orcd.data.ngk,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/ngk/002
+
+dn: cn=001,ou=auto.orcd.data.pog,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/pog/001
+
+dn: cn=001,ou=auto.orcd.data.rsi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor005-n2:/group/rsi/001
+
+dn: cn=001,ou=auto.orcd.data.so3,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/so3/001
+
+dn: cn=001,ou=auto.orcd.data.tah,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/tah/001
+
+dn: cn=001,ou=auto.orcd.data.tus,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/tus/001
+
+dn: cn=001,ou=auto.orcd.data.yec,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/yec/001
+
+dn: cn=001,ou=auto.orcd.datasets,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor010-p2.ib:/orcd/001
+
+dn: cn=legacy,ou=auto.orcd.datasets,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.datasets.legacy,ou=automount,dc=cm,dc=cluster
+
+dn: cn=001,ou=auto.orcd.examples,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001.ib:/examples/001
+
+dn: cn=*,ou=auto.orcd.pool.003,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n2:/pool/003/&
+
+dn: cn=*,ou=auto.orcd.pool.004,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n2:/pool/004/&
+
+dn: cn=*,ou=auto.orcd.pool.005,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor012-n2:/pool/005/&
+
+dn: cn=*,ou=auto.orcd.pool.006,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor013-n2:/pool/006/&
+
+dn: cn=*,ou=auto.orcd.pool.007,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor012-n1:/pool/007/&
+
+dn: cn=*,ou=auto.orcd.pool.008,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor013-n1:/pool/008/&
+
+dn: cn=*,ou=auto.orcd.pool.014,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data1/pool/014/&
+
+dn: cn=*,ou=auto.orcd.pool.015,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor015:/data1/pool/015/&
+
+dn: cn=*,ou=auto.orcd.pool.026,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 eofe-data026:/testpool/&
+
+dn: cn=001,ou=auto.orcd.projects,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1047672,wsize=1047532,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,proto=tcp,nconnect=2 fcstor002.inband:/projects/001
+
+dn: cn=core,ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster
+
+dn: cn=community,ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.software.community,ou=automount,dc=cm,dc=cluster
+
+dn: cn=deprecated,ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.software.deprecated,ou=automount,dc=cm,dc=cluster
+
+dn: cn=repository,ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.software.repository,ou=automount,dc=cm,dc=cluster
+
+dn: cn=001,ou=auto.orcd.data.binz,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n1:/group/binz/001
+
+dn: cn=001,ou=auto.orcd.data.econ,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/econ/001
+
+dn: cn=001,ou=auto.orcd.data.faez,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/faez/001
+
+dn: cn=001,ou=auto.orcd.data.gore,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/gore/001
+
+dn: cn=001,ou=auto.orcd.data.gssc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/gssc/001
+
+dn: cn=001,ou=auto.orcd.data.gwli,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/gwli/001
+
+dn: cn=001,ou=auto.orcd.data.laub,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n1:/group/laub/001
+
+dn: cn=001,ou=auto.orcd.data.linc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n1:/group/linc/001
+
+dn: cn=006,ou=auto.orcd.data.mick,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/mick/006
+
+dn: cn=007,ou=auto.orcd.data.mick,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n1:/group/mick/007
+
+dn: cn=001,ou=auto.orcd.data.mjaz,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/mjaz/001
+
+dn: cn=001,ou=auto.orcd.data.msur,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/msur/001
+
+dn: cn=001,ou=auto.orcd.data.ogot,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n2:/group/ogot/001
+
+dn: cn=001,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 eofe-data026:/group/orcd/001
+
+dn: cn=002,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/orcd/002
+
+dn: cn=003,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,proto=rdma,rsize=1048576,wsize=1048576,port=20049 hstor006-n1:/group/orcd/003
+
+dn: cn=004,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/orcd/004
+
+dn: cn=005,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor001:/data1/group/orcd/005
+
+dn: cn=006,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n1:/group/orcd/006
+
+dn: cn=007,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n2:/group/orcd/007
+
+dn: cn=008,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/orcd/008
+
+dn: cn=009,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/orcd/009
+
+dn: cn=010,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n2:/group/orcd/010
+
+dn: cn=011,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n1:/group/orcd/011
+
+dn: cn=012,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n2:/group/orcd/012
+
+dn: cn=013,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/orcd/013
+
+dn: cn=014,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n2:/group/orcd/014
+
+dn: cn=015,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor010:/group/orcd/015
+
+dn: cn=016,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor009:/group/orcd/016
+
+dn: cn=017,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor008:/group/orcd/017
+
+dn: cn=018,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor010:/group/orcd/018
+
+dn: cn=019,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor011:/group/orcd/019
+
+dn: cn=020,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n1:/group/orcd/020
+
+dn: cn=021,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,proto=rdma,rsize=1048576,wsize=1048576,port=20049 hstor012-n2:/group/orcd/021
+
+dn: cn=022,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n1:/group/orcd/022
+
+dn: cn=023,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n2:/group/orcd/023
+
+dn: cn=024,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/orcd/024
+
+dn: cn=025,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data1/group/orcd/025
+
+dn: cn=026,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/orcd/026
+
+dn: cn=027,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor015:/data1/group/orcd/027
+
+dn: cn=028,ou=auto.orcd.data.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor015:/data2/group/orcd/028
+
+dn: cn=001,ou=auto.orcd.data.psfc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/psfc/001
+
+dn: cn=001,ou=auto.orcd.data.saxe,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/saxe/001
+
+dn: cn=002,ou=auto.orcd.data.tami,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/tami/002
+
+dn: cn=003,ou=auto.orcd.data.tami,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/tami/003
+
+dn: cn=001,ou=auto.orcd.data.tess,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/tess/001
+
+dn: cn=001,ou=auto.orcd.data.ypol,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor003-n1:/group/ypol/001
+
+dn: cn=001,ou=auto.orcd.nese.csim,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/csim/001
+
+dn: cn=001,ou=auto.orcd.nese.econ,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/econ/001
+
+dn: cn=001,ou=auto.orcd.nese.psfc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/psfclab001
+
+dn: cn=001,ou=auto.orcd.nese.tami,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/tami/001
+
+dn: cn=001,ou=auto.orcd.data.amins,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/amins/001
+
+dn: cn=002,ou=auto.orcd.data.amins,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/amins/002
+
+dn: cn=001,ou=auto.orcd.data.arupc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/arupc/001
+
+dn: cn=001,ou=auto.orcd.data.beery,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor003-n1:/group/beery/001
+
+dn: cn=001,ou=auto.orcd.data.dandi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n1:/group/dandi/001
+
+dn: cn=002,ou=auto.orcd.data.dandi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n2:/group/dandi/002
+
+dn: cn=001,ou=auto.orcd.data.darae,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/darae/001
+
+dn: cn=001,ou=auto.orcd.data.edsun,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/edsun/001
+
+dn: cn=001,ou=auto.orcd.data.ejalm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/ejalm/001
+
+dn: cn=001,ou=auto.orcd.data.ekara,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/ekara/001
+
+dn: cn=001,ou=auto.orcd.data.fengg,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/fengg/001
+
+dn: cn=001,ou=auto.orcd.data.fiete,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/fiete/001
+
+dn: cn=001,ou=auto.orcd.data.kpate,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/kpate/001
+
+dn: cn=001,ou=auto.orcd.data.satra,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/satra/001
+
+dn: cn=002,ou=auto.orcd.data.satra,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor004-n2:/group/satra/002
+
+dn: cn=008,ou=auto.orcd.data.sloan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/sloan/008
+
+dn: cn=001,ou=auto.orcd.data.vfish,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/vfish/001
+
+dn: cn=001,ou=auto.orcd.data.yunha,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/yunha/001
+
+dn: cn=001,ou=auto.orcd.nese.ejalm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/ejalm/001
+
+dn: cn=001,ou=auto.orcd.archive.jhm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core010.ib:/jhm/001
+
+dn: cn=001,ou=auto.orcd.archive.las,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/las/001
+
+dn: cn=001,ou=auto.orcd.archive.ngk,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/ngk/001
+
+dn: cn=001,ou=auto.orcd.archive.pog,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/pog/001
+
+dn: cn=001,ou=auto.orcd.compute.bcs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor010.ib:/bcs/001
+
+dn: cn=001,ou=auto.orcd.compute.jhm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/jhm/001
+
+dn: cn=001,ou=auto.orcd.compute.mki,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor008.ib:/data1
+
+dn: cn=001,ou=auto.orcd.compute.rsi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor026.ib:/compute/rsi/001
+
+dn: cn=001,ou=auto.orcd.compute.so3,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/so3/001
+
+dn: cn=002,ou=auto.orcd.compute.so3,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor026.ib:/compute/so3/002
+
+dn: cn=001,ou=auto.orcd.data.bolken,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/bolken/001
+
+dn: cn=001,ou=auto.orcd.data.camcat,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/camcat/001
+
+dn: cn=002,ou=auto.orcd.data.cburge,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/cburge/002
+
+dn: cn=001,ou=auto.orcd.data.ccoley,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/ccoley/001
+
+dn: cn=001,ou=auto.orcd.data.dvaron,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n1:/group/dvaron/001
+
+dn: cn=002,ou=auto.orcd.data.dvaron,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data1/group/dvaron/002
+
+dn: cn=001,ou=auto.orcd.data.eilers,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/eilers/001
+
+dn: cn=001,ou=auto.orcd.data.evogan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/evogan/001
+
+dn: cn=001,ou=auto.orcd.data.fakhri,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/fakhri/001
+
+dn: cn=001,ou=auto.orcd.data.johanf,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n1:/group/johanf/001
+
+dn: cn=001,ou=auto.orcd.data.juanes,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/juanes/001
+
+dn: cn=001,ou=auto.orcd.data.knouse,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/knouse/001
+
+dn: cn=001,ou=auto.orcd.data.lboyer,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/lboyer/001
+
+dn: cn=001,ou=auto.orcd.data.lhtsai,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/lhtsai/001
+
+dn: cn=002,ou=auto.orcd.data.lhtsai,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/lhtsai/002
+
+dn: cn=001,ou=auto.orcd.data.lnecib,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/lnecib/001
+
+dn: cn=001,ou=auto.orcd.data.manoli,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/manoli/001
+
+dn: cn=001,ou=auto.orcd.data.mbathe,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 eofe-data027.ib:/
+
+dn: cn=001,ou=auto.orcd.data.pattie,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/pattie/001
+
+dn: cn=001,ou=auto.orcd.data.psinha,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/psinha/001
+
+dn: cn=001,ou=auto.orcd.data.rafagb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/rafagb/001
+
+dn: cn=001,ou=auto.orcd.data.reimer,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/reimer/001
+
+dn: cn=001,ou=auto.orcd.data.rplevy,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/rplevy/001
+
+dn: cn=001,ou=auto.orcd.data.tsmidt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/tsmidt/001
+
+dn: cn=001,ou=auto.orcd.nese.cburge,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core020.ib:/data/cburge/001
+
+dn: cn=001,ou=auto.orcd.scratch.bcs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor002.ib:/data1
+
+dn: cn=002,ou=auto.orcd.scratch.bcs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor003.ib:/data1
+
+dn: cn=001,ou=auto.orcd.archive.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/orcd/001
+
+dn: cn=002,ou=auto.orcd.archive.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/orcd/002
+
+dn: cn=003,ou=auto.orcd.archive.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/orcd/003
+
+dn: cn=001,ou=auto.orcd.archive.psfc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/psfclab001
+
+dn: cn=001,ou=auto.orcd.archive.saxe,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core020.ib:/data/saxe/001
+
+dn: cn=001,ou=auto.orcd.compute.faez,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072,noatime fstor001:/group/faez/001
+
+dn: cn=002,ou=auto.orcd.compute.faez,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor026.ib:/compute/faez/002
+
+dn: cn=001,ou=auto.orcd.compute.gore,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/gore/001
+
+dn: cn=001,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/group/orcd/001
+
+dn: cn=002,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor002.ib:/compute_orcd_002
+
+dn: cn=003,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor003.ib:/compute_orcd_003
+
+dn: cn=004,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor004.ib:/compute/orcd/004
+
+dn: cn=005,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor005.ib:/compute/orcd/005
+
+dn: cn=006,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor006.ib:/compute/orcd/006
+
+dn: cn=008,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor008.ib:/compute_orcd_008
+
+dn: cn=009,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor009.ib:/compute_orcd_009
+
+dn: cn=010,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor010.ib:/compute/orcd/010
+
+dn: cn=011,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/orcd/011
+
+dn: cn=012,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor012.ib:/compute/orcd/012
+
+dn: cn=013,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor013.ib:/compute/orcd/013
+
+dn: cn=014,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor014.ib:/compute/orcd/014
+
+dn: cn=015,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor015.ib:/compute/orcd/015
+
+dn: cn=016,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor016.ib:/compute/orcd/016
+
+dn: cn=017,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor017.ib:/compute/orcd/017
+
+dn: cn=018,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor018.ib:/compute/orcd/018
+
+dn: cn=019,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor019.ib:/compute/orcd/019
+
+dn: cn=020,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor020.ib:/compute/orcd/020
+
+dn: cn=021,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor021.ib:/compute/orcd/021
+
+dn: cn=022,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor022.ib:/compute/orcd/022
+
+dn: cn=023,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor023.ib:/compute/orcd/023
+
+dn: cn=024,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor024.ib:/compute/orcd/024
+
+dn: cn=025,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor025.ib:/compute/orcd/025
+
+dn: cn=026,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor026.ib:/compute/orcd/026
+
+dn: cn=027,ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor027.ib:/compute/orcd/027
+
+dn: cn=001,ou=auto.orcd.compute.psfc,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/group/psfc/001
+
+dn: cn=001,ou=auto.orcd.compute.tata,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor022.ib:/compute/tata/001
+
+dn: cn=002,ou=auto.orcd.compute.tata,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor023.ib:/compute/tata/002
+
+dn: cn=001,ou=auto.orcd.data.abodner,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/abodner/001
+
+dn: cn=002,ou=auto.orcd.data.abodner,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor009:/group/abodner/002
+
+dn: cn=003,ou=auto.orcd.data.abodner,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n2:/group/abodner/003
+
+dn: cn=001,ou=auto.orcd.data.andrewv,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/andrewv/001
+
+dn: cn=001,ou=auto.orcd.data.bdolsen,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/bdolsen/001
+
+dn: cn=001,ou=auto.orcd.data.belcher,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/belcher/001
+
+dn: cn=001,ou=auto.orcd.data.byildiz,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/byildiz/001
+
+dn: cn=001,ou=auto.orcd.data.cavoigt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n1:/group/cavoigt/001
+
+dn: cn=001,ou=auto.orcd.data.dicarlo,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/dicarlo/001
+
+dn: cn=001,ou=auto.orcd.data.dmcrose,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/dmcrose/001
+
+dn: cn=001,ou=auto.orcd.data.dylanhm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/dylanhm/001
+
+dn: cn=001,ou=auto.orcd.data.fisherp,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n2:/group/fisherp/001
+
+dn: cn=001,ou=auto.orcd.data.flavell,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/flavell/001
+
+dn: cn=002,ou=auto.orcd.data.flavell,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/flavell/002
+
+dn: cn=001,ou=auto.orcd.data.hjkulik,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n2:/group/hjkulik/001
+
+dn: cn=001,ou=auto.orcd.data.jhewitt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data025:/jhewitt/001
+
+dn: cn=002,ou=auto.orcd.data.jhewitt,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/jhewitt/002
+
+dn: cn=001,ou=auto.orcd.data.kburdge,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/kburdge/001
+
+dn: cn=001,ou=auto.orcd.data.keating,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/keating/001
+
+dn: cn=001,ou=auto.orcd.data.ldlewis,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/ldlewis/001
+
+dn: cn=001,ou=auto.orcd.data.mgjones,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor003-n1:/group/mgjones/001
+
+dn: cn=001,ou=auto.orcd.data.mheiman,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data1/group/mheiman/001
+
+dn: cn=001,ou=auto.orcd.data.modclim,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/modclim/001
+
+dn: cn=001,ou=auto.orcd.data.omarabu,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/omarabu/001
+
+dn: cn=001,ou=auto.orcd.data.rakhlin,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/rakhlin/001
+
+dn: cn=001,ou=auto.orcd.data.rsimcoe,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n1:/group/rsimcoe/001
+
+dn: cn=002,ou=auto.orcd.data.rteague,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/rteague/002
+
+dn: cn=001,ou=auto.orcd.data.sborisk,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n2:/group/sborisk/001
+
+dn: cn=001,ou=auto.orcd.data.shaohao,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/shaohao/001
+
+dn: cn=001,ou=auto.orcd.data.syslogs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/syslogs/001
+
+dn: cn=001,ou=auto.orcd.data.tegmark,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/tegmark/001
+
+dn: cn=001,ou=auto.orcd.data.tpoggio,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/tpoggio/001
+
+dn: cn=001,ou=auto.orcd.data.trancik,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor013-n2:/group/trancik/001
+
+dn: cn=001,ou=auto.orcd.data.zhang_f,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/zhang_f/001
+
+dn: cn=001,ou=auto.orcd.nese.fisherp,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core020.ib:/data/fisherp/001
+
+dn: cn=001,ou=auto.orcd.nese.rteague,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs eofe-data013:/rteague/001
+
+dn: cn=001,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor004.ib:/
+
+dn: cn=002,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor005.ib:/
+
+dn: cn=003,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor006.ib:/
+
+dn: cn=006,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor013.ib:/
+
+dn: cn=007,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor014.ib:/
+
+dn: cn=008,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor015.ib:/
+
+dn: cn=009,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor016.ib:/
+
+dn: cn=010,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor017.ib:/
+
+dn: cn=011,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor018.ib:/
+
+dn: cn=012,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor019.ib:/
+
+dn: cn=013,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor020.ib:/
+
+dn: cn=014,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor021.ib:/
+
+dn: cn=legacy,ou=auto.orcd.scratch.orcd,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=autofs,ghost,timeout=86400 ldap:ou=auto.orcd.scratch.orcd.legacy,ou=automount,dc=cm,dc=cluster
+
+dn: cn=001,ou=auto.orcd.archive.fiete,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core020.ib:/data/fiete/001
+
+dn: cn=001,ou=auto.orcd.archive.satra,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core010.ib:/satra/001
+
+dn: cn=008,ou=auto.orcd.archive.sloan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/sloan/008
+
+dn: cn=001,ou=auto.orcd.compute.edsun,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor012.ib:/compute/edsun/001
+
+dn: cn=001,ou=auto.orcd.compute.sloan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/group/sloan/001
+
+dn: cn=002,ou=auto.orcd.compute.sloan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor024.ib:/
+
+dn: cn=001,ou=auto.orcd.data.anikeeva,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/anikeeva/001
+
+dn: cn=001,ou=auto.orcd.data.ashansen,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/ashansen/001
+
+dn: cn=001,ou=auto.orcd.data.braakman,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/braakman/001
+
+dn: cn=001,ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/caitlinm/001
+
+dn: cn=002,ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/caitlinm/002
+
+dn: cn=001,ou=auto.orcd.data.cdrennan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor010:/group/cdrennan/001
+
+dn: cn=002,ou=auto.orcd.data.cdrennan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor010:/group/cdrennan/002
+
+dn: cn=001,ou=auto.orcd.data.chisholm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/chisholm/001
+
+dn: cn=002,ou=auto.orcd.data.chisholm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/chisholm/002
+
+dn: cn=001,ou=auto.orcd.data.coughlin,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/coughlin/001
+
+dn: cn=002,ou=auto.orcd.data.coughlin,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/coughlin/002
+
+dn: cn=001,ou=auto.orcd.data.desimone,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/desimone/001
+
+dn: cn=001,ou=auto.orcd.data.dhousman,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/dhousman/001
+
+dn: cn=001,ou=auto.orcd.data.dinaktbi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n1:/group/dinaktbi/001
+
+dn: cn=001,ou=auto.orcd.data.edboyden,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/edboyden/001
+
+dn: cn=002,ou=auto.orcd.data.edboyden,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor011:/group/edboyden/002
+
+dn: cn=001,ou=auto.orcd.data.ekmiller,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n2:/group/ekmiller/001
+
+dn: cn=001,ou=auto.orcd.data.enbrown1,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/enbrown1/001
+
+dn: cn=001,ou=auto.orcd.data.evelina9,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n2:/group/evelina9/001
+
+dn: cn=001,ou=auto.orcd.data.fan_wang,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/fan_wang/001
+
+dn: cn=001,ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/fraenkel/001
+
+dn: cn=002,ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data1/group/fraenkel/002
+
+dn: cn=003,ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n1:/group/fraenkel/003
+
+dn: cn=004,ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/fraenkel/004
+
+dn: cn=005,ou=auto.orcd.data.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data1/group/fraenkel/005
+
+dn: cn=001,ou=auto.orcd.data.gabrieli,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor005-n1:/group/gabrieli/001
+
+dn: cn=001,ou=auto.orcd.data.jmjacobs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/jmjacobs/001
+
+dn: cn=001,ou=auto.orcd.data.jspeedie,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/jspeedie/001
+
+dn: cn=002,ou=auto.orcd.data.katiegal,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n2:/group/katiegal/002
+
+dn: cn=001,ou=auto.orcd.data.lraymond,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/lraymond/001
+
+dn: cn=002,ou=auto.orcd.data.mhowland,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor014:/data2/group/mhowland/002
+
+dn: cn=001,ou=auto.orcd.data.mvogelsb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/mvogelsb/001
+
+dn: cn=004,ou=auto.orcd.data.mvogelsb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/mvogelsb/004
+
+dn: cn=005,ou=auto.orcd.data.mvogelsb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor007-n2:/group/mvogelsb/005
+
+dn: cn=001,ou=auto.orcd.data.raffaele,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor008:/group/raffaele/001
+
+dn: cn=001,ou=auto.orcd.data.sdorkenw,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/sdorkenw/001
+
+dn: cn=001,ou=auto.orcd.data.seedfund,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 hstor012-n1:/group/seedfund/001
+
+dn: cn=001,ou=auto.orcd.data.shaohorn,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor003-n1:/group/shaohorn/001
+
+dn: cn=001,ou=auto.orcd.data.sherwang,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n1:/group/sherwang/001
+
+dn: cn=001,ou=auto.orcd.data.soljacic,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n2:/group/soljacic/001
+
+dn: cn=001,ou=auto.orcd.data.stephdut,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor002-n2:/group/stephdut/001
+
+dn: cn=001,ou=auto.orcd.data.talia_tb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/talia_tb/001
+
+dn: cn=002,ou=auto.orcd.data.talia_tb,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor003-n1:/group/talia_tb/002
+
+dn: cn=001,ou=auto.orcd.data.wvanrees,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor012-n2:/group/wvanrees/001
+
+dn: cn=001,ou=auto.orcd.nese.ashansen,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/ashansen/001
+
+dn: cn=001,ou=auto.orcd.nese.caitlinm,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=131072,wsize=131072 hstor001:/data2/group/caitlinm/001
+
+dn: cn=001,ou=auto.orcd.nese.fraenkel,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core010.ib:/fraenkel/001
+
+dn: cn=001,ou=auto.orcd.nese.mhowland,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/mhowland/001
+
+dn: cn=001,ou=auto.orcd.nese.raffaele,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 core009.ib:/raffaele/001
+
+dn: cn=001,ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/software/core/001
+
+dn: cn=001,ou=auto.orcd.archive.lhtsai,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core010.ib:/lhtsai/001
+
+dn: cn=001,ou=auto.orcd.archive.reimer,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core021.ib:/data/reimer/001
+
+dn: cn=001,ou=auto.orcd.compute.guttag,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/guttag/001
+
+dn: cn=001,ou=auto.orcd.compute.juanes,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor026.ib:/compute/juanes/001
+
+dn: cn=001,ou=auto.orcd.compute.lboyer,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor027.ib:/compute/lboyer/001
+
+dn: cn=001,ou=auto.orcd.compute.pattie,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/pattie/001
+
+dn: cn=001,ou=auto.orcd.compute.reimer,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/group/reimer/001
+
+dn: cn=001,ou=auto.orcd.compute.ruonan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/ruonan/001
+
+dn: cn=001,ou=auto.orcd.compute.tjacks,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/tjacks/001
+
+dn: cn=001,ou=auto.orcd.data.courtview,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor013-n1:/group/courtview/001
+
+dn: cn=001,ou=auto.orcd.data.mki_aryeh,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor003-n1:/group/mki_aryeh/001
+
+dn: cn=001,ou=auto.orcd.archive.fisherp,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core020.ib:/data/fisherp/001
+
+dn: cn=001,ou=auto.orcd.archive.ldlewis,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/ldlewis/001
+
+dn: cn=001,ou=auto.orcd.archive.omarabu,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/omarabu/001
+
+dn: cn=001,ou=auto.orcd.archive.zhang_f,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/zhang_f/001
+
+dn: cn=001,ou=auto.orcd.compute.ashia07,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor012.ib:/compute/ashia07/001
+
+dn: cn=001,ou=auto.orcd.compute.gfarina,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor012.ib:/compute/gfarina/001
+
+dn: cn=001,ou=auto.orcd.compute.gforget,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/gforget/001
+
+dn: cn=001,ou=auto.orcd.compute.ppliang,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor012.ib:/compute/ppliang/001
+
+dn: cn=001,ou=auto.orcd.compute.sendhil,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/sendhil/001
+
+dn: cn=001,ou=auto.orcd.compute.songhan,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor025.ib:/compute/songhan/001
+
+dn: cn=001,ou=auto.orcd.datasets.legacy,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor010-p2.ib:/orcd/001
+
+dn: cn=001,ou=auto.orcd.archive.edboyden,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/edboyden/001
+
+dn: cn=002,ou=auto.orcd.archive.edboyden,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/edboyden/002
+
+dn: cn=001,ou=auto.orcd.archive.evelina9,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/evelina9/001
+
+dn: cn=001,ou=auto.orcd.archive.fan_wang,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core010.ib:/fan_wang/001
+
+dn: cn=001,ou=auto.orcd.archive.gabrieli,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2 core009.ib:/gabrieli/001
+
+dn: cn=001,ou=auto.orcd.compute.dinaktbi,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/dinaktbi/001
+
+dn: cn=001,ou=auto.orcd.compute.mghassem,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor009.ib:/data1
+
+dn: cn=001,ou=auto.orcd.compute.sdorkenw,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor012.ib:/compute/sdorkenw/001
+
+dn: cn=001,ou=auto.orcd.compute.sitzmann,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor011.ib:/compute/sitzmann/001
+
+dn: cn=001,ou=auto.orcd.compute.sprescot,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 fstor012.ib:/compute/sprescot/001
+
+dn: cn=001,ou=auto.orcd.scratch.seedfund,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor012.ib:/group/seedfund/001
+
+dn: cn=001,ou=auto.orcd.data.human_esfmri,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,proto=rdma,port=20049 hstor005-n2:/group/human_esfmri/001
+
+dn: cn=001,ou=auto.orcd.data.pg_inbrain_hs,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576 hstor006-n1:/group/pg_inbrain_hs/001
+
+dn: cn=001,ou=auto.orcd.software.community,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/software/community/001
+
+dn: cn=001,ou=auto.orcd.scratch.orcd.legacy,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor004.ib:/
+
+dn: cn=002,ou=auto.orcd.scratch.orcd.legacy,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor005.ib:/
+
+dn: cn=003,ou=auto.orcd.scratch.orcd.legacy,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,vers=4.2,rsize=1048576,wsize=1048576,rdma,port=20049 fstor006.ib:/
+
+dn: cn=001,ou=auto.orcd.software.deprecated,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=131072,wsize=131072 fstor001:/software/deprecated/001
+
+dn: cn=001,ou=auto.orcd.software.repository,ou=automount,dc=cm,dc=cluster
+automountInformation: -fstype=nfs,noatime,vers=4.2,rsize=16384,wsize=16384 fstor001:/software/repository/001
+

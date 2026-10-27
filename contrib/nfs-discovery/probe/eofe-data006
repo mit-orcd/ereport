@@ -1,0 +1,77 @@
+##host
+eofe-data006-mgmt
+##df
+Filesystem     Type       1K-blocks        Used Available Use% Mounted on
+/dev/md2       xfs        104519820     7777592  96742228   8% /
+/dev/md0       xfs          2086848      229120   1857728  11% /boot
+devtmpfs       devtmpfs    65857280           0  65857280   0% /dev
+tmpfs          tmpfs       65867908           0  65867908   0% /dev/shm
+/dev/sda1      xfs      85951840580 85797816408 154024172 100% /erelab001
+tmpfs          tmpfs       65867908      402676  65465232   1% /run
+tmpfs          tmpfs       13173584           0  13173584   0% /run/user/0
+tmpfs          tmpfs       65867908           0  65867908   0% /sys/fs/cgroup
+##mounts
+rootfs / rootfs rw 0 0
+/dev/md2 / xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md0 /boot xfs rw,relatime,attr2,inode64,noquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=65857280k,nr_inodes=16464320,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/dev/sda1 /erelab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=5632,usrquota 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=7,pgrp=1565,timeout=300,minproto=5,maxproto=5,indirect 0 0
+-hosts /net autofs rw,relatime,fd=13,pgrp=1565,timeout=300,minproto=5,maxproto=5,indirect 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=300,minproto=5,maxproto=5,direct 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=13173584k,mode=700 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/erelab001 172.16.0.0/16
+##zfs
+##inodes
+Filesystem        Inodes    IUsed     IFree IUse% Mounted on
+/dev/md2       104570880    77570 104493310    1% /
+/dev/md0         2097088      345   2096743    1% /boot
+devtmpfs        16464320      601  16463719    1% /dev
+tmpfs           16466977        1  16466976    1% /dev/shm
+/dev/sda1      645981232 29883025 616098207    5% /erelab001
+tmpfs           16466977      830  16466147    1% /run
+tmpfs           16466977        1  16466976    1% /run/user/0
+tmpfs           16466977       16  16466961    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+/erelab001 172.16.0.0/16(rw,fsid=85,async) 
+/erelab001 172.16.4.249(rw,fsid=85,async,no_root_squash) 
+/erelab001 172.16.4.246(ro,fsid=85,async,no_root_squash) 
+/erelab001 172.16.4.245(rw,async,no_root_squash)  172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)

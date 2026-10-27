@@ -1,0 +1,186 @@
+##host
+eofe-data026-mgmt
+##df
+Filesystem                  Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md1                    xfs         435529956     17394800    418135156   4% /
+/dev/sdg3                   vfat           204560         7568       196992   4% /boot/efi
+data1                       zfs       82124347520          896  82124346624   1% /data1
+data1/archive               zfs      169055460736  86931114112  82124346624  52% /data1/archive/001
+data1/cnh_c3ddb_archive     zfs      114214436224  32090089600  82124346624  29% /data1/archive/002
+data1/backup                zfs       32212254464      1073536  32211180928   1% /data1/backup/001
+data1/cnh                   zfs       21474836224          512  21474835712   1% /data1/cnh
+data1/ecrawl                zfs       82141685888     17339264  82124346624   1% /data1/ecrawl
+data1/erbmi1                zfs       21474836480          256  21474836224   1% /data1/erbmi1
+data1/bdarek                zfs        6442450944     42384512   6400066432   1% /data1/group/bdarek/001
+data1/test2                 zfs         524288000    169970432    354317568  33% /data1/group/bdarek/002
+data1/ki                    zfs       21474836480          512  21474835968   1% /data1/group/ki/000
+data1/orcd                  zfs       21140484608   3073713024  18066771584  15% /data1/group/orcd/001
+data1/mediaflux             zfs       82124346880          256  82124346624   1% /data1/mediaflux
+data1/s_b                   zfs       21474836352       243072  21474593280   1% /data1/s_b
+data1/testpool              zfs       82124346880          256  82124346624   1% /data1/testpool
+data1/testpool/bdarek       zfs       82124346880          256  82124346624   1% /data1/testpool/bdarek
+data1/testpool/cnh          zfs       82124346880          256  82124346624   1% /data1/testpool/cnh
+data1/testpool/erbmi1       zfs       82124346880          256  82124346624   1% /data1/testpool/erbmi1
+data1/testpool/lgardner     zfs       82124346880          256  82124346624   1% /data1/testpool/lgardner
+devtmpfs                    devtmpfs     98043496            0     98043496   0% /dev
+tmpfs                       tmpfs        98072260            0     98072260   0% /dev/shm
+nfs001.lb:/                 nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home             nfs4     432503206784 323470650496 109032556288  75% /net/nfs001.lb/home
+fstor001:/software/core/001 nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+tmpfs                       tmpfs        39228908        35088     39193820   1% /run
+tmpfs                       tmpfs        19614452            4     19614448   1% /run/user/0
+fcstor002.inband:/zfs       nfs4       1073741824       192000   1073549824   1% /zfs
+##mounts
+/dev/md1 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdg3 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+data1 /data1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/archive /data1/archive/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/cnh_c3ddb_archive /data1/archive/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/backup /data1/backup/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/cnh /data1/cnh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/ecrawl /data1/ecrawl zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/erbmi1 /data1/erbmi1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/bdarek /data1/group/bdarek/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/test2 /data1/group/bdarek/002 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/ki /data1/group/ki/000 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/orcd /data1/group/orcd/001 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/mediaflux /data1/mediaflux zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/s_b /data1/s_b zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/testpool /data1/testpool zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/testpool/bdarek /data1/testpool/bdarek zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/testpool/cnh /data1/testpool/cnh zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/testpool/erbmi1 /data1/testpool/erbmi1 zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+data1/testpool/lgardner /data1/testpool/lgardner zfs rw,relatime,xattr,posixacl,casesensitive 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=98043496k,nr_inodes=24510874,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=4906,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=90429 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=4906,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=90433 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.226,local_lock=none,addr=10.1.223.3 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=4906,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=90433 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.226,local_lock=none,addr=10.1.223.3 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=4906,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=104607 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=4906,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=91543 0 0
+ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster /orcd/software autofs rw,relatime,fd=24,pgrp=4906,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=23285533 0 0
+ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster /orcd/software/core autofs rw,relatime,fd=27,pgrp=4906,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=23292005 0 0
+fstor001:/software/core/001 /orcd/software/core/001 nfs4 rw,noatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.10.226,local_lock=none,addr=172.16.4.121 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=63462 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=4906,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=15867 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=39228908k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=19614452k,nr_inodes=4903613,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+fcstor002.inband:/zfs /zfs nfs4 rw,relatime,vers=4.2,rsize=1047672,wsize=1047532,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.226,local_lock=none,addr=10.1.223.51 0 0
+##exports
+Export list for localhost:
+/data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+data1	/data1	235476174598768	84095330977504
+data1/archive	/data1/archive/001	89163307747800	84095330977504
+data1/backup	/data1/backup/001	1099471296	32984249361984
+data1/bdarek	/data1/group/bdarek/001	6640471908384	6553668034128
+data1/cnh	/data1/cnh	752928	21990231802592
+data1/cnh_c3ddb_archive	/data1/archive/002	32862171263064	84095330977504
+data1/ecrawl	/data1/ecrawl	17755335312	84095330977504
+data1/erbmi1	/data1/erbmi1	638352	21990232310000
+data1/ki	/data1/group/ki/000	523776	21990232031744
+data1/mediaflux	/data1/mediaflux	392832	84095330977504
+data1/orcd	/data1/group/orcd/001	3489858353520	18500374202000
+data1/s_b	/data1/s_b	248924544	21989983630976
+data1/test2	/data1/group/bdarek/002	174049651776	362821260224
+data1/testpool	/data1/testpool	982080	84095330977504
+data1/testpool/bdarek	/data1/testpool/bdarek	196416	84095330977504
+data1/testpool/cnh	/data1/testpool/cnh	196416	84095330977504
+data1/testpool/erbmi1	/data1/testpool/erbmi1	196416	84095330977504
+data1/testpool/lgardner	/data1/testpool/lgardner	196416	84095330977504
+##inodes
+Filesystem                        Inodes      IUsed        IFree IUse% Mounted on
+/dev/md1                       217871360     274249    217597111    1% /
+/dev/sdg3                              0          0            0     - /boot/efi
+data1                       164248693374         59 164248693315    1% /data1
+data1/archive               164607205528  358512213 164248693315    1% /data1/archive/001
+data1/cnh_c3ddb_archive     164252295065    3601750 164248693315    1% /data1/archive/002
+data1/backup                 64422362050         15  64422362035    1% /data1/backup/001
+data1/cnh                    42949671499         10  42949671489    1% /data1/cnh
+data1/ecrawl                164273014452   24321137 164248693315    1% /data1/ecrawl
+data1/erbmi1                 42949672491         11  42949672480    1% /data1/erbmi1
+data1/bdarek                 12800132998        119  12800132879    1% /data1/group/bdarek/001
+data1/test2                    708635382        109    708635273    1% /data1/group/bdarek/002
+data1/ki                     42949671948         11  42949671937    1% /data1/group/ki/000
+data1/orcd                   36137605493    4062130  36133543363    1% /data1/group/orcd/001
+data1/mediaflux             164248693325         10 164248693315    1% /data1/mediaflux
+data1/s_b                    42949186808         29  42949186779    1% /data1/s_b
+data1/testpool              164248693325         10 164248693315    1% /data1/testpool
+data1/testpool/bdarek       164248693321          6 164248693315    1% /data1/testpool/bdarek
+data1/testpool/cnh          164248693321          6 164248693315    1% /data1/testpool/cnh
+data1/testpool/erbmi1       164248693321          6 164248693315    1% /data1/testpool/erbmi1
+data1/testpool/lgardner     164248693321          6 164248693315    1% /data1/testpool/lgardner
+devtmpfs                        24510874       1549     24509325    1% /dev
+tmpfs                           24518065          1     24518064    1% /dev/shm
+nfs001.lb:/                        31122        103        31019    1% /net/nfs001.lb
+nfs001.lb:/home              13852490493 1439698596  12412791897   11% /net/nfs001.lb/home
+fstor001:/software/core/001   2228666733   34454953   2194211780    2% /orcd/software/core/001
+tmpfs                             819200       2759       816441    1% /run
+tmpfs                            4903613         21      4903592    1% /run/user/0
+fcstor002.inband:/zfs         2147483648         27   2147483621    1% /zfs
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+
+# allow cluster to mount data1
+/data1 172.16.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+/data1 172.19.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+/data1 10.1.0.0/16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check)
+
+# eofe-data001.ib (172.16.4.252), ME: allow archive of un-used pool data
+/data1 172.16.4.252(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# eofe-data002.ib (172.16.4.253), ME: allow archive of un-used pool data
+/data1 172.16.4.253(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# eofe-data011.ib (172.16.10.211), ME: allow archive of un-used home2 data
+/data1 172.16.10.211(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# eofe-data024.ib (172.16.10.224), ME: allow moving Chris's C3DDB dataset
+/data1 172.16.10.224(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# no root squash on dtn001
+/data1 172.16.222.41(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# no root squash on dtn002
+/data1 172.16.222.42(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# hstro012-n2 (172.16.3.139), no root squash on mgmt001
+/data1 172.16.3.139(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# mgmt001 (172.16.222.12), no root squash on mgmt001
+/data1 172.16.222.12(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# mgmt002 (172.16.222.12), no root squash on mgmt002
+/data1 172.16.222.16(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+
+# node9900 (172.16.99.0), no root squash for mediaflux
+/data1 172.16.99.0(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash,insecure)

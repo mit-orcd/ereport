@@ -1,0 +1,77 @@
+##host
+core021
+##df
+Filesystem     Type         1K-blocks         Used    Available Use% Mounted on
+/dev/md0       xfs          904143524     12473388    891670136   2% /
+/dev/nvme0n1p1 vfat            204580         7560       197020   4% /boot/efi
+/dev/rbd3      xfs       429494642688 299910673076 129583969612  70% /data/las/001
+/dev/rbd2      xfs        10735331328     87465816  10647865512   1% /data/orcd/001
+/dev/rbd1      xfs       923415881728 618568889612 304846992116  67% /data/reimer/001
+/dev/rbd0      xfs      1030790064128 208586244544 822203819584  21% /data/sloan/008
+devtmpfs       devtmpfs     131519776            0    131519776   0% /dev
+tmpfs          tmpfs        131542804            0    131542804   0% /dev/shm
+tmpfs          tmpfs         52617124       473320     52143804   1% /run
+tmpfs          tmpfs         26308560            4     26308556   1% /run/user/0
+efivarfs       efivarfs           304          189          111  64% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+/dev/rbd3 /data/las/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=8192,swidth=8192,noquota 0 0
+/dev/rbd2 /data/orcd/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,noquota 0 0
+/dev/rbd1 /data/reimer/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,grpquota 0 0
+/dev/rbd0 /data/sloan/008 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,prjquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=131519776k,nr_inodes=32879944,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=7,pgrp=4336,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=59435 0 0
+-hosts /net autofs rw,relatime,fd=10,pgrp=4336,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=59439 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=19987 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=52617124k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26308560k,nr_inodes=6577140,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data/las/001    172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/orcd/001   172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/reimer/001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/sloan/008  172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem          Inodes     IUsed       IFree IUse% Mounted on
+/dev/md0         452292608    195738   452096870    1% /
+/dev/nvme0n1p1           0         0           0     - /boot/efi
+/dev/rbd3       8589934592     14042  8589920550    1% /data/las/001
+/dev/rbd2       1073741824        10  1073741814    1% /data/orcd/001
+/dev/rbd1      18468359360  51001589 18417357771    1% /data/reimer/001
+/dev/rbd0      20615843008 128318640 20487524368    1% /data/sloan/008
+devtmpfs          32879944       764    32879180    1% /dev
+tmpfs             32885701         1    32885700    1% /dev/shm
+tmpfs               819200      1222      817978    1% /run
+tmpfs              6577140        21     6577119    1% /run/user/0
+efivarfs                 0         0           0     - /sys/firmware/efi/efivars
+##exportfile
+/data/las/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+/data/las/001 172.16.3.131(ro,async,no_root_squash)
+/data/orcd/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+/data/sloan/008 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash) 172.16.10.212(rw,async)
+/data/reimer/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+

@@ -1,0 +1,184 @@
+##host
+eofe-data013-mgmt
+##df
+Filesystem                                 Type        1K-blocks         Used   Available Use% Mounted on
+/dev/sdk5                                  ext4        275311892     54569396   206734384  21% /
+/dev/sdk2                                  ext4          1998672       194824     1682608  11% /boot
+devtmpfs                                   devtmpfs     32869044            0    32869044   0% /dev
+tmpfs                                      tmpfs        32879148            0    32879148   0% /dev/shm
+hstor014.ib:/export/data2/group/lhtsai/002 nfs      236223201280 175000926208 61222275072  75% /mnt/lhtsai
+/dev/mapper/vg00-picower002                xfs       53685004088  53685004072          16 100% /picower002
+/dev/mapper/vg00-rteague--001              xfs       10735331288    573732432 10161598856   6% /rteague/001
+tmpfs                                      tmpfs        32879148        25584    32853564   1% /run
+tmpfs                                      tmpfs         6575832            0     6575832   0% /run/user/0
+/dev/mapper/sloanlab002                    xfs       26841456640        34016 26841422624   1% /sloanlab002
+/dev/mapper/vg00-sloanlab004               xfs      107372095088  97805300948  9566794140  92% /sloanlab004
+tmpfs                                      tmpfs        32879148            0    32879148   0% /sys/fs/cgroup
+##mounts
+/dev/sdk5 / ext4 rw,relatime,data=ordered 0 0
+rootfs / rootfs rw 0 0
+/dev/sdk2 /boot ext4 rw,relatime,data=ordered 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=32869044k,nr_inodes=8217261,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=2411,timeout=300,minproto=5,maxproto=5,indirect 0 0
+hstor014.ib:/export/data2/group/lhtsai/002 /mnt/lhtsai nfs rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.3.142,mountvers=3,mountport=20048,mountproto=udp,local_lock=none,addr=172.16.3.142 0 0
+-hosts /net autofs rw,relatime,fd=12,pgrp=2411,timeout=300,minproto=5,maxproto=5,indirect 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=23,pgrp=2411,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=29,pgrp=2411,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+/dev/mapper/vg00-picower002 /picower002 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=32,pgrp=1,timeout=300,minproto=5,maxproto=5,direct 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=2411,timeout=86400,minproto=5,maxproto=5,direct 0 0
+/dev/mapper/vg00-rteague--001 /rteague/001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=6575832k,mode=700 0 0
+/dev/mapper/sloanlab002 /sloanlab002 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+/dev/mapper/vg00-sloanlab004 /sloanlab004 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/picower002  172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/rteague/001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/sloanlab002 172.16.6.224,172.16.222.16,172.16.221.21,172.16.6.223,172.16.10.226,node1032.ib,node1031.ib,node970.ib,node965.ib,node964.ib,node963.ib,node962.ib,node961.ib,node960.ib,node959.ib,node958.ib,node957.ib,node956.ib,node955.ib,node954.ib,node953.ib,node952.ib,node951.ib,node950.ib,node949.ib,node948.ib,node947.ib,node946.ib,node945.ib,node944.ib,node943.ib,node942.ib,node441.ib,node440.ib,node439.ib,node438.ib,node437.ib,node436.ib,node435.ib,node434.ib
+/sloanlab004 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                                       Inodes    IUsed        IFree IUse% Mounted on
+/dev/sdk5                                      17489920   135056     17354864    1% /
+/dev/sdk2                                        131072      353       130719    1% /boot
+devtmpfs                                        8217261      650      8216611    1% /dev
+tmpfs                                           8219787        1      8219786    1% /dev/shm
+hstor014.ib:/export/data2/group/lhtsai/002 122456938106 12389468 122444548638    1% /mnt/lhtsai
+/dev/mapper/vg00-picower002                     3329696  3250699        78997   98% /picower002
+/dev/mapper/vg00-rteague--001                1073741760    78197   1073663563    1% /rteague/001
+tmpfs                                           8219787      924      8218863    1% /run
+tmpfs                                           8219787        1      8219786    1% /run/user/0
+/dev/mapper/sloanlab002                      2684354304       13   2684354291    1% /sloanlab002
+/dev/mapper/vg00-sloanlab004                 2147483584  8876150   2138607434    1% /sloanlab004
+tmpfs                                           8219787       16      8219771    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+# /software has moved to fstor001 on March 19th, 2024
+
+#/software001 172.16.0.0/16(ro,async) 10.1.0.0/16(ro,async) 172.19.0.0/16(ro,async) 
+#/software001 172.16.5.196(rw,async,no_root_squash)
+#/software001 172.16.4.245(rw,async,no_root_squash)
+#/software001 172.16.4.246(rw,async,no_root_squash)
+#/software001 172.16.4.247(rw,async,no_root_squash)
+#/software001 172.16.4.248(rw,async,no_root_squash)
+#/software001 172.16.4.249(rw,async,no_root_squash)
+#/software001 172.16.5.190(rw,async,no_root_squash)
+#/software001 172.16.5.191(rw,async,no_root_squash)
+#/software001 172.16.5.254(rw,async,no_root_squash)
+#/software001 172.16.10.130(rw,async,no_root_squash)
+#/software001 172.16.10.191(rw,async,no_root_squash)
+#/software001 172.16.10.192(rw,async,no_root_squash)
+#/software001 10.1.10.191(rw,async,no_root_squash)
+#/software001 10.1.10.192(rw,async,no_root_squash)
+
+#/software001 10.1.1.196(rw,async,no_root_squash)
+#/software001 10.1.1.199(rw,async,no_root_squash)
+#/software001 172.16.11.204(rw,async,no_root_squash)
+# added morgans compile node
+#/software001 172.16.0.79(rw,async,no_root_squash)
+#/software001 172.16.1.45(rw,async,no_root_squash)
+#/software001 172.16.20.0(rw,async,no_root_squash)
+
+# hstor/fstor makes copies
+#/software001 172.16.3.121(ro,async,no_root_squash)
+#/software001 172.16.4.121(ro,async,no_root_squash)
+
+# /sloanlab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async)
+/sloanlab002 node434.ib(rw,async)
+/sloanlab002 node435.ib(rw,async)
+/sloanlab002 node436.ib(rw,async)
+/sloanlab002 node437.ib(rw,async)
+/sloanlab002 node438.ib(rw,async)
+/sloanlab002 node439.ib(rw,async)
+/sloanlab002 node440.ib(rw,async)
+/sloanlab002 node441.ib(rw,async)
+/sloanlab002 node942.ib(rw,async)
+/sloanlab002 node943.ib(rw,async)
+/sloanlab002 node944.ib(rw,async)
+/sloanlab002 node945.ib(rw,async)
+/sloanlab002 node946.ib(rw,async)
+/sloanlab002 node947.ib(rw,async)
+/sloanlab002 node948.ib(rw,async)
+/sloanlab002 node949.ib(rw,async)
+/sloanlab002 node950.ib(rw,async)
+/sloanlab002 node951.ib(rw,async)
+/sloanlab002 node952.ib(rw,async)
+/sloanlab002 node953.ib(rw,async)
+/sloanlab002 node954.ib(rw,async)
+/sloanlab002 node955.ib(rw,async)
+/sloanlab002 node956.ib(rw,async)
+/sloanlab002 node957.ib(rw,async)
+/sloanlab002 node958.ib(rw,async)
+/sloanlab002 node959.ib(rw,async)
+/sloanlab002 node960.ib(rw,async)
+/sloanlab002 node961.ib(rw,async)
+/sloanlab002 node962.ib(rw,async)
+/sloanlab002 node963.ib(rw,async)
+/sloanlab002 node964.ib(rw,async)
+/sloanlab002 node965.ib(rw,async)
+/sloanlab002 node970.ib(rw,async)
+/sloanlab002 node1031.ib(rw,async)
+/sloanlab002 node1032.ib(rw,async)
+/sloanlab002 172.16.10.226(ro,async,no_root_squash) 
+/sloanlab002 172.16.6.223(rw,async,no_root_squash)
+/sloanlab002 172.16.221.21(rw,async,no_root_squash)
+/sloanlab002 172.16.222.16(rw,async,no_root_squash)
+/sloanlab002 172.16.6.224(rw,async,no_root_squash)
+
+
+/sloanlab004 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async)
+/sloanlab004 172.16.4.246(rw,async,no_root_squash)
+/sloanlab004 172.16.4.245(rw,async,no_root_squash)
+/sloanlab004 172.16.10.226(ro,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 
+/sloanlab004 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+/sloanlab004 172.16.10.118(rw,async,no_root_squash)
+
+/picower002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.4.245(ro,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 
+/picower002 172.16.10.226(ro,async,no_root_squash) 
+/picower002 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+/rteague/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.4.245(ro,async,no_root_squash)
+/rteague/001 172.16.10.226(ro,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash) 
+/rteague/001 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+
+# has moved to hstor001, no longer needed
+#/dhousman/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.4.245(ro,async,no_root_squash)
+
+# has moved to hstor001, no longer needed
+#/caitlinm/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.4.245(ro,async,no_root_squash)

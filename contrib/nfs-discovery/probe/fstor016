@@ -1,0 +1,74 @@
+##host
+fstor016-mgmt
+##df
+Filesystem      Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md1        xfs         435530980     12887968    422643012   3% /
+/dev/sdb1       vfat           204560         7568       196992   4% /boot/efi
+/dev/xi_dev00   xfs      315055131536  52066462832 262988668704  17% /data1
+devtmpfs        devtmpfs    792158400            0    792158400   0% /dev
+tmpfs           tmpfs       792181672            0    792181672   0% /dev/shm
+nfs001.lb:/     nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home nfs4     432503206784 323470349184 109032857600  75% /net/nfs001.lb/home
+tmpfs           tmpfs       316872672        26812    316845860   1% /run
+tmpfs           tmpfs       158436332            0    158436332   0% /run/user/0
+efivarfs        efivarfs          128           30           94  25% /sys/firmware/efi/efivars
+##mounts
+/dev/md1 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/sdb1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+/dev/xi_dev00 /data1 xfs rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=32,swidth=672,usrquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=792158400k,nr_inodes=198039600,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=5743,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=31839 0 0
+-hosts /net autofs rw,relatime,fd=9,pgrp=5743,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=77912 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.136,local_lock=none,addr=10.1.223.2 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=9,pgrp=5743,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=77912 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.136,local_lock=none,addr=10.1.223.2 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=12,pgrp=5743,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=73508 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=15,pgrp=5743,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=63753 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=88086 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=5743,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=204896 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=316872672k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=158436332k,nr_inodes=39609083,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem           Inodes      IUsed       IFree IUse% Mounted on
+/dev/md1          217871872     208932   217662940    1% /
+/dev/sdb1                 0          0           0     - /boot/efi
+/dev/xi_dev00    6301144320   24333233  6276811087    1% /data1
+devtmpfs          198039600       1379   198038221    1% /dev
+tmpfs             198045418          1   198045417    1% /dev/shm
+nfs001.lb:/           31122        103       31019    1% /net/nfs001.lb
+nfs001.lb:/home 13852490493 1439693348 12412797145   11% /net/nfs001.lb/home
+tmpfs                819200       1775      817425    1% /run
+tmpfs              39609083         15    39609068    1% /run/user/0
+efivarfs                  0          0           0     - /sys/firmware/efi/efivars
+##exportfile
+#allow cluster to mount data1
+/data1 172.16.0.0/16(fsid=0,rw,sync,no_wdelay)
+/data1 172.19.0.0/16(fsid=0,rw,sync,no_wdelay)
+/data1 10.1.0.0/16(fsid=0,rw,sync,no_wdelay)
+/data1 172.16.222.12(fsid=0,rw,sync,no_wdelay,no_root_squash)

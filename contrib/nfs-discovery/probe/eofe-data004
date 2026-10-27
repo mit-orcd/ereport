@@ -1,0 +1,167 @@
+##host
+eofe-data004-mgmt
+##df
+Filesystem                                 Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md125                                 xfs         381045980     15412580    365633400   5% /
+/dev/md127                                 xfs           2088896       177320      1911576   9% /boot
+/dev/mapper/vg00-corderolab001             xfs       10735331328   8900640452   1834690876  83% /corderolab001
+devtmpfs                                   devtmpfs    131912248            0    131912248   0% /dev
+tmpfs                                      tmpfs       131922840            0    131922840   0% /dev/shm
+/dev/mapper/vg00-emanuellab001             xfs       19894351872  14951117020   4943234852  76% /emanuellab001
+/dev/mapper/vg00-housman001                xfs       26841458688  22170158764   4671299924  83% /housman001
+hstor014.ib:/export/data2/group/lhtsai/002 nfs      236223201280 175001683968  61221517312  75% /mnt/lhtsai
+/dev/mapper/vg00-chisholmlab002            xfs       10735331328   7883118360   2852212968  74% /mnt/pool/chisholmlab002
+/dev/mapper/vg00-cnhlab001                 xfs       47242542080  46183648456   1058893624  98% /mnt/pool/cnhlab001
+/dev/mapper/vg00-micklab003                xfs      107372095488 107289082012     83013476 100% /mnt/pool/micklab003
+/dev/mapper/vg00-picower001                xfs      107372095488 106943847448    428248040 100% /mnt/pool/picower001
+nfs001.lb:/                                nfs            996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home                            nfs      432503206784 323469552384 109033654400  75% /net/nfs001.lb/home
+fstor001:/software/core/001                nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+tmpfs                                      tmpfs       131922840         1368    131921472   1% /run
+tmpfs                                      tmpfs        26384568            0     26384568   0% /run/user/0
+/dev/mapper/vg00-sloanlab003               xfs      107372095488  93893292448  13478803040  88% /sloanlab003
+tmpfs                                      tmpfs       131922840            0    131922840   0% /sys/fs/cgroup
+##mounts
+rootfs / rootfs rw 0 0
+/dev/md125 / xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md127 /boot xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/mapper/vg00-corderolab001 /corderolab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=131912248k,nr_inodes=32978062,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/dev/mapper/vg00-emanuellab001 /emanuellab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/dev/mapper/vg00-housman001 /housman001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=2080,timeout=300,minproto=5,maxproto=5,indirect 0 0
+hstor014.ib:/export/data2/group/lhtsai/002 /mnt/lhtsai nfs rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.3.142,mountvers=3,mountport=20048,mountproto=udp,local_lock=none,addr=172.16.3.142 0 0
+/dev/mapper/vg00-chisholmlab002 /mnt/pool/chisholmlab002 xfs ro,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/dev/mapper/vg00-cnhlab001 /mnt/pool/cnhlab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/dev/mapper/vg00-micklab003 /mnt/pool/micklab003 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/dev/mapper/vg00-picower001 /mnt/pool/picower001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+-hosts /net autofs rw,relatime,fd=12,pgrp=2080,timeout=300,minproto=5,maxproto=5,indirect 0 0
+nfs001.lb:/ /net/nfs001.lb nfs rw,nosuid,nodev,relatime,vers=3,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.1.223.1,mountvers=3,mountport=635,mountproto=udp,local_lock=none,addr=10.1.223.1 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=12,pgrp=2080,timeout=300,minproto=5,maxproto=5,offset 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs rw,nosuid,nodev,relatime,vers=3,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=10.1.223.3,mountvers=3,mountport=635,mountproto=udp,local_lock=none,addr=10.1.223.3 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=23,pgrp=2080,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=29,pgrp=2080,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster /orcd/software autofs rw,relatime,fd=35,pgrp=2080,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster /orcd/software/core autofs rw,relatime,fd=41,pgrp=2080,timeout=86400,minproto=5,maxproto=5,indirect 0 0
+fstor001:/software/core/001 /orcd/software/core/001 nfs4 rw,noatime,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys,clientaddr=172.16.5.214,local_lock=none,addr=172.16.4.121 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=34,pgrp=1,timeout=300,minproto=5,maxproto=5,direct 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=2080,timeout=86400,minproto=5,maxproto=5,direct 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26384568k,mode=700 0 0
+/dev/mapper/vg00-sloanlab003 /sloanlab003 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,prjquota,grpquota 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/corderolab001           172.16.0.0/16
+/emanuellab001           172.16.0.0/16
+/housman001              172.16.0.0/16
+/mnt/pool/chisholmlab002 172.16.0.0/16
+/mnt/pool/cnhlab001      172.16.0.0/16
+/mnt/pool/micklab003     10.1.0.0/16,172.16.0.0/16
+/mnt/pool/picower001     172.16.0.0/16
+/sloanlab003             10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                                       Inodes      IUsed        IFree IUse% Mounted on
+/dev/md125                                    381232128      71843    381160285    1% /
+/dev/md127                                      2099136        338      2098798    1% /boot
+/dev/mapper/vg00-corderolab001               1073741824     754064   1072987760    1% /corderolab001
+devtmpfs                                       32978062        806     32977256    1% /dev
+tmpfs                                          32980710          1     32980709    1% /dev/shm
+/dev/mapper/vg00-emanuellab001               1989643840    1746595   1987897245    1% /emanuellab001
+/dev/mapper/vg00-housman001                  5368709120     730568   5367978552    1% /housman001
+hstor014.ib:/export/data2/group/lhtsai/002 122458308931   12389467 122445919464    1% /mnt/lhtsai
+/dev/mapper/vg00-chisholmlab002              2147483648     342095   2147141553    1% /mnt/pool/chisholmlab002
+/dev/mapper/vg00-cnhlab001                   4238580384    3004469   4235575915    1% /mnt/pool/cnhlab001
+/dev/mapper/vg00-micklab003                   337131728    5073830    332057898    2% /mnt/pool/micklab003
+/dev/mapper/vg00-picower001                  1717519584    4525097   1712994487    1% /mnt/pool/picower001
+nfs001.lb:/                                       31122        103        31019    1% /net/nfs001.lb
+nfs001.lb:/home                             13852490493 1439688631  12412801862   11% /net/nfs001.lb/home
+fstor001:/software/core/001                  2228666733   34454953   2194211780    2% /orcd/software/core/001
+tmpfs                                          32980710       1053     32979657    1% /run
+tmpfs                                          32980710          1     32980709    1% /run/user/0
+/dev/mapper/vg00-sloanlab003                 2147483648  104394911   2043088737    5% /sloanlab003
+tmpfs                                          32980710         16     32980694    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+/mnt/pool/picower001 172.16.0.0/16(rw,async) 
+
+/mnt/pool/micklab003 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async)
+
+/mnt/pool/chisholmlab002 172.16.0.0/16(rw,async) 
+
+/mnt/pool/cnhlab001 172.16.0.0/16(rw,async) 
+
+/housman001 172.16.0.0/16(rw,async) 
+
+/mnt/pool/picower001 172.16.4.246(ro,async,no_root_squash) 172.16.4.245(ro,async,no_root_squash)
+
+/corderolab001 172.16.0.0/16(rw,async) 
+
+/corderolab001 172.16.4.245(rw,async,no_root_squash)
+
+
+/corderolab001 172.16.4.246(ro,async,no_root_squash)
+
+/sloanlab003 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 10.1.222.16(rw,async,no_root_squash)
+
+/sloanlab003 172.16.10.118(rw,async,no_root_squash)
+
+/emanuellab001 172.16.0.0/16(rw,async) 
+
+/sloanlab003 172.16.4.246(rw,async,no_root_squash)
+/sloanlab003 172.16.4.245(rw,async,no_root_squash)
+
+
+#backups for backup001 and 002
+/corderolab001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/emanuellab001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/housman001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/mnt/pool/chisholmlab002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/mnt/pool/cnhlab001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/mnt/pool/micklab003 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/mnt/pool/picower001 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/sloanlab003 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+
+/mnt/pool/picower001 172.16.222.41(rw,async,no_root_squash) 172.16.222.42(rw,async,no_root_squash)
+#

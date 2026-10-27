@@ -1,0 +1,87 @@
+##host
+core020
+##df
+Filesystem                              Type        1K-blocks         Used    Available Use% Mounted on
+/dev/md0                                xfs         904143524     12599616    891543908   2% /
+/dev/nvme0n1p1                          vfat           204580         7560       197020   4% /boot/efi
+/dev/mapper/cburge-cburge               xfs      107372091392  62977122836  44394968556  59% /data/cburge/001
+/dev/rbd3                               xfs       21472749568  21472749500           68 100% /data/fiete/001
+/dev/rbd0                               xfs       21472749568    371262276  21101487292   2% /data/fisherp/001
+/dev/mapper/saxe--001-openmind--saxelab xfs       53685000192  53603519328     81480864 100% /data/saxe/001
+devtmpfs                                devtmpfs    131519780            0    131519780   0% /dev
+tmpfs                                   tmpfs       131542812            0    131542812   0% /dev/shm
+hstor005-n2:/group/saxe/001             nfs4     128849018880 117084167168  11764851712  91% /mnt/datasaxe001
+nfs001.lb:/                             nfs4           996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/home                         nfs4     432503206784 323470871936 109032334848  75% /net/nfs001.lb/home
+tmpfs                                   tmpfs        52617128       461268     52155860   1% /run
+tmpfs                                   tmpfs        26308560            4     26308556   1% /run/user/0
+efivarfs                                efivarfs          304          120          180  41% /sys/firmware/efi/efivars
+##mounts
+/dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota 0 0
+/dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+/dev/mapper/cburge-cburge /data/cburge/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+/dev/rbd3 /data/fiete/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,prjquota,grpquota 0 0
+/dev/rbd0 /data/fisherp/001 xfs ro,relatime,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,prjquota,grpquota 0 0
+/dev/mapper/saxe--001-openmind--saxelab /data/saxe/001 xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=131519780k,nr_inodes=32879945,mode=755,inode64 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime,pagesize=2M 0 0
+mqueue /dev/mqueue mqueue rw,nosuid,nodev,noexec,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=7,pgrp=3212,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=30840 0 0
+hstor005-n2:/group/saxe/001 /mnt/datasaxe001 nfs4 rw,relatime,vers=4.0,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.46,local_lock=none,addr=172.16.3.129 0 0
+-hosts /net autofs rw,relatime,fd=10,pgrp=3212,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=92031 0 0
+nfs001.lb:/ /net/nfs001.lb nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.46,local_lock=none,addr=10.1.223.1 0 0
+-hosts /net/nfs001.lb/home autofs rw,relatime,fd=10,pgrp=3212,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=92031 0 0
+nfs001.lb:/home /net/nfs001.lb/home nfs4 rw,nosuid,nodev,relatime,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.46,local_lock=none,addr=10.1.223.4 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=14008 0 0
+binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,size=52617128k,nr_inodes=819200,mode=755,inode64 0 0
+none /run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+none /run/credentials/systemd-tmpfiles-setup.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26308560k,nr_inodes=6577140,mode=700,inode64 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+bpf /sys/fs/bpf bpf rw,nosuid,nodev,noexec,relatime,mode=700 0 0
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+fusectl /sys/fs/fuse/connections fusectl rw,nosuid,nodev,noexec,relatime 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,nosuid,nodev,noexec,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/debug/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+tracefs /sys/kernel/tracing tracefs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/data/cburge/001  172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/fiete/001   172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/fisherp/001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/data/saxe/001    172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                                   Inodes      IUsed       IFree IUse% Mounted on
+/dev/md0                                  452292608     207253   452085355    1% /
+/dev/nvme0n1p1                                    0          0           0     - /boot/efi
+/dev/mapper/cburge-cburge               10737417792    1853515 10735564277    1% /data/cburge/001
+/dev/rbd3                                  16005256   16004773         483  100% /data/fiete/001
+/dev/rbd0                                2147483648       1110  2147482538    1% /data/fisherp/001
+/dev/mapper/saxe--001-openmind--saxelab   233537664   70513303   163024361   31% /data/saxe/001
+devtmpfs                                   32879945        791    32879154    1% /dev
+tmpfs                                      32885703          1    32885702    1% /dev/shm
+hstor005-n2:/group/saxe/001             23721707741  192005328 23529702413    1% /mnt/datasaxe001
+nfs001.lb:/                                   31122        103       31019    1% /net/nfs001.lb
+nfs001.lb:/home                         13852490493 1439702083 12412788410   11% /net/nfs001.lb/home
+tmpfs                                        819200       1274      817926    1% /run
+tmpfs                                       6577140         21     6577119    1% /run/user/0
+efivarfs                                          0          0           0     - /sys/firmware/efi/efivars
+##exportfile
+/data/cburge/001 172.16.3.139(ro,async,no_root_squash)
+/data/fisherp/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+/data/cburge/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+/data/saxe/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+/data/fiete/001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.6.221(rw,async,no_root_squash)
+

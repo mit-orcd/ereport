@@ -1,0 +1,83 @@
+##host
+eofe-data020-mgmt
+##df
+Filesystem                    Type        1K-blocks         Used   Available Use% Mounted on
+/dev/md127                    xfs         124979588      2589656   122389932   3% /
+/dev/md125                    xfs           4178944       179596     3999348   5% /boot
+/dev/md124                    vfat           204516        11440      193076   6% /boot/efi
+devtmpfs                      devtmpfs    197236952            0   197236952   0% /dev
+tmpfs                         tmpfs       197247992            0   197247992   0% /dev/shm
+tmpfs                         tmpfs       197247992       109252   197138740   1% /run
+tmpfs                         tmpfs        39449600            0    39449600   0% /run/user/0
+tmpfs                         tmpfs       197247992            0   197247992   0% /sys/fs/cgroup
+/dev/mapper/vg00-wfranklab001 xfs      246091352064 218411185780 27680166284  89% /wfranklab001
+##mounts
+rootfs / rootfs rw 0 0
+/dev/md127 / xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md125 /boot xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md124 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=197236952k,nr_inodes=49309238,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=5,pgrp=2253,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=17853 0 0
+-hosts /net autofs rw,relatime,fd=11,pgrp=2253,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=81154 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=22,pgrp=2253,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=73720 0 0
+/dev/mapper/vg00-wfranklab001 /nfs/wfranklab001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=28,pgrp=2253,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=17859 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=23,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=66578 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=17,pgrp=2253,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=81158 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=39449600k,mode=700 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+efivarfs /sys/firmware/efi/efivars efivarfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+/dev/mapper/vg00-wfranklab001 /wfranklab001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+##exports
+Export list for localhost:
+/wfranklab001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                        Inodes    IUsed      IFree IUse% Mounted on
+/dev/md127                      62520320    67733   62452587    1% /
+/dev/md125                       2094592       24    2094568    1% /boot
+/dev/md124                             0        0          0     - /boot/efi
+devtmpfs                        49309238      761   49308477    1% /dev
+tmpfs                           49311998        1   49311997    1% /dev/shm
+tmpfs                           49311998     1291   49310707    1% /run
+tmpfs                           49311998        1   49311997    1% /run/user/0
+tmpfs                           49311998       16   49311982    1% /sys/fs/cgroup
+/dev/mapper/vg00-wfranklab001 4921868736 24190511 4897678225    1% /wfranklab001
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+/wfranklab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 172.16.222.12(rw,sync,no_root_squash)
+

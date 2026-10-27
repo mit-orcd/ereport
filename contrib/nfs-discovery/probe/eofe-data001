@@ -1,0 +1,228 @@
+##host
+eofe-data001-mgmt
+##df
+Filesystem                    Type        1K-blocks         Used   Available Use% Mounted on
+/dev/sda1                     ext3        100660656     59087512    36453144  62% /
+/dev/mapper/vg00-ccoleylab001 xfs       10735331288   8996885920  1738445368  84% /ccoleylab001
+devtmpfs                      devtmpfs     32867464            0    32867464   0% /dev
+tmpfs                         tmpfs        32878488            0    32878488   0% /dev/shm
+/dev/mapper/vg00-ejalmlab001  xfs       10735331288   9691725564  1043605724  91% /ejalmlab001
+/dev/mapper/vg00-micklab002   xfs       68717389568  67636035528  1081354040  99% /micklab002
+/dev/mapper/vg00-polzlab001   xfs       10735331288   9860149396   875181892  92% /polzlab001
+/dev/mapper/vg00-pool002      xfs      179184228352 141362933092 37821295260  79% /pool002
+/dev/mapper/vg00-rgmark001    xfs       21472749488      2130868 21470618620   1% /rgmark001
+tmpfs                         tmpfs        32878488      3343732    29534756  11% /run
+tmpfs                         tmpfs         6575700            0     6575700   0% /run/user/0
+/dev/mapper/vg00-schuh001     xfs       10735331288   9725488828  1009842460  91% /schuh001
+tmpfs                         tmpfs        32878488            0    32878488   0% /sys/fs/cgroup
+##mounts
+/dev/sda1 / ext3 rw,relatime,data=ordered 0 0
+rootfs / rootfs rw 0 0
+/dev/mapper/vg00-ccoleylab001 /ccoleylab001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=32867464k,nr_inodes=8216866,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/dev/mapper/vg00-ejalmlab001 /ejalmlab001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+/dev/mapper/vg00-micklab002 /micklab002 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=6,pgrp=2644,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=18864 0 0
+-hosts /net autofs rw,relatime,fd=12,pgrp=2644,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=43793 0 0
+ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster /nfs autofs rw,relatime,fd=23,pgrp=2644,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=43805 0 0
+ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster /orcd autofs rw,relatime,fd=29,pgrp=2644,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=43810 0 0
+/dev/mapper/vg00-polzlab001 /polzlab001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+/dev/mapper/vg00-pool002 /pool002 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=22,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=8490 0 0
+ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster /programs autofs rw,relatime,fd=18,pgrp=2644,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=43797 0 0
+/dev/mapper/vg00-rgmark001 /rgmark001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=6575700k,mode=700 0 0
+/dev/mapper/vg00-schuh001 /schuh001 xfs rw,relatime,attr2,inode64,usrquota,prjquota,grpquota 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/ccoleylab001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/ejalmlab001  172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/micklab002   172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/polzlab001   172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/pool002      172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/rgmark001    172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+/schuh001     172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                        Inodes     IUsed      IFree IUse% Mounted on
+/dev/sda1                        6406144    125295    6280849    2% /
+/dev/mapper/vg00-ccoleylab001 1073741760   8517643 1065224117    1% /ccoleylab001
+devtmpfs                         8216866       708    8216158    1% /dev
+tmpfs                            8219622         1    8219621    1% /dev/shm
+/dev/mapper/vg00-ejalmlab001  1073741760   1940851 1071800909    1% /ejalmlab001
+/dev/mapper/vg00-micklab002   1374389504  15289151 1359100353    2% /micklab002
+/dev/mapper/vg00-polzlab001   1073741760   7789637 1065952123    1% /polzlab001
+/dev/mapper/vg00-pool002      3583726272 177503520 3406222752    5% /pool002
+/dev/mapper/vg00-rgmark001    2147483584         9 2147483575    1% /rgmark001
+tmpfs                            8219622      1056    8218566    1% /run
+tmpfs                            8219622         1    8219621    1% /run/user/0
+/dev/mapper/vg00-schuh001     1073741760  32619926 1041121834    4% /schuh001
+tmpfs                            8219622        16    8219606    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+# /micklab001 172.16.0.0/16(rw,fsid=80,no_root_squash,async) 
+# /chisholmlab001 172.16.0.0/16(rw,fsid=81,no_root_squash,async) 
+# /raffaelelab001 172.16.0.0/16(rw,fsid=82,no_root_squash,async) 
+# /prietolab001 172.16.0.0/16(rw,fsid=83,no_root_squash,async) 
+# /reimerlab001 172.16.0.0/16(rw,fsid=84,no_root_squash,async) 
+
+# /micklab001 10.1.0.0/16(rw,fsid=80,no_root_squash,async) 
+# /chisholmlab001 10.1.0.0/16(rw,fsid=81,no_root_squash,async) 
+# /raffaelelab001 10.1.0.0/16(rw,fsid=82,no_root_squash,async) 
+# /prietolab001 10.1.0.0/16(rw,fsid=83,no_root_squash,async) 
+# /reimerlab001 10.1.0.0/16(rw,fsid=84,no_root_squash,async) 
+
+# /ll001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+# 
+# /ll001 172.16.5.196(rw,async,no_root_squash)
+# /ll001 172.16.4.245(rw,async,no_root_squash)
+# /ll001 172.16.4.246(rw,async,no_root_squash)
+# /ll001 172.16.4.247(rw,async,no_root_squash)
+# /ll001 172.16.4.248(rw,async,no_root_squash)
+# /ll001 172.16.4.249(rw,async,no_root_squash)
+# /ll001 172.16.5.190(rw,async,no_root_squash)
+# /ll001 172.16.5.254(rw,async,no_root_squash)
+# /ll001 10.1.1.196(rw,async,no_root_squash)
+# /ll001 10.1.1.199(rw,async,no_root_squash)
+
+/micklab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+
+/micklab002 172.16.5.196(rw,async,no_root_squash)
+/micklab002 172.16.4.245(rw,async,no_root_squash)
+/micklab002 172.16.4.246(rw,async,no_root_squash)
+/micklab002 172.16.4.247(rw,async,no_root_squash)
+/micklab002 172.16.4.248(rw,async,no_root_squash)
+/micklab002 172.16.4.249(rw,async,no_root_squash)
+/micklab002 172.16.5.190(rw,async,no_root_squash)
+/micklab002 172.16.5.254(rw,async,no_root_squash)
+/micklab002 10.1.1.196(rw,async,no_root_squash)
+/micklab002 10.1.1.199(rw,async,no_root_squash)
+
+/rgmark001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+
+/rgmark001 172.16.5.196(rw,async,no_root_squash)
+/rgmark001 172.16.4.245(rw,async,no_root_squash)
+/rgmark001 172.16.4.246(rw,async,no_root_squash)
+/rgmark001 172.16.4.247(rw,async,no_root_squash)
+/rgmark001 172.16.4.248(rw,async,no_root_squash)
+/rgmark001 172.16.4.249(rw,async,no_root_squash)
+/rgmark001 172.16.5.190(rw,async,no_root_squash)
+/rgmark001 172.16.5.254(rw,async,no_root_squash)
+/rgmark001 10.1.1.196(rw,async,no_root_squash)
+/rgmark001 10.1.1.199(rw,async,no_root_squash)
+
+/pool002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+
+/pool002 172.16.3.121(rw,async,no_root_squash)
+
+/pool002 172.16.5.196(rw,async,no_root_squash)
+/pool002 172.16.4.245(rw,async,no_root_squash)
+/pool002 172.16.4.246(rw,async,no_root_squash)
+/pool002 172.16.4.247(rw,async,no_root_squash)
+/pool002 172.16.4.248(rw,async,no_root_squash)
+/pool002 172.16.4.249(rw,async,no_root_squash)
+/pool002 172.16.5.190(rw,async,no_root_squash)
+/pool002 172.16.5.191(rw,async,no_root_squash)
+/pool002 172.16.5.254(rw,async,no_root_squash)
+/pool002 10.1.1.196(rw,async,no_root_squash)
+/pool002 10.1.1.199(rw,async,no_root_squash)
+/pool002 172.16.3.123(ro,async,no_root_squash)
+/pool002 172.16.3.125(ro,async,no_root_squash)
+/pool002 172.16.222.12(rw,async,no_root_squash)
+/pool002 172.16.222.16(rw,async,no_root_squash)
+
+
+/polzlab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+
+/polzlab001 172.16.5.196(rw,async,no_root_squash)
+/polzlab001 172.16.4.245(rw,async,no_root_squash)
+/polzlab001 172.16.4.246(rw,async,no_root_squash)
+/polzlab001 172.16.4.247(rw,async,no_root_squash)
+/polzlab001 172.16.4.248(rw,async,no_root_squash)
+/polzlab001 172.16.4.249(rw,async,no_root_squash)
+/polzlab001 172.16.5.190(rw,async,no_root_squash)
+/polzlab001 172.16.5.254(rw,async,no_root_squash)
+/polzlab001 10.1.1.196(rw,async,no_root_squash)
+/polzlab001 10.1.1.199(rw,async,no_root_squash)
+
+/ccoleylab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 
+/ccoleylab001 172.16.5.196(rw,async,no_root_squash)
+/ccoleylab001 172.16.4.245(rw,async,no_root_squash)
+/ccoleylab001 172.16.4.246(rw,async,no_root_squash)
+/ccoleylab001 172.16.4.247(rw,async,no_root_squash)
+/ccoleylab001 172.16.4.248(rw,async,no_root_squash)
+/ccoleylab001 172.16.4.249(rw,async,no_root_squash)
+/ccoleylab001 172.16.5.190(rw,async,no_root_squash)
+/ccoleylab001 172.16.5.254(rw,async,no_root_squash)
+/ccoleylab001 10.1.1.196(rw,async,no_root_squash)
+/ccoleylab001 10.1.1.199(rw,async,no_root_squash)
+
+# export to backups
+/micklab002 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/micklab002 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/micklab002 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/micklab002 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/rgmark001 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/rgmark001 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/rgmark001 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/rgmark001 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/ccoleylab001 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ccoleylab001 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ccoleylab001 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ccoleylab001 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/polzlab001 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/polzlab001 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/polzlab001 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/polzlab001 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/ejalmlab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash)
+
+/ejalmlab001 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ejalmlab001 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ejalmlab001 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/ejalmlab001 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+
+/schuh001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash)
+
+/schuh001 172.16.6.221(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/schuh001 172.16.6.222(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/schuh001 172.16.6.223(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+/schuh001 172.16.6.224(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)

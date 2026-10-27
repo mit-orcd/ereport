@@ -1,0 +1,90 @@
+##host
+eofe-data005-mgmt
+##df
+Filesystem                  Type        1K-blocks         Used   Available Use% Mounted on
+/dev/md126                  xfs         419225600      2344252   416881348   1% /
+/dev/md125                  xfs           2088896       177324     1911572   9% /boot
+/dev/mapper/vg00-cnhlab002  xfs      107372095488 104638865756  2733229732  98% /cnhlab002
+devtmpfs                    devtmpfs    131912248            0   131912248   0% /dev
+tmpfs                       tmpfs       131922840            0   131922840   0% /dev/shm
+/dev/mapper/vg00-micklab004 xfs      161059186688 149135749500 11923437188  93% /micklab004
+/dev/mapper/vg00-psfclab001 xfs       53684991488  53684990508         980 100% /psfclab001
+tmpfs                       tmpfs       131922840       255252   131667588   1% /run
+tmpfs                       tmpfs        26384568            0    26384568   0% /run/user/0
+tmpfs                       tmpfs       131922840            0   131922840   0% /sys/fs/cgroup
+##mounts
+rootfs / rootfs rw 0 0
+/dev/md126 / xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/md125 /boot xfs rw,relatime,attr2,inode64,noquota 0 0
+/dev/mapper/vg00-cnhlab002 /cnhlab002 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+devtmpfs /dev devtmpfs rw,nosuid,size=131912248k,nr_inodes=32978062,mode=755 0 0
+hugetlbfs /dev/hugepages hugetlbfs rw,relatime 0 0
+mqueue /dev/mqueue mqueue rw,relatime 0 0
+devpts /dev/pts devpts rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000 0 0
+tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0
+/dev/mapper/vg00-micklab004 /micklab004 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+/etc/auto.misc /misc autofs rw,relatime,fd=7,pgrp=1984,timeout=300,minproto=5,maxproto=5,indirect 0 0
+-hosts /net autofs rw,relatime,fd=13,pgrp=1984,timeout=300,minproto=5,maxproto=5,indirect 0 0
+proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0
+nfsd /proc/fs/nfsd nfsd rw,relatime 0 0
+systemd-1 /proc/sys/fs/binfmt_misc autofs rw,relatime,fd=32,pgrp=1,timeout=300,minproto=5,maxproto=5,direct 0 0
+/dev/mapper/vg00-psfclab001 /psfclab001 xfs rw,relatime,attr2,inode64,sunit=512,swidth=7168,usrquota,grpquota 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,mode=755 0 0
+tmpfs /run/user/0 tmpfs rw,nosuid,nodev,relatime,size=26384568k,mode=700 0 0
+sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+cgroup /sys/fs/cgroup/blkio cgroup rw,nosuid,nodev,noexec,relatime,blkio 0 0
+cgroup /sys/fs/cgroup/cpu,cpuacct cgroup rw,nosuid,nodev,noexec,relatime,cpuacct,cpu 0 0
+cgroup /sys/fs/cgroup/cpuset cgroup rw,nosuid,nodev,noexec,relatime,cpuset 0 0
+cgroup /sys/fs/cgroup/devices cgroup rw,nosuid,nodev,noexec,relatime,devices 0 0
+cgroup /sys/fs/cgroup/freezer cgroup rw,nosuid,nodev,noexec,relatime,freezer 0 0
+cgroup /sys/fs/cgroup/hugetlb cgroup rw,nosuid,nodev,noexec,relatime,hugetlb 0 0
+cgroup /sys/fs/cgroup/memory cgroup rw,nosuid,nodev,noexec,relatime,memory 0 0
+cgroup /sys/fs/cgroup/net_cls,net_prio cgroup rw,nosuid,nodev,noexec,relatime,net_prio,net_cls 0 0
+cgroup /sys/fs/cgroup/perf_event cgroup rw,nosuid,nodev,noexec,relatime,perf_event 0 0
+cgroup /sys/fs/cgroup/pids cgroup rw,nosuid,nodev,noexec,relatime,pids 0 0
+cgroup /sys/fs/cgroup/systemd cgroup rw,nosuid,nodev,noexec,relatime,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd 0 0
+pstore /sys/fs/pstore pstore rw,nosuid,nodev,noexec,relatime 0 0
+configfs /sys/kernel/config configfs rw,relatime 0 0
+debugfs /sys/kernel/debug debugfs rw,relatime 0 0
+securityfs /sys/kernel/security securityfs rw,nosuid,nodev,noexec,relatime 0 0
+sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
+##exports
+Export list for localhost:
+/cnhlab002  10.1.0.0/16,172.16.0.0/16
+/micklab004 10.1.0.0/16,172.16.0.0/16
+/psfclab001 10.1.0.0/16,172.16.0.0/16
+##zfs
+##inodes
+Filesystem                      Inodes    IUsed      IFree IUse% Mounted on
+/dev/md126                   419430400    86326  419344074    1% /
+/dev/md125                     2099136      338    2098798    1% /boot
+/dev/mapper/vg00-cnhlab002  4294967296 17054542 4277912754    1% /cnhlab002
+devtmpfs                      32978062      778   32977284    1% /dev
+tmpfs                         32980710        1   32980709    1% /dev/shm
+/dev/mapper/vg00-micklab004 6442450944 11606242 6430844702    1% /micklab004
+/dev/mapper/vg00-psfclab001    9186128  9173839      12289  100% /psfclab001
+tmpfs                         32980710      980   32979730    1% /run
+tmpfs                         32980710        1   32980709    1% /run/user/0
+tmpfs                         32980710       16   32980694    1% /sys/fs/cgroup
+##exportfile
+# /etc/exports: the access control list for filesystems which may be exported
+#		to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+#
+# Example for NFSv4:
+# /srv/nfs4        gss/krb5i(rw,sync,fsid=0,crossmnt,no_subtree_check)
+# /srv/nfs4/homes  gss/krb5i(rw,sync,no_subtree_check)
+#
+
+#/reimerlab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.16.4.249(rw,async,no_root_squash) 
+/cnhlab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.16.4.249(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash)
+/micklab004 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.16.4.249(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash)
+/psfclab001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.16.4.249(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash)  172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+# /reimerlab002 172.16.4.249(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash)
+/psfclab001 172.16.4.246(rw,async,no_root_squash) 
+#/reimerlab002 172.16.4.246(rw,async,no_root_squash)  172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
+#/reimerlab002 172.16.4.245(rw,async,no_root_squash)
+
