@@ -52,13 +52,16 @@ facts via `probe.sh` snapshots.
   inventory, and never store one in the DB.
 - The `.ib` / `.inband` / `.lb` suffixes describe how an export is
   published to clients, not how we reach the filer — never turn them into
-  a network tag. Every probe goes desktop → login → xcat → `root@<box>`.
+  a network tag. Every probe is one ssh to `root@<box>` from the clush
+  fanout; any jump the filer needs belongs in ssh config, not the script.
 - `probe/<host>` is the only snapshot name; parse.py reports any file
   whose name is not an inventory host as ignored.
 
-- Filer hosts accept only xcat's root key — probing goes desktop → xcat →
-  filer via ~/.ssh/config's xcat stanza; `root@<filer>` from any other vantage
-  fails auth. LDAP reads go via `AUTOMOUNT_SSH` (default `root@core017`).
+- Filer hosts accept only xcat's root key — ~/.ssh/config's filer stanza
+  (`Host eofe-data* fstor* hstor* …`) supplies `ProxyJump xcat`, so
+  `run_probes.sh` just runs `root@<filer>`; the same `root@<filer>` from a
+  vantage without that stanza fails auth. LDAP reads go via `AUTOMOUNT_SSH`
+  (default `root@core017`).
 - The automount values in the local export tree are *export aliases*: newer
   filers present `/data`, `/data1…` roots via showmount, hiding
   `/data1/<…>`-shaped local dataset paths. `parse.py` re-roots candidates
