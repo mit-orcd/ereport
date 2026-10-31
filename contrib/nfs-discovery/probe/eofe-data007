@@ -2,7 +2,7 @@
 eofe-data007-mgmt
 ##df
 Filesystem     Type       1K-blocks        Used   Available Use% Mounted on
-/dev/md125     xfs        104806400     2188352   102618048   3% /
+/dev/md125     xfs        104806400     2190464   102615936   3% /
 /dev/md126     xfs          2088896      176652     1912244   9% /boot
 devtmpfs       devtmpfs    65857496           0    65857496   0% /dev
 tmpfs          tmpfs       65868004           0    65868004   0% /dev/shm
@@ -10,7 +10,42 @@ tmpfs          tmpfs       65868004      189664    65678340   1% /run
 tmpfs          tmpfs       13173604           0    13173604   0% /run/user/0
 tmpfs          tmpfs       65868004           0    65868004   0% /sys/fs/cgroup
 /dev/sda1      xfs      85951840580 68715515252 17236325328  80% /twcroninlab001
-/dev/sdb1      xfs      85951840580 82430491216  3521349364  96% /twcroninlab002
+/dev/sdb1      xfs      85951840580 82436420832  3515419748  96% /twcroninlab002
+##mountinfo
+18 62 0:17 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw
+19 62 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+20 62 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=65857496k,nr_inodes=16464374,mode=755
+21 18 0:16 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:7 - securityfs securityfs rw
+22 20 0:18 / /dev/shm rw,nosuid,nodev shared:3 - tmpfs tmpfs rw
+23 20 0:11 / /dev/pts rw,nosuid,noexec,relatime shared:4 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+24 62 0:19 / /run rw,nosuid,nodev shared:22 - tmpfs tmpfs rw,mode=755
+25 18 0:20 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:8 - tmpfs tmpfs ro,mode=755
+26 25 0:21 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd
+27 18 0:22 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:20 - pstore pstore rw
+28 25 0:23 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,cpuacct,cpu
+29 25 0:24 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,hugetlb
+30 25 0:25 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,devices
+31 25 0:26 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec,relatime shared:13 - cgroup cgroup rw,perf_event
+32 25 0:27 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:14 - cgroup cgroup rw,pids
+33 25 0:28 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
+34 25 0:29 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,freezer
+35 25 0:30 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec,relatime shared:17 - cgroup cgroup rw,net_prio,net_cls
+36 25 0:31 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:18 - cgroup cgroup rw,blkio
+37 25 0:32 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:19 - cgroup cgroup rw,cpuset
+59 18 0:33 / /sys/kernel/config rw,relatime shared:21 - configfs configfs rw
+62 1 9:125 / / rw,relatime shared:1 - xfs /dev/md125 rw,attr2,inode64,noquota
+16 19 0:15 / /proc/sys/fs/binfmt_misc rw,relatime shared:23 - autofs systemd-1 rw,fd=26,pgrp=1,timeout=300,minproto=5,maxproto=5,direct
+38 20 0:14 / /dev/mqueue rw,relatime shared:24 - mqueue mqueue rw
+40 18 0:6 / /sys/kernel/debug rw,relatime shared:25 - debugfs debugfs rw
+39 20 0:35 / /dev/hugepages rw,relatime shared:26 - hugetlbfs hugetlbfs rw
+71 19 0:36 / /proc/fs/nfsd rw,relatime shared:27 - nfsd nfsd rw
+75 62 9:126 / /boot rw,relatime shared:28 - xfs /dev/md126 rw,attr2,inode64,noquota
+74 62 8:1 / /twcroninlab001 rw,relatime shared:29 - xfs /dev/sda1 rw,attr2,inode64,sunit=512,swidth=5632,usrquota
+73 62 8:17 / /twcroninlab002 rw,relatime shared:30 - xfs /dev/sdb1 rw,attr2,inode64,sunit=512,swidth=5632,usrquota
+80 62 0:37 / /var/lib/nfs/rpc_pipefs rw,relatime shared:31 - rpc_pipefs sunrpc rw
+82 62 0:38 / /misc rw,relatime shared:32 - autofs /etc/auto.misc rw,fd=7,pgrp=1665,timeout=300,minproto=5,maxproto=5,indirect
+84 62 0:39 / /net rw,relatime shared:33 - autofs -hosts rw,fd=13,pgrp=1665,timeout=300,minproto=5,maxproto=5,indirect
+86 24 0:40 / /run/user/0 rw,nosuid,nodev,relatime shared:34 - tmpfs tmpfs rw,size=13173604k,mode=700
 ##mounts
 rootfs / rootfs rw 0 0
 /dev/md125 / xfs rw,relatime,attr2,inode64,noquota 0 0
@@ -51,7 +86,33 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 Export list for localhost:
 /twcroninlab001 10.1.0.0/16,172.16.0.0/16
 /twcroninlab002 10.1.0.0/16,172.16.0.0/16
+##exportopts
+/twcroninlab001
+		172.16.6.221(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab001
+		172.16.6.222(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab001
+		172.16.6.223(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab001
+		172.16.6.224(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab002
+		172.16.6.221(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab002
+		172.16.6.222(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab002
+		172.16.6.223(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab002
+		172.16.6.224(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/twcroninlab001
+		172.16.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/twcroninlab001
+		10.1.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/twcroninlab002
+		172.16.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/twcroninlab002
+		10.1.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
+##zpool
 ##inodes
 Filesystem         Inodes   IUsed      IFree IUse% Mounted on
 /dev/md125      104857600   71044  104786556    1% /
@@ -62,7 +123,7 @@ tmpfs            16467001     800   16466201    1% /run
 tmpfs            16467001       1   16467000    1% /run/user/0
 tmpfs            16467001      16   16466985    1% /sys/fs/cgroup
 /dev/sda1      3438157056 3190210 3434966846    1% /twcroninlab001
-/dev/sdb1      3438157056 1902680 3436254376    1% /twcroninlab002
+/dev/sdb1      3438157056 1902915 3436254141    1% /twcroninlab002
 ##exportfile
 # /etc/exports: the access control list for filesystems which may be exported
 #		to NFS clients.  See exports(5).
@@ -83,3 +144,4 @@ tmpfs            16467001      16   16466985    1% /sys/fs/cgroup
 /twcroninlab001 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
 /twcroninlab002 172.16.6.221(rw,async,no_root_squash) 172.16.6.222(rw,async,no_root_squash)
 /twcroninlab002 172.16.6.223(rw,async,no_root_squash) 172.16.6.224(rw,async,no_root_squash)
+##ok

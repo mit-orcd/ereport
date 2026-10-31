@@ -2,7 +2,7 @@
 eofe-data023-mgmt.inband
 ##df
 Filesystem                      Type        1K-blocks         Used  Available Use% Mounted on
-/dev/sdc3                       xfs         158784768      3768724  155016044   3% /
+/dev/sdc3                       xfs         158784768      3769244  155015524   3% /
 /dev/sdc1                       ext4          8195240       275052    7484172   4% /boot
 devtmpfs                        devtmpfs    197272412            0  197272412   0% /dev
 tmpfs                           tmpfs       197289048            0  197289048   0% /dev/shm
@@ -10,6 +10,43 @@ tmpfs                           tmpfs       197289048            0  197289048   
 tmpfs                           tmpfs       197289048       616128  196672920   1% /run
 tmpfs                           tmpfs        39457808            0   39457808   0% /run/user/0
 tmpfs                           tmpfs       197289048            0  197289048   0% /sys/fs/cgroup
+##mountinfo
+22 97 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+23 97 0:5 / /proc rw,nosuid,nodev,noexec,relatime shared:25 - proc proc rw
+24 97 0:6 / /dev rw,nosuid shared:21 - devtmpfs devtmpfs rw,size=197272412k,nr_inodes=49318103,mode=755
+25 22 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+26 24 0:22 / /dev/shm rw,nosuid,nodev shared:22 - tmpfs tmpfs rw
+27 24 0:23 / /dev/pts rw,nosuid,noexec,relatime shared:23 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+28 97 0:24 / /run rw,nosuid,nodev shared:24 - tmpfs tmpfs rw,mode=755
+29 22 0:25 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:4 - tmpfs tmpfs ro,mode=755
+30 29 0:26 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:5 - cgroup cgroup rw,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd
+31 22 0:27 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:17 - pstore pstore rw
+32 22 0:28 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:18 - bpf bpf rw,mode=700
+33 29 0:29 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:6 - cgroup cgroup rw,cpu,cpuacct
+34 29 0:30 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec,relatime shared:7 - cgroup cgroup rw,devices
+35 29 0:31 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:8 - cgroup cgroup rw,hugetlb
+36 29 0:32 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,blkio
+37 29 0:33 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,freezer
+38 29 0:34 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,cpuset
+39 29 0:35 / /sys/fs/cgroup/rdma rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,rdma
+40 29 0:36 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec,relatime shared:13 - cgroup cgroup rw,net_cls,net_prio
+41 29 0:37 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec,relatime shared:14 - cgroup cgroup rw,perf_event
+42 29 0:38 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
+43 29 0:39 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,pids
+44 22 0:12 / /sys/kernel/tracing rw,relatime shared:19 - tracefs none rw
+93 22 0:40 / /sys/kernel/config rw,relatime shared:20 - configfs configfs rw
+97 1 8:35 / / rw,relatime shared:1 - xfs /dev/sdc3 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+21 24 0:20 / /dev/hugepages rw,relatime shared:26 - hugetlbfs hugetlbfs rw,pagesize=2M
+45 24 0:19 / /dev/mqueue rw,relatime shared:27 - mqueue mqueue rw
+46 23 0:42 / /proc/sys/fs/binfmt_misc rw,relatime shared:28 - autofs systemd-1 rw,fd=42,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=39055
+47 22 0:8 / /sys/kernel/debug rw,relatime shared:29 - debugfs debugfs rw
+110 23 0:43 / /proc/fs/nfsd rw,relatime shared:59 - nfsd nfsd rw
+114 97 8:33 / /boot rw,relatime shared:61 - ext4 /dev/sdc1 rw
+117 97 253:0 / /mvogelsblab002 rw,relatime shared:63 - xfs /dev/mapper/vg00-mvogelsblab002 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+185 97 0:44 / /var/lib/nfs/rpc_pipefs rw,relatime shared:65 - rpc_pipefs sunrpc rw
+321 97 0:46 / /misc rw,relatime shared:141 - autofs /etc/auto.misc rw,fd=5,pgrp=1747,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=17862
+322 97 0:47 / /net rw,relatime shared:145 - autofs -hosts rw,fd=11,pgrp=1747,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=26356
+327 28 0:48 / /run/user/0 rw,nosuid,nodev,relatime shared:187 - tmpfs tmpfs rw,size=39457808k,mode=700
 ##mounts
 /dev/sdc3 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/sdc1 /boot ext4 rw,relatime 0 0
@@ -50,7 +87,35 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /mvogelsblab002 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##exportopts
+/mvogelsblab002
+		172.16.5.196(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.4.245(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.4.246(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.4.247(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.4.248(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.4.249(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.5.190(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.5.254(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		10.1.1.196(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		10.1.1.199(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mvogelsblab002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/mvogelsblab002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/mvogelsblab002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
+##zpool
 ##inodes
 Filesystem                          Inodes   IUsed      IFree IUse% Mounted on
 /dev/sdc3                         79431168   64087   79367081    1% /
@@ -77,3 +142,4 @@ tmpfs                             49322262      17   49322245    1% /sys/fs/cgro
 /mvogelsblab002 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 
 
 
+##ok

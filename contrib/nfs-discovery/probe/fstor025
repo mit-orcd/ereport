@@ -2,17 +2,58 @@
 fstor025-mgmt
 ##df
 Filesystem                      Type        1K-blocks         Used    Available Use% Mounted on
-/dev/mapper/xcatvg-root         xfs         463051872     12142576    450909296   3% /
+/dev/mapper/xcatvg-root         xfs         463051872     12149796    450902076   3% /
 /dev/nvme17n1p2                 xfs           1038336       445480       592856  43% /boot
 /dev/nvme17n1p1                 vfat           261868         7568       254300   3% /boot/efi
-/dev/xi_dev00                   xfs      330014009344 146429179260 183584830084  45% /data1
+/dev/xi_dev00                   xfs      330014009344 146442650408 183571358936  45% /data1
 devtmpfs                        devtmpfs         4096            0         4096   0% /dev
 tmpfs                           tmpfs       792223480            0    792223480   0% /dev/shm
-hstor006-n2:/group/edboyden/001 nfs4      64424509440  45309305856  19115203584  71% /orcd/data/edboyden/001
-nfs001.lb:/home                 nfs4     432503206784 323470349184 109032857600  75% /orcd/home/002
+hstor006-n2:/group/edboyden/001 nfs4      64424509440  45310815232  19113694208  71% /orcd/data/edboyden/001
+nfs001.lb:/home                 nfs4     432503206784 326035537920 106467668864  76% /orcd/home/002
 tmpfs                           tmpfs       316889392       204096    316685296   1% /run
 tmpfs                           tmpfs       158444696            4    158444692   1% /run/user/0
 efivarfs                        efivarfs          496          341          151  70% /sys/firmware/efi/efivars
+##mountinfo
+20 69 0:19 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+21 69 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+22 69 0:5 / /dev rw,nosuid shared:9 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=198049921,mode=755,inode64
+23 21 0:6 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+24 22 0:21 / /dev/shm rw,nosuid,nodev shared:10 - tmpfs tmpfs rw,inode64
+25 22 0:22 / /dev/pts rw,nosuid,noexec,relatime shared:11 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+26 69 0:23 / /run rw,nosuid,nodev shared:12 - tmpfs tmpfs rw,size=316889392k,nr_inodes=819200,mode=755,inode64
+27 21 0:24 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+28 21 0:25 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+29 21 0:26 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:6 - efivarfs efivarfs rw
+30 21 0:27 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:7 - bpf bpf rw,mode=700
+63 21 0:31 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:8 - configfs configfs rw
+69 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/xcatvg-root rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+31 20 0:28 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=200738
+32 22 0:29 / /dev/hugepages rw,relatime shared:15 - hugetlbfs hugetlbfs rw,pagesize=2M
+33 22 0:18 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:16 - mqueue mqueue rw
+34 21 0:7 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:17 - debugfs debugfs rw
+35 21 0:12 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:18 - tracefs tracefs rw
+36 20 0:30 / /proc/fs/nfsd rw,relatime shared:19 - nfsd nfsd rw
+37 21 0:32 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:20 - fusectl fusectl rw
+60 26 0:33 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+62 26 0:34 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:22 - ramfs none rw,mode=700
+143 69 259:4 / /boot rw,relatime shared:65 - xfs /dev/nvme17n1p2 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+149 143 259:3 / /boot/efi rw,relatime shared:78 - vfat /dev/nvme17n1p1 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+155 69 259:29 / /data1 rw,noatime,nodiratime shared:82 - xfs /dev/xi_dev00 rw,swalloc,attr2,largeio,inode64,allocsize=131072k,logbufs=8,logbsize=256k,sunit=32,swidth=704,usrquota,prjquota,grpquota
+187 26 0:36 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:85 - ramfs none rw,mode=700
+160 31 0:37 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:88 - binfmt_misc binfmt_misc rw
+166 69 0:38 / /var/lib/nfs/rpc_pipefs rw,relatime shared:91 - rpc_pipefs sunrpc rw
+162 34 0:12 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:66 - tracefs tracefs rw
+718 69 0:45 / /misc rw,relatime shared:405 - autofs /etc/auto.misc rw,fd=6,pgrp=777862,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=179993791
+741 69 0:46 / /net rw,relatime shared:425 - autofs -hosts rw,fd=9,pgrp=777862,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=179946675
+769 69 0:47 / /nfs rw,relatime shared:437 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=777862,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=180009125
+845 69 0:48 / /orcd rw,relatime shared:449 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=15,pgrp=777862,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=179740648
+868 69 0:49 / /programs rw,relatime shared:461 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=24,pgrp=777862,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=179999870
+784 845 0:53 / /orcd/data rw,relatime shared:414 - autofs ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=777862,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=179869302
+807 784 0:54 / /orcd/data/edboyden rw,relatime shared:510 - autofs ou=auto.orcd.data.edboyden,ou=automount,dc=cm,dc=cluster rw,fd=21,pgrp=777862,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=179934072
+835 807 0:56 / /orcd/data/edboyden/001 rw,relatime shared:522 - nfs4 hstor006-n2:/group/edboyden/001 rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.4.145,local_lock=none,addr=172.16.3.131
+1137 845 0:58 / /orcd/home rw,relatime shared:567 - autofs ou=auto.orcd.home,ou=automount,dc=cm,dc=cluster rw,fd=29,pgrp=777862,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=387127609
+1164 1137 0:59 / /orcd/home/002 rw,relatime shared:612 - nfs4 nfs001.lb:/home rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.145,local_lock=none,addr=10.1.223.1
+541 26 0:44 / /run/user/0 rw,nosuid,nodev,relatime shared:247 - tmpfs tmpfs rw,size=158444696k,nr_inodes=39611174,mode=700,inode64
 ##mounts
 /dev/mapper/xcatvg-root / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/nvme17n1p2 /boot xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
@@ -57,17 +98,22 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##exportopts
+/data1        	172.16.0.0/16(sync,no_wdelay,hide,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.19.0.0/16(sync,no_wdelay,hide,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	10.1.0.0/16(sync,no_wdelay,hide,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
 ##zfs
+##zpool
 ##inodes
 Filesystem                           Inodes      IUsed       IFree IUse% Mounted on
-/dev/mapper/xcatvg-root           231639040     193604   231445436    1% /
+/dev/mapper/xcatvg-root           231639040     193605   231445435    1% /
 /dev/nvme17n1p2                      524288         38      524250    1% /boot
 /dev/nvme17n1p1                           0          0           0     - /boot/efi
-/dev/xi_dev00                    6600321920   64349409  6535972511    1% /data1
+/dev/xi_dev00                    6600321920   64376645  6535945275    1% /data1
 devtmpfs                          198049921       1373   198048548    1% /dev
 tmpfs                             198055870          1   198055869    1% /dev/shm
-hstor006-n2:/group/edboyden/001 38235509724    5102619 38230407105    1% /orcd/data/edboyden/001
-nfs001.lb:/home                 13852490493 1439693348 12412797145   11% /orcd/home/002
+hstor006-n2:/group/edboyden/001 38232494968    5106481 38227388487    1% /orcd/data/edboyden/001
+nfs001.lb:/home                 13853452123 1443841583 12409610540   11% /orcd/home/002
 tmpfs                                819200       1743      817457    1% /run
 tmpfs                              39611174         21    39611153    1% /run/user/0
 efivarfs                                  0          0           0     - /sys/firmware/efi/efivars
@@ -79,3 +125,4 @@ efivarfs                                  0          0           0     - /sys/fi
 
 # nvidia-bcm
 #/data1 172.19.202.37/16(fsid=0,rw,sync,no_subtree_check,no_wdelay)
+##ok

@@ -2,17 +2,60 @@
 eofe-data009-mgmt
 ##df
 Filesystem                  Type        1K-blocks         Used    Available Use% Mounted on
-/dev/sdm5                   ext4        275311892      4386428    256917352   2% /
+/dev/sdm5                   ext4        275311892      4387560    256916220   2% /
 /dev/sdm2                   ext4          1998672       178748      1698684  10% /boot
 /dev/mapper/vg01-cnhlab003  xfs      161059186088 149501315200  11557870888  93% /cnhlab003
 devtmpfs                    devtmpfs    131853540            0    131853540   0% /dev
 tmpfs                       tmpfs       131863648            0    131863648   0% /dev/shm
 /dev/mapper/vg00-micklab005 xfs      161059186088 103902746336  57156439752  65% /micklab005
-nfs001.lb:/home             nfs4     432503206784 323470871936 109032334848  75% /orcd/home/002
-fstor001:/software/core/001 nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+nfs001.lb:/home             nfs4     432503206784 326036352640 106466854144  76% /orcd/home/002
+fstor001:/software/core/001 nfs4       4294967296   3197863296   1097104000  75% /orcd/software/core/001
 tmpfs                       tmpfs       131863648         1280    131862368   1% /run
 tmpfs                       tmpfs        26372732            0     26372732   0% /run/user/0
 tmpfs                       tmpfs       131863648            0    131863648   0% /sys/fs/cgroup
+##mountinfo
+18 62 0:17 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw
+19 62 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+20 62 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=131853540k,nr_inodes=32963385,mode=755
+21 18 0:16 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:7 - securityfs securityfs rw
+22 20 0:18 / /dev/shm rw,nosuid,nodev shared:3 - tmpfs tmpfs rw
+23 20 0:11 / /dev/pts rw,nosuid,noexec,relatime shared:4 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+24 62 0:19 / /run rw,nosuid,nodev shared:22 - tmpfs tmpfs rw,mode=755
+25 18 0:20 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:8 - tmpfs tmpfs ro,mode=755
+26 25 0:21 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd
+27 18 0:22 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:20 - pstore pstore rw
+28 25 0:23 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,memory
+29 25 0:24 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,cpuacct,cpu
+30 25 0:25 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,cpuset
+31 25 0:26 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec,relatime shared:13 - cgroup cgroup rw,devices
+32 25 0:27 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:14 - cgroup cgroup rw,hugetlb
+33 25 0:28 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,perf_event
+34 25 0:29 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,blkio
+35 25 0:30 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec,relatime shared:17 - cgroup cgroup rw,freezer
+36 25 0:31 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec,relatime shared:18 - cgroup cgroup rw,net_prio,net_cls
+37 25 0:32 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:19 - cgroup cgroup rw,pids
+59 18 0:33 / /sys/kernel/config rw,relatime shared:21 - configfs configfs rw
+62 1 8:197 / / rw,relatime shared:1 - ext4 /dev/sdm5 rw,data=ordered
+16 19 0:15 / /proc/sys/fs/binfmt_misc rw,relatime shared:23 - autofs systemd-1 rw,fd=30,pgrp=1,timeout=300,minproto=5,maxproto=5,direct
+38 20 0:14 / /dev/mqueue rw,relatime shared:24 - mqueue mqueue rw
+40 18 0:6 / /sys/kernel/debug rw,relatime shared:25 - debugfs debugfs rw
+39 20 0:35 / /dev/hugepages rw,relatime shared:26 - hugetlbfs hugetlbfs rw
+71 19 0:36 / /proc/fs/nfsd rw,relatime shared:27 - nfsd nfsd rw
+74 62 8:194 / /boot rw,relatime shared:28 - ext4 /dev/sdm2 rw,data=ordered
+77 62 253:12 / /cnhlab003 rw,relatime shared:29 - xfs /dev/mapper/vg01-cnhlab003 rw,attr2,inode64,usrquota,grpquota
+76 62 253:10 / /micklab005 rw,relatime shared:30 - xfs /dev/mapper/vg00-micklab005 rw,attr2,inode64,usrquota,grpquota
+80 62 0:37 / /var/lib/nfs/rpc_pipefs rw,relatime shared:31 - rpc_pipefs sunrpc rw
+82 62 0:38 / /misc rw,relatime shared:32 - autofs /etc/auto.misc rw,fd=6,pgrp=2053,timeout=300,minproto=5,maxproto=5,indirect
+84 62 0:39 / /net rw,relatime shared:33 - autofs -hosts rw,fd=12,pgrp=2053,timeout=300,minproto=5,maxproto=5,indirect
+86 62 0:40 / /programs rw,relatime shared:34 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=2053,timeout=86400,minproto=5,maxproto=5,direct
+88 62 0:41 / /nfs rw,relatime shared:35 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=23,pgrp=2053,timeout=86400,minproto=5,maxproto=5,indirect
+90 62 0:42 / /orcd rw,relatime shared:36 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=29,pgrp=2053,timeout=86400,minproto=5,maxproto=5,indirect
+94 90 0:44 / /orcd/home rw,relatime shared:38 - autofs ou=auto.orcd.home,ou=automount,dc=cm,dc=cluster rw,fd=34,pgrp=2053,timeout=86400,minproto=5,maxproto=5,indirect
+96 94 0:46 / /orcd/home/002 rw,relatime shared:39 - nfs4 nfs001.lb:/home rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys,clientaddr=10.1.10.209,local_lock=none,addr=10.1.223.3
+98 90 0:45 / /orcd/software rw,relatime shared:40 - autofs ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster rw,fd=40,pgrp=2053,timeout=86400,minproto=5,maxproto=5,indirect
+100 98 0:47 / /orcd/software/core rw,relatime shared:41 - autofs ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster rw,fd=46,pgrp=2053,timeout=86400,minproto=5,maxproto=5,indirect
+102 100 0:49 / /orcd/software/core/001 rw,noatime shared:42 - nfs4 fstor001:/software/core/001 rw,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,port=0,timeo=600,retrans=2,sec=sys,clientaddr=172.16.10.209,local_lock=none,addr=172.16.4.121
+92 24 0:43 / /run/user/0 rw,nosuid,nodev,relatime shared:37 - tmpfs tmpfs rw,size=26372732k,mode=700
 ##mounts
 /dev/sdm5 / ext4 rw,relatime,data=ordered 0 0
 rootfs / rootfs rw 0 0
@@ -61,7 +104,17 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 Export list for localhost:
 /cnhlab003  10.1.0.0/16,172.16.0.0/16
 /micklab005 10.1.0.0/16,172.16.0.0/16
+##exportopts
+/micklab005   	172.16.4.249(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/micklab005   	172.16.4.246(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/cnhlab003    	172.16.4.249(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/cnhlab003    	172.16.4.246(rw,async,wdelay,no_root_squash,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/micklab005   	172.16.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/micklab005   	10.1.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/cnhlab003    	172.16.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/cnhlab003    	10.1.0.0/16(rw,async,wdelay,root_squash,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
+##zpool
 ##inodes
 Filesystem                       Inodes      IUsed       IFree IUse% Mounted on
 /dev/sdm5                      17489920     119642    17370278    1% /
@@ -70,8 +123,8 @@ Filesystem                       Inodes      IUsed       IFree IUse% Mounted on
 devtmpfs                       32963385        763    32962622    1% /dev
 tmpfs                          32965912          1    32965911    1% /dev/shm
 /dev/mapper/vg00-micklab005  6442450880   46325924  6396124956    1% /micklab005
-nfs001.lb:/home             13852490493 1439702083 12412788410   11% /orcd/home/002
-fstor001:/software/core/001  2228666733   34454953  2194211780    2% /orcd/software/core/001
+nfs001.lb:/home             13853452123 1443842140 12409609983   11% /orcd/home/002
+fstor001:/software/core/001  2228663157   34454954  2194208203    2% /orcd/software/core/001
 tmpfs                          32965912       1071    32964841    1% /run
 tmpfs                          32965912          1    32965911    1% /run/user/0
 tmpfs                          32965912         16    32965896    1% /sys/fs/cgroup
@@ -99,3 +152,4 @@ tmpfs                          32965912         16    32965896    1% /sys/fs/cgr
 #/reimerlab003 172.16.4.245(rw,async,no_root_squash)
 #/reimerlab004 172.16.4.245(rw,async,no_root_squash)
 
+##ok

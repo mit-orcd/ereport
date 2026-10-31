@@ -2,15 +2,54 @@
 eofe-data021-mgmt
 ##df
 Filesystem                   Type        1K-blocks        Used    Available Use% Mounted on
-/dev/md125                   xfs         124975492     2508868    122466624   3% /
+/dev/md125                   xfs         124975492     2509632    122465860   3% /
 /dev/md126                   xfs           4183040      179600      4003440   5% /boot
 /dev/md124                   vfat           204516       11440       193076   6% /boot/efi
 devtmpfs                     devtmpfs    197236952           0    197236952   0% /dev
 tmpfs                        tmpfs       197247992           0    197247992   0% /dev/shm
-/dev/mapper/vg00-mbuehler001 xfs      246091352064 79700086264 166391265800  33% /mbuehler001
-tmpfs                        tmpfs       197247992      109220    197138772   1% /run
+/dev/mapper/vg00-mbuehler001 xfs      246091352064 79700086312 166391265752  33% /mbuehler001
+tmpfs                        tmpfs       197247992      117412    197130580   1% /run
 tmpfs                        tmpfs        39449600           0     39449600   0% /run/user/0
 tmpfs                        tmpfs       197247992           0    197247992   0% /sys/fs/cgroup
+##mountinfo
+18 41 0:18 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw
+19 41 0:3 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
+20 41 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=197236952k,nr_inodes=49309238,mode=755
+21 18 0:17 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:7 - securityfs securityfs rw
+22 20 0:19 / /dev/shm rw,nosuid,nodev shared:3 - tmpfs tmpfs rw
+23 20 0:12 / /dev/pts rw,nosuid,noexec,relatime shared:4 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+24 41 0:20 / /run rw,nosuid,nodev shared:23 - tmpfs tmpfs rw,mode=755
+25 18 0:21 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:8 - tmpfs tmpfs ro,mode=755
+26 25 0:22 / /sys/fs/cgroup/systemd rw,nosuid,nodev,noexec,relatime shared:9 - cgroup cgroup rw,xattr,release_agent=/usr/lib/systemd/systemd-cgroups-agent,name=systemd
+27 18 0:23 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:20 - pstore pstore rw
+28 18 0:24 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:21 - efivarfs efivarfs rw
+29 25 0:25 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:10 - cgroup cgroup rw,memory
+30 25 0:26 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime shared:11 - cgroup cgroup rw,cpuset
+31 25 0:27 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime shared:12 - cgroup cgroup rw,cpuacct,cpu
+32 25 0:28 / /sys/fs/cgroup/perf_event rw,nosuid,nodev,noexec,relatime shared:13 - cgroup cgroup rw,perf_event
+33 25 0:29 / /sys/fs/cgroup/devices rw,nosuid,nodev,noexec,relatime shared:14 - cgroup cgroup rw,devices
+34 25 0:30 / /sys/fs/cgroup/freezer rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,freezer
+35 25 0:31 / /sys/fs/cgroup/net_cls,net_prio rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,net_prio,net_cls
+36 25 0:32 / /sys/fs/cgroup/hugetlb rw,nosuid,nodev,noexec,relatime shared:17 - cgroup cgroup rw,hugetlb
+37 25 0:33 / /sys/fs/cgroup/blkio rw,nosuid,nodev,noexec,relatime shared:18 - cgroup cgroup rw,blkio
+38 25 0:34 / /sys/fs/cgroup/pids rw,nosuid,nodev,noexec,relatime shared:19 - cgroup cgroup rw,pids
+39 18 0:35 / /sys/kernel/config rw,relatime shared:22 - configfs configfs rw
+41 0 9:125 / / rw,relatime shared:1 - xfs /dev/md125 rw,attr2,inode64,noquota
+16 19 0:16 / /proc/sys/fs/binfmt_misc rw,relatime shared:24 - autofs systemd-1 rw,fd=28,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=69719
+43 20 0:15 / /dev/mqueue rw,relatime shared:25 - mqueue mqueue rw
+42 18 0:6 / /sys/kernel/debug rw,relatime shared:26 - debugfs debugfs rw
+44 20 0:37 / /dev/hugepages rw,relatime shared:27 - hugetlbfs hugetlbfs rw
+45 19 0:38 / /proc/fs/nfsd rw,relatime shared:28 - nfsd nfsd rw
+46 41 9:126 / /boot rw,relatime shared:29 - xfs /dev/md126 rw,attr2,inode64,noquota
+47 46 9:124 / /boot/efi rw,relatime shared:30 - vfat /dev/md124 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+48 41 253:0 / /mbuehler001 rw,relatime shared:31 - xfs /dev/mapper/vg00-mbuehler001 rw,attr2,inode64,usrquota,prjquota,grpquota
+50 41 0:39 / /var/lib/nfs/rpc_pipefs rw,relatime shared:32 - rpc_pipefs sunrpc rw
+91 41 0:40 / /misc rw,relatime shared:72 - autofs /etc/auto.misc rw,fd=5,pgrp=2252,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=79317
+93 41 0:41 / /net rw,relatime shared:74 - autofs -hosts rw,fd=11,pgrp=2252,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=22490
+95 41 0:42 / /programs rw,relatime shared:76 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=17,pgrp=2252,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=82237
+97 41 0:43 / /nfs rw,relatime shared:78 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=22,pgrp=2252,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=82241
+99 41 0:44 / /orcd rw,relatime shared:80 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=28,pgrp=2252,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=82246
+101 24 0:45 / /run/user/0 rw,nosuid,nodev,relatime shared:82 - tmpfs tmpfs rw,size=39449600k,mode=700
 ##mounts
 rootfs / rootfs rw 0 0
 /dev/md125 / xfs rw,relatime,attr2,inode64,noquota 0 0
@@ -54,7 +93,22 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /mbuehler001 172.19.0.0/16,10.1.0.0/16,172.16.0.0/16
+##exportopts
+/mbuehler001  	172.16.5.196(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.4.245(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.4.246(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.4.247(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.4.248(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.4.249(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.5.190(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.5.254(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	10.1.1.196(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	10.1.1.199(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/mbuehler001  	172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/mbuehler001  	10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/mbuehler001  	172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
+##zpool
 ##inodes
 Filesystem                       Inodes    IUsed      IFree IUse% Mounted on
 /dev/md125                     62518272    67667   62450605    1% /
@@ -62,7 +116,7 @@ Filesystem                       Inodes    IUsed      IFree IUse% Mounted on
 /dev/md124                            0        0          0     - /boot/efi
 devtmpfs                       49309238      761   49308477    1% /dev
 tmpfs                          49311998        1   49311997    1% /dev/shm
-/dev/mapper/vg00-mbuehler001 4921868736 59963628 4861905108    2% /mbuehler001
+/dev/mapper/vg00-mbuehler001 4921868736 59963638 4861905098    2% /mbuehler001
 tmpfs                          49311998     1278   49310720    1% /run
 tmpfs                          49311998        1   49311997    1% /run/user/0
 tmpfs                          49311998       16   49311982    1% /sys/fs/cgroup
@@ -80,3 +134,4 @@ tmpfs                          49311998       16   49311982    1% /sys/fs/cgroup
 
 /mbuehler001 172.16.0.0/16(rw,async) 10.1.0.0/16(rw,async) 172.19.0.0/16(rw,async) 172.16.5.196(rw,async,no_root_squash) 172.16.4.245(rw,async,no_root_squash) 172.16.4.246(rw,async,no_root_squash) 172.16.4.247(rw,async,no_root_squash) 172.16.4.248(rw,async,no_root_squash) 172.16.4.249(rw,async,no_root_squash) 172.16.5.190(rw,async,no_root_squash) 172.16.5.254(rw,async,no_root_squash) 10.1.1.196(rw,async,no_root_squash) 10.1.1.199(rw,async,no_root_squash) 
 
+##ok

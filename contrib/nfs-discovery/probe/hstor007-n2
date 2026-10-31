@@ -2,19 +2,59 @@
 hstor007-n2-mgmt
 ##df
 Filesystem     Type         1K-blocks          Used   Available Use% Mounted on
-/dev/md0       xfs          201225220       8953452   192271768   5% /
+/dev/md0       xfs          201225220       8945204   192280016   5% /
 /dev/sda1      vfat            204560          7568      196992   4% /boot/efi
-data2          zfs        36059106688       5872640 36053234048   1% /data2
+data2          zfs        36059098752       5872640 36053226112   1% /data2
 data2/mki      zfs        53687091200           512 53687090688   1% /data2/group/mki/001
-data2/mvogelsb zfs      1099511627776 1091165404544  8346223232 100% /data2/group/mvogelsb/005
+data2/mvogelsb zfs      1099511627776 1091188123264  8323504512 100% /data2/group/mvogelsb/005
 data2/ogot     zfs        21474836480           512 21474835968   1% /data2/group/ogot/001
 data2/orcd     zfs        21474836480    6711485440 14763351040  32% /data2/group/orcd/014
 devtmpfs       devtmpfs     395830004             0   395830004   0% /dev
 tmpfs          tmpfs        395854404             0   395854404   0% /dev/shm
-nfs001.lb:/    nfs4            996160         62272      933888   7% /net/nfs001.lb
+nfs001.lb:/    nfs4            996160         64512      931648   7% /net/nfs001.lb
 tmpfs          tmpfs        158341764         46036   158295728   1% /run
 tmpfs          tmpfs         79170880             4    79170876   1% /run/user/0
 efivarfs       efivarfs           128            41          83  33% /sys/firmware/efi/efivars
+##mountinfo
+22 70 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+23 70 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 70 0:6 / /dev rw,nosuid shared:9 - devtmpfs devtmpfs rw,size=395830004k,nr_inodes=98957501,mode=755,inode64
+25 23 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+26 24 0:23 / /dev/shm rw,nosuid,nodev shared:10 - tmpfs tmpfs rw,inode64
+27 24 0:24 / /dev/pts rw,nosuid,noexec,relatime shared:11 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+28 70 0:25 / /run rw,nosuid,nodev shared:12 - tmpfs tmpfs rw,size=158341764k,nr_inodes=819200,mode=755,inode64
+29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+30 23 0:27 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+31 23 0:28 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:6 - efivarfs efivarfs rw
+32 23 0:29 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:7 - bpf bpf rw,mode=700
+65 23 0:18 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:8 - configfs configfs rw
+70 1 9:0 / / rw,relatime shared:1 - xfs /dev/md0 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+33 22 0:30 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=132121
+34 24 0:31 / /dev/hugepages rw,relatime shared:15 - hugetlbfs hugetlbfs rw,pagesize=2M
+35 24 0:20 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:16 - mqueue mqueue rw
+36 23 0:8 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:17 - debugfs debugfs rw
+37 23 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:18 - tracefs tracefs rw
+38 22 0:32 / /proc/fs/nfsd rw,relatime shared:19 - nfsd nfsd rw
+39 23 0:33 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:20 - fusectl fusectl rw
+62 28 0:34 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+64 28 0:35 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:22 - ramfs none rw,mode=700
+144 70 8:1 / /boot/efi rw,relatime shared:65 - vfat /dev/sda1 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+150 70 0:37 / /data2 rw,relatime shared:78 - zfs data2 rw,xattr,posixacl,casesensitive
+155 150 0:39 / /data2/group/mvogelsb/005 rw,relatime shared:81 - zfs data2/mvogelsb rw,xattr,posixacl,casesensitive
+160 150 0:38 / /data2/group/orcd/014 rw,relatime shared:84 - zfs data2/orcd rw,xattr,posixacl,casesensitive
+165 150 0:40 / /data2/group/ogot/001 rw,relatime shared:87 - zfs data2/ogot rw,xattr,posixacl,casesensitive
+170 150 0:41 / /data2/group/mki/001 rw,relatime shared:90 - zfs data2/mki rw,xattr,posixacl,casesensitive
+205 28 0:42 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:93 - ramfs none rw,mode=700
+451 36 0:13 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:227 - tracefs tracefs rw
+541 70 0:47 / /var/lib/nfs/rpc_pipefs rw,relatime shared:250 - rpc_pipefs sunrpc rw
+969 70 0:51 / /misc rw,relatime shared:497 - autofs /etc/auto.misc rw,fd=6,pgrp=18269,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=741933
+996 70 0:52 / /net rw,relatime shared:532 - autofs -hosts rw,fd=9,pgrp=18269,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=132361
+1023 70 0:53 / /nfs rw,relatime shared:546 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=18269,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=808030
+1050 70 0:54 / /orcd rw,relatime shared:560 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=15,pgrp=18269,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=106022
+1077 70 0:55 / /programs rw,relatime shared:574 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=18269,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=61851
+806 996 0:56 / /net/nfs001.lb rw,nosuid,nodev,relatime shared:271 - nfs4 nfs001.lb:/ rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.133,local_lock=none,addr=10.1.223.2
+805 806 0:57 / /net/nfs001.lb/home rw,relatime shared:284 - autofs -hosts rw,fd=9,pgrp=18269,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=132361
+464 28 0:46 / /run/user/0 rw,nosuid,nodev,relatime shared:257 - tmpfs tmpfs rw,size=79170880k,nr_inodes=19792720,mode=700,inode64
 ##mounts
 /dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/sda1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
@@ -58,19 +98,131 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /data2 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##exportopts
+/data2        	172.16.10.224(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.6.221(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.6.222(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.6.223(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.6.224(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.222.12(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2        	172.16.99.0(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,ro,insecure,no_root_squash,no_all_squash)
+/data2        	172.16.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2        	172.19.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2        	10.1.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
-data2	/data2	1209764733852800	36918511723392
-data2/mki	/data2/group/mki/001	499968	54975580888832
-data2/mvogelsb	/data2/group/mvogelsb/005	1117353374152320	8546532690304
-data2/ogot	/data2/group/ogot/001	499968	21990232055552
-data2/orcd	/data2/group/orcd/014	6872561032704	15117671522816
+data2	/data2	1209764741923712	36918503652480	0	yes
+data2/mki	/data2/group/mki/001	499968	54975580888832	54975581388800	yes
+data2/mvogelsb	/data2/group/mvogelsb/005	1117376638210944	8523268631680	1125899906842624	yes
+data2/ogot	/data2/group/ogot/001	499968	21990232055552	21990232555520	yes
+data2/orcd	/data2/group/orcd/014	6872561032704	15117671522816	21990232555520	yes
+##zpool
+  pool: data2
+ state: ONLINE
+  scan: scrub repaired 0B in 00:24:53 with 0 errors on Sat Oct 24 13:42:34 2026
+config:
+
+	NAME                                             STATE     READ WRITE CKSUM
+	data2                                            ONLINE       0     0     0
+	  raidz3-0                                       ONLINE       0     0     0
+	    35000cca4072874b4                            ONLINE       0     0     0
+	    35000cca40721b8dc                            ONLINE       0     0     0
+	    35000cca407221788                            ONLINE       0     0     0
+	    35000cca40728fb94                            ONLINE       0     0     0
+	    35000cca40728f2cc                            ONLINE       0     0     0
+	    35000cca40728f610                            ONLINE       0     0     0
+	    35000cca40728f8b4                            ONLINE       0     0     0
+	    35000cca40728f6a4                            ONLINE       0     0     0
+	    35000cca40728f590                            ONLINE       0     0     0
+	    35000cca40728f608                            ONLINE       0     0     0
+	    35000cca40728f2dc                            ONLINE       0     0     0
+	    35000cca40728fa34                            ONLINE       0     0     0
+	    35000cca40721bdec                            ONLINE       0     0     0
+	  raidz3-1                                       ONLINE       0     0     0
+	    35000cca4072203a4                            ONLINE       0     0     0
+	    35000cca40721cee8                            ONLINE       0     0     0
+	    35000cca40728f3a4                            ONLINE       0     0     0
+	    35000cca407209958                            ONLINE       0     0     0
+	    35000cca40722a350                            ONLINE       0     0     0
+	    35000cca2fe59cd50                            ONLINE       0     0     0
+	    35000cca40722a23c                            ONLINE       0     0     0
+	    35000cca40728f778                            ONLINE       0     0     0
+	    35000cca4072b86ec                            ONLINE       0     0     0
+	    35000cca407290074                            ONLINE       0     0     0
+	    35000cca40728f364                            ONLINE       0     0     0
+	    35000cca40720c2b0                            ONLINE       0     0     0
+	    35000cca2fe4bcf80                            ONLINE       0     0     0
+	  raidz3-2                                       ONLINE       0     0     0
+	    35000cca40728f39c                            ONLINE       0     0     0
+	    35000cca40728f5d4                            ONLINE       0     0     0
+	    35000cca40728f334                            ONLINE       0     0     0
+	    35000cca2be1248b4                            ONLINE       0     0     0
+	    35000cca2fe6423dc                            ONLINE       0     0     0
+	    35000cca40721d5b0                            ONLINE       0     0     0
+	    35000cca40728f4f4                            ONLINE       0     0     0
+	    35000cca4072218a4                            ONLINE       0     0     0
+	    35000cca407209bf0                            ONLINE       0     0     0
+	    35000cca2fe59cd08                            ONLINE       0     0     0
+	    35000cca407228e84                            ONLINE       0     0     0
+	    35000cca40728f3b4                            ONLINE       0     0     0
+	    35000cca2c82aecd8                            ONLINE       0     0     0
+	  raidz3-3                                       ONLINE       0     0     0
+	    35000cca4072900f0                            ONLINE       0     0     0
+	    35000cca40728f8a4                            ONLINE       0     0     0
+	    35000cca2be30c34c                            ONLINE       0     0     0
+	    35000cca40728f588                            ONLINE       0     0     0
+	    35000cca407226764                            ONLINE       0     0     0
+	    35000cca40728a070                            ONLINE       0     0     0
+	    35000cca40722c850                            ONLINE       0     0     0
+	    35000cca407209810                            ONLINE       0     0     0
+	    35000cca40728f388                            ONLINE       0     0     0
+	    35000cca40720989c                            ONLINE       0     0     0
+	    35000cca40728f7e4                            ONLINE       0     0     0
+	    35000cca40728a5bc                            ONLINE       0     0     0
+	    35000cca412738178                            ONLINE       0     0     0
+	  raidz3-4                                       ONLINE       0     0     0
+	    35000cca40722ca18                            ONLINE       0     0     0
+	    35000cca40728a518                            ONLINE       0     0     0
+	    35000cca40728f3c0                            ONLINE       0     0     0
+	    35000cca2fe59bde8                            ONLINE       0     0     0
+	    35000cca407209fd8                            ONLINE       0     0     0
+	    35000cca40728f96c                            ONLINE       0     0     0
+	    35000cca40721b8f0                            ONLINE       0     0     0
+	    35000cca40728f328                            ONLINE       0     0     0
+	    35000cca40728f764                            ONLINE       0     0     0
+	    35000cca40728fc38                            ONLINE       0     0     0
+	    35000cca40721be78                            ONLINE       0     0     0
+	    35000cca2be30e9c8                            ONLINE       0     0     0
+	    35000cca40728f634                            ONLINE       0     0     0
+	  raidz3-5                                       ONLINE       0     0     0
+	    35000cca40728f4f8                            ONLINE       0     0     0
+	    35000cca40728fb88                            ONLINE       0     0     0
+	    35000cca4072218bc                            ONLINE       0     0     0
+	    35000cca40728f3f4                            ONLINE       0     0     0
+	    35000cca40728a2e0                            ONLINE       0     0     0
+	    35000cca407209b70                            ONLINE       0     0     0
+	    35000cca407209a8c                            ONLINE       0     0     0
+	    35000cca40728fd34                            ONLINE       0     0     0
+	    35000cca40728f3e4                            ONLINE       0     0     0
+	    35000cca407289ed4                            ONLINE       0     0     0
+	    35000cca2fe59cd0c                            ONLINE       0     0     0
+	    35000cca407209900                            ONLINE       0     0     0
+	    35000cca40728f384                            ONLINE       0     0     0
+	logs	
+	  mirror-6                                       ONLINE       0     0     0
+	    nvme-INTEL_SSDPF21Q400GB_PHAL348300T2400AGN  ONLINE       0     0     0
+	    nvme-INTEL_SSDPF21Q400GB_PHAL348300M8400AGN  ONLINE       0     0     0
+	cache
+	  nvme-Micron_7450_MTFDKCC1T6TFS_233046DDC638    ONLINE       0     0     0
+	  nvme-Micron_7450_MTFDKCC1T6TFS_233046DD964F    ONLINE       0     0     0
+
+errors: No known data errors
 ##inodes
 Filesystem           Inodes   IUsed        IFree IUse% Mounted on
-/dev/md0          100661760  205345    100456415    1% /
+/dev/md0          100661760  205171    100456589    1% /
 /dev/sda1                 0       0            0     - /boot/efi
-data2           72106469490    1281  72106468209    1% /data2
+data2           72106453727    1281  72106452446    1% /data2
 data2/mki      107374181430       7 107374181423    1% /data2/group/mki/001
-data2/mvogelsb  16693645382 1198722  16692446660    1% /data2/group/mvogelsb/005
+data2/mvogelsb  16648208115 1199069  16647009046    1% /data2/group/mvogelsb/005
 data2/ogot      42949671990       7  42949671983    1% /data2/group/ogot/001
 data2/orcd      29526702264      71  29526702193    1% /data2/group/orcd/014
 devtmpfs           98957501    5661     98951840    1% /dev
@@ -98,3 +250,4 @@ efivarfs                  0       0            0     - /sys/firmware/efi/efivars
 # ME:Mar 18, 2026, allow Mediaflux read only access as root from node9900
 /data2 172.16.99.0(fsid=0,ro,async,crossmnt,no_root_squash,insecure)
 
+##ok

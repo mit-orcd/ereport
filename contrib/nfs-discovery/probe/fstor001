@@ -2,32 +2,93 @@
 fstor001-mgmt
 ##df
 Filesystem                       Type        1K-blocks         Used    Available Use% Mounted on
-/dev/mapper/xcatvg-root          xfs        1868563012     20140100   1848422912   2% /
+/dev/mapper/xcatvg-root          xfs        1868563012     20141984   1848421028   2% /
 /dev/sds1                        xfs           1038336       424504       613832  41% /boot
-data1                            zfs       27636786176          512  27636785664   1% /data1
+data1                            zfs       27636288384          512  27636287872   1% /data1
 data1/examples                   zfs         209715200        35584    209679616   1% /data1/examples/001
-data1/faez                       zfs        5368709120   4615262464    753446656  86% /data1/group/faez/001
+data1/faez                       zfs        5368709120   4615747840    752961280  86% /data1/group/faez/001
 data1/orcd                       zfs        1073741824      5281536   1068460288   1% /data1/group/orcd/001
 data1/psfc                       zfs         104857600     70255744     34601856  68% /data1/group/psfc/001
 data1/reimer                     zfs        5368709120          384   5368708736   1% /data1/group/reimer/001
 data1/sloan                      zfs        5368709120   1787536384   3581172736  34% /data1/group/sloan/001
-data1/software_community         zfs        5368709120   4366352128   1002356992  82% /data1/software/community/001
-data1/software_core              zfs        4294967296   3197861504   1097105792  75% /data1/software/core/001
+data1/software_community         zfs        5368709120   4366351872   1002357248  82% /data1/software/community/001
+data1/software_core              zfs        4294967296   3197863296   1097104000  75% /data1/software/core/001
 data1/software_deprecated        zfs         314572800          896    314571904   1% /data1/software/deprecated/001
 data1/software_repository        zfs        1073741824          224   1073741600   1% /data1/software/repository/001
-data1/system                     zfs       27636785920          256  27636785664   1% /data1/system
+data1/system                     zfs       27636288128          256  27636287872   1% /data1/system
 data1/system/ldap                zfs         209715200      6540032    203175168   4% /data1/system/ldap
 data1/system/reposync            zfs        2147483648   1183859712    963623936  56% /data1/system/reposync
 devtmpfs                         devtmpfs         4096            0         4096   0% /dev
 tmpfs                            tmpfs       387392852            0    387392852   0% /dev/shm
-nfs001.lb:/                      nfs4           996160        62272       933888   7% /net/nfs001.lb
-nfs001.lb:/home                  nfs4     432503206784 323470871936 109032334848  75% /net/nfs001.lb/home
+nfs001.lb:/                      nfs4           996160        64512       931648   7% /net/nfs001.lb
+nfs001.lb:/home                  nfs4     432503206784 326036352640 106466854144  76% /net/nfs001.lb/home
 xcat:/install                    nfs4        838808576    425346048    413462528  51% /net/xcat/install
-fstor022.ib:/compute/orcd/022    nfs4     300031415296  10545844224 289485571072   4% /orcd/compute/orcd/022
-fstor001:/software/community/001 nfs4       5368709120   4366352128   1002356992  82% /orcd/software/community/001
-fstor001:/software/core/001      nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
-tmpfs                            tmpfs       154957144       246236    154710908   1% /run
+fstor022.ib:/compute/orcd/022    nfs4     300031415296  10545850368 289485564928   4% /orcd/compute/orcd/022
+fstor001:/software/community/001 nfs4       5368709120   4366351872   1002357248  82% /orcd/software/community/001
+fstor001:/software/core/001      nfs4       4294967296   3197863296   1097104000  75% /orcd/software/core/001
+tmpfs                            tmpfs       154957144       254428    154702716   1% /run
 tmpfs                            tmpfs        77478568            4     77478564   1% /run/user/0
+##mountinfo
+20 66 0:19 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+21 66 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+22 66 0:5 / /dev rw,nosuid shared:8 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=96841933,mode=755,inode64
+23 21 0:6 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+24 22 0:21 / /dev/shm rw,nosuid,nodev shared:9 - tmpfs tmpfs rw,inode64
+25 22 0:22 / /dev/pts rw,nosuid,noexec,relatime shared:10 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+26 66 0:23 / /run rw,nosuid,nodev shared:11 - tmpfs tmpfs rw,size=154957144k,nr_inodes=819200,mode=755,inode64
+27 21 0:24 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+28 21 0:25 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+29 21 0:26 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:6 - bpf bpf rw,mode=700
+60 21 0:30 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:7 - configfs configfs rw
+66 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/xcatvg-root rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+30 20 0:27 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=70487
+31 22 0:28 / /dev/hugepages rw,relatime shared:14 - hugetlbfs hugetlbfs rw,pagesize=2M
+32 22 0:18 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:15 - mqueue mqueue rw
+33 21 0:7 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:16 - debugfs debugfs rw
+34 21 0:12 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:17 - tracefs tracefs rw
+35 20 0:29 / /proc/fs/nfsd rw,relatime shared:18 - nfsd nfsd rw
+36 21 0:31 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:19 - fusectl fusectl rw
+58 26 0:32 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:20 - ramfs none rw,mode=700
+61 26 0:33 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+138 66 65:33 / /boot rw,relatime shared:62 - xfs /dev/sds1 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+144 66 0:35 / /data1 rw,relatime shared:75 - zfs data1 rw,xattr,posixacl,casesensitive
+149 144 0:36 / /data1/examples/001 rw,relatime shared:78 - zfs data1/examples rw,xattr,posixacl,casesensitive
+154 144 0:41 / /data1/software/community/001 rw,relatime shared:81 - zfs data1/software_community rw,xattr,posixacl,casesensitive
+159 144 0:38 / /data1/group/psfc/001 rw,relatime shared:84 - zfs data1/psfc rw,xattr,posixacl,casesensitive
+164 144 0:39 / /data1/software/repository/001 rw,relatime shared:87 - zfs data1/software_repository rw,xattr,posixacl,casesensitive
+169 144 0:44 / /data1/software/deprecated/001 rw,relatime shared:90 - zfs data1/software_deprecated rw,xattr,posixacl,casesensitive
+174 144 0:43 / /data1/group/reimer/001 rw,relatime shared:93 - zfs data1/reimer rw,xattr,posixacl,casesensitive
+176 144 0:45 / /data1/software/core/001 rw,relatime shared:96 - zfs data1/software_core rw,xattr,posixacl,casesensitive
+184 144 0:40 / /data1/group/sloan/001 rw,relatime shared:99 - zfs data1/sloan rw,xattr,posixacl,casesensitive
+189 144 0:42 / /data1/group/faez/001 rw,relatime shared:102 - zfs data1/faez rw,xattr,posixacl,casesensitive
+194 144 0:37 / /data1/system rw,relatime shared:105 - zfs data1/system rw,xattr,posixacl,casesensitive
+199 144 0:46 / /data1/group/orcd/001 rw,relatime shared:108 - zfs data1/orcd rw,xattr,posixacl,casesensitive
+204 194 0:47 / /data1/system/reposync rw,relatime shared:111 - zfs data1/system/reposync rw,xattr,posixacl,casesensitive
+209 194 0:48 / /data1/system/ldap rw,relatime shared:114 - zfs data1/system/ldap rw,xattr,posixacl,casesensitive
+252 26 0:49 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:117 - ramfs none rw,mode=700
+639 33 0:12 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:312 - tracefs tracefs rw
+744 66 0:55 / /var/lib/nfs/rpc_pipefs rw,relatime shared:372 - rpc_pipefs sunrpc rw
+1173 66 0:58 / /misc rw,relatime shared:562 - autofs /etc/auto.misc rw,fd=6,pgrp=6336,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=115940
+1201 66 0:59 / /net rw,relatime shared:612 - autofs -hosts rw,fd=9,pgrp=6336,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=116868
+1228 66 0:60 / /nfs rw,relatime shared:648 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=83762
+1255 66 0:61 / /orcd rw,relatime shared:662 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=15,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=96815
+1282 66 0:62 / /programs rw,relatime shared:676 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=6336,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=68443
+1241 1255 0:66 / /orcd/software rw,relatime shared:601 - autofs ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster rw,fd=23,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=50844180
+1320 1241 0:67 / /orcd/software/core rw,relatime shared:699 - autofs ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster rw,fd=26,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=50837883
+1347 1320 0:69 / /orcd/software/core/001 rw,noatime shared:712 - nfs4 fstor001:/software/core/001 rw,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.4.121,local_lock=none,addr=172.16.4.121
+1394 1241 0:70 / /orcd/software/community rw,relatime shared:615 - autofs ou=auto.orcd.software.community,ou=automount,dc=cm,dc=cluster rw,fd=30,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=95939134
+1421 1394 0:72 / /orcd/software/community/001 rw,noatime shared:750 - nfs4 fstor001:/software/community/001 rw,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.4.121,local_lock=none,addr=172.16.4.121
+1034 1255 0:68 / /orcd/compute rw,relatime shared:587 - autofs ou=auto.orcd.compute,ou=automount,dc=cm,dc=cluster rw,fd=33,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=162452698
+1080 1034 0:71 / /orcd/compute/orcd rw,relatime shared:606 - autofs ou=auto.orcd.compute.orcd,ou=automount,dc=cm,dc=cluster rw,fd=36,pgrp=6336,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=162363894
+1104 1080 0:73 / /orcd/compute/orcd/022 rw,relatime shared:620 - nfs4 fstor022.ib:/compute/orcd/022 rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=rdma,port=20049,timeo=600,retrans=2,sec=sys,clientaddr=172.16.4.121,local_lock=none,addr=172.16.4.142
+1387 1201 0:63 / /net/nfs001.lb rw,nosuid,nodev,relatime shared:546 - nfs4 nfs001.lb:/ rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.121,local_lock=none,addr=10.1.223.4
+1386 1387 0:64 / /net/nfs001.lb/home rw,relatime shared:558 - autofs -hosts rw,fd=9,pgrp=6336,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=116868
+1036 1201 0:65 / /net/xcat/install rw,relatime shared:571 - autofs -hosts rw,fd=9,pgrp=6336,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=116868
+1103 1201 0:74 / /net/xcat/tftpboot rw,relatime shared:632 - autofs -hosts rw,fd=9,pgrp=6336,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=116868
+1151 1036 0:76 / /net/xcat/install rw,nosuid,nodev,relatime shared:677 - nfs4 xcat:/install rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.121,local_lock=none,addr=10.1.10.195
+1149 30 0:75 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:734 - binfmt_misc binfmt_misc rw
+1344 1386 0:78 / /net/nfs001.lb/home rw,nosuid,nodev,relatime shared:765 - nfs4 nfs001.lb:/home rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.4.121,local_lock=none,addr=10.1.223.3
+612 26 0:53 / /run/user/0 rw,nosuid,nodev,relatime shared:311 - tmpfs tmpfs rw,size=77478568k,nr_inodes=19369642,mode=700,inode64
 ##mounts
 /dev/mapper/xcatvg-root / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/sds1 /boot xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
@@ -93,48 +154,127 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 Export list for localhost:
 /data1                   10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
 /data1/software/core/001 172.16.0.0/16
+##exportopts
+/data1        	172.16.4.249(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.6.221(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.10.195(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	10.1.10.195(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	10.1.1.199(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.224.1(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.222.12(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.222.17(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.99.0(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,ro,insecure,no_root_squash,no_all_squash)
+/data1        	172.16.6.225(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,ro,secure,no_root_squash,no_all_squash)
+/data1        	10.1.225.99(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.224.23(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.224.24(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1        	172.19.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1        	10.1.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/software/core/001
+		172.16.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
 ##zfs
-data1	/data1	16250156339712	28300068625792
-data1/examples	/data1/examples/001	36376192	214711988608
-data1/faez	/data1/group/faez/001	4726028708608	771529430272
-data1/orcd	/data1/group/orcd/001	5408223104	1094103404672
-data1/psfc	/data1/group/psfc/001	71941829376	35432353024
-data1/reimer	/data1/group/reimer/001	280320	5497557858560
-data1/sloan	/data1/group/sloan/001	1830437133440	3667121005440
-data1/software_community	/data1/software/community/001	4471144496896	1026413641984
-data1/software_core	/data1/software/core/001	3274610079360	1123436431744
-data1/software_deprecated	/data1/software/deprecated/001	803584	322121743616
-data1/software_repository	/data1/software/repository/001	224256	1099511403520
-data1/system	/data1/system	1218969370880	28300068625792
-data1/system/ldap	/data1/system/ldap	6696872832	208051491968
-data1/system/reposync	/data1/system/reposync	1212272255104	986751000448
+data1	/data1	16250666064256	28299558901248	0	yes
+data1/examples	/data1/examples/001	36376192	214711988608	214748364800	yes
+data1/faez	/data1/group/faez/001	4726525744000	771032394880	5497558138880	yes
+data1/orcd	/data1/group/orcd/001	5408223104	1094103404672	1099511627776	yes
+data1/psfc	/data1/group/psfc/001	71941829376	35432353024	107374182400	yes
+data1/reimer	/data1/group/reimer/001	280320	5497557858560	5497558138880	yes
+data1/sloan	/data1/group/sloan/001	1830437133440	3667121005440	5497558138880	yes
+data1/software_community	/data1/software/community/001	4471144253952	1026413884928	5497558138880	yes
+data1/software_core	/data1/software/core/001	3274611910784	1123434600320	4398046511104	yes
+data1/software_deprecated	/data1/software/deprecated/001	803584	322121743616	322122547200	yes
+data1/software_repository	/data1/software/repository/001	224256	1099511403520	1099511627776	yes
+data1/system	/data1/system	1218969398912	28299558901248	0	yes
+data1/system/ldap	/data1/system/ldap	6696900864	208051463936	214748364800	yes
+data1/system/reposync	/data1/system/reposync	1212272255104	986751000448	2199023255552	yes
+##zpool
+  pool: data1
+ state: ONLINE
+  scan: scrub repaired 0B in 01:04:57 with 0 errors on Thu Oct  1 01:46:26 2026
+config:
+
+	NAME                                        STATE     READ WRITE CKSUM
+	data1                                       ONLINE       0     0     0
+	  raidz3-0                                  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A1HAT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A1HQT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A1FAT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KZT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0HGT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0H8T8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KET8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM7XRUG1T92_64D0A4WWTJKJ  ONLINE       0     0     0
+	  raidz3-1                                  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A00TT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0H9T8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0HMT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0L6T8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A1HDT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A012T8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KVT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0HET8R8  ONLINE       0     0     0
+	  raidz3-2                                  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A01PT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A1HBT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0HAT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KRT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KYT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31T0A0HCT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31P0A00QT8R8  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6XRUG1T92_31Q0A0KXT8R8  ONLINE       0     0     0
+	  raidz3-3                                  ONLINE       0     0     0
+	    358ce38ee215d9de5                       ONLINE       0     0     0
+	    358ce38ee215d9df9                       ONLINE       0     0     0
+	    358ce38ee215deb2d                       ONLINE       0     0     0
+	    358ce38ee215def99                       ONLINE       0     0     0
+	    358ce38ee215defa1                       ONLINE       0     0     0
+	    358ce38ee215df109                       ONLINE       0     0     0
+	    358ce38ee215e1a35                       ONLINE       0     0     0
+	    358ce38ee215e1a3d                       ONLINE       0     0     0
+	  raidz3-4                                  ONLINE       0     0     0
+	    358ce38ee215e1a55                       ONLINE       0     0     0
+	    358ce38ee215e1a59                       ONLINE       0     0     0
+	    358ce38ee215e1a5d                       ONLINE       0     0     0
+	    358ce38ee215e1a65                       ONLINE       0     0     0
+	    358ce38ee215e1a81                       ONLINE       0     0     0
+	    358ce38ee215e2a2d                       ONLINE       0     0     0
+	    358ce38ee215e2a49                       ONLINE       0     0     0
+	    358ce38ee215e2a51                       ONLINE       0     0     0
+	spares
+	  358ce38ee215e2a59                         AVAIL   
+	  358ce38ee215e2dc1                         AVAIL   
+	  358ce38ee215e2dd1                         AVAIL   
+	  358ce38ee215e2de5                         AVAIL   
+
+errors: No known data errors
 ##inodes
 Filesystem                            Inodes      IUsed       IFree IUse% Mounted on
-/dev/mapper/xcatvg-root            186947584     189106   186758478    1% /
+/dev/mapper/xcatvg-root            186947584     189109   186758475    1% /
 /dev/sds1                             524288        383      523905    1% /boot
-data1                            55273571565         31 55273571534    1% /data1
+data1                            55272576010         31 55272575979    1% /data1
 data1/examples                     419359582        230   419359352    1% /data1/examples/001
-data1/faez                        1542873874   35980456  1506893418    3% /data1/group/faez/001
+data1/faez                        1541918085   35995439  1505922646    3% /data1/group/faez/001
 data1/orcd                        2143471829    6551117  2136920712    1% /data1/group/orcd/001
 data1/psfc                          70175432     971618    69203814    2% /data1/group/psfc/001
 data1/reimer                     10737417700          8 10737417692    1% /data1/group/reimer/001
 data1/sloan                       7162394366      48653  7162345713    1% /data1/group/sloan/001
-data1/software_community          2066870975   62156831  2004714144    4% /data1/software/community/001
-data1/software_core               2228666733   34454953  2194211780    2% /data1/software/core/001
+data1/software_community          2066871450   62156831  2004714619    4% /data1/software/community/001
+data1/software_core               2228663157   34454954  2194208203    2% /data1/software/core/001
 data1/software_deprecated          629144084         54   629144030    1% /data1/software/deprecated/001
 data1/software_repository         2147483216          6  2147483210    1% /data1/software/repository/001
-data1/system                     55273571542          8 55273571534    1% /data1/system
-data1/system/ldap                  406378894      28324   406350570    1% /data1/system/ldap
+data1/system                     55272575987          8 55272575979    1% /data1/system
+data1/system/ldap                  406378842      28327   406350515    1% /data1/system/ldap
 data1/system/reposync             1927656270     408223  1927248047    1% /data1/system/reposync
 devtmpfs                            96841933       1830    96840103    1% /dev
 tmpfs                               96848213          1    96848212    1% /dev/shm
 nfs001.lb:/                            31122        103       31019    1% /net/nfs001.lb
-nfs001.lb:/home                  13852490493 1439702083 12412788410   11% /net/nfs001.lb/home
+nfs001.lb:/home                  13853452123 1443842140 12409609983   11% /net/nfs001.lb/home
 xcat:/install                      419429824     257153   419172671    1% /net/xcat/install
-fstor022.ib:/compute/orcd/022     6000670016    9582944  5991087072    1% /orcd/compute/orcd/022
-fstor001:/software/community/001  2066870975   62156831  2004714144    4% /orcd/software/community/001
-fstor001:/software/core/001       2228666733   34454953  2194211780    2% /orcd/software/core/001
-tmpfs                                 819200       3228      815972    1% /run
+fstor022.ib:/compute/orcd/022     6000670016    9583273  5991086743    1% /orcd/compute/orcd/022
+fstor001:/software/community/001  2066871450   62156831  2004714619    4% /orcd/software/community/001
+fstor001:/software/core/001       2228663157   34454954  2194208203    2% /orcd/software/core/001
+tmpfs                                 819200       3229      815971    1% /run
 tmpfs                               19369642         21    19369621    1% /run/user/0
 ##exportfile
 # /etc/exports: the access control list for filesystems which may be exported
@@ -188,3 +328,4 @@ tmpfs                               19369642         21    19369621    1% /run/u
 
 /data1 172.16.224.23(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
 /data1 172.16.224.24(fsid=0,rw,sync,no_wdelay,crossmnt,no_subtree_check,no_root_squash)
+##ok

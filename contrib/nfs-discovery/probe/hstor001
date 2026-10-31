@@ -2,41 +2,41 @@
 hstor001-mgmt
 ##df
 Filesystem                  Type        1K-blocks         Used    Available Use% Mounted on
-/dev/mapper/xcatvg-root     xfs        1868563012     29893896   1838669116   2% /
+/dev/mapper/xcatvg-root     xfs        1868563012     29891240   1838671772   2% /
 /dev/sdg1                   xfs           1038336       481300       557036  47% /boot
-data1                       zfs      213090947968          512 213090947456   1% /data1
-data1/systems_backup        zfs       42949672960  35247534208   7702138752  83% /data1/backup/systems/002
+data1                       zfs      213090893184          512 213090892672   1% /data1
+data1/systems_backup        zfs       42949672960  35383838208   7565834752  83% /data1/backup/systems/002
 data1/arupclab              zfs       10737418240          512  10737417728   1% /data1/group/arupclab/001
 data1/aselab                zfs       32212254720          512  32212254208   1% /data1/group/aselab/001
 data1/camcat                zfs       42949672960  40118742144   2830930816  94% /data1/group/camcat/001
 data1/cburge                zfs      214748364800 168266671104  46481693696  79% /data1/group/cburge/001
 data1/cordero               zfs       21474836480   6862999808  14611836672  32% /data1/group/cordero/002
-data1/econ                  zfs       21474836480  10220995584  11253840896  48% /data1/group/econ/001
-data1/fraenkel_002          zfs       21474836480  10097107456  11377729024  48% /data1/group/fraenkel/002
+data1/econ                  zfs       21474836480  10225293312  11249543168  48% /data1/group/econ/001
+data1/fraenkel_002          zfs       21474836480  10097107584  11377728896  48% /data1/group/fraenkel/002
 data1/fraenkel_003          zfs       21474836480   7432448256  14042388224  35% /data1/group/fraenkel/003
 data1/orcd                  zfs       21474836480   3355636224  18119200256  16% /data1/group/orcd/005
 data1/picower               zfs       64424509440  54381532672  10042976768  85% /data1/group/picower/003
 data1/polzlab               zfs       12884901888          512  12884901376   1% /data1/group/polzlab/002
-data1/rafagb                zfs       42949672960  35694243712   7255429248  84% /data1/group/rafagb/001
+data1/rafagb                zfs       42949672960  35732609664   7217063296  84% /data1/group/rafagb/001
 data1/rutledge              zfs       42949672960  40224809856   2724863104  94% /data1/group/rutledge/001
-data1/tah                   zfs       21474836480  10379440768  11095395712  49% /data1/group/tah/001
+data1/tah                   zfs       21474836480  10379441024  11095395456  49% /data1/group/tah/001
 data1/wvanreeslab           zfs       34359738368          512  34359737856   1% /data1/group/wvanreeslab/001
-data2                       zfs      159081238528          640 159081237888   1% /data2
-data2/systems_backup        zfs       32212254720  22466304896   9745949824  70% /data2/backup/systems/001
+data2                       zfs      159062195072          640 159062194432   1% /data2
+data2/systems_backup        zfs       32212254720  22466306176   9745948544  70% /data2/backup/systems/001
 data2/abodner               zfs      107374182400  58457955456  48916226944  55% /data2/group/abodner/001
 data2/ashansen              zfs       21474836480          256  21474836224   1% /data2/group/ashansen/001
 data2/chisholm              zfs       42949672960  20826775168  22122897792  49% /data2/group/chisholm/001
 data2/cnh                   zfs       10737418240          768  10737417472   1% /data2/group/cnh/001
 data2/dhousman              zfs       21474836480          256  21474836224   1% /data2/group/dhousman/001
-data2/faez                  zfs       85899345920  66379884928  19519460992  78% /data2/group/faez/001
+data2/faez                  zfs       85899345920  66391345536  19508000384  78% /data2/group/faez/001
 data2/fraenkel_001          zfs       42949672960  42570600448    379072512 100% /data2/group/fraenkel/001
 data2/kpate                 zfs       42949672960          256  42949672704   1% /data2/group/kpate/001
-data2/mick                  zfs      373829602688  97256374528 276573228160  27% /data2/group/mick/006
-data2/mvogelsb              zfs      171798691840 171431654272    367037568 100% /data2/group/mvogelsb/004
-data2/orcd                  zfs       21474836480   1744452480  19730384000   9% /data2/group/orcd/002
+data2/mick                  zfs      373810559360  97256374144 276554185216  27% /data2/group/mick/006
+data2/mvogelsb              zfs      171798691840 171450694144    347997696 100% /data2/group/mvogelsb/004
+data2/orcd                  zfs       21474836480   1744452736  19730383744   9% /data2/group/orcd/002
 data2/pog                   zfs       21474836480  19914000000   1560836480  93% /data2/group/pog/001
 data2/psfc                  zfs       21474836480   1132393856  20342442624   6% /data2/group/psfc/001
-data2/reimer                zfs      107374182400  98096024832   9278157568  92% /data2/group/reimer/001
+data2/reimer                zfs      107374182400  98096540544   9277641856  92% /data2/group/reimer/001
 data2/shaohao               zfs       10737418240         4352  10737413888   1% /data2/group/shaohao/001
 data2/talia_tb              zfs       64424509440  56212837248   8211672192  88% /data2/group/talia_tb/001
 data2/tami                  zfs       21474836480  12826324480   8648512000  60% /data2/group/tami/002
@@ -44,12 +44,93 @@ data2/tsmidt                zfs       21474836480    882304000  20592532480   5%
 data2/vfish                 zfs       21474836480       127360  21474709120   1% /data2/group/vfish/001
 devtmpfs                    devtmpfs    197056688            0    197056688   0% /dev
 tmpfs                       tmpfs       197081832            0    197081832   0% /dev/shm
-nfs001.lb:/                 nfs4           996160        62272       933888   7% /net/nfs001.lb
-nfs001.lb:/home             nfs4     432503206784 323470650496 109032556288  75% /net/nfs001.lb/home
+nfs001.lb:/                 nfs4           996160        64512       931648   7% /net/nfs001.lb
+nfs001.lb:/home             nfs4     432503206784 326036352640 106466854144  76% /net/nfs001.lb/home
 data2/caitlinm              zfs       85899345920  65169517312  20729828608  76% /orcd/data/caitlinm/001
-fstor001:/software/core/001 nfs4       4294967296   3197861504   1097105792  75% /orcd/software/core/001
+fstor001:/software/core/001 nfs4       4294967296   3197863296   1097104000  75% /orcd/software/core/001
 tmpfs                       tmpfs        78832736        46660     78786076   1% /run
 tmpfs                       tmpfs        39416364            4     39416360   1% /run/user/0
+##mountinfo
+22 67 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+23 67 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 67 0:6 / /dev rw,nosuid shared:8 - devtmpfs devtmpfs rw,size=197056688k,nr_inodes=49264172,mode=755,inode64
+25 23 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+26 24 0:23 / /dev/shm rw,nosuid,nodev shared:9 - tmpfs tmpfs rw,inode64
+27 24 0:24 / /dev/pts rw,nosuid,noexec,relatime shared:10 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+28 67 0:25 / /run rw,nosuid,nodev shared:11 - tmpfs tmpfs rw,size=78832736k,nr_inodes=819200,mode=755,inode64
+29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+30 23 0:27 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+31 23 0:28 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:6 - bpf bpf rw,mode=700
+62 23 0:18 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:7 - configfs configfs rw
+67 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/xcatvg-root rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+32 22 0:29 / /proc/sys/fs/binfmt_misc rw,relatime shared:13 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=271237
+33 24 0:30 / /dev/hugepages rw,relatime shared:14 - hugetlbfs hugetlbfs rw,pagesize=2M
+34 24 0:20 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:15 - mqueue mqueue rw
+35 23 0:8 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:16 - debugfs debugfs rw
+36 23 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:17 - tracefs tracefs rw
+37 22 0:31 / /proc/fs/nfsd rw,relatime shared:18 - nfsd nfsd rw
+38 23 0:32 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:19 - fusectl fusectl rw
+60 28 0:33 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:20 - ramfs none rw,mode=700
+63 28 0:34 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+139 67 8:97 / /boot rw,relatime shared:62 - xfs /dev/sdg1 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+145 67 0:37 / /data1 rw,relatime shared:75 - zfs data1 rw,xattr,posixacl,casesensitive
+150 67 0:36 / /data2 rw,relatime shared:78 - zfs data2 rw,xattr,posixacl,casesensitive
+155 145 0:46 / /data1/backup/systems/002 rw,relatime shared:81 - zfs data1/systems_backup rw,xattr,posixacl,casesensitive
+160 145 0:48 / /data1/group/tah/001 rw,relatime shared:84 - zfs data1/tah rw,xattr,posixacl,casesensitive
+165 145 0:47 / /data1/group/cburge/001 rw,relatime shared:87 - zfs data1/cburge rw,xattr,posixacl,casesensitive
+170 145 0:50 / /data1/group/econ/001 rw,relatime shared:90 - zfs data1/econ rw,xattr,posixacl,casesensitive
+175 145 0:40 / /data1/group/orcd/005 rw,relatime shared:93 - zfs data1/orcd rw,xattr,posixacl,casesensitive
+180 150 0:55 / /data2/group/reimer/001 rw,relatime shared:96 - zfs data2/reimer rw,xattr,posixacl,casesensitive
+185 145 0:49 / /data1/group/rafagb/001 rw,relatime shared:99 - zfs data1/rafagb rw,xattr,posixacl,casesensitive
+190 145 0:45 / /data1/group/aselab/001 rw,relatime shared:102 - zfs data1/aselab rw,xattr,posixacl,casesensitive
+195 145 0:51 / /data1/group/fraenkel/002 rw,relatime shared:105 - zfs data1/fraenkel_002 rw,xattr,posixacl,casesensitive
+200 145 0:43 / /data1/group/arupclab/001 rw,relatime shared:108 - zfs data1/arupclab rw,xattr,posixacl,casesensitive
+205 145 0:44 / /data1/group/camcat/001 rw,relatime shared:111 - zfs data1/camcat rw,xattr,posixacl,casesensitive
+210 145 0:52 / /data1/group/cordero/002 rw,relatime shared:114 - zfs data1/cordero rw,xattr,posixacl,casesensitive
+215 145 0:42 / /data1/group/picower/003 rw,relatime shared:117 - zfs data1/picower rw,xattr,posixacl,casesensitive
+220 150 0:59 / /data2/group/orcd/002 rw,relatime shared:120 - zfs data2/orcd rw,xattr,posixacl,casesensitive
+225 150 0:63 / /data2/group/mick/006 rw,relatime shared:123 - zfs data2/mick rw,xattr,posixacl,casesensitive
+230 150 0:70 / /data2/group/cnh/001 rw,relatime shared:126 - zfs data2/cnh rw,xattr,posixacl,casesensitive
+235 145 0:54 / /data1/group/fraenkel/003 rw,relatime shared:129 - zfs data1/fraenkel_003 rw,xattr,posixacl,casesensitive
+240 150 0:72 / /data2/group/shaohao/001 rw,relatime shared:132 - zfs data2/shaohao rw,xattr,posixacl,casesensitive
+245 150 0:60 / /data2/group/tsmidt/001 rw,relatime shared:135 - zfs data2/tsmidt rw,xattr,posixacl,casesensitive
+250 150 0:74 / /data2/group/vfish/001 rw,relatime shared:138 - zfs data2/vfish rw,xattr,posixacl,casesensitive
+255 145 0:41 / /data1/group/wvanreeslab/001 rw,relatime shared:141 - zfs data1/wvanreeslab rw,xattr,posixacl,casesensitive
+260 150 0:66 / /data2/group/mvogelsb/004 rw,relatime shared:144 - zfs data2/mvogelsb rw,xattr,posixacl,casesensitive
+265 150 0:62 / /data2/group/pog/001 rw,relatime shared:147 - zfs data2/pog rw,xattr,posixacl,casesensitive
+270 150 0:56 / /data2/group/faez/001 rw,relatime shared:150 - zfs data2/faez rw,xattr,posixacl,casesensitive
+275 145 0:39 / /data1/group/polzlab/002 rw,relatime shared:153 - zfs data1/polzlab rw,xattr,posixacl,casesensitive
+280 145 0:38 / /data1/group/rutledge/001 rw,relatime shared:156 - zfs data1/rutledge rw,xattr,posixacl,casesensitive
+285 150 0:68 / /data2/group/talia_tb/001 rw,relatime shared:159 - zfs data2/talia_tb rw,xattr,posixacl,casesensitive
+290 150 0:53 / /data2/backup/systems/001 rw,relatime shared:162 - zfs data2/systems_backup rw,xattr,posixacl,casesensitive
+295 150 0:69 / /data2/group/ashansen/001 ro,relatime shared:165 - zfs data2/ashansen ro,xattr,posixacl,casesensitive
+300 150 0:57 / /data2/group/tami/002 ro,relatime shared:168 - zfs data2/tami ro,xattr,posixacl,casesensitive
+305 150 0:65 / /data2/group/dhousman/001 ro,relatime shared:171 - zfs data2/dhousman ro,xattr,posixacl,casesensitive
+310 150 0:71 / /data2/group/fraenkel/001 rw,relatime shared:174 - zfs data2/fraenkel_001 rw,xattr,posixacl,casesensitive
+315 150 0:67 / /data2/group/psfc/001 ro,relatime shared:177 - zfs data2/psfc ro,xattr,posixacl,casesensitive
+320 150 0:64 / /data2/group/kpate/001 ro,relatime shared:180 - zfs data2/kpate ro,xattr,posixacl,casesensitive
+325 150 0:58 / /data2/group/chisholm/001 ro,relatime shared:183 - zfs data2/chisholm ro,xattr,posixacl,casesensitive
+330 150 0:73 / /data2/group/abodner/001 ro,relatime shared:186 - zfs data2/abodner ro,xattr,posixacl,casesensitive
+335 150 0:61 / /data2/group/caitlinm/001 rw,relatime shared:189 - zfs data2/caitlinm rw,xattr,posixacl,casesensitive
+403 28 0:75 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:192 - ramfs none rw,mode=700
+340 32 0:76 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:195 - binfmt_misc binfmt_misc rw
+345 67 0:77 / /var/lib/nfs/rpc_pipefs rw,relatime shared:198 - rpc_pipefs sunrpc rw
+619 35 0:13 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:213 - tracefs tracefs rw
+1696 67 0:85 / /misc rw,relatime shared:869 - autofs /etc/auto.misc rw,fd=6,pgrp=22788,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=388972
+1766 67 0:86 / /net rw,relatime shared:927 - autofs -hosts rw,fd=9,pgrp=22788,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=301842
+1926 67 0:87 / /nfs rw,relatime shared:940 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=331754
+1954 67 0:88 / /orcd rw,relatime shared:953 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=15,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=413733
+1981 67 0:89 / /programs rw,relatime shared:984 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=22788,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=413750
+1812 1766 0:90 / /net/nfs001.lb rw,nosuid,nodev,relatime shared:501 - nfs4 nfs001.lb:/ rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.121,local_lock=none,addr=10.1.223.3
+1811 1812 0:91 / /net/nfs001.lb/home rw,relatime shared:514 - autofs -hosts rw,fd=9,pgrp=22788,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=301842
+912 28 0:81 / /run/user/0 rw,nosuid,nodev,relatime shared:436 - tmpfs tmpfs rw,size=39416364k,nr_inodes=9854091,mode=700,inode64
+937 1954 0:92 / /orcd/data rw,relatime shared:526 - autofs ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster rw,fd=23,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31480784
+960 937 0:93 / /orcd/data/caitlinm rw,relatime shared:538 - autofs ou=auto.orcd.data.caitlinm,ou=automount,dc=cm,dc=cluster rw,fd=26,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31524210
+983 960 0:61 / /orcd/data/caitlinm/001 rw,relatime master:189 - zfs data2/caitlinm rw,xattr,posixacl,casesensitive
+1008 1811 0:94 / /net/nfs001.lb/home rw,nosuid,nodev,relatime shared:561 - nfs4 nfs001.lb:/home rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.121,local_lock=none,addr=10.1.223.3
+1006 1954 0:95 / /orcd/software rw,relatime shared:968 - autofs ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster rw,fd=30,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31683027
+1052 1006 0:96 / /orcd/software/core rw,relatime shared:980 - autofs ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster rw,fd=33,pgrp=22788,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=31683036
+1806 1052 0:98 / /orcd/software/core/001 rw,noatime shared:993 - nfs4 fstor001:/software/core/001 rw,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.3.121,local_lock=none,addr=172.16.4.121
 ##mounts
 /dev/mapper/xcatvg-root / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/sdg1 /boot xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
@@ -166,83 +247,836 @@ Export list for localhost:
 /data2/group/tami/002                  10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
 /data2/group/tsmidt/001                10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
 /data2/group/vfish/001                 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##exportopts
+/data1/group/orcd/005
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/orcd/005
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/orcd/005
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/orcd/005
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.222.12(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.224.23(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.224.24(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.222.12(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.7.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.3.139(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/tah/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/tah/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/tah/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/tah/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/econ/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/econ/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/econ/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/econ/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/pog/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/pog/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/pog/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/pog/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tami/002
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tami/002
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tami/002
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/tami/002
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mick/006
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mick/006
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mick/006
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/mick/006
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/faez/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/faez/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/faez/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/group/faez/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.1(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.2(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.3(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.4(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.5(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.6(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.7(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.8(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.22(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.222.21(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.4.130(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.6.225(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.6.221(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.6.222(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.6.223(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.6.224(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.1(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.2(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.3(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.4(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.5(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.6(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.7(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.8(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.22(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.21(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.4.130(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.6.225(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.12(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		10.1.222.12(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.222.16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002
+		10.1.222.16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002/provision001
+		172.16.225.103(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/backup/systems/002/provision001
+		10.1.225.103(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1/group/orcd/005
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/orcd/005
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/orcd/005
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/wvanreeslab/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/polzlab/002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/polzlab/002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/aselab/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/aselab/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/arupclab/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/arupclab/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/camcat/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/camcat/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/reimer/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/reimer/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/vfish/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/vfish/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tsmidt/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/ashansen/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/ashansen/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/kpate/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/kpate/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/cnh/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/cnh/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/shaohao/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/shaohao/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/orcd/002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/orcd/002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mvogelsb/004
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/caitlinm/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/dhousman/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/dhousman/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/psfc/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/psfc/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/talia_tb/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/chisholm/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/chisholm/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/tah/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/tah/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/tah/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/fraenkel/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/fraenkel/002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/econ/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/econ/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/econ/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/rafagb/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/group/rafagb/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/pog/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/pog/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/pog/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/abodner/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/abodner/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tami/002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tami/002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/tami/002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mick/006
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mick/006
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/mick/006
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/faez/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/faez/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/group/faez/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/backup/systems/001
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data2/backup/systems/001
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.16.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/backup/systems/002
+		172.19.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1/backup/systems/002
+		10.1.0.0/16(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
-data1	/data1	667568190229504	218205130304800
-data1/arupclab	/data1/group/arupclab/001	403200	10995115874560
-data1/aselab	/data1/group/aselab/001	403200	32985348430080
-data1/camcat	/data1/group/camcat/001	41081591869920	2898873241120
-data1/cburge	/data1/group/cburge/001	172305071114400	47597254440800
-data1/cordero	/data1/group/cordero/002	7027711729920	14962520825600
-data1/econ	/data1/group/econ/001	10466299448640	11523933106880
-data1/fraenkel_002	/data1/group/fraenkel/002	10339437921120	11650794634400
-data1/fraenkel_003	/data1/group/fraenkel/003	7610826888000	14379405667520
-data1/orcd	/data1/group/orcd/005	3436171441920	18554061113600
-data1/picower	/data1/group/picower/003	55686689352000	10284008314560
-data1/polzlab	/data1/group/polzlab/002	403200	13194139130112
-data1/rafagb	/data1/group/rafagb/001	36550905451200	7429559659840
-data1/rutledge	/data1/group/rutledge/001	41190205180320	2790259930720
-data1/systems_backup	/data1/backup/systems/002	36093474930240	7886990180800
-data1/tah	/data1/group/tah/001	10628547229440	11361685326080
-data1/wvanreeslab	/data1/group/wvanreeslab/001	403200	35184371685632
-data2	/data2	1058030937575520	162899187639104
-data2/abodner	/data2/group/abodner/001	59860946285280	50090216492320
-data2/ashansen	/data2/group/ashansen/001	241920	21990232313600
-data2/caitlinm	/data2/group/caitlinm/001	66733585672320	21227344549760
-data2/chisholm	/data2/group/chisholm/001	21326617670400	22653847440640
-data2/cnh	/data2/group/cnh/001	675360	10995115602400
-data2/dhousman	/data2/group/dhousman/001	241920	21990232313600
-data2/faez	/data2/group/faez/001	67973002060320	19987928161760
-data2/fraenkel_001	/data2/group/fraenkel/001	43592294753280	388170357760
-data2/kpate	/data2/group/kpate/001	241920	43980464869120
-data2/mick	/data2/group/mick/006	99590527451520	283210985742784
-data2/mvogelsb	/data2/group/mvogelsb/004	175546013922720	375846521440
-data2/orcd	/data2/group/orcd/002	1786319287200	20203913268320
-data2/pog	/data2/group/pog/001	20391935941440	1598296614080
-data2/psfc	/data2/group/psfc/001	1159571286720	20830661268800
-data2/reimer	/data2/group/reimer/001	100450329325920	9500833451680
-data2/shaohao	/data2/group/shaohao/001	4364640	10995111913120
-data2/systems_backup	/data2/backup/systems/001	23005496142720	9979852690560
-data2/talia_tb	/data2/group/talia_tb/001	57561945275520	8408752391040
-data2/tami	/data2/group/tami/002	13134156184800	8856076370720
-data2/tsmidt	/data2/group/tsmidt/001	903479250240	21086753305280
-data2/vfish	/data2/group/vfish/001	130415040	21990102140480
+data1	/data1	667568246415424	218205074118880	0	yes
+data1/arupclab	/data1/group/arupclab/001	403200	10995115874560	10995116277760	yes
+data1/aselab	/data1/group/aselab/001	403200	32985348430080	32985348833280	yes
+data1/camcat	/data1/group/camcat/001	41081591849760	2898873261280	43980465111040	yes
+data1/cburge	/data1/group/cburge/001	172305071114400	47597254440800	219902325555200	yes
+data1/cordero	/data1/group/cordero/002	7027711729920	14962520825600	21990232555520	yes
+data1/econ	/data1/group/econ/001	10470700296000	11519532259520	21990232555520	yes
+data1/fraenkel_002	/data1/group/fraenkel/002	10339438112640	11650794442880	21990232555520	yes
+data1/fraenkel_003	/data1/group/fraenkel/003	7610826888000	14379405667520	21990232555520	yes
+data1/orcd	/data1/group/orcd/005	3436171441920	18554061113600	21990232555520	yes
+data1/picower	/data1/group/picower/003	55686689352000	10284008314560	65970697666560	yes
+data1/polzlab	/data1/group/polzlab/002	403200	13194139130112	13194139533312	yes
+data1/rafagb	/data1/group/rafagb/001	36590192220960	7390272890080	43980465111040	yes
+data1/rutledge	/data1/group/rutledge/001	41190205180320	2790259930720	43980465111040	yes
+data1/systems_backup	/data1/backup/systems/002	36233050281120	7747414829920	43980465111040	yes
+data1/tah	/data1/group/tah/001	10628547572160	11361684983360	21990232555520	yes
+data1/wvanreeslab	/data1/group/wvanreeslab/001	403200	35184371685632	35184372088832	yes
+data2	/data2	1058050437990720	162879687223904	0	yes
+data2/abodner	/data2/group/abodner/001	59860946285280	50090216492320	109951162777600	yes
+data2/ashansen	/data2/group/ashansen/001	241920	21990232313600	21990232555520	yes
+data2/caitlinm	/data2/group/caitlinm/001	66733585712640	21227344509440	87960930222080	yes
+data2/chisholm	/data2/group/chisholm/001	21326617670400	22653847440640	43980465111040	yes
+data2/cnh	/data2/group/cnh/001	675360	10995115602400	10995116277760	yes
+data2/dhousman	/data2/group/dhousman/001	241920	21990232313600	21990232555520	yes
+data2/faez	/data2/group/faez/001	67984737770880	19976192451200	87960930222080	yes
+data2/fraenkel_001	/data2/group/fraenkel/001	43592294753280	388170357760	43980465111040	yes
+data2/kpate	/data2/group/kpate/001	241920	43980464869120	43980465111040	yes
+data2/mick	/data2/group/mick/006	99590527048320	283191485730784	439804651110400	yes
+data2/mvogelsb	/data2/group/mvogelsb/004	175565510759520	356349684640	175921860444160	yes
+data2/orcd	/data2/group/orcd/002	1786319478720	20203913076800	21990232555520	yes
+data2/pog	/data2/group/pog/001	20391935941440	1598296614080	21990232555520	yes
+data2/psfc	/data2/group/psfc/001	1159571286720	20830661268800	21990232555520	yes
+data2/reimer	/data2/group/reimer/001	100450857497760	9500305279840	109951162777600	yes
+data2/shaohao	/data2/group/shaohao/001	4364640	10995111913120	10995116277760	yes
+data2/systems_backup	/data2/backup/systems/001	23005497503520	9979851329760	32985348833280	yes
+data2/talia_tb	/data2/group/talia_tb/001	57561945275520	8408752391040	65970697666560	yes
+data2/tami	/data2/group/tami/002	13134156184800	8856076370720	21990232555520	yes
+data2/tsmidt	/data2/group/tsmidt/001	903479250240	21086753305280	21990232555520	yes
+data2/vfish	/data2/group/vfish/001	130415040	21990102140480	21990232555520	yes
+##zpool
+  pool: data1
+ state: ONLINE
+  scan: scrub repaired 0B in 05:12:33 with 0 errors on Sat Oct 24 16:24:32 2026
+config:
+
+	NAME                                        STATE     READ WRITE CKSUM
+	data1                                       ONLINE       0     0     0
+	  raidz3-0                                  ONLINE       0     0     0
+	    35000cca2957a3890                       ONLINE       0     0     0
+	    35000cca2957a3798                       ONLINE       0     0     0
+	    35000cca295794cc0                       ONLINE       0     0     0
+	    35000cca2957a22f8                       ONLINE       0     0     0
+	    35000cca2957a1ab0                       ONLINE       0     0     0
+	    35000cca2957a8dd8                       ONLINE       0     0     0
+	    35000cca2957a90e4                       ONLINE       0     0     0
+	    35000cca2957a8cc0                       ONLINE       0     0     0
+	    35000cca2957a1104                       ONLINE       0     0     0
+	  raidz3-1                                  ONLINE       0     0     0
+	    35000cca2957a91e0                       ONLINE       0     0     0
+	    35000cca2957a83b4                       ONLINE       0     0     0
+	    35000cca2957a8598                       ONLINE       0     0     0
+	    35000cca2957a3374                       ONLINE       0     0     0
+	    35000cca2957a1308                       ONLINE       0     0     0
+	    35000cca2957a2c08                       ONLINE       0     0     0
+	    35000cca2957960c0                       ONLINE       0     0     0
+	    35000cca2957a3c54                       ONLINE       0     0     0
+	    35000cca295797224                       ONLINE       0     0     0
+	  raidz3-2                                  ONLINE       0     0     0
+	    35000cca2957a3a08                       ONLINE       0     0     0
+	    35000cca2957a13a0                       ONLINE       0     0     0
+	    35000cca295796608                       ONLINE       0     0     0
+	    35000cca2957a1fe0                       ONLINE       0     0     0
+	    35000cca2957a1390                       ONLINE       0     0     0
+	    35000cca2957a85cc                       ONLINE       0     0     0
+	    35000cca2957a8e18                       ONLINE       0     0     0
+	    35000cca2957a1ddc                       ONLINE       0     0     0
+	    35000cca2957a8600                       ONLINE       0     0     0
+	  raidz3-3                                  ONLINE       0     0     0
+	    35000cca2957a83e0                       ONLINE       0     0     0
+	    35000cca2957a16f0                       ONLINE       0     0     0
+	    35000cca2957ae290                       ONLINE       0     0     0
+	    35000cca2957a1568                       ONLINE       0     0     0
+	    35000cca2957a23c4                       ONLINE       0     0     0
+	    35000cca2957adc94                       ONLINE       0     0     0
+	    35000cca2957a26ec                       ONLINE       0     0     0
+	    35000cca2957a130c                       ONLINE       0     0     0
+	    35000cca2957ae07c                       ONLINE       0     0     0
+	  raidz3-4                                  ONLINE       0     0     0
+	    35000cca2957a2724                       ONLINE       0     0     0
+	    35000cca2957a2d74                       ONLINE       0     0     0
+	    35000cca2957a8568                       ONLINE       0     0     0
+	    35000cca2957a8ab0                       ONLINE       0     0     0
+	    35000cca2957a8b38                       ONLINE       0     0     0
+	    35000cca2957a2d78                       ONLINE       0     0     0
+	    35000cca2957a2e08                       ONLINE       0     0     0
+	    35000cca2957a8d48                       ONLINE       0     0     0
+	    35000cca2957a9270                       ONLINE       0     0     0
+	  raidz3-5                                  ONLINE       0     0     0
+	    35000cca29579824c                       ONLINE       0     0     0
+	    35000cca2957a10e8                       ONLINE       0     0     0
+	    35000cca2957141cc                       ONLINE       0     0     0
+	    35000cca2957960f0                       ONLINE       0     0     0
+	    35000cca2957a15d8                       ONLINE       0     0     0
+	    35000cca295713c1c                       ONLINE       0     0     0
+	    35000cca2957a9138                       ONLINE       0     0     0
+	    35000cca2957a36b0                       ONLINE       0     0     0
+	    35000cca2957a1628                       ONLINE       0     0     0
+	  raidz3-6                                  ONLINE       0     0     0
+	    35000cca2957adfc8                       ONLINE       0     0     0
+	    35000cca2957a2bf4                       ONLINE       0     0     0
+	    35000cca295797084                       ONLINE       0     0     0
+	    35000cca2957a8bd0                       ONLINE       0     0     0
+	    35000cca2957a86f0                       ONLINE       0     0     0
+	    35000cca2957a13b4                       ONLINE       0     0     0
+	    35000cca295798730                       ONLINE       0     0     0
+	    35000cca2957a3b68                       ONLINE       0     0     0
+	    35000cca2957a3030                       ONLINE       0     0     0
+	  raidz3-7                                  ONLINE       0     0     0
+	    35000cca2957a86c0                       ONLINE       0     0     0
+	    35000cca295797ee8                       ONLINE       0     0     0
+	    35000cca2957adec4                       ONLINE       0     0     0
+	    35000cca295798dc8                       ONLINE       0     0     0
+	    35000cca2957addc4                       ONLINE       0     0     0
+	    35000cca295713994                       ONLINE       0     0     0
+	    35000cca2957a33a8                       ONLINE       0     0     0
+	    35000cca295713f80                       ONLINE       0     0     0
+	    35000cca2957a1204                       ONLINE       0     0     0
+	  raidz3-8                                  ONLINE       0     0     0
+	    35000cca2957138c4                       ONLINE       0     0     0
+	    35000cca2957a90a4                       ONLINE       0     0     0
+	    35000cca2957967dc                       ONLINE       0     0     0
+	    35000cca2a00fa60c                       ONLINE       0     0     0
+	    35000cca2ba06ce94                       ONLINE       0     0     0
+	    35000cca2a014055c                       ONLINE       0     0     0
+	    35000cca2ba06f924                       ONLINE       0     0     0
+	    35000cca2ba06d418                       ONLINE       0     0     0
+	    35000cca2ba071b00                       ONLINE       0     0     0
+	  raidz3-9                                  ONLINE       0     0     0
+	    35000cca2ba070a7c                       ONLINE       0     0     0
+	    35000cca2ba06faa4                       ONLINE       0     0     0
+	    35000cca2ba065948                       ONLINE       0     0     0
+	    35000cca2ba063bd4                       ONLINE       0     0     0
+	    35000cca2ba066024                       ONLINE       0     0     0
+	    35000cca2ba06f2c0                       ONLINE       0     0     0
+	    35000cca2b5793f08                       ONLINE       0     0     0
+	    35000cca2ba06d0ec                       ONLINE       0     0     0
+	    35000cca2ba06615c                       ONLINE       0     0     0
+	logs	
+	  mirror-10                                 ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6WVUG960G_63A0A01ST0ZJ  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6WVUG960G_63A0A01TT0ZJ  ONLINE       0     0     0
+	cache
+	  scsi-SKIOXIA_KPM6XRUG1T92_31P0A1HCT8R8    ONLINE       0     0     0
+	  scsi-SKIOXIA_KPM6XRUG1T92_31T0A0F9T8R8    ONLINE       0     0     0
+
+errors: No known data errors
+
+  pool: data2
+ state: ONLINE
+  scan: scrub canceled on Fri Sep 18 15:34:57 2026
+config:
+
+	NAME                                        STATE     READ WRITE CKSUM
+	data2                                       ONLINE       0     0     0
+	  raidz3-0                                  ONLINE       0     0     0
+	    35000cca2be5fc9e8                       ONLINE       0     0     0
+	    35000cca2be5f28b4                       ONLINE       0     0     0
+	    35000cca2be5ef2a8                       ONLINE       0     0     0
+	    35000cca2be5f4438                       ONLINE       0     0     0
+	    35000cca2be611cf8                       ONLINE       0     0     0
+	    35000cca2be5a3af4                       ONLINE       0     0     0
+	    35000cca2be61458c                       ONLINE       0     0     0
+	    35000cca2be600d48                       ONLINE       0     0     0
+	    35000cca2be6046fc                       ONLINE       0     0     0
+	  raidz3-1                                  ONLINE       0     0     0
+	    35000cca2be5db618                       ONLINE       0     0     0
+	    35000cca2be5e92e0                       ONLINE       0     0     0
+	    35000cca2be611d14                       ONLINE       0     0     0
+	    35000cca2be5ec778                       ONLINE       0     0     0
+	    35000cca2be611a90                       ONLINE       0     0     0
+	    35000cca2be604678                       ONLINE       0     0     0
+	    35000cca2be612c38                       ONLINE       0     0     0
+	    35000cca2be5f0d54                       ONLINE       0     0     0
+	    35000cca2be5d8898                       ONLINE       0     0     0
+	  raidz3-2                                  ONLINE       0     0     0
+	    35000cca2be5f3230                       ONLINE       0     0     0
+	    35000cca2c8014cc0                       ONLINE       0     0     0
+	    35000cca2be609178                       ONLINE       0     0     0
+	    35000cca2be5f3330                       ONLINE       0     0     0
+	    35000cca2be613bc4                       ONLINE       0     0     0
+	    35000cca2be5f35d0                       ONLINE       0     0     0
+	    35000cca2be6007b0                       ONLINE       0     0     0
+	    35000cca2be60c394                       ONLINE       0     0     0
+	    35000cca2be5f4194                       ONLINE       0     0     0
+	  raidz3-3                                  ONLINE       0     0     0
+	    35000cca2e900050c                       ONLINE       0     0     0
+	    35000cca2be61794c                       ONLINE       0     0     0
+	    35000cca2be61766c                       ONLINE       0     0     0
+	    35000cca2be5ef378                       ONLINE       0     0     0
+	    35000cca2be5ee358                       ONLINE       0     0     0
+	    35000cca2be5d6bbc                       ONLINE       0     0     0
+	    35000cca2be4ffae0                       ONLINE       0     0     0
+	    35000cca2be5e16ec                       ONLINE       0     0     0
+	    35000cca2be5df78c                       ONLINE       0     0     0
+	  raidz3-4                                  ONLINE       0     0     0
+	    35000cca2be595714                       ONLINE       0     0     0
+	    35000cca2be5f0e70                       ONLINE       0     0     0
+	    35000cca2be604d28                       ONLINE       0     0     0
+	    35000cca2be611da8                       ONLINE       0     0     0
+	    35000cca2be5fd13c                       ONLINE       0     0     0
+	    35000cca2be5f4484                       ONLINE       0     0     0
+	    35000cca2be610c2c                       ONLINE       0     0     0
+	    35000cca2be6128c8                       ONLINE       0     0     0
+	    35000cca2be604e70                       ONLINE       0     0     0
+	  raidz3-5                                  ONLINE       0     0     0
+	    35000cca2be60a554                       ONLINE       0     0     0
+	    35000cca2be610530                       ONLINE       0     0     0
+	    35000cca2be60a8b4                       ONLINE       0     0     0
+	    35000cca2be609298                       ONLINE       0     0     0
+	    35000cca2be60e8a4                       ONLINE       0     0     0
+	    35000cca2be612534                       ONLINE       0     0     0
+	    35000cca4128ae6a0                       ONLINE       0     0     0
+	    35000cca2be50e0bc                       ONLINE       0     0     0
+	    35000cca2be6129a4                       ONLINE       0     0     0
+	  raidz3-6                                  ONLINE       0     0     0
+	    35000cca2be5d89fc                       ONLINE       0     0     0
+	    35000cca2be606fa4                       ONLINE       0     0     0
+	    35000cca2e9000264                       ONLINE       0     0     0
+	    35000cca2be5d3a34                       ONLINE       0     0     0
+	    35000cca2be60d098                       ONLINE       0     0     0
+	    35000cca2be60bddc                       ONLINE       0     0     0
+	    35000cca2be5e9000                       ONLINE       0     0     0
+	    35000cca2be5584fc                       ONLINE       0     0     0
+	    35000cca2be5f99e0                       ONLINE       0     0     0
+	  raidz3-7                                  ONLINE       0     0     0
+	    35000cca2be1ee614                       ONLINE       0     0     0
+	    35000cca2e9425bdc                       ONLINE       0     0     0
+	    35000cca2be50d3a8                       ONLINE       0     0     0
+	    35000cca2be520a48                       ONLINE       0     0     0
+	    35000cca2be4f7210                       ONLINE       0     0     0
+	    35000cca2be5ef314                       ONLINE       0     0     0
+	    35000cca2be520cc0                       ONLINE       0     0     0
+	    35000cca2be5213e4                       ONLINE       0     0     0
+	    35000cca2be52c9b0                       ONLINE       0     0     0
+	  raidz3-8                                  ONLINE       0     0     0
+	    35000cca2be520f60                       ONLINE       0     0     0
+	    35000cca2be52c6f4                       ONLINE       0     0     0
+	    35000cca2be5f2c00                       ONLINE       0     0     0
+	    35000cca2be52107c                       ONLINE       0     0     0
+	    35000cca2be4f6a28                       ONLINE       0     0     0
+	    35000cca2be60180c                       ONLINE       0     0     0
+	    35000cca2be6144b8                       ONLINE       0     0     0
+	    35000cca2be4f6c64                       ONLINE       0     0     0
+	    35000cca2be601cf4                       ONLINE       0     0     0
+	  raidz3-9                                  ONLINE       0     0     0
+	    35000cca2be5e913c                       ONLINE       0     0     0
+	    35000cca2be600d10                       ONLINE       0     0     0
+	    35000cca2be520c90                       ONLINE       0     0     0
+	    35000cca2be613034                       ONLINE       0     0     0
+	    35000cca2be5f99c4                       ONLINE       0     0     0
+	    35000cca2be579c68                       ONLINE       0     0     0
+	    35000cca2be5e2ba8                       ONLINE       0     0     0
+	    35000cca2be60adcc                       ONLINE       0     0     0
+	    35000cca2e9425ff4                       ONLINE       0     0     0
+	logs	
+	  mirror-10                                 ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6WVUG960G_63A0A01UT0ZJ  ONLINE       0     0     0
+	    scsi-SKIOXIA_KPM6WVUG960G_Z2G0A0AKT0ZJ  ONLINE       0     0     0
+	cache
+	  scsi-SKIOXIA_KPM6XRUG1T92_31T0A0NGT8R8    ONLINE       0     0     0
+	  scsi-SKIOXIA_KPM6XRUG1T92_31T0A0NQT8R8    ONLINE       0     0     0
+
+errors: No known data errors
 ##inodes
 Filesystem                        Inodes      IUsed        IFree IUse% Mounted on
-/dev/mapper/xcatvg-root        186947584     268702    186678882    1% /
+/dev/mapper/xcatvg-root        186947584     268623    186678961    1% /
 /dev/sdg1                         524288        384       523904    1% /boot
-data1                       426181895167         41 426181895126    1% /data1
-data1/systems_backup         15417114982   12837286  15404277696    1% /data1/backup/systems/002
+data1                       426181785429         41 426181785388    1% /data1
+data1/systems_backup         15144517919   12848330  15131669589    1% /data1/backup/systems/002
 data1/arupclab               21474835698          6  21474835692    1% /data1/group/arupclab/001
 data1/aselab                 64424508658          6  64424508652    1% /data1/group/aselab/001
-data1/camcat                  5661919857      58058   5661861799    1% /data1/group/camcat/001
+data1/camcat                  5661919896      58058   5661861838    1% /data1/group/camcat/001
 data1/cburge                 93119062566  155674987  92963387579    1% /data1/group/cburge/001
 data1/cordero                29225024318    1350831  29223673487    1% /data1/group/cordero/002
-data1/econ                   22509238052    1556203  22507681849    1% /data1/group/econ/001
-data1/fraenkel_002           22756021734     563464  22755458270    1% /data1/group/fraenkel/002
+data1/econ                   22500642826    1556382  22499086444    1% /data1/group/econ/001
+data1/fraenkel_002           22756021389     563493  22755457896    1% /data1/group/fraenkel/002
 data1/fraenkel_003           28101753755   16977061  28084776694    1% /data1/group/fraenkel/003
 data1/orcd                   36238400650         38  36238400612    1% /data1/group/orcd/005
 data1/picower                20088659069    2705330  20085953739    1% /data1/group/picower/003
 data1/polzlab                25769802994          6  25769802988    1% /data1/group/polzlab/002
-data1/rafagb                 14588259942   77401232  14510858710    1% /data1/group/rafagb/001
+data1/rafagb                 14511554079   77427341  14434126738    1% /data1/group/rafagb/001
 data1/rutledge                5517983509   68257082   5449726427    2% /data1/group/rutledge/001
-data1/tah                    22203964340   13172688  22190791652    1% /data1/group/tah/001
+data1/tah                    22203963671   13172688  22190790983    1% /data1/group/tah/001
 data1/wvanreeslab            68719475954          6  68719475948    1% /data1/group/wvanreeslab/001
-data2                       318162475913         56 318162475857    1% /data2
-data2/systems_backup         19515877854   23978068  19491899786    1% /data2/backup/systems/001
+data2                       318124389165         56 318124389109    1% /data2
+data2/systems_backup         19515875303   23978175  19491897128    1% /data2/backup/systems/001
 data2/abodner                97832513507      59421  97832454086    1% /data2/group/abodner/001
 data2/ashansen               42949672493          6  42949672487    1% /data2/group/ashansen/001
 data2/chisholm               44250714775    4918993  44245795782    1% /data2/group/chisholm/001
 data2/cnh                    21474835195         35  21474835160    1% /data2/group/cnh/001
 data2/dhousman               42949672493          6  42949672487    1% /data2/group/dhousman/001
-data2/faez                   39202480261  163558071  39038922190    1% /data2/group/faez/001
+data2/faez                   39179723592  163722711  39016000881    1% /data2/group/faez/001
 data2/fraenkel_001             762785931    4640701    758145230    1% /data2/group/fraenkel/001
 data2/kpate                  85899345453          6  85899345447    1% /data2/group/kpate/001
-data2/mick                  553148898609    2442081 553146456528    1% /data2/group/mick/006
-data2/mvogelsb                 737993678    3918441    734075237    1% /data2/group/mvogelsb/004
-data2/orcd                   39461333431     565329  39460768102    1% /data2/group/orcd/002
+data2/mick                  553110812648    2442081 553108370567    1% /data2/group/mick/006
+data2/mvogelsb                 699914029    3918552    695995477    1% /data2/group/mvogelsb/004
+data2/orcd                   39461333062     565334  39460767728    1% /data2/group/orcd/002
 data2/pog                     3139352911   17679837   3121673074    1% /data2/group/pog/001
 data2/psfc                   40688585525    3700235  40684885290    1% /data2/group/psfc/001
-data2/reimer                 18574580890   18265555  18556315335    1% /data2/group/reimer/001
+data2/reimer                 18573549305   18265556  18555283749    1% /data2/group/reimer/001
 data2/shaohao                21474828341        386  21474827955    1% /data2/group/shaohao/001
 data2/talia_tb               16423946705     602192  16423344513    1% /data2/group/talia_tb/001
 data2/tami                   17297220850     196689  17297024161    1% /data2/group/tami/002
@@ -251,9 +1085,9 @@ data2/vfish                  42949418283         40  42949418243    1% /data2/gr
 devtmpfs                        49264172       5960     49258212    1% /dev
 tmpfs                           49270458          1     49270457    1% /dev/shm
 nfs001.lb:/                        31122        103        31019    1% /net/nfs001.lb
-nfs001.lb:/home              13852490493 1439698596  12412791897   11% /net/nfs001.lb/home
-data2/caitlinm               41466364143    6706820  41459657323    1% /orcd/data/caitlinm/001
-fstor001:/software/core/001   2228666733   34454953   2194211780    2% /orcd/software/core/001
+nfs001.lb:/home              13853452123 1443842140  12409609983   11% /net/nfs001.lb/home
+data2/caitlinm               41466364065    6706820  41459657245    1% /orcd/data/caitlinm/001
+fstor001:/software/core/001   2228663157   34454954   2194208203    2% /orcd/software/core/001
 tmpfs                             819200      10515       808685    2% /run
 tmpfs                            9854091         21      9854070    1% /run/user/0
 ##exportfile
@@ -496,3 +1330,4 @@ tmpfs                            9854091         21      9854070    1% /run/user
 #provision001 (testing xcat backup process)
 /data1/backup/systems/002/provision001 172.16.225.103(rw,async,no_root_squash) 10.1.225.103(rw,async,no_root_squash) 
 
+##ok

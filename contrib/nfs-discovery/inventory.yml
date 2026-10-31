@@ -1,0 +1,143 @@
+hosts:
+  core009:
+    tags: [core, xfs]
+  core010:
+    tags: [core, xfs]
+  core020:
+    tags: [core, xfs]
+  core021:
+    tags: [core, xfs]
+  eofe-data001:
+    tags: [eofe, xfs]
+  eofe-data003:
+    tags: [eofe, xfs]
+  eofe-data004:
+    tags: [eofe, xfs]
+  eofe-data005:
+    tags: [eofe, xfs]
+  eofe-data006:
+    tags: [eofe, xfs]
+  eofe-data007:
+    tags: [eofe, xfs]
+  eofe-data009:
+    tags: [eofe, xfs]
+  eofe-data010:
+    tags: [eofe, xfs]
+  eofe-data013:
+    tags: [eofe, xfs]
+  eofe-data020:
+    tags: [eofe, xfs]
+  eofe-data021:
+    tags: [eofe, xfs]
+  eofe-data022:
+    tags: [eofe, xfs]
+  eofe-data023:
+    tags: [eofe, xfs]
+  eofe-data025:
+    tags: [eofe, xfs]
+  eofe-data026:
+    tags: [eofe, zfs]
+  eofe-data027:
+    tags: [eofe, xfs]
+  fcstor002:
+    tags: [fcstor]
+  fstor001:
+    tags: [fstor, flash, zfs]
+  fstor002:
+    tags: [fstor, flash, xfs]
+  fstor003:
+    tags: [fstor, flash, xfs]
+  fstor004:
+    tags: [fstor, flash, xfs]
+  fstor005:
+    tags: [fstor, flash, xfs]
+  fstor006:
+    tags: [fstor, flash, xfs]
+  fstor008:
+    tags: [fstor, flash, xfs]
+  fstor009:
+    tags: [fstor, flash, xfs]
+  fstor010:
+    tags: [fstor, flash, xfs]
+  fstor011:
+    tags: [fstor, flash, xfs]
+  fstor012:
+    tags: [fstor, flash, xfs]
+  fstor013:
+    tags: [fstor, flash, xfs]
+  fstor014:
+    tags: [fstor, flash, xfs]
+  fstor015:
+    tags: [fstor, flash, xfs]
+  fstor016:
+    tags: [fstor, flash, xfs]
+  fstor017:
+    tags: [fstor, flash, xfs]
+  fstor018:
+    tags: [fstor, flash, xfs]
+  fstor019:
+    tags: [fstor, flash, xfs]
+  fstor020:
+    tags: [fstor, flash, xfs]
+  fstor021:
+    tags: [fstor, flash, xfs]
+  fstor022:
+    tags: [fstor, flash, xfs]
+  fstor023:
+    tags: [fstor, flash, xfs]
+  fstor024:
+    tags: [fstor, flash, xfs]
+  fstor025:
+    tags: [fstor, flash, xfs]
+  fstor026:
+    tags: [fstor, flash, xfs]
+  fstor027:
+    tags: [fstor, flash, xfs]
+  hstor001:
+    tags: [hstor, hdd, zfs]
+  hstor002-n1:
+    tags: [hstor, hdd, zfs]
+  hstor002-n2:
+    tags: [hstor, hdd, zfs]
+  hstor003-n1:
+    tags: [hstor, hdd, zfs]
+  hstor003-n2:
+    tags: [hstor, hdd, zfs]
+  hstor004-n1:
+    tags: [hstor, hdd, zfs]
+  hstor004-n2:
+    tags: [hstor, hdd, zfs]
+  hstor005-n1:
+    tags: [hstor, hdd, zfs]
+  hstor005-n2:
+    tags: [hstor, hdd, zfs]
+  hstor006-n1:
+    tags: [hstor, hdd, zfs]
+  hstor006-n2:
+    tags: [hstor, hdd, zfs]
+  hstor007-n1:
+    tags: [hstor, hdd, zfs]
+  hstor007-n2:
+    tags: [hstor, hdd, zfs]
+  hstor008:
+    tags: [hstor, hdd, zfs]
+  hstor009:
+    tags: [hstor, hdd, zfs]
+  hstor010:
+    tags: [hstor, hdd, zfs]
+  hstor011:
+    tags: [hstor, hdd, zfs]
+  hstor012-n1:
+    tags: [hstor, hdd, zfs]
+  hstor012-n2:
+    tags: [hstor, hdd, zfs]
+  hstor013-n1:
+    tags: [hstor, hdd, zfs]
+  hstor013-n2:
+    tags: [hstor, hdd, zfs]
+  hstor014:
+    tags: [hstor, hdd, zfs]
+  hstor015:
+    tags: [hstor, hdd, zfs]
+  nfs001:
+    tags: [nfs]

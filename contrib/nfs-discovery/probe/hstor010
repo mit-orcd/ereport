@@ -2,20 +2,62 @@
 hstor010-mgmt
 ##df
 Filesystem     Type         1K-blocks         Used    Available Use% Mounted on
-/dev/md0       xfs          904143524    284872500    619271024  32% /
+/dev/md0       xfs          904143524    284865180    619278344  32% /
 /dev/nvme0n1p1 vfat            204580         7568       197012   4% /boot/efi
-data1          zfs       111863605376          384 111863604992   1% /data1
-data1/cdrennan zfs      1209462790656 681699093888 527763696768  57% /data1/group/cdrennan/001
-data2/cdrennan zfs      1209462790528 747608062592 461854727936  62% /data1/group/cdrennan/002
+data1          zfs       111863553024          384 111863552640   1% /data1
+data1/cdrennan zfs      1209462790528 690347660544 519115129984  58% /data1/group/cdrennan/001
+data2/cdrennan zfs      1209462790528 747766654464 461696136064  62% /data1/group/cdrennan/002
 data1/orcd     zfs        21474836480   6711485568  14763350912  32% /data1/group/orcd/015
 data2/orcd     zfs        21474836480   6717547776  14757288704  32% /data1/group/orcd/018
-data2          zfs       111858954368          384 111858953984   1% /data2
+data2          zfs       111858953600          384 111858953216   1% /data2
 devtmpfs       devtmpfs     197600844            0    197600844   0% /dev
 tmpfs          tmpfs        197625116            0    197625116   0% /dev/shm
-nfs001.lb:/    nfs4            996160        62272       933888   7% /net/nfs001.lb
+nfs001.lb:/    nfs4            996160        64512       931648   7% /net/nfs001.lb
 tmpfs          tmpfs         79050048        45852     79004196   1% /run
 tmpfs          tmpfs         39525020            0     39525020   0% /run/user/0
 efivarfs       efivarfs           512           45          463   9% /sys/firmware/efi/efivars
+##mountinfo
+22 70 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+23 70 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 70 0:6 / /dev rw,nosuid shared:9 - devtmpfs devtmpfs rw,size=197600844k,nr_inodes=49400211,mode=755,inode64
+25 23 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+26 24 0:23 / /dev/shm rw,nosuid,nodev shared:10 - tmpfs tmpfs rw,inode64
+27 24 0:24 / /dev/pts rw,nosuid,noexec,relatime shared:11 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+28 70 0:25 / /run rw,nosuid,nodev shared:12 - tmpfs tmpfs rw,size=79050048k,nr_inodes=819200,mode=755,inode64
+29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+30 23 0:27 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+31 23 0:28 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:6 - efivarfs efivarfs rw
+32 23 0:29 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:7 - bpf bpf rw,mode=700
+65 23 0:18 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:8 - configfs configfs rw
+70 1 9:0 / / rw,relatime shared:1 - xfs /dev/md0 rw,attr2,inode64,logbufs=8,logbsize=32k,noquota
+33 22 0:30 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=621293
+34 24 0:31 / /dev/hugepages rw,relatime shared:15 - hugetlbfs hugetlbfs rw,pagesize=2M
+35 24 0:20 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:16 - mqueue mqueue rw
+36 23 0:8 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:17 - debugfs debugfs rw
+37 23 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:18 - tracefs tracefs rw
+38 22 0:32 / /proc/fs/nfsd rw,relatime shared:19 - nfsd nfsd rw
+39 23 0:33 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:20 - fusectl fusectl rw
+62 28 0:34 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+64 28 0:35 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:22 - ramfs none rw,mode=700
+144 70 259:17 / /boot/efi rw,relatime shared:65 - vfat /dev/nvme0n1p1 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+150 70 0:37 / /data1 rw,relatime shared:78 - zfs data1 rw,xattr,posixacl,casesensitive
+155 150 0:40 / /data1/group/cdrennan/001 rw,relatime shared:81 - zfs data1/cdrennan rw,xattr,posixacl,casesensitive
+160 150 0:39 / /data1/group/cdrennan/002 rw,relatime shared:84 - zfs data2/cdrennan rw,xattr,posixacl,casesensitive
+165 70 0:38 / /data2 rw,relatime shared:87 - zfs data2 rw,xattr,posixacl,casesensitive
+170 150 0:42 / /data1/group/orcd/018 rw,relatime shared:90 - zfs data2/orcd rw,xattr,posixacl,casesensitive
+175 150 0:41 / /data1/group/orcd/015 rw,relatime shared:93 - zfs data1/orcd rw,xattr,posixacl,casesensitive
+211 28 0:43 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:96 - ramfs none rw,mode=700
+180 36 0:13 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:99 - tracefs tracefs rw
+185 33 0:44 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:102 - binfmt_misc binfmt_misc rw
+190 70 0:45 / /var/lib/nfs/rpc_pipefs rw,relatime shared:105 - rpc_pipefs sunrpc rw
+939 70 0:53 / /misc rw,relatime shared:496 - autofs /etc/auto.misc rw,fd=6,pgrp=21660,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=88446
+976 70 0:54 / /net rw,relatime shared:521 - autofs -hosts rw,fd=9,pgrp=21660,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=600665
+1001 70 0:55 / /nfs rw,relatime shared:534 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=21660,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=585284
+1077 70 0:56 / /orcd rw,relatime shared:547 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=15,pgrp=21660,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=643462
+1127 70 0:57 / /programs rw,relatime shared:579 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=18,pgrp=21660,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=623875
+962 976 0:49 / /net/nfs001.lb rw,nosuid,nodev,relatime shared:251 - nfs4 nfs001.lb:/ rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.3.136,local_lock=none,addr=10.1.223.4
+583 962 0:59 / /net/nfs001.lb/home rw,relatime shared:281 - autofs -hosts rw,fd=9,pgrp=21660,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=600665
+502 28 0:58 / /run/user/0 rw,nosuid,nodev,relatime shared:294 - tmpfs tmpfs rw,size=39525020k,nr_inodes=9881255,mode=700,inode64
 ##mounts
 /dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
 /dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
@@ -61,23 +103,233 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /data1 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##exportopts
+/data1        	172.16.6.221(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.6.222(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.6.223(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data1        	172.16.99.0(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,ro,insecure,no_root_squash,no_all_squash)
+/data1        	172.16.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1        	172.19.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data1        	10.1.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
-data1	/data1	1245373874197990	114548331620890
-data1/cdrennan	/data1/group/cdrennan/001	698059872034944	540430025491942
-data1/orcd	/data1/group/orcd/015	6872561104128	15117671451392
-data2	/data2	1245378636845542	114543568973338
-data2/cdrennan	/data1/group/cdrennan/002	765550655991168	472939241535718
-data2/orcd	/data1/group/orcd/018	6878768849664	15111463705856
+data1	/data1	1245373927837414	114548277981466	0	yes
+data1/cdrennan	/data1/group/cdrennan/001	706916004396672	531573893130214	1238489897526886	yes
+data1/orcd	/data1/group/orcd/015	6872561104128	15117671451392	21990232555520	yes
+data2	/data2	1245378637666918	114543568151962	0	yes
+data2/cdrennan	/data1/group/cdrennan/002	765713054156544	472776843370342	1238489897526886	yes
+data2/orcd	/data1/group/orcd/018	6878768849664	15111463705856	21990232555520	yes
+##zpool
+  pool: data1
+ state: ONLINE
+  scan: scrub repaired 0B in 00:00:05 with 0 errors on Mon Oct 26 09:39:47 2026
+config:
+
+	NAME                                           STATE     READ WRITE CKSUM
+	data1                                          ONLINE       0     0     0
+	  raidz3-0                                     ONLINE       0     0     0
+	    35000c500f3cf1a17                          ONLINE       0     0     0
+	    35000c500f3cf23d7                          ONLINE       0     0     0
+	    35000c500f3cdea37                          ONLINE       0     0     0
+	    35000c500f3cf9087                          ONLINE       0     0     0
+	    35000c500f3cdfa63                          ONLINE       0     0     0
+	    35000c500f3cee543                          ONLINE       0     0     0
+	    35000c500f3cee47b                          ONLINE       0     0     0
+	    35000c500f3cf6b23                          ONLINE       0     0     0
+	    35000c500f3cf8bd7                          ONLINE       0     0     0
+	    35000c500f5245a2f                          ONLINE       0     0     0
+	    35000c500f3cdbd2b                          ONLINE       0     0     0
+	    35000c500f3cf8f67                          ONLINE       0     0     0
+	    35000c500f3cf65a3                          ONLINE       0     0     0
+	  raidz3-1                                     ONLINE       0     0     0
+	    35000c500f5238d37                          ONLINE       0     0     0
+	    35000c500f3cf078f                          ONLINE       0     0     0
+	    35000c500f3cf4a4b                          ONLINE       0     0     0
+	    35000c500f3cf91bb                          ONLINE       0     0     0
+	    35000c500f3cf82ab                          ONLINE       0     0     0
+	    35000c500f3cf85b3                          ONLINE       0     0     0
+	    35000c500f3cf71b7                          ONLINE       0     0     0
+	    35000c500f3cf438f                          ONLINE       0     0     0
+	    35000c500f3ce0747                          ONLINE       0     0     0
+	    35000c500f3cf1e7f                          ONLINE       0     0     0
+	    35000c500f3cefac7                          ONLINE       0     0     0
+	    35000c500f3cf61cb                          ONLINE       0     0     0
+	    35000c500f47de0f3                          ONLINE       0     0     0
+	  raidz3-2                                     ONLINE       0     0     0
+	    35000c500f3cf15e7                          ONLINE       0     0     0
+	    35000c500f3cf1af7                          ONLINE       0     0     0
+	    35000c500f3d87e1b                          ONLINE       0     0     0
+	    35000c500f3cf9243                          ONLINE       0     0     0
+	    35000c500f3cf920f                          ONLINE       0     0     0
+	    35000c500f3ce0877                          ONLINE       0     0     0
+	    35000c500f3cf2db7                          ONLINE       0     0     0
+	    35000c500f3cd9353                          ONLINE       0     0     0
+	    35000c500f3cdf35f                          ONLINE       0     0     0
+	    35000c500f3cf4f3f                          ONLINE       0     0     0
+	    35000c500f3cf0d1f                          ONLINE       0     0     0
+	    35000c500f3cf444b                          ONLINE       0     0     0
+	    35000c500f3cf6343                          ONLINE       0     0     0
+	  raidz3-3                                     ONLINE       0     0     0
+	    35000c500f3cef3d7                          ONLINE       0     0     0
+	    35000c500f3cdd30b                          ONLINE       0     0     0
+	    35000c500f3cf6423                          ONLINE       0     0     0
+	    35000c500f3cf5183                          ONLINE       0     0     0
+	    35000c500f3cf716f                          ONLINE       0     0     0
+	    35000c500f5444487                          ONLINE       0     0     0
+	    35000c500f3cf3edb                          ONLINE       0     0     0
+	    35000c500f3cf1a7f                          ONLINE       0     0     0
+	    35000c500f3ced5e3                          ONLINE       0     0     0
+	    35000c500f3cf5c07                          ONLINE       0     0     0
+	    35000c500f3cf58e3                          ONLINE       0     0     0
+	    35000c500f3cf7c63                          ONLINE       0     0     0
+	    35000c500f3cdf187                          ONLINE       0     0     0
+	  raidz3-4                                     ONLINE       0     0     0
+	    35000c500f3cf9217                          ONLINE       0     0     0
+	    35000c500f3ceeddb                          ONLINE       0     0     0
+	    35000c500f3cf7933                          ONLINE       0     0     0
+	    35000c500f3cddf83                          ONLINE       0     0     0
+	    35000c500f3cf76a7                          ONLINE       0     0     0
+	    35000c500f3cf8577                          ONLINE       0     0     0
+	    35000c500f3cf12ab                          ONLINE       0     0     0
+	    35000c500f3cf5357                          ONLINE       0     0     0
+	    35000c500f3cf5acf                          ONLINE       0     0     0
+	    35000c500f3cf5313                          ONLINE       0     0     0
+	    35000c500f3cf7057                          ONLINE       0     0     0
+	    35000c500f4c6833b                          ONLINE       0     0     0
+	    35000c500f52454eb                          ONLINE       0     0     0
+	  raidz3-5                                     ONLINE       0     0     0
+	    35000c500f3cddff7                          ONLINE       0     0     0
+	    35000c500f3cf287f                          ONLINE       0     0     0
+	    35000c500f3ced4a3                          ONLINE       0     0     0
+	    35000c500f3cdde2f                          ONLINE       0     0     0
+	    35000c500f3cddb7b                          ONLINE       0     0     0
+	    35000c500f3cf0a43                          ONLINE       0     0     0
+	    35000c500f3cf7e57                          ONLINE       0     0     0
+	    35000c500f3cf5bd7                          ONLINE       0     0     0
+	    35000c500f3cf67db                          ONLINE       0     0     0
+	    35000c500f3cf36d3                          ONLINE       0     0     0
+	    35000c500f8c81597                          ONLINE       0     0     0
+	    35000c500f3cf6a2b                          ONLINE       0     0     0
+	    35000c500f5245267                          ONLINE       0     0     0
+	logs	
+	  mirror-6                                     ONLINE       0     0     0
+	    nvme-MTFDKCC800TGQ-1BK1DABYY_022410317776  ONLINE       0     0     0
+	    nvme-MTFDKCC800TGQ-1BK1DABYY_0224102F5131  ONLINE       0     0     0
+	cache
+	  nvme-MTFDKCC800TGQ-1BK1DABYY_0224102F4C50    ONLINE       0     0     0
+	  nvme-MTFDKCC800TGQ-1BK1DABYY_0224102F50C7    ONLINE       0     0     0
+
+errors: No known data errors
+
+  pool: data2
+ state: ONLINE
+  scan: scrub canceled on Sun Oct 25 10:54:08 2026
+config:
+
+	NAME                                           STATE     READ WRITE CKSUM
+	data2                                          ONLINE       0     0     0
+	  raidz3-0                                     ONLINE       0     0     0
+	    35000c500f3cf4363                          ONLINE       0     0     0
+	    35000c500f3cd9217                          ONLINE       0     0     0
+	    35000c500f3ceffc3                          ONLINE       0     0     0
+	    35000c500f3cecf63                          ONLINE       0     0     0
+	    35000c500f3cf5507                          ONLINE       0     0     0
+	    35000c500f3cdcc2b                          ONLINE       0     0     0
+	    35000c500f3cdd503                          ONLINE       0     0     0
+	    35000c500f3ce0a4f                          ONLINE       0     0     0
+	    35000c500f3cf0dcf                          ONLINE       0     0     0
+	    35000c500f3ce0d1f                          ONLINE       0     0     0
+	    35000c500f3cf1b2b                          ONLINE       0     0     0
+	    35000c500f5238787                          ONLINE       0     0     0
+	    35000c500f3cd9e37                          ONLINE       0     0     0
+	  raidz3-1                                     ONLINE       0     0     0
+	    35000c500f3cf7c1b                          ONLINE       0     0     0
+	    35000c500f3cf6fb3                          ONLINE       0     0     0
+	    35000c500f3cf715f                          ONLINE       0     0     0
+	    35000c500f54c2c7b                          ONLINE       0     0     0
+	    35000c500f3cf3887                          ONLINE       0     0     0
+	    35000c500f3cf51df                          ONLINE       0     0     0
+	    35000c500f3cf388f                          ONLINE       0     0     0
+	    35000c500f3cee49b                          ONLINE       0     0     0
+	    35000c500f3cf9077                          ONLINE       0     0     0
+	    35000c500f3cf53b7                          ONLINE       0     0     0
+	    35000c500f3cf8d27                          ONLINE       0     0     0
+	    35000c500f3cf6faf                          ONLINE       0     0     0
+	    35000c500f3cf4753                          ONLINE       0     0     0
+	  raidz3-2                                     ONLINE       0     0     0
+	    35000c500f3cf700b                          ONLINE       0     0     0
+	    35000c500f3cf470b                          ONLINE       0     0     0
+	    35000c500f3cdc99f                          ONLINE       0     0     0
+	    35000c500f3cdb0ef                          ONLINE       0     0     0
+	    35000c500f3cddf2b                          ONLINE       0     0     0
+	    35000c500f3cf6cb3                          ONLINE       0     0     0
+	    35000c500f3cf1d67                          ONLINE       0     0     0
+	    35000c500f3ced26f                          ONLINE       0     0     0
+	    35000c500f3cdce17                          ONLINE       0     0     0
+	    35000c500f3cf362f                          ONLINE       0     0     0
+	    35000c500f3cf691f                          ONLINE       0     0     0
+	    35000c500f3cee55b                          ONLINE       0     0     0
+	    35000c500f3cf76c7                          ONLINE       0     0     0
+	  raidz3-3                                     ONLINE       0     0     0
+	    35000c500f3cef127                          ONLINE       0     0     0
+	    35000c500f3cdcd93                          ONLINE       0     0     0
+	    35000c500f3cf3623                          ONLINE       0     0     0
+	    35000c500f3cf72b3                          ONLINE       0     0     0
+	    35000c500f3cf0f2b                          ONLINE       0     0     0
+	    35000c500f3cf6a63                          ONLINE       0     0     0
+	    35000c500f4c5f7e3                          ONLINE       0     0     0
+	    35000c500f3cf57f3                          ONLINE       0     0     0
+	    35000c500f3cf5ed7                          ONLINE       0     0     0
+	    35000c500f8f7eaf7                          ONLINE       0     0     0
+	    35000c500f3cdd357                          ONLINE       0     0     0
+	    35000c500f3cf16f7                          ONLINE       0     0     0
+	    35000c500f3cf565b                          ONLINE       0     0     0
+	  raidz3-4                                     ONLINE       0     0     0
+	    35000c500f3cdf12b                          ONLINE       0     0     0
+	    35000c500f3cf0723                          ONLINE       0     0     0
+	    35000c500f3cd9147                          ONLINE       0     0     0
+	    35000c500f3cd90fb                          ONLINE       0     0     0
+	    35000c500f3cde00f                          ONLINE       0     0     0
+	    35000c500f3cf593b                          ONLINE       0     0     0
+	    35000c500f3ceea2b                          ONLINE       0     0     0
+	    35000c500f3cdcb77                          ONLINE       0     0     0
+	    35000c500f3cf6e6f                          ONLINE       0     0     0
+	    35000c500f3ceee17                          ONLINE       0     0     0
+	    35000c500f3cdd0e3                          ONLINE       0     0     0
+	    35000c500f3cf43e3                          ONLINE       0     0     0
+	    35000c500f3cf68a7                          ONLINE       0     0     0
+	  raidz3-5                                     ONLINE       0     0     0
+	    35000c500f3cdcac3                          ONLINE       0     0     0
+	    35000c500f3ce15a7                          ONLINE       0     0     0
+	    35000c500f3cf8c13                          ONLINE       0     0     0
+	    35000c500f3cd92e3                          ONLINE       0     0     0
+	    35000c500f3cddf53                          ONLINE       0     0     0
+	    35000c500f3cf5b33                          ONLINE       0     0     0
+	    35000c500f3cddf9f                          ONLINE       0     0     0
+	    35000c500f3cde453                          ONLINE       0     0     0
+	    35000c500f3cdcce7                          ONLINE       0     0     0
+	    35000c500f3cdff6b                          ONLINE       0     0     0
+	    35000c500f3cf6b2b                          ONLINE       0     0     0
+	    35000c500f3cdff23                          ONLINE       0     0     0
+	    35000c500f3cf6737                          ONLINE       0     0     0
+	logs	
+	  mirror-6                                     ONLINE       0     0     0
+	    nvme-MTFDKCC800TGQ-1BK1DABYY_26241052A320  ONLINE       0     0     0
+	    nvme-MTFDKCC800TGQ-1BK1DABYY_26241052A321  ONLINE       0     0     0
+	cache
+	  nvme-MTFDKCC800TGQ-1BK1DABYY_26241052A333    ONLINE       0     0     0
+	  nvme-MTFDKCC800TGQ-1BK1DABYY_262410529A02    ONLINE       0     0     0
+
+errors: No known data errors
 ##inodes
 Filesystem            Inodes    IUsed         IFree IUse% Mounted on
-/dev/md0           452292608   206792     452085816    1% /
+/dev/md0           452292608   206618     452085990    1% /
 /dev/nvme0n1p1             0        0             0     - /boot/efi
-data1           223727210210       13  223727210197    1% /data1
-data1/cdrennan 1055577434757 50041219 1055527393538    1% /data1/group/cdrennan/001
-data2/cdrennan  923776637425 67181301  923709456124    1% /data1/group/cdrennan/002
+data1           223727105445       13  223727105432    1% /data1
+data1/cdrennan 1038281834089 51574070 1038230260019    1% /data1/group/cdrennan/001
+data2/cdrennan  923459454151 67181944  923392272207    1% /data1/group/cdrennan/002
 data1/orcd       29526702253      200   29526702053    1% /data1/group/orcd/015
 data2/orcd       29514577624       74   29514577550    1% /data1/group/orcd/018
-data2           223717908157        6  223717908151    1% /data2
+data2           223717906552        6  223717906546    1% /data2
 devtmpfs            49400211     5623      49394588    1% /dev
 tmpfs               49406279        1      49406278    1% /dev/shm
 nfs001.lb:/            31122      103         31019    1% /net/nfs001.lb
@@ -101,3 +353,4 @@ efivarfs                   0        0             0     - /sys/firmware/efi/efiv
 
 # ME:Mar 18, 2026, allow Mediaflux read only access as root from node9900
 /data1 172.16.99.0(fsid=0,ro,async,crossmnt,no_root_squash,insecure)
+##ok

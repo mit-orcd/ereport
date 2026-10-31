@@ -2,7 +2,7 @@
 core009
 ##df
 Filesystem                                Type         1K-blocks          Used    Available Use% Mounted on
-/dev/md0                                  xfs          904143524      13400784    890742740   2% /
+/dev/md0                                  xfs          904143524      13389424    890754100   2% /
 /dev/nvme0n1p1                            vfat            204580          7568       197012   4% /boot/efi
 /dev/mapper/arupclab002-arupclab002       xfs        32210163712    7395759536  24814404176  23% /data/arupclab002
 /dev/mapper/cdrennan-cdrennan001          xfs       440232056832  291646767724 148585289108  67% /data/cdrennan/003
@@ -10,28 +10,94 @@ Filesystem                                Type         1K-blocks          Used  
 /dev/rbd16                                xfs       322120460288  109225897004 212894563284  34% /data/edboyden/001
 /dev/mapper/edboyden002-edboyden002       xfs      1047849469952 1047849469932           20 100% /data/edboyden/002
 /dev/mapper/ejalm-ejalm                   xfs        42947581952   26901730660  16045851292  63% /data/ejalm/001
-/dev/mapper/evelina9--001-openmind--evlab xfs       429494638592  420081073284   9413565308  98% /data/evelina9/001
+/dev/mapper/evelina9--001-openmind--evlab xfs       429494638592  420165529888   9329108704  98% /data/evelina9/001
 /dev/mapper/gabrieli001-gabrieli001       xfs        64422418432   64422418016          416 100% /data/gabrieli/001
 /dev/rbd15                                xfs       128846931488  128332273684    514657804 100% /data/ldlewis/001
-/dev/mapper/mhowland-mhowland             xfs        42947581952   33014764612   9932817340  77% /data/mhowland/001
+/dev/mapper/mhowland-mhowland             xfs        42947581952   33014764624   9932817328  77% /data/mhowland/001
 /dev/mapper/ngk001-kanlab                 xfs        53685000192   53653698804     31301388 100% /data/ngk/001
 /dev/rbd14                                xfs        42947586048   41496201464   1451384584  97% /data/omarabu/001
 /dev/mapper/picower004-picower004         xfs       107372091392   54278436504  53093654888  51% /data/picower004
 /dev/mapper/polzlab-polzlab               xfs        12882810880   10669062596   2213748284  83% /data/polzlab003
-/dev/mapper/raffaele-raffaele             xfs        21472745472   18402199148   3070546324  86% /data/raffaele/001
+/dev/mapper/raffaele-raffaele             xfs        21472745472   20071052024   1401693448  94% /data/raffaele/001
 /dev/mapper/seyvos-seyvos001              xfs        53685000192   52740902800    944097392  99% /data/seyvos/001
 /dev/mapper/tami-tami--001                xfs       107372091392   36134608892  71237482500  34% /data/tami/001
 /dev/mapper/zhang_f001-zhanglab           xfs       268433364992  259968854988   8464510004  97% /data/zhang_f/001
 devtmpfs                                  devtmpfs     263632572             0    263632572   0% /dev
 tmpfs                                     tmpfs        263656704             0    263656704   0% /dev/shm
-nfs001.lb:/                               nfs4            996160         62272       933888   7% /net/nfs001.lb
+nfs001.lb:/                               nfs4            996160         64512       931648   7% /net/nfs001.lb
 xcat:/install                             nfs4         838808576     425346048    413462528  51% /net/xcat/install
-core009.ib:/evelina9/001                  nfs4      429494638592  420081073152   9413565440  98% /orcd/archive/evelina9/001
-hstor006-n2:/group/evelina9/001           nfs4      279172874240   50748012544 228424861696  19% /orcd/data/evelina9/001
-fstor001:/software/core/001               nfs4        4294967296    3197861504   1097105792  75% /orcd/software/core/001
-tmpfs                                     tmpfs        105462684        167092    105295592   1% /run
+core009.ib:/evelina9/001                  nfs4      429494638592  420165529600   9329108992  98% /orcd/archive/evelina9/001
+hstor006-n2:/group/evelina9/001           nfs4      279172874240   51287658496 227885215744  19% /orcd/data/evelina9/001
+fstor001:/software/core/001               nfs4        4294967296    3197863296   1097104000  75% /orcd/software/core/001
+tmpfs                                     tmpfs        105462684        175284    105287400   1% /run
 tmpfs                                     tmpfs         52731340             0     52731340   0% /run/user/0
 efivarfs                                  efivarfs           304           170          130  57% /sys/firmware/efi/efivars
+##mountinfo
+22 70 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw
+23 70 0:22 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 70 0:6 / /dev rw,nosuid shared:9 - devtmpfs devtmpfs rw,size=263632572k,nr_inodes=65908143,mode=755,inode64
+25 23 0:7 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:3 - securityfs securityfs rw
+26 24 0:23 / /dev/shm rw,nosuid,nodev shared:10 - tmpfs tmpfs rw,inode64
+27 24 0:24 / /dev/pts rw,nosuid,noexec,relatime shared:11 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+28 70 0:25 / /run rw,nosuid,nodev shared:12 - tmpfs tmpfs rw,size=105462684k,nr_inodes=819200,mode=755,inode64
+29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot
+30 23 0:27 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:5 - pstore pstore rw
+31 23 0:28 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:6 - efivarfs efivarfs rw
+32 23 0:29 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:7 - bpf bpf rw,mode=700
+65 23 0:18 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:8 - configfs configfs rw
+70 1 9:0 / / rw,relatime shared:1 - xfs /dev/md0 rw,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota
+33 22 0:30 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=29,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=33850
+34 24 0:31 / /dev/hugepages rw,relatime shared:15 - hugetlbfs hugetlbfs rw,pagesize=2M
+35 24 0:20 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:16 - mqueue mqueue rw
+36 23 0:8 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:17 - debugfs debugfs rw
+37 23 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:18 - tracefs tracefs rw
+38 22 0:32 / /proc/fs/nfsd rw,relatime shared:19 - nfsd nfsd rw
+39 23 0:33 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:20 - fusectl fusectl rw
+62 28 0:34 / /run/credentials/systemd-sysctl.service ro,nosuid,nodev,noexec,relatime shared:21 - ramfs none rw,mode=700
+64 28 0:35 / /run/credentials/systemd-tmpfiles-setup-dev.service ro,nosuid,nodev,noexec,relatime shared:22 - ramfs none rw,mode=700
+144 70 259:2 / /boot/efi rw,relatime shared:65 - vfat /dev/nvme0n1p1 rw,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro
+175 28 0:37 / /run/credentials/systemd-tmpfiles-setup.service ro,nosuid,nodev,noexec,relatime shared:78 - ramfs none rw,mode=700
+150 33 0:38 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:81 - binfmt_misc binfmt_misc rw
+156 70 0:39 / /var/lib/nfs/rpc_pipefs rw,relatime shared:84 - rpc_pipefs sunrpc rw
+411 36 0:13 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime shared:208 - tracefs tracefs rw
+472 70 252:224 / /data/omarabu/001 rw,relatime shared:246 - xfs /dev/rbd14 rw,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,prjquota,grpquota
+754 70 252:240 / /data/ldlewis/001 rw,relatime shared:265 - xfs /dev/rbd15 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+475 70 252:256 / /data/edboyden/001 rw,relatime shared:247 - xfs /dev/rbd16 rw,attr2,inode64,logbufs=8,logbsize=64k,sunit=128,swidth=128,usrquota,prjquota,grpquota
+862 70 253:0 / /data/edboyden/002 rw,relatime shared:444 - xfs /dev/mapper/edboyden002-edboyden002 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+800 70 253:1 / /data/polzlab003 rw,relatime shared:425 - xfs /dev/mapper/polzlab-polzlab rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+823 70 253:5 / /data/arupclab002 ro,relatime shared:437 - xfs /dev/mapper/arupclab002-arupclab002 ro,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+846 70 253:4 / /data/ejalm/001 rw,relatime shared:450 - xfs /dev/mapper/ejalm-ejalm rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+892 70 253:3 / /data/mhowland/001 rw,relatime shared:473 - xfs /dev/mapper/mhowland-mhowland rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+915 70 253:9 / /data/tami/001 ro,relatime shared:485 - xfs /dev/mapper/tami-tami--001 ro,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+938 70 253:2 / /data/picower004 rw,relatime shared:497 - xfs /dev/mapper/picower004-picower004 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+961 70 253:11 / /data/cdrennan/003 ro,relatime shared:509 - xfs /dev/mapper/cdrennan-cdrennan001 ro,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+984 70 253:8 / /data/ngk/001 rw,relatime shared:521 - xfs /dev/mapper/ngk001-kanlab rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1007 70 253:10 / /data/seyvos/001 ro,relatime shared:533 - xfs /dev/mapper/seyvos-seyvos001 ro,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1030 70 253:12 / /data/gabrieli/001 rw,relatime shared:545 - xfs /dev/mapper/gabrieli001-gabrieli001 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1053 70 253:14 / /data/econ/001 rw,relatime shared:557 - xfs /dev/mapper/econ-econ--001 rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1076 70 253:13 / /data/raffaele/001 rw,relatime shared:569 - xfs /dev/mapper/raffaele-raffaele rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1099 70 253:7 / /data/zhang_f/001 rw,relatime shared:581 - xfs /dev/mapper/zhang_f001-zhanglab rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1122 70 253:6 / /data/evelina9/001 rw,relatime shared:593 - xfs /dev/mapper/evelina9--001-openmind--evlab rw,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+1145 70 0:43 / /misc rw,relatime shared:605 - autofs /etc/auto.misc rw,fd=6,pgrp=4361,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=55398
+1168 70 0:47 / /net rw,relatime shared:617 - autofs -hosts rw,fd=9,pgrp=4361,timeout=300,minproto=5,maxproto=5,indirect,pipe_ino=162656
+893 70 0:48 / /nfs rw,relatime shared:249 - autofs ldap:ou=auto.nfs,ou=automount,dc=cm,dc=cluster rw,fd=12,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=62583
+1214 70 0:49 / /orcd rw,relatime shared:641 - autofs ldap:ou=auto.orcd,ou=automount,dc=cm,dc=cluster rw,fd=16,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=56418
+1366 1168 0:51 / /net/nfs001.lb rw,nosuid,nodev,relatime shared:667 - nfs4 nfs001.lb:/ rw,vers=4.2,rsize=65536,wsize=65536,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.9,local_lock=none,addr=10.1.223.2
+1365 1366 0:52 / /net/nfs001.lb/home rw,relatime shared:679 - autofs -hosts rw,fd=9,pgrp=4361,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=162656
+1262 70 0:53 / /programs rw,relatime shared:691 - autofs ldap:ou=auto.direct,ou=automount,dc=cm,dc=cluster rw,fd=21,pgrp=4361,timeout=86400,minproto=5,maxproto=5,direct,pipe_ino=92068200
+1285 1168 0:54 / /net/xcat/install rw,relatime shared:703 - autofs -hosts rw,fd=9,pgrp=4361,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=162656
+1308 1168 0:55 / /net/xcat/tftpboot rw,relatime shared:715 - autofs -hosts rw,fd=9,pgrp=4361,timeout=300,minproto=5,maxproto=5,offset,pipe_ino=162656
+1333 1285 0:57 / /net/xcat/install rw,nosuid,nodev,relatime shared:727 - nfs4 xcat:/install rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.1.222.9,local_lock=none,addr=10.1.10.195
+1331 1214 0:56 / /orcd/software rw,relatime shared:739 - autofs ou=auto.orcd.software,ou=automount,dc=cm,dc=cluster rw,fd=25,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=182019379
+1423 1331 0:58 / /orcd/software/core rw,relatime shared:751 - autofs ou=auto.orcd.software.core,ou=automount,dc=cm,dc=cluster rw,fd=28,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=182018128
+1448 1423 0:60 / /orcd/software/core/001 rw,noatime shared:763 - nfs4 fstor001:/software/core/001 rw,vers=4.2,rsize=131072,wsize=131072,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.9,local_lock=none,addr=172.16.4.121
+1446 1214 0:59 / /orcd/data rw,relatime shared:775 - autofs ou=auto.orcd.data,ou=automount,dc=cm,dc=cluster rw,fd=31,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=181850766
+1492 1446 0:61 / /orcd/data/evelina9 rw,relatime shared:787 - autofs ou=auto.orcd.data.evelina9,ou=automount,dc=cm,dc=cluster rw,fd=34,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=182047801
+1517 1492 0:63 / /orcd/data/evelina9/001 rw,relatime shared:799 - nfs4 hstor006-n2:/group/evelina9/001 rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.9,local_lock=none,addr=172.16.3.131
+1515 1214 0:62 / /orcd/archive rw,relatime shared:811 - autofs ou=auto.orcd.archive,ou=automount,dc=cm,dc=cluster rw,fd=37,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=181905404
+1561 1515 0:64 / /orcd/archive/evelina9 rw,relatime shared:823 - autofs ou=auto.orcd.archive.evelina9,ou=automount,dc=cm,dc=cluster rw,fd=40,pgrp=4361,timeout=86400,minproto=5,maxproto=5,indirect,pipe_ino=182076656
+1586 1561 0:66 / /orcd/archive/evelina9/001 rw,relatime shared:835 - nfs4 core009.ib:/evelina9/001 rw,vers=4.2,rsize=1048576,wsize=1048576,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.222.9,local_lock=none,addr=172.16.222.9
+917 28 0:50 / /run/user/0 rw,nosuid,nodev,relatime shared:250 - tmpfs tmpfs rw,size=52731340k,nr_inodes=13182835,mode=700,inode64
 ##mounts
 /dev/md0 / xfs rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota 0 0
 /dev/nvme0n1p1 /boot/efi vfat rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii,shortname=winnt,errors=remount-ro 0 0
@@ -101,10 +167,23 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
 ##exports
 Export list for localhost:
 /data 10.1.0.0/16,172.19.0.0/16,172.16.0.0/16
+##exportopts
+/data         	172.16.6.221(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.6.222(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.6.223(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.6.224(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.222.41(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.3.142(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.6.225(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/data         	172.16.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data         	172.19.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
+/data         	10.1.0.0/16(async,wdelay,hide,crossmnt,no_subtree_check,fsid=0,sec=sys,rw,secure,root_squash,no_all_squash)
 ##zfs
+##zpool
+no pools available
 ##inodes
 Filesystem                                      Inodes     IUsed        IFree IUse% Mounted on
-/dev/md0                                     452292608    203455    452089153    1% /
+/dev/md0                                     452292608    203454    452089154    1% /
 /dev/nvme0n1p1                                       0         0            0     - /boot/efi
 /dev/mapper/arupclab002-arupclab002         3221225024   4181892   3217043132    1% /data/arupclab002
 /dev/mapper/cdrennan-cdrennan001            8804682816  39726579   8764956237    1% /data/cdrennan/003
@@ -112,7 +191,7 @@ Filesystem                                      Inodes     IUsed        IFree IU
 /dev/rbd16                                  6442450944   1623225   6440827719    1% /data/edboyden/001
 /dev/mapper/edboyden002-edboyden002           43111208  42845178       266030  100% /data/edboyden/002
 /dev/mapper/ejalm-ejalm                     4294966848    924932   4294041916    1% /data/ejalm/001
-/dev/mapper/evelina9--001-openmind--evlab  19017555128 185567832  18831987296    1% /data/evelina9/001
+/dev/mapper/evelina9--001-openmind--evlab  18848654656 185753906  18662900750    1% /data/evelina9/001
 /dev/mapper/gabrieli001-gabrieli001           54579136  54578301          835  100% /data/gabrieli/001
 /dev/rbd15                                  1056736568  27414592   1029321976    3% /data/ldlewis/001
 /dev/mapper/mhowland-mhowland               4294966848   1577385   4293389463    1% /data/mhowland/001
@@ -120,7 +199,7 @@ Filesystem                                      Inodes     IUsed        IFree IU
 /dev/rbd14                                  2929931632  27155293   2902776339    1% /data/omarabu/001
 /dev/mapper/picower004-picower004           2147483520   2451049   2145032471    1% /data/picower004
 /dev/mapper/polzlab-polzlab                 1288489728   1676037   1286813691    1% /data/polzlab003
-/dev/mapper/raffaele-raffaele               2147483200    299833   2147183367    1% /data/raffaele/001
+/dev/mapper/raffaele-raffaele               2147483200    359459   2147123741    1% /data/raffaele/001
 /dev/mapper/seyvos-seyvos001                1889112800    916711   1888196089    1% /data/seyvos/001
 /dev/mapper/tami-tami--001                  2147483520    844434   2146639086    1% /data/tami/001
 /dev/mapper/zhang_f001-zhanglab             5368708992  92360163   5276348829    2% /data/zhang_f/001
@@ -128,9 +207,9 @@ devtmpfs                                      65908143      1238     65906905   
 tmpfs                                         65914176         1     65914175    1% /dev/shm
 nfs001.lb:/                                      31122       103        31019    1% /net/nfs001.lb
 xcat:/install                                419429824    257153    419172671    1% /net/xcat/install
-core009.ib:/evelina9/001                   19017555128 185567832  18831987296    1% /orcd/archive/evelina9/001
-hstor006-n2:/group/evelina9/001           456877166772  27444871 456849721901    1% /orcd/data/evelina9/001
-fstor001:/software/core/001                 2228666733  34454953   2194211780    2% /orcd/software/core/001
+core009.ib:/evelina9/001                   18848654656 185753906  18662900750    1% /orcd/archive/evelina9/001
+hstor006-n2:/group/evelina9/001           455798071128  27640523 455770430605    1% /orcd/data/evelina9/001
+fstor001:/software/core/001                 2228663157  34454954   2194208203    2% /orcd/software/core/001
 tmpfs                                           819200      1840       817360    1% /run
 tmpfs                                         13182835        15     13182820    1% /run/user/0
 efivarfs                                             0         0            0     - /sys/firmware/efi/efivars
@@ -146,3 +225,4 @@ efivarfs                                             0         0            0   
 /data 172.16.222.41(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
 /data 172.16.3.142(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
 /data 172.16.6.225(fsid=0,rw,async,crossmnt,no_subtree_check,no_root_squash)
+##ok
