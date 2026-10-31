@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS shares (
     nfiles     INTEGER,            -- files in use on that fs          (facts)
     pool       TEXT,               -- zfs pool of the backing fs       (facts)
     leaf       INTEGER,            -- 1 leaf / 0 parent dataset        (facts)
+    crawl      TEXT,               -- 'y' scan / 'n' covered elsewhere  (facts)
     PRIMARY KEY (host, share, mountpoint)
 ) WITHOUT ROWID
 """
@@ -88,11 +89,11 @@ def main():
         con.execute(SCHEMA)
         facts = {(h, s, m): rest for h, s, m, *rest in con.execute(
             "SELECT host, share, mountpoint, backing, usage, local_fs,"
-            " size, nfiles, pool, leaf FROM shares")}
+            " size, nfiles, pool, leaf, crawl FROM shares")}
         con.execute("DELETE FROM shares")
         con.executemany(
-            "INSERT INTO shares VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(h, s, m, *facts.get((h, s, m), (None,) * 7))
+            "INSERT INTO shares VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(h, s, m, *facts.get((h, s, m), (None,) * 8))
              for h, s, m in sorted(rows)])
         con.commit()
         known = hostlist.load() if hostlist.INVENTORY.exists() else {}

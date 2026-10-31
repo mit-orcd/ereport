@@ -7,8 +7,9 @@ Column rules (never guessed, never defaulted):
     backing    fs kind behind the share, or the original export for
                mount-table-backed re-exports, or 're-export'
     usage      capacity in use, %
-    local_fs   filer-local path/remote that actually carries the share
-               (NULL when the share path itself is that path)
+    local_fs   filer-local path/remote that actually carries the share;
+               the share path itself when that path is the local mountpoint
+               (NULL only when the share is unresolved)
     size       capacity of the fs carrying the share, bytes: df total, or
                zfs used+avail when only a dataset matched (zfs avail is
                pool-wide on un-quotaed datasets; df wins wherever a df
@@ -24,6 +25,11 @@ Column rules (never guessed, never defaulted):
                so walking it never revisits another row's data; 0 when one
                does; NULL when the share has no local path (re-export or
                unresolved)
+    crawl      'y' when this row's bytes are not read by another row,
+               'n' when they are: a duplicate carrier (same device and
+               relative path, e.g. /data1 and a bind of its root) or a
+               subtree of a crawled whole-fs row.  A scan filters on
+               crawl = 'y' and never reads the same tree twice.
 
 Decision rules above the stages:
     A bare 'host:/' automount rides the filer's single fsid=0 pseudo-root
@@ -64,6 +70,13 @@ def norm(path):
     return path.rstrip("/") or "/"
 
 
+def unescape(field):
+    """Kernel mount tables escape space, tab, newline and backslash as
+    \\ooo; a mountpoint is one token, so turn them back into bytes."""
+    return (field.replace("\\040", " ").replace("\\011", "\t")
+                 .replace("\\012", "\n").replace("\\134", "\\"))
+
+
 def inside(parent, child):
     """True when child is strictly beneath parent (path boundaries; '/'
     contains every other path)."""
@@ -100,6 +113,49 @@ def mount_pairs(section):
         if fields and fields[0].startswith("/dev/") and len(fields) >= 3:
             rows.append((fields[0], fields[1], fields[2]))
     return rows
+
+
+def mountinfo(section):
+    """{mountpoint: (device, fsroot)} from '##mountinfo'.
+
+    device is the zfs dataset name, otherwise major:minor - every mount of
+    the same filesystem carries the same pair.  fsroot is the subtree the
+    mount exposes, so a bind of /data1/compute/x is ('/', '/data1') with
+    fsroot /compute/x rather than a second whole-fs mount.  Empty when the
+    snapshot predates the marker, and identity falls back to the path."""
+    info = {}
+    for line in section.splitlines():
+        fields = line.split()
+        if "-" not in fields:
+            continue
+        sep = fields.index("-")
+        if sep < 3 or len(fields) < sep + 3:
+            continue
+        fstype, source = fields[sep + 1], unescape(fields[sep + 2])
+        info[unescape(fields[4])] = (
+            source if fstype == "zfs" else fields[2], norm(unescape(fields[3])))
+    return info
+
+
+def fs_path(fsroot, local_fs, base):
+    """The path inside its filesystem that a share's carrier names.
+    'fsroot' is where the mount sits in that filesystem, '(local_fs - base)'
+    the share's offset from the mountpoint."""
+    rel = norm(local_fs)[len(norm(base)):] if local_fs != base else ""
+    return norm(fsroot.rstrip("/") + "/" + rel.lstrip("/"))
+
+
+def carrier_key(local_fs, base, mi):
+    """(device, path inside it) naming the tree a share serves.
+
+    Equal tuples mean the same bytes: /data1 and a bind of the fs root are
+    both (dev, '/'), a bind of /data1/compute/x is (dev, '/compute/x').
+    Without a ##mountinfo row for the matched mountpoint the fallback is
+    the carrier path itself, which is all a pre-v2 snapshot attests."""
+    if base is None or base not in mi:
+        return ("path", norm(wildcard_base(local_fs)))
+    device, fsroot = mi[base]
+    return (device, fs_path(fsroot, local_fs, base))
 
 
 def fsid0_roots(section):
@@ -214,8 +270,8 @@ def is_leaf(path, carriers):
     """1 when no other share's local path sits strictly beneath path, so
     walking this share never revisits another row's data; 0 when one does.
 
-    The carrier is the server-side path (local_fs, or the share when that
-    path is the local mountpoint) - never the client-side export alias."""
+    The carrier is the server-side path (local_fs) - never the client-side
+    export alias."""
     return int(not any(inside(path, other) for other in carriers))
 
 
@@ -254,16 +310,18 @@ def candidates(share, root):
 
 
 def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
-    """(backing, usage, local_fs, size, nfiles, pool) for one share,
+    """(backing, usage, local_fs, size, nfiles, pool, base) for one share,
     decided locally from snapshot - all None when no stage matches;
     never guessed.
 
-    local_fs shows where the share actually lives on the filer (NULL
-    if the automount path IS the local mountpoint, 'host:/export' when
-    a mount-table re-export matched).  size/nfiles ride the df row that
+    local_fs shows where the share actually lives on the filer (the
+    share path itself when that path is the local mountpoint, 'host:/export'
+    when a mount-table re-export matched).  size/nfiles ride the df row that
     matched; stage 3 works off the deepest ancestor's fs exactly like
     usage does; stage 4's size is zfs used+avail and nfiles comes from
-    the dataset's own df -i row."""
+    the dataset's own df -i row.  base is the mountpoint carrying local_fs
+    (None for a re-export): with ##mountinfo it names the filesystem and
+    the subtree a share's bytes really are."""
     share = norm(wildcard_base(share))
     cands = candidates(share, root)
     rerooted = cands[3:]        # candidates() appends the root+ forms last
@@ -276,13 +334,14 @@ def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
             if mountpoint == fsid0[0]:
                 return (fstype, usage, mountpoint, total,
                         inodes.get(mountpoint),
-                        pool_of(zfsm, mountpoint, fstype))
+                        pool_of(zfsm, mountpoint, fstype), mountpoint)
     # 1. exact local mountpoint == the share (never the OS root for '/')
     if share != "/":
         for mountpoint, fstype, usage, total in df:
             if mountpoint == share:
-                return (fstype, usage, None, total, inodes.get(mountpoint),
-                        pool_of(zfsm, mountpoint, fstype))
+                return (fstype, usage, mountpoint, total,
+                        inodes.get(mountpoint),
+                        pool_of(zfsm, mountpoint, fstype), mountpoint)
     # 2. exact mountpoint == a re-rooted form: the share's own path first,
     #    then its parent dataset - whatever order df printed them in
     for form in rerooted[:2]:
@@ -290,7 +349,7 @@ def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
             if mountpoint == form:
                 return (fstype, usage, mountpoint, total,
                         inodes.get(mountpoint),
-                        pool_of(zfsm, mountpoint, fstype))
+                        pool_of(zfsm, mountpoint, fstype), mountpoint)
     # 3. share lives inside an existing fs (re-rooted forms only; the
     #    deepest ancestor fs carries its backing, same as `df -T` would).
     #    The path must be attested: df rows strictly beneath it, or the
@@ -312,7 +371,7 @@ def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
             row = max(ancestors, key=lambda r: len(r[0]))
             _, fstype, usage, total = row
             return (fstype, usage, cand, total, inodes.get(row[0]),
-                    pool_of(zfsm, row[0], fstype))
+                    pool_of(zfsm, row[0], fstype), row[0])
     # 4. zfs dataset whose mountpoint carries the share: exact mountpoint
     #    forms first, then the deepest path-boundary suffix - whatever
     #    order zfs printed its tables in.  pool is the dataset name's
@@ -321,20 +380,22 @@ def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
     if exact:
         _name, mountpoint, used, avail = max(exact, key=lambda r: len(r[1]))
         usage = round(100 * used / (used + avail)) if used + avail else None
-        served = None if mountpoint == share else mountpoint
+        served = mountpoint
         return ("zfs", usage, served,
                 used + avail if used + avail else None,
-                inodes.get(mountpoint), pool_of(zfsm, mountpoint, "zfs"))
+                inodes.get(mountpoint), pool_of(zfsm, mountpoint, "zfs"),
+                mountpoint)
     deepest = [row for row in zfsm
                if any(cand != "/" and suffix_of(cand, row[1])
                       for cand in cands)]
     if deepest:
         _name, mountpoint, used, avail = max(deepest, key=lambda r: len(r[1]))
         usage = round(100 * used / (used + avail)) if used + avail else None
-        served = None if mountpoint == share else mountpoint
+        served = mountpoint
         return ("zfs", usage, served,
                 used + avail if used + avail else None,
-                inodes.get(mountpoint), pool_of(zfsm, mountpoint, "zfs"))
+                inodes.get(mountpoint), pool_of(zfsm, mountpoint, "zfs"),
+                mountpoint)
     # 5. mount-table re-export: an NFS-mounted export that names the share
     #    (automount hooks and local device binds are neither)
     for row in mounts:
@@ -350,34 +411,70 @@ def resolve_share(share, df, root, zfsm, inodes, mounts, fsid0=()):
                (source_path.startswith("/")
                 and (source_path == cand
                      or source_path.endswith("/" + cand.lstrip("/")))):
-                return source, None, source, None, None, None
-    return None, None, None, None, None, None
+                return source, None, source, None, None, None, None
+    return None, None, None, None, None, None, None
+
+
+def crawl_flags(rows):
+    """Set each row's crawl flag: 'n' when its bytes are already read by
+    another row, 'y' otherwise.
+
+    Two rows are the same tree when their carrier keys match (the export
+    alias case); one of them is kept, whole-fs mount first, then
+    non-'/legacy/', then shortest mountpoint.  A row is also dropped when
+    its tree sits strictly inside a row that is itself crawled (leaf = 1),
+    so a bind of /data1/compute/x under a whole-fs /data1 share is not read
+    twice.  A row with no carrier has no duplicate evidence and stays 'y'."""
+    groups = {}
+    for row in rows:
+        row["crawl"] = "y"
+        if row["key"] is not None:
+            groups.setdefault(row["key"], []).append(row)
+    for group in groups.values():
+        keep = min(group, key=lambda r: (
+            r["local_fs"] != r["base"],      # the whole-fs mount is canonical
+            "/legacy/" in r["mountpoint"],
+            len(r["mountpoint"]), r["mountpoint"]))
+        for row in group:
+            if row is not keep:
+                row["crawl"] = "n"
+    for row in rows:
+        if row["device"] is None or row["leaf"] != 1:
+            continue
+        for other in rows:
+            if other is not row and other["crawl"] == "y" \
+                    and other["device"] == row["device"] \
+                    and other["leaf"] == 1 \
+                    and inside(other["fspath"], row["fspath"]):
+                row["crawl"] = "n"
+                break
 
 
 def update_db(con, host, resolutions):
-    """Write one host's resolutions.  A fresh snapshot that cannot resolve
-    a stored share contradicts the facts it carries: clear them instead of
-    letting stale values pose as current."""
+    """Write one host's per-row resolutions.  A fresh snapshot that cannot
+    resolve a stored row contradicts the facts it carries: clear them
+    instead of letting stale values pose as current."""
     updated = cleared = 0
     clear = ("UPDATE shares SET backing = NULL, usage = NULL,"
              " local_fs = NULL, size = NULL, nfiles = NULL, pool = NULL,"
-             " leaf = NULL"
-             " WHERE host = ? AND share = ? AND (backing IS NOT NULL"
-             " OR usage IS NOT NULL OR local_fs IS NOT NULL"
-             " OR size IS NOT NULL OR nfiles IS NOT NULL"
-             " OR pool IS NOT NULL OR leaf IS NOT NULL)")
-    for (share, backing, usage, local_fs, size, nfiles, pool,
-         leaf) in resolutions:
+             " leaf = NULL, crawl = NULL"
+             " WHERE host = ? AND share = ? AND mountpoint = ?"
+             " AND (backing IS NOT NULL OR usage IS NOT NULL"
+             " OR local_fs IS NOT NULL OR size IS NOT NULL"
+             " OR nfiles IS NOT NULL OR pool IS NOT NULL"
+             " OR leaf IS NOT NULL OR crawl IS NOT NULL)")
+    for (share, mountpoint, backing, usage, local_fs, size, nfiles, pool,
+         leaf, crawl) in resolutions:
         if backing is not None:
             changed = con.execute(
                 "UPDATE shares SET backing = ?, usage = ?, local_fs = ?,"
-                " size = ?, nfiles = ?, pool = ?, leaf = ?"
-                " WHERE host = ? AND share = ?",
-                (backing, usage, local_fs, size, nfiles, pool, leaf,
-                 host, share)).rowcount
+                " size = ?, nfiles = ?, pool = ?, leaf = ?, crawl = ?"
+                " WHERE host = ? AND share = ? AND mountpoint = ?",
+                (backing, usage, local_fs, size, nfiles, pool, leaf, crawl,
+                 host, share, mountpoint)).rowcount
             updated += 1 if changed else 0
             continue
-        cleared += con.execute(clear, (host, share)).rowcount
+        cleared += con.execute(clear, (host, share, mountpoint)).rowcount
     return updated, cleared
 
 
@@ -386,10 +483,21 @@ def fs_tag(kinds):
     return "mixed" if len(kinds) > 1 else next(iter(kinds), None)
 
 
-def parse_snapshot(path, shares):
-    """[resolutions] for shares from one snapshot file; None if unusable."""
+def incomplete(text):
+    """True for a v2 snapshot whose fatal sections failed (##error, no ##ok).
+    A legacy snapshot carries neither marker and stays parseable."""
+    return "##ok" not in text and \
+        any(line.startswith("##error") for line in text.splitlines())
+
+
+def parse_snapshot(path, keys):
+    """[per-row resolutions] from one snapshot; None if unusable.
+
+    keys are the (share, mountpoint) rows stored for this host.  A snapshot
+    whose fatal probe section failed is incomplete: it never reaches the DB,
+    so a broken probe cannot clear facts."""
     text = path.read_text()
-    if "##host" not in text:
+    if "##host" not in text or incomplete(text):
         return None
     snap = sections(text)
     pairs = exports(snap.get("exports", ""))
@@ -409,18 +517,36 @@ def parse_snapshot(path, shares):
     zfsm = zfs_map(snap.get("zfs", ""))
     mounts = snap.get("mounts", "").splitlines()
     fsid0 = fsid0_roots(snap.get("exportfile", ""))
-    facts = [(share, *resolve_share(share, df, root, zfsm, inodes, mounts,
-                                    fsid0))
-             for share in shares]
-    # carrier: the filer-local path carrying the share - local_fs when the
-    # share is an export alias, the share itself when that path is the local
-    # mountpoint.  Re-exports name another server's tree, so they are out.
-    carriers = {share: norm(wildcard_base(local_fs or share))
-                for share, backing, _usage, local_fs, _size, _n, _pool in facts
-                if backing in ("zfs", "xfs")}
-    return [(*row, is_leaf(carriers[row[0]], carriers.values())
-             if row[0] in carriers else None)
-            for row in facts]
+    mi = mountinfo(snap.get("mountinfo", ""))
+    shares = sorted({share for share, _mountpoint in keys})
+    facts = {share: resolve_share(share, df, root, zfsm, inodes, mounts,
+                                  fsid0) for share in shares}
+    # carrier: the filer-local path carrying the share - local_fs, which is
+    # the share itself when that path is the local mountpoint.  Re-exports
+    # name another server's tree, so they are out.
+    paths = {share: norm(wildcard_base(local_fs))
+             for share, (backing, _usage, local_fs, _size, _n, _pool, _base)
+             in facts.items() if backing in ("zfs", "xfs")}
+    leaves = {share: is_leaf(paths[share], paths.values())
+              for share in paths}
+    rows = []
+    for share, mountpoint in keys:
+        (backing, usage, local_fs, size, nfiles, pool, base) = facts[share]
+        device = fspath = key = None
+        if share in paths:
+            key = carrier_key(local_fs, base, mi)
+            device = key[0]
+            fspath = key[1]
+        rows.append({"share": share, "mountpoint": mountpoint,
+                     "backing": backing, "usage": usage, "local_fs": local_fs,
+                     "size": size, "nfiles": nfiles, "pool": pool,
+                     "leaf": leaves.get(share), "key": key,
+                     "device": device, "fspath": fspath, "base": base,
+                     "crawl": "y"})
+    crawl_flags(rows)
+    return [(r["share"], r["mountpoint"], r["backing"], r["usage"],
+             r["local_fs"], r["size"], r["nfiles"], r["pool"], r["leaf"],
+             r["crawl"]) for r in rows]
 
 
 def main():
@@ -433,14 +559,19 @@ def main():
                      and (not wanted or box in wanted)}
         parsed = set()
         for box, snap in snapshots.items():
-            if "##host" not in snap.read_text(errors="replace"):
+            text = snap.read_text(errors="replace")
+            if "##host" not in text:
                 print(f"{box}: snapshot unusable (no ##host marker)",
                       flush=True)
                 continue
-            shares = [s for (s,) in con.execute(
-                "SELECT share FROM shares WHERE host = ? ORDER BY share",
-                (box,))]
-            updated, cleared = update_db(con, box, parse_snapshot(snap, shares))
+            if incomplete(text):
+                print(f"{box}: snapshot incomplete (##error, no ##ok),"
+                      " facts kept", flush=True)
+                continue
+            rows = list(con.execute(
+                "SELECT share, mountpoint FROM shares WHERE host = ?"
+                " ORDER BY share, mountpoint", (box,)))
+            updated, cleared = update_db(con, box, parse_snapshot(snap, rows))
             con.commit()
             parsed.add(box)
             unresolved = [s for (s,) in con.execute(
@@ -448,9 +579,9 @@ def main():
                 " AND backing IS NULL ORDER BY share", (box,))]
             note = f", unresolved {len(unresolved)}" if unresolved else ""
             cleared_note = f", {cleared} cleared" if cleared else ""
-            print(f"{box} [{snap.name}]: {updated}/{len(shares)} shares parsed"
+            print(f"{box} [{snap.name}]: {updated}/{len(rows)} rows parsed"
                   f"{cleared_note}{note}"
-                  + ("" if shares else " (no LDAP shares)"), flush=True)
+                  + ("" if rows else " (no LDAP shares)"), flush=True)
         unlisted = sorted(p.name for p in PROBE_DIR.iterdir()
                           if p.is_file() and p.name not in snapshots)
         db_hosts = {h for (h,) in con.execute(
@@ -479,10 +610,13 @@ def main():
             " WHERE backing IS NOT NULL").fetchone()
         parent_count = con.execute(
             "SELECT COUNT(*) FROM shares WHERE leaf = 0").fetchone()[0]
+        skip_count = con.execute(
+            "SELECT COUNT(*) FROM shares WHERE crawl = 'n'").fetchone()[0]
         print(f"DB: {share_count} shares carry backing facts across"
               f" {host_count} hosts; size on {size_count},"
               f" nfiles on {nfiles_count},"
-              f" leaf = 0 on {parent_count}"
+              f" leaf = 0 on {parent_count},"
+              f" crawl = n on {skip_count}"
               f" ({len(pending)} hosts lack a usable snapshot)")
         print(f"inventory: {len(hosts)} hosts,"
               f" {len(unclassified)} unclassified"

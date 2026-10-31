@@ -52,16 +52,13 @@ facts via `probe.sh` snapshots.
   inventory, and never store one in the DB.
 - The `.ib` / `.inband` / `.lb` suffixes describe how an export is
   published to clients, not how we reach the filer — never turn them into
-  a network tag. Every probe is one ssh to `root@<box>` from the clush
-  fanout; any jump the filer needs belongs in ssh config, not the script.
+  a network tag. Every probe goes desktop → login → xcat → `root@<box>`.
 - `probe/<host>` is the only snapshot name; parse.py reports any file
   whose name is not an inventory host as ignored.
 
-- Filer hosts accept only xcat's root key — ~/.ssh/config's filer stanza
-  (`Host eofe-data* fstor* hstor* …`) supplies `ProxyJump xcat`, so
-  `run_probes.sh` just runs `root@<filer>`; the same `root@<filer>` from a
-  vantage without that stanza fails auth. LDAP reads go via `AUTOMOUNT_SSH`
-  (default `root@core017`).
+- Filer hosts accept only xcat's root key — probing goes desktop → xcat →
+  filer via ~/.ssh/config's xcat stanza; `root@<filer>` from any other vantage
+  fails auth. LDAP reads go via `AUTOMOUNT_SSH` (default `root@core017`).
 - The automount values in the local export tree are *export aliases*: newer
   filers present `/data`, `/data1…` roots via showmount, hiding
   `/data1/<…>`-shaped local dataset paths. `parse.py` re-roots candidates
@@ -73,13 +70,29 @@ facts via `probe.sh` snapshots.
   matching source; `##exportfile` corroborates only.
 - Pool wildcard shares end in `&`; they resolve to the parent dataset
   (`/pool/00N/&` → `/data1/pool/008`).
+- `local_fs` is set on every resolved row: it is the share path itself when
+  that path is the filer-local mountpoint, otherwise the path/dataset that
+  carries it (`host:/path` for re-exports).  Blank means only "unresolved".
 - `leaf` is about shares, not zfs: 1 when no other share's local path
-  (`local_fs`, or `share` when that path is the local mountpoint) sits
-  beneath it, 0 when one does.  A filer's `/` under per-directory shares
-  is 0 (16 xfs rows today, plus fstor001's `/software/community/001`);
-  pool wildcards stay 1 because nothing else covers their children, so
-  dropping every `leaf = 0` row never loses a byte.  Re-exports and
-  unresolved rows are NULL — they have no local path to compare.
+  (`local_fs`) sits beneath it, 0 when one does.  A filer's `/` under
+  per-directory shares is 0 (16 xfs rows today, plus fstor001's
+  `/software/community/001`); pool wildcards stay 1 because nothing else
+  covers their children, so dropping every `leaf = 0` row never loses a
+  byte.  Re-exports and unresolved rows are NULL — a re-export has no
+  local dataset to compare.
+- `crawl` is about bytes, not shares: `n` marks a row whose tree is
+  already read by another row - the same carrier (`##mountinfo` device plus
+  the path inside it) or a bind of a subtree under a crawled whole-fs row.
+  Two shares with the same `local_fs` but a different path inside the
+  device (fstor011's twelve `/data1/compute/<project>/001` directories) are
+  not duplicates.  Equal paths on *different* hosts never merge.
+- `##mountinfo` is what makes that possible: `/proc/mounts` has no bind
+  root, so a bind of `/data1/compute/x` is indistinguishable from a second
+  whole-fs mount.  It is a v2 marker; older snapshots fall back to plain
+  `local_fs` identity until re-probed.
+- A v2 snapshot ends in `##ok`; a failed fatal command writes `##error`
+  and drops `##ok`.  parse.py skips such a snapshot and keeps stored facts
+  instead of reading absence as evidence.
 - The `##marker` lines in probe.sh output are the parse contract between
   collection and parsing — change them on both sides together.
 - The first `uv` run bootstraps into `~/.local/bin`; the project

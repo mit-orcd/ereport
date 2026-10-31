@@ -67,9 +67,10 @@ from the inventory and any `probe/<host>` file no inventory host names.
     backing     zfs/xfs once local_fs is identified directly; 'host:/path'
                 when the row rides a re-export from another server
     local_fs    the filer-local path (or remote) that actually carries
-                the bytes (/data/arupclab002).  NULL when the share path
-                already is a real filer-local path; bare host:/ v4 shares
-                name their fsid=0 frame's data fs (fstor013's / -> /data1)
+                the bytes (/data/arupclab002); the share path itself when
+                that path is already the local mountpoint.  bare host:/ v4
+                shares name their fsid=0 frame's data fs (fstor013's
+                / -> /data1).  NULL only when the share is unresolved
     usage       % used of that filesystem (NULL when unknown)
     size        capacity of that filesystem, bytes (zfs: used+avail,
                 pool-wide on un-quotaed datasets)
@@ -79,11 +80,15 @@ from the inventory and any `probe/<host>` file no inventory host names.
                 data1); NULL for xfs filers and unattested paths
     leaf        1 when no other share's local path sits beneath this one,
                 so walking it never revisits another row's data (the local
-                path is local_fs, or the share when that path is the local
-                mountpoint); 0 when a share does sit beneath it, e.g. a
-                whole-filesystem '/' share above the per-directory shares;
-                NULL when the share has no local path (re-export,
+                path is local_fs); 0 when a share does sit beneath it, e.g.
+                a whole-filesystem '/' share above the per-directory
+                shares; NULL when the share has no local path (re-export,
                 unresolved)
+    crawl       'y' when a scan should read this row's bytes, 'n' when
+                another row already covers them: a duplicate carrier (same
+                device and path inside it - /data1 and a bind of its root)
+                or a subtree bind under a crawled whole-fs row.  Scan with
+                crawl = 'y' to never read the same tree twice.
 
 Facts trace to probe/<host> snapshot evidence only: exact mountpoint rows,
 framed re-roots, mounted-children-attested paths, device-mated mount
